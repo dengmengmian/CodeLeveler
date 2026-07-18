@@ -39,31 +39,31 @@ repository = "https://github.com/dengmengmian/CodeLeveler"
 
 [workspace.dependencies]
 # Internal crates
-leveler-core = { path = "crates/leveler-core" }
-leveler-lifecycle = { path = "crates/leveler-lifecycle" }
-leveler-memory = { path = "crates/leveler-memory" }
-leveler-model = { path = "crates/leveler-model" }
-leveler-protocol = { path = "crates/leveler-protocol" }
-leveler-provider = { path = "crates/leveler-provider" }
-leveler-storage = { path = "crates/leveler-storage" }
-leveler-project = { path = "crates/leveler-project" }
-leveler-execution = { path = "crates/leveler-execution" }
-leveler-tools = { path = "crates/leveler-tools" }
-leveler-agent = { path = "crates/leveler-agent" }
-leveler-verifier = { path = "crates/leveler-verifier" }
-leveler-context = { path = "crates/leveler-context" }
-leveler-vcs = { path = "crates/leveler-vcs" }
-leveler-lsp = { path = "crates/leveler-lsp" }
-leveler-skills = { path = "crates/leveler-skills" }
-leveler-eval = { path = "crates/leveler-eval" }
-leveler-orchestrator = { path = "crates/leveler-orchestrator" }
-leveler-engine = { path = "crates/leveler-engine" }
-leveler-app = { path = "crates/leveler-app" }
-leveler-client-protocol = { path = "crates/leveler-client-protocol" }
-leveler-local-transport = { path = "crates/leveler-local-transport" }
-leveler-media = { path = "crates/leveler-media" }
-leveler-tui = { path = "crates/leveler-tui" }
-leveler-test-support = { path = "crates/leveler-test-support" }
+leveler-core = { version = "0.1.0", path = "crates/leveler-core" }
+leveler-lifecycle = { version = "0.1.0", path = "crates/leveler-lifecycle" }
+leveler-memory = { version = "0.1.0", path = "crates/leveler-memory" }
+leveler-model = { version = "0.1.0", path = "crates/leveler-model" }
+leveler-protocol = { version = "0.1.0", path = "crates/leveler-protocol" }
+leveler-provider = { version = "0.1.0", path = "crates/leveler-provider" }
+leveler-storage = { version = "0.1.0", path = "crates/leveler-storage" }
+leveler-project = { version = "0.1.0", path = "crates/leveler-project" }
+leveler-execution = { version = "0.1.0", path = "crates/leveler-execution" }
+leveler-tools = { version = "0.1.0", path = "crates/leveler-tools" }
+leveler-agent = { version = "0.1.0", path = "crates/leveler-agent" }
+leveler-verifier = { version = "0.1.0", path = "crates/leveler-verifier" }
+leveler-context = { version = "0.1.0", path = "crates/leveler-context" }
+leveler-vcs = { version = "0.1.0", path = "crates/leveler-vcs" }
+leveler-lsp = { version = "0.1.0", path = "crates/leveler-lsp" }
+leveler-skills = { version = "0.1.0", path = "crates/leveler-skills" }
+leveler-eval = { version = "0.1.0", path = "crates/leveler-eval" }
+leveler-orchestrator = { version = "0.1.0", path = "crates/leveler-orchestrator" }
+leveler-engine = { version = "0.1.0", path = "crates/leveler-engine" }
+leveler-app = { version = "0.1.0", path = "crates/leveler-app" }
+leveler-client-protocol = { version = "0.1.0", path = "crates/leveler-client-protocol" }
+leveler-local-transport = { version = "0.1.0", path = "crates/leveler-local-transport" }
+leveler-media = { version = "0.1.0", path = "crates/leveler-media" }
+leveler-tui = { version = "0.1.0", path = "crates/leveler-tui" }
+leveler-test-support = { version = "0.1.0", path = "crates/leveler-test-support" }
 
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }
