@@ -260,7 +260,7 @@ fn resolve_windows_executable(
     let extensions = if program_path.extension().is_some() {
         vec![std::ffi::OsString::new()]
     } else {
-        let configured = environment
+        let configured: Vec<std::ffi::OsString> = environment
             .var_os_case_insensitive("PATHEXT")
             .map(|value| {
                 std::env::split_paths(&value)
