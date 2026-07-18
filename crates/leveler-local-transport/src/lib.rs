@@ -1,14 +1,18 @@
 //! Trusted local transport between CodeLeveler UI clients and the runtime.
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use leveler_client_protocol::{
-    ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient, ModelRef,
-    PermissionProfile, ProtocolEnvelope, ProtocolError, RuntimeEvent, SessionId, UiSessionSnapshot,
+    ClientCommand, ClientError, InteractiveRuntimeClient, ModelRef, PermissionProfile,
+    ProtocolError, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
+#[cfg(unix)]
+use leveler_client_protocol::{CommandEnvelope, ProtocolEnvelope};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +62,7 @@ pub enum TransportError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
+#[cfg(unix)]
 enum WireRequest {
     Ping,
     Send(ClientCommand),
@@ -69,6 +74,7 @@ enum WireRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
+#[cfg(unix)]
 enum WireResponse {
     Ack,
     Snapshot(UiSessionSnapshot),
@@ -78,11 +84,13 @@ enum WireResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(unix)]
 struct WireError {
     message: String,
     session_id: Option<SessionId>,
 }
 
+#[cfg(unix)]
 impl From<ClientError> for WireError {
     fn from(error: ClientError) -> Self {
         match error {
@@ -98,6 +106,7 @@ impl From<ClientError> for WireError {
     }
 }
 
+#[cfg(unix)]
 impl WireError {
     fn into_client_error(self) -> ClientError {
         match self.session_id {
@@ -107,6 +116,7 @@ impl WireError {
     }
 }
 
+#[cfg(unix)]
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(unix)]
@@ -695,7 +705,7 @@ mod unsupported {
 #[cfg(not(unix))]
 pub use unsupported::{LocalSocketRuntimeClient, LocalSocketServer};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::Mutex;
 
