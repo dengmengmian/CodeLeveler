@@ -569,8 +569,29 @@ fn profile_name_for(request: &ProcessRequest) -> String {
 #[cfg(any(windows, test))]
 fn build_cmdline(program: &str, args: &[String]) -> String {
     let mut parts = vec![quote_win(program)];
-    for a in args {
-        parts.push(quote_win(a));
+
+    // cmd.exe parses the command following /C or /K itself. Quoting that
+    // entire command as a normal Win32 argv item breaks embedded cmd quotes:
+    // cmd does not treat backslashes as quote escapes. Preserve the command
+    // tail verbatim while still encoding options before it normally.
+    let basename = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let cmd_tail = matches!(basename.as_str(), "cmd" | "cmd.exe")
+        .then(|| {
+            args.iter()
+                .position(|arg| arg.eq_ignore_ascii_case("/C") || arg.eq_ignore_ascii_case("/K"))
+        })
+        .flatten();
+
+    for (index, arg) in args.iter().enumerate() {
+        if cmd_tail.is_some_and(|tail| index > tail) {
+            parts.push(arg.clone());
+        } else {
+            parts.push(quote_win(arg));
+        }
     }
     parts.join(" ")
 }
@@ -580,11 +601,32 @@ fn quote_win(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".into();
     }
-    if s.chars().any(|c| c.is_whitespace() || c == '"') {
-        format!("\"{}\"", s.replace('"', "\\\""))
-    } else {
-        s.to_string()
+    if !s.chars().any(|c| c.is_whitespace() || c == '"') {
+        return s.to_string();
     }
+
+    // Encode one argv item using the CommandLineToArgvW/MSVC rules. Runs of
+    // backslashes are doubled before a quote and at the end of a quoted item.
+    let mut quoted = String::with_capacity(s.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for ch in s.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+            quoted.push('"');
+        } else {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+            quoted.push(ch);
+        }
+        backslashes = 0;
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(windows)]
@@ -614,8 +656,21 @@ mod tests {
     fn quote_and_cmdline_stable() {
         assert_eq!(quote_win("cmd"), "cmd");
         assert_eq!(quote_win("a b"), "\"a b\"");
+        assert_eq!(quote_win("a \\\"b\\\""), "\"a \\\\\\\"b\\\\\\\"\"");
+        assert_eq!(quote_win("a b\\"), "\"a b\\\\\"");
         let line = build_cmdline("cmd", &["/C".into(), "echo hi".into()]);
-        assert!(line.contains("cmd") && line.contains("/C"));
+        assert_eq!(line, "cmd /C echo hi");
+        assert_eq!(
+            build_cmdline(
+                r"C:\Windows\System32\cmd.exe",
+                &["/C".into(), r#"type "C:\path with space\file.txt""#.into()]
+            ),
+            r#"C:\Windows\System32\cmd.exe /C type "C:\path with space\file.txt""#
+        );
+        assert_eq!(
+            build_cmdline("tool", &[r#"a "quoted" value"#.into()]),
+            r#"tool "a \"quoted\" value""#
+        );
     }
 
     #[test]
