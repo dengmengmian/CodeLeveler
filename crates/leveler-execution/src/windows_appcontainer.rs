@@ -124,8 +124,9 @@ async fn run_appcontainer_windows(
             .map_err(|e| ProcessError::SandboxPolicy(format!("security capabilities: {e}")))?;
 
         let cmdline = build_cmdline(&program_owned, &args_owned);
-        // Inherit host env (scrubbed), then apply plan TEMP overrides so GetTempPath
-        // lands inside the granted private sandbox_temp — not host TEMP.
+        // Inherit host env (scrubbed), then request a private TEMP fallback.
+        // Windows can replace these values with the still-private, profile-scoped
+        // Packages/<profile>/AC/Temp path when it creates an AppContainer process.
         let mut env_pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = environment
             .vars_os()
             .filter(|(k, _)| {
@@ -397,9 +398,10 @@ fn walk_grant(
 struct AppContainerFsPlan {
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
-    /// Private per-command temp (never the whole system temp tree).
+    /// Private per-command TEMP fallback (never the whole system temp tree).
     sandbox_temp: PathBuf,
-    /// Env overrides applied at launch so GetTempPath/%TEMP% lands in `sandbox_temp`.
+    /// Requested TEMP overrides. Windows may replace them with the current
+    /// AppContainer profile's own virtualized AC/Temp directory.
     env_overrides: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
@@ -509,8 +511,9 @@ fn plan_for_intent(
                 .unwrap_or_else(|| request.cwd.clone());
             let sandbox_temp = private_sandbox_temp("ro", &seed, temp_root)?;
             // Workspace stays RX-only (not in write_roots). Private temp is the
-            // sole writeable path so GetTempPath/%TEMP% works without opening
-            // workspace writes.
+            // sole explicitly writeable path so temp access works without
+            // opening workspace writes. Windows may instead provide the
+            // profile-scoped AppContainer AC/Temp virtualized directory.
             reads.push(sandbox_temp.clone());
             Ok(AppContainerFsPlan {
                 read_roots: dedup_paths(reads),
@@ -1090,6 +1093,7 @@ mod tests {
             treq.filesystem_intent = Some(intent.clone());
             treq.write_root = Some(pair.ws.clone());
             treq.timeout = Duration::from_secs(30);
+            let expected_profile = profile_name_for(&treq).to_ascii_lowercase();
             let tout = canary_runner()
                 .run(treq, CancellationToken::new())
                 .await
@@ -1111,19 +1115,23 @@ mod tests {
                     )
                 })
                 .trim()
+                .trim_end_matches(['\\', '/'])
+                .replace('/', "\\")
                 .to_ascii_lowercase();
-            assert!(
-                child_temp.contains("leveler-ac-"),
-                "reported child TEMP must be CodeLeveler's private directory: {child_temp:?}"
-            );
             let host_temp = std::env::temp_dir()
                 .display()
                 .to_string()
                 .trim_end_matches(['\\', '/'])
+                .replace('/', "\\")
                 .to_ascii_lowercase();
+            let requested_private_temp = child_temp.contains("leveler-ac-")
+                && child_temp.starts_with(&host_temp)
+                && child_temp != host_temp;
+            let profile_temp_suffix = format!("\\packages\\{expected_profile}\\ac\\temp");
+            let appcontainer_virtual_temp = child_temp.ends_with(&profile_temp_suffix);
             assert!(
-                child_temp.starts_with(&host_temp) && child_temp != host_temp,
-                "child TEMP must be private under host temp: child={child_temp:?} host={host_temp:?}"
+                requested_private_temp || appcontainer_virtual_temp,
+                "child TEMP must be CodeLeveler's requested private directory or the exact current AppContainer profile temp: child={child_temp:?} host={host_temp:?} profile={expected_profile:?}"
             );
             // Must not create the probe at the host system temp root.
             let host_pwned = host_probe.exists()
