@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -433,6 +434,7 @@ pub(crate) async fn cmd_discuss(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+#[cfg(unix)]
 const DEFAULT_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

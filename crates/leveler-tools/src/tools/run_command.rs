@@ -385,8 +385,10 @@ fn path_allows(allowed: &str, modified: &str) -> bool {
 /// guessing (e.g. calling it a "pre-existing, unrelated" failure). Writes
 /// outside the workspace (temp/toolchain caches aside) are denied by design.
 fn sandbox_denial_hint(sandboxed: bool, success: bool, body: &str) -> Option<&'static str> {
-    let denied =
-        body.contains("operation not permitted") || body.contains("Operation not permitted");
+    let body = body.to_ascii_lowercase();
+    let denied = body.contains("operation not permitted")
+        || body.contains("permission denied")
+        || body.contains("read-only file system");
     if sandboxed && !success && denied {
         Some(crate::recoverable::sandbox_write_denied())
     } else {
@@ -598,6 +600,11 @@ mod tests {
         let hint = sandbox_denial_hint(true, false, denied).expect("hint");
         assert!(hint.contains("request_permissions"));
         assert!(hint.contains("[recoverable]"));
+        assert!(
+            sandbox_denial_hint(true, false, "cannot create .git/x: Read-only file system")
+                .is_some()
+        );
+        assert!(sandbox_denial_hint(true, false, "mkdir: Permission denied").is_some());
         // not sandboxed → no hint (real failure, no sandbox to blame).
         assert!(sandbox_denial_hint(false, false, denied).is_none());
         // succeeded → no hint.

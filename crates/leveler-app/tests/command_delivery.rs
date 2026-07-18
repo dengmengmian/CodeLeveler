@@ -13,12 +13,13 @@ use leveler_client_protocol::{
 };
 use leveler_core::{CommandId, SessionId};
 use leveler_execution::PermissionProfile;
-use leveler_local_transport::{
-    CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient, LocalSocketServer,
-};
+use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService};
+#[cfg(unix)]
+use leveler_local_transport::{LocalSocketRuntimeClient, LocalSocketServer};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::TurnRepository;
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
 /// Point `LEVELER_HOME` at an empty dir so `GlobalConfig::load()` yields the
