@@ -1,0 +1,26 @@
+id: go-json-defaults
+name: Apply defaults without overwriting explicit JSON values
+files:
+  go.mod: |
+    module evalcase
+    go 1.21
+  config.go: |
+    package evalcase
+    import "encoding/json"
+    type Config struct { Enabled bool `json:"enabled"`; Limit int `json:"limit"` }
+    func Parse(data []byte) (Config, error) {
+        var cfg Config
+        err := json.Unmarshal(data, &cfg)
+        if cfg.Limit == 0 { cfg.Limit = 10 }
+        cfg.Enabled = true
+        return cfg, err
+    }
+  config_test.go: |
+    package evalcase
+    import "testing"
+    func TestParseDefaultsAndExplicitFalse(t *testing.T) {
+        cfg, err := Parse([]byte(`{}`)); if err != nil || !cfg.Enabled || cfg.Limit != 10 { t.Fatalf("default: %#v %v", cfg, err) }
+        cfg, err = Parse([]byte(`{"enabled":false,"limit":0}`)); if err != nil || cfg.Enabled || cfg.Limit != 0 { t.Fatalf("explicit: %#v %v", cfg, err) }
+    }
+task: "Fix Parse so missing enabled/limit fields default to true/10, while explicit false and explicit zero are preserved. Keep Config's public field types unchanged and do not modify tests."
+expect: { program: go, args: [test, ./...] }

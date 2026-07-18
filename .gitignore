@@ -1,0 +1,43 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local runtime state
+*.db
+*.db-wal
+*.db-shm
+.leveler/state/
+.leveler/sessions.db*
+.leveler/permissions.yaml
+.leveler/media/
+.leveler/drafts/
+.local-leveler/
+
+# Local agent/orchestration state
+.claude/
+.codex/
+.omc/
+AGENTS.md
+CLAUDE.md
+
+# Generated evaluation output
+evals/baselines/*.json
+evals/baselines/*.jsonl
+
+# Env / secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
+
+# Packaging output
+dist/
+
+# Local sandbox / tool-cache leftovers from execution tests
+crates/leveler-execution/leveler-ac-*/
+crates/leveler-execution/leveler-tool-cache/

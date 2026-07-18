@@ -1,0 +1,23 @@
+[package]
+name = "leveler-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Verification gates (format/build/test), failure classification, and completion gate."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-execution = { workspace = true }
+leveler-project = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

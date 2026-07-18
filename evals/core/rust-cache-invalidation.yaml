@@ -1,0 +1,35 @@
+id: rust-cache-invalidation
+name: Invalidate a memoized value after mutation
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    use std::cell::Cell;
+    pub struct Cart { cents: Vec<u64>, cached_total: Cell<Option<u64>> }
+    impl Cart {
+        pub fn new() -> Self { Self { cents: vec![], cached_total: Cell::new(None) } }
+        pub fn add(&mut self, cents: u64) { self.cents.push(cents); }
+        pub fn total(&self) -> u64 {
+            if let Some(value) = self.cached_total.get() { return value; }
+            let value = self.cents.iter().sum();
+            self.cached_total.set(Some(value));
+            value
+        }
+    }
+  tests/spec.rs: |
+    use evalcase::Cart;
+    #[test]
+    fn mutation_invalidates_cached_total() {
+        let mut cart = Cart::new();
+        cart.add(100);
+        assert_eq!(cart.total(), 100);
+        cart.add(50);
+        assert_eq!(cart.total(), 150);
+    }
+task: "Fix Cart so total() never returns stale data after add(). Keep the public API and do not modify tests."
+expect: { program: cargo, args: [test, --quiet] }

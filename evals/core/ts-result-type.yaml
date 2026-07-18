@@ -1,0 +1,12 @@
+id: ts-result-type
+name: Preserve zero in a Result conversion
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export type Result<T> = {ok:true,value:T}|{ok:false,error:string};
+    export function parseCount(raw: string): Result<number> { const value=Number(raw); return value ? {ok:true,value} : {ok:false,error:"invalid"}; }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { parseCount } from "./src.ts";
+    test("result", () => { assert.deepEqual(parseCount("0"),{ok:true,value:0}); assert.deepEqual(parseCount("12"),{ok:true,value:12}); assert.equal(parseCount("12x").ok,false); assert.equal(parseCount("").ok,false); });
+task: "Fix parseCount so it accepts complete non-negative integer strings including zero and rejects empty, partial, negative, decimal, and non-numeric input. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

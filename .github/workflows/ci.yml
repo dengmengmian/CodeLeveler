@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt · clippy · test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Linux sandbox runtime
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      # Windows uses its own execution backends; tests assert fail-closed
+      # filesystem behavior and honest capability probes.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Keep Windows security boundaries visible as their own required step.
+      # These exercise real NTFS directory sharing/junction behavior, real
+      # AppContainer ACLs, and Job Object descendant termination on the runner.
+      - name: Windows security canaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo test -p leveler-tools windows_ --all-features -- --nocapture
+          cargo test -p leveler-execution windows_appcontainer::tests::canaries --all-features -- --nocapture
+          cargo test -p leveler-execution windows_job_ --all-features -- --nocapture
+
+      - name: Test
+        run: cargo test --workspace
+
+  supply-chain:
+    name: deny · audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo-audit
+        # Expires 2026-10-01. rsa is only an unreachable sqlx-mysql lockfile
+        # edge; this workspace enables sqlite only (`cargo tree --target all
+        # -i rsa` is empty). Remove when sqlx drops the edge or a fix ships.
+        run: cargo audit --ignore RUSTSEC-2023-0071

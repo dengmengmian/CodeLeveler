@@ -1,0 +1,11 @@
+id: ts-cache-ttl
+name: Expire cached values at the TTL boundary
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export class Cache<T>{ #entries=new Map<string,{value:T,expires:number}>(); constructor(private now:()=>number=Date.now){} set(key:string,value:T,ttl:number){this.#entries.set(key,{value,expires:this.now()+ttl});} get(key:string):T|undefined{return this.#entries.get(key)?.value;} }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { Cache } from "./src.ts";
+    test("ttl", () => { let now=100; const cache=new Cache<number>(()=>now); cache.set("x",7,10); assert.equal(cache.get("x"),7); now=110; assert.equal(cache.get("x"),undefined); now=90; cache.set("bad",1,0); assert.equal(cache.get("bad"),undefined); });
+task: "Fix Cache so entries expire when now is greater than or equal to expires, expired entries are removed, and non-positive TTLs are never readable. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

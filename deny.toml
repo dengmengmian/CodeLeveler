@@ -1,0 +1,49 @@
+# cargo-deny configuration for CodeLeveler.
+# Run in CI: `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # serde_yaml is archived/unmaintained. Retained temporarily for compatibility;
+    # track a migration to a maintained YAML implementation.
+    "RUSTSEC-2024-0320",
+    # Expires 2026-10-01. Unreachable optional sqlx-mysql lockfile dependency;
+    # this workspace enables sqlite only. See audit.toml for the graph check.
+    "RUSTSEC-2023-0071",
+    # No safe direct upgrade is currently available. These are unmaintained
+    # transitive dependencies of syntect and ratatui, not vulnerability reports.
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSL-1.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

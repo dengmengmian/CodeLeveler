@@ -1,0 +1,22 @@
+[package]
+name = "leveler-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vendor protocol adapters (OpenAI Chat first) and a robust SSE parser."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

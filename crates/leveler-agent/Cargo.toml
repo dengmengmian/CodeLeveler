@@ -1,0 +1,32 @@
+[package]
+name = "leveler-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The CodeLeveler agent tool-execution loop."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-lifecycle = { workspace = true }
+leveler-model = { workspace = true }
+leveler-tools = { workspace = true }
+leveler-execution = { workspace = true }
+leveler-context = { workspace = true }
+leveler-skills = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+tempfile = "3"

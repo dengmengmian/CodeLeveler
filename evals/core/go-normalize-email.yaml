@@ -1,0 +1,23 @@
+id: go-normalize-email
+name: Normalize and validate an email address
+files:
+  go.mod: |
+    module evalcase
+    go 1.21
+  email.go: |
+    package evalcase
+    import "strings"
+    func NormalizeEmail(raw string) (string, bool) {
+        return strings.ToLower(raw), true
+    }
+  email_test.go: |
+    package evalcase
+    import "testing"
+    func TestNormalizeEmail(t *testing.T) {
+        if got, ok := NormalizeEmail(" User@Example.COM "); !ok || got != "user@example.com" { t.Fatalf("%q %v", got, ok) }
+        for _, bad := range []string{"", "a", "@x.com", "a@", "a@@x.com", "a b@x.com"} {
+            if _, ok := NormalizeEmail(bad); ok { t.Fatalf("accepted %q", bad) }
+        }
+    }
+task: "Implement conservative NormalizeEmail: trim surrounding whitespace, lowercase it, and reject empty, whitespace-containing, or malformed values that do not contain exactly one @ with non-empty sides. Do not modify tests."
+expect: { program: go, args: [test, ./...] }

@@ -1,0 +1,26 @@
+id: rust-dedup-stable
+name: Deduplicate while preserving first-seen order
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn dedup_stable(values: &[String]) -> Vec<String> {
+        let mut output = values.to_vec();
+        output.sort();
+        output.dedup();
+        output
+    }
+  tests/spec.rs: |
+    use evalcase::dedup_stable;
+    #[test]
+    fn keeps_first_seen_order() {
+        let input = ["b", "a", "b", "c", "a"].map(String::from);
+        assert_eq!(dedup_stable(&input), ["b", "a", "c"]);
+    }
+task: "Fix dedup_stable so it removes duplicates without changing first-seen order. Do not modify tests."
+expect: { program: cargo, args: [test, --quiet] }

@@ -1,0 +1,38 @@
+id: rust-parse-ratio
+name: Convert a panicking parser to Result (no panics)
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    /// BUG: panics on bad input and divides by zero.
+    pub fn parse_ratio(s: &str) -> Result<f64, String> {
+        let (a, b) = s.split_once('/').unwrap();
+        Ok(a.parse::<f64>().unwrap() / b.parse::<f64>().unwrap())
+    }
+  tests/spec.rs: |
+    use evalcase::parse_ratio;
+    #[test]
+    fn ok_case() {
+        assert_eq!(parse_ratio("6/2"), Ok(3.0));
+    }
+    #[test]
+    fn missing_slash_is_err() {
+        assert!(parse_ratio("42").is_err());
+    }
+    #[test]
+    fn non_numeric_is_err() {
+        assert!(parse_ratio("x/2").is_err());
+    }
+    #[test]
+    fn divide_by_zero_is_err() {
+        assert!(parse_ratio("1/0").is_err());
+    }
+task: "Make parse_ratio never panic: return Err(String) for missing '/', non-numeric parts, and division by zero. All tests in tests/spec.rs must pass. Do NOT modify the tests."
+expect:
+  program: cargo
+  args: ["test", "--quiet"]

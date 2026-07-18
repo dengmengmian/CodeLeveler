@@ -1,0 +1,19 @@
+# Copy to ~/.leveler/hooks.yaml and/or <repo>/.leveler/hooks.yaml
+# Both files are loaded when present; project hooks run after global hooks.
+#
+# PreToolUse (pre_tool_use):
+#   exit 0  → allow
+#   exit 2  → hard deny (tool blocked)
+#   any other non-zero / spawn error → also deny
+#
+# PostToolUse (post_tool_use): observational only; failures are ignored.
+# On tool failure the phase env is post_tool_use_error instead of post_tool_use.
+#
+# Env injected into every hook process:
+#   LEVELER_HOOK            — phase name (pre_tool_use | post_tool_use | post_tool_use_error)
+#   LEVELER_TOOL            — tool name
+#   LEVELER_TOOL_ARGS_JSON  — tool args JSON (may be truncated)
+hooks:
+  pre_tool_use: []
+  # - command: ["python3", ".leveler/hooks/pre.py"]
+  post_tool_use: []

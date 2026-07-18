@@ -1,0 +1,24 @@
+id: deepseek-v4-pro
+provider: deepseek
+model_id: deepseek-v4-pro
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: false
+  structured_output: true
+  reasoning: true
+  vision: false
+reasoning:
+  style: thinking_flag
+  effort: high
+limits:
+  context_window: 1048576
+  reliable_context: 786432
+  max_output_tokens: 65536
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 1
+compatibility:
+  middleware: []
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true

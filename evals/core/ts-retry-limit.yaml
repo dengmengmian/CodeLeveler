@@ -1,0 +1,11 @@
+id: ts-retry-limit
+name: Bound async retries and preserve the final error
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export async function retry<T>(operation:()=>Promise<T>, attempts:number):Promise<T>{ return operation(); }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { retry } from "./src.ts";
+    test("retries", async () => { let calls=0; assert.equal(await retry(async()=>{if(++calls<3)throw new Error("x");return 9;},3),9); assert.equal(calls,3); calls=0; await assert.rejects(retry(async()=>{calls++;throw new Error("final");},2),/final/); assert.equal(calls,2); await assert.rejects(retry(async()=>1,0)); });
+task: "Fix retry so attempts is the total positive attempt count, success returns immediately, and the final original error is rethrown. Reject attempts <= 0. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

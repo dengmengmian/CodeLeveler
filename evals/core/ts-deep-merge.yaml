@@ -1,0 +1,11 @@
+id: ts-deep-merge
+name: Merge nested configuration without losing siblings
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export function merge(base: Record<string,unknown>, patch: Record<string,unknown>): Record<string,unknown> { return {...base,...patch}; }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { merge } from "./src.ts";
+    test("deep merge", () => { const base={server:{host:"localhost",port:80},flags:["a"]}; const got=merge(base,{server:{port:443}}); assert.deepEqual(got,{server:{host:"localhost",port:443},flags:["a"]}); assert.notEqual(got.server,base.server); });
+task: "Implement immutable recursive merge for plain objects. Arrays and primitive patch values replace the base value. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

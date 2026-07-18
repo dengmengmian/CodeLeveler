@@ -1,0 +1,33 @@
+[package]
+name = "leveler-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The persistent task/turn engine: one execution kernel with Direct/Plan strategies, an append-only event log, and resume."
+
+[dependencies]
+leveler-agent = { workspace = true }
+leveler-context = { workspace = true }
+leveler-core = { workspace = true }
+leveler-lifecycle = { workspace = true }
+leveler-execution = { workspace = true }
+leveler-model = { workspace = true }
+leveler-orchestrator = { workspace = true }
+leveler-storage = { workspace = true }
+leveler-tools = { workspace = true }
+leveler-verifier = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+leveler-provider = { workspace = true }

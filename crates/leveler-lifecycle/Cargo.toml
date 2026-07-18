@@ -1,0 +1,16 @@
+[package]
+name = "leveler-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The execution lifecycle vocabulary: session status, agent state, and task outcome — one typed source depended on by storage, engine, orchestrator, and clients."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,11 @@
+id: ts-concurrency-limit
+name: Enforce an async concurrency limit
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export async function mapLimit<T,R>(values:T[],limit:number,fn:(value:T)=>Promise<R>):Promise<R[]>{ return Promise.all(values.map(fn)); }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { mapLimit } from "./src.ts";
+    test("limit", async () => { let active=0,max=0; const got=await mapLimit([1,2,3,4,5],2,async n=>{active++;max=Math.max(max,active);await new Promise(r=>setTimeout(r,5));active--;return n*2;}); assert.deepEqual(got,[2,4,6,8,10]); assert.equal(max,2); await assert.rejects(mapLimit([1],0,async n=>n)); });
+task: "Implement mapLimit with at most limit operations running at once, results in input order, and rejection for non-positive/non-integer limits. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

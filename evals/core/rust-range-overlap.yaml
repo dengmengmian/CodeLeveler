@@ -1,0 +1,25 @@
+id: rust-range-overlap
+name: Correct half-open range overlap semantics
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn overlaps(a: (i32, i32), b: (i32, i32)) -> bool {
+        a.0 <= b.1 && b.0 <= a.1
+    }
+  tests/spec.rs: |
+    use evalcase::overlaps;
+    #[test]
+    fn uses_half_open_ranges_and_rejects_empty_ranges() {
+        assert!(overlaps((0, 4), (3, 8)));
+        assert!(!overlaps((0, 4), (4, 8)));
+        assert!(!overlaps((2, 2), (1, 3)));
+        assert!(!overlaps((5, 1), (0, 9)));
+    }
+task: "Fix overlaps for half-open ranges [start,end): touching endpoints and empty/reversed ranges do not overlap. Do not modify tests."
+expect: { program: cargo, args: [test, --quiet] }

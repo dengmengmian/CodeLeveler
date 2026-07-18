@@ -1,0 +1,42 @@
+[package]
+name = "leveler-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tool trait, registry, JSON-schema validation, and the built-in tools."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-model = { workspace = true }
+leveler-execution = { workspace = true }
+leveler-context = { workspace = true }
+leveler-project = { workspace = true }
+leveler-lsp = { workspace = true }
+leveler-skills = { workspace = true }
+leveler-memory = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+schemars = { workspace = true }
+jsonschema = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+fs2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+cap-std = { workspace = true }
+cap-tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

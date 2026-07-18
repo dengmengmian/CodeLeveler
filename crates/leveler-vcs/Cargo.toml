@@ -1,0 +1,20 @@
+[package]
+name = "leveler-vcs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Git/GitHub workflow: branch, commit, push, and open pull requests."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-execution = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

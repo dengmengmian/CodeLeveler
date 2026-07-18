@@ -1,0 +1,36 @@
+[package]
+name = "leveler-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CodeLeveler interactive terminal UI (Ratatui/Crossterm): AppState, reducer, composer, screens."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-client-protocol = { workspace = true }
+leveler-skills = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
+textwrap = { workspace = true }
+pulldown-cmark = { workspace = true }
+syntect = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml_edit = { workspace = true }
+arboard = "3"
+
+[dev-dependencies]
+leveler-client-protocol = { workspace = true, features = ["testing"] }
+leveler-tools = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }

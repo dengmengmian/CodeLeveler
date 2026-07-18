@@ -1,0 +1,30 @@
+[package]
+name = "leveler-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The agent state machine, requirement model, and task graph."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-lifecycle = { workspace = true }
+leveler-model = { workspace = true }
+leveler-tools = { workspace = true }
+leveler-execution = { workspace = true }
+leveler-agent = { workspace = true }
+leveler-verifier = { workspace = true }
+leveler-context = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }

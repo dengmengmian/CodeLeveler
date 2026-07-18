@@ -1,0 +1,17 @@
+# Kimi Code OpenAI-compatible endpoint (chat completions).
+# Docs: https://www.kimi.com/code/docs/kimi-code/models
+# Key via env only — never commit secrets.
+id: kimi
+protocol: openai_chat
+base_url: ${KIMI_BASE_URL:-https://api.kimi.com/coding/v1}
+api_key_env: KIMI_API_KEY
+headers:
+  user-agent: CodeLeveler/0.1.0
+timeouts:
+  connect_seconds: 20
+  request_seconds: 600
+  idle_stream_seconds: 180
+retry:
+  max_attempts: 3
+  initial_backoff_ms: 500
+  max_backoff_ms: 10000

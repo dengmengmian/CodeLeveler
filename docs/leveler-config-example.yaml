@@ -1,0 +1,54 @@
+# Example project config: copy to <repo>/.leveler/config.yaml
+# Everything is optional. Absent keys fall back to language detection / CLI flags.
+# Invalid YAML is non-fatal: Leveler falls back to defaults.
+#
+# This file is NOT the global model config.
+#   Global:  ~/.leveler/config.toml  (Windows: set LEVELER_HOME, then use %LEVELER_HOME%\config.toml)
+#   Bundle:  configs/providers/*.yaml and configs/models/*.yaml
+#   Schema:  configs/example.yaml
+
+# Default model reference (overridden by CLI --model).
+model: deepseek/deepseek-v4-pro
+
+# Default permission profile (same wire values as CLI --permission).
+# Canonical:
+#   request_approval — always ask for external edits and network
+#   assisted         — default; only risky ops need approval
+#   full_access      — unrestricted FS + network (use with care)
+# Legacy aliases still accepted by the runtime:
+#   plan             → request_approval
+#   workspace_write  → assisted
+mode: assisted
+
+# Explicit verification commands. When any of format/build/test is set,
+# this section fully replaces the language-derived plan.
+# - format: best-effort, non-gating (failure does not block completion)
+# - build / test: gating (must pass for a verified completion)
+verify:
+  # Python example
+  format: { program: ruff,   args: ["format", "--check", "."] }
+  build:  { program: python, args: ["-m", "compileall", "-q", "src"] }
+  test:   { program: pytest, args: ["-q"] }
+
+  # Other stacks (uncomment / adapt):
+  # Node/TS:  format {prettier --check .} build {tsc --noEmit} test {npm test}
+  # Go:       format {gofmt -l .} build {go build ./...} test {go test ./...}
+  # Rust:     format {cargo fmt -- --check} build {cargo check} test {cargo test}
+
+# Optional resource ceilings for one top-level run. Absence means run until a
+# terminal outcome (provider timeouts still apply to individual requests).
+# limits:
+#   max_model_tokens: 200000
+#   max_cost_usd_micros: 5000000   # $5.00 — requires auditable pricing
+#   max_duration_seconds: 1800
+
+ignore:
+  - "*.log"
+  - "tmp/**"
+
+# Other checkouts the agent may *read* (not write). Absolute paths or paths
+# relative to this repo root. Same as CLI `--readonly-root` / env
+# LEVELER_READONLY_ROOTS (':' on Unix, ';' on Windows).
+# readonly_roots:
+#   - ../adjacent-project
+#   - /Users/you/src/other-project

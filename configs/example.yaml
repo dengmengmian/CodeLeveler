@@ -1,0 +1,117 @@
+# CodeLeveler config bundle — annotated example (NOT loaded).
+#
+# This file documents the full on-disk config schema. It is a reference only:
+# the loader scans `configs/providers/` and `configs/models/`
+# (see Layout::models_dir), so a file sitting at `configs/example.yaml` is never
+# loaded and cannot break startup.
+#
+# ── How config is resolved (final effective flow) ─────────────────────────────
+#   1. Repo bundle: every `*.yaml` under `configs/{providers,models}/`.
+#   2. Global config: `~/.leveler/config.toml` (or `$LEVELER_HOME/config.toml`).
+#   3. Merge: repo WINS on id collision; global fills the gaps. `default_model`
+#      always comes from the global config.
+#   4. The selected model's `reliable_context` is the auto-compaction threshold
+#      (transcript is folded once its tokens exceed it).
+#
+# Most users need NOTHING here — just `~/.leveler/config.toml`:
+#
+#     default_model = "deepseek/deepseek-v4-pro"
+#     [providers.deepseek]
+#     base_url = "https://api.deepseek.com"
+#     api_key_env = "DEEPSEEK_API_KEY"
+#     [models."deepseek-v4-pro"]
+#     provider = "deepseek"
+#     context_window = 1048576      # reliable_context is derived = window / 2
+#     reliable_context = 786432     # optional explicit compaction threshold
+#     max_output_tokens = 65536     # omit → 8192
+#     streaming = true
+#     tool_calling = true
+#     parallel_tool_calls = false   # optional: force serial; omitted = provider-native
+#     structured_output = true
+#     max_tool_schema_bytes = 32768
+#     max_parallel_tool_calls = 1
+#     reasoning = true              # model can reason (drives UI rendering)
+#     reasoning_style = "thinking_flag"   # HOW to ask for it — see below
+#     reasoning_effort = "high"
+#
+# Kimi Code (K3 / K2.7) — OpenAI-compatible, docs:
+# https://www.kimi.com/code/docs/kimi-code/models
+#
+#     [providers.kimi]
+#     base_url = "https://api.kimi.com/coding/v1"
+#     api_key_env = "KIMI_API_KEY"
+#     [models.k3]
+#     provider = "kimi"
+#     model_id = "k3"                 # wire model id
+#     context_window = 1048576        # set 262144 on Moderato if plan-capped
+#     reliable_context = 786432
+#     max_output_tokens = 65536
+#     reasoning = true
+#     reasoning_style = "open_ai_effort"  # wire: reasoning_effort
+#     reasoning_effort = "max"            # low | high | max (default max)
+#     vision = true
+#     supports_temperature = false    # Coding API rejects non-default temperature
+#     [models."kimi-for-coding"]
+#     provider = "kimi"
+#     model_id = "kimi-for-coding"
+#     context_window = 262144
+#     supports_temperature = false
+#
+# Use the file bundle below when you need advanced provider retry/timeouts,
+# compatibility middleware, or per-model instructions.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# configs/providers/<id>.yaml — an upstream API endpoint
+# ══════════════════════════════════════════════════════════════════════════════
+id: deepseek                 # provider id, referenced by models
+protocol: openai_chat        # openai_chat | openai_responses | anthropic_messages | gemini_generate_content
+base_url: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}   # env expansion + default
+api_key_env: DEEPSEEK_API_KEY   # key ALWAYS from env, never stored in the repo
+headers:
+  user-agent: CodeLeveler/0.1.0
+timeouts:
+  connect_seconds: 20
+  request_seconds: 600
+  idle_stream_seconds: 120
+retry:
+  max_attempts: 3
+  initial_backoff_ms: 500
+  max_backoff_ms: 10000
+
+# ══════════════════════════════════════════════════════════════════════════════
+# configs/models/<id>.yaml — a concrete model (facts only)
+# ══════════════════════════════════════════════════════════════════════════════
+id: deepseek-v4-pro          # model id → referenced as `deepseek/deepseek-v4-pro`
+provider: deepseek           # must match a provider id above
+model_id: deepseek-v4-pro    # provider-side model name
+protocol: openai_chat
+# NOTE: the `policy:` key is RETIRED (model tiers are gone). A leftover
+# `policy: ...` line is a hard config error — execution configuration is
+# resolved from model facts + role + task + safety constraints at run time.
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: false
+  structured_output: true
+  reasoning: false           # model CAN reason; see `reasoning:` below for how to ask
+  vision: false
+# How to spell a reasoning request on the wire. Omit the block entirely and we
+# send no reasoning field at all (safe for providers that reject them).
+#   style: none          — send nothing (default)
+#   style: openai_effort — top-level `reasoning_effort: "high"`
+#   style: thinking_flag — `thinking: {"type": "enabled"}` (+ effort), DeepSeek/GLM
+# effort: minimal | low | medium | high | max. Omit → the provider's default.
+reasoning:
+  style: thinking_flag
+  effort: high
+limits:
+  context_window: 1048576    # hard window (DeepSeek v4 = 1M)
+  reliable_context: 786432   # auto-compaction threshold; only the file bundle can
+                             # set this explicitly (TOML derives window / 2)
+  max_output_tokens: 65536   # per-request output cap; keep input+output ≤ window
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 1
+compatibility:
+  middleware: []
+  synthesize_tool_call_ids: true   # provider omits tool-call ids → synthesize them
+  drop_unsupported_fields: true

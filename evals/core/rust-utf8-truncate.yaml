@@ -1,0 +1,25 @@
+id: rust-utf8-truncate
+name: Truncate UTF-8 text on character boundaries
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn truncate_chars(value: &str, max_chars: usize) -> &str {
+        &value[..max_chars.min(value.len())]
+    }
+  tests/spec.rs: |
+    use evalcase::truncate_chars;
+    #[test]
+    fn truncates_by_characters_not_bytes() {
+        assert_eq!(truncate_chars("你好abc", 2), "你好");
+        assert_eq!(truncate_chars("éclair", 1), "é");
+        assert_eq!(truncate_chars("abc", 9), "abc");
+        assert_eq!(truncate_chars("abc", 0), "");
+    }
+task: "Fix truncate_chars so max_chars is a Unicode character count and slicing never panics. Do not allocate and do not modify tests."
+expect: { program: cargo, args: [test, --quiet] }

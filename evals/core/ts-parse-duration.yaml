@@ -1,0 +1,11 @@
+id: ts-parse-duration
+name: Parse strict duration strings
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export function parseDuration(raw: string): number { return Number.parseInt(raw,10); }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { parseDuration } from "./src.ts";
+    test("duration", () => { assert.equal(parseDuration("250ms"),250); assert.equal(parseDuration("2s"),2000); assert.equal(parseDuration("3m"),180000); for(const bad of ["","1","-2s","2 s","1.5s"]) assert.throws(()=>parseDuration(bad)); });
+task: "Make parseDuration accept only positive integer values suffixed ms, s, or m and return milliseconds; throw on all other forms. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

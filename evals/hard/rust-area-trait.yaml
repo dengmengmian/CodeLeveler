@@ -1,0 +1,31 @@
+id: rust-area-trait
+name: Implement a trait for two structs
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub trait Area {
+        fn area(&self) -> f64;
+    }
+    pub struct Circle { pub r: f64 }
+    pub struct Rect { pub w: f64, pub h: f64 }
+    // TODO: implement Area for Circle and Rect.
+  tests/spec.rs: |
+    use evalcase::{Area, Circle, Rect};
+    #[test]
+    fn circle_area() {
+        assert!((Circle { r: 2.0 }.area() - std::f64::consts::PI * 4.0).abs() < 1e-9);
+    }
+    #[test]
+    fn rect_area() {
+        assert_eq!(Rect { w: 3.0, h: 4.0 }.area(), 12.0);
+    }
+task: "Implement the Area trait for both Circle and Rect so tests/spec.rs passes. Do NOT modify the tests."
+expect:
+  program: cargo
+  args: ["test", "--quiet"]

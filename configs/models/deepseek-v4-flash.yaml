@@ -1,0 +1,21 @@
+id: deepseek-v4-flash
+provider: deepseek
+model_id: deepseek-v4-flash
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: false
+  structured_output: true
+  reasoning: false
+  vision: false
+limits:
+  context_window: 1048576
+  reliable_context: 524288
+  max_output_tokens: 65536
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 1
+compatibility:
+  middleware: []
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true

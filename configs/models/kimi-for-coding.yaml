@@ -1,0 +1,28 @@
+# Kimi K2.7 Code — stable coding model (model id: kimi-for-coding).
+# Docs: https://www.kimi.com/code/docs/kimi-code/models
+# Thinking is always ON; disabling routes to K2.6.
+id: kimi-for-coding
+provider: kimi
+model_id: kimi-for-coding
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: true
+  structured_output: true
+  reasoning: true
+  vision: false
+reasoning:
+  # Always-on thinking for K2.7 Code; server enables Thinking without a wire knob.
+  style: none
+limits:
+  context_window: 262144
+  reliable_context: 196608
+  max_output_tokens: 32768
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 16
+compatibility:
+  middleware: []
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+  supports_temperature: false

@@ -1,0 +1,19 @@
+id: rust-mul
+name: Add a Rust multiply function
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+
+    [lib]
+    path = "lib.rs"
+  lib.rs: |
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+task: "Add a public function mul(a: i32, b: i32) -> i32 that returns a*b to lib.rs, including a unit test. Do not run build commands yourself."
+expect:
+  program: cargo
+  args: ["test", "--quiet"]

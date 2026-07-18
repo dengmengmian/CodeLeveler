@@ -1,0 +1,25 @@
+# Copy to ~/.leveler/permissions.yaml and/or <repo>/.leveler/permissions.yaml
+#
+# Among matching rules: deny > ask > allow.
+# No match → fall through to the session permission profile
+# (request_approval | assisted | full_access).
+#
+# Interactive approval "Always" (CLI: w, TUI: 始终允许) appends project allow
+# rules here. Manage with: leveler permissions list|clear
+# (clear only removes the project file; global rules are untouched.)
+#
+# What Always writes today:
+# - run_command / simple shell_command → command_prefix "program [first-arg]"
+# - apply_patch / replace → tool-level allow (all paths for that tool)
+# - sh -c / compound shell / memory tools → no durable rule (session only)
+#
+# effect values: allow | ask | deny
+rules:
+  - match: { tool: run_command, command_prefix: "cargo test" }
+    effect: allow
+  - match: { tool: run_command, command_prefix: "rm -rf" }
+    effect: deny
+  - match: { tool: apply_patch }
+    effect: allow
+  - match: { tool: apply_patch, path_glob: "secrets/**" }
+    effect: deny

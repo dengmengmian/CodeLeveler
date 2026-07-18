@@ -1,0 +1,26 @@
+id: go-context-worker
+name: Stop a worker promptly on context cancellation
+files:
+  go.mod: |
+    module evalcase
+    go 1.21
+  worker.go: |
+    package evalcase
+    import "context"
+    func Consume(ctx context.Context, jobs <-chan int, handled chan<- int) {
+        for job := range jobs { handled <- job }
+    }
+  worker_test.go: |
+    package evalcase
+    import ("context"; "testing"; "time")
+    func TestConsumeStopsOnCancel(t *testing.T) {
+        ctx, cancel := context.WithCancel(context.Background())
+        jobs := make(chan int)
+        handled := make(chan int)
+        done := make(chan struct{})
+        go func() { Consume(ctx, jobs, handled); close(done) }()
+        cancel()
+        select { case <-done: case <-time.After(200*time.Millisecond): t.Fatal("worker did not stop") }
+    }
+task: "Fix Consume so it exits promptly when ctx is cancelled, including while waiting for a job or while delivering a handled job. Do not modify tests."
+expect: { program: go, args: [test, ./...] }

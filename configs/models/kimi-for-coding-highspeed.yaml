@@ -1,0 +1,26 @@
+# Kimi K2.7 Code HighSpeed — same coding ability, ~6× output speed (3× quota).
+# Model id: kimi-for-coding-highspeed. Allegretto+ membership required.
+id: kimi-for-coding-highspeed
+provider: kimi
+model_id: kimi-for-coding-highspeed
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: true
+  structured_output: true
+  reasoning: true
+  vision: false
+reasoning:
+  style: none
+limits:
+  context_window: 262144
+  reliable_context: 196608
+  max_output_tokens: 32768
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 16
+compatibility:
+  middleware: []
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+  supports_temperature: false

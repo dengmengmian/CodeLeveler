@@ -1,0 +1,5 @@
+# CodeLeveler clippy configuration.
+# Keep the runtime honest: no hidden panics, no sloppy conversions.
+avoid-breaking-exported-api = false
+too-many-arguments-threshold = 10
+type-complexity-threshold = 500

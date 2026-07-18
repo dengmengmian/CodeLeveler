@@ -1,0 +1,58 @@
+id: rust-race-counter
+name: Make a shared counter thread-safe (concurrency)
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A counter shared by cloning `handle()`. Currently NOT thread-safe.
+    pub struct Counter {
+        inner: Rc<RefCell<u64>>,
+    }
+
+    impl Counter {
+        pub fn new() -> Self {
+            Self { inner: Rc::new(RefCell::new(0)) }
+        }
+        pub fn handle(&self) -> Self {
+            Self { inner: self.inner.clone() }
+        }
+        pub fn incr(&self) {
+            *self.inner.borrow_mut() += 1;
+        }
+        pub fn get(&self) -> u64 {
+            *self.inner.borrow()
+        }
+    }
+  tests/spec.rs: |
+    use evalcase::Counter;
+    use std::thread;
+
+    #[test]
+    fn concurrent_increments_are_not_lost() {
+        let c = Counter::new();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let h = c.handle();
+            handles.push(thread::spawn(move || {
+                for _ in 0..1000 {
+                    h.incr();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(c.get(), 8000);
+    }
+task: "The tests/spec.rs test shares a Counter across 8 threads and expects no lost increments. Make Counter safe to share and mutate across threads so the test passes. Do NOT modify tests/spec.rs."
+expect:
+  program: cargo
+  args: ["test", "--quiet"]

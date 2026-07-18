@@ -1,0 +1,23 @@
+[package]
+name = "leveler-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A Language Server Protocol client: symbols, definitions, and diagnostics."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-execution = { workspace = true }
+leveler-project = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

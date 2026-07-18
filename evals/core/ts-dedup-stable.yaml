@@ -1,0 +1,11 @@
+id: ts-dedup-stable
+name: Stable TypeScript deduplication
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export function dedup(values: string[]): string[] { return [...new Set(values)].sort(); }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { dedup } from "./src.ts";
+    test("stable", () => assert.deepEqual(dedup(["b","a","b","c"]), ["b","a","c"]));
+task: "Fix dedup so it removes duplicates while preserving first-seen order. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

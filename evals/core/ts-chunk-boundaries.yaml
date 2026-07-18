@@ -1,0 +1,11 @@
+id: ts-chunk-boundaries
+name: Chunk arrays at exact boundaries
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export function chunk<T>(values: T[], size: number): T[][] { return [values]; }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { chunk } from "./src.ts";
+    test("chunks", () => { assert.deepEqual(chunk([1,2,3,4,5],2),[[1,2],[3,4],[5]]); assert.deepEqual(chunk([],2),[]); assert.throws(()=>chunk([1],0)); });
+task: "Implement chunk preserving order, with a final short chunk, an empty result for empty input, and an error for non-positive/non-integer size. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

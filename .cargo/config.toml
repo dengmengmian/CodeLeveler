@@ -1,0 +1,21 @@
+# Local / team build helpers. Do not put rustc-wrapper here (breaks CI if sccache missing).
+
+[build]
+incremental = true
+
+# Narrow-scope aliases — prefer these while developing; use full workspace only for DoD.
+[alias]
+# Core security / permissions surface
+t-exec = "test -p leveler-execution --lib --test classify_adversarial"
+# Agent authorize + executor
+t-agent = "test -p leveler-agent --lib"
+# CLI is bin-only: integration tests under tests/ (not --lib)
+t-cli = "test -p leveler-cli --test permissions"
+t-tui = "test -p leveler-tui --lib"
+# Permission-path checks across execution, agent, TUI, and CLI
+t-perm = "test -p leveler-execution -p leveler-agent -p leveler-tui --lib"
+# Fast typecheck of the permission chain
+c-perm = "check -p leveler-execution -p leveler-agent -p leveler-cli -p leveler-tui"
+# Definition of done (slow — run once before push)
+dod-test = "test --workspace"
+dod-clippy = "clippy --workspace --all-targets --all-features -- -D warnings"

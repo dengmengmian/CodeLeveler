@@ -1,0 +1,24 @@
+id: go-copy-map
+name: Copy a map without aliasing nested slices
+files:
+  go.mod: |
+    module evalcase
+    go 1.21
+  copy.go: |
+    package evalcase
+    func Clone(input map[string][]string) map[string][]string {
+        output := make(map[string][]string, len(input))
+        for key, value := range input { output[key] = value }
+        return output
+    }
+  copy_test.go: |
+    package evalcase
+    import "testing"
+    func TestCloneDoesNotAliasSlices(t *testing.T) {
+        original := map[string][]string{"roles": {"reader"}}
+        cloned := Clone(original)
+        cloned["roles"][0] = "admin"
+        if original["roles"][0] != "reader" { t.Fatal("clone aliases original slice") }
+    }
+task: "Fix Clone so neither the map nor its nested string slices alias the input. Do not modify tests."
+expect: { program: go, args: [test, ./...] }

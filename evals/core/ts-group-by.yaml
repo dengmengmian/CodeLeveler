@@ -1,0 +1,11 @@
+id: ts-group-by
+name: Group records without shared buckets
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export function groupBy<T>(values: T[], key: (value: T) => string): Record<string,T[]> { return {}; }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { groupBy } from "./src.ts";
+    test("groups", () => { const got=groupBy([1,2,3,4], n => String(n%2)); assert.deepEqual(got,{"0":[2,4],"1":[1,3]}); assert.notEqual(got["0"],got["1"]); });
+task: "Implement generic groupBy preserving input order and using an independent array per key. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

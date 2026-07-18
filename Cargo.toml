@@ -1,0 +1,158 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/leveler-core",
+    "crates/leveler-lifecycle",
+    "crates/leveler-memory",
+    "crates/leveler-model",
+    "crates/leveler-protocol",
+    "crates/leveler-provider",
+    "crates/leveler-storage",
+    "crates/leveler-project",
+    "crates/leveler-execution",
+    "crates/leveler-tools",
+    "crates/leveler-agent",
+    "crates/leveler-verifier",
+    "crates/leveler-context",
+    "crates/leveler-vcs",
+    "crates/leveler-lsp",
+    "crates/leveler-skills",
+    "crates/leveler-eval",
+    "crates/leveler-orchestrator",
+    "crates/leveler-engine",
+    "crates/leveler-app",
+    "crates/leveler-client-protocol",
+    "crates/leveler-local-transport",
+    "crates/leveler-media",
+    "crates/leveler-tui",
+    "crates/leveler-cli",
+    "crates/leveler-test-support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+authors = ["CodeLeveler contributors"]
+repository = "https://github.com/dengmengmian/CodeLeveler"
+
+[workspace.dependencies]
+# Internal crates
+leveler-core = { path = "crates/leveler-core" }
+leveler-lifecycle = { path = "crates/leveler-lifecycle" }
+leveler-memory = { path = "crates/leveler-memory" }
+leveler-model = { path = "crates/leveler-model" }
+leveler-protocol = { path = "crates/leveler-protocol" }
+leveler-provider = { path = "crates/leveler-provider" }
+leveler-storage = { path = "crates/leveler-storage" }
+leveler-project = { path = "crates/leveler-project" }
+leveler-execution = { path = "crates/leveler-execution" }
+leveler-tools = { path = "crates/leveler-tools" }
+leveler-agent = { path = "crates/leveler-agent" }
+leveler-verifier = { path = "crates/leveler-verifier" }
+leveler-context = { path = "crates/leveler-context" }
+leveler-vcs = { path = "crates/leveler-vcs" }
+leveler-lsp = { path = "crates/leveler-lsp" }
+leveler-skills = { path = "crates/leveler-skills" }
+leveler-eval = { path = "crates/leveler-eval" }
+leveler-orchestrator = { path = "crates/leveler-orchestrator" }
+leveler-engine = { path = "crates/leveler-engine" }
+leveler-app = { path = "crates/leveler-app" }
+leveler-client-protocol = { path = "crates/leveler-client-protocol" }
+leveler-local-transport = { path = "crates/leveler-local-transport" }
+leveler-media = { path = "crates/leveler-media" }
+leveler-tui = { path = "crates/leveler-tui" }
+leveler-test-support = { path = "crates/leveler-test-support" }
+
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# HTTP (rustls, no system OpenSSL)
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+    "json",
+    "gzip",
+] }
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+toml_edit = "0.22"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "chrono",
+    "macros",
+    "migrate",
+] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Terminal
+console = "0.15"
+indicatif = "0.17"
+
+# Terminal UI (TUI product layer)
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+textwrap = "0.16"
+pulldown-cmark = { version = "0.12", default-features = false }
+syntect = { version = "5", default-features = false, features = [
+    "default-syntaxes",
+    "default-themes",
+    "regex-fancy",
+] }
+
+# JSON Schema
+schemars = "0.8"
+jsonschema = "0.26"
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Media (image attachments)
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+] }
+infer = "0.16"
+sha2 = "0.10"
+base64 = "0.22"
+fs2 = "0.4"
+rustix = { version = "1.1", features = ["fs"] }
+cap-std = "4.0.2"
+cap-tempfile = "4.0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = 1

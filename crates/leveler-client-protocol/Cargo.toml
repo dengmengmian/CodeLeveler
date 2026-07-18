@@ -1,0 +1,25 @@
+[package]
+name = "leveler-client-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Stable client protocol (ClientCommand / RuntimeEvent) between UI clients and the CodeLeveler runtime."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+# Enables the in-memory MockRuntimeClient for client tests (TUI, integration).
+testing = []
+
+[dev-dependencies]
+tokio = { workspace = true }

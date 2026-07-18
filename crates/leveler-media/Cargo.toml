@@ -1,0 +1,20 @@
+[package]
+name = "leveler-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Image attachment pipeline: import, validate, decode, resize, EXIF strip, hash, and a content-addressed store."
+
+[dependencies]
+image = { workspace = true }
+infer = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

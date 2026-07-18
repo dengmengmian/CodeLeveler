@@ -1,0 +1,49 @@
+[package]
+name = "leveler-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The `leveler` command-line interface."
+
+[[bin]]
+name = "leveler"
+path = "src/main.rs"
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-model = { workspace = true }
+leveler-provider = { workspace = true }
+leveler-storage = { workspace = true }
+leveler-project = { workspace = true }
+leveler-execution = { workspace = true }
+leveler-memory = { workspace = true }
+leveler-lifecycle = { workspace = true }
+leveler-agent = { workspace = true }
+leveler-verifier = { workspace = true }
+leveler-orchestrator = { workspace = true }
+leveler-engine = { workspace = true }
+leveler-eval = { workspace = true }
+leveler-lsp = { workspace = true }
+leveler-app = { workspace = true }
+leveler-client-protocol = { workspace = true }
+leveler-local-transport = { workspace = true }
+leveler-tui = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+console = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

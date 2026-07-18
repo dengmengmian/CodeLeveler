@@ -1,0 +1,30 @@
+# Kimi K3 — flagship coding model (Kimi Code model id: k3).
+# Docs: https://www.kimi.com/code/docs/kimi-code/models
+# Context up to 1M (Allegretto+); Moderato caps at 256k.
+# Reasoning effort: low / high / max (default max). Keep Thinking on.
+id: k3
+provider: kimi
+model_id: k3
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: true
+  structured_output: true
+  reasoning: true
+  vision: true
+reasoning:
+  style: open_ai_effort
+  effort: max
+limits:
+  context_window: 1048576
+  reliable_context: 786432
+  max_output_tokens: 65536
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 16
+compatibility:
+  middleware: []
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+  # Kimi Coding endpoints reject caller-chosen temperature (only default allowed).
+  supports_temperature: false

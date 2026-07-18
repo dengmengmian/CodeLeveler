@@ -1,0 +1,11 @@
+id: ts-normalize-path
+name: Normalize portable relative paths
+files:
+  package.json: '{"type":"module"}'
+  src.ts: |
+    export function normalizeRelative(raw: string): string { return raw.replaceAll("\\","/"); }
+  spec.ts: |
+    import test from "node:test"; import assert from "node:assert/strict"; import { normalizeRelative } from "./src.ts";
+    test("normalizes", () => { assert.equal(normalizeRelative("a\\b/./c"),"a/b/c"); assert.throws(()=>normalizeRelative("../secret")); assert.throws(()=>normalizeRelative("/absolute")); assert.throws(()=>normalizeRelative("C:\\x")); });
+task: "Fix normalizeRelative to normalize separators and dot segments while rejecting parent traversal and Unix/Windows absolute paths. Do not modify spec.ts."
+expect: { program: node, args: [--test, spec.ts] }

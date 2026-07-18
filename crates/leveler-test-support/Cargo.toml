@@ -1,0 +1,12 @@
+[package]
+name = "leveler-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Test utilities: a scriptable mock OpenAI-compatible provider server."
+
+[dependencies]
+tokio = { workspace = true }
