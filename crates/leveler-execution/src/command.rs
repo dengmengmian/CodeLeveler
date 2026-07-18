@@ -1542,10 +1542,9 @@ mod tests {
     #[tokio::test]
     async fn windows_job_timeout_kills_grandchildren() {
         let (dir, mut request, pidfile) = windows_grandchild_request("timeout");
-        // PowerShell cold-start on hosted Windows runners can exceed 400 ms;
-        // leave enough time to prove the grandchild exists before exercising
-        // the timeout kill path.
-        request.timeout = Duration::from_secs(3);
+        // Leave enough time for PowerShell cold-start on hosted runners and to
+        // prove the grandchild exists before exercising the timeout kill path.
+        request.timeout = Duration::from_secs(8);
         let runner = windows_host_runner();
         let handle =
             tokio::spawn(async move { runner.run(request, CancellationToken::new()).await });
@@ -1614,11 +1613,27 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let pidfile = dir.join("gc.pid");
-        let pidfile_str = pidfile.display().to_string();
+        let system_root = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let ping = system_root.join(r"System32\PING.EXE");
+        let pidfile_str = pidfile.display().to_string().replace('\'', "''");
+        let ping_str = ping.display().to_string().replace('\'', "''");
         let script = format!(
-            "powershell -NoProfile -Command \"$p = Start-Process -PassThru -WindowStyle Hidden -FilePath ping -ArgumentList '-n','60','127.0.0.1'; $p.Id | Out-File -Encoding ascii '{pidfile_str}'; Wait-Process -Id $p.Id\""
+            "$p = Start-Process -PassThru -WindowStyle Hidden -FilePath '{ping_str}' -ArgumentList @('-n','60','127.0.0.1'); Set-Content -Encoding Ascii -Path '{pidfile_str}' -Value $p.Id; Wait-Process -Id $p.Id"
         );
-        let request = ProcessRequest::new("cmd", vec!["/C".into(), script], dir.clone());
+        let request = ProcessRequest::new(
+            powershell.display().to_string(),
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script,
+            ],
+            dir.clone(),
+        );
         (dir, request, pidfile)
     }
 

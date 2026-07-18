@@ -47,6 +47,23 @@ impl EnvSnapshot {
             .map(|v| std::env::split_paths(&v).collect())
             .unwrap_or_default()
     }
+
+    /// Read a variable using Windows' case-insensitive environment semantics.
+    /// Useful for immutable snapshots captured on Windows, where the host may
+    /// expose `Path` rather than `PATH`.
+    pub fn var_os_case_insensitive(&self, key: &str) -> Option<OsString> {
+        self.values.iter().find_map(|(name, value)| {
+            name.to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(key))
+                .then(|| value.clone())
+        })
+    }
+
+    pub fn paths_case_insensitive(&self, key: &str) -> Vec<PathBuf> {
+        self.var_os_case_insensitive(key)
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default()
+    }
 }
 
 static ENVIRONMENT: OnceLock<EnvSnapshot> = OnceLock::new();
@@ -62,4 +79,23 @@ pub fn environment() -> &'static EnvSnapshot {
     ENVIRONMENT
         .get()
         .unwrap_or_else(|| EMPTY.get_or_init(EnvSnapshot::default))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_can_read_windows_environment_names_case_insensitively() {
+        let snapshot = EnvSnapshot::new(
+            [(OsString::from("Path"), OsString::from("tool-bin"))],
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+
+        assert_eq!(
+            snapshot.var_os_case_insensitive("PATH"),
+            Some(OsString::from("tool-bin"))
+        );
+    }
 }

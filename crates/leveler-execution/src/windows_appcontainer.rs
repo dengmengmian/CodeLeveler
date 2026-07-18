@@ -73,6 +73,7 @@ async fn run_appcontainer_windows(
     let allow_network = !request.deny_network;
     let profile_name = profile_name_for(&request);
     let program_owned = program.to_string();
+    let executable = resolve_windows_executable(program, &request.cwd, &environment);
     let args_owned = args.to_vec();
     let cwd = request.cwd.clone();
     let timeout = request.timeout;
@@ -145,7 +146,10 @@ async fn run_appcontainer_windows(
         env_pairs.push(("FORCE_COLOR".into(), "0".into()));
 
         let opts = LaunchOptions {
-            exe: PathBuf::from(&program_owned),
+            // rappct passes this as CreateProcessW's non-null application name,
+            // which does not provide std::process::Command's PATH resolution.
+            // Resolve the executable from the immutable host snapshot first.
+            exe: executable,
             cmdline: Some(cmdline),
             cwd: Some(cwd),
             env: Some(env_pairs),
@@ -161,7 +165,10 @@ async fn run_appcontainer_windows(
 
         let mut launched = launch_in_container_with_io(&caps, &opts).map_err(|e| {
             let _ = acl.restore_all();
-            ProcessError::SandboxPolicy(format!("AppContainer launch failed: {e}"))
+            ProcessError::SandboxPolicy(format!(
+                "AppContainer launch failed: {}",
+                format_error_chain(&e)
+            ))
         })?;
 
         // Drain pipes on helper threads while we wait (wait consumes LaunchedIo).
@@ -231,6 +238,76 @@ async fn run_appcontainer_windows(
         }
         _ = cancellation.cancelled() => Err(ProcessError::Cancelled),
     }
+}
+
+#[cfg(windows)]
+fn resolve_windows_executable(
+    program: &str,
+    cwd: &std::path::Path,
+    environment: &leveler_core::EnvSnapshot,
+) -> PathBuf {
+    let program_path = PathBuf::from(program);
+    if program_path.is_absolute() {
+        return program_path;
+    }
+
+    let has_directory = program_path.components().count() > 1;
+    let mut search_roots = vec![cwd.to_path_buf()];
+    if !has_directory {
+        search_roots.extend(environment.paths_case_insensitive("PATH"));
+    }
+
+    let extensions = if program_path.extension().is_some() {
+        vec![std::ffi::OsString::new()]
+    } else {
+        let configured = environment
+            .var_os_case_insensitive("PATHEXT")
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .map(|p| p.into_os_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if configured.is_empty() {
+            [".COM", ".EXE", ".BAT", ".CMD"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect()
+        } else {
+            configured
+        }
+    };
+
+    for root in search_roots {
+        let base = root.join(&program_path);
+        for extension in &extensions {
+            let candidate = if extension.is_empty() {
+                base.clone()
+            } else {
+                let mut name = base.as_os_str().to_os_string();
+                name.push(extension);
+                PathBuf::from(name)
+            };
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    // Preserve the original name so rappct returns the real typed Win32 error.
+    program_path
+}
+
+#[cfg(windows)]
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 /// FILE_GENERIC_EXECUTE / FILE_TRAVERSE (Win32). Combined with FILE_GENERIC_READ
