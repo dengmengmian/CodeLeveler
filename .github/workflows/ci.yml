@@ -60,8 +60,11 @@ jobs:
         shell: pwsh
         run: |
           cargo test -p leveler-tools windows_ --all-features -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p leveler-execution windows_appcontainer::tests::canaries --all-features -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p leveler-execution windows_job_ --all-features -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test
         run: cargo test --workspace

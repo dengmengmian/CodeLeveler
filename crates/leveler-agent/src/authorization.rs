@@ -27,10 +27,14 @@ pub(crate) fn is_verification_command(arguments: &serde_json::Value) -> bool {
     let Some(program) = arguments.get("program").and_then(|v| v.as_str()) else {
         return false;
     };
-    let base = std::path::Path::new(program)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(program);
+    // Parse both separator styles so Windows tool calls are classified the
+    // same way even when replayed or tested on a Unix host.
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let base = base.to_ascii_lowercase();
+    let base = [".exe", ".cmd", ".bat", ".com"]
+        .into_iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+        .unwrap_or(&base);
     VERIFICATION_PROGRAMS.contains(&base)
 }
 
@@ -564,6 +568,12 @@ mod tests {
         // Helper without name gate: no program → false; with program → true.
         assert!(!is_verification_command(&shell_cargo));
         assert!(is_verification_command(&cargo_args));
+        assert!(is_verification_command(
+            &serde_json::json!({"program": r"C:\\Rust\\bin\\cargo.exe", "args": ["test"]})
+        ));
+        assert!(is_verification_command(
+            &serde_json::json!({"program": r"C:\\Node\\npm.CMD", "args": ["test"]})
+        ));
     }
 
     #[test]

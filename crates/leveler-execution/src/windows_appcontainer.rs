@@ -141,9 +141,12 @@ async fn run_appcontainer_windows(
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        env_pairs.extend(plan.env_overrides);
-        env_pairs.push(("NO_COLOR".into(), "1".into()));
-        env_pairs.push(("FORCE_COLOR".into(), "0".into()));
+        for (name, value) in plan.env_overrides {
+            upsert_windows_environment(&mut env_pairs, name, value);
+        }
+        upsert_windows_environment(&mut env_pairs, "NO_COLOR".into(), "1".into());
+        upsert_windows_environment(&mut env_pairs, "FORCE_COLOR".into(), "0".into());
+        sort_windows_environment(&mut env_pairs);
 
         let opts = LaunchOptions {
             // rappct passes this as CreateProcessW's non-null application name,
@@ -308,6 +311,26 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         source = cause.source();
     }
     message
+}
+
+#[cfg(any(windows, test))]
+fn upsert_windows_environment(
+    environment: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    name: std::ffi::OsString,
+    value: std::ffi::OsString,
+) {
+    let target = name.to_string_lossy();
+    environment.retain(|(existing, _)| !existing.to_string_lossy().eq_ignore_ascii_case(&target));
+    environment.push((name, value));
+}
+
+#[cfg(any(windows, test))]
+fn sort_windows_environment(environment: &mut [(std::ffi::OsString, std::ffi::OsString)]) {
+    environment.sort_by(|(left, _), (right, _)| {
+        left.to_string_lossy()
+            .to_ascii_lowercase()
+            .cmp(&right.to_string_lossy().to_ascii_lowercase())
+    });
 }
 
 /// FILE_GENERIC_EXECUTE / FILE_TRAVERSE (Win32). Combined with FILE_GENERIC_READ
@@ -593,6 +616,37 @@ mod tests {
         assert_eq!(quote_win("a b"), "\"a b\"");
         let line = build_cmdline("cmd", &["/C".into(), "echo hi".into()]);
         assert!(line.contains("cmd") && line.contains("/C"));
+    }
+
+    #[test]
+    fn windows_environment_is_case_insensitively_replaced_and_sorted() {
+        let mut environment = vec![
+            ("Path".into(), "old".into()),
+            ("SystemRoot".into(), "windows".into()),
+        ];
+        upsert_windows_environment(&mut environment, "PATH".into(), "new".into());
+        upsert_windows_environment(&mut environment, "TEMP".into(), "private".into());
+        sort_windows_environment(&mut environment);
+
+        assert_eq!(
+            environment
+                .iter()
+                .filter(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            environment
+                .iter()
+                .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"))
+                .map(|(_, value)| value.to_string_lossy().into_owned()),
+            Some("new".into())
+        );
+        let names: Vec<_> = environment
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().to_ascii_lowercase())
+            .collect();
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     fn sys_tmp_canon() -> PathBuf {
