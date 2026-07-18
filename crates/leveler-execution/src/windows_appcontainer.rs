@@ -60,7 +60,6 @@ async fn run_appcontainer_windows(
     cancellation: CancellationToken,
     environment: std::sync::Arc<leveler_core::EnvSnapshot>,
 ) -> Result<ProcessOutput, ProcessError> {
-    use rappct::acl::{AccessMask, ResourcePath, grant_to_package};
     use rappct::launch::{JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io};
     use rappct::{AppContainerProfile, KnownCapability, SecurityCapabilitiesBuilder};
     use std::io::Read;
@@ -292,6 +291,7 @@ struct AppContainerFsPlan {
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     /// Private per-command temp (never the whole system temp tree).
+    #[cfg(test)]
     sandbox_temp: PathBuf,
     /// Env overrides applied at launch so GetTempPath/%TEMP% lands in `sandbox_temp`.
     env_overrides: Vec<(std::ffi::OsString, std::ffi::OsString)>,
@@ -365,6 +365,7 @@ fn plan_for_intent(
             Ok(AppContainerFsPlan {
                 read_roots: dedup_paths(reads),
                 write_roots: dedup_paths(vec![sandbox_temp.clone()]),
+                #[cfg(test)]
                 sandbox_temp: sandbox_temp.clone(),
                 env_overrides: temp_env_overrides(&sandbox_temp),
             })
@@ -387,6 +388,7 @@ fn plan_for_intent(
             Ok(AppContainerFsPlan {
                 read_roots: dedup_paths(reads),
                 write_roots: dedup_paths(writes),
+                #[cfg(test)]
                 sandbox_temp: sandbox_temp.clone(),
                 env_overrides: temp_env_overrides(&sandbox_temp),
             })

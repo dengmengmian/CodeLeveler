@@ -2604,12 +2604,13 @@ async fn cargo_command_is_completion_evidence() {
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
     let registry = Arc::new(default_registry());
 
-    // `true` stands in for a real verification binary; the program set is
-    // checked by basename, so use a real verification program name via a
-    // trivially succeeding command: `make --version`.
+    // This test covers evidence classification, not OS sandbox integration.
+    // Use Cargo's absolute build-time path in FullAccess mode; unit-test
+    // ToolContext intentionally has no inherited PATH. Confinement has
+    // dedicated platform canaries in leveler-execution.
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
@@ -2621,7 +2622,7 @@ async fn cargo_command_is_completion_evidence() {
         assistant_tool_call(
             "c2",
             "run_command",
-            serde_json::json!({"program": "make", "args": ["--version"]}),
+            serde_json::json!({"program": env!("CARGO"), "args": ["--version"]}),
         ),
         assistant_text("All done."),
     ]));
@@ -4508,7 +4509,7 @@ async fn delivery_complete_step_accepts_fresh_verify_evidence() {
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::with_environment(
         workspace,
-        PermissionProfile::Assisted,
+        PermissionProfile::FullAccess,
         Arc::new(leveler_core::EnvSnapshot::new(
             std::env::vars_os(),
             std::env::current_dir().unwrap_or_default(),
