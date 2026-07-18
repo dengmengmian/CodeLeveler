@@ -1523,8 +1523,8 @@ mod tests {
         let (dir, request, pidfile) = windows_grandchild_request("cancel");
         let token = CancellationToken::new();
         let run_token = token.clone();
-        let handle =
-            tokio::spawn(async move { CommandRunner::new().run(request, run_token).await });
+        let runner = windows_host_runner();
+        let handle = tokio::spawn(async move { runner.run(request, run_token).await });
 
         let gc_pid = wait_windows_pidfile(&pidfile).await;
         token.cancel();
@@ -1542,12 +1542,13 @@ mod tests {
     #[tokio::test]
     async fn windows_job_timeout_kills_grandchildren() {
         let (dir, mut request, pidfile) = windows_grandchild_request("timeout");
-        request.timeout = Duration::from_millis(400);
-        let handle = tokio::spawn(async move {
-            CommandRunner::new()
-                .run(request, CancellationToken::new())
-                .await
-        });
+        // PowerShell cold-start on hosted Windows runners can exceed 400 ms;
+        // leave enough time to prove the grandchild exists before exercising
+        // the timeout kill path.
+        request.timeout = Duration::from_secs(3);
+        let runner = windows_host_runner();
+        let handle =
+            tokio::spawn(async move { runner.run(request, CancellationToken::new()).await });
 
         let gc_pid = wait_windows_pidfile(&pidfile).await;
         let result = handle.await.unwrap().expect("timeout returns Ok timed_out");
@@ -1590,6 +1591,15 @@ mod tests {
             }
             other => panic!("expected Spawn or ProcessTreeSetup, got {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    fn windows_host_runner() -> CommandRunner {
+        CommandRunner::with_environment(std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )))
     }
 
     #[cfg(windows)]

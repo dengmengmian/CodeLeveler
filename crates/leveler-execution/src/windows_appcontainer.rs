@@ -64,8 +64,9 @@ async fn run_appcontainer_windows(
     use rappct::{AppContainerProfile, KnownCapability, SecurityCapabilitiesBuilder};
     use std::io::Read;
 
-    let plan = plan_for_intent(&intent, &request)?;
-    for r in plan.read_roots.iter().chain(plan.write_roots.iter()) {
+    let plan = plan_for_intent(&intent, &request, environment.temp_dir())?;
+    let acl_roots = acl_roots_for_plan(&plan);
+    for r in &acl_roots {
         validate_acl_root(r).map_err(ProcessError::SandboxPolicy)?;
     }
 
@@ -80,8 +81,14 @@ async fn run_appcontainer_windows(
     let allow_env = request.allow_env.clone();
 
     let join = tokio::task::spawn_blocking(move || -> Result<ProcessOutput, ProcessError> {
+        // Created before `acl` so unwinding/early returns restore ACLs first,
+        // then remove the command-private temp directory.
+        let _sandbox_temp_guard = SandboxTempGuard(plan.sandbox_temp.clone());
         let mut acl = AclCoordinator::new();
-        for r in plan.read_roots.iter().chain(plan.write_roots.iter()) {
+        // A write root is also readable and therefore appears in both plan
+        // lists. Snapshot/lock every physical root exactly once; preparing the
+        // same root twice would make the coordinator conflict with itself.
+        for r in &acl_roots {
             acl.prepare_root(r)
                 .map_err(|e| ProcessError::SandboxPolicy(format!("ACL prepare: {e}")))?;
         }
@@ -291,10 +298,38 @@ struct AppContainerFsPlan {
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     /// Private per-command temp (never the whole system temp tree).
-    #[cfg(test)]
     sandbox_temp: PathBuf,
     /// Env overrides applied at launch so GetTempPath/%TEMP% lands in `sandbox_temp`.
     env_overrides: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+#[cfg(any(windows, test))]
+fn acl_roots_for_plan(plan: &AppContainerFsPlan) -> Vec<PathBuf> {
+    dedup_paths(
+        plan.read_roots
+            .iter()
+            .chain(plan.write_roots.iter())
+            .cloned()
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+struct SandboxTempGuard(PathBuf);
+
+#[cfg(windows)]
+impl Drop for SandboxTempGuard {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                %error,
+                path = %self.0.display(),
+                "failed to remove AppContainer private temp"
+            );
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -308,18 +343,32 @@ fn is_temp_env_key(name: &str) -> bool {
 /// Private process temp under the system temp dir — a unique subdirectory, never
 /// the whole `temp_dir()` tree (which would authorize sibling canaries).
 #[cfg(any(windows, test))]
-fn private_sandbox_temp(tag: &str, seed: &std::path::Path) -> PathBuf {
+fn private_sandbox_temp(
+    tag: &str,
+    seed: &std::path::Path,
+    temp_root: &std::path::Path,
+) -> Result<PathBuf, ProcessError> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
     let mut h = DefaultHasher::new();
     tag.hash(&mut h);
     seed.hash(&mut h);
-    let p = leveler_core::environment()
-        .temp_dir()
-        .to_path_buf()
-        .join(format!("leveler-ac-{tag}-{:x}", h.finish()));
-    let _ = std::fs::create_dir_all(&p);
-    p
+    let p = temp_root.join(format!(
+        "leveler-ac-{tag}-{:x}-{}-{}",
+        h.finish(),
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&p).map_err(|error| {
+        ProcessError::SandboxPolicy(format!(
+            "create private AppContainer temp {}: {error}",
+            p.display()
+        ))
+    })?;
+    Ok(p)
 }
 
 #[cfg(any(windows, test))]
@@ -340,6 +389,7 @@ fn temp_env_overrides(
 fn plan_for_intent(
     intent: &FilesystemIntent,
     request: &ProcessRequest,
+    temp_root: &std::path::Path,
 ) -> Result<AppContainerFsPlan, ProcessError> {
     match intent {
         FilesystemIntent::Unrestricted => Err(ProcessError::SandboxPolicy(
@@ -357,7 +407,7 @@ fn plan_for_intent(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| request.cwd.clone());
-            let sandbox_temp = private_sandbox_temp("ro", &seed);
+            let sandbox_temp = private_sandbox_temp("ro", &seed, temp_root)?;
             // Workspace stays RX-only (not in write_roots). Private temp is the
             // sole writeable path so GetTempPath/%TEMP% works without opening
             // workspace writes.
@@ -365,7 +415,6 @@ fn plan_for_intent(
             Ok(AppContainerFsPlan {
                 read_roots: dedup_paths(reads),
                 write_roots: dedup_paths(vec![sandbox_temp.clone()]),
-                #[cfg(test)]
                 sandbox_temp: sandbox_temp.clone(),
                 env_overrides: temp_env_overrides(&sandbox_temp),
             })
@@ -374,12 +423,9 @@ fn plan_for_intent(
             write_root,
             extra_read_roots,
         } => {
-            let sandbox_temp = private_sandbox_temp("ww", write_root);
+            let sandbox_temp = private_sandbox_temp("ww", write_root, temp_root)?;
             let mut writes = vec![write_root.clone(), sandbox_temp.clone()];
-            let cache = leveler_core::environment()
-                .temp_dir()
-                .to_path_buf()
-                .join("leveler-tool-cache");
+            let cache = temp_root.join("leveler-tool-cache");
             let _ = std::fs::create_dir_all(&cache);
             writes.push(cache);
 
@@ -388,7 +434,6 @@ fn plan_for_intent(
             Ok(AppContainerFsPlan {
                 read_roots: dedup_paths(reads),
                 write_roots: dedup_paths(writes),
-                #[cfg(test)]
                 sandbox_temp: sandbox_temp.clone(),
                 env_overrides: temp_env_overrides(&sandbox_temp),
             })
@@ -474,11 +519,9 @@ mod tests {
     }
 
     fn sys_tmp_canon() -> PathBuf {
-        leveler_core::environment()
-            .temp_dir()
-            .to_path_buf()
+        std::env::temp_dir()
             .canonicalize()
-            .unwrap_or_else(|_| leveler_core::environment().temp_dir().to_path_buf())
+            .unwrap_or_else(|_| std::env::temp_dir())
     }
 
     fn path_in(list: &[PathBuf], needle: &std::path::Path) -> bool {
@@ -498,7 +541,7 @@ mod tests {
             read_roots: vec![dir.path().to_path_buf()],
         };
         let req = ProcessRequest::new("cmd", vec![], dir.path().to_path_buf());
-        let plan = plan_for_intent(&intent, &req).unwrap();
+        let plan = plan_for_intent(&intent, &req, &std::env::temp_dir()).unwrap();
         // Workspace itself is not a write root.
         let ws = dir
             .path()
@@ -516,6 +559,18 @@ mod tests {
         assert!(
             path_in(&plan.write_roots, &plan.sandbox_temp),
             "sandbox_temp must be write-granted under RO; plan={plan:?}"
+        );
+        let temp = plan
+            .sandbox_temp
+            .canonicalize()
+            .unwrap_or_else(|_| plan.sandbox_temp.clone());
+        let temp_acl_count = acl_roots_for_plan(&plan)
+            .iter()
+            .filter(|path| path.canonicalize().unwrap_or_else(|_| (*path).clone()) == temp)
+            .count();
+        assert_eq!(
+            temp_acl_count, 1,
+            "overlapping read/write roots must be prepared exactly once"
         );
         assert_ne!(
             plan.sandbox_temp
@@ -539,7 +594,7 @@ mod tests {
             extra_read_roots: vec![],
         };
         let req = ProcessRequest::new("cmd", vec![], dir.path().to_path_buf());
-        let plan = plan_for_intent(&intent, &req).unwrap();
+        let plan = plan_for_intent(&intent, &req, &std::env::temp_dir()).unwrap();
         assert!(
             path_in(&plan.write_roots, &plan.sandbox_temp),
             "WW sandbox_temp ∈ write_roots; plan={plan:?}"
@@ -584,7 +639,7 @@ mod tests {
             read_roots: vec![dir.path().to_path_buf()],
         };
         let req = ProcessRequest::new("cmd", vec![], dir.path().to_path_buf());
-        let plan = plan_for_intent(&intent, &req).unwrap();
+        let plan = plan_for_intent(&intent, &req, &std::env::temp_dir()).unwrap();
         let temp_path = plan.sandbox_temp.as_os_str();
         for key in ["TEMP", "TMP", "TMPDIR"] {
             let v = plan
@@ -597,6 +652,20 @@ mod tests {
     }
 
     #[test]
+    fn plan_uses_a_unique_temp_for_each_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent = FilesystemIntent::ReadOnly {
+            read_roots: vec![dir.path().to_path_buf()],
+        };
+        let req = ProcessRequest::new("cmd", vec![], dir.path().to_path_buf());
+        let first = plan_for_intent(&intent, &req, &std::env::temp_dir()).unwrap();
+        let second = plan_for_intent(&intent, &req, &std::env::temp_dir()).unwrap();
+        assert_ne!(first.sandbox_temp, second.sandbox_temp);
+        let _ = std::fs::remove_dir_all(first.sandbox_temp);
+        let _ = std::fs::remove_dir_all(second.sandbox_temp);
+    }
+
+    #[test]
     fn plan_does_not_authorize_unrelated_sibling_temp() {
         let ws = tempfile::tempdir().unwrap();
         let sib = tempfile::tempdir().unwrap();
@@ -604,7 +673,7 @@ mod tests {
             read_roots: vec![ws.path().to_path_buf()],
         };
         let req = ProcessRequest::new("cmd", vec![], ws.path().to_path_buf());
-        let plan = plan_for_intent(&intent, &req).unwrap();
+        let plan = plan_for_intent(&intent, &req, &std::env::temp_dir()).unwrap();
         let sib_c = sib
             .path()
             .canonicalize()
@@ -639,6 +708,14 @@ mod tests {
         use super::*;
         use crate::command::CommandRunner;
         use std::time::Duration;
+
+        fn canary_runner() -> CommandRunner {
+            CommandRunner::with_environment(std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )))
+        }
 
         struct Pair {
             _ws_keep: tempfile::TempDir,
@@ -680,7 +757,7 @@ mod tests {
             );
             req.filesystem_intent = Some(intent.clone());
             req.timeout = Duration::from_secs(30);
-            let out = CommandRunner::new()
+            let out = canary_runner()
                 .run(req, CancellationToken::new())
                 .await
                 .expect("RO read spawn");
@@ -701,7 +778,7 @@ mod tests {
             );
             wreq.filesystem_intent = Some(intent);
             wreq.timeout = Duration::from_secs(30);
-            let wout = CommandRunner::new()
+            let wout = canary_runner()
                 .run(wreq, CancellationToken::new())
                 .await
                 .expect("RO write spawn");
@@ -724,7 +801,7 @@ mod tests {
                 read_roots: vec![pair.ws.clone()],
             };
             let req_probe = ProcessRequest::new("cmd", vec![], pair.ws.clone());
-            let plan = plan_for_intent(&intent, &req_probe).unwrap();
+            let plan = plan_for_intent(&intent, &req_probe, &std::env::temp_dir()).unwrap();
             let sib_c = pair
                 .sibling
                 .canonicalize()
@@ -750,7 +827,7 @@ mod tests {
             );
             req.filesystem_intent = Some(intent);
             req.timeout = Duration::from_secs(30);
-            let out = CommandRunner::new()
+            let out = canary_runner()
                 .run(req, CancellationToken::new())
                 .await
                 .expect("RO sibling spawn");
@@ -770,7 +847,7 @@ mod tests {
                 extra_read_roots: vec![],
             };
             let req_probe = ProcessRequest::new("cmd", vec![], pair.ws.clone());
-            let plan = plan_for_intent(&intent, &req_probe).unwrap();
+            let plan = plan_for_intent(&intent, &req_probe, &std::env::temp_dir()).unwrap();
             let sib_c = pair
                 .sibling
                 .canonicalize()
@@ -793,7 +870,7 @@ mod tests {
             req.filesystem_intent = Some(intent.clone());
             req.write_root = Some(pair.ws.clone());
             req.timeout = Duration::from_secs(30);
-            let out = CommandRunner::new()
+            let out = canary_runner()
                 .run(req, CancellationToken::new())
                 .await
                 .expect("WW write spawn");
@@ -806,38 +883,53 @@ mod tests {
                 out.stderr
             );
 
-            // Per-command temp: child writes via %TEMP% and file lands under plan.sandbox_temp.
+            // Per-command temp: prove the child can write/read through %TEMP%,
+            // that the path is a private child of the host temp root, and that
+            // the host temp root itself was not used as the write target.
             let probe_name = "leveler_temp_probe.txt";
+            let host_probe = std::env::temp_dir().join(probe_name);
+            let _ = std::fs::remove_file(&host_probe);
             let mut treq = ProcessRequest::new(
                 "cmd",
-                vec!["/C".into(), format!("echo temp-ok>%TEMP%\\{probe_name}")],
+                vec![
+                    "/C".into(),
+                    format!(
+                        "echo %TEMP%&& echo temp-ok>%TEMP%\\{probe_name}&& type %TEMP%\\{probe_name}"
+                    ),
+                ],
                 pair.ws.clone(),
             );
             treq.filesystem_intent = Some(intent.clone());
             treq.write_root = Some(pair.ws.clone());
             treq.timeout = Duration::from_secs(30);
-            let tout = CommandRunner::new()
+            let tout = canary_runner()
                 .run(treq, CancellationToken::new())
                 .await
                 .expect("WW %TEMP% spawn");
-            let under_sandbox = plan.sandbox_temp.join(probe_name);
-            let sandbox_content = std::fs::read_to_string(&under_sandbox).unwrap_or_default();
             assert!(
-                sandbox_content.contains("temp-ok"),
-                "%TEMP% write must land under sandbox_temp={:?}; exit={:?} stderr={} host_temp={:?}",
-                plan.sandbox_temp,
+                tout.stdout.contains("temp-ok"),
+                "%TEMP% write/read must succeed; stdout={} exit={:?} stderr={}",
+                tout.stdout,
                 tout.exit_code,
-                tout.stderr,
-                leveler_core::environment()
-                    .temp_dir()
-                    .to_path_buf()
-                    .join(probe_name)
+                tout.stderr
+            );
+            let child_temp = tout
+                .stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| line.to_ascii_lowercase().contains("leveler-ac-"))
+                .expect("child must report its private %TEMP% path");
+            let child_temp = child_temp.to_ascii_lowercase();
+            let host_temp = std::env::temp_dir()
+                .display()
+                .to_string()
+                .trim_end_matches(['\\', '/'])
+                .to_ascii_lowercase();
+            assert!(
+                child_temp.starts_with(&host_temp) && child_temp != host_temp,
+                "child TEMP must be private under host temp: child={child_temp:?} host={host_temp:?}"
             );
             // Must not create the probe at the host system temp root.
-            let host_probe = leveler_core::environment()
-                .temp_dir()
-                .to_path_buf()
-                .join(probe_name);
             let host_pwned = host_probe.exists()
                 && std::fs::read_to_string(&host_probe)
                     .map(|s| s.contains("temp-ok"))
@@ -856,7 +948,7 @@ mod tests {
             sreq.filesystem_intent = Some(intent);
             sreq.write_root = Some(pair.ws.clone());
             sreq.timeout = Duration::from_secs(30);
-            let _ = CommandRunner::new()
+            let _ = canary_runner()
                 .run(sreq, CancellationToken::new())
                 .await
                 .expect("WW sibling spawn");
@@ -868,6 +960,7 @@ mod tests {
                 !sibling_pwned,
                 "sibling write must fail under write-restricted intent"
             );
+            let _ = std::fs::remove_dir_all(plan.sandbox_temp);
         }
 
         #[tokio::test]
@@ -884,7 +977,7 @@ mod tests {
             req.filesystem_intent = Some(intent);
             req.deny_network = true;
             req.timeout = Duration::from_secs(30);
-            let out = CommandRunner::new()
+            let out = canary_runner()
                 .run(req, CancellationToken::new())
                 .await
                 .expect("deny_network AppContainer spawn");
