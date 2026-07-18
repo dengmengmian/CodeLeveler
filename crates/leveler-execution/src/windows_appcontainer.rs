@@ -1019,13 +1019,15 @@ mod tests {
             // the host temp root itself was not used as the write target.
             let probe_name = "leveler_temp_probe.txt";
             let host_probe = std::env::temp_dir().join(probe_name);
+            let temp_report = pair.ws.join("leveler_temp_path.txt");
             let _ = std::fs::remove_file(&host_probe);
             let mut treq = ProcessRequest::new(
                 "cmd",
                 vec![
                     "/C".into(),
                     format!(
-                        "echo %TEMP%&& echo temp-ok>%TEMP%\\{probe_name}&& type %TEMP%\\{probe_name}"
+                        "echo %TEMP%>\"{}\"&& echo temp-ok>\"%TEMP%\\{probe_name}\"&& type \"%TEMP%\\{probe_name}\"",
+                        temp_report.display()
                     ),
                 ],
                 pair.ws.clone(),
@@ -1044,13 +1046,21 @@ mod tests {
                 tout.exit_code,
                 tout.stderr
             );
-            let child_temp = tout
-                .stdout
-                .lines()
-                .map(str::trim)
-                .find(|line| line.to_ascii_lowercase().contains("leveler-ac-"))
-                .expect("child must report its private %TEMP% path");
-            let child_temp = child_temp.to_ascii_lowercase();
+            let child_temp = std::fs::read_to_string(&temp_report)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "child must report private %TEMP% to {}: {error}; stdout={:?} stderr={:?}",
+                        temp_report.display(),
+                        tout.stdout,
+                        tout.stderr
+                    )
+                })
+                .trim()
+                .to_ascii_lowercase();
+            assert!(
+                child_temp.contains("leveler-ac-"),
+                "reported child TEMP must be CodeLeveler's private directory: {child_temp:?}"
+            );
             let host_temp = std::env::temp_dir()
                 .display()
                 .to_string()
