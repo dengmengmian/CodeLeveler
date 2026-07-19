@@ -290,14 +290,19 @@ mod tests {
             .iter()
             .find(|command| command.name == "cargo check (nested-crate)")
             .expect("nested Rust workspace should have a cargo check gate");
+        // Path::join uses `\` on Windows; cargo still accepts it. Do not hardcode `/`.
+        let manifest = std::path::Path::new("nested-crate")
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             check.args,
-            [
-                "check",
-                "--manifest-path",
-                "nested-crate/Cargo.toml",
-                "--workspace",
-                "--quiet"
+            vec![
+                "check".to_string(),
+                "--manifest-path".to_string(),
+                manifest,
+                "--workspace".to_string(),
+                "--quiet".to_string(),
             ]
         );
         assert!(check.gating);
