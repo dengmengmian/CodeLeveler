@@ -325,7 +325,7 @@ fn truncate(s: &str) -> String {
 
 fn find_in_path(program: &str, environment: &leveler_core::EnvSnapshot) -> Option<PathBuf> {
     // An explicit path is used directly.
-    if program.contains('/') {
+    if program.contains('/') || program.contains('\\') {
         let p = PathBuf::from(program);
         return p.is_file().then_some(p);
     }
@@ -335,8 +335,33 @@ fn find_in_path(program: &str, environment: &leveler_core::EnvSnapshot) -> Optio
         if candidate.is_file() {
             return Some(candidate);
         }
+        // Windows executables carry a PATHEXT extension (`cargo` →
+        // `cargo.exe`); without this probe every gate reports ToolMissing.
+        #[cfg(windows)]
+        for ext in pathext_extensions(environment) {
+            let candidate = dir.join(format!("{program}.{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
     }
     None
+}
+
+/// Executable extensions from PATHEXT, without the leading dot, matching how
+/// Windows resolves a bare program name. Falls back to the cmd default set.
+#[cfg(windows)]
+fn pathext_extensions(environment: &leveler_core::EnvSnapshot) -> Vec<String> {
+    let value = environment
+        .var("PATHEXT")
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    value
+        .split(';')
+        .filter_map(|ext| {
+            let ext = ext.trim().trim_start_matches('.').trim();
+            (!ext.is_empty()).then(|| ext.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -629,5 +654,26 @@ mod tests {
             report.verdict(),
             crate::report::Verdict::Unverified(_)
         ));
+    }
+
+    /// Bare program names on Windows resolve via PATHEXT (`gate` → `gate.exe`);
+    /// otherwise every gate would report ToolMissing there.
+    #[cfg(windows)]
+    #[test]
+    fn find_in_path_probes_pathext_extensions() {
+        use std::ffi::OsString;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gate.exe"), b"").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let env = leveler_core::EnvSnapshot::new(
+            vec![
+                (OsString::from("PATH"), path),
+                (OsString::from("PATHEXT"), OsString::from(".COM;.EXE")),
+            ],
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        );
+        assert!(find_in_path("gate", &env).is_some());
+        assert!(find_in_path("missing-gate", &env).is_none());
     }
 }
