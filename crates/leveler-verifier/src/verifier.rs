@@ -329,6 +329,11 @@ fn find_in_path(program: &str, environment: &leveler_core::EnvSnapshot) -> Optio
         let p = PathBuf::from(program);
         return p.is_file().then_some(p);
     }
+    // Windows hosts expose the variable as `Path`; the snapshot keeps the
+    // original casing, so look it up case-insensitively there.
+    #[cfg(windows)]
+    let path = environment.var_os_case_insensitive("PATH")?;
+    #[cfg(not(windows))]
     let path = environment.var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(program);
@@ -353,7 +358,8 @@ fn find_in_path(program: &str, environment: &leveler_core::EnvSnapshot) -> Optio
 #[cfg(windows)]
 fn pathext_extensions(environment: &leveler_core::EnvSnapshot) -> Vec<String> {
     let value = environment
-        .var("PATHEXT")
+        .var_os_case_insensitive("PATHEXT")
+        .and_then(|v| v.into_string().ok())
         .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
     value
         .split(';')
@@ -656,8 +662,8 @@ mod tests {
         ));
     }
 
-    /// Bare program names on Windows resolve via PATHEXT (`gate` → `gate.exe`);
-    /// otherwise every gate would report ToolMissing there.
+    /// Bare program names on Windows resolve via PATHEXT (`gate` → `gate.exe`),
+    /// and the path variable arrives as `Path` — not `PATH` — on real hosts.
     #[cfg(windows)]
     #[test]
     fn find_in_path_probes_pathext_extensions() {
@@ -667,7 +673,7 @@ mod tests {
         let path = std::env::join_paths([dir.path()]).unwrap();
         let env = leveler_core::EnvSnapshot::new(
             vec![
-                (OsString::from("PATH"), path),
+                (OsString::from("Path"), path),
                 (OsString::from("PATHEXT"), OsString::from(".COM;.EXE")),
             ],
             std::env::current_dir().unwrap_or_default(),
