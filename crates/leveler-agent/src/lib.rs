@@ -19,6 +19,7 @@ mod sub_agent;
 
 pub use compaction::{
     COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages, estimate_tokens,
+    summarize_with_model,
 };
 pub use executor::{
     AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,

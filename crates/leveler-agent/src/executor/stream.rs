@@ -1,11 +1,41 @@
+use std::time::Duration;
+
 use tokio_util::sync::CancellationToken;
 
-use leveler_model::{
-    ContentPart, Message, ModelError, ModelRequest, Role, TokenUsage, ToolCall, ToolChoice,
-};
+use leveler_model::{ContentPart, Message, ModelError, ModelRequest, Role, TokenUsage, ToolCall};
 
-use super::{ADVISORY_REQUEST_TIMEOUT, AgentError, AgentEvent, Executor, StreamRoundResult};
-use crate::compaction::{COMPACT_PROMPT, compaction_span};
+use super::{AgentError, AgentEvent, Executor, StreamRoundResult};
+
+/// Delay before retrying a failed model round. `attempt` is the 1-based count
+/// of failures so far.
+///
+/// Rate limits clear on second scales: a provider-advertised `Retry-After`
+/// wins (capped), otherwise exponential seconds. Transient stream/transport
+/// drops usually recover immediately, so they keep fast sub-second retries.
+pub(crate) fn retry_backoff_delay(error: &ModelError, attempt: u32) -> Duration {
+    const MAX_ADVERTISED: Duration = Duration::from_secs(120);
+    const MAX_RATE_LIMIT: Duration = Duration::from_secs(30);
+    if let Some(ms) = error.retry_after_ms {
+        return Duration::from_millis(ms).min(MAX_ADVERTISED);
+    }
+    match error.kind {
+        leveler_model::ModelErrorKind::RateLimit => {
+            let exp = 1u64 << attempt.saturating_sub(1).min(6);
+            Duration::from_secs(exp).min(MAX_RATE_LIMIT)
+        }
+        _ => Duration::from_millis(200 * attempt.min(10) as u64),
+    }
+}
+
+/// Cheap ±0–20% jitter (no `rand` dependency) so N concurrent turns hitting
+/// the same rate limit do not retry in lockstep.
+fn jittered(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as u64;
+    base + base.mul_f64((nanos % 200) as f64 / 1000.0)
+}
 
 impl Executor {
     /// Run one model round over a stream and assemble the final assistant
@@ -22,7 +52,7 @@ impl Executor {
         observer: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<StreamRoundResult, AgentError> {
-        const MAX_ATTEMPTS: u32 = 3;
+        const MAX_ATTEMPTS: u32 = 5;
         let mut attempt = 0u32;
         let started = std::time::Instant::now();
         loop {
@@ -40,8 +70,14 @@ impl Executor {
                 Err(AgentError::Model(e))
                     if e.retryable && attempt < MAX_ATTEMPTS && !cancellation.is_cancelled() =>
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
-                        .await;
+                    let wait = jittered(retry_backoff_delay(&e, attempt));
+                    // Cancellable: a user Ctrl+C during a long rate-limit wait
+                    // must not hang until the timer fires.
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -182,23 +218,66 @@ impl Executor {
         keep_recent: usize,
         cancellation: &CancellationToken,
     ) -> Option<String> {
-        let (_, tail_start) = compaction_span(messages, keep_recent)?;
-        let mut summary_messages = messages[..tail_start].to_vec();
-        summary_messages.push(Message::text(Role::User, COMPACT_PROMPT));
-
-        let mut request = ModelRequest::new(self.model.clone(), summary_messages);
-        request.tool_choice = ToolChoice::None;
-        request.max_output_tokens = Some(1024);
-        request.reasoning_effort = self.reasoning_effort;
-
-        let response = tokio::time::timeout(
-            ADVISORY_REQUEST_TIMEOUT,
-            self.runtime.generate(request, cancellation.child_token()),
+        crate::compaction::summarize_with_model(
+            self.runtime.as_ref(),
+            &self.model,
+            self.reasoning_effort,
+            messages,
+            keep_recent,
+            cancellation,
         )
         .await
-        .ok()?
-        .ok()?;
-        let text = response.message.text_content().trim().to_string();
-        (!text.is_empty()).then_some(text)
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    use leveler_model::ModelErrorKind;
+
+    fn err(kind: ModelErrorKind) -> ModelError {
+        ModelError::new(kind, "x")
+    }
+
+    #[test]
+    fn rate_limit_backs_off_in_seconds_not_milliseconds() {
+        // 200ms after a 429 is a guaranteed second 429; rate limits clear on
+        // second scales.
+        let d1 = retry_backoff_delay(&err(ModelErrorKind::RateLimit), 1);
+        let d2 = retry_backoff_delay(&err(ModelErrorKind::RateLimit), 2);
+        assert!(d1 >= Duration::from_secs(1), "attempt 1: {d1:?}");
+        assert!(d2 >= d1 * 2, "attempt 2 must grow exponentially: {d2:?}");
+    }
+
+    #[test]
+    fn rate_limit_honors_provider_advertised_delay() {
+        let e = err(ModelErrorKind::RateLimit).with_retry_after_ms(5_000);
+        assert_eq!(retry_backoff_delay(&e, 1), Duration::from_secs(5));
+        // …but a hostile/buggy value is capped.
+        let e = err(ModelErrorKind::RateLimit).with_retry_after_ms(3_600_000);
+        assert!(retry_backoff_delay(&e, 1) <= Duration::from_secs(120));
+    }
+
+    #[test]
+    fn transient_stream_errors_keep_fast_retries() {
+        // A dropped stream is usually recoverable immediately; seconds-scale
+        // waits would add pure latency.
+        for kind in [
+            ModelErrorKind::StreamInterrupted,
+            ModelErrorKind::Transport,
+            ModelErrorKind::Timeout,
+        ] {
+            let d = retry_backoff_delay(&err(kind), 1);
+            assert!(
+                d <= Duration::from_millis(500),
+                "{kind:?} attempt 1 should stay fast: {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_backoff_is_capped() {
+        let d = retry_backoff_delay(&err(ModelErrorKind::RateLimit), 10);
+        assert!(d <= Duration::from_secs(30), "uncapped: {d:?}");
     }
 }

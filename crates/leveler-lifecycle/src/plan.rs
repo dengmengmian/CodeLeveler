@@ -130,16 +130,27 @@ impl PlanState {
         if previous.is_empty() {
             return Ok(());
         }
-        for next_step in &next.steps {
+        // A step may go straight pending → completed (finishing the current
+        // step in one shot is normal, not a skip). The only real skip is
+        // completing a step while an EARLIER step in the list is still
+        // unfinished — that jumps ahead of outstanding work.
+        for (i, next_step) in next.steps.iter().enumerate() {
             if next_step.status != "completed" {
                 continue;
             }
-            if let Some(prev) = previous.steps.iter().find(|p| p.step == next_step.step)
-                && prev.status == "pending"
-            {
+            let was_pending = previous
+                .steps
+                .iter()
+                .find(|p| p.step == next_step.step)
+                .is_some_and(|p| p.status == "pending");
+            if !was_pending {
+                continue;
+            }
+            let earlier_all_completed = next.steps[..i].iter().all(|s| s.status == "completed");
+            if !earlier_all_completed {
                 return Err(format!(
-                    "plan step \"{}\" cannot jump from pending to completed; \
-                     mark it in_progress first, then complete it",
+                    "plan step \"{}\" cannot be completed while an earlier step is \
+                     still unfinished; complete the steps in order",
                     next_step.step
                 ));
             }
@@ -234,38 +245,37 @@ mod tests {
         assert!(!plan.has_incomplete_model_todos());
     }
 
+    fn step(name: &str, status: &str) -> PlanStep {
+        PlanStep {
+            step: name.into(),
+            status: status.into(),
+            id: None,
+            origin: PlanOrigin::ModelExplicit,
+        }
+    }
+
     #[test]
-    fn rejects_pending_to_completed_skip() {
-        let prev = PlanState::from_model_explicit(vec![
-            PlanStep {
-                step: "a".into(),
-                status: "pending".into(),
-                id: None,
-                origin: PlanOrigin::ModelExplicit,
-            },
-            PlanStep {
-                step: "b".into(),
-                status: "in_progress".into(),
-                id: None,
-                origin: PlanOrigin::ModelExplicit,
-            },
-        ])
-        .unwrap();
-        let next = PlanState::from_model_explicit(vec![
-            PlanStep {
-                step: "a".into(),
-                status: "completed".into(),
-                id: None,
-                origin: PlanOrigin::ModelExplicit,
-            },
-            PlanStep {
-                step: "b".into(),
-                status: "in_progress".into(),
-                id: None,
-                origin: PlanOrigin::ModelExplicit,
-            },
-        ])
-        .unwrap();
+    fn allows_completing_the_current_step_directly() {
+        // Finishing the first outstanding step in one shot (pending → completed
+        // without a separate in_progress hop) is normal, not a skip — the model
+        // shouldn't be forced through a two-step ritual it finds unnatural.
+        let prev = PlanState::from_model_explicit(vec![step("a", "pending"), step("b", "pending")])
+            .unwrap();
+        let next =
+            PlanState::from_model_explicit(vec![step("a", "completed"), step("b", "pending")])
+                .unwrap();
+        assert!(PlanState::validate_no_skip_complete(&prev, &next).is_ok());
+    }
+
+    #[test]
+    fn rejects_completing_a_step_before_an_earlier_unfinished_one() {
+        // Completing `b` while `a` (earlier in the list) is still unfinished is
+        // a real skip — that stays rejected.
+        let prev = PlanState::from_model_explicit(vec![step("a", "pending"), step("b", "pending")])
+            .unwrap();
+        let next =
+            PlanState::from_model_explicit(vec![step("a", "pending"), step("b", "completed")])
+                .unwrap();
         assert!(PlanState::validate_no_skip_complete(&prev, &next).is_err());
     }
 }

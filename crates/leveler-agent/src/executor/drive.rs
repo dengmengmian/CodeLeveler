@@ -161,6 +161,8 @@ impl Executor {
         // the same answer a bounded number of times; truncated tool calls are
         // never safe to execute and fail immediately below.
         let mut length_continuations = 0u32;
+        // One-shot "actually answer" nudge for a non-goal turn ending empty.
+        let mut empty_answer_nudged = false;
         let mut continued_text = String::new();
         const MAX_LENGTH_CONTINUATIONS: u32 = 2;
         let mut had_tool_calls = false;
@@ -439,7 +441,18 @@ impl Executor {
                 retry_count: stream_result.retry_count,
             })
             .await?;
-            model_tokens_spent = model_tokens_spent.saturating_add(stream_result.usage.total());
+            // Zero-usage gateways must not disable the token budget: fall back
+            // to the transcript estimate (same fallback compaction uses), so
+            // `max_model_tokens` still binds. Estimated spend is per-round
+            // request + response, mirroring what the provider actually bills.
+            let round_tokens = if stream_result.usage.total() > 0 {
+                stream_result.usage.total()
+            } else {
+                estimate_tokens(&messages).saturating_add(estimate_tokens(std::slice::from_ref(
+                    &stream_result.message,
+                )))
+            };
+            model_tokens_spent = model_tokens_spent.saturating_add(round_tokens);
             if let Some(pricing) = self.pricing {
                 cost_spent_micros = cost_spent_micros.saturating_add(pricing.cost_usd_micros(
                     stream_result.usage.input_tokens,
@@ -494,10 +507,29 @@ impl Executor {
             match finish_reason {
                 FinishReason::Length => {
                     if !calls.is_empty() {
-                        return Err(AgentError::Model(ModelError::new(
-                            leveler_model::ModelErrorKind::Truncated,
-                            "model output ended at the token limit while producing a tool call; the call was not executed",
-                        )));
+                        // The call is incomplete and must never execute; but a
+                        // too-large tool call deserves the same bounded second
+                        // chance text truncation gets — nudge for a smaller
+                        // re-issue instead of killing the whole turn.
+                        if length_continuations >= MAX_LENGTH_CONTINUATIONS
+                            || !has_next_round
+                            || cancellation.is_cancelled()
+                        {
+                            return Err(AgentError::Model(ModelError::new(
+                                leveler_model::ModelErrorKind::Truncated,
+                                "model output ended at the token limit while producing a tool call; the call was not executed",
+                            )));
+                        }
+                        length_continuations += 1;
+                        let feedback = Message::text(
+                            Role::User,
+                            "Your output hit the token limit while emitting a tool call — the \
+                             call was NOT executed. Re-issue it smaller: split a large patch \
+                             into several apply_patch calls, or shorten the arguments.",
+                        );
+                        sink.append(std::slice::from_ref(&feedback)).await?;
+                        messages.push(feedback);
+                        continue;
                     }
                     if text.trim().is_empty()
                         || length_continuations >= MAX_LENGTH_CONTINUATIONS
@@ -532,16 +564,36 @@ impl Executor {
                     )));
                 }
                 FinishReason::ToolCalls if calls.is_empty() => {
+                    // Provider/gateway glitch (a dropped tool-call fragment),
+                    // not a model mistake: bounded feedback retry, same budget
+                    // as parameter-level decode failures.
+                    if decode_retries < MAX_DECODE_RETRIES
+                        && has_next_round
+                        && !cancellation.is_cancelled()
+                    {
+                        decode_retries += 1;
+                        let feedback = Message::text(
+                            Role::User,
+                            "Your last response declared a tool call but no complete call \
+                             arrived (it was likely cut off in transit). Re-issue the tool \
+                             call in full.",
+                        );
+                        sink.append(std::slice::from_ref(&feedback)).await?;
+                        messages.push(feedback);
+                        continue;
+                    }
                     return Err(AgentError::Model(ModelError::new(
                         leveler_model::ModelErrorKind::Decode,
                         "provider reported tool_calls but supplied no complete tool call",
                     )));
                 }
                 FinishReason::Stop if !calls.is_empty() => {
-                    return Err(AgentError::Model(ModelError::new(
-                        leveler_model::ModelErrorKind::Decode,
-                        "provider supplied tool calls with an incompatible stop finish reason",
-                    )));
+                    // Some OpenAI-compatible gateways finish tool-call rounds
+                    // with `stop`. The calls are complete — execute them.
+                    tracing::warn!(
+                        "provider sent complete tool calls with finish_reason=stop; \
+                         treating as tool_calls"
+                    );
                 }
                 FinishReason::Stop | FinishReason::ToolCalls => {}
             }
@@ -614,6 +666,26 @@ impl Executor {
                             text: goal_resolve_nudge(&original_task),
                         }],
                     });
+                    continue;
+                }
+                // Non-goal turn ending with an empty answer: nudge once for
+                // the actual answer. `Answered("")` is indistinguishable from
+                // a silent failure for the caller. (Goal mode is covered by
+                // the quiet-nudge/Stalled path above.)
+                if !self.goal_mode
+                    && last_text.trim().is_empty()
+                    && !empty_answer_nudged
+                    && has_next_round
+                    && !cancellation.is_cancelled()
+                {
+                    empty_answer_nudged = true;
+                    metrics.extra_model_calls += 1;
+                    sink.append(&[assistant]).await?;
+                    messages.push(Message::text(
+                        Role::User,
+                        "Your last message was empty. Reply with the actual answer to the \
+                         request — do not send an empty message.",
+                    ));
                     continue;
                 }
                 // Completion-evidence gate (spec §17): refuse the first
@@ -756,10 +828,19 @@ impl Executor {
             let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
             // spawn_agent calls deferred to run concurrently after this pass.
             let mut spawn_jobs: Vec<(usize, ToolCall)> = Vec::new();
-            // Pure-observe refused this round after a completed plan.
-            let mut closeout_observe_denied_this_round = false;
             observe_only_tools_this_round = 0;
             non_observe_success_this_round = 0;
+            // Calls a guard refused before they ran (loop guard, plan gate,
+            // budgets, allowlist, permission). A round consisting solely of
+            // refusals is no progress — it must not reset the AC3 streak.
+            let mut denied_calls_this_round: usize = 0;
+            // User cancel observed inside this batch. The batch stops, but the
+            // round is still committed (results + spend) before Cancelled
+            // surfaces — completed tools' side effects are already on disk.
+            let mut cancelled_mid_batch = false;
+            // Ids/names survive the consuming loop below so calls the cancel
+            // cut short can still be refused in place (transcript pairing).
+            let call_snapshot: Vec<ToolCall> = calls.clone();
 
             for (index, call) in calls.into_iter().enumerate() {
                 // Complex tasks must register a structured plan before mutation.
@@ -790,6 +871,7 @@ impl Executor {
                              and remaining steps pending before any further tools."
                                 .to_string()
                         };
+                        denied_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
                     }
@@ -806,6 +888,7 @@ impl Executor {
                              instead of searching again.",
                             self.max_search_calls_per_step
                         );
+                        denied_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
                     }
@@ -1092,6 +1175,7 @@ impl Executor {
                              this path ({sources}). They will be injected as system rules on \
                              the next model step; review them, then retry the edit."
                         );
+                        denied_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
                     }
@@ -1104,12 +1188,12 @@ impl Executor {
                 if progress.should_refuse_observe_in_closing()
                     && is_pure_observe_call(&call.name, &call.arguments)
                 {
-                    closeout_observe_denied_this_round = true;
                     observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
                     let msg = "Plan steps are complete. Do not re-check git status, \
                          re-list files, or re-audit prior questions — reply with a \
                          final summary only and stop calling tools."
                         .to_string();
+                    denied_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -1130,6 +1214,7 @@ impl Executor {
                          another action.",
                         call.name, LOOP_GUARD_THRESHOLD
                     );
+                    denied_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -1166,6 +1251,7 @@ impl Executor {
                 if let Some(which) = over_budget {
                     let msg = format!("Refused: {which}. The run stops here.");
                     budget_exceeded = Some(format!("Stopped: {which}."));
+                    denied_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -1183,6 +1269,7 @@ impl Executor {
                             outside.join(", "),
                             allow.join(", ")
                         );
+                        denied_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
                     }
@@ -1253,17 +1340,29 @@ impl Executor {
                             let (content, is_error, image, workspace_snapshot, plan) = self
                                 .dispatch(&call, ctx, &mut modified_files, &cancellation)
                                 .await;
+                            // Cancel during a long tool must stop the batch — do not
+                            // keep running subsequent tools after the user hit Ctrl+C.
+                            // This call's own result still flows through: it ran, so
+                            // its outcome and spend must reach the transcript/ledger.
+                            if cancellation.is_cancelled()
+                                && !deadline_expired.load(Ordering::Acquire)
+                            {
+                                cancelled_mid_batch = true;
+                            }
                             let newly = newly_modified_paths(&files_before, &modified_files);
                             (content, is_error, image, workspace_snapshot, plan, newly)
                         }
-                        Err(reason) => (
-                            format!("action not permitted: {reason}"),
-                            true,
-                            None,
-                            None,
-                            None,
-                            Vec::new(),
-                        ),
+                        Err(reason) => {
+                            denied_calls_this_round += 1;
+                            (
+                                format!("action not permitted: {reason}"),
+                                true,
+                                None,
+                                None,
+                                None,
+                                Vec::new(),
+                            )
+                        }
                     };
                 if let Some(snapshot) = workspace_snapshot {
                     observer(AgentEvent::WorkspaceSnapshot {
@@ -1383,12 +1482,15 @@ impl Executor {
                         is_error,
                     },
                 });
+                if cancelled_mid_batch {
+                    break;
+                }
             }
 
             // Run the deferred read-only tools concurrently, then fold their
             // results back into their original call slots so the transcript
             // stays in call order regardless of completion order.
-            if !parallel_jobs.is_empty() {
+            if !parallel_jobs.is_empty() && !cancelled_mid_batch {
                 use futures::stream::{FuturesUnordered, StreamExt};
                 let cancellation_ref = &cancellation;
                 // Leveling knob: bound how many of the batch actually overlap
@@ -1483,7 +1585,7 @@ impl Executor {
             // spawn_agent calls in one round run in parallel, bounded by
             // max_concurrent_agents. Each sub-agent's result folds into its call
             // slot; start/finish bubbles to the observer for the UI.
-            if !spawn_jobs.is_empty() {
+            if !spawn_jobs.is_empty() && !cancelled_mid_batch {
                 use futures::stream::{FuturesUnordered, StreamExt};
                 let sem = Arc::new(tokio::sync::Semaphore::new(
                     self.max_concurrent_agents.max(1),
@@ -1682,7 +1784,23 @@ impl Executor {
                     ledger: progress.clone(),
                 });
                 if cancellation.is_cancelled() && !deadline_expired.load(Ordering::Acquire) {
-                    return Err(AgentError::Cancelled);
+                    // All sub-agent results are folded in by now; commit them
+                    // with the round below before surfacing Cancelled.
+                    cancelled_mid_batch = true;
+                }
+            }
+
+            // Cancel cut the batch short: refuse every remaining call in place
+            // so each tool_use still gets a paired result in the transcript.
+            if cancelled_mid_batch {
+                for (index, slot) in results.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        *slot = Some(deny_call(
+                            observer,
+                            call_snapshot[index].clone(),
+                            "cancelled by the user before this call ran".to_string(),
+                        ));
+                    }
                 }
             }
 
@@ -1715,27 +1833,54 @@ impl Executor {
                 ledger: progress.clone(),
             });
             sink.append(&[assistant, tool_message]).await?;
+            // Batch was cancelled: the round is durable (results paired, spend
+            // flushed above) — exit now instead of starting another model round.
+            if cancelled_mid_batch {
+                return Err(AgentError::Cancelled);
+            }
 
             // Progress assess: closeout thrash + pure-observe no-progress streaks.
             if plan_state.is_fully_completed() {
                 progress.enter_closing();
             }
-            let pure_observe_round = closeout_observe_denied_this_round
-                || (observe_only_tools_this_round > 0
-                    && non_observe_success_this_round == 0
-                    && !verification_ran);
-            if closeout_observe_denied_this_round {
+            // A round that ran or attempted a SUBSTANTIVE tool — anything but
+            // plan/goal bookkeeping. Marking the plan complete is not itself
+            // thrash; re-running builds/tests/curl or re-observing after it is.
+            let substantive_round = call_snapshot.iter().any(|c| !is_bookkeeping_tool(&c.name));
+            let pure_observe_round = observe_only_tools_this_round > 0
+                && non_observe_success_this_round == 0
+                && !verification_ran;
+            if progress.closing && substantive_round {
+                // Plan complete, but the model kept doing substantive work
+                // (re-running builds/tests/curl, or re-inspecting files). That
+                // is redundant closeout thrash, not new progress — it is what
+                // makes a finished task look like an endless "re-audit" loop.
+                // Count it, nudge for a final summary, and after the cap stop
+                // as Answered: plan complete means the task is done, so verify
+                // (not an Incomplete/failure verdict) decides pass/fail. This
+                // also catches execute-class thrash, which observe-only guards
+                // never could.
                 progress.note_closeout_deny_round();
                 observer(AgentEvent::ProgressUpdated {
                     ledger: progress.clone(),
                 });
+                if !post_plan_closeout_nudged {
+                    post_plan_closeout_nudged = true;
+                    messages.push(Message::text(
+                        Role::User,
+                        "The plan is complete. Your next message must be the final \
+                         summary only — do not run more builds/tests/commands and do \
+                         not re-inspect files; the work is done."
+                            .to_string(),
+                    ));
+                }
                 if progress.should_hard_stop_closeout(progress_caps) {
                     progress.enter_terminal();
                     observer(AgentEvent::ProgressUpdated {
                         ledger: progress.clone(),
                     });
                     let final_text = if last_text.trim().is_empty() {
-                        "Stopped: plan complete; refused further observe-only thrash.".to_string()
+                        "Stopped: plan complete; ended redundant re-verification.".to_string()
                     } else {
                         last_text.clone()
                     };
@@ -1761,23 +1906,16 @@ impl Executor {
                         final_text,
                         rounds: round,
                         modified_files,
-                        // Not Answered/Completed — thrash is incomplete progress.
-                        stop_reason: StopReason::Incomplete,
+                        // Plan complete = the task is done; verify decides
+                        // pass/fail. Incomplete here would misreport success.
+                        stop_reason: StopReason::Answered,
                         stop_detail: Some(
-                            "plan complete; observe thrash short-circuited".to_string(),
+                            "plan complete; stopped redundant closeout work".to_string(),
                         ),
                         metrics: metrics.clone(),
                         progress: progress.clone(),
                         objective: objective.clone(),
                     });
-                }
-                if !post_plan_closeout_nudged {
-                    post_plan_closeout_nudged = true;
-                    messages.push(Message::text(
-                        Role::User,
-                        "Plan steps are complete. Your next message must be the final                          summary only — do not call tools, do not re-run git status, and                          do not reopen earlier questions."
-                            .to_string(),
-                    ));
                 }
             } else if pure_observe_round {
                 // Only count as thrash when observe output is *repeated*
@@ -1848,6 +1986,72 @@ impl Executor {
                             objective: objective.clone(),
                         });
                     }
+                }
+            } else if !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len() {
+                // Every call this round was refused before it ran — that is
+                // not progress. Feed the AC3 streak so an UntilTerminal run
+                // cannot spin forever re-issuing guarded actions. (Rounds with
+                // executed-but-failed tools still count as progress: the model
+                // is iterating on real results, and identical failures are
+                // caught by the loop guard above.)
+                progress.note_no_progress_round(round);
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+                if !no_progress_nudge_sent {
+                    no_progress_nudge_sent = true;
+                    messages.push(Message::text(
+                        Role::User,
+                        format!(
+                            "Every action you attempted this round was refused. Re-read the \
+                             refusal reasons and the active objective:\n\
+                             <objective>\n{original_task}\n</objective>\n\
+                             Do something different, or give the final answer and stop \
+                             calling tools."
+                        ),
+                    ));
+                }
+                if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
+                    progress.enter_terminal();
+                    observer(AgentEvent::ProgressUpdated {
+                        ledger: progress.clone(),
+                    });
+                    let final_text = if last_text.trim().is_empty() {
+                        "Stopped: no progress (every attempted action was refused).".to_string()
+                    } else {
+                        last_text.clone()
+                    };
+                    observer(AgentEvent::Finished(final_text.clone()));
+                    sync_epoch_progress(
+                        &mut progress,
+                        &mut metrics,
+                        epoch_rounds_at_start,
+                        epoch_tokens_at_start,
+                        epoch_duration_at_start,
+                        run_started,
+                        round,
+                        model_tokens_spent,
+                        commands_run,
+                        cost_spent_micros,
+                        &modified_files,
+                    );
+                    observer(AgentEvent::ProgressUpdated {
+                        ledger: progress.clone(),
+                    });
+
+                    return Ok(AgentOutcome {
+                        final_text,
+                        rounds: round,
+                        modified_files,
+                        // Not Answered/Completed — refusals are incomplete progress.
+                        stop_reason: StopReason::Incomplete,
+                        stop_detail: Some(
+                            "no-progress streak; all-refused rounds short-circuited".to_string(),
+                        ),
+                        metrics: metrics.clone(),
+                        progress: progress.clone(),
+                        objective: objective.clone(),
+                    });
                 }
             } else {
                 // Successful non-observe work resets the streak.
@@ -2155,6 +2359,13 @@ fn projected_epoch_file_count(
     drive_files: &[String],
 ) -> usize {
     epoch_modified_paths(progress, drive_files).len()
+}
+
+/// Pure state-marking tools that do no external work (plan/goal/step
+/// bookkeeping). Calling one is never itself closeout thrash — re-running
+/// substantive tools after the plan is complete is.
+fn is_bookkeeping_tool(name: &str) -> bool {
+    matches!(name, "update_plan" | UPDATE_GOAL_TOOL | COMPLETE_STEP_TOOL)
 }
 
 /// Epoch + this-drive distinct modified paths (source of truth for residual).

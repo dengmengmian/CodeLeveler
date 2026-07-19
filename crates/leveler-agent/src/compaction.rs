@@ -184,25 +184,100 @@ pub fn compact_messages(
     out
 }
 
-/// Coarse token estimate (~4 chars/token) over a transcript's textual content.
-/// A fallback for providers/gateways that don't report streaming usage, so
-/// auto-compaction still triggers on a growing conversation.
+/// Ask `runtime` for a compaction handoff briefing over the middle the fold
+/// is about to elide. Returns `None` when there is nothing to fold or the
+/// call fails/times out — callers then fold with a bare breadcrumb, which
+/// still beats overflowing the window (and the loss stays explicit).
+pub async fn summarize_with_model(
+    runtime: &dyn leveler_model::ModelRuntime,
+    model: &leveler_model::ModelRef,
+    reasoning_effort: Option<leveler_model::ReasoningEffort>,
+    messages: &[Message],
+    keep_recent: usize,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Option<String> {
+    // Advisory call: never let a slow summarizer stall the main loop.
+    const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let (_, tail_start) = compaction_span(messages, keep_recent)?;
+    let mut summary_messages = messages[..tail_start].to_vec();
+    summary_messages.push(Message::text(Role::User, COMPACT_PROMPT));
+
+    let mut request = leveler_model::ModelRequest::new(model.clone(), summary_messages);
+    request.tool_choice = leveler_model::ToolChoice::None;
+    request.max_output_tokens = Some(1024);
+    request.reasoning_effort = reasoning_effort;
+
+    let response = tokio::time::timeout(
+        SUMMARY_TIMEOUT,
+        runtime.generate(request, cancellation.child_token()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let text = response.message.text_content().trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Coarse token estimate over a transcript's textual content. A fallback for
+/// providers/gateways that don't report streaming usage, so auto-compaction
+/// still triggers on a growing conversation.
+///
+/// ASCII averages ~4 bytes/token; CJK and other non-ASCII text spends ~1 token
+/// per character (~3 UTF-8 bytes), so those bytes are weighted at 3 bytes/token
+/// — a flat ÷4 under-counts Chinese-heavy transcripts by ~25% and fires
+/// compaction only after the request already exceeds the provider window.
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
-    // A conservative flat cost (in char-equivalents, ÷4 below) for one image, so
-    // a vision turn isn't counted as ~free. Real vision billing is tile-based and
-    // model-specific; ~1000 tokens/image is a safe floor that keeps compaction
-    // firing on image-heavy conversations when the gateway reports no usage.
-    const IMAGE_CHAR_EQUIV: usize = 4096;
-    let chars: usize = messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .map(|part| match part {
-            ContentPart::Text { text } => text.len(),
-            ContentPart::ToolCall { call } => call.name.len() + call.arguments.to_string().len(),
-            ContentPart::ToolResult { result } => result.content.len(),
-            ContentPart::Image { .. } => IMAGE_CHAR_EQUIV,
-            _ => 0,
-        })
-        .sum();
-    (chars / 4) as u64
+    // A conservative flat cost (in ASCII byte-equivalents, ÷4 below) for one
+    // image, so a vision turn isn't counted as ~free. Real vision billing is
+    // tile-based and model-specific; ~1000 tokens/image is a safe floor that
+    // keeps compaction firing on image-heavy conversations when the gateway
+    // reports no usage.
+    const IMAGE_BYTE_EQUIV: u64 = 4096;
+    let mut ascii_bytes: u64 = 0;
+    let mut wide_bytes: u64 = 0;
+    let mut flat: u64 = 0;
+    let mut count = |s: &str| {
+        let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
+        ascii_bytes += ascii;
+        wide_bytes += s.len() as u64 - ascii;
+    };
+    for part in messages.iter().flat_map(|m| &m.content) {
+        match part {
+            ContentPart::Text { text } => count(text),
+            ContentPart::ToolCall { call } => {
+                count(&call.name);
+                count(&call.arguments.to_string());
+            }
+            ContentPart::ToolResult { result } => count(&result.content),
+            ContentPart::Image { .. } => flat += IMAGE_BYTE_EQUIV / 4,
+            _ => {}
+        }
+    }
+    ascii_bytes / 4 + wide_bytes / 3 + flat
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+    use leveler_model::Role;
+
+    #[test]
+    fn cjk_text_is_not_underestimated() {
+        // Common tokenizers spend ~1 token per CJK char. Plain bytes/4 counts a
+        // 3-byte char as 0.75 tokens, so Chinese-heavy transcripts trigger
+        // compaction too late and slam into the provider context limit.
+        let messages = vec![Message::text(Role::User, "修".repeat(1000))];
+        let est = estimate_tokens(&messages);
+        assert!(est >= 950, "CJK estimate too low ({est} for 1000 chars)");
+    }
+
+    #[test]
+    fn ascii_text_stays_at_a_quarter_byte_per_token() {
+        let messages = vec![Message::text(Role::User, "a".repeat(1000))];
+        let est = estimate_tokens(&messages);
+        assert!(
+            (200..=300).contains(&est),
+            "ASCII estimate drifted from ~len/4: {est}"
+        );
+    }
 }

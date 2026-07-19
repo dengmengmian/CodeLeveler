@@ -80,8 +80,12 @@ pub(crate) async fn send_with_retry(
                     return Ok(response);
                 }
                 let code = status.as_u16();
+                let retry_after = parse_retry_after(response.headers());
                 let text = response.text().await.unwrap_or_default();
-                let err = ModelError::from_status(code, truncate(&text, 500));
+                let mut err = ModelError::from_status(code, truncate(&text, 500));
+                if let Some(ms) = retry_after {
+                    err = err.with_retry_after_ms(ms);
+                }
                 if !err.retryable {
                     return Err(err);
                 }
@@ -102,17 +106,41 @@ pub(crate) async fn send_with_retry(
             }
         }
 
-        // Backoff before the next attempt, cancellable.
+        // Backoff before the next attempt, cancellable. A provider-advertised
+        // Retry-After overrides the exponential schedule — retrying a rate
+        // limit sooner than told just burns the next attempt on another 429.
+        let wait = last_error
+            .as_ref()
+            .and_then(|e| e.retry_after_ms)
+            .map(|ms| Duration::from_millis(ms).min(MAX_RETRY_AFTER))
+            .unwrap_or(backoff);
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ModelError::cancelled()),
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(wait) => {}
         }
         backoff = (backoff * 2).min(max_backoff);
     }
 
     Err(last_error
         .unwrap_or_else(|| ModelError::new(ModelErrorKind::Other, "request failed with no error")))
+}
+
+/// Hard cap on a provider-advertised wait so a hostile/buggy `Retry-After`
+/// cannot park the turn for minutes.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// Parse `Retry-After` as delay-seconds into milliseconds. The HTTP-date form
+/// is rare on LLM gateways and is ignored (falls back to exponential backoff).
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| secs.saturating_mul(1000))
 }
 
 /// Provider-level retries are the owner of request-start failures. Once they

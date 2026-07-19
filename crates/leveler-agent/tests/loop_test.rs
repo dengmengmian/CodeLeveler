@@ -506,7 +506,7 @@ async fn auto_reviewer_can_deny_before_user_approval() {
         assistant_tool_call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "git", "args": ["push", "origin", "main"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
         ),
         assistant_text("stopped"),
     ]));
@@ -928,14 +928,14 @@ async fn dangerous_command_denied_is_fed_back_not_executed() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The model tries `git push` (dangerous); after the denial it gives up.
+    // The model tries `rm -rf` (dangerous); after the denial it gives up.
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "git", "args": ["push", "origin", "main"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
         ),
-        assistant_text("Understood, I will not push."),
+        assistant_text("Understood, I will not delete it."),
     ]));
 
     let executor = Executor::new(
@@ -1437,18 +1437,25 @@ async fn long_run_auto_compacts_when_over_budget() {
         std::process::id() as u64 * 17 + 5
     ));
     std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    for i in 0..16 {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // 16 read rounds (enough transcript to have a compactible middle) + finish.
+    // 16 distinct read rounds (enough transcript to have a compactible middle,
+    // without tripping the identical-call loop guard) + finish.
     let mut responses: Vec<ModelResponse> = (0..16)
         .map(|i| {
             assistant_tool_call(
                 &format!("c{i}"),
                 "read_file",
-                serde_json::json!({"path": "src/lib.rs"}),
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
             )
         })
         .collect();
@@ -1712,9 +1719,11 @@ async fn repeated_identical_call_is_blocked_by_loop_guard() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// After every plan step is completed, pure-observe thrash (git status via
-/// different wrappers) must be refused and the turn must hard-stop rather than
-/// burn rounds re-auditing.
+/// After every plan step is completed, closeout thrash (re-running git status
+/// via different wrappers) must be refused and the turn must hard-stop rather
+/// than burn rounds re-auditing. Plan complete means the task is done, so the
+/// stop is Answered (verify decides pass/fail), NOT Incomplete — Incomplete
+/// would misreport a finished task as a failure.
 #[tokio::test]
 async fn completed_plan_refuses_observe_thrash_and_stops() {
     let dir = std::env::temp_dir().join(format!(
@@ -1773,15 +1782,15 @@ async fn completed_plan_refuses_observe_thrash_and_stops() {
 
     assert_eq!(
         outcome.stop_reason,
-        StopReason::Incomplete,
-        "observe thrash must not surface as Answered/Completed"
+        StopReason::Answered,
+        "plan complete = done; closeout thrash must not be misreported as Incomplete"
     );
     assert!(
         outcome
             .stop_detail
             .as_deref()
-            .is_some_and(|d| d.contains("observe thrash")),
-        "expected observe thrash short-circuit: {:?}",
+            .is_some_and(|d| d.contains("closeout")),
+        "expected a closeout short-circuit detail: {:?}",
         outcome.stop_detail
     );
     let closeout_denials = events
@@ -3069,10 +3078,20 @@ async fn length_finished_tool_call_is_never_executed() {
     let dir = std::env::temp_dir().join(format!("leveler-length-tool-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("readme.md"), "secret\n").unwrap();
-    let mut truncated_call =
-        assistant_tool_call("c1", "read_file", serde_json::json!({"path": "readme.md"}));
-    truncated_call.finish_reason = FinishReason::Length;
-    let runtime = Arc::new(MockRuntime::new(vec![truncated_call]));
+    // Truncated tool calls get bounded re-issue nudges (2); a model that keeps
+    // overrunning past the cap still fails as Truncated, and none of the
+    // partial calls ever executes.
+    let truncated = || {
+        let mut call =
+            assistant_tool_call("c1", "read_file", serde_json::json!({"path": "readme.md"}));
+        call.finish_reason = FinishReason::Length;
+        call
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        truncated(),
+        truncated(),
+        truncated(),
+    ]));
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
@@ -3402,17 +3421,24 @@ async fn auto_compaction_summarizes_the_elided_middle_with_the_model() {
         std::process::id() as u64 * 19 + 7
     ));
     std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    for i in 0..16 {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
+    // Distinct reads so the identical-call loop guard never refuses a round.
     let mut responses: Vec<ModelResponse> = (0..16)
         .map(|i| {
             assistant_tool_call(
                 &format!("c{i}"),
                 "read_file",
-                serde_json::json!({"path": "src/lib.rs"}),
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
             )
         })
         .collect();
@@ -4901,6 +4927,550 @@ async fn no_plan_observe_streak_hard_stops() {
     assert!(
         !outcome.final_text.contains("should not reach"),
         "must not reach post-thrash assistant text: {}",
+        outcome.final_text
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A sink that records every appended message, standing in for the resume
+/// transcript store.
+struct RecordingSink(Arc<Mutex<Vec<Message>>>);
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for RecordingSink {
+    async fn append(&mut self, messages: &[Message]) -> Result<(), AgentError> {
+        self.0.lock().unwrap().extend_from_slice(messages);
+        Ok(())
+    }
+}
+
+/// Cancelling mid-way through a serial tool batch must not erase the work that
+/// already happened in that batch: the completed calls' results are committed
+/// to the transcript (paired with their tool_use), the remaining calls are
+/// refused in place, and the epoch spend (commands run) is flushed — all
+/// before `Cancelled` surfaces. Otherwise resume sees a model that "never ran"
+/// tools whose side effects are already on disk, and the ledger under-counts.
+#[tokio::test]
+async fn cancel_mid_serial_batch_commits_completed_results_and_spend() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-cancel-batch-{}",
+        std::process::id() as u64 * 89 + 41
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // One round, two serial commands. Cancel fires the moment the first
+    // command's result is observed, so it lands before/while the second runs.
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_calls(vec![
+            (
+                "c1",
+                "run_command",
+                serde_json::json!({"program": "echo", "args": ["first-done"]}),
+            ),
+            (
+                "c2",
+                "run_command",
+                serde_json::json!({"program": "echo", "args": ["second"]}),
+            ),
+        ]),
+        assistant_text("never requested"),
+    ]));
+
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink(transcript.clone());
+    let mut events: Vec<AgentEvent> = Vec::new();
+
+    let result = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "run both commands",
+        &mut |e| {
+            if let AgentEvent::ToolResult { id, .. } = &e
+                && id == "c1"
+            {
+                cancel.cancel();
+            }
+            events.push(e);
+        },
+        &mut sink,
+        token,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(AgentError::Cancelled)),
+        "user cancel must surface as Cancelled: {result:?}"
+    );
+
+    // The first command ran before the cancel: its spend must be flushed into
+    // a ProgressUpdated ledger, not silently dropped.
+    let max_commands = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_commands),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_commands >= 1,
+        "cancel must not drop the completed command's spend; max_commands={max_commands}"
+    );
+
+    // And its result must be persisted, paired with the assistant tool calls,
+    // so a resumed session knows what already executed.
+    let messages = transcript.lock().unwrap();
+    let c1_persisted = messages.iter().any(|m| {
+        m.content.iter().any(|p| {
+            matches!(
+                p,
+                ContentPart::ToolResult { result }
+                    if result.call_id.as_str() == "c1" && result.content.contains("first-done")
+            )
+        })
+    });
+    assert!(
+        c1_persisted,
+        "the completed call's result must be committed to the transcript before Cancelled; \
+         persisted messages: {messages:?}"
+    );
+    // Every tool_use must have a paired result — the cut-short second call is
+    // refused in place, never left dangling.
+    let c2_persisted = messages.iter().any(|m| {
+        m.content.iter().any(
+            |p| matches!(p, ContentPart::ToolResult { result } if result.call_id.as_str() == "c2"),
+        )
+    });
+    assert!(
+        c2_persisted,
+        "the unfinished call must get a refusal result so the transcript stays paired; \
+         persisted messages: {messages:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A round in which every tool call was refused by a guard (loop guard, plan
+/// gate, budget, allowlist) is NOT progress. Repeated all-refused rounds must
+/// feed the no-progress streak and hard-stop the turn — otherwise a model that
+/// keeps re-issuing the same guarded non-observe call spins forever under
+/// `UntilTerminal` (the guard refuses, the refusal resets the streak, repeat).
+#[tokio::test]
+async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-denied-rounds-{}",
+        std::process::id() as u64 * 97 + 43
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // The same non-observe command every round. Rounds 1–2 run it (identical
+    // output), from round 3 the loop guard refuses it. The refused rounds must
+    // trip the no-progress hard stop long before the script runs dry.
+    let echo = || {
+        assistant_tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": "echo", "args": ["same-thing"]}),
+        )
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        echo(),
+        echo(),
+        echo(),
+        echo(),
+        echo(),
+        echo(),
+        echo(),
+        echo(),
+        assistant_text("all done"),
+    ]));
+
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "do the thing",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Incomplete,
+        "all-refused rounds must hard-stop as no progress, not run the script dry: {outcome:?}"
+    );
+    assert!(
+        outcome.rounds <= 6,
+        "the no-progress stop must fire within a few refused rounds, got {}",
+        outcome.rounds
+    );
+    assert!(
+        !outcome.final_text.contains("all done"),
+        "the scripted closing text must never be reached: {}",
+        outcome.final_text
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Gateways that never report streaming usage must not disable the token
+/// budget: spend falls back to the transcript estimate, so `max_model_tokens`
+/// still binds instead of silently never tripping.
+#[tokio::test]
+async fn token_budget_binds_when_the_gateway_reports_no_usage() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-zero-usage-{}",
+        std::process::id() as u64 * 101 + 47
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for i in 0..6 {
+        std::fs::write(dir.join(format!("src/g{i}.rs")), "pub fn g() {}\n").unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // MockRuntime reports TokenUsage::default() (all zeros) for every round.
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("c0", "read_file", serde_json::json!({"path": "src/g0.rs"})),
+        assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/g1.rs"})),
+        assistant_tool_call("c2", "read_file", serde_json::json!({"path": "src/g2.rs"})),
+        assistant_tool_call("c3", "read_file", serde_json::json!({"path": "src/g3.rs"})),
+        assistant_tool_call("c4", "read_file", serde_json::json!({"path": "src/g4.rs"})),
+        assistant_tool_call("c5", "read_file", serde_json::json!({"path": "src/g5.rs"})),
+        assistant_text("finished everything"),
+    ]));
+
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_step_limits(leveler_agent::StepLimits {
+        // Tiny budget: the estimated transcript alone exceeds this by round 2.
+        max_model_tokens: Some(100),
+        ..Default::default()
+    })
+    .run(
+        "read the files",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::BudgetExhausted,
+        "zero-usage gateway must not disable the token budget: {outcome:?}"
+    );
+    assert!(
+        !outcome.final_text.contains("finished everything"),
+        "the script must not run dry: {}",
+        outcome.final_text
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `finish_reason: tool_calls` with no complete call is a provider/gateway
+/// glitch, not a fatal condition: retry the round with feedback (bounded),
+/// exactly like a parameter-level decode failure.
+#[tokio::test]
+async fn tool_calls_finish_without_calls_retries_instead_of_aborting() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-emptycalls-{}",
+        std::process::id() as u64 * 103 + 49
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text_finished("", FinishReason::ToolCalls),
+        assistant_text("recovered"),
+    ]));
+
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "do the thing",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("a tool_calls-without-calls glitch must not abort the turn");
+
+    assert_eq!(outcome.final_text, "recovered");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `finish_reason: stop` alongside complete tool calls (some OpenAI-compatible
+/// gateways do this) must execute the calls, not kill the turn.
+#[tokio::test]
+async fn stop_finish_with_tool_calls_executes_the_calls() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-stopcalls-{}",
+        std::process::id() as u64 * 107 + 51
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn here() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let stop_with_call = ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId::new("c1"),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            }],
+        },
+        finish_reason: FinishReason::Stop,
+        usage: TokenUsage::default(),
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        stop_with_call,
+        assistant_text("read it"),
+    ]));
+
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "read the file",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("stop+tool_calls must be tolerated");
+
+    let executed = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolResult { id, is_error: false, .. } if id == "c1"));
+    assert!(executed, "the call must actually run: {events:?}");
+    assert_eq!(outcome.final_text, "read it");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `length` truncation while emitting a tool call: the partial call is never
+/// executed, but the turn recovers with a "re-issue smaller" nudge instead of
+/// aborting — text truncation already gets bounded continuations, and a
+/// too-large apply_patch deserves the same second chance.
+#[tokio::test]
+async fn length_truncated_tool_call_recovers_with_a_smaller_reissue() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-lentool-{}",
+        std::process::id() as u64 * 109 + 53
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let truncated_call = ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId::new("big"),
+                    name: "apply_patch".to_string(),
+                    arguments: serde_json::json!({"patch": "*** Begin Patch (cut off"}),
+                },
+            }],
+        },
+        finish_reason: FinishReason::Length,
+        usage: TokenUsage::default(),
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        truncated_call,
+        assistant_tool_call("c2", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_text("done smaller"),
+    ]));
+
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "patch the file",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("a truncated tool call must be recoverable");
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolResult { id, .. } if id == "big")),
+        "the truncated call must never execute: {events:?}"
+    );
+    assert_eq!(outcome.final_text, "done smaller");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A non-goal turn whose answer is empty gets one "actually answer" nudge
+/// before the loop accepts it — an empty `Answered` is indistinguishable from
+/// a silent failure for the caller.
+#[tokio::test]
+async fn empty_answer_gets_one_nudge_before_answered() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-emptyans-{}",
+        std::process::id() as u64 * 113 + 57
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text(""),
+        assistant_text("the real answer"),
+    ]));
+
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "answer the question",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.final_text, "the real answer",
+        "an empty answer must be nudged once, not silently accepted"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #1/#2: after the plan is complete, re-running commands (builds/tests/curl)
+/// is redundant closeout work — NOT a fresh objective. The drive must stop
+/// within the closeout cap and report Answered, because "plan complete" means
+/// the task is done; Incomplete here would misreport a finished task as a
+/// failure (which is exactly what a user sees as "任务未完成").
+#[tokio::test]
+async fn plan_complete_then_repeated_execute_stops_as_answered() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-closeout-exec-{}",
+        std::process::id() as u64 * 131 + 61
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        // Plan fully complete → enter closing.
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [{"step": "build go backend", "status": "completed"}]}),
+        ),
+        // Redundant re-verification: execute commands (not observe), each
+        // distinct so the loop-guard does not fire — only the closeout cap can.
+        assistant_tool_call(
+            "e1",
+            "run_command",
+            serde_json::json!({"program": "echo", "args": ["verify 1"]}),
+        ),
+        assistant_tool_call(
+            "e2",
+            "run_command",
+            serde_json::json!({"program": "echo", "args": ["verify 2"]}),
+        ),
+        assistant_tool_call(
+            "e3",
+            "run_command",
+            serde_json::json!({"program": "echo", "args": ["verify 3"]}),
+        ),
+        assistant_tool_call(
+            "e4",
+            "run_command",
+            serde_json::json!({"program": "echo", "args": ["verify 4"]}),
+        ),
+        assistant_text("should never be reached — the audit loop must be cut"),
+    ]));
+
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .run(
+        "port the backend to Go",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Answered,
+        "plan complete = done; must not misreport redundant closeout as Incomplete: {outcome:?}"
+    );
+    assert!(
+        outcome.rounds <= 5,
+        "the audit loop must be cut within the closeout cap, got {} rounds",
+        outcome.rounds
+    );
+    assert!(
+        !outcome.final_text.contains("should never be reached"),
+        "the drive must stop before running the whole script dry: {}",
         outcome.final_text
     );
     std::fs::remove_dir_all(&dir).ok();

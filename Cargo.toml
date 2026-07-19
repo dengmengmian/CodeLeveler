@@ -85,7 +85,9 @@ bytes = "1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# serde_yaml is archived; serde_yaml_ng is the maintained API-compatible fork.
+# The package rename keeps call sites as `serde_yaml::…`.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 toml = "0.8"
 toml_edit = "0.22"
 
@@ -143,6 +145,7 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 infer = "0.16"
 sha2 = "0.10"
+libc = "0.2"
 base64 = "0.22"
 fs2 = "0.4"
 rustix = { version = "1.1", features = ["fs"] }

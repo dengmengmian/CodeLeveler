@@ -62,6 +62,10 @@ pub struct ModelError {
     pub message: String,
     pub status: Option<u16>,
     pub retryable: bool,
+    /// Provider-advertised wait (`Retry-After`) in milliseconds. Retry layers
+    /// must prefer this over their own backoff schedule when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ModelError {
@@ -72,11 +76,17 @@ impl ModelError {
             message: message.into(),
             status: None,
             retryable: kind.is_retryable(),
+            retry_after_ms: None,
         }
     }
 
     pub fn with_status(mut self, status: u16) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    pub fn with_retry_after_ms(mut self, ms: u64) -> Self {
+        self.retry_after_ms = Some(ms);
         self
     }
 

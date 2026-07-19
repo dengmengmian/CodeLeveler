@@ -21,6 +21,12 @@ pub enum MockResponse {
     RawChunks { chunks: Vec<Vec<u8>> },
     /// A non-2xx status with a JSON body.
     Status { code: u16, body: String },
+    /// A non-2xx status with a JSON body and extra response headers.
+    StatusWithHeaders {
+        code: u16,
+        body: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 impl MockResponse {
@@ -72,6 +78,15 @@ impl MockResponse {
         MockResponse::Status {
             code: 429,
             body: r#"{"error":{"message":"rate limited"}}"#.to_string(),
+        }
+    }
+
+    /// HTTP 429 with a `Retry-After: <secs>` header.
+    pub fn too_many_requests_retry_after(secs: u64) -> Self {
+        MockResponse::StatusWithHeaders {
+            code: 429,
+            body: r#"{"error":{"message":"rate limited"}}"#.to_string(),
+            headers: vec![("Retry-After".to_string(), secs.to_string())],
         }
     }
 
@@ -190,6 +205,26 @@ async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result
                  Connection: close\r\n\r\n",
                 body.len()
             );
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(body.as_bytes()).await?;
+            stream.flush().await?;
+        }
+        MockResponse::StatusWithHeaders {
+            code,
+            body,
+            headers,
+        } => {
+            let reason = reason_phrase(code);
+            let mut header = format!(
+                "HTTP/1.1 {code} {reason}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n",
+                body.len()
+            );
+            for (name, value) in headers {
+                header.push_str(&format!("{name}: {value}\r\n"));
+            }
+            header.push_str("Connection: close\r\n\r\n");
             stream.write_all(header.as_bytes()).await?;
             stream.write_all(body.as_bytes()).await?;
             stream.flush().await?;

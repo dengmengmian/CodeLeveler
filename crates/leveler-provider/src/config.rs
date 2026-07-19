@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use leveler_model::ProtocolKind;
 
 /// A provider endpoint definition (spec §15).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the plaintext `api_key` can never reach logs or
+/// error messages — it prints `[redacted]` when a key is present.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
     pub protocol: ProtocolKind,
@@ -31,6 +34,21 @@ pub struct ProviderConfig {
     pub timeouts: Timeouts,
     #[serde(default)]
     pub retry: RetryConfig,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("id", &self.id)
+            .field("protocol", &self.protocol)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("headers", &self.headers)
+            .field("timeouts", &self.timeouts)
+            .field("retry", &self.retry)
+            .finish()
+    }
 }
 
 /// Connection / streaming timeouts in seconds.
@@ -60,7 +78,7 @@ mod default_timeout_tests {
         let timeouts = Timeouts::default();
         assert_eq!(timeouts.request_seconds, 120);
         assert_eq!(timeouts.idle_stream_seconds, 60);
-        assert_eq!(RetryConfig::default().max_attempts, 2);
+        assert_eq!(RetryConfig::default().max_attempts, 4);
     }
 }
 
@@ -75,7 +93,9 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 2,
+            // 4 attempts × exponential 0.5s/1s/2s absorbs routine 429/5xx
+            // blips; Retry-After (when advertised) overrides the schedule.
+            max_attempts: 4,
             initial_backoff_ms: 500,
             max_backoff_ms: 10_000,
         }
@@ -302,5 +322,33 @@ retry:
         assert_eq!(cfg.protocol, ProtocolKind::OpenAiChat);
         assert_eq!(cfg.timeouts.connect_seconds, 5);
         assert_eq!(cfg.retry.max_attempts, 2);
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn provider_config_debug_never_prints_the_api_key() {
+        let config = ProviderConfig {
+            id: "p".into(),
+            protocol: ProtocolKind::OpenAiChat,
+            base_url: "https://x".into(),
+            api_key_env: "X_KEY".into(),
+            api_key: Some("sk-super-secret-value".into()),
+            headers: Default::default(),
+            timeouts: Timeouts::default(),
+            retry: RetryConfig::default(),
+        };
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("sk-super-secret-value"),
+            "Debug output leaks the plaintext key: {debug}"
+        );
+        assert!(
+            debug.contains("[redacted]"),
+            "a present key should be visibly redacted, not silently absent: {debug}"
+        );
     }
 }

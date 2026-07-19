@@ -305,3 +305,38 @@ async fn cancellation_stops_before_request() {
         Some(leveler_model::ModelErrorKind::Cancelled)
     );
 }
+
+#[tokio::test]
+async fn rate_limit_retry_honors_retry_after_header() {
+    // The provider says "wait 1s". The configured backoff is 5ms — if the
+    // header is ignored, the retry lands almost immediately.
+    let server = MockServer::start(vec![
+        MockResponse::too_many_requests_retry_after(1),
+        MockResponse::sse(&[r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#]),
+    ])
+    .await;
+    let reg = registry(&server);
+
+    let started = std::time::Instant::now();
+    let stream = reg
+        .stream(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(stream).await;
+    let elapsed = started.elapsed();
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ModelEvent::TextDelta { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "ok", "the retry after the advertised delay succeeds");
+    assert_eq!(server.request_count(), 2);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "the retry must wait out Retry-After (~1s), not the 5ms backoff; \
+         elapsed: {elapsed:?}"
+    );
+}

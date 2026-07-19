@@ -45,6 +45,11 @@ pub enum NodeStatus {
 }
 
 /// A bounded budget for a single step/node (spec §27).
+///
+/// `max_commands` / `max_modified_files` / `max_duration` are enforced by the
+/// executor (`0` = unlimited). `max_tool_rounds` is retired as a hard cap —
+/// nodes run until terminal, bounded by the wall clock and the no-progress
+/// guards — and is kept only for schema compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepBudget {
     pub max_tool_rounds: u32,
