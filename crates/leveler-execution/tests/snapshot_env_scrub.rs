@@ -15,6 +15,14 @@ fn git(root: &std::path::Path, args: &[&str]) {
 
 #[tokio::test]
 async fn snapshot_git_does_not_pass_credentials_to_clean_filter() {
+    // Install a realistic host environment to scrub. Without one, git runs
+    // env-less: the filter's nested `sh`/path handling then depends on OS
+    // defaults and the probe file may never be created (seen on Windows).
+    let _ = leveler_core::install_environment(leveler_core::EnvSnapshot::new(
+        std::env::vars_os(),
+        std::env::current_dir().unwrap_or_default(),
+        std::env::temp_dir(),
+    ));
     let dir = tempfile::tempdir().unwrap();
     let captured = dir.path().join("captured.txt");
     git(dir.path(), &["init", "-q"]);
