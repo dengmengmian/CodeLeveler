@@ -296,7 +296,12 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::Verified);
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "ledger: {:?}",
+        report.acceptance
+    );
     assert_eq!(report.modified_files, vec!["src/lib.rs".to_string()]);
 
     // Session row: execution config + terminal outcome.
@@ -436,7 +441,12 @@ async fn impl_with_mutations_and_green_gates_is_verified() {
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::Verified);
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "ledger: {:?}",
+        report.acceptance
+    );
     assert!(
         !report.modified_files.is_empty(),
         "impl path requires observed mutation"
@@ -600,7 +610,12 @@ async fn direct_required_met_acceptance_allows_verified() {
         .await
         .unwrap();
 
-    assert_eq!(report.outcome, TaskOutcome::Verified);
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "ledger: {:?}",
+        report.acceptance
+    );
     let ledger = report.acceptance.expect("ledger present");
     assert!(ledger.all_required_met());
 }
