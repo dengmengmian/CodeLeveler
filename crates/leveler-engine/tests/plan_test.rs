@@ -183,9 +183,13 @@ fn passing_gate(name: &str) -> VerificationCommand {
 /// A gate that passes only when `needle` appears in `file`.
 fn grep_gate(name: &str, needle: &str, file: &str) -> VerificationCommand {
     let (program, args) = if cfg!(windows) {
+        // findstr parses `/` in the file argument as option switches.
         (
             "cmd",
-            vec!["/c".to_string(), format!("findstr {needle} {file}")],
+            vec![
+                "/c".to_string(),
+                format!("findstr {needle} {}", file.replace('/', "\\")),
+            ],
         )
     } else {
         (
