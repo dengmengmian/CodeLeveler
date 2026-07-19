@@ -772,7 +772,7 @@ async fn run_with_windows_job(
 
     // Bound post-kill wait so a stuck job cannot trap the agent turn (same
     // failure mode as Unix child.wait hanging after killpg).
-    let wait_deadline = async |child: &mut process_wrap::tokio::Child| match tokio::time::timeout(
+    let wait_deadline = async |child: &mut Box<dyn TokioChildWrapper>| match tokio::time::timeout(
         POST_KILL_WAIT,
         Box::into_pin(child.wait()),
     )
