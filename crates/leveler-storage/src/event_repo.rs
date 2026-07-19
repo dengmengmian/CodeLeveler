@@ -115,6 +115,29 @@ impl<'a> EventRepository<'a> {
         .await?;
         Ok(rows)
     }
+
+    /// The newest event of `event_type`, optionally scoped to one turn — an
+    /// indexed single-row lookup so "latest plan/ledger/snapshot" seeding never
+    /// scans the whole session log.
+    pub async fn load_last_by_type(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        turn_id: Option<&leveler_core::TurnId>,
+    ) -> Result<Option<EventRecord>, StorageError> {
+        let row = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND type = ?2 AND (?3 IS NULL OR turn_id = ?3) \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .bind(event_type)
+        .bind(turn_id.map(|t| t.as_str()))
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(row)
+    }
 }
 
 #[cfg(test)]

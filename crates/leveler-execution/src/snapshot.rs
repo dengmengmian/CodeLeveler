@@ -82,10 +82,24 @@ impl WorkspaceSnapshot {
                 None,
             )
             .await?;
+            // A deletion failure must surface: a file the snapshot says should
+            // not exist but survives the restore leaves the workspace out of
+            // sync with the transcript the caller reports as rolled back.
+            let mut failed: Vec<String> = Vec::new();
             for path in current.lines() {
                 if !in_snapshot.contains(path) {
-                    let _ = std::fs::remove_file(root.join(path));
+                    match std::fs::remove_file(root.join(path)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => failed.push(format!("{path}: {e}")),
+                    }
                 }
+            }
+            if !failed.is_empty() {
+                return Err(SnapshotError::Git(format!(
+                    "restore incomplete; could not delete: {}",
+                    failed.join(", ")
+                )));
             }
             Ok(())
         }
@@ -138,16 +152,37 @@ impl WorkspaceSnapshot {
 
 /// The repository's `.git` directory, or `None` when `root` is not a git
 /// repository (or git is unavailable — logged, not swallowed).
+///
+/// `root` must BE the repository toplevel, not merely inside one:
+/// `rev-parse` walks upward, so a workspace launched in a subdirectory of
+/// some enclosing repo would otherwise capture/restore the whole OUTER tree —
+/// wrong scope, and a restore could delete files far outside the workspace.
+/// (The failure you'd see first: `git add -A .` erroring because the whole
+/// cwd is ignored by the outer repo's .gitignore.)
 async fn git_dir(root: &Path) -> Option<PathBuf> {
     let mut command = tokio::process::Command::new("git");
     command
-        .args(["rev-parse", "--absolute-git-dir"])
+        .args(["rev-parse", "--absolute-git-dir", "--show-toplevel"])
         .current_dir(root);
     scrub_credentials(&mut command);
     let out = command.output().await;
     match out {
         Ok(out) if out.status.success() => {
-            let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut lines = stdout.lines();
+            let dir = lines.next()?.trim().to_string();
+            let toplevel = PathBuf::from(lines.next()?.trim());
+            let root_real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            let top_real = std::fs::canonicalize(&toplevel).unwrap_or(toplevel);
+            if root_real != top_real {
+                tracing::debug!(
+                    workspace = %root.display(),
+                    toplevel = %top_real.display(),
+                    "workspace is a subdirectory of an enclosing git repo; \
+                     snapshots disabled (transcript-only checkpoints)"
+                );
+                return None;
+            }
             Some(PathBuf::from(dir))
         }
         Ok(_) => None,
@@ -432,5 +467,23 @@ mod tests {
         let recorded =
             std::fs::read_to_string(dir.path().join(".git/leveler/last-command-snapshot")).unwrap();
         assert_eq!(recorded.trim(), snap.0);
+    }
+
+    /// Launching in a subdirectory of some enclosing repo must NOT snapshot
+    /// that outer repo: `git rev-parse` walks up, so without the toplevel
+    /// check the capture/restore scope silently becomes the whole outer tree
+    /// (restore could then delete files far outside the workspace).
+    #[tokio::test]
+    async fn subdirectory_of_an_outer_repo_is_not_treated_as_a_git_workspace() {
+        let outer = git_repo().await;
+        let sub = outer.path().join("nested/workdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("f.txt"), "x").unwrap();
+
+        let captured = WorkspaceSnapshot::capture(&sub).await.unwrap();
+        assert_eq!(
+            captured, None,
+            "a subdir of an enclosing repo must degrade to transcript-only              checkpoints, never snapshot the outer repository"
+        );
     }
 }

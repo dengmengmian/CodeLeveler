@@ -741,3 +741,298 @@ async fn orchestrate_inspect_only_may_verify_without_mutation() {
         "inspect-only + non-impl goal should not require mutation"
     );
 }
+
+/// Wraps the scripted runtime and records every request it receives, so tests
+/// can assert what the resumed node actually showed the model.
+struct RecordingRuntime {
+    inner: MockRuntime,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait]
+impl ModelRuntime for RecordingRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        self.requests.lock().unwrap().push(request.clone());
+        self.inner.generate(request, cancellation).await
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.requests.lock().unwrap().push(request.clone());
+        self.inner.stream(request, cancellation).await
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        self.inner.profile(model).await
+    }
+}
+
+/// Delays each `stream` call by the next queued duration (then no delay), so
+/// tests can burn a node's wall-clock budget deterministically.
+struct SlowRuntime {
+    inner: MockRuntime,
+    delays: Mutex<VecDeque<std::time::Duration>>,
+}
+
+#[async_trait]
+impl ModelRuntime for SlowRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        let delay = self.delays.lock().unwrap().pop_front().unwrap_or_default();
+        tokio::time::sleep(delay).await;
+        self.inner.generate(request, cancellation).await
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let delay = self.delays.lock().unwrap().pop_front().unwrap_or_default();
+        tokio::time::sleep(delay).await;
+        self.inner.stream(request, cancellation).await
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        self.inner.profile(model).await
+    }
+}
+
+/// `harness` with a caller-supplied runtime instead of a plain MockRuntime.
+async fn harness_with_runtime(runtime: Arc<dyn ModelRuntime>) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let environment = Arc::new(leveler_core::EnvSnapshot::new(
+        std::env::vars_os(),
+        std::env::current_dir().unwrap_or_default(),
+        std::env::temp_dir(),
+    ));
+    let tool_context =
+        ToolContext::with_environment(workspace, PermissionProfile::Assisted, environment);
+    let engine = TaskEngine {
+        db: Database::connect_in_memory().await.unwrap(),
+        factory: ExecutorFactory {
+            runtime,
+            registry: Arc::new(default_registry()),
+            tool_context,
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: Some(leveler_engine::ExecutionOverrides {
+                completion_evidence: Some(false),
+                ..Default::default()
+            }),
+            work_profile: leveler_agent::WorkProfile::Balanced,
+            memory_index: String::new(),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            grants_state_dir: None,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+    };
+    Harness { engine, dir }
+}
+
+/// An in-flight node whose turn wrote a ContextSnapshot (mid-node compaction)
+/// and then kept working must resume from snapshot + everything after it — the
+/// snapshot is a compact BASE, never a replacement for the later rounds. If the
+/// tail were dropped, the model would re-do work whose side effects (edits,
+/// commands) already happened before the crash.
+#[tokio::test]
+async fn resume_of_in_flight_node_keeps_messages_appended_after_snapshot() {
+    use leveler_core::TurnId;
+    use leveler_engine::EventLog;
+
+    // Phase 1: two-node plan; n1 completes; n2 starts (seed transcript
+    // persists) and dies mid-node.
+    let two_node_plan = r#"{"nodes":[
+        {"id":"n1","kind":"edit","description":"add pub fn b"},
+        {"id":"n2","kind":"edit","description":"add a FIXED marker","dependencies":["n1"]}]}"#;
+    let h = harness(vec![
+        text(&requirement_json()),
+        text(two_node_plan),
+        tool_call("c1", "apply_patch", serde_json::json!({ "patch": PATCH })),
+        text("added b"),
+        // n2's turn: the model errors out (no more responses) mid-node.
+    ])
+    .await;
+    let spec = spec(
+        &h,
+        VerificationPlan {
+            commands: vec![passing_gate("ok")],
+        },
+    );
+    let session = h.engine.create_task(&spec).await.unwrap();
+    h.engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("n2 must die mid-run");
+
+    // n2's failed turn is the in-flight one the resume will re-drive.
+    let turns = TurnRepository::new(&h.engine.db)
+        .list(&session)
+        .await
+        .unwrap();
+    let n2_turn = turns
+        .iter()
+        .find(|t| t.payload.as_deref() == Some(r#"{"node_id":"n2"}"#) && t.status == "failed")
+        .expect("n2's interrupted turn must be persisted");
+    let n2_turn_id = TurnId::new(n2_turn.id.clone());
+
+    // Simulate mid-node compaction followed by more work: a ContextSnapshot
+    // for n2's turn (the compact base), then a raw message appended AFTER it.
+    let log = EventLog::new(&h.engine.db, session.clone());
+    log.append(
+        Some(&n2_turn_id),
+        EngineEvent::ContextSnapshot {
+            messages: vec![Message::text(
+                Role::User,
+                "COMPACT_BASE_SUMMARY of the earlier n2 rounds",
+            )],
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    MessageRepository::new(&h.engine.db)
+        .append_in_turn(
+            &session,
+            &n2_turn_id,
+            &[serde_json::to_string(&Message::text(
+                Role::User,
+                "POST_SNAPSHOT_MARKER: the FIXED marker patch was already prepared",
+            ))
+            .unwrap()],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+    // Phase 2: resume with a recording runtime scripted only with n2's
+    // continuation.
+    let edit2 =
+        "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn b() {}\n+// FIXED\n*** End Patch";
+    let runtime = Arc::new(RecordingRuntime {
+        inner: MockRuntime::new(vec![
+            tool_call("c2", "apply_patch", serde_json::json!({ "patch": edit2 })),
+            text("added marker"),
+        ]),
+        requests: Mutex::new(Vec::new()),
+    });
+    let engine2 = TaskEngine {
+        db: h.engine.db.clone(),
+        factory: ExecutorFactory {
+            runtime: runtime.clone(),
+            registry: Arc::new(default_registry()),
+            tool_context: h.engine.factory.tool_context.clone(),
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: Some(leveler_engine::ExecutionOverrides {
+                completion_evidence: Some(false),
+                ..Default::default()
+            }),
+            work_profile: leveler_agent::WorkProfile::Balanced,
+            memory_index: String::new(),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            grants_state_dir: None,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+    };
+
+    engine2
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = runtime.requests.lock().unwrap();
+    let first = requests
+        .first()
+        .expect("the resumed node must issue a model request");
+    let joined: String = first
+        .messages
+        .iter()
+        .map(|m| m.text_content())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("COMPACT_BASE_SUMMARY"),
+        "resume must start from the compact snapshot base: {joined}"
+    );
+    assert!(
+        joined.contains("POST_SNAPSHOT_MARKER"),
+        "resume must keep the raw messages appended after the snapshot, \
+         not wholesale-replace them with the snapshot: {joined}"
+    );
+}
+
+/// A node's declared wall-clock budget (`StepBudget.max_duration`) must reach
+/// the executor as a `StepLimits.max_duration`, so a node stuck on a slow
+/// model/command cannot run unbounded under `UntilTerminal`. (Rounds caps are
+/// deliberately retired — see the twenty-round test above — but the wall clock
+/// is the backstop.)
+#[tokio::test]
+async fn node_wall_clock_budget_reaches_the_executor() {
+    // A 1s node budget with a >1s first model round: the boundary check after
+    // that round must stop the node instead of letting it run its script dry.
+    // (0 means unlimited, like the legacy caps.)
+    let plan = r#"{"nodes":[{"id":"n1","kind":"inspect",
+        "description":"budgeted node",
+        "budget":{"max_tool_rounds":20,"max_modified_files":8,
+                  "max_commands":10,"max_repairs":2,"max_duration":1}}]}"#;
+    let inner = MockRuntime::new(vec![
+        text(r#"{"goal":"inspect","acceptance_criteria":[]}"#),
+        text(plan),
+        tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({
+                "explanation": "slow round",
+                "plan": [{"step": "inspect", "status": "in_progress"}]
+            }),
+        ),
+        // Never legitimately reached: the budget expires during round 1.
+        text("node ran to completion"),
+        text("still going"),
+    ]);
+    // Delay only the node's first round (call #3) past the 1s budget.
+    let runtime = Arc::new(SlowRuntime {
+        inner,
+        delays: Mutex::new(VecDeque::from(vec![
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1200),
+        ])),
+    });
+    let h = harness_with_runtime(runtime).await;
+    let mut s = spec(&h, VerificationPlan::default());
+    s.goal = "inspect".into();
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::BudgetExhausted,
+        "an exhausted node wall-clock budget must stop the node: {report:?}"
+    );
+}

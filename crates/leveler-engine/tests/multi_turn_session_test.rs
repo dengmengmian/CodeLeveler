@@ -206,7 +206,13 @@ async fn seed_oversized_login_history(engine: &TaskEngine, session: &leveler_cor
 
 #[tokio::test]
 async fn chat_compacts_when_history_oversized_and_persists_snapshot() {
-    let h = harness(vec![text("timeout answer")]).await;
+    // Over-threshold chat first makes one advisory summarize call, then the
+    // chat turn itself.
+    let h = harness(vec![
+        text("SUMMARY_BRIEFING_MARKER: earlier rounds investigated the login timeout"),
+        text("timeout answer"),
+    ])
+    .await;
     let s = spec(&h, "chat session");
     let session = h.engine.create_task(&s).await.unwrap();
 
@@ -249,12 +255,23 @@ async fn chat_compacts_when_history_oversized_and_persists_snapshot() {
         .await
         .expect("chat should succeed");
 
-    let saw_snapshot = events
+    let snapshot_messages: Vec<String> = events
         .iter()
-        .any(|e| matches!(e, EngineEvent::ContextSnapshot { .. }));
+        .find_map(|e| match e {
+            EngineEvent::ContextSnapshot { messages } => Some(
+                messages
+                    .iter()
+                    .map(|m| m.text_content())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .expect("expected ContextSnapshot when history exceeds pre-request threshold");
     assert!(
-        saw_snapshot,
-        "expected ContextSnapshot when history exceeds pre-request threshold; events={events:?}"
+        snapshot_messages
+            .iter()
+            .any(|t| t.contains("SUMMARY_BRIEFING_MARKER")),
+        "the fold must carry the model handoff briefing, not a bare breadcrumb: {snapshot_messages:?}"
     );
 }
 
@@ -262,7 +279,9 @@ async fn chat_compacts_when_history_oversized_and_persists_snapshot() {
 async fn second_chat_after_compact_still_sees_first_chat_turn() {
     // AC2: snapshot must not erase the previous chat exchange for the next turn.
     let h = harness(vec![
+        text("summary of chat1 history"),
         text("compact-aware answer about login"),
+        text("summary of chat2 history"),
         text("I still remember UNIQUE_CHAT1_MARKER"),
     ])
     .await;
@@ -373,11 +392,15 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     // 3) Goal incomplete (BudgetLimited) so resume is allowed.
     // 4) Resume Ok and its model request carries login context.
     let h = harness(vec![
+        text("summary of chat1 history"),
         text("compact-aware answer"),
+        text("summary of chat2 history"),
         text("follow-up still knows UNIQUE_CHAT1_MARKER"),
         // Goal: exhaust rounds without terminal complete → BudgetLimited.
+        // (Goal prior injection uses the bounded-history path: no summarize.)
         text("working on timeout, not done yet"),
-        // Resume turn.
+        // Resume summarizes its oversized transcript, then the resume turn.
+        text("summary of the resumed history"),
         text("resumed with prior login context"),
     ])
     .await;

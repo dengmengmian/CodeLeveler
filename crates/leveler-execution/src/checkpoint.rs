@@ -7,12 +7,26 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Originals larger than this spill to a temp file instead of staying
+/// resident: a session that touches a build artifact or data file must not pin
+/// megabytes of RAM per file for the whole run.
+const MAX_IN_MEMORY_ORIGINAL: usize = 4 * 1024 * 1024;
+
+/// The captured original state of one touched path.
+enum Original {
+    /// The file did not exist before the first write.
+    Absent,
+    InMemory(Vec<u8>),
+    /// Large original spilled to a session temp file (removed on reset/drop).
+    Spilled(PathBuf),
+}
 
 /// Records the pre-modification state of touched files.
 #[derive(Default)]
 pub struct Checkpoint {
-    /// Path -> original bytes (`None` means the file did not exist).
-    originals: Mutex<HashMap<PathBuf, Option<Vec<u8>>>>,
+    originals: Mutex<HashMap<PathBuf, Original>>,
 }
 
 impl Checkpoint {
@@ -28,19 +42,50 @@ impl Checkpoint {
         if map.contains_key(path) {
             return;
         }
-        let original = std::fs::read(path).ok();
+        let original = match std::fs::read(path).ok() {
+            None => Original::Absent,
+            Some(bytes) if bytes.len() <= MAX_IN_MEMORY_ORIGINAL => Original::InMemory(bytes),
+            Some(bytes) => match spill(&bytes) {
+                Ok(spill_path) => Original::Spilled(spill_path),
+                // Rollback safety beats memory: keep it resident rather than
+                // silently losing the ability to restore.
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not spill large checkpoint original; keeping in memory"
+                    );
+                    Original::InMemory(bytes)
+                }
+            },
+        };
         map.insert(path.to_path_buf(), original);
     }
 
     /// Clear all captured state, making the current tree the new restore point
     /// (an explicit `create_checkpoint`).
     pub fn reset(&self) {
-        self.originals.lock().unwrap().clear();
+        let mut map = self.originals.lock().unwrap();
+        remove_spill_files(&map);
+        map.clear();
     }
 
     /// The number of distinct files captured.
     pub fn touched_count(&self) -> usize {
         self.originals.lock().unwrap().len()
+    }
+
+    /// Total original-content bytes currently held in memory (not spilled).
+    pub fn in_memory_bytes(&self) -> usize {
+        self.originals
+            .lock()
+            .unwrap()
+            .values()
+            .map(|v| match v {
+                Original::InMemory(bytes) => bytes.len(),
+                Original::Absent | Original::Spilled(_) => 0,
+            })
+            .sum()
     }
 
     /// Whether anything has been recorded.
@@ -53,13 +98,19 @@ impl Checkpoint {
         let map = self.originals.lock().unwrap();
         for (path, original) in map.iter() {
             match original {
-                Some(bytes) => {
+                Original::InMemory(bytes) => {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(path, bytes)?;
                 }
-                None => match std::fs::remove_file(path) {
+                Original::Spilled(spill_path) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::copy(spill_path, path)?;
+                }
+                Original::Absent => match std::fs::remove_file(path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
@@ -67,6 +118,34 @@ impl Checkpoint {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Checkpoint {
+    fn drop(&mut self) {
+        if let Ok(map) = self.originals.lock() {
+            remove_spill_files(&map);
+        }
+    }
+}
+
+/// Write a large original into a unique session temp file.
+fn spill(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "leveler-checkpoint-{}-{}.orig",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+fn remove_spill_files(map: &HashMap<PathBuf, Original>) {
+    for original in map.values() {
+        if let Original::Spilled(spill_path) = original {
+            std::fs::remove_file(spill_path).ok();
+        }
     }
 }
 
@@ -107,6 +186,34 @@ mod tests {
         std::fs::write(&file, "created").unwrap();
         cp.restore().unwrap();
         assert!(!file.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn large_originals_do_not_stay_resident_in_memory() {
+        // A session touching a big artifact (build output, data file) must not
+        // pin its whole original in RAM — spill it, but restore must still
+        // reproduce it byte-for-byte.
+        let dir = tmp();
+        let file = dir.join("big.bin");
+        let original: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &original).unwrap();
+
+        let cp = Checkpoint::new();
+        cp.record(&file);
+        assert!(
+            cp.in_memory_bytes() < 5 * 1024 * 1024,
+            "a 6MB original must not be held in memory ({} bytes resident)",
+            cp.in_memory_bytes()
+        );
+
+        std::fs::write(&file, b"clobbered").unwrap();
+        cp.restore().unwrap();
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            original,
+            "spilled originals must still restore byte-for-byte"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

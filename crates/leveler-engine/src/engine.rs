@@ -86,6 +86,7 @@ fn chat_profile(spec: &TaskSpec) -> TurnProfile {
 pub fn budget_prior_messages(
     raw: Vec<leveler_model::Message>,
     snapshot: Option<Vec<leveler_model::Message>>,
+    summary: Option<&str>,
     active_objective: Option<&str>,
     threshold: u64,
 ) -> (Vec<leveler_model::Message>, bool) {
@@ -106,7 +107,7 @@ pub fn budget_prior_messages(
     let folded = leveler_agent::compact_messages(
         &base,
         leveler_agent::COMPACT_KEEP_RECENT,
-        None,
+        summary,
         active_objective,
     );
     let changed = leveler_agent::estimate_tokens(&folded) < tokens || folded.len() < base.len();
@@ -354,6 +355,7 @@ impl TaskEngine {
 
         let log = EventLog::new(&self.db, session_id.clone());
         let snapshot = log.latest_context_snapshot(None).await?;
+        let summary = self.summarize_if_over(&raw_prior, &cancellation).await;
         let objective_hint = content
             .iter()
             .filter_map(|p| match p {
@@ -364,6 +366,7 @@ impl TaskEngine {
         let (prior, compacted) = budget_prior_messages(
             raw_prior,
             snapshot,
+            summary.as_deref(),
             objective_hint,
             leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
         );
@@ -481,10 +484,12 @@ impl TaskEngine {
 
         let log = EventLog::new(&self.db, session_id.clone());
         let snapshot = log.latest_context_snapshot(None).await?;
+        let summary = self.summarize_if_over(&raw_prior, &cancellation).await;
         // Same merge rules as chat: never drop post-snapshot transcript rows.
         let (prior, compacted) = budget_prior_messages(
             raw_prior,
             snapshot,
+            summary.as_deref(),
             Some(spec.goal.as_str()),
             leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
         );
@@ -548,6 +553,41 @@ impl TaskEngine {
             }
         }
         result
+    }
+
+    /// Best-effort model handoff briefing for a pre-request fold: only called
+    /// when the raw history exceeds the compact threshold, and any failure
+    /// degrades to the bare-breadcrumb fold (never blocks the turn).
+    async fn summarize_if_over(
+        &self,
+        raw: &[leveler_model::Message],
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        if leveler_agent::estimate_tokens(raw) <= leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD {
+            return None;
+        }
+        leveler_agent::summarize_with_model(
+            self.factory.runtime.as_ref(),
+            &self.factory.model,
+            None,
+            raw,
+            leveler_agent::COMPACT_KEEP_RECENT,
+            cancellation,
+        )
+        .await
+    }
+
+    /// The explicit reconciliation flow behind `RecoveryConfirmationRequired`:
+    /// after the user has inspected the workspace, close every dangling tool
+    /// call with an explicit user-acknowledged marker so resume can proceed.
+    /// The marker is an errored result — never a fake success — and nothing is
+    /// replayed; the model re-drives from the last clean turn boundary.
+    /// Returns how many calls were closed.
+    pub async fn acknowledge_crash_window(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<usize, EngineError> {
+        acknowledge_crash_window(&self.db, session_id).await
     }
 
     /// Reconcile the crash window on resume: for every tool call that started
@@ -766,10 +806,16 @@ impl TaskEngine {
                         .map_err(|e| {
                             EngineError::Corrupt(format!("unreplayable node transcript: {e}"))
                         })?;
-                    let prior = log
-                        .latest_context_snapshot(Some(turn_id))
-                        .await?
-                        .unwrap_or(raw_prior);
+                    // A snapshot is a compact BASE, never a replacement for
+                    // rounds persisted after it: merge with the raw tail like
+                    // `budget_prior_messages`, or resumed nodes would redo
+                    // work whose side effects already happened pre-crash.
+                    let prior = match log.latest_context_snapshot(Some(turn_id)).await? {
+                        Some(snap) if !snap.is_empty() => {
+                            merge_snapshot_with_raw_tail(snap, &raw_prior)
+                        }
+                        _ => raw_prior,
+                    };
                     resume_in_flight = Some((node_id, prior));
                 }
             }
@@ -896,6 +942,7 @@ impl TaskEngine {
         let (budgeted, _) = budget_prior_messages(
             raw,
             snapshot,
+            None,
             Some(goal),
             leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
         );
@@ -958,9 +1005,11 @@ impl TaskEngine {
                     ))
                 })?;
             let snapshot = log.latest_context_snapshot(None).await?;
+            let summary = self.summarize_if_over(&raw_prior, &cancellation).await;
             let (prior, compacted) = budget_prior_messages(
                 raw_prior,
                 snapshot,
+                summary.as_deref(),
                 Some(spec.goal.as_str()),
                 leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
             );
@@ -1414,10 +1463,18 @@ impl TaskEngine {
                     },
                     TurnProfile::Node {
                         continuation: node_continuation,
-                        limits: leveler_agent::StepLimits::from_legacy_caps(
-                            node.budget.max_commands,
-                            node.budget.max_modified_files,
-                        ),
+                        limits: leveler_agent::StepLimits {
+                            // Wall clock is the node's backstop under
+                            // UntilTerminal (rounds caps are deliberately
+                            // retired; see the twenty-round test). Zero means
+                            // unlimited, like the legacy caps.
+                            max_duration: (!node.budget.max_duration.is_zero())
+                                .then_some(node.budget.max_duration),
+                            ..leveler_agent::StepLimits::from_legacy_caps(
+                                node.budget.max_commands,
+                                node.budget.max_modified_files,
+                            )
+                        },
                         write_allowlist: (!node.allowed_paths.is_empty())
                             .then(|| node.allowed_paths.clone()),
                     },
@@ -2150,6 +2207,37 @@ mod continue_cap_tests {
     }
 }
 
+/// Close every dangling tool call of a session with an explicit
+/// user-acknowledged marker (an errored `ToolCallFinished`, never a fake
+/// success), so a resume blocked by `RecoveryConfirmationRequired` can
+/// proceed. Nothing is replayed. Returns how many calls were closed.
+pub async fn acknowledge_crash_window(
+    db: &Database,
+    session_id: &SessionId,
+) -> Result<usize, EngineError> {
+    let log = EventLog::new(db, session_id.clone());
+    let dangling = log.dangling_tool_calls().await?;
+    let closed = dangling.len();
+    for call in dangling {
+        let turn_id = call.turn_id.as_ref().map(|t| TurnId::new(t.clone()));
+        log.append(
+            turn_id.as_ref(),
+            EngineEvent::ToolCallFinished {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                is_error: true,
+                preview: "user-acknowledged crash recovery: the interrupted call's outcome \
+                          is unknown; the workspace was verified manually and the call was \
+                          not replayed"
+                    .to_string(),
+            },
+            &mut |_| {},
+        )
+        .await?;
+    }
+    Ok(closed)
+}
+
 /// Map non-success agent stops for Direct conclude (shipped path used by
 /// `conclude_direct`). `None` means continue into verification.
 pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Option<TaskOutcome> {
@@ -2263,7 +2351,7 @@ mod multi_turn_session_tests {
             msg(Role::Assistant, "second answer"),
         ];
         let snap = vec![msg(Role::User, "stale snapshot only")];
-        let (out, compacted) = budget_prior_messages(raw.clone(), Some(snap), None, 100_000);
+        let (out, compacted) = budget_prior_messages(raw.clone(), Some(snap), None, None, 100_000);
         assert!(!compacted);
         assert_eq!(out.len(), raw.len());
         assert!(
@@ -2288,7 +2376,7 @@ mod multi_turn_session_tests {
         ];
         let tokens = leveler_agent::estimate_tokens(&raw);
         assert!(tokens > 200, "need over-threshold raw: {tokens}");
-        let (out, compacted) = budget_prior_messages(raw, Some(snap), Some("fix login"), 200);
+        let (out, compacted) = budget_prior_messages(raw, Some(snap), None, Some("fix login"), 200);
         assert!(compacted);
         let joined: String = out
             .iter()
@@ -2304,6 +2392,30 @@ mod multi_turn_session_tests {
     }
 
     #[test]
+    fn budget_prior_folds_with_the_model_summary_when_given() {
+        // The engine pre-request path passes a model handoff briefing; the
+        // fold must carry it instead of a bare no-summary breadcrumb.
+        let raw = long_prior(40);
+        let (out, compacted) = budget_prior_messages(
+            raw,
+            None,
+            Some("HANDOFF_SUMMARY_TEXT for the elided rounds"),
+            Some("fix login"),
+            200,
+        );
+        assert!(compacted);
+        let joined: String = out
+            .iter()
+            .map(|m| m.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("HANDOFF_SUMMARY_TEXT"),
+            "the provided summary must survive into the folded transcript: {joined}"
+        );
+    }
+
+    #[test]
     fn budget_prior_compacts_oversized_history() {
         let raw = long_prior(40);
         let tokens = leveler_agent::estimate_tokens(&raw);
@@ -2311,7 +2423,8 @@ mod multi_turn_session_tests {
             tokens > 100,
             "synthetic history should be non-trivial: {tokens}"
         );
-        let (out, compacted) = budget_prior_messages(raw.clone(), None, Some("fix login"), 200);
+        let (out, compacted) =
+            budget_prior_messages(raw.clone(), None, None, Some("fix login"), 200);
         assert!(compacted, "must take compact path when over threshold");
         assert!(
             leveler_agent::estimate_tokens(&out) < tokens || out.len() < raw.len(),

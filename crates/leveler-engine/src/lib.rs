@@ -16,7 +16,9 @@ mod reaper;
 mod recorders;
 mod turn;
 
-pub use engine::{TaskEngine, TaskReport, TaskSpec, budget_prior_messages, mode_str};
+pub use engine::{
+    TaskEngine, TaskReport, TaskSpec, acknowledge_crash_window, budget_prior_messages, mode_str,
+};
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, PublicAcceptanceStatus, PublicEvent, PublicTurnKind,
     TurnKind,

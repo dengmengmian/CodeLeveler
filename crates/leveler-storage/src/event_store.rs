@@ -41,6 +41,16 @@ pub trait EventStore: Send + Sync {
         session_id: &SessionId,
         after: i64,
     ) -> Result<Vec<EventRecord>, StorageError>;
+
+    /// The newest event of `event_type`, optionally scoped to one turn.
+    /// Backed by an index in the SQLite adapter — callers may treat this as a
+    /// cheap single-row lookup, never a log scan.
+    async fn load_last_by_type(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        turn_id: Option<&TurnId>,
+    ) -> Result<Option<EventRecord>, StorageError>;
 }
 
 /// The production SQLite adapter: delegates to [`EventRepository`].
@@ -70,6 +80,17 @@ impl EventStore for Database {
     ) -> Result<Vec<EventRecord>, StorageError> {
         EventRepository::new(self)
             .load_after(session_id, after)
+            .await
+    }
+
+    async fn load_last_by_type(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        turn_id: Option<&TurnId>,
+    ) -> Result<Option<EventRecord>, StorageError> {
+        EventRepository::new(self)
+            .load_last_by_type(session_id, event_type, turn_id)
             .await
     }
 }
@@ -144,6 +165,24 @@ impl EventStore for MemoryEventStore {
         rows.sort_by_key(|e| e.sequence);
         Ok(rows)
     }
+
+    async fn load_last_by_type(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        turn_id: Option<&TurnId>,
+    ) -> Result<Option<EventRecord>, StorageError> {
+        let events = self.events.lock().unwrap();
+        Ok(events
+            .iter()
+            .filter(|e| {
+                e.session_id == session_id.as_str()
+                    && e.event_type == event_type
+                    && turn_id.is_none_or(|t| e.turn_id.as_deref() == Some(t.as_str()))
+            })
+            .max_by_key(|e| e.sequence)
+            .cloned())
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +218,56 @@ mod tests {
         );
     }
 
+    /// Both implementations: newest row of the requested type wins, turn
+    /// scoping filters, and a missing type is `None` (not an error).
+    async fn assert_last_by_type(store: &dyn EventStore, session: &SessionId, turn_a: TurnId) {
+        store
+            .append(
+                session,
+                None,
+                "plan_updated",
+                r#"{"v":1}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                session,
+                Some(&turn_a),
+                "plan_updated",
+                r#"{"v":2}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .append(session, None, "other", r#"{"v":3}"#, leveler_core::now())
+            .await
+            .unwrap();
+
+        let latest = store
+            .load_last_by_type(session, "plan_updated", None)
+            .await
+            .unwrap()
+            .expect("latest plan row");
+        assert_eq!(latest.payload, r#"{"v":2}"#, "newest of the type wins");
+
+        let scoped = store
+            .load_last_by_type(session, "plan_updated", Some(&turn_a))
+            .await
+            .unwrap()
+            .expect("turn-scoped row");
+        assert_eq!(scoped.payload, r#"{"v":2}"#);
+        assert!(
+            store
+                .load_last_by_type(session, "missing_type", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn memory_store_honors_the_contract() {
         let store = MemoryEventStore::new();
@@ -191,6 +280,27 @@ mod tests {
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
         SessionRepository::new(&db).create(&record).await.unwrap();
         assert_gapless_and_ordered(&db, &SessionId::new(record.id)).await;
+    }
+
+    #[tokio::test]
+    async fn memory_store_last_by_type() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        assert_last_by_type(&store, &session, TurnId::new("turn-a".to_string())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_last_by_type() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        // events.turn_id has a foreign key: use a real persisted turn.
+        let turn = crate::TurnRepository::new(&db)
+            .start(&session, "node", None, leveler_core::now())
+            .await
+            .unwrap();
+        assert_last_by_type(&db, &session, TurnId::new(turn.id)).await;
     }
 
     #[tokio::test]

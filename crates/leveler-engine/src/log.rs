@@ -71,31 +71,27 @@ impl<'a> EventLog<'a> {
     /// The newest durable model-visible context, optionally scoped to one
     /// turn. Raw transcript reconstruction is only a fallback when no snapshot
     /// has ever been emitted.
+    ///
+    /// Uses the store's indexed by-type lookup: snapshots embed whole message
+    /// lists, and a full-log scan per restore would be O(session length).
     pub async fn latest_context_snapshot(
         &self,
         turn_id: Option<&TurnId>,
     ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
-        let rows = self.store.load(&self.session_id).await?;
-        for row in rows.iter().rev() {
-            if row.event_type != "context_snapshot" {
-                continue;
-            }
-            check_version(row)?;
-            if let Some(turn_id) = turn_id
-                && row.turn_id.as_deref() != Some(turn_id.as_str())
-            {
-                continue;
-            }
-            match EngineEvent::from_payload(&row.payload)? {
-                EngineEvent::ContextSnapshot { messages } => return Ok(Some(messages)),
-                _ => {
-                    return Err(EngineError::Corrupt(
-                        "context_snapshot row carried a different event".into(),
-                    ));
-                }
-            }
+        let Some(row) = self
+            .store
+            .load_last_by_type(&self.session_id, "context_snapshot", turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        check_version(&row)?;
+        match EngineEvent::from_payload(&row.payload)? {
+            EngineEvent::ContextSnapshot { messages } => Ok(Some(messages)),
+            _ => Err(EngineError::Corrupt(
+                "context_snapshot row carried a different event".into(),
+            )),
         }
-        Ok(None)
     }
 
     /// Tool calls with a persisted `ToolCallStarted` but no matching

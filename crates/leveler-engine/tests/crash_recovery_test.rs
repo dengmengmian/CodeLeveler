@@ -567,3 +567,52 @@ async fn legacy_call_without_persisted_risk_blocks_conservatively() {
         EngineError::RecoveryConfirmationRequired { ref call_id, .. } if call_id == "legacy"
     ));
 }
+
+/// The explicit reconciliation flow the conservative stop promises: after the
+/// user verifies the workspace, `acknowledge_crash_window` closes every
+/// dangling call with an explicit user-acknowledged marker, and the next
+/// resume proceeds instead of failing forever on the same call.
+#[tokio::test]
+async fn acknowledged_crash_window_unblocks_resume() {
+    let patch = serde_json::json!({
+        "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+    })
+    .to_string();
+    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&engine, &session).await;
+    seed_dangling_call(&engine, &session, "apply_patch", patch).await;
+
+    // Without acknowledgement the resume is blocked (locked elsewhere).
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("unacknowledged mutating dangling call blocks resume");
+
+    // The user inspected the workspace and acknowledged: dangling calls close
+    // with an explicit marker...
+    let closed = engine.acknowledge_crash_window(&session).await.unwrap();
+    assert_eq!(closed, 1, "exactly the one dangling call is closed");
+
+    let events = recorded_events(&engine, &session).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EngineEvent::ToolCallFinished { call_id, is_error: true, preview, .. }
+                if call_id == "c1" && preview.contains("acknowledged")
+        )),
+        "the closure must be an explicit user-acknowledged marker, not a fake success: {events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\n",
+        "acknowledgement must not execute the uncertain patch"
+    );
+
+    // ...and the next resume proceeds to completion.
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("resume must proceed after explicit acknowledgement");
+}

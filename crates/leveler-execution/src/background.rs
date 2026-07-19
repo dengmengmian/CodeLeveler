@@ -198,7 +198,10 @@ impl BackgroundTaskRegistry {
         // Own process group so kill can signal the whole tree via pgid even
         // after the wait reaper has taken `Child`.
         #[cfg(unix)]
-        cmd.process_group(0);
+        {
+            cmd.process_group(0);
+            crate::command::set_parent_death_signal(&mut cmd);
+        }
         cmd.env_clear();
         for (name, value) in self.environment.vars_os() {
             let name_text = name.to_string_lossy();

@@ -364,20 +364,35 @@ pub(crate) fn should_seed_task_state(
     true
 }
 
+/// Seed loaders: indexed single-row lookups (never full-log scans), and a
+/// selected row that fails to parse is a hard error — same fail-loud policy as
+/// `EventLog::replay`, never a silently missing seed.
+async fn last_event_of_type(
+    db: &Database,
+    session_id: &SessionId,
+    event_type: &str,
+) -> Result<Option<EngineEvent>, EngineError> {
+    use leveler_storage::EventRepository;
+    match EventRepository::new(db)
+        .load_last_by_type(session_id, event_type, None)
+        .await?
+    {
+        Some(row) => Ok(Some(EngineEvent::from_payload(&row.payload)?)),
+        None => Ok(None),
+    }
+}
+
 /// Last full-list plan from the event log (SoT for resume PlanState).
 async fn last_persisted_plan(
     db: &Database,
     session_id: &SessionId,
 ) -> Result<Option<leveler_agent::PlanState>, EngineError> {
-    use leveler_storage::EventRepository;
-    let rows = EventRepository::new(db).load(session_id).await?;
-    let mut last = None;
-    for row in rows {
-        if let Ok(EngineEvent::PlanUpdated { steps }) = EngineEvent::from_payload(&row.payload) {
-            last = Some(leveler_agent::PlanState { steps });
-        }
-    }
-    Ok(last)
+    Ok(
+        match last_event_of_type(db, session_id, "plan_updated").await? {
+            Some(EngineEvent::PlanUpdated { steps }) => Some(leveler_agent::PlanState { steps }),
+            _ => None,
+        },
+    )
 }
 
 /// Last EvidenceLedger snapshot from the event log (SoT for Delivery resume).
@@ -385,17 +400,12 @@ async fn last_persisted_ledger(
     db: &Database,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::EvidenceLedger>, EngineError> {
-    use leveler_storage::EventRepository;
-    let rows = EventRepository::new(db).load(session_id).await?;
-    let mut last = None;
-    for row in rows {
-        if let Ok(EngineEvent::EvidenceLedgerUpdated { ledger }) =
-            EngineEvent::from_payload(&row.payload)
-        {
-            last = Some(ledger);
-        }
-    }
-    Ok(last)
+    Ok(
+        match last_event_of_type(db, session_id, "evidence_ledger_updated").await? {
+            Some(EngineEvent::EvidenceLedgerUpdated { ledger }) => Some(ledger),
+            _ => None,
+        },
+    )
 }
 
 /// Last ProgressLedger snapshot (closeout / no-progress streak for continue).
@@ -403,16 +413,12 @@ async fn last_persisted_progress(
     db: &Database,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::ProgressLedger>, EngineError> {
-    use leveler_storage::EventRepository;
-    let rows = EventRepository::new(db).load(session_id).await?;
-    let mut last = None;
-    for row in rows {
-        if let Ok(EngineEvent::ProgressUpdated { ledger }) = EngineEvent::from_payload(&row.payload)
-        {
-            last = Some(ledger);
-        }
-    }
-    Ok(last)
+    Ok(
+        match last_event_of_type(db, session_id, "progress_updated").await? {
+            Some(EngineEvent::ProgressUpdated { ledger }) => Some(ledger),
+            _ => None,
+        },
+    )
 }
 
 #[cfg(test)]

@@ -677,6 +677,31 @@ async fn run_windows_dispatch(
     }
 }
 
+/// Linux: deliver SIGTERM to the child when this (parent) process dies — the
+/// timeout/cancel paths already `killpg`, but a force-quit (`process::exit`,
+/// SIGKILL, third Ctrl-C) runs no destructors and would orphan grandchildren
+/// like `npm run dev`. macOS has no PDEATHSIG equivalent; process groups and
+/// registry Drop reaping remain the cleanup there.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_parent_death_signal(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the pre-exec closure runs in the forked child before exec and
+    // only calls `prctl`, which is async-signal-safe; it allocates nothing and
+    // touches no locks.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn set_parent_death_signal(_cmd: &mut Command) {}
+
 /// Unix path: process group + killpg for whole tree.
 #[cfg(not(windows))]
 async fn run_unix_process_group(
@@ -691,6 +716,7 @@ async fn run_unix_process_group(
     // Put the child in its own process group so we can terminate the whole
     // subtree (the child and any grandchildren) on timeout or cancellation.
     cmd.process_group(0);
+    set_parent_death_signal(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|source| ProcessError::Spawn {
         program: request.program.clone(),
