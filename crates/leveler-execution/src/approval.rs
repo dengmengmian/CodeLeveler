@@ -275,6 +275,51 @@ fn shell_script_needs_host_escape(script: &str) -> bool {
     false
 }
 
+/// Remote-publish commands (`git push`, `cargo publish`, `npm publish`, …).
+///
+/// Interactive Assisted auto-runs these (sandbox-first, user present to see
+/// the result). Unattended contexts — model-authored acceptance checks — must
+/// still refuse them: nobody is watching, and "the check pushed to a remote"
+/// is never acceptable verification evidence. Nested shell wrappers are
+/// unwrapped so `sh -c 'git push'` cannot launder the verdict.
+pub fn is_remote_publish_command(cmd: &CommandView) -> bool {
+    if is_shell_wrapper_program(cmd.program)
+        && let Some(script) = shell_c_script(cmd.args)
+    {
+        return shell_script_has_remote_publish(script);
+    }
+    is_remote_publish_program(basename(cmd.program), cmd.args.first().map(String::as_str))
+}
+
+fn shell_script_has_remote_publish(script: &str) -> bool {
+    for segment in split_shell_segments(script) {
+        let tokens = shell_tokens(&segment);
+        if let Some(inner) = nested_shell_c_body(&tokens) {
+            if shell_script_has_remote_publish(&inner) {
+                return true;
+            }
+            continue;
+        }
+        if let Some((prog, rest)) = tokens.split_first()
+            && is_remote_publish_program(basename(prog), rest.first().map(String::as_str))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_remote_publish_program(program: &str, first_arg: Option<&str>) -> bool {
+    matches!(
+        (program, first_arg),
+        ("git", Some("push"))
+            | ("cargo", Some("publish"))
+            | ("npm", Some("publish"))
+            | ("pnpm", Some("publish"))
+            | ("yarn", Some("publish"))
+    )
+}
+
 /// Classify a single resolved (program, first-arg) pair against the danger lists.
 ///
 /// This is the single source of danger verdicts: both the string classifier
@@ -282,11 +327,12 @@ fn shell_script_needs_host_escape(script: &str) -> bool {
 /// command here.
 ///
 /// Policy is sandbox-first for Assisted: only irreversible destruction,
-/// privilege escalation, host escape, and irreversible publish/push prompt.
-/// Network tools, package installers, and routine process control rely on the
-/// OS workspace sandbox rather than pre-run approval.
+/// privilege escalation, and host escape prompt. Network, shell builds/tests,
+/// and publish/push (`git push`, `cargo publish`, …) auto-run under Assisted —
+/// the OS workspace sandbox still confines writes. Users who want a prompt on
+/// every network/shell action should use RequestApproval.
 pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> CommandClass {
-    // Irreversible / host-wide destructive tools.
+    // Irreversible / host-wide destructive tools — the main Assisted prompt gate.
     const DESTRUCTIVE: &[&str] = &[
         "rm", "rmdir", "dd", "mkfs", "shutdown", "reboot", "halt", "poweroff",
     ];
@@ -308,12 +354,10 @@ pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> Comman
         }
     }
 
-    match program {
-        "git" if first_arg == Some("push") => CommandClass::Dangerous,
-        "cargo" if first_arg == Some("publish") => CommandClass::Dangerous,
-        "npm" if matches!(first_arg, Some("publish")) => CommandClass::Dangerous,
-        _ => CommandClass::Safe,
-    }
+    // `first_arg` retained for future command-specific danger lists; publish/push
+    // are intentionally Safe (sandbox-first + user-driven Always rules).
+    let _ = first_arg;
+    CommandClass::Safe
 }
 
 /// Classify a shell script, taking the strictest verdict across every command
@@ -601,9 +645,10 @@ impl ApprovalPolicy {
             };
         }
 
-        // 替我审批 (default): sandbox-first — only irreversible / break-out ops
-        // prompt. Network tools auto-run; the session/OS sandbox still gates
-        // whether packets actually leave the machine.
+        // 替我审批 (default / "auto"): sandbox-first — only destruction,
+        // privilege escalation, and host escape prompt. Network + ordinary
+        // shell (including `git push`) auto-run; OS sandbox still confines
+        // workspace writes. RequestApproval is the "ask more" profile.
         if is_command_tool(tool) {
             return match command.map(|c| classify_command(&c)) {
                 Some(CommandClass::Dangerous) => Requirement::NeedApproval,
@@ -724,14 +769,12 @@ mod tests {
             classify_command(&view("/usr/bin/sudo", &[])),
             CommandClass::Dangerous
         );
+        // Push/publish auto under Assisted (sandbox-first); only deletion/etc. prompt.
         let push = ["push".to_string(), "origin".to_string()];
-        assert_eq!(
-            classify_command(&view("git", &push)),
-            CommandClass::Dangerous
-        );
+        assert_eq!(classify_command(&view("git", &push)), CommandClass::Safe);
         assert_eq!(
             classify_command(&view("cargo", &["publish".into()])),
-            CommandClass::Dangerous
+            CommandClass::Safe
         );
         // Network / installers / routine process control rely on the OS sandbox,
         // not pre-run approval prompts (sandbox-first Assisted default).
@@ -882,7 +925,9 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_command_needs_approval() {
+    fn assisted_git_push_and_publish_are_auto() {
+        // Product policy: under Assisted, only deletion/privilege/host-escape
+        // prompt — not network shell or git push (screenshot: `git push` spam).
         let policy = ApprovalPolicy::default();
         let push = ["push".to_string()];
         assert_eq!(
@@ -892,7 +937,41 @@ mod tests {
                 RiskLevel::WorkspaceWrite,
                 Some(view("git", &push)),
             ),
-            Requirement::NeedApproval
+            Requirement::Auto
+        );
+        let shell_push = ["-c".to_string(), "git push".to_string()];
+        assert_eq!(
+            policy.evaluate(
+                PermissionProfile::Assisted,
+                "shell_command",
+                RiskLevel::WorkspaceWrite,
+                Some(view("sh", &shell_push)),
+            ),
+            Requirement::Auto,
+            "shell_command git push must not prompt under Assisted"
+        );
+        assert_eq!(
+            policy.evaluate(
+                PermissionProfile::Assisted,
+                "run_command",
+                RiskLevel::WorkspaceWrite,
+                Some(view("cargo", &["publish".to_string()])),
+            ),
+            Requirement::Auto
+        );
+    }
+
+    #[test]
+    fn assisted_network_risk_is_auto() {
+        let policy = ApprovalPolicy::default();
+        assert_eq!(
+            policy.evaluate(
+                PermissionProfile::Assisted,
+                "web_fetch",
+                RiskLevel::Network,
+                None
+            ),
+            Requirement::Auto
         );
     }
 
@@ -1174,8 +1253,8 @@ mod tests {
     }
 
     #[test]
-    fn classifies_installers_safe_publish_dangerous() {
-        // Installers are sandbox-first (no pre-prompt); publish stays irreversible.
+    fn classifies_installers_and_publish_safe_under_sandbox_first() {
+        // Installers and publish/push are sandbox-first (no pre-prompt under Assisted).
         assert_eq!(
             classify_command(&view("brew", &["install".to_string()])),
             CommandClass::Safe
@@ -1186,11 +1265,11 @@ mod tests {
         );
         assert_eq!(
             classify_command(&view("cargo", &["publish".to_string()])),
-            CommandClass::Dangerous
+            CommandClass::Safe
         );
         assert_eq!(
             classify_command(&view("npm", &["publish".to_string()])),
-            CommandClass::Dangerous
+            CommandClass::Safe
         );
     }
 
@@ -1252,5 +1331,36 @@ mod tests {
         assert!(is_comment_only_acceptance_command("   # bar"));
         assert!(is_comment_only_acceptance_command(""));
         assert!(!is_comment_only_acceptance_command("true # still has body"));
+    }
+}
+
+#[cfg(test)]
+mod remote_publish_tests {
+    use super::*;
+
+    fn view<'a>(program: &'a str, args: &'a [String]) -> CommandView<'a> {
+        CommandView { program, args }
+    }
+
+    #[test]
+    fn detects_push_and_publish_including_nested_shells() {
+        let push = ["push".to_string(), "origin".to_string()];
+        assert!(is_remote_publish_command(&view("git", &push)));
+        let publish = ["publish".to_string()];
+        assert!(is_remote_publish_command(&view("cargo", &publish)));
+        assert!(is_remote_publish_command(&view("npm", &publish)));
+        // Nested wrappers must not launder the verdict.
+        let nested = [
+            "-c".to_string(),
+            "echo hi && git push origin main".to_string(),
+        ];
+        assert!(is_remote_publish_command(&view("sh", &nested)));
+        let double = ["-c".to_string(), "bash -c 'cargo publish'".to_string()];
+        assert!(is_remote_publish_command(&view("sh", &double)));
+        // Ordinary commands stay clean.
+        let status = ["status".to_string()];
+        assert!(!is_remote_publish_command(&view("git", &status)));
+        let build = ["build".to_string()];
+        assert!(!is_remote_publish_command(&view("cargo", &build)));
     }
 }

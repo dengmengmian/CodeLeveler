@@ -197,7 +197,12 @@ impl Verifier {
                         program: shell,
                         args: &shell_args,
                     };
-                    if classify_command(&view) == CommandClass::Dangerous {
+                    // Publish/push is auto-run interactively (sandbox-first)
+                    // but stays refused here: acceptance checks run unattended
+                    // and must never have remote side effects.
+                    if classify_command(&view) == CommandClass::Dangerous
+                        || leveler_execution::is_remote_publish_command(&view)
+                    {
                         (
                             AcceptanceStatus::Unverifiable,
                             "rejected: dangerous acceptance command".to_string(),

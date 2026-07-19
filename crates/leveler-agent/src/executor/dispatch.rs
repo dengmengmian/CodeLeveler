@@ -545,12 +545,13 @@ mod authorize_tests {
         .with_approver(approver)
     }
 
-    /// `git push …` classifies dangerous, so Assisted always asks for it.
-    fn git_push_call() -> ToolCall {
+    /// `rm -rf …` classifies dangerous (irreversible destruction), so Assisted
+    /// always asks for it. (`git push` no longer prompts: sandbox-first.)
+    fn rm_rf_call() -> ToolCall {
         ToolCall {
             id: ToolCallId::new("c"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "git", "args": ["push", "origin", "main"]}),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
         }
     }
 
@@ -563,7 +564,7 @@ mod authorize_tests {
         let mut session = HashSet::new();
 
         executor
-            .authorize(&git_push_call(), &mut session)
+            .authorize(&rm_rf_call(), &mut session)
             .await
             .unwrap();
         assert_eq!(approver.asks(), 1);
@@ -574,14 +575,14 @@ mod authorize_tests {
         assert_eq!(set.rules().len(), 1);
         assert_eq!(
             set.rules()[0].match_.command_prefix.as_deref(),
-            Some("git push")
+            Some("rm -rf")
         );
 
         // A fresh session set is auto-allowed by the live rule set — the
         // approver is not asked again.
         let mut fresh_session = HashSet::new();
         executor
-            .authorize(&git_push_call(), &mut fresh_session)
+            .authorize(&rm_rf_call(), &mut fresh_session)
             .await
             .unwrap();
         assert_eq!(approver.asks(), 1);
@@ -595,7 +596,7 @@ mod authorize_tests {
         let mut session = HashSet::new();
 
         executor
-            .authorize(&git_push_call(), &mut session)
+            .authorize(&rm_rf_call(), &mut session)
             .await
             .unwrap();
         assert_eq!(approver.asks(), 1);
@@ -606,14 +607,14 @@ mod authorize_tests {
 
         // Same signature in-session: allowed without re-asking …
         executor
-            .authorize(&git_push_call(), &mut session)
+            .authorize(&rm_rf_call(), &mut session)
             .await
             .unwrap();
         assert_eq!(approver.asks(), 1);
         // … but a fresh session set asks again: nothing durable was recorded.
         let mut fresh_session = HashSet::new();
         executor
-            .authorize(&git_push_call(), &mut fresh_session)
+            .authorize(&rm_rf_call(), &mut fresh_session)
             .await
             .unwrap();
         assert_eq!(approver.asks(), 2);
@@ -627,7 +628,7 @@ mod authorize_tests {
         let mut session = HashSet::new();
 
         executor
-            .authorize(&git_push_call(), &mut session)
+            .authorize(&rm_rf_call(), &mut session)
             .await
             .unwrap();
         assert!(
@@ -636,20 +637,23 @@ mod authorize_tests {
         );
 
         executor
-            .authorize(&git_push_call(), &mut session)
+            .authorize(&rm_rf_call(), &mut session)
             .await
             .unwrap();
         assert_eq!(approver.asks(), 1, "session grant covers the repeat");
         let mut fresh_session = HashSet::new();
         executor
-            .authorize(&git_push_call(), &mut fresh_session)
+            .authorize(&rm_rf_call(), &mut fresh_session)
             .await
             .unwrap();
         assert_eq!(approver.asks(), 2, "nothing durable was recorded");
     }
 
     #[tokio::test]
-    async fn approve_always_shell_script_stays_session_only() {
+    async fn approve_always_shell_script_persists_an_exact_rule() {
+        // ApproveAlways on a compound shell now persists an EXACT rule (only
+        // this verbatim command), not nothing — so it survives across sessions
+        // without opening a `sh -c` prefix hole. A variant still asks.
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveAlways));
         let executor = executor_for(dir.path(), approver.clone())
@@ -663,13 +667,38 @@ mod authorize_tests {
         };
         executor.authorize(&script, &mut session).await.unwrap();
         assert_eq!(approver.asks(), 1);
-        assert!(
-            !leveler_execution::project_rules_path(dir.path()).exists(),
-            "shell scripts keep exact-hash identity; no durable rule"
+
+        let set =
+            leveler_execution::load_rules_file(&leveler_execution::project_rules_path(dir.path()))
+                .unwrap();
+        assert_eq!(set.rules().len(), 1, "an exact rule must be persisted");
+        assert_eq!(
+            set.rules()[0].match_.command_prefix,
+            None,
+            "compound shell must never get a prefix rule"
         );
-        // The session grant still covers the identical script.
-        executor.authorize(&script, &mut session).await.unwrap();
-        assert_eq!(approver.asks(), 1);
+        assert!(
+            set.rules()[0].match_.command_exact.is_some(),
+            "it must be an exact-match rule"
+        );
+
+        // A fresh session is auto-allowed by the persisted exact rule.
+        let mut fresh = HashSet::new();
+        executor.authorize(&script, &mut fresh).await.unwrap();
+        assert_eq!(
+            approver.asks(),
+            1,
+            "exact rule covers the identical command"
+        );
+
+        // A DIFFERENT script still asks — exact, not prefix.
+        let other = ToolCall {
+            id: ToolCallId::new("c2"),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"program": "sh", "args": ["-c", "rm -rf y"]}),
+        };
+        executor.authorize(&other, &mut fresh).await.unwrap();
+        assert_eq!(approver.asks(), 2, "a variant must not ride the exact rule");
     }
 
     #[tokio::test]
@@ -701,6 +730,7 @@ mod authorize_tests {
             match_: leveler_execution::RuleMatch {
                 tool: Some("apply_patch".into()),
                 command_prefix: None,
+                command_exact: None,
                 path_glob: Some("src/**".into()),
             },
             effect: leveler_execution::RuleEffect::Deny,
@@ -746,11 +776,11 @@ mod authorize_tests {
         let call = ToolCall {
             id: ToolCallId::new("c"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "git", "args": ["push"], "cwd": "src"}),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "x"], "cwd": "src"}),
         };
         executor.authorize(&call, &mut session).await.unwrap();
         let request = approver.last_request().unwrap();
-        assert_eq!(request.command.as_deref(), Some("git push"));
+        assert_eq!(request.command.as_deref(), Some("rm -rf x"));
         assert_eq!(request.paths, vec![std::path::PathBuf::from("src")]);
     }
 }

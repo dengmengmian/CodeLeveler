@@ -231,16 +231,13 @@ fn sandbox_first_verdicts() {
     assert_eq!(classify("rm", &["-rf"]), CommandClass::Dangerous);
     assert_eq!(classify("/usr/bin/sudo", &[]), CommandClass::Dangerous);
     assert_eq!(classify("curl", &["x"]), CommandClass::Safe);
-    assert_eq!(
-        classify("git", &["push", "origin"]),
-        CommandClass::Dangerous
-    );
+    assert_eq!(classify("git", &["push", "origin"]), CommandClass::Safe);
     assert_eq!(classify("git", &["status"]), CommandClass::Safe);
     assert_eq!(classify("cargo", &["test"]), CommandClass::Safe);
     assert_eq!(classify("ls", &[]), CommandClass::Safe);
     assert_eq!(classify("brew", &["install"]), CommandClass::Safe);
     assert_eq!(classify("chmod", &["+x"]), CommandClass::Safe);
-    assert_eq!(classify("cargo", &["publish"]), CommandClass::Dangerous);
-    assert_eq!(classify("npm", &["publish"]), CommandClass::Dangerous);
+    assert_eq!(classify("cargo", &["publish"]), CommandClass::Safe);
+    assert_eq!(classify("npm", &["publish"]), CommandClass::Safe);
     assert_eq!(classify("open", &["index.html"]), CommandClass::Dangerous);
 }

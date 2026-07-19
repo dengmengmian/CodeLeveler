@@ -23,11 +23,14 @@ struct Input {
     /// Working directory relative to the workspace root. Defaults to ".".
     #[serde(default)]
     cwd: Option<String>,
-    /// Timeout in seconds. Defaults to 120.
+    /// Timeout in seconds. Defaults to 120. Do not raise this to "wait forever"
+    /// for dev servers — use `background=true` instead.
     #[serde(default)]
     timeout_seconds: Option<u64>,
     /// When true, start the process in the background and return a task_id
     /// immediately. Use get_task / wait_task / kill_task to manage it.
+    /// Required for long-lived processes (HTTP servers, watchers): foreground
+    /// runs block the agent until exit or timeout.
     #[serde(default)]
     background: Option<bool>,
 }
@@ -72,6 +75,12 @@ impl Tool for RunCommandTool {
         let args = normalize_args(&input.program, input.args);
         if input.background.unwrap_or(false) {
             return execute_background(&input.program, args, input.cwd.as_deref(), context).await;
+        }
+        // Close the `sh -c 'python app.py & …'` bypass of shell_command guards.
+        if let Some(reason) =
+            super::shell_guard::refuse_run_command_shell_bypass(&input.program, &args)
+        {
+            return Ok(ToolOutput::error(reason));
         }
         execute_program(
             &input.program,
@@ -397,6 +406,45 @@ fn sandbox_denial_hint(sandboxed: bool, success: bool, body: &str) -> Option<&'s
 }
 
 /// Legacy marker truncation, kept for unit tests of the no-store path shape.
+#[cfg(test)]
+mod hang_guard_tests {
+    use super::*;
+    use crate::tool::{Tool, ToolContext};
+    use crate::tools::shell_guard::HANG_ANTI_PATTERN;
+    use leveler_execution::{PermissionProfile, Workspace};
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn sh_c_anti_pattern_refused_instantly() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-run-hang-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, PermissionProfile::Assisted);
+        let start = Instant::now();
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", HANG_ANTI_PATTERN],
+                }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(out.is_error, "must refuse bypass: {out:?}");
+        assert!(out.content.contains("background=true"), "{out:?}");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "must not hang, took {elapsed:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 #[cfg(test)]
 mod grant_tests {
     use super::*;

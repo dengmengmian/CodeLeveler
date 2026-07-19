@@ -41,6 +41,7 @@ fn permissions_list_shows_project_rule_then_clear_removes_it() {
         match_: RuleMatch {
             tool: Some("run_command".into()),
             command_prefix: Some("git push".into()),
+            command_exact: None,
             path_glob: None,
         },
         effect: RuleEffect::Allow,

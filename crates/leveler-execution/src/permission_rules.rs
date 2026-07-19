@@ -27,6 +27,11 @@ pub struct RuleMatch {
     /// Prefix of the rendered command line (`program` + args joined by space).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_prefix: Option<String>,
+    /// Exact (whitespace-trimmed) command line. Used for compound shells that
+    /// cannot be safely prefix-matched: only this one verbatim command is
+    /// allowed, so an appended payload (`cmd; rm -rf /`) never rides the rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_exact: Option<String>,
     /// Glob matched against any path involved (simple `*` / `**` / `?`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_glob: Option<String>,
@@ -125,6 +130,15 @@ fn rule_matches(m: &RuleMatch, tool: &str, command_line: Option<&str>, paths: &[
             return false;
         };
         if !cmd.starts_with(prefix.as_str()) {
+            return false;
+        }
+    }
+    if let Some(exact) = &m.command_exact {
+        any_constraint = true;
+        let Some(cmd) = command_line else {
+            return false;
+        };
+        if cmd.trim() != exact.as_str() {
             return false;
         }
     }
@@ -260,31 +274,43 @@ pub fn always_rules_for(
         effect: RuleEffect::Allow,
     };
     match tool {
-        "run_command" => command_prefix_rule(tool, command, allow),
-        // Simple one-shot scripts only; compound shells stay session-scoped.
-        "shell_command" => command_prefix_rule(tool, command, allow),
+        "run_command" | "shell_command" => command_rule(tool, command, allow),
         // Plan edits many files: one Always covers the whole edit tool.
         "apply_patch" | "replace" => vec![allow(RuleMatch {
             tool: Some(tool.to_string()),
             command_prefix: None,
+            command_exact: None,
             path_glob: None,
         })],
         _ => Vec::new(),
     }
 }
 
-/// Standing allow by `program [first-arg]` prefix for shell-like tools.
-fn command_prefix_rule(
+/// A standing allow rule for a shell-like tool. Simple commands get a
+/// `program [first-arg]` prefix rule (covers `cargo test …` variants). A
+/// compound shell (pipes, `$()`, `&&`, wrappers) cannot be prefix-generalized
+/// safely, so it gets an EXACT rule instead of nothing — persisting the one
+/// verbatim command the user approved without opening a hole for variants.
+fn command_rule(
     tool: &str,
     command: Option<&str>,
     allow: impl Fn(RuleMatch) -> PermissionRule,
 ) -> Vec<PermissionRule> {
-    let Some(prefix) = durable_command_prefix(command) else {
+    if let Some(prefix) = durable_command_prefix(command) {
+        return vec![allow(RuleMatch {
+            tool: Some(tool.to_string()),
+            command_prefix: Some(prefix),
+            command_exact: None,
+            path_glob: None,
+        })];
+    }
+    let Some(exact) = command.map(str::trim).filter(|c| !c.is_empty()) else {
         return Vec::new();
     };
     vec![allow(RuleMatch {
         tool: Some(tool.to_string()),
-        command_prefix: Some(prefix),
+        command_prefix: None,
+        command_exact: Some(exact.to_string()),
         path_glob: None,
     })]
 }
@@ -371,6 +397,7 @@ mod tests {
             match_: RuleMatch {
                 tool: Some(tool.into()),
                 command_prefix: Some(line.into()),
+                command_exact: None,
                 path_glob: None,
             },
             effect: RuleEffect::Allow,
@@ -385,6 +412,7 @@ mod tests {
             match_: RuleMatch {
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
+                command_exact: None,
                 path_glob: None,
             },
             effect: RuleEffect::Allow,
@@ -406,6 +434,7 @@ mod tests {
                 match_: RuleMatch {
                     tool: Some("run_command".into()),
                     command_prefix: Some("cargo".into()),
+                    command_exact: None,
                     path_glob: None,
                 },
                 effect: RuleEffect::Allow,
@@ -414,6 +443,7 @@ mod tests {
                 match_: RuleMatch {
                     tool: Some("run_command".into()),
                     command_prefix: Some("cargo clean".into()),
+                    command_exact: None,
                     path_glob: None,
                 },
                 effect: RuleEffect::Deny,
@@ -435,6 +465,7 @@ mod tests {
             match_: RuleMatch {
                 tool: Some("apply_patch".into()),
                 command_prefix: None,
+                command_exact: None,
                 path_glob: Some("src/**".into()),
             },
             effect: RuleEffect::Ask,
@@ -497,12 +528,28 @@ rules:
     }
 
     #[test]
-    fn always_rules_shell_wrapper_stays_session_only() {
-        // Scripts keep exact-hash identity; a `sh` prefix would grant everything.
-        assert!(always_rules_for("run_command", Some("sh -c 'cargo test'"), &[]).is_empty());
-        assert!(always_rules_for("run_command", Some("bash -lc 'ls'"), &[]).is_empty());
-        assert!(always_rules_for("shell_command", Some("sh -c 'rm -rf x'"), &[]).is_empty());
-        assert!(always_rules_for("shell_command", Some("cargo test | tee log"), &[]).is_empty());
+    fn always_rules_shell_wrapper_is_exact_never_prefix() {
+        // A `sh` prefix would grant every script, so wrappers/compound shells
+        // must never get a prefix rule. They now get an EXACT rule instead of
+        // nothing, so "Always" persists the one approved command verbatim.
+        for cmd in [
+            "sh -c 'cargo test'",
+            "bash -lc 'ls'",
+            "sh -c 'rm -rf x'",
+            "cargo test | tee log",
+        ] {
+            let rules = always_rules_for("shell_command", Some(cmd), &[]);
+            assert_eq!(rules.len(), 1, "{cmd}");
+            assert_eq!(
+                rules[0].match_.command_prefix, None,
+                "no prefix rule: {cmd}"
+            );
+            assert_eq!(
+                rules[0].match_.command_exact.as_deref(),
+                Some(cmd),
+                "exact rule for: {cmd}"
+            );
+        }
     }
 
     #[test]
@@ -518,6 +565,27 @@ rules:
         assert_eq!(
             set.evaluate("shell_command", Some("cargo test -p foo"), &[]),
             RuleDecision::Allow
+        );
+    }
+
+    #[test]
+    fn always_rules_shell_git_push_covers_later_similar_pushes() {
+        // "始终允许" for shell `git push` must stop re-prompting for `git push origin main`.
+        let rules = always_rules_for("shell_command", Some("git push"), &[]);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].match_.command_prefix.as_deref(), Some("git push"));
+        let set = PermissionRuleSet::from_rules(rules);
+        assert_eq!(
+            set.evaluate("shell_command", Some("git push"), &[]),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate("shell_command", Some("git push origin main"), &[]),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate("shell_command", Some("git status"), &[]),
+            RuleDecision::NoMatch
         );
     }
 
@@ -561,6 +629,7 @@ rules:
             match_: RuleMatch {
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
+                command_exact: None,
                 path_glob: None,
             },
             effect: RuleEffect::Allow,
@@ -581,6 +650,7 @@ rules:
             match_: RuleMatch {
                 tool: Some("apply_patch".into()),
                 command_prefix: None,
+                command_exact: None,
                 path_glob: Some("src/lib.rs".into()),
             },
             effect: RuleEffect::Allow,
@@ -600,6 +670,7 @@ rules:
             match_: RuleMatch {
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
+                command_exact: None,
                 path_glob: None,
             },
             effect: RuleEffect::Allow,
@@ -624,6 +695,7 @@ rules:
             match_: RuleMatch {
                 tool: Some("run_command".into()),
                 command_prefix: Some("cargo test".into()),
+                command_exact: None,
                 path_glob: None,
             },
             effect: RuleEffect::Allow,
@@ -634,5 +706,54 @@ rules:
         // Freshly merged rules no longer contain the cleared project rule.
         let set = load_merged_rules(dir.path(), dir.path());
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn always_rule_for_compound_shell_is_exact_not_prefix() {
+        // A compound shell (command substitution, pipes, &&) cannot be made a
+        // prefix rule — `$()` could hide anything, and a prefix is
+        // append-exploitable (`cmd; rm -rf /` starts with `cmd`). "Always"
+        // must still persist though, as an EXACT rule: only this one, verbatim
+        // command is allowed, so it survives across sessions without opening a
+        // hole for variants.
+        let cmd = "TOKEN=$(curl -sf localhost/login) && echo \"$TOKEN\"";
+        let rules = always_rules_for("shell_command", Some(cmd), &[]);
+        assert_eq!(
+            rules.len(),
+            1,
+            "compound shell must still get a durable rule"
+        );
+        assert_eq!(
+            rules[0].match_.command_prefix, None,
+            "compound shell must NOT get a prefix rule"
+        );
+        assert_eq!(
+            rules[0].match_.command_exact.as_deref(),
+            Some(cmd),
+            "it must be an exact-match rule"
+        );
+
+        let set = PermissionRuleSet::from_rules(rules);
+        assert_eq!(
+            set.evaluate("shell_command", Some(cmd), &[]),
+            RuleDecision::Allow,
+            "the exact command is allowed across sessions"
+        );
+        // The whole safety point: an appended payload does NOT match.
+        assert_eq!(
+            set.evaluate("shell_command", Some(&format!("{cmd}; rm -rf /")), &[]),
+            RuleDecision::NoMatch,
+            "an appended payload must not ride the exact rule"
+        );
+        // A different command does not match either.
+        assert_eq!(
+            set.evaluate("shell_command", Some("echo hi"), &[]),
+            RuleDecision::NoMatch
+        );
+        // Leading/trailing whitespace is normalized, not a bypass or a miss.
+        assert_eq!(
+            set.evaluate("shell_command", Some(&format!("  {cmd}  ")), &[]),
+            RuleDecision::Allow
+        );
     }
 }

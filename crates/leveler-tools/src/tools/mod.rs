@@ -18,6 +18,7 @@ mod replace;
 mod repository_search;
 mod run_command;
 mod shell_command;
+mod shell_guard;
 mod skills;
 mod symbols;
 mod task_control;
