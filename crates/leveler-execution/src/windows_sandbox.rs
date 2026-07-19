@@ -76,9 +76,11 @@ pub fn validate_acl_root(root: &Path) -> Result<(), String> {
         Some(Component::Prefix(_)) | Some(Component::RootDir) => {}
         _ => return Err(format!("ACL root not rooted: {}", root.display())),
     }
-    // Drive root (e.g. C:\) or Unix /
+    // Drive root (e.g. C:\) or Unix /: an anchor with no real directory below
+    // it. On Windows the RootDir stays after the Prefix, so count only Normal
+    // components.
     let rest: Vec<_> = components.collect();
-    if rest.is_empty() {
+    if !rest.iter().any(|c| matches!(c, Component::Normal(_))) {
         return Err(format!("refusing drive/root path: {}", root.display()));
     }
     // Known system paths (Windows-oriented; also blocks obvious Unix system dirs).
