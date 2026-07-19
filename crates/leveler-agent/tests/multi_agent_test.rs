@@ -25,6 +25,10 @@ struct SleepyRuntime {
     /// Per-stream delays (front is next). When empty, `default_delay` is used.
     delays: Mutex<VecDeque<Duration>>,
     default_delay: Duration,
+    /// Invoked with the 0-based stream index at the start of each `stream`
+    /// call, so tests can time cancellation deterministically.
+    on_stream: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    stream_count: std::sync::atomic::AtomicUsize,
 }
 
 impl SleepyRuntime {
@@ -33,12 +37,20 @@ impl SleepyRuntime {
             responses: Mutex::new(VecDeque::from(responses)),
             delays: Mutex::new(VecDeque::new()),
             default_delay: delay,
+            on_stream: None,
+            stream_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Per-response delays in stream order (extra responses use `default_delay`).
     fn with_delays(mut self, delays: Vec<Duration>) -> Self {
         self.delays = Mutex::new(VecDeque::from(delays));
+        self
+    }
+
+    /// Hook invoked at the start of each `stream` call with its 0-based index.
+    fn with_stream_hook(mut self, hook: impl Fn(usize) + Send + Sync + 'static) -> Self {
+        self.on_stream = Some(Arc::new(hook));
         self
     }
 }
@@ -59,6 +71,12 @@ impl ModelRuntime for SleepyRuntime {
         _cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         use leveler_model::ModelEvent;
+        let index = self
+            .stream_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(hook) = &self.on_stream {
+            hook(index);
+        }
         let delay = self
             .delays
             .lock()
@@ -1192,40 +1210,43 @@ async fn cancel_after_child_spend_still_flushes_ledger() {
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
 
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![spawn_call(
-                    "s1",
-                    serde_json::json!({"task": "run then hang", "role": "explorer"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // Child: one command, then a slow model round so cancel can land.
-            assistant_with(
-                vec![tool_call_part(
-                    "c1",
-                    "run_command",
-                    serde_json::json!({"program": "echo", "args": ["spent"]}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // Slow second child model call — parent cancel fires during this.
-            assistant_text("child still going"),
-            assistant_text("parent should not reach here cleanly"),
-        ],
-        // Delay only on stream; first parent + first child tool are quick enough
-        // that the command commits before cancel.
-        Duration::from_millis(40),
-    ));
-
     let token = CancellationToken::new();
     let cancel = token.clone();
-    tokio::spawn(async move {
-        // After child command likely completed (~2 streams × 40ms + tools).
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        cancel.cancel();
-    });
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "run then hang", "role": "explorer"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // Child: one command, then a slow model round so cancel can land.
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "run_command",
+                        serde_json::json!({"program": "echo", "args": ["spent"]}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // Slow second child model call — parent cancel fires during this.
+                assistant_text("child still going"),
+                assistant_text("parent should not reach here cleanly"),
+            ],
+            Duration::from_millis(40),
+        )
+        // Streams: 0 = parent spawn, 1 = child run_command (its spend commits
+        // before the next stream is requested), 2 = the child's following
+        // round. Cancel on stream 2 deterministically — a wall-clock timer
+        // races the child's command on loaded runners.
+        .with_stream_hook(move |index| {
+            if index == 2 {
+                cancel.cancel();
+            }
+        }),
+    );
 
     let mut events = Vec::new();
     let result = Executor::new(

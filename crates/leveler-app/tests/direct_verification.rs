@@ -114,6 +114,18 @@ compatibility:
     .unwrap();
 }
 
+/// Verify gates must spawn a real program. Unix fixtures shell out to `sh`;
+/// Windows runners have no `sh`/`true`/`grep` on PATH, so the same checks go
+/// through `cmd /c` there.
+fn gate_config(unix_body: &str, windows_body: &str) -> String {
+    let (program, flag, body) = if cfg!(windows) {
+        ("cmd", "/c", windows_body)
+    } else {
+        ("sh", "-c", unix_body)
+    };
+    format!("verify:\n  test: {{ program: \"{program}\", args: [\"{flag}\", \"{body}\"] }}\n")
+}
+
 #[tokio::test]
 async fn direct_run_fails_when_post_edit_verification_fails() {
     let patch = "*** Begin Patch\n*** Update File: README.md\n old\n+new\n*** End Patch";
@@ -138,10 +150,10 @@ async fn direct_run_fails_when_post_edit_verification_fails() {
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        r#"
-verify:
-  test: { program: "sh", args: ["-c", "echo VERIFY_SENTINEL; exit 1"] }
-"#,
+        gate_config(
+            "echo VERIFY_SENTINEL; exit 1",
+            "echo VERIFY_SENTINEL & exit 1",
+        ),
     )
     .unwrap();
     write_config(tmp.path(), &server.base_url());
@@ -205,10 +217,10 @@ async fn direct_content_run_fails_when_post_edit_verification_fails() {
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        r#"
-verify:
-  test: { program: "sh", args: ["-c", "echo CONTENT_VERIFY_SENTINEL; exit 1"] }
-"#,
+        gate_config(
+            "echo CONTENT_VERIFY_SENTINEL; exit 1",
+            "echo CONTENT_VERIFY_SENTINEL & exit 1",
+        ),
     )
     .unwrap();
     write_config(tmp.path(), &server.base_url());
@@ -281,10 +293,7 @@ async fn direct_run_succeeds_when_post_edit_verification_passes() {
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        r#"
-verify:
-  test: { program: "true", args: [] }
-"#,
+        gate_config("exit 0", "exit 0"),
     )
     .unwrap();
     write_config(tmp.path(), &server.base_url());
@@ -390,10 +399,7 @@ async fn direct_content_run_emits_verification_events() {
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        r#"
-verify:
-  test: { program: "true", args: [] }
-"#,
+        gate_config("exit 0", "exit 0"),
     )
     .unwrap();
     write_config(tmp.path(), &server.base_url());
@@ -484,10 +490,7 @@ async fn direct_run_repairs_once_after_failed_verification() {
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        r#"
-verify:
-  test: { program: "sh", args: ["-c", "grep fixed README.md"] }
-"#,
+        gate_config("grep fixed README.md", "findstr fixed README.md"),
     )
     .unwrap();
     write_config(tmp.path(), &server.base_url());

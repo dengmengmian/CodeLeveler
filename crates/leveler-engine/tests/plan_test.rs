@@ -162,6 +162,47 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     Harness { engine, dir }
 }
 
+/// A gate that always passes. Unix fixtures use `true`; Windows runners have
+/// no `true`/`sh` on PATH, so the gate goes through `cmd /c` there.
+fn passing_gate(name: &str) -> VerificationCommand {
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/c".to_string(), "exit 0".to_string()])
+    } else {
+        ("true", Vec::new())
+    };
+    VerificationCommand {
+        name: name.into(),
+        program: program.into(),
+        args,
+        kind: CheckKind::Test,
+        gating: true,
+        timeout_seconds: 30,
+    }
+}
+
+/// A gate that passes only when `needle` appears in `file`.
+fn grep_gate(name: &str, needle: &str, file: &str) -> VerificationCommand {
+    let (program, args) = if cfg!(windows) {
+        (
+            "cmd",
+            vec!["/c".to_string(), format!("findstr {needle} {file}")],
+        )
+    } else {
+        (
+            "sh",
+            vec!["-c".to_string(), format!("grep -q {needle} {file}")],
+        )
+    };
+    VerificationCommand {
+        name: name.into(),
+        program: program.into(),
+        args,
+        kind: CheckKind::Build,
+        gating: true,
+        timeout_seconds: 30,
+    }
+}
+
 fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
     TaskSpec {
         repository: h.dir.path().to_path_buf(),
@@ -197,14 +238,7 @@ async fn orchestrated_run_persists_every_node_as_a_turn() {
     let spec = spec(
         &h,
         VerificationPlan {
-            commands: vec![VerificationCommand {
-                name: "ok".into(),
-                program: "true".into(),
-                args: vec![],
-                kind: CheckKind::Test,
-                gating: true,
-                timeout_seconds: 30,
-            }],
+            commands: vec![passing_gate("ok")],
         },
     );
     let session = h.engine.create_task(&spec).await.unwrap();
@@ -373,14 +407,7 @@ async fn verification_failure_triggers_a_persisted_repair_turn() {
     let spec = spec(
         &h,
         VerificationPlan {
-            commands: vec![VerificationCommand {
-                name: "marker".into(),
-                program: "sh".into(),
-                args: vec!["-c".into(), "grep -q FIXED src/lib.rs".into()],
-                kind: CheckKind::Build,
-                gating: true,
-                timeout_seconds: 30,
-            }],
+            commands: vec![grep_gate("marker", "FIXED", "src/lib.rs")],
         },
     );
     let session = h.engine.create_task(&spec).await.unwrap();
@@ -433,14 +460,7 @@ async fn interrupted_orchestrated_run_resumes_mid_graph() {
     let spec = spec(
         &h,
         VerificationPlan {
-            commands: vec![VerificationCommand {
-                name: "ok".into(),
-                program: "true".into(),
-                args: vec![],
-                kind: CheckKind::Test,
-                gating: true,
-                timeout_seconds: 30,
-            }],
+            commands: vec![passing_gate("ok")],
         },
     );
     let session = h.engine.create_task(&spec).await.unwrap();
@@ -533,14 +553,7 @@ async fn interrupted_orchestrated_run_resumes_mid_graph() {
 #[tokio::test]
 async fn fallback_optional_ac_allows_verified_required_unverifiable_blocks() {
     let gate = VerificationPlan {
-        commands: vec![VerificationCommand {
-            name: "ok".into(),
-            program: "true".into(),
-            args: vec![],
-            kind: CheckKind::Test,
-            gating: true,
-            timeout_seconds: 30,
-        }],
+        commands: vec![passing_gate("ok")],
     };
 
     // --- Path A: understand fails twice → Requirement::fallback (optional).
@@ -632,14 +645,7 @@ async fn fallback_optional_ac_allows_verified_required_unverifiable_blocks() {
 #[tokio::test]
 async fn orchestrate_edit_answered_without_mutation_is_failed() {
     let gate = VerificationPlan {
-        commands: vec![VerificationCommand {
-            name: "ok".into(),
-            program: "true".into(),
-            args: vec![],
-            kind: CheckKind::Test,
-            gating: true,
-            timeout_seconds: 30,
-        }],
+        commands: vec![passing_gate("ok")],
     };
     let req = r#"{"goal":"explain how auth works","task_type":"docs",
         "acceptance_criteria":[]}"#;
@@ -685,14 +691,7 @@ async fn orchestrate_edit_answered_without_mutation_is_failed() {
 #[tokio::test]
 async fn orchestrate_inspect_only_may_verify_without_mutation() {
     let gate = VerificationPlan {
-        commands: vec![VerificationCommand {
-            name: "ok".into(),
-            program: "true".into(),
-            args: vec![],
-            kind: CheckKind::Test,
-            gating: true,
-            timeout_seconds: 30,
-        }],
+        commands: vec![passing_gate("ok")],
     };
     let req = r#"{"goal":"explain how auth works","task_type":"docs",
         "acceptance_criteria":[]}"#;
