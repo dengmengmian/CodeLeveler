@@ -10,7 +10,7 @@ All notable changes to CodeLeveler are documented here. The format follows
 - `leveler init`: interactively create `~/.leveler/config.toml` (refuses to
   overwrite; prints a template when not a TTY). Startup itself never writes
   config. The "no models configured" error now points at it.
-- Tag-triggered release workflow: four-platform binaries with `.sha256`
+- Tag-triggered release workflow: three-platform binaries (Linux x64, macOS arm64, Windows x64) with `.sha256`
   checksums attached to a draft GitHub release.
 - `leveler upgrade` verifies the release asset against its published sha256
   before installing, and refuses releases without a checksum.
