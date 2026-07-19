@@ -217,10 +217,26 @@ fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
 }
 
 // Required AC with a real check command — empty/missing hints are Unverifiable
-// and block Verified (K2). `grep` is non-trivial so acceptance can Met.
-const REQUIREMENT_JSON: &str = r#"{"goal":"add function b","task_type":"feature",
-    "acceptance_criteria":[{"id":"AC-1","description":"b exists",
-    "verification_hint":"grep -q 'pub fn b' src/lib.rs","required":true}]}"#;
+// and block Verified (K2). The grep is non-trivial so acceptance can Met; the
+// hint runs through the platform's shell (`sh -c` / `cmd /c`).
+fn requirement_json() -> String {
+    let hint = grep_hint("pub fn b", "src/lib.rs");
+    format!(
+        r#"{{"goal":"add function b","task_type":"feature",
+    "acceptance_criteria":[{{"id":"AC-1","description":"b exists",
+    "verification_hint":"{hint}","required":true}}]}}"#
+    )
+}
+
+/// `grep`-style acceptance hint for the platform's shell (`sh -c` on Unix,
+/// `cmd /c` on Windows), already JSON-escaped for the understand fixture.
+fn grep_hint(needle: &str, file: &str) -> String {
+    if cfg!(windows) {
+        format!("findstr \\\"{needle}\\\" {file}")
+    } else {
+        format!("grep -q '{needle}' {file}")
+    }
+}
 const PLAN_JSON: &str = r#"{"nodes":[{"id":"n1","kind":"edit",
     "description":"add pub fn b to src/lib.rs","allowed_paths":["src/lib.rs"]}]}"#;
 const PATCH: &str =
@@ -229,8 +245,8 @@ const PATCH: &str =
 #[tokio::test]
 async fn orchestrated_run_persists_every_node_as_a_turn() {
     let h = harness(vec![
-        text(REQUIREMENT_JSON), // understand
-        text(PLAN_JSON),        // plan
+        text(&requirement_json()), // understand
+        text(PLAN_JSON),           // plan
         tool_call("c1", "apply_patch", serde_json::json!({ "patch": PATCH })), // node round 1
         text("Added function b."), // node round 2 (finish)
     ])
@@ -321,7 +337,7 @@ async fn orchestrated_run_persists_every_node_as_a_turn() {
 #[tokio::test]
 async fn orchestrated_eval_respects_the_case_wide_round_budget() {
     let h = harness(vec![
-        text(REQUIREMENT_JSON),
+        text(&requirement_json()),
         text(PLAN_JSON),
         tool_call("c1", "apply_patch", serde_json::json!({ "patch": PATCH })),
         text("must not be requested"),
@@ -391,12 +407,13 @@ async fn verification_failure_triggers_a_persisted_repair_turn() {
         "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn b() {}\n+// FIXED\n*** End Patch";
     // Required AC proves FIXED marker (same check as the gate) so impl-class
     // Verified is allowed after repair.
+    let hint = grep_hint("FIXED", "src/lib.rs");
     let h = harness(vec![
-        text(
-            r#"{"goal":"add b and marker","task_type":"feature",
-            "acceptance_criteria":[{"id":"AC-1","description":"FIXED marker present",
-            "verification_hint":"grep -q FIXED src/lib.rs","required":true}]}"#,
-        ),
+        text(&format!(
+            r#"{{"goal":"add b and marker","task_type":"feature",
+            "acceptance_criteria":[{{"id":"AC-1","description":"FIXED marker present",
+            "verification_hint":"{hint}","required":true}}]}}"#
+        )),
         text(r#"{"nodes":[{"id":"n1","kind":"edit","description":"add pub fn b"}]}"#),
         tool_call("c1", "apply_patch", serde_json::json!({"patch": PATCH})),
         text("added b"),
@@ -450,7 +467,7 @@ async fn interrupted_orchestrated_run_resumes_mid_graph() {
         {"id":"n1","kind":"edit","description":"add pub fn b"},
         {"id":"n2","kind":"edit","description":"add a FIXED marker","dependencies":["n1"]}]}"#;
     let h = harness(vec![
-        text(REQUIREMENT_JSON),
+        text(&requirement_json()),
         text(two_node_plan),
         tool_call("c1", "apply_patch", serde_json::json!({ "patch": PATCH })),
         text("added b"),

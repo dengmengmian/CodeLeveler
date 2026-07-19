@@ -142,12 +142,13 @@ fn patch_then_resolve() -> Vec<ModelResponse> {
 
 /// Understand JSON with a required AC that greps the patch fixture (`pub fn added`).
 fn understand_met_required_ac() -> ModelResponse {
-    text(
-        r#"{"goal":"add a function","task_type":"feature","constraints":[],
-        "acceptance_criteria":[{"id":"AC-1","description":"added() exists",
-        "verification_hint":"grep -q 'pub fn added' src/lib.rs","required":true}],
-        "out_of_scope":[],"risk":"low","uncertainties":[]}"#,
-    )
+    let hint = grep_hint("pub fn added", "src/lib.rs");
+    text(&format!(
+        r#"{{"goal":"add a function","task_type":"feature","constraints":[],
+        "acceptance_criteria":[{{"id":"AC-1","description":"added() exists",
+        "verification_hint":"{hint}","required":true}}],
+        "out_of_scope":[],"risk":"low","uncertainties":[]}}"#
+    ))
 }
 
 /// Goal turn + understand that proves required acceptance (impl-class Verified path).
@@ -247,15 +248,32 @@ fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
 }
 
 fn gate(name: &str, program: &str) -> VerificationPlan {
+    // Unix fixtures use `true`/`false`; neither exists on Windows runners,
+    // so spell the same exit codes via cmd there.
+    let (program, args) = match (cfg!(windows), program) {
+        (true, "true") => ("cmd".to_string(), vec!["/c".into(), "exit 0".into()]),
+        (true, "false") => ("cmd".to_string(), vec!["/c".into(), "exit 1".into()]),
+        _ => (program.to_string(), Vec::new()),
+    };
     VerificationPlan {
         commands: vec![VerificationCommand {
             name: name.into(),
-            program: program.into(),
-            args: vec![],
+            program,
+            args,
             kind: CheckKind::Test,
             gating: true,
             timeout_seconds: 30,
         }],
+    }
+}
+
+/// `grep`-style acceptance hint for the platform's shell (`sh -c` on Unix,
+/// `cmd /c` on Windows), already JSON-escaped for the understand fixture.
+fn grep_hint(needle: &str, file: &str) -> String {
+    if cfg!(windows) {
+        format!("findstr \\\"{needle}\\\" {file}")
+    } else {
+        format!("grep -q '{needle}' {file}")
     }
 }
 
@@ -534,12 +552,13 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
 async fn direct_required_unmet_acceptance_blocks_verified() {
     let mut responses = patch_then_resolve();
     // After goal completes + gates pass, conclude_direct calls understand.
-    responses.push(text(
-        r#"{"goal":"add a function","task_type":"feature","constraints":[],
-        "acceptance_criteria":[{"id":"AC-1","description":"must contain NEVER_MARKER",
-        "verification_hint":"grep -q NEVER_MARKER src/lib.rs","required":true}],
-        "out_of_scope":[],"risk":"low","uncertainties":[]}"#,
-    ));
+    let hint = grep_hint("NEVER_MARKER", "src/lib.rs");
+    responses.push(text(&format!(
+        r#"{{"goal":"add a function","task_type":"feature","constraints":[],
+        "acceptance_criteria":[{{"id":"AC-1","description":"must contain NEVER_MARKER",
+        "verification_hint":"{hint}","required":true}}],
+        "out_of_scope":[],"risk":"low","uncertainties":[]}}"#
+    )));
     let h = harness(responses).await;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
@@ -565,12 +584,13 @@ async fn direct_required_unmet_acceptance_blocks_verified() {
 #[tokio::test]
 async fn direct_required_met_acceptance_allows_verified() {
     let mut responses = patch_then_resolve();
-    responses.push(text(
-        r#"{"goal":"add a function","task_type":"feature","constraints":[],
-        "acceptance_criteria":[{"id":"AC-1","description":"added() exists",
-        "verification_hint":"grep -q 'pub fn added' src/lib.rs","required":true}],
-        "out_of_scope":[],"risk":"low","uncertainties":[]}"#,
-    ));
+    let hint = grep_hint("pub fn added", "src/lib.rs");
+    responses.push(text(&format!(
+        r#"{{"goal":"add a function","task_type":"feature","constraints":[],
+        "acceptance_criteria":[{{"id":"AC-1","description":"added() exists",
+        "verification_hint":"{hint}","required":true}}],
+        "out_of_scope":[],"risk":"low","uncertainties":[]}}"#
+    )));
     let h = harness(responses).await;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
