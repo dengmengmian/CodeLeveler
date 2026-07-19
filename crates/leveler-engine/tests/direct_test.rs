@@ -271,7 +271,9 @@ fn gate(name: &str, program: &str) -> VerificationPlan {
 /// `cmd /c` on Windows), already JSON-escaped for the understand fixture.
 fn grep_hint(needle: &str, file: &str) -> String {
     if cfg!(windows) {
-        format!("findstr \\\"{needle}\\\" {file}")
+        // findstr parses `/` in the file argument as option switches, and the
+        // JSON fixture escapes both the quotes and the path backslashes.
+        format!("findstr \\\"{needle}\\\" {}", file.replace('/', "\\\\"))
     } else {
         format!("grep -q '{needle}' {file}")
     }
