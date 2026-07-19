@@ -14,15 +14,62 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::thread::ThreadId;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::windows_sandbox::validate_acl_root;
 
 /// Global per-root serialization (process-local; named mutex is Windows-only).
-fn root_locks() -> &'static Mutex<HashMap<String, ()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, ()>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Cross-thread contention WAITS on the condvar — parallel command spawns
+/// share roots (e.g. the tool-cache dir) and must not fail just because a
+/// sibling command is mid-sandbox. A same-thread re-prepare still fails fast:
+/// blocking there would deadlock.
+fn root_locks() -> &'static (Mutex<HashMap<String, ThreadId>>, Condvar) {
+    static LOCKS: OnceLock<(Mutex<HashMap<String, ThreadId>>, Condvar)> = OnceLock::new();
+    LOCKS.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
+}
+
+/// Held while a coordinator owns a root; releases it and wakes waiters on drop.
+#[derive(Debug)]
+struct RootPermit {
+    key: String,
+}
+
+impl Drop for RootPermit {
+    fn drop(&mut self) {
+        let (map, cv) = root_locks();
+        let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+        guard.remove(&self.key);
+        drop(guard);
+        cv.notify_all();
+    }
+}
+
+fn acquire_root(key: &str) -> Result<RootPermit, AclError> {
+    let current = std::thread::current().id();
+    let (map, cv) = root_locks();
+    let mut guard = map
+        .lock()
+        .map_err(|_| AclError::LockBusy(key.to_string()))?;
+    loop {
+        match guard.get(key) {
+            None => {
+                guard.insert(key.to_string(), current);
+                return Ok(RootPermit {
+                    key: key.to_string(),
+                });
+            }
+            Some(&owner) if owner == current => {
+                return Err(AclError::LockBusy(key.to_string()));
+            }
+            Some(_) => {
+                guard = cv
+                    .wait(guard)
+                    .map_err(|_| AclError::LockBusy(key.to_string()))?;
+            }
+        }
+    }
 }
 
 /// Snapshot of one root's ACL state (opaque icacls dump).
@@ -45,7 +92,7 @@ pub struct ResidueMarker {
 pub struct AclCoordinator {
     snapshots: Vec<AclSnapshot>,
     markers: Vec<ResidueMarker>,
-    locked_keys: Vec<String>,
+    permits: Vec<RootPermit>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,19 +119,13 @@ impl AclCoordinator {
     }
 
     /// Validate, lock, snapshot, and drop a residue marker for `root`.
+    /// Cross-thread contention on the same root waits; a same-thread
+    /// re-prepare fails fast with [`AclError::LockBusy`].
     pub fn prepare_root(&mut self, root: &Path) -> Result<(), AclError> {
         validate_acl_root(root).map_err(AclError::InvalidRoot)?;
         let key = normalize_root_key(root);
-        {
-            let mut map = root_locks()
-                .lock()
-                .map_err(|_| AclError::LockBusy(key.clone()))?;
-            if map.contains_key(&key) {
-                return Err(AclError::LockBusy(key));
-            }
-            map.insert(key.clone(), ());
-        }
-        self.locked_keys.push(key);
+        let permit = acquire_root(&key)?;
+        self.permits.push(permit);
 
         let marker = write_marker(root)?;
         self.markers.push(marker);
@@ -107,20 +148,10 @@ impl AclCoordinator {
         for marker in self.markers.drain(..) {
             let _ = fs::remove_file(&marker.path);
         }
-        self.release_locks();
+        self.permits.clear();
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
-        }
-    }
-
-    fn release_locks(&mut self) {
-        if let Ok(mut map) = root_locks().lock() {
-            for key in self.locked_keys.drain(..) {
-                map.remove(&key);
-            }
-        } else {
-            self.locked_keys.clear();
         }
     }
 }
@@ -347,6 +378,29 @@ mod tests {
         b.prepare_root(root).unwrap();
         assert!(marker_path(root).exists());
         b.restore_all().unwrap();
+    }
+
+    /// Parallel coordinators on one root must serialize, not fail: sandboxed
+    /// commands run concurrently (tests, parallel tool calls) and share roots
+    /// like the tool-cache dir.
+    #[test]
+    fn concurrent_prepare_on_other_thread_waits_for_the_root_lock() {
+        let dir = temp_root();
+        let root = dir.path().to_path_buf();
+        let mut a = AclCoordinator::new();
+        a.prepare_root(&root).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut b = AclCoordinator::new();
+            b.prepare_root(&root).expect("must wait, not fail");
+            tx.send(()).unwrap();
+            b.restore_all().unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        a.restore_all().unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second prepare must complete once the first restores");
+        handle.join().unwrap();
     }
 
     #[test]
