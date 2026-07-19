@@ -71,6 +71,17 @@ impl Tool for RunCommandTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        // The frequent mixup: the model hands run_command a whole shell string
+        // (or shell_command's `cmd` field) instead of program+args. Steer it to
+        // the right tool rather than surfacing a bare serde "missing field".
+        if input.get("program").is_none() {
+            return Ok(ToolOutput::error(
+                "run_command needs a `program` (the executable) and an optional \
+                 `args` array — it does not take a shell string. To run a whole \
+                 command line (e.g. `./admin-server`, or one with pipes / $() / \
+                 redirection / &&), use shell_command with its `cmd` field instead.",
+            ));
+        }
         let input: Input = super::parse_input(self.name(), input)?;
         let args = normalize_args(&input.program, input.args);
         if input.background.unwrap_or(false) {
@@ -716,6 +727,38 @@ mod tests {
         let shown = truncate_or_spill(&big, None);
         assert!(shown.contains("… [truncated]"));
         assert!(!shown.contains("full output:"));
+    }
+
+    #[tokio::test]
+    async fn missing_program_guides_to_shell_command() {
+        // The common mixup: the model passes a whole command line (or uses the
+        // shell_command `cmd` field) to run_command, which needs program+args.
+        // The error must steer it to shell_command instead of a raw serde note.
+        let dir =
+            std::env::temp_dir().join(format!("leveler-run-noprog-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"cmd": "./admin-server"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "missing program must be an error");
+        assert!(
+            out.content.contains("shell_command"),
+            "must steer to shell_command: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("program"),
+            "must name the missing field: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
