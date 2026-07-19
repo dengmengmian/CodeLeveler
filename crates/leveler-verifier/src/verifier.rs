@@ -185,9 +185,16 @@ impl Verifier {
                     Some("trivial"),
                 ),
                 Some(cmd) => {
-                    let shell_args = vec!["-c".to_string(), cmd.to_string()];
+                    // Hints run through the platform's script shell: `sh -c`
+                    // on Unix, `cmd /c` on Windows (no POSIX shell there).
+                    let (shell, flag) = if cfg!(windows) {
+                        ("cmd", "/c")
+                    } else {
+                        ("sh", "-c")
+                    };
+                    let shell_args = vec![flag.to_string(), cmd.to_string()];
                     let view = CommandView {
-                        program: "sh",
+                        program: shell,
                         args: &shell_args,
                     };
                     if classify_command(&view) == CommandClass::Dangerous {
@@ -199,7 +206,7 @@ impl Verifier {
                     } else {
                         // Sandbox: write confinement + force deny network (K12/K3).
                         let mut request = process_request_for_verify_check(
-                            "sh",
+                            shell,
                             shell_args,
                             self.workspace_root.clone(),
                             VerifyNetworkPolicy::ForceDeny,
@@ -466,8 +473,14 @@ mod tests {
                 std::env::temp_dir(),
             )),
         );
+        // `false` does not exist on Windows runners; fail via cmd there.
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/c", "exit 1"])
+        } else {
+            ("false", &[])
+        };
         let plan = VerificationPlan {
-            commands: vec![cmd("bad", "false", &[], true)],
+            commands: vec![cmd("bad", program, args, true)],
         };
         let report = v
             .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
@@ -485,13 +498,27 @@ mod tests {
                 id: "AC-1".into(),
                 description: "passes".into(),
                 // Non-trivial: real path check (not `true`, which is rejected).
-                command: Some("test -d .".into()),
+                command: Some(
+                    if cfg!(windows) {
+                        "if exist . (exit 0) else (exit 1)"
+                    } else {
+                        "test -d ."
+                    }
+                    .into(),
+                ),
                 required: true,
             },
             AcceptanceCheck {
                 id: "AC-2".into(),
                 description: "fails".into(),
-                command: Some("echo boom >&2; exit 1".into()),
+                command: Some(
+                    if cfg!(windows) {
+                        "echo boom 1>&2 & exit 1"
+                    } else {
+                        "echo boom >&2; exit 1"
+                    }
+                    .into(),
+                ),
                 required: true,
             },
             AcceptanceCheck {

@@ -180,8 +180,7 @@ pub fn synthesize_mutation_acceptance(
         if abs.exists() {
             continue;
         }
-        let quoted = shell_single_quote(&rel);
-        let command = format!("test ! -e {quoted}");
+        let command = absence_command(&rel);
         let id = mutation_delete_id(&rel, out.len());
         out.push(AcceptanceCheck {
             id,
@@ -191,6 +190,19 @@ pub fn synthesize_mutation_acceptance(
         });
     }
     out
+}
+
+/// Shell snippet proving `rel` is absent, for the platform's acceptance
+/// shell (`sh -c` on Unix, `cmd /c` on Windows — see `evaluate_acceptance`).
+#[cfg(not(windows))]
+fn absence_command(rel: &str) -> String {
+    format!("test ! -e {}", shell_single_quote(rel))
+}
+
+/// `cmd` equivalent of `test ! -e` (a Windows path cannot contain `"`).
+#[cfg(windows)]
+fn absence_command(rel: &str) -> String {
+    format!("if exist \"{rel}\" (exit 1) else (exit 0)")
 }
 
 /// Reject absolute paths, `..`, empty, control chars; return a normalized
@@ -228,6 +240,7 @@ pub fn sanitize_workspace_rel_path(raw: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+#[cfg(any(not(windows), test))]
 fn shell_single_quote(s: &str) -> String {
     // POSIX: 'foo'\''bar' for embedded single quotes.
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -397,8 +410,13 @@ mod tests {
         assert_eq!(checks[0].id, "MUT-DEL-deleted.rs");
         assert!(checks[0].required);
         let cmd = checks[0].command.as_deref().unwrap();
-        assert!(cmd.starts_with("test ! -e "), "{cmd}");
-        assert!(cmd.contains("'deleted.rs'"), "{cmd}");
+        if cfg!(windows) {
+            assert!(cmd.starts_with("if exist "), "{cmd}");
+            assert!(cmd.contains("\"deleted.rs\""), "{cmd}");
+        } else {
+            assert!(cmd.starts_with("test ! -e "), "{cmd}");
+            assert!(cmd.contains("'deleted.rs'"), "{cmd}");
+        }
         assert!(!is_trivial_like(cmd));
     }
 
