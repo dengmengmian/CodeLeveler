@@ -69,6 +69,10 @@ pub(crate) fn cmd_models_list(layout: Layout) -> anyhow::Result<std::process::Ex
     refs.sort_by_key(|r| r.to_string());
     if refs.is_empty() {
         println!("{}", Line::warn("No models configured."));
+        println!(
+            "  Add providers/models in ~/.leveler/config.toml \
+             (or $LEVELER_HOME/config.toml), then re-run `leveler doctor`."
+        );
     } else {
         println!("{}", Line::heading("Models"));
         for r in refs {

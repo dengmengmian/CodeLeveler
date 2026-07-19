@@ -801,6 +801,7 @@ fn ctrl_c_busy_cancels_then_force_cancels() {
         })]
     );
     assert!(s.cancel_armed);
+    assert!(!s.force_cancel_armed);
 
     let second = reduce(&mut s, ctrl('c'));
     assert_eq!(
@@ -808,6 +809,29 @@ fn ctrl_c_busy_cancels_then_force_cancels() {
         vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
             session_id: SessionId::new("s1"),
         })]
+    );
+    assert!(s.force_cancel_armed);
+
+    // Third press while still busy: force-cancel did not free the turn — quit.
+    assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
+}
+
+#[test]
+fn turn_cancelled_clears_force_cancel_arm() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentActivity {
+            label: "run".into(),
+        }),
+    );
+    reduce(&mut s, ctrl('c'));
+    reduce(&mut s, ctrl('c'));
+    assert!(s.force_cancel_armed);
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCancelled));
+    assert!(
+        !s.force_cancel_armed && !s.cancel_armed,
+        "cancel arms must clear at turn end, else next busy turn escalates too fast"
     );
 }
 

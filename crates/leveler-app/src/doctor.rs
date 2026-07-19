@@ -94,22 +94,9 @@ pub fn run_with_memory(
         });
     }
 
-    // Config bundle.
-    if config.providers.is_empty() {
-        results.push(CheckResult::warn(
-            "config: providers",
-            "no provider configs found",
-        ));
-    } else {
-        results.push(CheckResult::ok(
-            "config: providers",
-            format!("{} loaded", config.providers.len()),
-        ));
-    }
-    results.push(CheckResult::ok(
-        "config: models",
-        format!("{} loaded", config.models.len()),
-    ));
+    // Config bundle. First install with no models/providers must fail closed —
+    // "Environment looks healthy" with zero models is how new users get stuck.
+    results.extend(check_model_bundle(config));
 
     // Surface global-config load failures (incl. MCP plaintext env) even when
     // the rest of doctor runs against a lenient empty LoadedConfig.
@@ -163,6 +150,58 @@ fn memory_check(dir: &std::path::Path) -> CheckResult {
     }
 }
 
+/// Check that at least one provider and model exist, and every model points at
+/// a loaded provider. Empty / orphaned configs are Fail so `leveler doctor`
+/// never green-lights a machine that cannot start a turn.
+fn check_model_bundle(config: &LoadedConfig) -> Vec<CheckResult> {
+    let mut results = Vec::new();
+    let setup_hint = "add providers/models in ~/.leveler/config.toml (or $LEVELER_HOME/config.toml); see `leveler doctor` / README";
+
+    if config.providers.is_empty() {
+        results.push(CheckResult::fail(
+            "config: providers",
+            format!("none loaded — {setup_hint}"),
+        ));
+    } else {
+        results.push(CheckResult::ok(
+            "config: providers",
+            format!("{} loaded", config.providers.len()),
+        ));
+    }
+
+    if config.models.is_empty() {
+        results.push(CheckResult::fail(
+            "config: models",
+            format!("none loaded — {setup_hint}"),
+        ));
+    } else {
+        results.push(CheckResult::ok(
+            "config: models",
+            format!("{} loaded", config.models.len()),
+        ));
+        // Orphan models assemble fine but fail at first request with a late
+        // "unknown provider" — catch them here for first-install clarity.
+        let provider_ids: std::collections::BTreeSet<&str> =
+            config.providers.iter().map(|p| p.id.as_str()).collect();
+        for model in &config.models {
+            if !provider_ids.contains(model.profile.provider.as_str()) {
+                results.push(CheckResult::fail(
+                    &format!(
+                        "config: model {}/{}",
+                        model.profile.provider, model.profile.id
+                    ),
+                    format!(
+                        "provider `{}` is not configured — add [providers.{}] in ~/.leveler/config.toml",
+                        model.profile.provider, model.profile.provider
+                    ),
+                ));
+            }
+        }
+    }
+
+    results
+}
+
 fn check_api_key(provider: &ProviderConfig) -> CheckResult {
     let name = format!("api key: {}", provider.id);
     match resolve_api_key(provider) {
@@ -189,7 +228,17 @@ fn check_api_key(provider: &ProviderConfig) -> CheckResult {
 
 fn check_global_config() -> CheckResult {
     match crate::global_config::GlobalConfig::load() {
-        Ok(_) => CheckResult::ok("config: global", "ok"),
+        Ok(_) => {
+            // Distinguish "file missing → empty defaults" from "file present".
+            // First install often has no file; still Ok (models check fails),
+            // but the detail must not claim a config exists when it does not.
+            let detail = match crate::global_config::GlobalConfig::path() {
+                Some(path) if path.is_file() => format!("ok ({})", path.display()),
+                Some(path) => format!("not found at {} — using empty defaults", path.display()),
+                None => "no path (set HOME, USERPROFILE, or LEVELER_HOME)".into(),
+            };
+            CheckResult::ok("config: global", detail)
+        }
         // Display is key-safe for McpSecretInConfig (names field, not value).
         Err(e) => CheckResult::fail("config: global", e.to_string()),
     }
@@ -248,6 +297,107 @@ pub fn has_failure(results: &[CheckResult]) -> bool {
 mod tests {
     use super::*;
     use leveler_memory::{MemoryStore, new_entry};
+
+    fn sample_model(provider: &str, id: &str) -> leveler_provider::ModelConfigFile {
+        use leveler_model::{ModelCapabilities, ModelLimits, ModelProfile, ProtocolKind};
+        leveler_provider::ModelConfigFile {
+            profile: ModelProfile {
+                id: id.into(),
+                provider: provider.into(),
+                model_id: id.into(),
+                protocol: ProtocolKind::OpenAiChat,
+                capabilities: ModelCapabilities {
+                    streaming: true,
+                    tool_calling: true,
+                    parallel_tool_calls: true,
+                    structured_output: true,
+                    reasoning: false,
+                    vision: false,
+                },
+                limits: ModelLimits {
+                    context_window: 8_192,
+                    reliable_context: 4_096,
+                    max_output_tokens: 1_024,
+                    max_tool_schema_bytes: 8_192,
+                    max_parallel_tool_calls: 1,
+                },
+                reasoning: Default::default(),
+                compatibility: Default::default(),
+                instructions: None,
+                pricing: None,
+            },
+            policy: None,
+        }
+    }
+
+    fn sample_provider(id: &str) -> ProviderConfig {
+        ProviderConfig {
+            id: id.into(),
+            protocol: leveler_model::ProtocolKind::OpenAiChat,
+            base_url: "https://provider.invalid".into(),
+            api_key_env: "DEFINITELY_UNSET_LEVELER_TEST_KEY".into(),
+            api_key: Some("sk-test".into()),
+            headers: Default::default(),
+            timeouts: Default::default(),
+            retry: Default::default(),
+        }
+    }
+
+    #[test]
+    fn empty_config_fails_closed_for_first_install() {
+        let results = run(&LoadedConfig::default());
+        assert!(
+            has_failure(&results),
+            "first install with no models must not look healthy: {results:?}"
+        );
+        let providers = results
+            .iter()
+            .find(|r| r.name == "config: providers")
+            .expect("providers check");
+        let models = results
+            .iter()
+            .find(|r| r.name == "config: models")
+            .expect("models check");
+        assert_eq!(providers.status, CheckStatus::Fail, "{}", providers.detail);
+        assert_eq!(models.status, CheckStatus::Fail, "{}", models.detail);
+        assert!(
+            models.detail.contains("config.toml") || models.detail.contains("LEVELER_HOME"),
+            "hint must point at global config, not only repo configs/: {}",
+            models.detail
+        );
+    }
+
+    #[test]
+    fn model_without_matching_provider_is_a_failure() {
+        let config = LoadedConfig {
+            providers: vec![],
+            models: vec![sample_model("deepseek", "deepseek-chat")],
+            ..Default::default()
+        };
+        let results = run(&config);
+        assert!(has_failure(&results));
+        let orphan = results
+            .iter()
+            .find(|r| r.name.contains("deepseek/deepseek-chat"))
+            .expect("orphan model check");
+        assert_eq!(orphan.status, CheckStatus::Fail, "{}", orphan.detail);
+        assert!(orphan.detail.contains("provider"), "{}", orphan.detail);
+    }
+
+    #[test]
+    fn complete_bundle_passes_provider_and_model_checks() {
+        let config = LoadedConfig {
+            providers: vec![sample_provider("deepseek")],
+            models: vec![sample_model("deepseek", "deepseek-chat")],
+            ..Default::default()
+        };
+        let results = check_model_bundle(&config);
+        assert!(
+            results.iter().all(|r| r.status == CheckStatus::Ok),
+            "{results:?}"
+        );
+        assert!(!has_failure(&results));
+    }
 
     #[test]
     fn reports_missing_provider_api_key_as_failure() {

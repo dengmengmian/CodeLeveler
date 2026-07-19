@@ -36,6 +36,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
+sha2 = { workspace = true }
 console = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,4 +47,6 @@ reqwest = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+leveler-tools = { workspace = true }
+futures = { workspace = true }
 tempfile = "3"

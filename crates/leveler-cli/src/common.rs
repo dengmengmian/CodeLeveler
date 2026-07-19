@@ -38,9 +38,26 @@ pub(crate) fn resolve_model(app: &Application, model: Option<String>) -> anyhow:
     }
     let mut refs = app.model_refs();
     refs.sort_by_key(|r| r.to_string());
-    refs.into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no models configured; add one under configs/models/"))
+    refs.into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no models configured\n\
+                 \n\
+                 Run `leveler init` to set this up interactively, or create \
+                 ~/.leveler/config.toml (or $LEVELER_HOME/config.toml) with a \
+                 provider and model, then set the API key env var. Example:\n\
+                 \n\
+                   default_model = \"deepseek/deepseek-chat\"\n\
+                   [providers.deepseek]\n\
+                   base_url = \"https://api.deepseek.com\"\n\
+                   api_key_env = \"DEEPSEEK_API_KEY\"\n\
+                   [models.\"deepseek-chat\"]\n\
+                   provider = \"deepseek\"\n\
+                   context_window = 131072\n\
+                 \n\
+                 Then: export DEEPSEEK_API_KEY=… && leveler doctor\n\
+                 (Repo-local configs/models/*.yaml still works for developers.)"
+        )
+    })
 }
 
 pub(crate) fn map_mode(mode: RunMode) -> PermissionProfile {

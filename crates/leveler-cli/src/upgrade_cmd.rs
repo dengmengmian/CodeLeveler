@@ -103,6 +103,9 @@ pub struct ReleaseInfo {
     pub version: Version,
     pub asset_name: Option<String>,
     pub download_url: Option<String>,
+    /// The `<asset>.sha256` sibling asset. Installation refuses to proceed
+    /// without it — the self-update channel never installs unverified bytes.
+    pub checksum_url: Option<String>,
 }
 
 /// Look up a release: latest, or a specific tag (`v0.1.0` / `0.1.0`).
@@ -146,17 +149,22 @@ pub async fn fetch_release(
     let ver = parse_version(&release.tag_name)
         .with_context(|| format!("unparseable release tag `{}`", release.tag_name))?;
 
-    let (asset_name, download_url) = match host_target_triple() {
+    let (asset_name, download_url, checksum_url) = match host_target_triple() {
         Some(triple) => {
             let want = release_asset_name(ver, triple);
+            let checksum = release
+                .assets
+                .iter()
+                .find(|a| a.name == format!("{want}.sha256"))
+                .map(|a| a.browser_download_url.clone());
             release
                 .assets
                 .into_iter()
                 .find(|a| a.name == want)
-                .map(|a| (Some(a.name), Some(a.browser_download_url)))
-                .unwrap_or((None, None))
+                .map(|a| (Some(a.name), Some(a.browser_download_url), checksum))
+                .unwrap_or((None, None, None))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     Ok(ReleaseInfo {
@@ -164,6 +172,7 @@ pub async fn fetch_release(
         version: ver,
         asset_name,
         download_url,
+        checksum_url,
     })
 }
 
@@ -250,7 +259,7 @@ pub(crate) async fn cmd_upgrade(
     if let (Some(url), Some(name)) = (&release.download_url, &release.asset_name) {
         println!("{}", Line::heading("Downloading release asset"));
         println!("  {name}");
-        install_from_asset(&client, url, name).await?;
+        install_from_asset(&client, url, name, release.checksum_url.as_deref()).await?;
         println!(
             "{}",
             Line::ok(&format!("Installed {} successfully.", release.tag))
@@ -274,6 +283,7 @@ async fn install_from_asset(
     client: &reqwest::Client,
     url: &str,
     asset_name: &str,
+    checksum_url: Option<&str>,
 ) -> anyhow::Result<()> {
     let bytes = client
         .get(url)
@@ -285,6 +295,25 @@ async fn install_from_asset(
         .bytes()
         .await
         .context("read asset body")?;
+
+    // Fail closed: no published checksum → no install. Every release built by
+    // the release workflow ships `<asset>.sha256`; its absence means either a
+    // hand-rolled release or a stripped-down mirror — both untrusted.
+    let checksum_url = checksum_url.with_context(|| {
+        format!("release has no {asset_name}.sha256 asset; refusing unverified install")
+    })?;
+    let checksum_file = client
+        .get(checksum_url)
+        .send()
+        .await
+        .with_context(|| format!("download {checksum_url}"))?
+        .error_for_status()
+        .with_context(|| format!("download {checksum_url}"))?
+        .text()
+        .await
+        .context("read checksum body")?;
+    verify_sha256(&bytes, &checksum_file, asset_name)?;
+    println!("  sha256:   verified");
 
     let current_exe = std::env::current_exe().context("resolve current executable")?;
     let current_exe = std::fs::canonicalize(&current_exe).unwrap_or(current_exe);
@@ -445,6 +474,69 @@ fn install_via_cargo(repo: &str, tag: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Verify downloaded bytes against a `sha256sum`-style checksum file
+/// (`<hex>  <name>`). The self-update channel replaces the running binary —
+/// a corrupted or tampered download must never be installed.
+fn verify_sha256(bytes: &[u8], checksum_file: &str, asset_name: &str) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let expected = checksum_file
+        .split_whitespace()
+        .next()
+        .filter(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .with_context(|| format!("unparseable sha256 checksum file for {asset_name}"))?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!(
+            "sha256 mismatch for {asset_name}: expected {expected}, got {actual} — \
+             refusing to install a corrupted or tampered download"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod verify_sha256_tests {
+    use super::verify_sha256;
+
+    // sha256("leveler-test-bytes")
+    const GOOD: &str = "c22126f13fabb24a69455c85ff9e6821c68032ba91be2041b7275847e0e24906";
+
+    #[test]
+    fn matching_digest_passes() {
+        let line = format!("{GOOD}  leveler-v0.1.0-x.tar.gz\n");
+        verify_sha256(b"leveler-test-bytes", &line, "leveler-v0.1.0-x.tar.gz")
+            .expect("matching digest must verify");
+    }
+
+    #[test]
+    fn mismatched_digest_is_rejected() {
+        let line = format!("{}  leveler-v0.1.0-x.tar.gz\n", "0".repeat(64));
+        assert!(
+            verify_sha256(b"leveler-test-bytes", &line, "leveler-v0.1.0-x.tar.gz").is_err(),
+            "a wrong digest must reject the download"
+        );
+    }
+
+    #[test]
+    fn garbage_checksum_file_is_rejected() {
+        assert!(
+            verify_sha256(b"leveler-test-bytes", "not a checksum", "x.tar.gz").is_err(),
+            "an unparseable checksum file must reject, not skip verification"
+        );
+        assert!(
+            verify_sha256(b"leveler-test-bytes", "", "x.tar.gz").is_err(),
+            "an empty checksum file must reject"
+        );
+    }
+
+    #[test]
+    fn uppercase_digest_is_accepted() {
+        let line = format!("{}  x.tar.gz", GOOD.to_uppercase());
+        verify_sha256(b"leveler-test-bytes", &line, "x.tar.gz")
+            .expect("hex comparison must be case-insensitive");
+    }
 }
 
 #[cfg(test)]

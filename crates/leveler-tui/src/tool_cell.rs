@@ -547,7 +547,30 @@ pub(crate) fn tool_lines(
     t: &crate::i18n::UiText,
     out: &mut Vec<Line<'static>>,
 ) {
-    let glyph = tool_glyph(block.status);
+    // A guard turning down a read-only/bookkeeping call (closeout, loop-guard,
+    // skip-complete) is NOT a tool failure — the agent is correctly
+    // constraining itself. The model gets English guidance; the user should
+    // see a neutral "skipped", not a red error with internal English text.
+    let guard_denial = block.status == ToolStatus::Failed
+        && matches!(
+            block.name.as_str(),
+            "update_plan"
+                | "update_goal"
+                | "list_files"
+                | "git_status"
+                | "grep"
+                | "repository_search"
+        );
+    let glyph = if guard_denial {
+        "⊘"
+    } else {
+        tool_glyph(block.status)
+    };
+    let glyph_style = if guard_denial {
+        Style::default().fg(theme.muted)
+    } else {
+        tool_style(theme, block.status)
+    };
     // Prefer taxonomy presentation; task keeps the localized unsupported label.
     let action = if block.name == "task" {
         t.unsupported_task_action.to_string()
@@ -564,7 +587,7 @@ pub(crate) fn tool_lines(
 
     // Compact default row: glyph + presentation + one-line summary.
     let mut head = vec![
-        Span::styled(format!("{glyph} "), tool_style(theme, block.status)),
+        Span::styled(format!("{glyph} "), glyph_style),
         Span::styled(
             action.clone(),
             Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
@@ -617,7 +640,16 @@ pub(crate) fn tool_lines(
         return;
     };
     let actionable_preview;
-    let preview = if block.name == "task"
+    let preview = if guard_denial {
+        // Guard denials carry internal English guidance for the model
+        // (skip-complete, closeout, loop-guard). Users just need to know the
+        // action was turned down, not the raw guard text.
+        if block.name == "update_plan" {
+            t.plan_update_rejected
+        } else {
+            t.observe_denied
+        }
+    } else if block.name == "task"
         && (raw_preview.contains("unknown tool") || raw_preview.contains("spawn_agent"))
     {
         actionable_preview = t.unsupported_task_hint.to_string();
@@ -957,6 +989,91 @@ mod tests {
             text.iter()
                 .any(|l| l.contains("+39 行") && l.contains("Ctrl+O")),
             "must hint how to expand: {text:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_update_plan_hides_the_internal_validation_text() {
+        // A skip-complete rejection returns an English guard message meant for
+        // the model. The user sees a short localized "plan unchanged" line, not
+        // the raw `— plan step "…" cannot …` internals.
+        let block = ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("p1"),
+            name: "update_plan".to_string(),
+            arguments: r#"{"explanation":"现在开始第3步"}"#.to_string(),
+            status: ToolStatus::Failed,
+            preview: Some(
+                "— plan step \"创建项目结构\" cannot be completed while step 1 is in_progress"
+                    .to_string(),
+            ),
+            duration_ms: None,
+        };
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+            &mut out,
+        );
+        let text = out
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("plan step") && !text.contains("cannot"),
+            "internal English validation text must not reach the user: {text}"
+        );
+        assert!(
+            text.contains("计划未更新"),
+            "a short localized 'plan unchanged' note must show instead: {text}"
+        );
+    }
+
+    #[test]
+    fn closeout_denied_list_files_reads_as_a_neutral_skip_not_a_red_error() {
+        // After the plan completes, a repeat list_files is turned down with an
+        // English nudge. The user must see a neutral "skipped" (⊘, not ✗) with
+        // a localized note — never the internal English guard text.
+        let block = ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("l1"),
+            name: "list_files".to_string(),
+            arguments: r#"{"path":"backend"}"#.to_string(),
+            status: ToolStatus::Failed,
+            preview: Some(
+                "Plan steps are complete. Do not re-check git status, re-list files, or \
+                 re-audit prior questions — reply with a final summary only."
+                    .to_string(),
+            ),
+            duration_ms: None,
+        };
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+            &mut out,
+        );
+        let text = out
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("Plan steps are complete") && !text.contains("re-check"),
+            "internal English guard text must not reach the user: {text}"
+        );
+        assert!(
+            text.contains("已跳过"),
+            "a localized 'skipped' note must show instead: {text}"
+        );
+        assert!(
+            text.contains('⊘'),
+            "a guard denial reads as a neutral skip glyph, not the failure marker: {text}"
         );
     }
 

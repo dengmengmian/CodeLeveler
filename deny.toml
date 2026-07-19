@@ -8,9 +8,6 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # serde_yaml is archived/unmaintained. Retained temporarily for compatibility;
-    # track a migration to a maintained YAML implementation.
-    "RUSTSEC-2024-0320",
     # Expires 2026-10-01. Unreachable optional sqlx-mysql lockfile dependency;
     # this workspace enables sqlite only. See audit.toml for the graph check.
     "RUSTSEC-2023-0071",

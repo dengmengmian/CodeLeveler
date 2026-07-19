@@ -234,6 +234,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.input_queues.clear_pending();
             state.transcript.finalize_in_flight();
             state.cancel_armed = false;
+            state.force_cancel_armed = false;
             reset_reasoning(state);
             // Surface the error ONCE, followed by the persistent turn-end
             // marker. A duplicate transient notification would only add noise.
@@ -255,6 +256,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.input_queues.reject_pending();
             state.transcript.finalize_in_flight();
             state.cancel_armed = false;
+            state.force_cancel_armed = false;
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
             state.transcript.push_turn_end(
                 TurnEndStatus::Cancelled,
@@ -405,6 +407,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     state.input_queues.clear_pending();
     state.transcript.finalize_in_flight();
     state.cancel_armed = false;
+    state.force_cancel_armed = false;
     // Answer is in the transcript; a fully-done plan chrome is pure clutter.
     if state
         .plan

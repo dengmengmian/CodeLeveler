@@ -11,6 +11,7 @@ mod common;
 mod eval_cmd;
 mod eval_signals;
 mod info_cmds;
+mod init_cmd;
 mod mcp_lsp_cmds;
 mod memory_cmds;
 mod output;
@@ -46,7 +47,11 @@ async fn main() -> std::process::ExitCode {
         std::env::temp_dir(),
     ));
     let args = Cli::parse();
-    init_tracing(args.verbose);
+    // No subcommand or `tui` takes over the terminal (ratatui alternate
+    // screen). Logs written to stderr there paint straight over the UI and
+    // corrupt it, so TUI mode logs to a file instead.
+    let is_tui = matches!(args.command, None | Some(Command::Tui { .. }));
+    init_tracing(args.verbose, is_tui);
 
     match run(args).await {
         Ok(code) => code,
@@ -58,17 +63,46 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-fn init_tracing(verbose: u8) {
+fn init_tracing(verbose: u8, is_tui: bool) {
     let level = match verbose {
         0 => "warn",
         1 => "info",
         _ => "debug",
     };
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| format!("leveler={level}"));
+    if is_tui {
+        // The TUI owns the terminal; stderr must stay clean. Redirect to a log
+        // file, or disable logging entirely — never fall back to stderr, which
+        // would be the very corruption we are avoiding.
+        if let Some(file) = tui_log_file() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .try_init();
+        }
+        return;
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+/// Append-mode `~/.leveler/leveler.log` (next to the global config) for TUI
+/// runs. `None` disables file logging rather than risk corrupting the screen.
+fn tui_log_file() -> Option<std::fs::File> {
+    let path = leveler_app::GlobalConfig::path()?
+        .parent()?
+        .join("leveler.log");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 fn resolve_layout(repo: Option<PathBuf>, config_dir: Option<PathBuf>) -> anyhow::Result<Layout> {
@@ -221,8 +255,10 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Resume {
             id,
             auto_approve,
+            confirm_recovery,
             output,
-        } => cmd_resume(layout, id, auto_approve, output).await,
+        } => cmd_resume(layout, id, auto_approve, confirm_recovery, output).await,
+        Command::Init => init_cmd::cmd_init(),
         Command::Upgrade {
             check,
             force,

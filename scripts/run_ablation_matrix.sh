@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-night single-knob ablation matrix: flash × evals/l1-hard × 4 resolver
+# One-night single-knob ablation matrix: flash × evals/hard × 4 resolver
 # knobs (post-tier-retirement names; legacy require_* still accepted).
 # Each run carries its own control+ablated pair — never compare arms across
 # network conditions (0e2ae4a). Proxy env is stripped: through the local proxy
@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 
 LEVELER=target/release/leveler
 MODEL=deepseek/deepseek-v4-flash
-CASES=evals/l1-hard
+CASES=evals/hard
 KNOBS=(explicit_plan step_summary completion_evidence repeated_read_guard)
 
 for knob in "${KNOBS[@]}"; do

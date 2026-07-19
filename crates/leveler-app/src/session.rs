@@ -285,7 +285,8 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         }
         EngineError::RecoveryConfirmationRequired { call_id, tool } => AppError::Engine(format!(
             "crash recovery halted: an interrupted `{tool}` (call {call_id}) may already have \
-             run; verify the workspace state, then start a new turn"
+             run; inspect the workspace, then resume with --confirm-recovery to acknowledge \
+             and continue"
         )),
     }
 }
@@ -391,9 +392,11 @@ impl Application {
         observer: &mut dyn FnMut(AgentEvent),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
-        // Unattended default: AutoClarify. Prefer
-        // [`Self::run_in_session_with_clarifier`] from interactive UIs.
-        self.run_in_session_with_clarifier(
+        // Unattended defaults: AutoClarify + a wall-clock ceiling — nobody is
+        // watching a headless run to Ctrl+C a stuck task. Interactive UIs go
+        // through [`Self::run_in_session_with_clarifier`], which stays
+        // until-terminal. Config `limits.max_duration_seconds` overrides.
+        self.run_in_session_with_policy(
             session_id,
             model,
             mode,
@@ -403,6 +406,8 @@ impl Application {
             sandbox,
             observer,
             cancellation,
+            leveler_agent::ContinuationPolicy::UntilTerminal,
+            unattended_limits(self.top_level_limits()),
         )
         .await
     }
@@ -616,6 +621,19 @@ impl Application {
 
     /// Resume an interrupted session from its persisted transcript AND its
     /// persisted execution config (mode/sandbox/kind) **and product axes**
+    /// Close a session's dangling tool calls with a user-acknowledged marker
+    /// so a resume blocked by crash-recovery confirmation can proceed. The
+    /// caller asserts the workspace has been inspected. Returns the count.
+    pub async fn acknowledge_crash_window(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<usize, AppError> {
+        let db = self.open_database().await?;
+        leveler_engine::acknowledge_crash_window(&db, session_id)
+            .await
+            .map_err(app_error_from_engine)
+    }
+
     /// (work_profile / collaboration). Application in-memory defaults are not
     /// the SoT for resume — the session row is (CLI `leveler resume` may
     /// `assemble()` with balanced default).
@@ -685,6 +703,48 @@ impl Application {
             .update_status(session_id, status, state, leveler_core::now())
             .await?;
         result
+    }
+}
+
+/// A headless run's wall-clock ceiling when the project config sets none.
+/// Nobody is present to Ctrl+C an unattended task stuck on a slow gateway or
+/// a spinning model; interactive runs deliberately have no default ceiling.
+const DEFAULT_UNATTENDED_MAX_DURATION: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+
+/// Apply the unattended wall-clock default without overriding an explicitly
+/// configured `limits.max_duration_seconds`.
+fn unattended_limits(mut limits: leveler_agent::StepLimits) -> leveler_agent::StepLimits {
+    if limits.max_duration.is_none() {
+        limits.max_duration = Some(DEFAULT_UNATTENDED_MAX_DURATION);
+    }
+    limits
+}
+
+#[cfg(test)]
+mod unattended_limits_tests {
+    use super::*;
+
+    #[test]
+    fn headless_runs_get_a_wall_clock_ceiling_by_default() {
+        let limits = unattended_limits(leveler_agent::StepLimits::default());
+        assert_eq!(
+            limits.max_duration,
+            Some(DEFAULT_UNATTENDED_MAX_DURATION),
+            "an unattended run must never be unbounded in wall-clock time"
+        );
+    }
+
+    #[test]
+    fn configured_duration_wins_over_the_default() {
+        let configured = leveler_agent::StepLimits {
+            max_duration: Some(std::time::Duration::from_secs(120)),
+            ..Default::default()
+        };
+        assert_eq!(
+            unattended_limits(configured).max_duration,
+            Some(std::time::Duration::from_secs(120))
+        );
     }
 }
 

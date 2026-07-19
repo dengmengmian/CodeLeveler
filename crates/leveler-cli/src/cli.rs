@@ -200,10 +200,18 @@ pub enum Command {
         /// Approve risky actions automatically (no prompts).
         #[arg(long)]
         auto_approve: bool,
+        /// Acknowledge a crash-recovery stop: you have inspected the
+        /// workspace; close the interrupted tool call(s) and proceed.
+        #[arg(long)]
+        confirm_recovery: bool,
         /// Output format.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
     },
+
+    /// Create the global config (~/.leveler/config.toml) interactively.
+    /// Refuses to overwrite an existing config; prints a template when not a TTY.
+    Init,
 
     /// Check for or install a newer CodeLeveler release from GitHub.
     ///

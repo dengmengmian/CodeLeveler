@@ -907,10 +907,18 @@ fn clear_quit_confirm_notification(state: &mut AppState) {
 
 fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
     if state.is_busy() {
+        // Escalation: cancel → force-cancel → quit. Force-cancel alone is not
+        // enough when a tool is stuck in process wait: the runtime re-cancels
+        // the same token and the UI stays Busy forever. Third press exits.
+        if state.force_cancel_armed {
+            state.notification = None;
+            return vec![Effect::Quit];
+        }
         if state.cancel_armed {
+            state.force_cancel_armed = true;
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: "强制取消中…".to_string(),
+                message: "强制取消中…仍卡住再按 Ctrl+C 退出，或输入 /quit".to_string(),
             });
             return vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
                 session_id: state.session_id.clone(),

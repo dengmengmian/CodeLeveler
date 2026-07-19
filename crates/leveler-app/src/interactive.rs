@@ -402,14 +402,26 @@ impl InProcessRuntimeClient {
     }
 
     /// Record a checkpoint at the current transcript length, before a turn runs.
+    ///
+    /// When the transcript length cannot be determined the checkpoint is
+    /// skipped entirely — a fallback ordinal of 0 would restore to an empty
+    /// transcript, silently wiping the whole conversation.
     async fn checkpoint_before_turn(&self, session_id: &SessionId, label: &str) {
-        let ordinal = match self.app.open_database().await {
+        let loaded = match self.app.open_database().await {
             Ok(db) => MessageRepository::new(&db)
                 .load(session_id)
                 .await
                 .map(|m| m.len())
-                .unwrap_or(0),
-            Err(_) => 0,
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let Some(ordinal) = checkpoint_ordinal(loaded) else {
+            tracing::warn!(
+                session_id = %session_id.as_str(),
+                "skipping checkpoint: transcript length unavailable (a 0-ordinal \
+                 fallback would restore to an empty conversation)"
+            );
+            return;
         };
         let label: String = label.chars().take(40).collect();
         let checkpoint = UiCheckpoint {
@@ -716,9 +728,11 @@ impl InProcessRuntimeClient {
                         .collect();
                     // Same budgeted path as main turns — never dump unbounded raw history.
                     let snapshot = load_latest_context_snapshot(&db, &session_id).await;
+                    // Advisory side-question: bare fold, no model summary call.
                     let (mut messages, _) = leveler_engine::budget_prior_messages(
                         raw,
                         snapshot,
+                        None,
                         Some(question.as_str()),
                         leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
                     );
@@ -2040,6 +2054,35 @@ fn ui_message(payload: &str) -> Option<UiMessage> {
     })
 }
 
+/// The ordinal a new checkpoint records, or `None` to skip creating one.
+/// A load failure must NEVER fall back to 0: restoring a 0-ordinal checkpoint
+/// truncates the whole transcript.
+fn checkpoint_ordinal(loaded: Result<usize, String>) -> Option<usize> {
+    loaded.ok()
+}
+
+#[cfg(test)]
+mod checkpoint_ordinal_tests {
+    use super::checkpoint_ordinal;
+
+    #[test]
+    fn load_failure_skips_the_checkpoint_instead_of_recording_zero() {
+        assert_eq!(
+            checkpoint_ordinal(Err("db unavailable".to_string())),
+            None,
+            "a failed transcript load must skip the checkpoint — a 0-ordinal \
+             fallback wipes the conversation on restore"
+        );
+    }
+
+    #[test]
+    fn successful_load_records_the_transcript_length() {
+        assert_eq!(checkpoint_ordinal(Ok(7)), Some(7));
+        // An actually-empty transcript is a legitimate ordinal 0.
+        assert_eq!(checkpoint_ordinal(Ok(0)), Some(0));
+    }
+}
+
 #[cfg(test)]
 mod collab_route_tests {
     use super::collaboration_routes_submit_to_goal;
@@ -2184,6 +2227,7 @@ mod context_ops_tests {
         let before = raw.len();
         let (budgeted, _) = leveler_engine::budget_prior_messages(
             raw,
+            None,
             None,
             Some("side question"),
             // Force compaction path with a tiny threshold.

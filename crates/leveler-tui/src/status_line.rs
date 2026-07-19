@@ -407,7 +407,18 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
                 parts.push(t.pending_n.replacen("{}", &waiting.to_string(), 1));
             }
             let text = fit_status(&parts, width);
-            Line::from(Span::styled(text, Style::default().fg(theme.muted)))
+            // Give the moving spinner glyph an accent color so "still working"
+            // reads at a glance; keep the rest of the line low-key.
+            let rest = text.strip_prefix(frame).unwrap_or(&text);
+            Line::from(vec![
+                Span::styled(
+                    frame.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest.to_string(), Style::default().fg(theme.muted)),
+            ])
         }
         RuntimeStatus::Error | RuntimeStatus::Idle => {
             if let Some(label) = &state.activity {

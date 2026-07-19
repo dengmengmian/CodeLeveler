@@ -292,6 +292,9 @@ pub struct AppState {
 
     // Ctrl+C escalation state.
     pub cancel_armed: bool,
+    /// Set after ForceCancel was sent while still busy. A further Ctrl+C quits
+    /// so a hung turn cannot trap the user in cancel-only key handling.
+    pub force_cancel_armed: bool,
     pub quit_armed: bool,
 
     /// Monotonic frame counter driving the busy spinner animation.
@@ -392,6 +395,7 @@ impl AppState {
             clock_label: String::new(),
             context_window_tokens: boot.context_window,
             cancel_armed: false,
+            force_cancel_armed: false,
             quit_armed: false,
             tick: 0,
             turn_started_at: None,
@@ -441,6 +445,7 @@ impl AppState {
     /// Clear any pending Ctrl+C escalation (any other activity resets it).
     pub fn disarm_ctrlc(&mut self) {
         self.cancel_armed = false;
+        self.force_cancel_armed = false;
         self.quit_armed = false;
     }
 }

@@ -719,12 +719,27 @@ pub(crate) async fn cmd_resume(
     layout: Layout,
     id: String,
     auto_approve: bool,
+    confirm_recovery: bool,
     output: OutputFormat,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Axes SoT is the session row: resume_session reloads work_profile /
     // collaboration from DB. assemble() defaults (balanced) must not stick.
     let app = Application::assemble(layout)?;
     let session_id = leveler_core::SessionId::new(id.clone());
+
+    // The explicit answer to a RecoveryConfirmationRequired stop: the user
+    // inspected the workspace, so close the interrupted call(s) first.
+    if confirm_recovery {
+        let closed = app.acknowledge_crash_window(&session_id).await?;
+        if output == OutputFormat::Text {
+            println!(
+                "{}",
+                Line::warn(&format!(
+                    "Acknowledged {closed} interrupted tool call(s); they were NOT replayed."
+                ))
+            );
+        }
+    }
 
     if output == OutputFormat::Text {
         println!("{}", Line::heading(&format!("Resuming session {id}")));

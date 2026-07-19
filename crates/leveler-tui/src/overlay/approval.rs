@@ -14,9 +14,11 @@ use leveler_client_protocol::{ApprovalDecision, UiApprovalRequest};
 const OPTIONS: [(&str, ApprovalDecision); 4] = [
     ("仅允许本次", ApprovalDecision::ApproveOnce),
     ("本次会话内允许", ApprovalDecision::ApproveSession),
-    // Edits: whole apply_patch/replace tool. Shell: program [arg] prefix.
+    // Persisted as a project rule: whole tool (apply_patch), a `program [arg]`
+    // prefix (simple shell), or the exact command (compound shell). "不再问"
+    // is honest for all three; the scope varies by command shape.
     (
-        "始终允许（写入项目规则，同类不再问）",
+        "始终允许（写入项目规则，以后不再问）",
         ApprovalDecision::ApproveAlways,
     ),
     ("拒绝", ApprovalDecision::Deny),

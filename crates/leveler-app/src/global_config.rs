@@ -225,12 +225,18 @@ pub enum GlobalConfigError {
     McpEnvNotString { server: String, key: String },
 }
 impl GlobalConfig {
-    /// The config path: `$LEVELER_HOME/config.toml`, else `$HOME/.leveler/config.toml`.
+    /// The config path: `$LEVELER_HOME/config.toml`, else
+    /// `$HOME/.leveler/config.toml` (or `%USERPROFILE%\.leveler\config.toml` on
+    /// Windows). Matches [`leveler_project::Layout`]'s home resolution so state
+    /// and config never land in different roots on a first Windows install.
     pub fn path() -> Option<PathBuf> {
-        if let Some(home) = std::env::var_os("LEVELER_HOME") {
+        if let Some(home) = std::env::var_os("LEVELER_HOME").filter(|v| !v.is_empty()) {
             return Some(PathBuf::from(home).join("config.toml"));
         }
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".leveler").join("config.toml"))
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+            .map(|h| PathBuf::from(h).join(".leveler").join("config.toml"))
     }
 
     /// Load the global config, or an empty one if the file is absent. A present
@@ -262,13 +268,51 @@ impl GlobalConfig {
     /// picks the same model without re-selecting.
     pub fn save_default_model(model: &str) -> Result<(), GlobalConfigError> {
         let path = Self::path().ok_or_else(|| {
-            GlobalConfigError::Parse("no config path (set HOME or LEVELER_HOME)".to_string())
+            GlobalConfigError::Parse(
+                "no config path (set HOME, USERPROFILE, or LEVELER_HOME)".to_string(),
+            )
         })?;
         save_default_model_at(&path, model)
     }
 }
 
 /// Write `default_model = "…"` to a specific config path (tests + production).
+/// Render the starter config `leveler init` writes. Lives next to the parser
+/// so the generated document can never drift from the accepted schema (the
+/// round-trip is unit-tested in this module).
+pub fn render_init_config(
+    provider_id: &str,
+    base_url: &str,
+    api_key_env: &str,
+    model_id: &str,
+    context_window: u64,
+) -> String {
+    // Built with toml_edit so user-supplied values are always escaped
+    // correctly; the round-trip through the strict parser is unit-tested.
+    // Explicit `[providers.x]` tables (not inline) — humans edit this file.
+    let mut doc = DocumentMut::new();
+    doc["default_model"] = value(format!("{provider_id}/{model_id}"));
+    let mut provider = toml_edit::Table::new();
+    provider["base_url"] = value(base_url);
+    provider["api_key_env"] = value(api_key_env);
+    let mut providers = toml_edit::Table::new();
+    providers.set_implicit(true);
+    providers[provider_id] = toml_edit::Item::Table(provider);
+    doc["providers"] = toml_edit::Item::Table(providers);
+    let mut model = toml_edit::Table::new();
+    model["provider"] = value(provider_id);
+    model["context_window"] = value(context_window as i64);
+    let mut models = toml_edit::Table::new();
+    models.set_implicit(true);
+    models[model_id] = toml_edit::Item::Table(model);
+    doc["models"] = toml_edit::Item::Table(models);
+    format!(
+        "# CodeLeveler global config — created by `leveler init`.\n\
+         # Reference: https://github.com/dengmengmian/CodeLeveler#configuration\n\
+         {doc}"
+    )
+}
+
 pub fn save_default_model_at(path: &Path, model: &str) -> Result<(), GlobalConfigError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
@@ -470,6 +514,44 @@ fn parse_protocol(s: &str) -> ProtocolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_rendering_round_trips_through_the_parser() {
+        let text = render_init_config(
+            "deepseek",
+            "https://api.deepseek.com",
+            "DEEPSEEK_API_KEY",
+            "deepseek-chat",
+            131_072,
+        );
+        let parsed = GlobalConfig::from_toml_str(&text)
+            .expect("init output must parse with the strict (deny_unknown_fields) parser");
+        assert_eq!(
+            parsed.default_model.as_deref(),
+            Some("deepseek/deepseek-chat")
+        );
+        let bundle = parsed.into_bundle();
+        assert_eq!(bundle.providers.len(), 1, "one provider: {text}");
+        assert_eq!(bundle.providers[0].id, "deepseek");
+        assert_eq!(bundle.providers[0].base_url, "https://api.deepseek.com");
+        assert_eq!(bundle.providers[0].api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(bundle.models.len(), 1, "one model: {text}");
+        assert_eq!(bundle.models[0].profile.id, "deepseek-chat");
+        assert_eq!(bundle.models[0].profile.limits.context_window, 131_072);
+    }
+
+    #[test]
+    fn init_rendering_escapes_awkward_values() {
+        // Values are user input; a quote or backslash must not corrupt the TOML.
+        let text = render_init_config(
+            "my-provider",
+            "https://例子.example/v1?a=\"b\"",
+            "MY_KEY",
+            "model.v1",
+            8192,
+        );
+        GlobalConfig::from_toml_str(&text).expect("escaped values must still parse");
+    }
 
     #[test]
     fn expands_a_compact_toml_into_a_full_bundle() {
