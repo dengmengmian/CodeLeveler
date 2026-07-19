@@ -79,9 +79,18 @@ fn walk(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<S
         if path.is_dir() {
             walk(root, &path, depth + 1, max_depth, out);
         } else if let Ok(rel) = path.strip_prefix(root) {
-            out.push(rel.to_string_lossy().into_owned());
+            out.push(slashes(rel));
         }
     }
+}
+
+/// Workspace-relative paths use `/` on every platform so prompts, `is_test`,
+/// and scope checks match on one form (`strip_prefix` yields `\` on Windows).
+fn slashes(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Whether a path looks like a source file worth considering.
