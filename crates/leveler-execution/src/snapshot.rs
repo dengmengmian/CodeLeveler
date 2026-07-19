@@ -252,9 +252,11 @@ mod tests {
 
     async fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
+        // No autocrlf: the runner's global config must not smudge file content
+        // on checkout/restore (CRLF breaks byte-exact assertions).
         sh(
             dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t",
+            "git init -q && git config user.email t@t && git config user.name t && git config core.autocrlf false",
         )
         .await;
         dir

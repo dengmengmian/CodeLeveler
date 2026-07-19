@@ -710,11 +710,13 @@ async fn run_unix_process_group(
         _ = tokio::time::sleep(request.timeout) => {
             timed_out = true;
             terminate_unix_tree(child_pid, &mut child).await;
-            child.wait().await
+            // Never block forever on a post-kill wait (unkillable / stuck
+            // sandbox-exec children previously trapped cancel and the TUI).
+            wait_child_deadline(&mut child).await
         }
         _ = cancellation.cancelled() => {
             terminate_unix_tree(child_pid, &mut child).await;
-            let _ = child.wait().await;
+            let _ = wait_child_deadline(&mut child).await;
             return Err(ProcessError::Cancelled);
         }
     };
@@ -768,6 +770,29 @@ async fn run_with_windows_job(
     let stdout_task = tokio::spawn(async move { read_capped(&mut stdout_pipe, cap).await });
     let stderr_task = tokio::spawn(async move { read_capped(&mut stderr_pipe, cap).await });
 
+    // Bound post-kill wait so a stuck job cannot trap the agent turn (same
+    // failure mode as Unix child.wait hanging after killpg).
+    let wait_deadline = async |child: &mut process_wrap::tokio::Child| match tokio::time::timeout(
+        POST_KILL_WAIT,
+        Box::into_pin(child.wait()),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(_elapsed) => {
+            let _ = child.start_kill();
+            match tokio::time::timeout(Duration::from_millis(500), Box::into_pin(child.wait()))
+                .await
+            {
+                Ok(status) => status,
+                Err(_elapsed) => {
+                    use std::os::windows::process::ExitStatusExt;
+                    Ok(std::process::ExitStatus::from_raw(1))
+                }
+            }
+        }
+    };
+
     let mut timed_out = false;
     let status = tokio::select! {
         status = Box::into_pin(child.wait()) => status,
@@ -775,11 +800,11 @@ async fn run_with_windows_job(
             timed_out = true;
             // JobObjectChild::start_kill terminates the entire job tree.
             let _ = child.start_kill();
-            Box::into_pin(child.wait()).await
+            wait_deadline(&mut child).await
         }
         _ = cancellation.cancelled() => {
             let _ = child.start_kill();
-            let _ = Box::into_pin(child.wait()).await;
+            let _ = wait_deadline(&mut child).await;
             return Err(ProcessError::Cancelled);
         }
     };
@@ -875,6 +900,44 @@ async fn terminate_unix_tree(child_pid: Option<u32>, child: &mut tokio::process:
         let _ = killpg(group, Signal::SIGKILL);
     }
     child.start_kill().ok();
+}
+
+/// Upper bound for waiting after kill/timeout. Without this, a child that
+/// never reaps (rare sandbox / zombie edge cases) holds the tool future, which
+/// holds the whole turn, which holds the TUI in Busy with no escape.
+const POST_KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait for the child to exit, or give up after [`POST_KILL_WAIT`].
+///
+/// On deadline, attempt one more kill and return a synthetic signal-exit status
+/// so callers can finish (timeout → timed_out; cancel → Cancelled) instead of
+/// hanging the agent loop.
+#[cfg(not(windows))]
+async fn wait_child_deadline(
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    match tokio::time::timeout(POST_KILL_WAIT, child.wait()).await {
+        Ok(status) => status,
+        Err(_elapsed) => {
+            child.start_kill().ok();
+            match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+                Ok(status) => status,
+                Err(_elapsed) => {
+                    // Fabricate a signalled exit so the tool path unwinds.
+                    // Unix: status 9 ≈ SIGKILL. Prefer `from_raw` when available.
+                    synthetic_killed_status()
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn synthetic_killed_status() -> Result<std::process::ExitStatus, std::io::Error> {
+    // `ExitStatus::from_raw(9)` is SIGKILL on Unix; used only when wait truly
+    // will not return so the rest of the stack can still complete.
+    use std::os::unix::process::ExitStatusExt;
+    Ok(std::process::ExitStatus::from_raw(9))
 }
 
 /// Drain a pipe to EOF while keeping at most `cap` bytes in memory: the first
@@ -1075,6 +1138,37 @@ mod tests {
         assert!(matches!(err, ProcessError::Cancelled));
     }
 
+    /// Cancel must free the runner within a hard wall-clock bound (the product
+    /// hang: cancel/force-cancel stayed Busy for minutes). Allow SIGTERM grace
+    /// + POST_KILL_WAIT (2s) + margin.
+    #[tokio::test]
+    async fn cancellation_of_long_sleep_returns_within_bound() {
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+        let handle = tokio::spawn(async move {
+            CommandRunner::new()
+                .run(
+                    ProcessRequest::new("sleep", vec!["120".into()], std::env::temp_dir()),
+                    run_token,
+                )
+                .await
+        });
+        // Let the child actually start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let start = std::time::Instant::now();
+        token.cancel();
+        let result = handle.await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ProcessError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "cancel must complete within 4s (term + post-kill wait), took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn bwrap_confines_writes_to_roots() {
         let roots = vec![PathBuf::from("/ws"), PathBuf::from("/tmp")];
@@ -1126,10 +1220,14 @@ mod tests {
 
     #[test]
     fn absolute_arg_outside_roots_is_detected() {
-        let allowed = vec![PathBuf::from("/tmp")];
+        // Absolute-path spelling differs by platform.
+        #[cfg(not(windows))]
+        let (allowed, outside) = (PathBuf::from("/tmp"), "/etc/hosts");
+        #[cfg(windows)]
+        let (allowed, outside) = (PathBuf::from(r"C:\ws"), r"C:\Windows\System32\etc\hosts");
+        let allowed = vec![allowed];
         assert!(
-            first_absolute_arg_outside_roots(&["hello".into(), "/etc/hosts".into()], &allowed)
-                .is_some()
+            first_absolute_arg_outside_roots(&["hello".into(), outside.into()], &allowed).is_some()
         );
         assert!(first_absolute_arg_outside_roots(&["-n".into(), "hi".into()], &allowed).is_none());
     }

@@ -221,13 +221,22 @@ pub fn load_hooks_file(path: &Path) -> Result<HooksFile, String> {
 mod tests {
     use super::*;
 
+    /// Hook fixture shell exiting with `code`: `/bin/sh` on Unix, `cmd` on
+    /// Windows (`/bin/sh` does not exist there and would fail at spawn).
+    fn shell_exit(code: u32) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".into(), "/c".into(), format!("exit {code}")]
+        } else {
+            vec!["/bin/sh".into(), "-c".into(), format!("exit {code}")]
+        }
+    }
+
     #[tokio::test]
     async fn pre_exit_2_denies() {
         let dir = tempfile::tempdir().unwrap();
-        // portable: use /bin/sh -c 'exit 2'
         let runner = HookRunner {
             pre: vec![HookCommand {
-                command: vec!["/bin/sh".into(), "-c".into(), "exit 2".into()],
+                command: shell_exit(2),
             }],
             post: vec![],
             cwd: dir.path().to_path_buf(),
@@ -243,7 +252,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = HookRunner {
             pre: vec![HookCommand {
-                command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                command: shell_exit(0),
             }],
             post: vec![],
             cwd: dir.path().to_path_buf(),

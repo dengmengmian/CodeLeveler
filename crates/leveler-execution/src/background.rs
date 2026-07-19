@@ -396,7 +396,7 @@ impl BackgroundTaskRegistry {
     }
 
     /// Test-only: whether the wait reaper has already `take()`n `Child`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn child_taken_for_test(&self, id: &str) -> Option<bool> {
         let st = self.inner.lock().await;
         st.tasks.get(id).map(|t| t.child.is_none())
@@ -633,6 +633,9 @@ mod tests {
 
     /// Core PR-3a guarantee: after the wait reaper `take()`s `Child`, kill must
     /// still terminate the process via recorded pid/pgid.
+    /// Unix-only: pid/reaper semantics; Windows kills via Job Objects
+    /// (windows_job_ tests) and MSYS shell pids are not Win32 pids.
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_after_reaper_takes_child_terminates_process() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -685,6 +688,8 @@ mod tests {
 
     /// Session/registry drop must reap Running processes without an explicit kill
     /// (KillOnDrop must not be kept alive by reaper tasks).
+    /// Unix-only for the same pid-namespace reason as above.
+    #[cfg(unix)]
     #[tokio::test]
     async fn registry_drop_reaps_running_sleep() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -834,6 +839,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[cfg(unix)]
     async fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> Option<u32> {
         let start = Instant::now();
         loop {
@@ -849,6 +855,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn wait_until_child_taken(
         reg: &BackgroundTaskRegistry,
         id: &str,
@@ -876,17 +883,5 @@ mod tests {
         use nix::unistd::Pid;
         // signal 0 = existence check
         kill(Pid::from_raw(pid as i32), None).is_ok()
-    }
-
-    #[cfg(not(unix))]
-    fn process_alive(pid: u32) -> bool {
-        // Best-effort: tasklist; tests primarily target Unix CI.
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
-            Err(_) => false,
-        }
     }
 }

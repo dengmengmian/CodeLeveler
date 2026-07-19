@@ -364,6 +364,8 @@ mod tests {
         assert!(validate_acl_root(Path::new("/")).is_err());
         assert!(validate_acl_root(Path::new("relative/path")).is_err());
         assert!(validate_acl_root(Path::new("/usr/bin")).is_err());
+        // A drive-less Unix path is a valid ACL root only on Unix hosts.
+        #[cfg(not(windows))]
         assert!(validate_acl_root(Path::new("/Users/me/project")).is_ok());
         #[cfg(windows)]
         {
