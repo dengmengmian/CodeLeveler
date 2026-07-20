@@ -2272,6 +2272,67 @@ async fn completion_audit_accepts_fresh_verification() {
 }
 
 #[tokio::test]
+async fn completion_evidence_nudge_is_capped_when_verification_never_passes() {
+    // Regression: on a machine where verification can never pass (e.g. a broken
+    // local sandbox failing every test), the model keeps making "progress" (a
+    // tool call) between finish attempts, so `progress_since_evidence_nudge`
+    // stays true and the gate would nudge forever. The hard cap must stop it and
+    // let the turn close instead of looping.
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-nudgecap-{}",
+        std::process::id() as u64 * 43 + 7
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Edit, then before every finish attempt do a read_file (progress) but never
+    // run a passing verification. With the cap, the third finish attempt closes.
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+            }),
+        ),
+        assistant_tool_call("c2", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_text("Done."), // finish #1 → nudge #1
+        assistant_tool_call("c3", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_text("Done."), // finish #2 → nudge #2 (progress happened)
+        assistant_tool_call("c4", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_text("Final answer."), // finish #3 → cap hit, accepts (no nudge)
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_structure(false, true);
+
+    let outcome = executor
+        .run(
+            "Add an `added` function to lib.rs",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Terminates at the third finish attempt — no infinite nudging.
+    assert_eq!(outcome.final_text, "Final answer.");
+    assert_eq!(outcome.rounds, 7, "cap must stop a 3rd evidence nudge");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn completion_audit_reengages_only_after_progress() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-reaudit-{}",
@@ -5096,24 +5157,32 @@ async fn cancel_mid_serial_batch_commits_completed_results_and_spend() {
     );
 
     // And its result must be persisted, paired with the assistant tool calls,
-    // so a resumed session knows what already executed.
+    // so a resumed session knows what already executed. Don't assert on the
+    // command's stdout ("first-done"): the test sandbox (seatbelt / AppContainer)
+    // can block `echo` on macOS and Windows, making its output unreliable. The
+    // stable invariant is that cancel fires only AFTER c1's result is observed,
+    // so c1 always completes on its own — success or sandbox error — and is
+    // never a cancellation result. (c2, by contrast, is cut short: whether it
+    // gets the deny_call refusal or a process-level cancel depends on timing,
+    // so we only assert c2 is paired at all, not its content.)
     let messages = transcript.lock().unwrap();
     let c1_persisted = messages.iter().any(|m| {
         m.content.iter().any(|p| {
             matches!(
                 p,
                 ContentPart::ToolResult { result }
-                    if result.call_id.as_str() == "c1" && result.content.contains("first-done")
+                    if result.call_id.as_str() == "c1"
+                        && !result.content.contains("cancelled")
             )
         })
     });
     assert!(
         c1_persisted,
-        "the completed call's result must be committed to the transcript before Cancelled; \
-         persisted messages: {messages:?}"
+        "the completed call's result must be committed to the transcript before Cancelled \
+         and must be its own completion, not a cancellation; persisted messages: {messages:?}"
     );
     // Every tool_use must have a paired result — the cut-short second call is
-    // refused in place, never left dangling.
+    // refused/cancelled in place, never left dangling.
     let c2_persisted = messages.iter().any(|m| {
         m.content.iter().any(
             |p| matches!(p, ContentPart::ToolResult { result } if result.call_id.as_str() == "c2"),
@@ -5121,7 +5190,7 @@ async fn cancel_mid_serial_batch_commits_completed_results_and_spend() {
     });
     assert!(
         c2_persisted,
-        "the unfinished call must get a refusal result so the transcript stays paired; \
+        "the unfinished call must get a paired result so the transcript stays paired; \
          persisted messages: {messages:?}"
     );
 

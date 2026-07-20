@@ -684,7 +684,6 @@ async fn run_windows_dispatch(
 /// registry Drop reaping remain the cleanup there.
 #[cfg(target_os = "linux")]
 pub(crate) fn set_parent_death_signal(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
     // SAFETY: the pre-exec closure runs in the forked child before exec and
     // only calls `prctl`, which is async-signal-safe; it allocates nothing and
     // touches no locks.
