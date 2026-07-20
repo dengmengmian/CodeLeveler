@@ -508,12 +508,13 @@ mod tests {
             AcceptanceCheck {
                 id: "AC-1".into(),
                 description: "passes".into(),
-                // Non-trivial: real path check (not `true`, which is rejected).
-                // `dir` reliably lists the (existing) cwd and exits 0; bare
-                // `if exist .` is unreliable in cmd.exe.
+                // Non-trivial (a redirect makes `echo` non-trivial, so it is not
+                // rejected) and exits 0. Mirrors AC-2's proven-on-Windows
+                // construct; bare `true` is rejected and `if exist .` / `dir
+                // >nul` proved unreliable under cmd.exe on the runner.
                 command: Some(
                     if cfg!(windows) {
-                        "dir >nul"
+                        "echo ok 1>&2"
                     } else {
                         "test -d ."
                     }
