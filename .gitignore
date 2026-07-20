@@ -41,3 +41,9 @@ dist/
 # Local sandbox / tool-cache leftovers from execution tests
 crates/leveler-execution/leveler-ac-*/
 crates/leveler-execution/leveler-tool-cache/
+
+# Conversation exports written by /export (default cwd)
+leveler-chat-*.md
+
+# Local per-session test scratch dir
+fixtures/
