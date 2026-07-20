@@ -723,6 +723,45 @@ mod tests {
         );
     }
 
+    /// Complement to `registry_drop_reaps_running_sleep`: a per-turn engine holds
+    /// a *clone* of the process-lived registry, so dropping that clone at turn end
+    /// must NOT reap background processes — only the last handle (process exit)
+    /// does. This is the invariant the app-level registry hoist relies on so
+    /// `background=true` servers survive across turns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_registry_clone_keeps_tasks_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 60", pid_file.display());
+        let reg = BackgroundTaskRegistry::new();
+        let req = ProcessRequest::new("sh", vec!["-c".into(), script], dir.path().to_path_buf());
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let pid = wait_for_pid_file(&pid_file, Duration::from_secs(5))
+            .await
+            .expect("pid file");
+
+        // Simulate a turn ending: the engine's registry clone goes out of scope.
+        let clone = reg.clone();
+        drop(clone);
+
+        // The process must stay alive and the task must remain queryable on the
+        // surviving handle across a window that comfortably exceeds reap timing.
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                process_alive(pid),
+                "a clone drop must not reap background pid {pid}"
+            );
+        }
+        assert!(
+            reg.get(&id).await.is_some(),
+            "surviving handle must still know the task id after a clone drop"
+        );
+
+        drop(reg); // last handle: reaping is allowed now.
+    }
+
     #[tokio::test]
     async fn spawn_honors_sandbox_fields_on_process_request() {
         // Smoke: confined ProcessRequest spawns and produces stdout (wrap path

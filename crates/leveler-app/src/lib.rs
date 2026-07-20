@@ -129,6 +129,12 @@ pub struct Application {
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
     environment: Arc<leveler_core::EnvSnapshot>,
+    /// Process-lived background task registry, shared (cloned) into every
+    /// engine/turn so `background=true` servers survive between messages. A
+    /// per-engine registry was dropped at turn end, and its `KillOnDrop` reaped
+    /// every background process — hence servers dying between turns. Only the
+    /// process exit drops the last handle.
+    background_tasks: Arc<leveler_execution::BackgroundTaskRegistry>,
 }
 
 impl Application {
@@ -206,6 +212,9 @@ impl Application {
 
         // Project config + env (composition root may read env — AGENTS.md).
         let readonly_roots = Self::default_readonly_roots(&layout.repo_root);
+        let background_tasks = Arc::new(
+            leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone()),
+        );
         Ok(Self {
             layout,
             config,
@@ -217,6 +226,7 @@ impl Application {
             work_profile: WorkProfile::Balanced,
             collaboration: CollaborationMode::Chat,
             environment,
+            background_tasks,
         })
     }
 
@@ -397,9 +407,12 @@ impl Application {
         let artifact_store = std::sync::Arc::new(leveler_execution::ArtifactStore::new(
             self.layout.state_dir.join("artifacts"),
         ));
-        let bg = std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::with_environment(
-            self.environment.clone(),
-        ));
+        // Reuse the process-lived registry so background servers/watchers
+        // survive across turns. A fresh per-engine registry was dropped when the
+        // turn's engine went out of scope, and its KillOnDrop killed every
+        // background process (and the next turn's registry no longer knew the
+        // task id) — the "服务活不过一个回合" bug.
+        let bg = self.background_tasks.clone();
         let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
             .with_policy_limits(max_files, read_guard)
             .with_sandbox(sandbox)
