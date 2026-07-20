@@ -2328,7 +2328,7 @@ async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
+    assert_eq!(outcome.stop_reason, StopReason::TurnLimitReached);
     assert_eq!(outcome.rounds, 5, "must stop exactly at the round ceiling");
     assert!(
         outcome.final_text.contains("ceiling"),

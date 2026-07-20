@@ -2256,6 +2256,11 @@ mod continue_cap_tests {
             Some(TaskOutcome::BudgetLimited)
         );
         assert_eq!(
+            direct_non_success_outcome(leveler_agent::StopReason::TurnLimitReached),
+            Some(TaskOutcome::Failed),
+            "an absolute-ceiling loop break is a failed turn, not a resumable budget"
+        );
+        assert_eq!(
             direct_non_success_outcome(leveler_agent::StopReason::Answered),
             None,
             "Answered continues into verify path"
@@ -2306,8 +2311,12 @@ pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Opt
         // Plan done (incl. a forced closeout stop): let verification decide.
         S::Completed | S::Answered | S::CloseoutForced => None,
         S::BudgetExhausted => Some(TaskOutcome::BudgetLimited),
-        // Incomplete thrash, stalled quiet, blocked, etc. — never success.
-        S::Incomplete | S::Blocked | S::Stalled | S::CompletedUnverified => {
+        // Incomplete thrash, stalled quiet, blocked, etc. — never success. A
+        // turn broken by the absolute round ceiling belongs here, NOT with
+        // BudgetLimited: it is a failed (likely looping) turn, so it must
+        // terminate the auto-orchestrated path instead of auto-resuming — which
+        // would re-enter the same loop the ceiling just broke.
+        S::Incomplete | S::Blocked | S::Stalled | S::CompletedUnverified | S::TurnLimitReached => {
             Some(TaskOutcome::Failed)
         }
     }

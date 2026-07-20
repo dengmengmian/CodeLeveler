@@ -35,6 +35,13 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
                 StopReason::BudgetExhausted => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "预算用尽 · 说「继续」或 /goal 接着做".into()),
                 },
+                // Absolute round-ceiling breaker: a turn that would not end on
+                // its own was force-stopped. Not a liftable budget, so its own
+                // wording — do not point at /goal as if more work-window helps.
+                StopReason::TurnLimitReached => RuntimeEvent::TurnIncomplete {
+                    reason: detail
+                        .unwrap_or_else(|| "触及单轮回合上限 · 已强制终止,请检查是否陷入循环".into()),
+                },
                 StopReason::Blocked => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
                 },

@@ -62,6 +62,8 @@ fn status_for_app(result: &Result<AgentOutcome, AppError>) -> (SessionStatus, Ag
             StopReason::CloseoutForced => (SessionStatus::Completed, AgentState::Complete),
             StopReason::Incomplete => (SessionStatus::Incomplete, AgentState::Execute),
             StopReason::BudgetExhausted => (SessionStatus::Incomplete, AgentState::Execute),
+            // Same outcome as a spent budget — work so far is real, task unfinished.
+            StopReason::TurnLimitReached => (SessionStatus::Incomplete, AgentState::Execute),
             StopReason::Blocked => (SessionStatus::Blocked, AgentState::Execute),
             StopReason::Stalled => (SessionStatus::Incomplete, AgentState::Execute),
             StopReason::CompletedUnverified => (SessionStatus::Completed, AgentState::Complete),

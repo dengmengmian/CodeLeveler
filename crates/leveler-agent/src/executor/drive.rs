@@ -357,7 +357,7 @@ impl Executor {
                     reason,
                     round,
                     modified_files,
-                    StopReason::BudgetExhausted,
+                    StopReason::TurnLimitReached,
                     Some("round ceiling reached".to_string()),
                     &metrics,
                     &progress,

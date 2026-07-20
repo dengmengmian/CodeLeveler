@@ -305,8 +305,15 @@ pub enum StopReason {
     /// work). Distinct from Incomplete so "how the turn ended" and "was the task
     /// finished" are not encoded in one value.
     CloseoutForced,
-    /// The round budget was exhausted first.
+    /// A token or cost budget was exhausted first.
     BudgetExhausted,
+    /// The absolute per-turn round ceiling was hit. This is the unconditional
+    /// circuit breaker that fires even when every progress watchdog was evaded
+    /// (a "busy" loop that fakes progress each round). It guarantees termination
+    /// but is not a budget the user can lift by saying "继续" — so it is kept
+    /// distinct from `BudgetExhausted` for honest logs/telemetry. Maps to the
+    /// same session outcome as `BudgetExhausted` (Incomplete / Execute).
+    TurnLimitReached,
     /// Goal mode: the model declared the goal unreachable via `update_goal(blocked)`.
     Blocked,
     /// Goal mode: the model went quiet without ever resolving the goal via
