@@ -635,6 +635,21 @@ fn batched_text_input_edits_composer_once() {
 }
 
 #[test]
+fn typing_reclaims_input_focus_after_mousing_into_conversation() {
+    use leveler_tui::state::WorkbenchFocus;
+    let mut s = opened();
+    // User moused / scrolled into the conversation, so focus left the input.
+    s.workbench_focus = WorkbenchFocus::Conversation;
+    // Normal human typing arrives as coalesced TextInput bursts. It must both
+    // insert AND pull focus back to the input — matching the single-key path's
+    // "typing always claims Input focus" rule. Otherwise the composer stays
+    // muted and ↑/↓ keep scrolling, so typing "feels" dead.
+    reduce(&mut s, Action::TextInput("hi".to_string()));
+    assert_eq!(s.composer.text(), "hi");
+    assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
+}
+
+#[test]
 fn raw_control_chars_edit_composer_like_control_keys() {
     let mut s = state();
     for ch in "hello world".chars() {
@@ -780,6 +795,45 @@ fn visible_quit_prompt_is_enough_to_confirm_quit() {
     reduce(&mut s, ctrl('c'));
     s.quit_armed = false;
     assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
+}
+
+#[test]
+fn enter_on_queued_item_starts_now_and_interrupts_turn() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentActivity {
+            label: "run".into(),
+        }),
+    );
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    s.input_queues.queued = vec!["first".into(), "second".into()];
+    s.queue_collapsed = false;
+    s.queue_selected = Some(1); // waiting index 1 = "second"
+
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    // Running turn is interrupted so the runtime idles and drains this item.
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::CancelCurrentTurn {
+            session_id: SessionId::new("s1"),
+        })]
+    );
+    // "second" jumped to the front so it runs next.
+    assert_eq!(
+        s.input_queues.queued.first().map(String::as_str),
+        Some("second")
+    );
+}
+
+#[test]
+fn delete_cancels_selected_queued_item() {
+    let mut s = state();
+    s.input_queues.queued = vec!["a".into(), "b".into()];
+    s.queue_collapsed = false;
+    s.queue_selected = Some(0); // first waiting = "a"
+    reduce(&mut s, key(KeyCode::Delete));
+    assert_eq!(s.input_queues.queued, vec!["b".to_string()]);
 }
 
 #[test]

@@ -45,19 +45,37 @@ Windows、macOS 和 Linux 均纳入 CI。CodeLeveler 目前处于 public beta
 
 ## 快速开始
 
-### 1. 从源码安装
+### 1. 安装
+
+**方式 A — Homebrew（macOS，推荐）**
+
+```sh
+brew install dengmengmian/tap/leveler
+```
+
+之后用 `brew upgrade leveler` 升级。
+
+**方式 B — 下载预编译二进制**
+
+从[最新发布页](https://github.com/dengmengmian/CodeLeveler/releases/latest)下载对应
+平台的压缩包，解压后把 `leveler` 放到 `PATH`。示例（按平台替换 `V`/`T`）：
+
+```sh
+V=0.1.0; T=aarch64-apple-darwin   # 或 x86_64-apple-darwin、x86_64-unknown-linux-gnu
+curl -LO https://github.com/dengmengmian/CodeLeveler/releases/download/v$V/leveler-v$V-$T.tar.gz
+tar -xzf "leveler-v$V-$T.tar.gz"
+sudo mv "leveler-v$V-$T/leveler" /usr/local/bin/
+leveler --version
+```
+
+Windows 下载 `leveler-v<版本>-x86_64-pc-windows-msvc.zip`，解压后把目录加入
+`PATH`。任意平台安装后，用 `leveler upgrade` 升级到新版本。
+
+**方式 C — 从源码编译**
 
 需要 [Rust 1.90+](https://www.rust-lang.org/tools/install) 和 Git。
 
-```powershell
-# PowerShell（Windows）
-git clone https://github.com/dengmengmian/CodeLeveler.git
-cd codeleveler
-cargo install --path crates/leveler-cli --locked
-```
-
 ```sh
-# macOS / Linux
 git clone https://github.com/dengmengmian/CodeLeveler.git
 cd codeleveler
 cargo install --path crates/leveler-cli --locked

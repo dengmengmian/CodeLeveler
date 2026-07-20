@@ -67,6 +67,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                 && state.overlay.is_none()
                 && state.active_screen == Screen::Conversation
             {
+                // Typing always claims Input focus (parity with the single-key
+                // Char path). Without this, coalesced typing bursts insert but
+                // leave focus on the Conversation after a mouse click/scroll, so
+                // the composer stays muted and ↑/↓ keep scrolling — typing feels
+                // dead even though the text landed.
+                state.workbench_focus = WorkbenchFocus::Input;
                 // PTY paste without bracketed-paste arrives as a key burst;
                 // still fold large multi-line blobs like Action::Paste.
                 if text.contains('\n') {
@@ -574,6 +580,16 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             }
             return submit(state);
         }
+        // Empty composer + expanded queue: Enter starts the selected/next queued
+        // item now (interrupting any running turn).
+        KeyCode::Enter
+            if state.composer.is_empty()
+                && popup_len == 0
+                && !state.queue_collapsed
+                && state.input_queues.waiting_len() > 0 =>
+        {
+            return start_queued_now(state);
+        }
         // Conversation focus while reading history: Enter = jump to live edge.
         KeyCode::Enter
             if state.workbench_focus == WorkbenchFocus::Conversation
@@ -693,6 +709,15 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             } else {
                 state.composer.backspace();
             }
+            touch_slash_filter(state);
+        }
+        // Empty composer + expanded queue: Delete cancels the selected/next item.
+        KeyCode::Delete
+            if state.composer.is_empty()
+                && !state.queue_collapsed
+                && state.input_queues.waiting_len() > 0 =>
+        {
+            cancel_selected_queued(state);
             touch_slash_filter(state);
         }
         KeyCode::Delete => {
@@ -966,6 +991,68 @@ fn reorder_queue(state: &mut AppState, delta: i32) {
         state.queue_selected = Some(pending_n + new_w);
         state.queue_collapsed = false;
         crate::footer_queue::normalize_queue_focus(state);
+    }
+}
+
+/// Waiting flat index the queue actions target: the selected waiting row, else
+/// the first waiting item. `None` when nothing is waiting.
+fn queue_action_target(state: &AppState) -> Option<usize> {
+    if state.input_queues.waiting_len() == 0 {
+        return None;
+    }
+    let pending_n = state.input_queues.pending.len();
+    match state.queue_selected {
+        Some(sel) if sel >= pending_n => Some(sel - pending_n),
+        _ => Some(0),
+    }
+}
+
+/// "Start now": promote the targeted queued item to the front; if a turn is
+/// running, cancel it so the runtime idles and `drain_queued` submits this item
+/// next. When idle, the drain path picks it up on the following loop tick.
+fn start_queued_now(state: &mut AppState) -> Vec<Effect> {
+    let Some(waiting_idx) = queue_action_target(state) else {
+        return Vec::new();
+    };
+    if state
+        .input_queues
+        .promote_waiting_to_front(waiting_idx)
+        .is_none()
+    {
+        return Vec::new();
+    }
+    let pending_n = state.input_queues.pending.len();
+    state.queue_selected = Some(pending_n + state.input_queues.rejected.len());
+    crate::footer_queue::on_queue_changed(state);
+    if state.is_busy() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: state.t().queue_starting_now.to_string(),
+        });
+        return vec![Effect::Send(ClientCommand::CancelCurrentTurn {
+            session_id: state.session_id.clone(),
+        })];
+    }
+    Vec::new()
+}
+
+/// Cancel (remove) the targeted queued item.
+fn cancel_selected_queued(state: &mut AppState) {
+    let Some(waiting_idx) = queue_action_target(state) else {
+        return;
+    };
+    if state.input_queues.remove_waiting_at(waiting_idx).is_some() {
+        crate::footer_queue::on_queue_changed(state);
+        let remaining = state.input_queues.visible_len();
+        let t = state.t();
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: if remaining == 0 {
+                t.cleared_queue.to_string()
+            } else {
+                t.deleted_queue_n.replacen("{}", &remaining.to_string(), 1)
+            },
+        });
     }
 }
 

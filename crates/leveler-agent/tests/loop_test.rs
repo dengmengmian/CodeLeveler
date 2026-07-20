@@ -2272,6 +2272,70 @@ async fn completion_audit_accepts_fresh_verification() {
 }
 
 #[tokio::test]
+async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
+    // Architectural backstop: a turn that keeps issuing tool calls forever (a
+    // "busy" loop that evades every progress watchdog) must still terminate at
+    // the absolute round ceiling, regardless of the UntilTerminal policy.
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-ceiling-{}",
+        std::process::id() as u64 * 47 + 3
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    // Distinct files so each read is "novel" progress — this evades the
+    // no-progress / stagnation watchdogs, leaving only the absolute ceiling.
+    for i in 0..20 {
+        std::fs::write(dir.join(format!("src/f{i}.rs")), format!("pub fn f{i}() {{}}\n")).unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Far more responses than the ceiling — the loop must stop before using them.
+    let responses: Vec<_> = (0..20)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    let runtime = Arc::new(MockRuntime::new(responses));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        0, // 0 => UntilTerminal (no continuation round limit)
+    )
+    .with_step_limits(leveler_agent::StepLimits {
+        max_rounds: Some(5),
+        ..Default::default()
+    });
+
+    let outcome = executor
+        .run(
+            "spin forever",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
+    assert_eq!(outcome.rounds, 5, "must stop exactly at the round ceiling");
+    assert!(
+        outcome.final_text.contains("ceiling"),
+        "should report the ceiling stop: {}",
+        outcome.final_text
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn completion_evidence_nudge_is_capped_when_verification_never_passes() {
     // Regression: on a machine where verification can never pass (e.g. a broken
     // local sandbox failing every test), the model keeps making "progress" (a

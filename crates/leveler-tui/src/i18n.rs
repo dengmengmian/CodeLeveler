@@ -258,6 +258,10 @@ pub struct UiText {
     pub queue_next: &'static str,
     /// Short backspace hint on the same line.
     pub queue_del_hint: &'static str,
+    /// Action hint under the expanded queue when items are waiting.
+    pub queue_actions_hint: &'static str,
+    /// Notice when "start now" interrupts the running turn.
+    pub queue_starting_now: &'static str,
 
     // Slash command descriptions (same order as screen::SLASH_COMMANDS)
     pub slash: SlashText,
@@ -476,6 +480,8 @@ static ZH: UiText = UiText {
     queue_retry_n: "（含 {} 待重试）",
     queue_next: "下一条：",
     queue_del_hint: "⌫ 删末条",
+    queue_actions_hint: "  Enter 马上开始 · Delete 取消 · Alt+↑↓ 排序",
+    queue_starting_now: "打断当前，马上开始这条",
     slash: SlashText {
         model: "切换使用的 AI 模型",
         mode: "权限档：逐步批准 / 辅助放行 / 全权放行",
@@ -679,6 +685,8 @@ static EN: UiText = UiText {
     queue_retry_n: " ({} retry)",
     queue_next: "next: ",
     queue_del_hint: "⌫ pop last",
+    queue_actions_hint: "  Enter run now · Delete cancel · Alt+↑↓ reorder",
+    queue_starting_now: "interrupting current turn to run this now",
     slash: SlashText {
         model: "switch AI model",
         mode: "permission (request-approval / assisted / full-access)",

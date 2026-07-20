@@ -49,19 +49,39 @@ together:
 
 ## Quick start
 
-### 1. Install from source
+### 1. Install
+
+**Option A — Homebrew (macOS, recommended)**
+
+```sh
+brew install dengmengmian/tap/leveler
+```
+
+`brew upgrade leveler` moves you to newer releases.
+
+**Option B — Download a prebuilt binary**
+
+From the [latest release](https://github.com/dengmengmian/CodeLeveler/releases/latest),
+download the archive for your platform, unpack it, and move `leveler` onto your
+`PATH`. Example (replace `V`/`T` for your platform):
+
+```sh
+V=0.1.0; T=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
+curl -LO https://github.com/dengmengmian/CodeLeveler/releases/download/v$V/leveler-v$V-$T.tar.gz
+tar -xzf "leveler-v$V-$T.tar.gz"
+sudo mv "leveler-v$V-$T/leveler" /usr/local/bin/
+leveler --version
+```
+
+On Windows, download `leveler-v<version>-x86_64-pc-windows-msvc.zip`, unzip it,
+and add the folder to `PATH`. After installing on any platform, `leveler
+upgrade` moves you to newer releases.
+
+**Option C — Build from source**
 
 You need [Rust 1.90+](https://www.rust-lang.org/tools/install) and Git.
 
-```powershell
-# PowerShell (Windows)
-git clone https://github.com/dengmengmian/CodeLeveler.git
-cd codeleveler
-cargo install --path crates/leveler-cli --locked
-```
-
 ```sh
-# macOS / Linux
 git clone https://github.com/dengmengmian/CodeLeveler.git
 cd codeleveler
 cargo install --path crates/leveler-cli --locked

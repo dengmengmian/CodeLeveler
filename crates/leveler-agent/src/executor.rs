@@ -267,6 +267,10 @@ pub struct StepLimits {
     /// model profile; callers must reject a configured cost cap when pricing is
     /// unavailable rather than inventing a price.
     pub max_cost_usd_micros: Option<u64>,
+    /// Absolute per-turn round ceiling. `None` falls back to a built-in default.
+    /// This is an unconditional circuit breaker — independent of progress
+    /// heuristics — so an `UntilTerminal` turn always terminates.
+    pub max_rounds: Option<u32>,
 }
 
 impl StepLimits {

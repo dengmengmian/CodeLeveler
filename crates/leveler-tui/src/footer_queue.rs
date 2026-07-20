@@ -61,8 +61,12 @@ pub(crate) fn queue_panel_height(state: &AppState) -> u16 {
         return 1;
     }
     let n = state.input_queues.visible_len();
-    // title + up to QUEUE_BODY_MAX rows
-    (1 + n.min(QUEUE_BODY_MAX)) as u16
+    let body = n.min(QUEUE_BODY_MAX);
+    let more = if n > QUEUE_BODY_MAX { 1 } else { 0 };
+    // Action hint sits under the list whenever there is something to act on.
+    let hint = if state.input_queues.waiting_len() > 0 { 1 } else { 0 };
+    // title + body rows (+ overflow marker) (+ action hint)
+    (1 + body + more + hint) as u16
 }
 
 /// Full panel lines for the workbench Queue region.
@@ -133,6 +137,13 @@ pub(crate) fn queue_panel_lines(state: &AppState, width: usize) -> Vec<Line<'sta
             )));
         }
     }
+    // Discoverable actions for the selected/next waiting item.
+    if state.input_queues.waiting_len() > 0 {
+        lines.push(Line::from(Span::styled(
+            truncate_display(t.queue_actions_hint, width),
+            Style::default().fg(theme.border),
+        )));
+    }
     lines
 }
 
@@ -165,6 +176,14 @@ impl InputQueues {
                 None
             }
         }
+    }
+
+    /// Promote the waiting item at flat `index` to the front of the queue so it
+    /// drains next. Returns its new flat waiting index, or `None` if invalid.
+    pub fn promote_waiting_to_front(&mut self, index: usize) -> Option<usize> {
+        let text = self.remove_waiting_at(index)?;
+        self.queued.insert(0, text);
+        Some(self.rejected.len())
     }
 
     /// Move waiting item at flat index by `delta` (-1 up / +1 down).
@@ -326,6 +345,35 @@ mod tests {
                 "first".to_string(),
                 "third".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn promote_moves_item_to_front() {
+        let mut q = InputQueues {
+            queued: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(q.promote_waiting_to_front(2), Some(0));
+        assert_eq!(
+            q.queued,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn expanded_panel_shows_action_hint() {
+        let mut state = test_state();
+        state.queue_collapsed = false;
+        state.input_queues.queued = vec!["item".into()];
+        let joined = queue_panel_lines(&state, 80)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("马上开始") && joined.contains("取消"),
+            "action hint missing: {joined}"
         );
     }
 

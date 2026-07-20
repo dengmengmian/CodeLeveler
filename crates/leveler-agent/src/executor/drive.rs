@@ -168,12 +168,27 @@ impl Executor {
         let mut had_tool_calls = false;
         let mut answer_audit_repairs = 0u32;
         const MAX_ANSWER_AUDIT_REPAIRS: u32 = 2;
+        // Hard cap on completion-evidence nudges. `verification_ran` only flips
+        // true when a verification command PASSES, so if verification cannot pass
+        // (e.g. a broken local sandbox — `sandbox-exec` exit 71 — fails every
+        // test), the gate would nudge forever: each retry counts as "progress",
+        // re-arming the nudge. This cap bounds that loop; after it, the turn
+        // closes honestly unverified instead of spinning.
+        const MAX_EVIDENCE_NUDGES: u32 = 2;
         // Goal mode: how many times the model went quiet without calling
         // update_goal. Each time we re-prompt it to audit and resolve explicitly;
         // after a small cap we accept completion, so a model that never learns to
         // call update_goal still terminates as stalled instead of running forever.
         let mut goal_quiet_nudges = 0u32;
         const MAX_GOAL_QUIET_NUDGES: u32 = 3;
+        // Absolute per-turn round ceiling — the unconditional circuit breaker.
+        // The progress watchdogs are heuristic (they only fire on "no progress"),
+        // so a busy loop that keeps issuing novel-looking reads/searches while a
+        // gate refuses closeout evades them and, under `UntilTerminal`, never
+        // ends. This ceiling guarantees termination regardless of progress or
+        // continuation policy. Set well above any legitimate single turn.
+        const MAX_TURN_ROUNDS: u32 = 100;
+        let round_ceiling = self.step_limits.max_rounds.unwrap_or(MAX_TURN_ROUNDS);
         // Closeout thrash nudge (once): plan complete / delivery closeout.
         let mut post_plan_closeout_nudged = false;
         let mut no_progress_nudge_sent = false;
@@ -310,6 +325,40 @@ impl Executor {
                     modified_files,
                     StopReason::BudgetExhausted,
                     Some("model cost budget exhausted".to_string()),
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
+            }
+            if round >= round_ceiling {
+                // Unconditional circuit breaker: even a busy loop that evades
+                // every progress watchdog terminates here.
+                let reason = format!(
+                    "Stopped: reached the {round_ceiling}-round ceiling for a single turn."
+                );
+                observer(AgentEvent::Finished(reason.clone()));
+                sync_epoch_progress(
+                    &mut progress,
+                    &mut metrics,
+                    epoch_rounds_at_start,
+                    epoch_tokens_at_start,
+                    epoch_duration_at_start,
+                    run_started,
+                    round,
+                    model_tokens_spent,
+                    commands_run,
+                    cost_spent_micros,
+                    &modified_files,
+                );
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+                return Ok(AgentOutcome::drive_result(
+                    reason,
+                    round,
+                    modified_files,
+                    StopReason::BudgetExhausted,
+                    Some("round ceiling reached".to_string()),
                     &metrics,
                     &progress,
                     &objective,
@@ -709,6 +758,7 @@ impl Executor {
                 if self.require_completion_evidence
                     && !modified_files.is_empty()
                     && !verification_ran
+                    && evidence_nudges < MAX_EVIDENCE_NUDGES
                     && (evidence_nudges == 0 || progress_since_evidence_nudge)
                     && has_next_round
                 {
