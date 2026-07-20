@@ -838,6 +838,10 @@ mod tests {
         assert!(out.len() <= MAX_OUTPUT + "\n… [truncated]\n".len());
     }
 
+    // Invokes bare Unix `pwd`; Git's pwd.exe fails to initialize under the
+    // Windows sandbox (STATUS_DLL_INIT_FAILED). cwd handling on Windows is
+    // covered by the windows_ canaries.
+    #[cfg(unix)]
     #[tokio::test]
     async fn honors_custom_cwd() {
         let dir =
