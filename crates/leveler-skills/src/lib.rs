@@ -605,7 +605,7 @@ mod tests {
         assert!(rendered.contains("references/note.md"));
         assert!(rendered.contains(detail.dir.to_string_lossy().as_ref()));
         // Absolute path under skill dir (not a hard-coded project-only prefix).
-        assert!(rendered.contains(&format!("{}/scripts/foo.sh", detail.dir.display())));
+        assert!(rendered.contains(&format!("{}", detail.dir.join("scripts/foo.sh").display())));
     }
 
     #[test]
