@@ -15,8 +15,12 @@ const MAX_OUTPUT: usize = 32 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
-    /// The program to run, e.g. "cargo".
-    program: String,
+    /// The program to run, e.g. "cargo". Required in practice, but kept
+    /// schema-optional so a missing/blank value reaches the tool and returns
+    /// actionable guidance (steer to `shell_command`) instead of a bare
+    /// "program is a required field" schema rejection from the registry.
+    #[serde(default)]
+    program: Option<String>,
     /// Arguments passed as an array (never a shell string).
     #[serde(default)]
     args: Vec<String>,
@@ -71,30 +75,35 @@ impl Tool for RunCommandTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        let input: Input = super::parse_input(self.name(), input)?;
         // The frequent mixup: the model hands run_command a whole shell string
         // (or shell_command's `cmd` field) instead of program+args. Steer it to
-        // the right tool rather than surfacing a bare serde "missing field".
-        if input.get("program").is_none() {
+        // the right tool rather than surfacing a bare "program is a required
+        // field" schema note. `program` is schema-optional (see `Input`) so a
+        // missing/blank value lands here instead of being rejected upstream.
+        let Some(program) = input
+            .program
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
             return Ok(ToolOutput::error(
                 "run_command needs a `program` (the executable) and an optional \
                  `args` array — it does not take a shell string. To run a whole \
                  command line (e.g. `./admin-server`, or one with pipes / $() / \
                  redirection / &&), use shell_command with its `cmd` field instead.",
             ));
-        }
-        let input: Input = super::parse_input(self.name(), input)?;
-        let args = normalize_args(&input.program, input.args);
+        };
+        let args = normalize_args(program, input.args);
         if input.background.unwrap_or(false) {
-            return execute_background(&input.program, args, input.cwd.as_deref(), context).await;
+            return execute_background(program, args, input.cwd.as_deref(), context).await;
         }
         // Close the `sh -c 'python app.py & …'` bypass of shell_command guards.
-        if let Some(reason) =
-            super::shell_guard::refuse_run_command_shell_bypass(&input.program, &args)
-        {
+        if let Some(reason) = super::shell_guard::refuse_run_command_shell_bypass(program, &args) {
             return Ok(ToolOutput::error(reason));
         }
         execute_program(
-            &input.program,
+            program,
             args,
             input.cwd.as_deref(),
             input.timeout_seconds,

@@ -359,17 +359,48 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        // run_command requires `program` (string); missing it should fail schema validation.
+        // `args` must be an array of strings; a string fails schema validation.
         let err = reg
             .execute(
                 "run_command",
-                serde_json::json!({}),
+                serde_json::json!({"program": "echo", "args": "hi"}),
                 ctx,
                 CancellationToken::new(),
             )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a `run_command` call missing `program` must reach the tool and
+    /// return actionable guidance (steer to `shell_command`), not be rejected
+    /// upstream by schema validation with a bare "program is a required field".
+    /// This exercises the full registry path (schema validation → dispatch),
+    /// unlike the unit test that calls `RunCommandTool::execute` directly.
+    #[tokio::test]
+    async fn run_command_missing_program_steers_to_shell_command() {
+        let reg = default_registry();
+        let dir =
+            std::env::temp_dir().join(format!("leveler-noprog-{}", crate::tools::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = reg
+            .execute(
+                "run_command",
+                serde_json::json!({"cmd": "./admin-server --port 3001"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("missing program should be a friendly tool error, not a schema rejection");
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("shell_command") && out.content.contains("program"),
+            "must steer to shell_command and name program: {}",
+            out.content
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
