@@ -455,8 +455,14 @@ mod tests {
                 std::env::temp_dir(),
             )),
         );
+        // `true` does not exist on Windows runners; pass via cmd there.
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/c", "exit 0"])
+        } else {
+            ("true", &[])
+        };
         let plan = VerificationPlan {
-            commands: vec![cmd("ok", "true", &[], true)],
+            commands: vec![cmd("ok", program, args, true)],
         };
         let mut seen = 0;
         let report = v
@@ -503,9 +509,11 @@ mod tests {
                 id: "AC-1".into(),
                 description: "passes".into(),
                 // Non-trivial: real path check (not `true`, which is rejected).
+                // `dir` reliably lists the (existing) cwd and exits 0; bare
+                // `if exist .` is unreliable in cmd.exe.
                 command: Some(
                     if cfg!(windows) {
-                        "if exist . (exit 0) else (exit 1)"
+                        "dir >nul"
                     } else {
                         "test -d ."
                     }

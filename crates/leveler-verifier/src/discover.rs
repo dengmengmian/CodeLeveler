@@ -339,7 +339,14 @@ mod tests {
         std::fs::write(bin.join("tsc"), "#!/bin/sh\n").unwrap();
         let plan = node_plan(dir.path());
         let tsc = find(&plan, "tsc");
-        assert_eq!(tsc.program, bin.join("tsc").to_string_lossy());
+        // Match production's single-literal join (`root.join("node_modules/.bin/
+        // tsc")`, all forward slashes). A second `bin.join("tsc")` would insert a
+        // native separator and diverge on Windows (`/.bin\tsc` vs `/.bin/tsc`),
+        // though both resolve to the same file there.
+        assert_eq!(
+            tsc.program,
+            dir.path().join("node_modules/.bin/tsc").to_string_lossy()
+        );
     }
 
     #[test]
