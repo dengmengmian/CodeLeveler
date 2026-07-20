@@ -172,11 +172,13 @@ mod tests {
             )
             .await
             .unwrap();
-        // Join per component so the expected path uses native separators,
-        // matching how the tool renders it (`project_skills_dir` joins segment
-        // by segment). A `".leveler/skills/pack"` literal keeps forward slashes
-        // on Windows and would not match the tool's backslash rendering.
-        let skill_dir = dir.join(".leveler").join("skills").join("pack");
+        // Derive the expected dir exactly as the tool does: `Workspace::new`
+        // canonicalizes the root, and the tool renders the skill dir under that
+        // canonical root. Mirroring `canonicalize` (per-component join) matches
+        // the tool on every platform — native separators, `/private/var/…` on
+        // macOS, and the `\\?\C:\…` verbatim prefix on Windows.
+        let root = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let skill_dir = root.join(".leveler").join("skills").join("pack");
         std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
         std::fs::create_dir_all(skill_dir.join("references")).unwrap();
         std::fs::write(skill_dir.join("scripts/run.sh"), "echo run\n").unwrap();
@@ -196,13 +198,8 @@ mod tests {
         assert!(loaded.content.contains("scripts/run.sh"));
         assert!(loaded.content.contains("## References"));
         assert!(loaded.content.contains("references/a.md"));
-        // Windows canonicalization renders verbatim paths with a `\\?\`
-        // extended-length prefix that the raw `temp_dir()`-based expectation
-        // lacks; strip it so the same absolute path is compared on every
-        // platform (no-op on Unix, where the prefix never appears).
-        let rendered = loaded.content.replace(r"\\?\", "");
         assert!(
-            rendered.contains(skill_dir.to_string_lossy().as_ref()),
+            loaded.content.contains(skill_dir.to_string_lossy().as_ref()),
             "must include absolute skill dir, not only project-relative prefix: {}",
             loaded.content
         );
