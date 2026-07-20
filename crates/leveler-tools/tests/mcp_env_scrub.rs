@@ -1,5 +1,9 @@
 //! MCP servers are third-party subprocesses and must not inherit provider or
 //! credential-like environment variables unless explicitly configured.
+//!
+//! Unix-only: the probe spawns an absolute `/bin/sh` that does not exist on
+//! Windows (bare `sh` would PATH-resolve, but this test pins the interpreter).
+#![cfg(unix)]
 
 use leveler_tools::mcp::{McpClient, McpServerConfig};
 
