@@ -903,6 +903,15 @@ fn finish(
                             outcome.rounds, outcome.final_text
                         ))
                     ),
+                    StopReason::TurnLimitReached => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Hit absolute round ceiling after {} round(s). \
+                             The turn was force-stopped to guarantee termination; \
+                             check if the model was looping.",
+                            outcome.rounds
+                        ))
+                    ),
                     StopReason::Blocked => println!(
                         "{}",
                         Line::warn(&format!(

@@ -530,6 +530,7 @@ fn termination_from_stop_reason(reason: StopReason) -> leveler_eval::Termination
         | StopReason::CompletedUnverified
         | StopReason::CloseoutForced => leveler_eval::TerminationClass::Completed,
         StopReason::BudgetExhausted => leveler_eval::TerminationClass::BudgetLimited,
+        StopReason::TurnLimitReached => leveler_eval::TerminationClass::BudgetLimited,
         StopReason::Blocked => leveler_eval::TerminationClass::Blocked,
         StopReason::Incomplete | StopReason::Stalled => leveler_eval::TerminationClass::Incomplete,
     }
