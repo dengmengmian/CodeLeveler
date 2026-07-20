@@ -6,6 +6,8 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-21
+
 ### Added
 - `leveler init`: interactively create `~/.leveler/config.toml` (refuses to
   overwrite; prints a template when not a TTY). Startup itself never writes
@@ -46,6 +48,16 @@ All notable changes to CodeLeveler are documented here. The format follows
 - Replaced unmaintained `serde_yaml` with `serde_yaml_ng`.
 
 ### Fixed
+- Background `run_command` tasks (dev servers, watchers started with
+  `background=true`) now survive across turns. The process-lived task registry
+  was rebuilt per turn, so its `KillOnDrop` reaped every background process at
+  turn end and the next turn no longer knew the task id.
+- `run_command` called without a `program` now returns actionable guidance
+  (use `shell_command` for a whole command line) instead of a bare
+  "program is a required field" schema rejection.
+- Windows CI is green: platform-specific test assumptions (POSIX
+  coreutils/shell fixtures, path-separator and `\\?\` canonicalization) were
+  corrected; no product behavior changed.
 - A checkpoint recorded while the database was unavailable could restore to
   an empty conversation; it is now skipped with a warning.
 - Workspace snapshot restore surfaces file-deletion failures instead of
