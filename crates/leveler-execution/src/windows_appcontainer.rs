@@ -165,14 +165,13 @@ async fn run_appcontainer_windows(
             if !env_pairs
                 .iter()
                 .any(|(k, _)| k.to_str().is_some_and(|s| s.eq_ignore_ascii_case(key)))
+                && let Ok(val) = std::env::var(key)
             {
-                if let Ok(val) = std::env::var(key) {
-                    upsert_windows_environment(
-                        &mut env_pairs,
-                        std::ffi::OsString::from(key),
-                        std::ffi::OsString::from(val),
-                    );
-                }
+                upsert_windows_environment(
+                    &mut env_pairs,
+                    std::ffi::OsString::from(key),
+                    std::ffi::OsString::from(val),
+                );
             }
         }
         sort_windows_environment(&mut env_pairs);
