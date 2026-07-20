@@ -1850,8 +1850,8 @@ async fn completed_plan_refuses_observe_thrash_and_stops() {
 
     assert_eq!(
         outcome.stop_reason,
-        StopReason::Incomplete,
-        "plan complete + observe thrash → hard-stop, recorded as Incomplete"
+        StopReason::CloseoutForced,
+        "plan complete + observe thrash → forced closeout stop (not Incomplete)"
     );
     assert!(
         outcome
@@ -5465,11 +5465,11 @@ async fn empty_answer_gets_one_nudge_before_answered() {
 
 /// #1/#2: after the plan is complete, re-running commands (builds/tests/curl)
 /// is redundant closeout work — NOT a fresh objective. The drive must stop
-/// within the closeout cap and report Answered, because "plan complete" means
-/// the task is done; Incomplete here would misreport a finished task as a
-/// failure (which is exactly what a user sees as "任务未完成").
+/// within the closeout cap. The forced hard-stop is its own terminal state
+/// (CloseoutForced): the task is done so it is not Incomplete, but the model
+/// could not close out on its own so it is not a clean Answered either.
 #[tokio::test]
-async fn plan_complete_then_repeated_execute_stops_as_answered() {
+async fn plan_complete_then_repeated_execute_stops() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-closeout-exec-{}",
         std::process::id() as u64 * 131 + 61
@@ -5528,8 +5528,8 @@ async fn plan_complete_then_repeated_execute_stops_as_answered() {
 
     assert_eq!(
         outcome.stop_reason,
-        StopReason::Answered,
-        "plan complete = done; must not misreport redundant closeout as Incomplete: {outcome:?}"
+        StopReason::CloseoutForced,
+        "forced closeout hard-stop is its own terminal state, not Incomplete: {outcome:?}"
     );
     assert!(
         outcome.rounds <= 5,

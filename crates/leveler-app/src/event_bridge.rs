@@ -21,6 +21,10 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
             match outcome.stop_reason {
                 StopReason::Completed => RuntimeEvent::TurnCompleted,
                 StopReason::Answered => RuntimeEvent::TurnAnswered,
+                // Plan done, but the model wouldn't stop re-auditing so a guard
+                // ended the turn. Presented as an ended turn (completion is the
+                // verify layer's call), not as Incomplete.
+                StopReason::CloseoutForced => RuntimeEvent::TurnAnswered,
                 StopReason::Incomplete => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "完整性检查未通过或无法完成".to_string()),
                 },

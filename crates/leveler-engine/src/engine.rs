@@ -2303,7 +2303,8 @@ pub async fn acknowledge_crash_window(
 pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Option<TaskOutcome> {
     use leveler_agent::StopReason as S;
     match stop {
-        S::Completed | S::Answered => None,
+        // Plan done (incl. a forced closeout stop): let verification decide.
+        S::Completed | S::Answered | S::CloseoutForced => None,
         S::BudgetExhausted => Some(TaskOutcome::BudgetLimited),
         // Incomplete thrash, stalled quiet, blocked, etc. — never success.
         S::Incomplete | S::Blocked | S::Stalled | S::CompletedUnverified => {

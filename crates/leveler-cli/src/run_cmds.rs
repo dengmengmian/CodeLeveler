@@ -882,6 +882,13 @@ fn finish(
                             outcome.rounds
                         ))
                     ),
+                    StopReason::CloseoutForced => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Plan complete; stopped redundant closeout after {} round(s).",
+                            outcome.rounds
+                        ))
+                    ),
                     StopReason::Incomplete => println!(
                         "{}",
                         Line::warn(&format!(

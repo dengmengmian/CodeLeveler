@@ -1896,11 +1896,13 @@ impl Executor {
                 // (re-running builds/tests/curl, or re-inspecting files). That
                 // is redundant closeout thrash, not new progress — it is what
                 // makes a finished task look like an endless "re-audit" loop.
-                // Count it, nudge for a final summary, and after the cap stop
-                // as Answered: plan complete means the task is done, so verify
-                // (not an Incomplete/failure verdict) decides pass/fail. This
-                // also catches execute-class thrash, which observe-only guards
-                // never could.
+                // Count it, nudge for a final summary, and after the cap force a
+                // stop reported as CloseoutForced: the plan is done (so this is
+                // NOT Incomplete — a finished task must not fall back to
+                // Execute), but the model could not close out on its own, so it
+                // is an abnormal end, not a clean Answered either. This also
+                // catches execute-class thrash, which observe-only guards never
+                // could.
                 progress.note_closeout_deny_round();
                 observer(AgentEvent::ProgressUpdated {
                     ledger: progress.clone(),
@@ -1947,8 +1949,8 @@ impl Executor {
                         final_text,
                         round,
                         modified_files,
-                        StopReason::Incomplete,
-                        Some("plan complete; observe thrash short-circuited".to_string()),
+                        StopReason::CloseoutForced,
+                        Some("plan complete; closeout thrash short-circuited".to_string()),
                         &metrics,
                         &progress,
                         &objective,

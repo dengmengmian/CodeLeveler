@@ -262,7 +262,10 @@ impl Executor {
             Ok(outcome) => {
                 let ok = matches!(
                     outcome.stop_reason,
-                    StopReason::Completed | StopReason::Answered | StopReason::CompletedUnverified
+                    StopReason::Completed
+                        | StopReason::Answered
+                        | StopReason::CompletedUnverified
+                        | StopReason::CloseoutForced
                 );
                 SubAgentRunResult {
                     text: outcome.final_text,

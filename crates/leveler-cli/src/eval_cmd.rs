@@ -525,9 +525,10 @@ async fn run_bare_case(
 
 fn termination_from_stop_reason(reason: StopReason) -> leveler_eval::TerminationClass {
     match reason {
-        StopReason::Completed | StopReason::Answered | StopReason::CompletedUnverified => {
-            leveler_eval::TerminationClass::Completed
-        }
+        StopReason::Completed
+        | StopReason::Answered
+        | StopReason::CompletedUnverified
+        | StopReason::CloseoutForced => leveler_eval::TerminationClass::Completed,
         StopReason::BudgetExhausted => leveler_eval::TerminationClass::BudgetLimited,
         StopReason::Blocked => leveler_eval::TerminationClass::Blocked,
         StopReason::Incomplete | StopReason::Stalled => leveler_eval::TerminationClass::Incomplete,

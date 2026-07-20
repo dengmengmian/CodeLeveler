@@ -13,10 +13,10 @@ use tokio_util::sync::CancellationToken;
 use leveler_context::load_rules;
 use leveler_core::{ClarificationId, TurnId};
 use leveler_execution::{ApprovalPolicy, Approver, AutoApprove, AutoReviewer, NeedUserReviewer};
-use leveler_memory::MemoryStore;
 use leveler_lifecycle::{
     EvidenceLedger, GateConfig, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, WorkProfile,
 };
+use leveler_memory::MemoryStore;
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelPricing, ModelRef, ModelRuntime,
     ReasoningEffort, Role, TokenUsage,
@@ -292,6 +292,15 @@ pub enum StopReason {
     /// The run ended cleanly, but its semantic completeness could not be
     /// established after bounded audit/repair attempts.
     Incomplete,
+    /// The plan was already complete, but the model kept doing redundant
+    /// closeout work (re-running builds/tests or re-observing) and a guard
+    /// force-stopped the turn after the closeout cap. The task's work IS done —
+    /// completeness is the verify layer's call — so this is an abnormal *end*,
+    /// not an incomplete *task*: it maps to a completed session, never to the
+    /// Execute state (which would misreport a finished task as needing more
+    /// work). Distinct from Incomplete so "how the turn ended" and "was the task
+    /// finished" are not encoded in one value.
+    CloseoutForced,
     /// The round budget was exhausted first.
     BudgetExhausted,
     /// Goal mode: the model declared the goal unreachable via `update_goal(blocked)`.
@@ -1221,7 +1230,10 @@ mod recall_tests {
         let block = render_recall_block(hits.into_iter()).expect("some block");
         assert!(block.contains("Relevant memory"), "{block}");
         assert!(block.contains("verify against the current code"), "{block}");
-        assert!(block.contains("Build target: install to ~/.cargo/bin"), "{block}");
+        assert!(
+            block.contains("Build target: install to ~/.cargo/bin"),
+            "{block}"
+        );
         assert!(block.contains("Concurrency: never git stash"), "{block}");
     }
 
@@ -1233,8 +1245,15 @@ mod recall_tests {
             (entry("b", "second", "should be dropped"), 2.0),
         ];
         let block = render_recall_block(hits.into_iter()).expect("some block");
-        assert!(block.contains("first"), "first must survive: {}", &block[..80]);
-        assert!(!block.contains("should be dropped"), "second must be dropped");
+        assert!(
+            block.contains("first"),
+            "first must survive: {}",
+            &block[..80]
+        );
+        assert!(
+            !block.contains("should be dropped"),
+            "second must be dropped"
+        );
     }
 
     #[test]
@@ -1258,7 +1277,10 @@ mod recall_tests {
         let block = render_recall_block(hits.into_iter().filter(|(_, s)| *s >= RECALL_FLOOR))
             .expect("the install memory should be retrieved");
         assert!(block.contains("Install target"), "{block}");
-        assert!(!block.contains("Cooking"), "unrelated memory must not leak: {block}");
+        assert!(
+            !block.contains("Cooking"),
+            "unrelated memory must not leak: {block}"
+        );
     }
 }
 

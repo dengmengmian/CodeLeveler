@@ -57,6 +57,9 @@ fn status_for_app(result: &Result<AgentOutcome, AppError>) -> (SessionStatus, Ag
         Ok(o) => match o.stop_reason {
             StopReason::Completed => (SessionStatus::Completed, AgentState::Complete),
             StopReason::Answered => (SessionStatus::Completed, AgentState::Complete),
+            // Plan finished; a forced closeout stop is an abnormal *end*, not an
+            // unfinished *task* — it must NOT fall back to Execute.
+            StopReason::CloseoutForced => (SessionStatus::Completed, AgentState::Complete),
             StopReason::Incomplete => (SessionStatus::Incomplete, AgentState::Execute),
             StopReason::BudgetExhausted => (SessionStatus::Incomplete, AgentState::Execute),
             StopReason::Blocked => (SessionStatus::Blocked, AgentState::Execute),
