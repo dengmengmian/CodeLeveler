@@ -149,6 +149,34 @@ async fn run_appcontainer_windows(
         upsert_windows_environment(&mut env_pairs, "FORCE_COLOR".into(), "0".into());
         sort_windows_environment(&mut env_pairs);
 
+        // Guarantee essential Windows system variables are present. An empty
+        // EnvSnapshot::default() (e.g. ToolContext::new in tests) skips PATH,
+        // SystemRoot, etc., which causes CreateProcessW to fail with
+        // ERROR_ENVVAR_NOT_FOUND (203) inside an AppContainer. Inherit any
+        // missing essential keys from the real process environment.
+        for key in [
+            "SystemRoot",
+            "SystemDrive",
+            "PATH",
+            "PATHEXT",
+            "TMP",
+            "TEMP",
+        ] {
+            if !env_pairs
+                .iter()
+                .any(|(k, _)| k.to_str().is_some_and(|s| s.eq_ignore_ascii_case(key)))
+            {
+                if let Ok(val) = std::env::var(key) {
+                    upsert_windows_environment(
+                        &mut env_pairs,
+                        std::ffi::OsString::from(key),
+                        std::ffi::OsString::from(val),
+                    );
+                }
+            }
+        }
+        sort_windows_environment(&mut env_pairs);
+
         let opts = LaunchOptions {
             // rappct passes this as CreateProcessW's non-null application name,
             // which does not provide std::process::Command's PATH resolution.
