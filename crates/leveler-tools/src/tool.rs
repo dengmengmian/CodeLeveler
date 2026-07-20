@@ -67,12 +67,11 @@ pub struct ToolContext {
 
 impl ToolContext {
     pub fn new(workspace: Workspace, mode: PermissionProfile) -> Self {
-        let env = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
-            std::env::vars_os(),
-            std::env::current_dir().unwrap_or_default(),
-            std::env::temp_dir(),
-        ));
-        Self::with_environment(workspace, mode, env.clone())
+        Self::with_environment(
+            workspace,
+            mode,
+            Arc::new(leveler_core::EnvSnapshot::default()),
+        )
     }
 
     pub fn with_environment(

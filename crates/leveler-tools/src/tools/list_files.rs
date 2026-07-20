@@ -108,7 +108,7 @@ fn walk(
         }
         let is_dir = path.is_dir();
         if let Ok(rel) = path.strip_prefix(root) {
-            let mut display = rel.to_string_lossy().into_owned();
+            let mut display = rel.to_string_lossy().replace('\\', "/");
             if is_dir {
                 display.push('/');
             }

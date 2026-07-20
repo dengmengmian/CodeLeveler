@@ -173,7 +173,7 @@ fn collect_source_files(root: &std::path::Path, dir: &std::path::Path, out: &mut
         if path.is_dir() {
             collect_source_files(root, &path, out);
         } else if let Ok(rel) = path.strip_prefix(root) {
-            let rel = rel.to_string_lossy().into_owned();
+            let rel = rel.to_string_lossy().replace('\\', "/");
             if leveler_context::repo_map::is_source(&rel) {
                 out.push(rel);
             }
