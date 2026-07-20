@@ -196,10 +196,13 @@ mod tests {
         assert!(loaded.content.contains("scripts/run.sh"));
         assert!(loaded.content.contains("## References"));
         assert!(loaded.content.contains("references/a.md"));
+        // Windows canonicalization renders verbatim paths with a `\\?\`
+        // extended-length prefix that the raw `temp_dir()`-based expectation
+        // lacks; strip it so the same absolute path is compared on every
+        // platform (no-op on Unix, where the prefix never appears).
+        let rendered = loaded.content.replace(r"\\?\", "");
         assert!(
-            loaded
-                .content
-                .contains(skill_dir.to_string_lossy().as_ref()),
+            rendered.contains(skill_dir.to_string_lossy().as_ref()),
             "must include absolute skill dir, not only project-relative prefix: {}",
             loaded.content
         );
