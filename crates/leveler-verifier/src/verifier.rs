@@ -508,13 +508,14 @@ mod tests {
             AcceptanceCheck {
                 id: "AC-1".into(),
                 description: "passes".into(),
-                // Non-trivial (a redirect makes `echo` non-trivial, so it is not
-                // rejected) and exits 0. Mirrors AC-2's proven-on-Windows
-                // construct; bare `true` is rejected and `if exist .` / `dir
-                // >nul` proved unreliable under cmd.exe on the runner.
+                // Structurally identical to AC-2's proven-on-Windows command,
+                // but exits 0: the redirect makes it non-trivial (so it is not
+                // rejected), and the explicit `exit 0` cleanly sets the code
+                // (commands without an explicit `exit` came back nonzero under
+                // cmd.exe on the runner). Bare `true` is rejected as trivial.
                 command: Some(
                     if cfg!(windows) {
-                        "echo ok 1>&2"
+                        "echo ok 1>&2 & exit 0"
                     } else {
                         "test -d ."
                     }
