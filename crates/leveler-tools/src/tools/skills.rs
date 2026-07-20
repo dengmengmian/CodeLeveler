@@ -199,7 +199,9 @@ mod tests {
         assert!(loaded.content.contains("## References"));
         assert!(loaded.content.contains("references/a.md"));
         assert!(
-            loaded.content.contains(skill_dir.to_string_lossy().as_ref()),
+            loaded
+                .content
+                .contains(skill_dir.to_string_lossy().as_ref()),
             "must include absolute skill dir, not only project-relative prefix: {}",
             loaded.content
         );
