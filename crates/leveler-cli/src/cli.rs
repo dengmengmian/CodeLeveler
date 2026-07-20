@@ -120,6 +120,11 @@ pub enum Command {
         /// Approve risky actions automatically (no prompts).
         #[arg(long)]
         auto_approve: bool,
+        /// With `--resume`, acknowledge a crash-recovery stop: you have
+        /// inspected the workspace; close the interrupted tool call(s) and
+        /// proceed. Ignored without `--resume`.
+        #[arg(long)]
+        confirm_recovery: bool,
         /// Output format.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,

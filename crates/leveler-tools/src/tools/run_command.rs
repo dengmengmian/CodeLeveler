@@ -734,8 +734,10 @@ mod tests {
         // The common mixup: the model passes a whole command line (or uses the
         // shell_command `cmd` field) to run_command, which needs program+args.
         // The error must steer it to shell_command instead of a raw serde note.
-        let dir =
-            std::env::temp_dir().join(format!("leveler-run-noprog-{}", super::super::test_ordinal()));
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-run-noprog-{}",
+            super::super::test_ordinal()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
