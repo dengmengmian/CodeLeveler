@@ -39,8 +39,9 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
                 // its own was force-stopped. Not a liftable budget, so its own
                 // wording — do not point at /goal as if more work-window helps.
                 StopReason::TurnLimitReached => RuntimeEvent::TurnIncomplete {
-                    reason: detail
-                        .unwrap_or_else(|| "触及单轮回合上限 · 已强制终止,请检查是否陷入循环".into()),
+                    reason: detail.unwrap_or_else(|| {
+                        "触及单轮回合上限 · 已强制终止,请检查是否陷入循环".into()
+                    }),
                 },
                 StopReason::Blocked => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
