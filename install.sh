@@ -67,6 +67,13 @@ mkdir -p "$BIN_DIR"
 mv "$tmp/${name}/leveler" "$BIN_DIR/leveler"
 chmod +x "$BIN_DIR/leveler"
 
+# macOS: a quarantine flag (set when an archive is downloaded via a browser)
+# trips Gatekeeper's "unverified developer" prompt on first run. A curl install
+# usually carries none, but strip it either way so `leveler` runs immediately.
+if [ "$os" = Darwin ]; then
+  xattr -d com.apple.quarantine "$BIN_DIR/leveler" 2>/dev/null || true
+fi
+
 echo "Installed leveler ${ver} -> $BIN_DIR/leveler"
 case ":$PATH:" in
   *":$BIN_DIR:"*) : ;;

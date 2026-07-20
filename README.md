@@ -87,6 +87,20 @@ cd codeleveler
 cargo install --path crates/leveler-cli --locked
 ```
 
+**First run — security prompts.** The prebuilt binaries are not yet notarized
+(macOS) or code-signed (Windows), so a first run may be blocked:
+
+- **macOS:** the `curl … | sh` installer runs without a prompt (and strips the
+  quarantine flag). If you downloaded the archive in a browser and Gatekeeper
+  says "unverified developer", clear it once:
+  `xattr -dr com.apple.quarantine ./leveler` (or right-click → Open, or System
+  Settings → Privacy & Security → Open Anyway).
+- **Windows:** SmartScreen may warn — "More info → Run anyway", and if the
+  `.zip` was browser-downloaded, Properties → check "Unblock" first.
+- **Linux:** no signing gate. For full sandboxing install `bubblewrap`
+  (`sudo apt install bubblewrap`); without it `leveler` still runs but the
+  sandbox degrades — `leveler doctor` reports what is available.
+
 ### 2. Configure a model
 
 On Windows, set a persistent Leveler home and create the config from PowerShell:

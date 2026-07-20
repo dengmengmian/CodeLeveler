@@ -81,6 +81,17 @@ cd codeleveler
 cargo install --path crates/leveler-cli --locked
 ```
 
+**首次运行 — 安全拦截。** 预编译二进制暂未做 macOS 公证 / Windows 代码签名,
+首次运行可能被拦：
+
+- **macOS：** 用 `curl … | sh` 安装不会弹窗（并已清除 quarantine 标记）。若你是在
+  浏览器里下载的压缩包、Gatekeeper 提示「无法验证开发者」，清一次即可：
+  `xattr -dr com.apple.quarantine ./leveler`（或右键→打开，或 系统设置→隐私与安全性→仍要打开）。
+- **Windows：** SmartScreen 可能警告——「更多信息 → 仍要运行」；若 `.zip` 是浏览器下载的，
+  先在 属性 里勾「解除锁定」。
+- **Linux：** 无签名门槛。要完整沙箱请装 `bubblewrap`（`sudo apt install bubblewrap`）；
+  没有它 `leveler` 仍能运行，但沙箱能力降级——`leveler doctor` 会报告实际可用能力。
+
 ### 2. 配置模型
 
 Windows 先在 PowerShell 中设置持久的 Leveler 主目录，并新建配置文件：
