@@ -272,6 +272,7 @@ mod tests {
     async fn memory_store_honors_the_contract() {
         let store = MemoryEventStore::new();
         assert_gapless_and_ordered(&store, &SessionId::generate()).await;
+        assert_last_of_type(&store, &SessionId::generate()).await;
     }
 
     #[tokio::test]
@@ -279,7 +280,9 @@ mod tests {
         let db = Database::connect_in_memory().await.unwrap();
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
         SessionRepository::new(&db).create(&record).await.unwrap();
-        assert_gapless_and_ordered(&db, &SessionId::new(record.id)).await;
+        let session = SessionId::new(record.id);
+        assert_gapless_and_ordered(&db, &session).await;
+        assert_last_of_type(&db, &session).await;
     }
 
     #[tokio::test]

@@ -1572,6 +1572,7 @@ dependencies = [
  "leveler-core",
  "leveler-execution",
  "leveler-lifecycle",
+ "leveler-memory",
  "leveler-model",
  "leveler-skills",
  "leveler-tools",

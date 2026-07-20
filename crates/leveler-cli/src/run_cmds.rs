@@ -554,9 +554,7 @@ pub(crate) async fn cmd_tui(
             let _snap = client.snapshot(&session_id).await.map_err(|e| {
                 anyhow::anyhow!(
                     "cannot open session {id}: {e}\n\
-                     list sessions: leveler sessions list\n\
-                     note: interactive chat uses `leveler tui --session <id>` \
-                     (not `leveler resume`)"
+                     list sessions: leveler resume"
                 )
             })?;
             // Daemon path has no local registry; gauge may show 0 until first turn.
@@ -612,9 +610,7 @@ pub(crate) async fn cmd_tui(
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "session `{id}` not found in this repository.\n\
-                     list: leveler sessions list\n\
-                     note: interactive chat reopens with `leveler tui --session <id>`, \
-                     not `leveler resume` (resume is for interrupted task runs with a transcript)"
+                     list sessions: leveler resume"
                 )
             })?;
         session_id
@@ -715,7 +711,54 @@ pub(crate) async fn cmd_serve(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// Interactive resume: reopen a session in the TUI (the mainstream `resume`).
+/// With no id, list recent sessions so the user can pick one to reopen.
 pub(crate) async fn cmd_resume(
+    layout: Layout,
+    id: Option<String>,
+    config_overridden: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    let Some(id) = id else {
+        return list_sessions_for_resume(layout).await;
+    };
+    // Reopen reuses the TUI session path; persisted model/mode are restored.
+    cmd_tui(
+        layout,
+        None,
+        RunMode::Assisted,
+        false,
+        false,
+        None,
+        Some(id),
+        config_overridden,
+    )
+    .await
+}
+
+/// Print recent sessions with a copy-paste `leveler resume <id>` hint.
+async fn list_sessions_for_resume(layout: Layout) -> anyhow::Result<std::process::ExitCode> {
+    let app = Application::assemble(layout)?;
+    let db = app.open_database().await?;
+    let sessions = leveler_storage::SessionRepository::new(&db).list().await?;
+    if sessions.is_empty() {
+        println!(
+            "{}",
+            Line::warn("No sessions yet. Start one with `leveler`.")
+        );
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    println!(
+        "{}",
+        Line::heading("Recent sessions — reopen with `leveler resume <id>`")
+    );
+    for s in sessions.iter().take(20) {
+        println!("  {}  [{}]  {}", s.id, s.status.as_str(), s.goal);
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Headless recovery of an interrupted non-interactive run (`run --resume`).
+pub(crate) async fn cmd_run_resume(
     layout: Layout,
     id: String,
     auto_approve: bool,

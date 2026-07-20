@@ -151,6 +151,11 @@ pub enum TranscriptItem {
 #[derive(Debug, Default, Clone)]
 pub struct TranscriptState {
     items: Vec<TranscriptItem>,
+    /// Bumped on every mutation so the conversation renderer can cache its
+    /// wrapped lines and only rebuild when the content actually changed. Every
+    /// `&mut self` method calls [`Self::bump`]; over-bumping is safe (a wasted
+    /// rebuild), under-bumping is not (stale render), so err toward bumping.
+    version: u64,
 }
 
 impl TranscriptState {
@@ -158,11 +163,23 @@ impl TranscriptState {
         Self::default()
     }
 
+    /// A monotonic content version; changes whenever the transcript mutates.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[inline]
+    fn bump(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
     pub fn items(&self) -> &[TranscriptItem] {
         &self.items
     }
 
     pub fn items_mut(&mut self) -> &mut [TranscriptItem] {
+        // The caller takes a mutable slice; assume it mutates and invalidate.
+        self.bump();
         &mut self.items
     }
 
@@ -176,6 +193,7 @@ impl TranscriptState {
 
     /// Insert the welcome block at the top, once.
     pub fn push_welcome(&mut self, block: WelcomeBlock) {
+        self.bump();
         if self
             .items
             .iter()
@@ -187,11 +205,13 @@ impl TranscriptState {
     }
 
     pub fn push_user(&mut self, text: String) {
+        self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::User(text));
     }
 
     pub fn push_user_if_new(&mut self, text: String) {
+        self.bump();
         if matches!(self.items.last(), Some(TranscriptItem::User(existing)) if existing == &text) {
             return;
         }
@@ -199,18 +219,21 @@ impl TranscriptState {
     }
 
     pub fn push_error(&mut self, text: String) {
+        self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Error(text));
     }
 
     /// Durable multi-line host note (memory list, etc.). Survives status TTL.
     pub fn push_note(&mut self, text: String) {
+        self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Note(text));
     }
 
     /// Start a `/btw` side-question block (ephemeral).
     pub fn begin_btw(&mut self, question: String) {
+        self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Btw(BtwBlock {
             question,
@@ -221,6 +244,7 @@ impl TranscriptState {
     }
 
     pub fn append_btw(&mut self, delta: &str) {
+        self.bump();
         if let Some(TranscriptItem::Btw(b)) = self
             .items
             .iter_mut()
@@ -232,6 +256,7 @@ impl TranscriptState {
     }
 
     pub fn finish_btw(&mut self, failed: bool) {
+        self.bump();
         if let Some(TranscriptItem::Btw(b)) = self
             .items
             .iter_mut()
@@ -244,6 +269,7 @@ impl TranscriptState {
     }
 
     pub fn push_completion(&mut self, report: UiCompletionReport) {
+        self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Completion(report));
     }
@@ -275,6 +301,7 @@ impl TranscriptState {
     }
 
     pub fn push_recap(&mut self, recap: RecapBlock) {
+        self.bump();
         if matches!(self.items.last(), Some(TranscriptItem::Recap(_))) {
             return;
         }
@@ -322,6 +349,7 @@ impl TranscriptState {
 
     /// Begin a new assistant message that deltas will target.
     pub fn begin_assistant(&mut self, id: MessageId) {
+        self.bump();
         // Guard against a duplicate start for the same id.
         if self.assistant_mut(&id).is_none() {
             self.close_tool_group();
@@ -336,6 +364,7 @@ impl TranscriptState {
 
     /// Remove an unfinished assistant block from a failed stream attempt.
     pub fn reset_assistant_attempt(&mut self, id: &MessageId) {
+        self.bump();
         self.items.retain(|item| {
             !matches!(item, TranscriptItem::Assistant(block) if &block.id == id && !block.done)
         });
@@ -346,6 +375,7 @@ impl TranscriptState {
     /// re-emits after completion), reopen it so the new text actually renders
     /// (the cached `rendered` would otherwise hide it).
     pub fn append_assistant(&mut self, id: &MessageId, delta: &str) {
+        self.bump();
         match self.assistant_mut(id) {
             Some(block) => {
                 block.text.push_str(delta);
@@ -366,6 +396,7 @@ impl TranscriptState {
 
     /// Mark an assistant message complete and parse its markdown once.
     pub fn finish_assistant(&mut self, id: &MessageId) {
+        self.bump();
         if let Some(block) = self.assistant_mut(id) {
             block.done = true;
             block.rendered = Some(MdDoc::parse(&block.text));
@@ -378,6 +409,7 @@ impl TranscriptState {
     /// to scrollback, showing a stuck spinner/cursor. A cleanly-completed turn has
     /// nothing in-flight, so this is a no-op there.
     pub fn finalize_in_flight(&mut self) {
+        self.bump();
         for item in &mut self.items {
             match item {
                 TranscriptItem::Assistant(b) if !b.done => {
@@ -402,6 +434,7 @@ impl TranscriptState {
 
     /// Record a started tool call as a running block.
     pub fn push_tool_started(&mut self, id: ToolCallId, name: String, arguments: String) {
+        self.bump();
         let call = ToolCallBlock {
             id,
             name,
@@ -422,6 +455,7 @@ impl TranscriptState {
 
     /// Complete a tool call, updating its status, preview, and duration.
     pub fn complete_tool(&mut self, id: &ToolCallId, ok: bool, preview: String, duration_ms: u64) {
+        self.bump();
         for item in self.items.iter_mut().rev() {
             let TranscriptItem::ToolGroup(group) = item else {
                 continue;
@@ -444,6 +478,7 @@ impl TranscriptState {
     /// Returns the new expanded state of that group, or `None` when there is
     /// no tool group to toggle.
     pub fn toggle_last_tool_group(&mut self) -> Option<bool> {
+        self.bump();
         for item in self.items.iter_mut().rev() {
             if let TranscriptItem::ToolGroup(group) = item {
                 group.expanded = !group.expanded;
@@ -458,6 +493,7 @@ impl TranscriptState {
     /// Not used by the Ctrl+O binding (that toggles only the latest group via
     /// [`Self::toggle_last_tool_group`]); kept for bulk UI actions / tests.
     pub fn set_all_tool_groups_expanded(&mut self, expanded: bool) {
+        self.bump();
         for item in &mut self.items {
             if let TranscriptItem::ToolGroup(group) = item {
                 group.expanded = expanded;
@@ -468,6 +504,7 @@ impl TranscriptState {
     /// Dismiss the latest finished `/btw` card (done or failed). Returns true
     /// if a card was removed. Running (incomplete) cards are left alone.
     pub fn dismiss_latest_finished_btw(&mut self) -> bool {
+        self.bump();
         if let Some(idx) = self.items.iter().rposition(|item| {
             matches!(
                 item,
@@ -500,12 +537,14 @@ impl TranscriptState {
     }
 
     fn close_tool_group(&mut self) {
+        self.bump();
         if let Some(TranscriptItem::ToolGroup(group)) = self.items.last_mut() {
             group.open = false;
         }
     }
 
     fn sub_agent_mut(&mut self, id: &str) -> Option<&mut SubAgentBlock> {
+        self.bump();
         self.items.iter_mut().rev().find_map(|item| match item {
             TranscriptItem::SubAgent(b) if b.id == id => Some(b),
             _ => None,
@@ -541,6 +580,7 @@ impl TranscriptState {
     /// the finish arrives before/without a start (e.g. a dropped event), still
     /// show a completed block so the result isn't lost.
     pub fn complete_sub_agent(&mut self, id: &str, nickname: &str, ok: bool, summary: String) {
+        self.bump();
         let status = if ok {
             ToolStatus::Ok
         } else {
@@ -583,10 +623,12 @@ impl TranscriptState {
 
     /// Clear every block (visual `/clear`; does not delete the session).
     pub fn clear(&mut self) {
+        self.bump();
         self.items.clear();
     }
 
     fn assistant_mut(&mut self, id: &MessageId) -> Option<&mut AssistantBlock> {
+        self.bump();
         self.items.iter_mut().rev().find_map(|item| match item {
             TranscriptItem::Assistant(b) if &b.id == id => Some(b),
             _ => None,
@@ -610,6 +652,35 @@ fn compact_summary(text: String, max_chars: usize) -> Option<String> {
 mod tests {
     use super::*;
     use leveler_client_protocol::ToolCallId;
+
+    #[test]
+    fn version_bumps_on_mutation_but_not_on_reads() {
+        let mut t = TranscriptState::new();
+        let v = t.version();
+
+        // Reads never change the version.
+        let _ = t.items();
+        let _ = t.is_empty();
+        let _ = t.len();
+        assert_eq!(t.version(), v, "reads must not bump");
+
+        // Representative mutations each advance it.
+        t.push_user("hi".into());
+        let v1 = t.version();
+        assert!(v1 > v, "push_user must bump");
+
+        t.push_tool_started(ToolCallId::new("t1"), "read_file".into(), "{}".into());
+        let v2 = t.version();
+        assert!(v2 > v1, "push_tool_started must bump");
+
+        t.complete_tool(&ToolCallId::new("t1"), true, "ok".into(), 1);
+        let v3 = t.version();
+        assert!(v3 > v2, "complete_tool must bump");
+
+        // In-place mutation via the slice escape hatch must also invalidate.
+        let _ = t.items_mut();
+        assert!(t.version() > v3, "items_mut must bump");
+    }
 
     fn group(expanded: bool) -> ToolGroupBlock {
         ToolGroupBlock {

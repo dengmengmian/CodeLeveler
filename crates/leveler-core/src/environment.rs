@@ -81,6 +81,32 @@ pub fn environment() -> &'static EnvSnapshot {
         .unwrap_or_else(|| EMPTY.get_or_init(EnvSnapshot::default))
 }
 
+/// The global CodeLeveler home directory — `$LEVELER_HOME`, else `$HOME/.leveler`,
+/// else `%USERPROFILE%\.leveler` (Windows). `None` when no home is known.
+///
+/// The single source of this resolution order. Callers pass their own env
+/// lookup so each keeps its source (live `std::env` vs the installed snapshot);
+/// only the order — including the `USERPROFILE` fallback — lives here, so the
+/// surfaces cannot drift apart (which previously dropped `USERPROFILE` on
+/// Windows in some places but not others).
+pub fn leveler_home_dir_from<F>(var_os: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    if let Some(h) = var_os("LEVELER_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(h));
+    }
+    var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(|h| PathBuf::from(h).join(".leveler"))
+}
+
+/// [`leveler_home_dir_from`] resolved against an [`EnvSnapshot`].
+pub fn leveler_home_dir(env: &EnvSnapshot) -> Option<PathBuf> {
+    leveler_home_dir_from(|k| env.var_os(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +122,38 @@ mod tests {
         assert_eq!(
             snapshot.var_os_case_insensitive("PATH"),
             Some(OsString::from("tool-bin"))
+        );
+    }
+
+    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| OsString::from(*v))
+        }
+    }
+
+    #[test]
+    fn resolution_order_prefers_leveler_home_then_home_then_userprofile() {
+        assert_eq!(
+            leveler_home_dir_from(lookup(&[("LEVELER_HOME", "/lh"), ("HOME", "/h")])),
+            Some(PathBuf::from("/lh"))
+        );
+        assert_eq!(
+            leveler_home_dir_from(lookup(&[("HOME", "/h"), ("USERPROFILE", "/u")])),
+            Some(PathBuf::from("/h/.leveler"))
+        );
+        // USERPROFILE is the Windows fallback that used to be dropped.
+        assert_eq!(
+            leveler_home_dir_from(lookup(&[("USERPROFILE", "/u")])),
+            Some(PathBuf::from("/u/.leveler"))
+        );
+        assert_eq!(leveler_home_dir_from(lookup(&[])), None);
+        // Empty values are skipped, not treated as a set home.
+        assert_eq!(
+            leveler_home_dir_from(lookup(&[("LEVELER_HOME", ""), ("HOME", "/h")])),
+            Some(PathBuf::from("/h/.leveler"))
         );
     }
 }

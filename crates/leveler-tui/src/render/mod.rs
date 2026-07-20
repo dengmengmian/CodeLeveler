@@ -1269,6 +1269,18 @@ mod tests {
     }
 
     #[test]
+    fn composer_hint_hidden_once_conversation_has_turns() {
+        let mut s = test_state();
+        s.transcript.push_user("你好".into());
+        let (lines, _) = super::composer_box_lines(&s, 48);
+        let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
+        assert!(
+            !joined.contains("输入消息") && !joined.contains("Type a message"),
+            "hint should not repeat after real turns: {joined}"
+        );
+    }
+
+    #[test]
     fn composer_shows_slash_arg_ghost_without_mutating_buffer() {
         let mut s = test_state();
         s.composer.replace("/btw ");

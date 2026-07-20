@@ -185,22 +185,26 @@ impl TurnRunner<'_> {
             // Resume / same unfinished task: seed Plan/Ledger/Progress so
             // Delivery and closeout stay consistent. Fresh Content turns must
             // NOT inherit terminal Closing/Completed state (new task epoch).
+            // Load the last persisted plan/progress once and reuse them for both
+            // the seed decision and the seeding itself. Each `last_persisted_*`
+            // call scans the full event log, so loading plan/progress twice
+            // (as this did) doubled that cost every Content/Goal turn.
+            let progress = last_persisted_progress(self.db, &self.session_id).await?;
+            let plan = last_persisted_plan(self.db, &self.session_id).await?;
             let seed_state = match &input {
                 TurnInput::Resume(_) => true,
                 TurnInput::Content { .. } | TurnInput::Goal { .. } => {
-                    let progress = last_persisted_progress(self.db, &self.session_id).await?;
-                    let plan = last_persisted_plan(self.db, &self.session_id).await?;
                     should_seed_task_state(plan.as_ref(), progress.as_ref())
                 }
             };
             if seed_state {
-                if let Some(plan) = last_persisted_plan(self.db, &self.session_id).await? {
+                if let Some(plan) = plan {
                     executor = executor.with_seeded_plan(plan);
                 }
                 if let Some(ledger) = last_persisted_ledger(self.db, &self.session_id).await? {
                     executor = executor.with_seeded_ledger(ledger);
                 }
-                if let Some(progress) = last_persisted_progress(self.db, &self.session_id).await? {
+                if let Some(progress) = progress {
                     executor = executor.with_seeded_progress(progress);
                 }
             }

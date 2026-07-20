@@ -95,16 +95,15 @@ fn resolve_leveler_home(
     userprofile: Option<std::ffi::OsString>,
     temp_dir: PathBuf,
 ) -> PathBuf {
-    if let Some(h) = leveler_home.filter(|value| !value.is_empty()) {
-        return PathBuf::from(h);
-    }
-    if let Some(h) = home
-        .filter(|value| !value.is_empty())
-        .or_else(|| userprofile.filter(|value| !value.is_empty()))
-    {
-        return PathBuf::from(h).join(".leveler");
-    }
-    temp_dir.join(format!("leveler-{}", std::process::id()))
+    // Home-resolution order (incl. USERPROFILE) is shared via leveler-core; this
+    // adds the process-local temp fallback the runtime state dir requires.
+    leveler_core::leveler_home_dir_from(|k| match k {
+        "LEVELER_HOME" => leveler_home.clone(),
+        "HOME" => home.clone(),
+        "USERPROFILE" => userprofile.clone(),
+        _ => None,
+    })
+    .unwrap_or_else(|| temp_dir.join(format!("leveler-{}", std::process::id())))
 }
 
 /// The runtime-state dir for a repo under `home`: `<home>/projects/<encoded>`.

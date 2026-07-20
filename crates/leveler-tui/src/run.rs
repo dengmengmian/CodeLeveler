@@ -57,11 +57,12 @@ const NOTIFICATION_TTL_WARNING: Duration = Duration::from_secs(8);
 const NOTIFICATION_TTL_INFO: Duration = Duration::from_secs(4);
 /// Animation / clock cadence for the busy spinner and header wall clock.
 ///
-/// The inline renderer rewrites the whole live footer on every animation frame.
-/// At subsecond rates this produced very noisy PTY logs during long model waits
-/// while adding little visual value. The elapsed timer is second-granular, so a
-/// one-second animation cadence keeps the TUI alive without flooding captures.
-const BUSY_TICK: Duration = Duration::from_secs(1);
+/// Drives the busy spinner AND the animated header progress line, so it must run
+/// subsecond to look smooth. It only forces a repaint while `is_busy()` (line
+/// ~390), so idle sessions stay quiet; the extra frames during a task are the
+/// cost of the moving top line (a deliberate visual, unlike the old silent
+/// waits). The elapsed clock is `Instant`-based, independent of this cadence.
+const BUSY_TICK: Duration = Duration::from_millis(150);
 /// Cadence for Conversation edge auto-scroll while drag-selecting text.
 const SELECTION_TICK: Duration = Duration::from_millis(50);
 /// Coalescing window for PTYs that deliver pasted text as plain key events.
@@ -435,11 +436,17 @@ pub async fn run(client: Arc<dyn InteractiveRuntimeClient>, boot: Boot) -> Resul
 }
 
 /// Text printed when the TUI exits (full copy-paste command to reopen chat).
+///
+/// Leaving the alternate screen restores the primary screen, which may still
+/// hold pre-launch content on these rows. Each line ends with `\x1b[K` (clear to
+/// end of line) — and the last with `\x1b[J` (clear to end of screen) — so that
+/// stale content cannot bleed into the printed lines (which previously appended
+/// a stray character onto the copy-paste `resume` command).
 fn session_exit_hint(session_id: &str) -> String {
     format!(
-        "Session: {session_id}\n\
-         Reopen:  leveler tui --session {session_id}\n\
-         (use `leveler resume` only for interrupted non-interactive task runs)"
+        "Session: {session_id}\x1b[K\n\
+         Reopen:  leveler resume {session_id}\x1b[K\n\
+         (or `leveler resume` to pick from recent sessions)\x1b[J"
     )
 }
 
@@ -785,12 +792,14 @@ mod tests {
         let id = "c1be5e5e-c3f8-4caa-abf4-18f66eb0aa57";
         let hint = session_exit_hint(id);
         assert!(
-            hint.contains(&format!("leveler tui --session {id}")),
-            "must be a full copy-paste TUI reopen command: {hint}"
+            hint.contains(&format!("leveler resume {id}")),
+            "must be a full copy-paste reopen command: {hint}"
         );
+        // The reopen line must clear to end of line right after the id so stale
+        // primary-screen content can't append a stray char to the command.
         assert!(
-            !hint.contains("leveler resume "),
-            "interactive chat must not suggest resume: {hint}"
+            hint.contains(&format!("leveler resume {id}\x1b[K")),
+            "reopen line must clear residue after the id: {hint:?}"
         );
     }
 

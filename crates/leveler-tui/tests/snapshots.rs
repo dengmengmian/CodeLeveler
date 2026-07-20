@@ -270,7 +270,7 @@ fn conversation_messages_use_prompt_and_bullet_without_role_labels() {
     );
 
     let text = render_at(100, 24, &mut state);
-    assert!(text.contains("> 请检查项目"), "{text}");
+    assert!(text.contains("▌ 请检查项目"), "{text}");
     assert!(text.contains("● 开始检查"), "{text}");
     assert!(!text.lines().any(|line| line.trim() == "User"), "{text}");
     assert!(
@@ -646,6 +646,62 @@ fn renders_completion_block() {
 }
 
 #[test]
+fn second_render_reflects_new_content_not_a_stale_cache() {
+    let mut state = opened_state();
+
+    let m1 = leveler_client_protocol::MessageId::new("m1");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: m1.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: m1.clone(),
+            delta: "first answer".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: m1 }),
+    );
+    let first = render_at(100, 24, &mut state);
+    assert!(first.contains("first answer"), "first render: {first}");
+
+    // Add a second message and re-render the SAME state: the conversation-line
+    // cache must invalidate so the new content shows and the old one stays.
+    let m2 = leveler_client_protocol::MessageId::new("m2");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: m2.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: m2.clone(),
+            delta: "second answer".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: m2 }),
+    );
+    let second = render_at(100, 24, &mut state);
+    assert!(
+        second.contains("second answer"),
+        "cache must not hide new content: {second}"
+    );
+    assert!(
+        second.contains("first answer"),
+        "prior content must remain: {second}"
+    );
+}
+
+#[test]
 fn completed_turn_omits_recap_and_does_not_guess_input_suggestion() {
     let mut state = opened_state();
     let id = leveler_client_protocol::MessageId::new("handoff");
@@ -677,9 +733,11 @@ fn completed_turn_omits_recap_and_does_not_guess_input_suggestion() {
         !text.contains("recap:"),
         "freeform answer must not become a recap: {text}"
     );
+    // Once the conversation has real turns, the empty-composer hint no longer
+    // repeats — it is a first-run cue only.
     assert!(
-        text.contains("输入消息") || text.contains("Type a message"),
-        "empty composer hint missing: {text}"
+        !text.contains("输入消息") && !text.contains("Type a message"),
+        "hint should not repeat after a completed turn: {text}"
     );
 }
 

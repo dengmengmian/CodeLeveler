@@ -105,8 +105,12 @@ pub enum Command {
 
     /// Run an agent task: the model uses tools to investigate and edit the repo.
     Run {
-        /// The natural-language task.
-        task: String,
+        /// The natural-language task. Omit only with `--resume`.
+        task: Option<String>,
+        /// Resume an interrupted non-interactive run by session id (headless,
+        /// streams events). For interactive chat use `leveler resume <id>`.
+        #[arg(long, value_name = "ID")]
+        resume: Option<String>,
         /// Model reference (defaults to the only configured model).
         #[arg(long)]
         model: Option<String>,
@@ -193,20 +197,11 @@ pub enum Command {
     #[command(subcommand)]
     Mcp(McpCommand),
 
-    /// Resume an interrupted session by id.
+    /// Reopen a session in the interactive TUI. With no id, lists recent
+    /// sessions to pick from. (Headless task recovery moved to `run --resume`.)
     Resume {
-        /// The session id to resume.
-        id: String,
-        /// Approve risky actions automatically (no prompts).
-        #[arg(long)]
-        auto_approve: bool,
-        /// Acknowledge a crash-recovery stop: you have inspected the
-        /// workspace; close the interrupted tool call(s) and proceed.
-        #[arg(long)]
-        confirm_recovery: bool,
-        /// Output format.
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        output: OutputFormat,
+        /// Session id to reopen. Omit to list recent sessions.
+        id: Option<String>,
     },
 
     /// Create the global config (~/.leveler/config.toml) interactively.
@@ -526,7 +521,7 @@ mod tests {
                 parallel,
                 ..
             }) => {
-                assert_eq!(task, "fix the bug");
+                assert_eq!(task.as_deref(), Some("fix the bug"));
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
                 assert!(commit && push && pr);
                 assert_eq!(branch.as_deref(), Some("fix/bug"));
@@ -780,14 +775,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_parses_id_and_output() {
-        let cli = parse(&["leveler", "resume", "sess-42", "--output", "jsonl"]);
-        match cli.command {
-            Some(Command::Resume { id, output, .. }) => {
-                assert_eq!(id, "sess-42");
-                assert_eq!(output, OutputFormat::Jsonl);
-            }
+    fn resume_parses_optional_id() {
+        let with_id = parse(&["leveler", "resume", "sess-42"]);
+        match with_id.command {
+            Some(Command::Resume { id }) => assert_eq!(id.as_deref(), Some("sess-42")),
             other => panic!("expected Resume, got {other:?}"),
+        }
+        let no_id = parse(&["leveler", "resume"]);
+        match no_id.command {
+            Some(Command::Resume { id }) => assert_eq!(id, None),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_parses_resume_id() {
+        let cli = parse(&["leveler", "run", "--resume", "sess-9"]);
+        match cli.command {
+            Some(Command::Run { task, resume, .. }) => {
+                assert_eq!(task, None);
+                assert_eq!(resume.as_deref(), Some("sess-9"));
+            }
+            other => panic!("expected Run, got {other:?}"),
         }
     }
 

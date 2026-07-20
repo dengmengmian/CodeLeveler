@@ -171,16 +171,13 @@ fn round_budget_exhausted_report(
         final_text.push_str("\n\nLatest note: ");
         final_text.push_str(last_text.trim());
     }
-    TaskReport {
-        outcome: TaskOutcome::BudgetLimited,
+    TaskReport::new(
+        TaskOutcome::BudgetLimited,
         final_text,
         modified_files,
-        verification: None,
-        stop_reason: StopReason::BudgetExhausted,
+        StopReason::BudgetExhausted,
         rounds,
-        review: None,
-        acceptance: None,
-    }
+    )
 }
 
 /// The engine's terminal report for a task.
@@ -197,6 +194,31 @@ pub struct TaskReport {
     pub review: Option<Vec<leveler_orchestrator::ReviewFinding>>,
     /// Command-backed acceptance-criteria evidence (orchestrated runs only).
     pub acceptance: Option<leveler_verifier::AcceptanceLedger>,
+}
+
+impl TaskReport {
+    /// A report with the always-present fields set and the orchestration-only
+    /// extras (`verification`/`review`/`acceptance`) defaulted to `None`.
+    /// Sites that produce those set them via `TaskReport { field: Some(..),
+    /// ..TaskReport::new(..) }`, so a new optional field defaults in one place.
+    pub(crate) fn new(
+        outcome: TaskOutcome,
+        final_text: String,
+        modified_files: Vec<String>,
+        stop_reason: StopReason,
+        rounds: u32,
+    ) -> Self {
+        Self {
+            outcome,
+            final_text,
+            modified_files,
+            verification: None,
+            stop_reason,
+            rounds,
+            review: None,
+            acceptance: None,
+        }
+    }
 }
 
 pub fn mode_str(mode: PermissionProfile) -> &'static str {
@@ -1089,31 +1111,25 @@ impl TaskEngine {
         // failure (阶段A semantics: Stalled/Blocked/Incomplete/BudgetExhausted
         // never read as success).
         if let Some(terminal) = direct_non_success_outcome(outcome.stop_reason) {
-            return Ok(TaskReport {
-                outcome: terminal,
-                final_text: outcome.final_text,
-                modified_files: outcome.modified_files,
-                verification: None,
-                stop_reason: outcome.stop_reason,
-                rounds: outcome.rounds,
-                review: None,
-                acceptance: None,
-            });
+            return Ok(TaskReport::new(
+                terminal,
+                outcome.final_text,
+                outcome.modified_files,
+                outcome.stop_reason,
+                outcome.rounds,
+            ));
         }
 
         // K19 early short-circuit: no mutation or no gates → never claim Verified
         // (pure Q&A over a green repo must stay CompletedUnverified).
         if outcome.modified_files.is_empty() || !spec.verification.has_gates() {
-            return Ok(TaskReport {
-                outcome: TaskOutcome::CompletedUnverified,
-                final_text: outcome.final_text,
-                modified_files: outcome.modified_files,
-                verification: None,
-                stop_reason: outcome.stop_reason,
-                rounds: outcome.rounds,
-                review: None,
-                acceptance: None,
-            });
+            return Ok(TaskReport::new(
+                TaskOutcome::CompletedUnverified,
+                outcome.final_text,
+                outcome.modified_files,
+                outcome.stop_reason,
+                outcome.rounds,
+            ));
         }
 
         let mut report = self
@@ -1208,14 +1224,15 @@ impl TaskEngine {
             expected,
         ));
         Ok(TaskReport {
-            outcome: task_outcome,
-            final_text: outcome.final_text,
-            modified_files: outcome.modified_files,
             verification: Some(report),
-            stop_reason: outcome.stop_reason,
-            rounds: outcome.rounds,
-            review: None,
             acceptance,
+            ..TaskReport::new(
+                task_outcome,
+                outcome.final_text,
+                outcome.modified_files,
+                outcome.stop_reason,
+                outcome.rounds,
+            )
         })
     }
 
@@ -1397,16 +1414,13 @@ impl TaskEngine {
                 observer,
             )
             .await?;
-            return Ok(TaskReport {
-                outcome: TaskOutcome::Failed,
-                final_text: format!("invalid_plan: {e}"),
+            return Ok(TaskReport::new(
+                TaskOutcome::Failed,
+                format!("invalid_plan: {e}"),
                 modified_files,
-                verification: None,
-                stop_reason: StopReason::Completed,
+                StopReason::Completed,
                 rounds,
-                review: None,
-                acceptance: None,
-            });
+            ));
         }
 
         let mut phase = AgentState::Execute;
@@ -1501,13 +1515,11 @@ impl TaskEngine {
             // false so Answered is the normal success stop). Test/Verify may
             // Answer without files and still complete.
             // Task-level completion is still decided by verify/finalize below.
-            let status = match (node.kind, recorded.outcome.stop_reason) {
-                (TaskNodeKind::Edit, StopReason::Answered) if node_modified.is_empty() => {
-                    NodeStatus::Failed
-                }
-                (_, StopReason::Completed | StopReason::Answered) => NodeStatus::Completed,
-                _ => NodeStatus::Failed,
-            };
+            let status = node_status(
+                node.kind,
+                recorded.outcome.stop_reason,
+                node_modified.is_empty(),
+            );
             graph.nodes[index].status = status;
             log.append(
                 None,
@@ -1540,20 +1552,17 @@ impl TaskEngine {
                 } else {
                     last_text
                 };
-                return Ok(TaskReport {
-                    outcome: if recorded.outcome.stop_reason == StopReason::BudgetExhausted {
+                return Ok(TaskReport::new(
+                    if recorded.outcome.stop_reason == StopReason::BudgetExhausted {
                         TaskOutcome::BudgetLimited
                     } else {
                         TaskOutcome::Failed
                     },
-                    final_text: failed_text,
+                    failed_text,
                     modified_files,
-                    verification: None,
-                    stop_reason: recorded.outcome.stop_reason,
+                    recorded.outcome.stop_reason,
                     rounds,
-                    review: None,
-                    acceptance: None,
-                });
+                ));
             }
         }
 
@@ -1568,16 +1577,13 @@ impl TaskEngine {
                 observer,
             )
             .await?;
-            return Ok(TaskReport {
-                outcome: TaskOutcome::Failed,
-                final_text: "graph_stuck: no ready nodes while unfinished work remains".into(),
+            return Ok(TaskReport::new(
+                TaskOutcome::Failed,
+                "graph_stuck: no ready nodes while unfinished work remains".into(),
                 modified_files,
-                verification: None,
-                stop_reason: StopReason::Completed,
+                StopReason::Completed,
                 rounds,
-                review: None,
-                acceptance: None,
-            });
+            ));
         }
 
         // Verification gate (spec §2.3, §29-32): without gates the task can at
@@ -1592,16 +1598,13 @@ impl TaskEngine {
                 observer,
             )
             .await?;
-            return Ok(TaskReport {
-                outcome: TaskOutcome::CompletedUnverified,
-                final_text: last_text,
+            return Ok(TaskReport::new(
+                TaskOutcome::CompletedUnverified,
+                last_text,
                 modified_files,
-                verification: None,
-                stop_reason: StopReason::Completed,
+                StopReason::Completed,
                 rounds,
-                review: None,
-                acceptance: None,
-            });
+            ));
         }
         advance!(AgentState::VerifyTask);
         let allowed = allowed_paths(&graph);
@@ -1684,14 +1687,14 @@ impl TaskEngine {
             )
             .await?;
             return Ok(TaskReport {
-                outcome: TaskOutcome::Failed,
-                final_text: last_text,
-                modified_files,
                 verification: Some(report),
-                stop_reason: StopReason::Completed,
-                rounds,
-                review: None,
-                acceptance: None,
+                ..TaskReport::new(
+                    TaskOutcome::Failed,
+                    last_text,
+                    modified_files,
+                    StopReason::Completed,
+                    rounds,
+                )
             });
         }
 
@@ -1757,14 +1760,15 @@ impl TaskEngine {
             )
             .await?;
             return Ok(TaskReport {
-                outcome: TaskOutcome::Failed,
-                final_text: last_text,
-                modified_files,
                 verification: Some(report),
-                stop_reason: StopReason::Completed,
-                rounds,
                 review: Some(review.findings),
-                acceptance: None,
+                ..TaskReport::new(
+                    TaskOutcome::Failed,
+                    last_text,
+                    modified_files,
+                    StopReason::Completed,
+                    rounds,
+                )
             });
         }
 
@@ -1811,14 +1815,16 @@ impl TaskEngine {
         let outcome =
             map_completion_verdict(finalize_task_outcome(&report, Some(&acceptance), expected));
         Ok(TaskReport {
-            outcome,
-            final_text: last_text,
-            modified_files,
             verification: Some(report),
-            stop_reason: StopReason::Completed,
-            rounds,
             review: Some(review.findings),
             acceptance: Some(acceptance),
+            ..TaskReport::new(
+                outcome,
+                last_text,
+                modified_files,
+                StopReason::Completed,
+                rounds,
+            )
         })
     }
 
@@ -1961,6 +1967,24 @@ fn map_completion_verdict(v: CompletionVerdict) -> TaskOutcome {
     }
 }
 
+/// A graph node's terminal status from its kind and how its drive stopped.
+///
+/// K15: an Edit node that only Answered without touching any file did not do its
+/// job, so it Fails even though Answered is the normal (non-goal) success stop.
+/// Test/Verify nodes may Answer without files and still Complete.
+fn node_status(
+    kind: leveler_orchestrator::TaskNodeKind,
+    stop_reason: StopReason,
+    node_modified_empty: bool,
+) -> leveler_orchestrator::NodeStatus {
+    use leveler_orchestrator::{NodeStatus, TaskNodeKind};
+    match (kind, stop_reason) {
+        (TaskNodeKind::Edit, StopReason::Answered) if node_modified_empty => NodeStatus::Failed,
+        (_, StopReason::Completed | StopReason::Answered) => NodeStatus::Completed,
+        _ => NodeStatus::Failed,
+    }
+}
+
 /// Direct ExpectedMutation decision (design §1.3 / K19).
 ///
 /// `needs_mutation = task_looks_like_implementation(goal) || delivery_gate`.
@@ -2013,6 +2037,42 @@ fn gate_plan(spec: &TaskSpec) -> VerificationPlan {
         leveler_verifier::discover::plan_for_repo(&spec.repository)
     } else {
         spec.verification.clone()
+    }
+}
+
+#[cfg(test)]
+mod node_status_tests {
+    use super::*;
+    use leveler_orchestrator::{NodeStatus, TaskNodeKind};
+
+    #[test]
+    fn edit_answered_without_mutation_fails_but_completes_with_files() {
+        // K15: Edit that only Answered without touching files did not do its job.
+        assert_eq!(
+            node_status(TaskNodeKind::Edit, StopReason::Answered, true),
+            NodeStatus::Failed
+        );
+        assert_eq!(
+            node_status(TaskNodeKind::Edit, StopReason::Answered, false),
+            NodeStatus::Completed
+        );
+    }
+
+    #[test]
+    fn non_edit_answer_completes_and_non_success_fails() {
+        // Test/Verify nodes may Answer without files and still complete.
+        assert_eq!(
+            node_status(TaskNodeKind::Test, StopReason::Answered, true),
+            NodeStatus::Completed
+        );
+        assert_eq!(
+            node_status(TaskNodeKind::Edit, StopReason::Completed, true),
+            NodeStatus::Completed
+        );
+        assert_eq!(
+            node_status(TaskNodeKind::Edit, StopReason::BudgetExhausted, false),
+            NodeStatus::Failed
+        );
     }
 }
 

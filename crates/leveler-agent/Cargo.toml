@@ -13,6 +13,7 @@ leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-model = { workspace = true }
 leveler-tools = { workspace = true }
+leveler-memory = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-context = { workspace = true }
 leveler-skills = { workspace = true }

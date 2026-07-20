@@ -247,6 +247,15 @@ pub struct AppState {
     pub conversation_plain: Vec<String>,
     /// Content width used when `conversation_plain` was built.
     pub conversation_plain_width: usize,
+    /// Memoized wrapped conversation lines, reused across repaints while no
+    /// render input changed (see `AppState::conversation_lines`). Interior
+    /// mutability so read-only render/measure paths can populate it.
+    pub conversation_cache: std::cell::RefCell<
+        Option<(
+            crate::workbench::ConvKey,
+            std::rc::Rc<Vec<ratatui::text::Line<'static>>>,
+        )>,
+    >,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
     /// Prompt Queue panel collapsed to a single title row (`Ctrl+Q`).
@@ -376,6 +385,7 @@ impl AppState {
             selection_last_mouse: None,
             conversation_plain: Vec::new(),
             conversation_plain_width: 0,
+            conversation_cache: std::cell::RefCell::new(None),
             plan_collapsed: false,
             queue_collapsed: false,
             queue_selected: None,

@@ -248,7 +248,7 @@ fn tui_session_commands_ui_and_logic() {
     reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
     let btw_foot = footer_text(&s);
     assert!(
-        btw_foot.contains("旁问") || btw_foot.contains("btw"),
+        btw_foot.contains("临时提问") || btw_foot.contains("btw"),
         "btw card title: {btw_foot}"
     );
     assert!(

@@ -105,8 +105,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let plan_rows = plan_panel_height(state);
     let composer_rows =
         composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2) as u16;
-    // Header: single status line + hairline separator (2 rows). Footer 1.
-    let header_rows: u16 = 2;
+    // Header: blank breathing row + status line + hairline separator (3 rows)
+    // so the brand strip is not flush against the terminal's top edge. Footer 1.
+    let header_rows: u16 = 3;
     let footer_rows: u16 = 1;
     // One blank row between transcript and bottom chrome so the last answer /
     // turn-end marker does not sit flush on the composer border (parity with
@@ -182,26 +183,80 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
 // ── Header (single-line environment strip + rule — no model / tokens) ───────
 
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = &state.theme;
-    let width = area.width as usize;
-    let [status, rule_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    // Leading blank row keeps the brand strip off the terminal's top edge.
+    let [_gap, status, rule_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
-    frame.render_widget(Paragraph::new(header_status_line(state, width)), status);
+    // One-column left inset so the brand does not sit flush on the edge.
+    let text_area = Rect {
+        x: status.x + 1,
+        width: status.width.saturating_sub(1),
+        ..status
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(width),
-            Style::default().fg(theme.border),
-        ))),
+        Paragraph::new(header_status_line(state, text_area.width as usize)),
+        text_area,
+    );
+    frame.render_widget(
+        Paragraph::new(header_rule_line(area.width as usize, state)),
         rule_area,
     );
 }
 
+/// The header underline. Idle: a static hairline. Busy: an accent segment that
+/// slides back and forth (indeterminate progress) so the top of the screen shows
+/// the agent is working. Uses a heavy glyph for the moving part so the motion is
+/// still visible under `NO_COLOR`.
+fn header_rule_line(width: usize, state: &AppState) -> Line<'static> {
+    let theme = &state.theme;
+    let border = Style::default().fg(theme.border);
+    if width == 0 {
+        return Line::from("");
+    }
+    if !state.is_busy() {
+        return Line::from(Span::styled("─".repeat(width), border));
+    }
+
+    let seg = (width / 6).clamp(6, 24).min(width);
+    let travel = width.saturating_sub(seg);
+    // Ping-pong the segment start across [0, travel] to avoid edge wrap. Two
+    // cells per frame keeps the slide lively without looking frantic.
+    let start = if travel == 0 {
+        0
+    } else {
+        let period = travel * 2;
+        let phase = (state.tick as usize).wrapping_mul(2) % period;
+        if phase <= travel {
+            phase
+        } else {
+            period - phase
+        }
+    };
+    let after = width - start - seg;
+
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("─".repeat(start), border));
+    }
+    spans.push(Span::styled("━".repeat(seg), accent));
+    if after > 0 {
+        spans.push(Span::styled("─".repeat(after), border));
+    }
+    Line::from(spans)
+}
+
 /// Progressive single-line header that degrades as the terminal narrows.
 ///
-/// Wide:   `CodeLeveler v0.1.0 · ~/.../repo ·  main a899d24`
-/// Medium: `CodeLeveler v0.1.0 · repo ·  main`
-/// Narrow: `CodeLeveler ·  main`
+/// Wide:   `CodeLeveler v0.1.0 · repo ·  main ●`
+/// Medium: `CodeLeveler v0.1.0 ·  main ●`
+/// Narrow: `CodeLeveler ·  main ●`
 fn header_status_line(state: &AppState, width: usize) -> Line<'static> {
     let theme = &state.theme;
     let brand = Style::default()
@@ -211,16 +266,14 @@ fn header_status_line(state: &AppState, width: usize) -> Line<'static> {
     let git = Style::default().fg(theme.success);
 
     let version = state.version();
-    let branch = state.branch.as_deref().unwrap_or("—").to_string();
-    let sid = short_session(state);
-    let home_repo = display_repo(state);
-    let base_repo = repo_basename(&home_repo);
-    let mid_repo = middle_ellipsis_repo(&home_repo);
+    let branch = dirty_display(state.branch.as_deref().unwrap_or("—"));
+    let full_repo = crate::status_line::home_collapsed_repo(state);
+    let base_repo = repo_basename(&full_repo);
 
     let ver = format!(" v{version}");
     // Richest → sparsest plain-text candidates; first that fits wins.
     let texts = [
-        format!("CodeLeveler{ver} · {mid_repo} ·  {branch} {sid}"),
+        format!("CodeLeveler{ver} · {full_repo} ·  {branch}"),
         format!("CodeLeveler{ver} · {base_repo} ·  {branch}"),
         format!("CodeLeveler{ver} ·  {branch}"),
         format!("CodeLeveler ·  {branch}"),
@@ -264,39 +317,13 @@ fn style_header_text(text: &str, brand: Style, muted: Style, git: Style) -> Line
     Line::from(spans)
 }
 
-fn display_repo(state: &AppState) -> String {
-    let repo = if state.repository.is_empty() {
-        "—"
-    } else {
-        state.repository.as_str()
-    };
-    match leveler_core::environment().var_os("HOME") {
-        Some(h) => {
-            let hs = h.to_string_lossy();
-            if let Some(rest) = repo.strip_prefix(hs.as_ref()) {
-                format!("~{rest}")
-            } else {
-                repo.to_string()
-            }
-        }
-        None => repo.to_string(),
+/// Render the branch's dirty marker as a spaced dot instead of a glued `*`,
+/// so `main*` reads as `main ●` and the marker is not mistaken for the name.
+fn dirty_display(branch: &str) -> String {
+    match branch.strip_suffix('*') {
+        Some(base) => format!("{base} ●"),
+        None => branch.to_string(),
     }
-}
-
-/// `~/projects/services/example-service` → `~/.../example-service`
-fn middle_ellipsis_repo(repo: &str) -> String {
-    let base = repo_basename(repo);
-    if repo == base || repo == "—" {
-        return base;
-    }
-    if let Some(rest) = repo.strip_prefix("~/") {
-        if rest.contains('/') {
-            return format!("~/.../{base}");
-        }
-    } else if repo.contains('/') {
-        return format!(".../{base}");
-    }
-    repo.to_string()
 }
 
 fn repo_basename(repo: &str) -> String {
@@ -305,15 +332,6 @@ fn repo_basename(repo: &str) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or(repo)
         .to_string()
-}
-
-fn short_session(state: &AppState) -> String {
-    let raw = state.session_id.as_str();
-    if raw.len() <= 8 {
-        raw.to_string()
-    } else {
-        raw[raw.len().saturating_sub(8)..].to_string()
-    }
 }
 
 // ── Conversation viewport ───────────────────────────────────────────────────
@@ -328,10 +346,18 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
 
-    let all = build_conversation_lines(state, width);
-    // Cache plain text for mouse selection / clipboard.
-    state.conversation_plain = all.iter().map(crate::selection::line_to_plain).collect();
-    state.conversation_plain_width = width;
+    let all = state.conversation_lines(width);
+    // Plain text only backs mouse selection / clipboard. Rebuild it from this
+    // frame's lines while a selection is live; otherwise clear it (the mouse-down
+    // path calls `ensure_conversation_plain`, which rebuilds against current
+    // content on demand) so idle frames skip an O(lines) clone per repaint.
+    if state.selection.is_active() {
+        state.conversation_plain = all.iter().map(crate::selection::line_to_plain).collect();
+        state.conversation_plain_width = width;
+    } else if !state.conversation_plain.is_empty() {
+        state.conversation_plain.clear();
+        state.conversation_plain_width = 0;
+    }
 
     let total = all.len();
     let max_scroll = total.saturating_sub(height);
@@ -341,13 +367,19 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
         state.conversation_scroll.min(max_scroll)
     };
 
+    // Only the visible window is cloned + highlighted; the rest stays in the Rc.
     let mut lines: Vec<Line> = all
-        .into_iter()
+        .iter()
         .enumerate()
         .skip(scroll)
         .take(height)
         .map(|(abs_row, line)| {
-            crate::selection::apply_selection_highlight(line, abs_row, &state.selection, theme)
+            crate::selection::apply_selection_highlight(
+                line.clone(),
+                abs_row,
+                &state.selection,
+                theme,
+            )
         })
         .collect();
 
@@ -400,6 +432,52 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
 }
 
 /// Flatten transcript (+ live reasoning) into display lines for the viewport.
+/// Everything `build_conversation_lines` reads that can change its output. When
+/// this is unchanged the previously wrapped lines are reused verbatim. Note the
+/// transcript is captured by its monotonic `version`, so any in-place item edit
+/// invalidates the cache.
+#[derive(Debug, PartialEq, Clone)]
+pub struct ConvKey {
+    version: u64,
+    width: usize,
+    theme_id: crate::theme::ThemeId,
+    monochrome: bool,
+    locale: crate::i18n::Locale,
+    tools_expanded: bool,
+    reasoning_expanded: bool,
+    reasoning: String,
+}
+
+impl AppState {
+    /// Cache-aware conversation lines: re-wraps the whole transcript only when a
+    /// render input changed; otherwise returns the previously built lines (an
+    /// `Rc` clone, O(1)). The empty/splash case is not cached — the splash reads
+    /// repo/branch, which the transcript `version` does not track.
+    pub(crate) fn conversation_lines(&self, width: usize) -> std::rc::Rc<Vec<Line<'static>>> {
+        if crate::splash::conversation_is_empty(self) {
+            return std::rc::Rc::new(build_conversation_lines(self, width));
+        }
+        let key = ConvKey {
+            version: self.transcript.version(),
+            width,
+            theme_id: self.theme.id,
+            monochrome: self.theme.monochrome,
+            locale: self.locale,
+            tools_expanded: self.tools_expanded,
+            reasoning_expanded: self.reasoning_expanded,
+            reasoning: self.reasoning.clone(),
+        };
+        if let Some((k, lines)) = self.conversation_cache.borrow().as_ref()
+            && *k == key
+        {
+            return lines.clone();
+        }
+        let lines = std::rc::Rc::new(build_conversation_lines(self, width));
+        *self.conversation_cache.borrow_mut() = Some((key, lines.clone()));
+        lines
+    }
+}
+
 pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let theme = &state.theme;
     let t = state.t();
@@ -420,13 +498,21 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
             out.push(Line::from(""));
         }
         // Message types are distinguished by shape, not role headings:
-        // `>` user prompt, `●` agent prose, status glyphs for tool activity.
+        // `▌` user prompt, `●` agent prose, status glyphs for tool activity.
         match item {
             TranscriptItem::User(text) => {
+                // A solid accent bar + bold body marks the user's turn clearly
+                // apart from the assistant's `●` bullet and normal-weight prose.
+                let bar = Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD);
+                let body = Style::default()
+                    .fg(theme.user_message)
+                    .add_modifier(Modifier::BOLD);
                 for line in wrap_simple(text, width.saturating_sub(2).max(1)) {
                     out.push(Line::from(vec![
-                        Span::styled("> ", Style::default().fg(theme.accent)),
-                        Span::styled(line, Style::default().fg(theme.user_message)),
+                        Span::styled("▌ ", bar),
+                        Span::styled(line, body),
                     ]));
                 }
             }
@@ -718,7 +804,7 @@ fn wrap_simple(s: &str, width: usize) -> Vec<String> {
 
 /// How many lines the conversation content needs at `width` (for scroll math).
 pub fn conversation_line_count(state: &AppState, width: usize) -> usize {
-    build_conversation_lines(state, width).len()
+    state.conversation_lines(width).len()
 }
 
 /// Clamp scroll after resize / content change. Returns true if state changed.
@@ -760,6 +846,109 @@ mod tests {
     use super::*;
     use leveler_client_protocol::PlanStepStatus;
     use leveler_client_protocol::{SessionId, UiPlan, UiPlanStep};
+
+    fn test_state() -> AppState {
+        AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+            },
+        )
+    }
+
+    fn rule_plain(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn header_rule_is_static_hairline_when_idle() {
+        let state = test_state();
+        assert!(!state.is_busy());
+        let line = header_rule_line(40, &state);
+        let plain = rule_plain(&line);
+        assert_eq!(plain, "─".repeat(40), "idle rule must be a plain hairline");
+    }
+
+    #[test]
+    fn header_rule_animates_and_keeps_width_when_busy() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        // Width is preserved across frames; a moving heavy segment is present.
+        for tick in [0u64, 3, 7, 50] {
+            state.tick = tick;
+            let plain = rule_plain(&header_rule_line(48, &state));
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(plain.as_str()),
+                48,
+                "busy rule must fill width at tick {tick}: {plain:?}"
+            );
+            assert!(plain.contains('━'), "moving segment missing at tick {tick}");
+        }
+    }
+
+    #[test]
+    fn header_shows_full_path_when_wide_and_basename_when_narrow() {
+        let mut state = test_state();
+        state.repository = "/Users/me/Develop/app/codeleveler".into();
+        state.branch = Some("main".into());
+        let full = crate::status_line::home_collapsed_repo(&state);
+        // Wide terminal fits the full home-collapsed path.
+        let wide = rule_plain(&header_status_line(&state, 120));
+        assert!(
+            wide.contains(&full),
+            "wide header should show full path: {wide}"
+        );
+        // Mid terminal degrades to the basename only.
+        let narrow = rule_plain(&header_status_line(&state, 46));
+        assert!(narrow.contains("codeleveler"), "narrow: {narrow}");
+        assert!(
+            !narrow.contains("Develop/app"),
+            "narrow header should drop the full path: {narrow}"
+        );
+    }
+
+    #[test]
+    fn conversation_lines_reuses_cache_until_an_input_changes() {
+        let mut s = test_state();
+        s.transcript.push_user("hello".into());
+
+        let a = s.conversation_lines(40);
+        let b = s.conversation_lines(40);
+        assert!(
+            std::rc::Rc::ptr_eq(&a, &b),
+            "unchanged inputs must return the very same cached Rc"
+        );
+        // The cached lines must equal a fresh uncached build (no staleness).
+        assert_eq!(*a, build_conversation_lines(&s, 40));
+
+        // A transcript mutation bumps the version → rebuild with new content.
+        s.transcript.push_user("world".into());
+        let c = s.conversation_lines(40);
+        assert!(
+            !std::rc::Rc::ptr_eq(&a, &c),
+            "a content change must invalidate the cache"
+        );
+        assert_eq!(*c, build_conversation_lines(&s, 40));
+
+        // A width change also rebuilds.
+        let d = s.conversation_lines(60);
+        assert!(!std::rc::Rc::ptr_eq(&c, &d), "a width change must rebuild");
+
+        // An in-place edit via items_mut bumps the version too.
+        let _ = s.transcript.items_mut();
+        let e = s.conversation_lines(60);
+        assert!(
+            !std::rc::Rc::ptr_eq(&d, &e),
+            "items_mut must invalidate the cache"
+        );
+    }
 
     fn sample_plan() -> UiPlan {
         UiPlan {

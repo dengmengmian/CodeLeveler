@@ -419,11 +419,7 @@ impl Application {
             registry.register(tool);
         }
         let memory_index = load_memory_index(&self.layout.memory_dir());
-        let leveler_home = std::env::var_os("LEVELER_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".leveler"))
-            })
+        let leveler_home = leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
             .unwrap_or_else(|| std::path::PathBuf::from(".leveler"));
         let permission_rules =
             leveler_execution::load_merged_rules(&leveler_home, &self.layout.repo_root);

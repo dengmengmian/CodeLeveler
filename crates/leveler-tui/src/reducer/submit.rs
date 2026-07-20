@@ -192,6 +192,8 @@ fn is_known_slash(name: &str) -> bool {
             | "restore"
             | "checkpoint"
             | "compact"
+            | "export"
+            | "save" // alias of /export
             | "paste"
             | "theme"
             | "image"
@@ -251,6 +253,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "compact" => vec![Effect::Send(ClientCommand::CompactContext {
             session_id: state.session_id.clone(),
         })],
+        "export" | "save" => export_conversation(state, command),
         "paste" => vec![Effect::Send(ClientCommand::AddClipboardImage {
             session_id: state.session_id.clone(),
         })],
@@ -318,6 +321,118 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             Vec::new()
         }
     }
+}
+
+/// `/export [path]`: write the visible conversation to a markdown file. Default
+/// path is `<cwd>/leveler-chat-<timestamp>.md`; an argument overrides it. Only
+/// the dialogue (user + assistant prose) is written — tool activity is skipped.
+/// Expand a leading `~` / `~/` to the user's home. `~user` is not supported
+/// (rare, and needs passwd lookup); anything else is returned verbatim.
+fn expand_tilde(arg: &str) -> std::path::PathBuf {
+    let home = || {
+        leveler_core::environment()
+            .var_os("HOME")
+            .or_else(|| leveler_core::environment().var_os("USERPROFILE"))
+    };
+    if arg == "~"
+        && let Some(h) = home()
+    {
+        return std::path::PathBuf::from(h);
+    }
+    if let Some(rest) = arg.strip_prefix("~/")
+        && let Some(h) = home()
+    {
+        return std::path::PathBuf::from(h).join(rest);
+    }
+    std::path::PathBuf::from(arg)
+}
+
+fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
+    use crate::transcript::TranscriptItem;
+    // Nothing to write if there is no actual dialogue yet — say so instead of
+    // dropping an empty file.
+    let has_dialogue = state
+        .transcript
+        .items()
+        .iter()
+        .any(|i| matches!(i, TranscriptItem::User(_) | TranscriptItem::Assistant(_)));
+    if !has_dialogue {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: "没有可导出的内容".to_string(),
+        });
+        return Vec::new();
+    }
+    // Everything after the command word is the path, so paths with spaces
+    // survive and the `/export` / `/save` aliases are both handled.
+    let arg = command
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest)
+        .unwrap_or("")
+        .trim();
+    let path: std::path::PathBuf = if arg.is_empty() {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        leveler_core::environment()
+            .current_dir()
+            .join(format!("leveler-chat-{stamp}.md"))
+    } else {
+        // `~` is a literal char here (no shell), so expand it ourselves.
+        expand_tilde(arg)
+    };
+    // Create missing parent dirs so `~/Desktop/notes/x.md` does not just fail.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let md = build_export_markdown(state);
+    match std::fs::write(&path, md) {
+        Ok(()) => {
+            // A persistent transcript note keeps the path on screen (and
+            // selectable) rather than a toast that vanishes in a few seconds.
+            let msg = format!("已导出对话到 {}", path.display());
+            state.transcript.push_note(msg.clone());
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: msg,
+            });
+        }
+        Err(e) => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: format!("导出失败: {e}"),
+            });
+        }
+    }
+    Vec::new()
+}
+
+/// Render the visible transcript to markdown: user turns and assistant answers
+/// only, with `---` between turns. Tool activity, side questions (`/btw`), and
+/// transient chrome are intentionally excluded.
+fn build_export_markdown(state: &AppState) -> String {
+    use crate::transcript::TranscriptItem;
+    let mut out = String::from("# CodeLeveler 对话导出\n\n");
+    out.push_str(&format!("- 会话: {}\n", state.session_id.as_str()));
+    if !state.repository.is_empty() {
+        out.push_str(&format!("- 项目: {}\n", state.repository));
+    }
+    out.push('\n');
+    for item in state.transcript.items() {
+        match item {
+            TranscriptItem::User(text) => {
+                out.push_str("## 你\n\n");
+                out.push_str(text.trim());
+                out.push_str("\n\n");
+            }
+            TranscriptItem::Assistant(block) => {
+                out.push_str("## 助手\n\n");
+                out.push_str(block.text.trim());
+                out.push_str("\n\n");
+            }
+            TranscriptItem::TurnEnd(_) => out.push_str("---\n\n"),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn run_btw(state: &mut AppState, command: &str) -> Vec<Effect> {
@@ -617,4 +732,141 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
         session_id: state.session_id.clone(),
         content: goal,
     })]
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::state::Boot;
+    use crate::theme::Theme;
+    use leveler_client_protocol::{MessageId, SessionId};
+
+    fn state_with_dialogue() -> AppState {
+        let mut s = AppState::new(
+            Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s-export"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+            },
+        );
+        s.transcript.push_user("帮我加个导出功能".into());
+        let id = MessageId::new("m1");
+        s.transcript.begin_assistant(id.clone());
+        s.transcript
+            .append_assistant(&id, "好的，已经加上 /export 了。");
+        s.transcript.finish_assistant(&id);
+        s
+    }
+
+    #[test]
+    fn markdown_has_dialogue_and_omits_non_dialogue() {
+        let s = state_with_dialogue();
+        let md = build_export_markdown(&s);
+        assert!(md.contains("# CodeLeveler 对话导出"), "{md}");
+        assert!(md.contains("## 你\n\n帮我加个导出功能"), "{md}");
+        assert!(
+            md.contains("## 助手\n\n好的，已经加上 /export 了。"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn export_with_explicit_path_writes_the_file() {
+        let mut s = state_with_dialogue();
+        let path =
+            std::env::temp_dir().join(format!("leveler-export-test-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let effects = export_conversation(&mut s, &format!("export {}", path.display()));
+        assert!(
+            effects.is_empty(),
+            "export is a local action, no runtime effect"
+        );
+        let written = std::fs::read_to_string(&path).expect("file should exist");
+        assert!(written.contains("帮我加个导出功能"), "{written}");
+        assert!(
+            matches!(&s.notification, Some(n) if n.message.contains("已导出")),
+            "should notify success"
+        );
+        // The path is also appended as a persistent transcript note.
+        assert!(
+            s.transcript.items().iter().any(|i| matches!(
+                i,
+                crate::transcript::TranscriptItem::Note(t) if t.contains("已导出")
+            )),
+            "export path should persist as a transcript note"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_alias_writes_to_the_given_path() {
+        let mut s = state_with_dialogue();
+        let path =
+            std::env::temp_dir().join(format!("leveler-save-alias-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // The `/save` alias must strip its own command word, not leave "save" in
+        // the path.
+        export_conversation(&mut s, &format!("save {}", path.display()));
+        assert!(
+            std::fs::read_to_string(&path).is_ok(),
+            "the /save alias should write to the given path"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expand_tilde_passes_through_non_tilde_paths() {
+        assert_eq!(
+            expand_tilde("/abs/x.md"),
+            std::path::PathBuf::from("/abs/x.md")
+        );
+        assert_eq!(
+            expand_tilde("rel/x.md"),
+            std::path::PathBuf::from("rel/x.md")
+        );
+    }
+
+    #[test]
+    fn export_accepts_a_path_with_spaces() {
+        let mut s = state_with_dialogue();
+        let dir = std::env::temp_dir().join(format!("leveler export dir {}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("my notes.md");
+        let _ = std::fs::remove_file(&path);
+        export_conversation(&mut s, &format!("export {}", path.display()));
+        assert!(
+            std::fs::read_to_string(&path).is_ok(),
+            "a path with spaces must be written verbatim, not truncated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_with_no_dialogue_reports_nothing() {
+        let mut s = AppState::new(
+            Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s-empty"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+            },
+        );
+        let effects = export_conversation(&mut s, "export");
+        assert!(effects.is_empty());
+        assert!(
+            matches!(&s.notification, Some(n) if n.message.contains("没有可导出的内容")),
+            "empty transcript should report nothing to export"
+        );
+    }
 }

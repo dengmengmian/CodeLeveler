@@ -174,43 +174,51 @@ pub fn apply_selection_highlight(
         let span_w = UnicodeWidthStr::width(text);
         let span_start = col;
         let span_end = col + span_w;
-        col = span_end;
-        let style = span.style;
 
         // Entirely outside selection → keep as-is.
         if span_end <= from || span_start >= to {
+            col = span_end;
             out.push(span);
             continue;
         }
+        let style = span.style;
 
-        // Split this span at selection boundaries (display columns relative to span).
-        let rel_from = from.saturating_sub(span_start).min(span_w);
-        let rel_to = to.saturating_sub(span_start).min(span_w);
-
-        if rel_from > 0 {
-            let before = slice_display_cols(text, 0, rel_from);
-            if !before.is_empty() {
-                out.push(Span::styled(before, style));
+        // Classify every grapheme into before/mid/after by its own cell span, so
+        // a full-width glyph straddling a selection boundary lands in exactly one
+        // bucket (never duplicated, never dropped). Rule matches the overlap rule
+        // in `slice_display_cols` so highlight and copied text stay consistent.
+        let (mut before, mut mid, mut after) = (String::new(), String::new(), String::new());
+        for g in text.graphemes(true) {
+            let gw = g
+                .chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum::<usize>()
+                .max(1);
+            let gstart = col;
+            col += gw;
+            if col <= from {
+                before.push_str(g);
+            } else if gstart < to {
+                mid.push_str(g);
+            } else {
+                after.push_str(g);
             }
         }
-        if rel_to > rel_from {
-            let mid = slice_display_cols(text, rel_from, rel_to);
-            if !mid.is_empty() {
-                // Background only: keep fg from original style so glyphs don't reflow.
-                let mut mid_style = style;
-                mid_style = mid_style.bg(sel_bg);
-                // Ensure selected text stays readable if fg was default/dark.
-                if mid_style.fg.is_none() {
-                    mid_style = mid_style.fg(theme.text);
-                }
-                out.push(Span::styled(mid, mid_style));
-            }
+
+        if !before.is_empty() {
+            out.push(Span::styled(before, style));
         }
-        if rel_to < span_w {
-            let after = slice_display_cols(text, rel_to, span_w);
-            if !after.is_empty() {
-                out.push(Span::styled(after, style));
+        if !mid.is_empty() {
+            // Background only: keep fg from original style so glyphs don't reflow.
+            let mut mid_style = style.bg(sel_bg);
+            // Ensure selected text stays readable if fg was default/dark.
+            if mid_style.fg.is_none() {
+                mid_style = mid_style.fg(theme.text);
             }
+            out.push(Span::styled(mid, mid_style));
+        }
+        if !after.is_empty() {
+            out.push(Span::styled(after, style));
         }
     }
     if out.is_empty() {
@@ -302,6 +310,27 @@ mod tests {
                 .intersects(ratatui::style::Modifier::BOLD)),
             "selection must not add BOLD: {out:?}"
         );
+    }
+
+    #[test]
+    fn highlight_no_duplicate_when_boundary_splits_wide_glyph() {
+        // Drag end lands in the middle of the trailing full-width "？" (cols 26..28).
+        // The glyph must not be emitted twice (once highlighted, once not).
+        let theme = Theme::no_color();
+        let text = "你好！有什么需要帮忙的吗？";
+        let line = Line::from(Span::styled(text.to_string(), Style::default()));
+        let full_w = UnicodeWidthStr::width(text);
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        // Odd column inside the last wide glyph.
+        sel.extend(TextPos {
+            row: 0,
+            col: full_w - 1,
+        });
+        let out = apply_selection_highlight(line, 0, &sel, &theme);
+        let plain: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(plain, text, "highlighted line must not duplicate the glyph");
+        assert_eq!(UnicodeWidthStr::width(plain.as_str()), full_w);
     }
 
     #[test]

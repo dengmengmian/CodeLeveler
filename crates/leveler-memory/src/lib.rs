@@ -251,12 +251,61 @@ fn slugify(title: &str) -> String {
     }
 }
 
+/// True for ideographic / kana / hangul scripts that write without spaces.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3400..=0x9FFF   // CJK unified (incl. ext A)
+        | 0xF900..=0xFAFF // CJK compatibility ideographs
+        | 0x3040..=0x30FF // hiragana + katakana
+        | 0xAC00..=0xD7A3 // hangul syllables
+    )
+}
+
+/// Split text into lexical terms for BM25. ASCII/alphanumeric runs become
+/// whole words (as before); CJK runs — which have no spaces — become overlapping
+/// character bigrams so Chinese queries actually match. A lone CJK char falls
+/// back to a unigram. Without this, `is_alphanumeric()` treats a whole Chinese
+/// phrase as one token and search never matches (recall + `/memory` both broke).
 fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() > 1)
-        .map(|t| t.to_string())
-        .collect()
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+
+    fn flush_word(word: &mut String, out: &mut Vec<String>) {
+        if word.chars().count() > 1 {
+            out.push(std::mem::take(word));
+        } else {
+            word.clear();
+        }
+    }
+    fn flush_cjk(cjk: &mut Vec<char>, out: &mut Vec<String>) {
+        match cjk.len() {
+            0 => {}
+            1 => out.push(cjk[0].to_string()),
+            _ => {
+                for w in cjk.windows(2) {
+                    out.push(w.iter().collect());
+                }
+            }
+        }
+        cjk.clear();
+    }
+
+    for c in text.chars() {
+        if is_cjk(c) {
+            flush_word(&mut word, &mut out);
+            cjk.push(c);
+        } else if c.is_alphanumeric() {
+            flush_cjk(&mut cjk, &mut out);
+            word.extend(c.to_lowercase());
+        } else {
+            flush_word(&mut word, &mut out);
+            flush_cjk(&mut cjk, &mut out);
+        }
+    }
+    flush_word(&mut word, &mut out);
+    flush_cjk(&mut cjk, &mut out);
+    out
 }
 
 fn now_rfc3339() -> String {
@@ -283,6 +332,31 @@ mod tests {
         store.forget(&e.id).unwrap();
         assert_eq!(store.counts().unwrap(), (0, 1));
         assert_eq!(store.list_archived().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tokenize_bigrams_chinese_and_keeps_ascii_words() {
+        let t = tokenize("部署密钥 Zephyr-Q7");
+        // Overlapping CJK bigrams…
+        assert!(t.contains(&"部署".to_string()), "{t:?}");
+        assert!(t.contains(&"署密".to_string()), "{t:?}");
+        assert!(t.contains(&"密钥".to_string()), "{t:?}");
+        // …plus ASCII runs as lowercased words.
+        assert!(t.contains(&"zephyr".to_string()), "{t:?}");
+        assert!(t.contains(&"q7".to_string()), "{t:?}");
+    }
+
+    #[test]
+    fn search_matches_chinese_query() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let entry = new_entry("部署密钥保管人", "由代号 Zephyr-Q7 的同事保管。", vec![]);
+        store.remember(entry.clone()).unwrap();
+        // A Chinese query must retrieve the entry (regression: whole-phrase token
+        // never matched before CJK bigram tokenization).
+        let hits = store.search("谁保管部署密钥", 5).unwrap();
+        assert!(!hits.is_empty(), "chinese search returned nothing");
+        assert_eq!(hits[0].0.id, entry.id);
     }
 
     #[test]

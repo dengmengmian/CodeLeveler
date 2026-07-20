@@ -11,28 +11,6 @@ use crate::render::{truncate_display, wrap};
 use crate::theme::Theme;
 use crate::transcript::{ToolCallBlock, ToolStatus};
 
-#[allow(dead_code)] // alternate running-tool chrome; Conversation uses compact activity lines
-pub(crate) fn activity_lines(
-    call: &ToolCallBlock,
-    theme: &Theme,
-    width: usize,
-    locale: Locale,
-    t: &UiText,
-) -> Vec<Line<'static>> {
-    debug_assert_eq!(call.status, ToolStatus::Running);
-    let action = tool_target(call, locale);
-    vec![Line::from(vec![
-        Span::styled("⟳ ", Style::default().fg(theme.accent)),
-        Span::styled(
-            truncate_display(
-                &format!("{} · {action}", t.tool_status_running),
-                width.saturating_sub(2),
-            ),
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        ),
-    ])]
-}
-
 /// Completed Tool Result component: Summary is always visible; Details owns
 /// the raw tool output and is only emitted when the owning group is expanded.
 pub(crate) fn result_lines(

@@ -13,7 +13,9 @@ pub mod text;
 pub mod time;
 
 pub use budget::ResourceBudget;
-pub use environment::{EnvSnapshot, environment, install_environment};
+pub use environment::{
+    EnvSnapshot, environment, install_environment, leveler_home_dir, leveler_home_dir_from,
+};
 pub use ids::{
     ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, RequestId,
     SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, new_uuid_string,

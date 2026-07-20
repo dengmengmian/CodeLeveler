@@ -90,12 +90,10 @@ pub fn project_skills_dir(root: &Path) -> PathBuf {
     root.join(".leveler").join("skills")
 }
 
-/// The user-global skills directory (`~/.leveler/skills`), if a home is known.
+/// The user-global skills directory (`<leveler-home>/skills`), if a home is
+/// known. Shares the home-resolution order via [`leveler_core::leveler_home_dir`].
 pub fn global_skills_dir() -> Option<PathBuf> {
-    let home = leveler_core::environment()
-        .var_os("HOME")
-        .or_else(|| leveler_core::environment().var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".leveler").join("skills"))
+    leveler_core::leveler_home_dir(leveler_core::environment()).map(|home| home.join("skills"))
 }
 
 /// Discover skills from the project and global directories. On a name clash the

@@ -69,16 +69,6 @@ fn streaming_output_estimate(state: &AppState) -> Option<u32> {
 }
 
 /// Permission mode label and color role (localized chrome, e.g. status screens).
-#[allow(dead_code)] // retained for localized status surfaces beyond the English chip
-pub(crate) fn permission_label(state: &AppState) -> (&'static str, ratatui::style::Color) {
-    let t = state.t();
-    match state.mode_label.as_str() {
-        "RequestApproval" => (t.perm_readonly, state.theme.muted),
-        "FullAccess" => (t.perm_full, state.theme.error),
-        _ => (t.perm_workspace, state.theme.accent),
-    }
-}
-
 /// Stable English permission chip for the Input border (`model · auto`).
 ///
 /// Keeps the product surface short and language-neutral next to the model id.
@@ -435,26 +425,27 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
 
 /// Sparse top chrome: `⑂ branch · ~/path` only. Trust signals sit by the
 /// prompt (composer bottom-border trust chip).
+/// Collapse a repository path's `$HOME` prefix to `~` for display, or `—` when
+/// no repo is set. Shared by the header, workbench, and splash surfaces so the
+/// collapse rule stays in one place.
+pub(crate) fn home_collapsed_repo(state: &AppState) -> String {
+    if state.repository.is_empty() {
+        return "—".to_string();
+    }
+    let repo = state.repository.as_str();
+    match leveler_core::environment().var_os("HOME") {
+        Some(h) => match repo.strip_prefix(h.to_string_lossy().as_ref()) {
+            Some(rest) => format!("~{rest}"),
+            None => repo.to_string(),
+        },
+        None => repo.to_string(),
+    }
+}
+
 pub(crate) fn header_line(state: &AppState, width: usize) -> Line<'static> {
     let theme = &state.theme;
     let branch = state.branch.as_deref().unwrap_or("—");
-    let repo = if state.repository.is_empty() {
-        "—"
-    } else {
-        state.repository.as_str()
-    };
-    // Collapse home prefix for readability.
-    let repo_disp = match leveler_core::environment().var_os("HOME") {
-        Some(h) => {
-            let hs = h.to_string_lossy();
-            if let Some(rest) = repo.strip_prefix(hs.as_ref()) {
-                format!("~{rest}")
-            } else {
-                repo.to_string()
-            }
-        }
-        None => repo.to_string(),
-    };
+    let repo_disp = home_collapsed_repo(state);
 
     let full = format!("⑂ {branch} · {repo_disp}");
     let mid = format!("⑂ {branch}");

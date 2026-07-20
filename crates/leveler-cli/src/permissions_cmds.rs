@@ -99,20 +99,12 @@ fn format_rule(rule: &PermissionRule) -> String {
     format!("{effect}  {}", parts.join(" "))
 }
 
-/// Same resolution order as the app composition root: `$LEVELER_HOME`, else
-/// `$HOME/.leveler`, else a local `.leveler` fallback (should not hit in normal
-/// interactive use).
+/// The leveler home, with a local `.leveler` fallback (should not hit in normal
+/// interactive use). Home-resolution order is shared via
+/// [`leveler_core::leveler_home_dir_from`].
 fn leveler_home() -> PathBuf {
-    if let Some(h) = std::env::var_os("LEVELER_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(h);
-    }
-    if let Some(h) = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
-    {
-        return PathBuf::from(h).join(".leveler");
-    }
-    PathBuf::from(".leveler")
+    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+        .unwrap_or_else(|| PathBuf::from(".leveler"))
 }
 
 // Unit tests for this module live in `tests/permissions.rs` (bin-only crate).

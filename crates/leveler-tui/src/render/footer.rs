@@ -125,6 +125,10 @@ struct ComposerVisRow {
 /// `width` (inside the box, after `│ `). Long lines wrap instead of overflowing.
 fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>, usize) {
     let inner_w = width.max(1);
+    // Only show the "type a message / commands" hint on a fresh session. Once
+    // real turns exist the user knows the ropes — repeating it every idle moment
+    // is noise.
+    let show_placeholder = crate::splash::conversation_is_empty(state);
     let chips: String = (1..=state.pending_attachments.len())
         .map(|n| format!("[图片 #{n}] "))
         .collect();
@@ -173,7 +177,8 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
                 None
             };
 
-            let placeholder = li == 0 && first_of_logical && state.composer.is_empty();
+            let placeholder =
+                show_placeholder && li == 0 && first_of_logical && state.composer.is_empty();
             let ghost = if li == crow
                 && first_of_logical
                 && li == 0
@@ -207,7 +212,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             chips,
             text: String::new(),
             caret_col: Some(0),
-            placeholder: true,
+            placeholder: show_placeholder,
             ghost: None,
         });
     }

@@ -10,14 +10,10 @@ use toml_edit::{DocumentMut, Item, value};
 
 use crate::theme::ThemeId;
 
-/// Config path: `$LEVELER_HOME/config.toml`, else `$HOME/.leveler/config.toml`.
+/// Config path: `<leveler-home>/config.toml`, or `None` when no home is known.
+/// Shares the home-resolution order via [`leveler_core::leveler_home_dir`].
 pub fn config_path() -> Option<PathBuf> {
-    if let Some(home) = leveler_core::environment().var_os("LEVELER_HOME") {
-        return Some(PathBuf::from(home).join("config.toml"));
-    }
-    leveler_core::environment()
-        .var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".leveler").join("config.toml"))
+    leveler_core::leveler_home_dir(leveler_core::environment()).map(|home| home.join("config.toml"))
 }
 
 /// Read the theme id string from config, if present and valid.

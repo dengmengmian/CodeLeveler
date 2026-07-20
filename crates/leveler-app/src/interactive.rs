@@ -881,6 +881,160 @@ impl InProcessRuntimeClient {
             });
         });
     }
+    /// Restore a checkpoint: roll back the transcript, task epoch, and (git)
+    /// workspace to the checkpoint, surfacing any partial-failure honestly.
+    async fn handle_restore_checkpoint(
+        &self,
+        session_id: SessionId,
+        checkpoint_id: CheckpointId,
+    ) -> Result<(), ClientError> {
+        let _token = self.admit_context_op(&session_id, "恢复检查点")?;
+        let ordinal = self
+            .checkpoints
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .into_iter()
+            .flatten()
+            .find(|c| c.id == checkpoint_id)
+            .map(|c| c.ordinal);
+        if let Some(ordinal) = ordinal {
+            // A failed truncate means the conversation did NOT roll
+            // back; the user must know rather than see a fake restore.
+            match self.truncate_messages(&session_id, ordinal as usize).await {
+                Ok(()) => {
+                    // Cut post-checkpoint Plan/Evidence/Progress so
+                    // resume does not inherit work after the restore point.
+                    if let Err(error) = self.reset_task_epoch(&session_id).await {
+                        self.notify_error(
+                            &session_id,
+                            format!("对话已回滚,但任务状态重置失败: {error}"),
+                        );
+                    }
+                    // Roll the workspace back to the checkpoint's
+                    // snapshot (git repos). A failure is surfaced —
+                    // the transcript rolled back but files did not.
+                    let snapshot = self
+                        .checkpoint_snapshots
+                        .lock()
+                        .unwrap()
+                        .get(&checkpoint_id)
+                        .cloned();
+                    match snapshot {
+                        Some(snapshot) => {
+                            if let Err(error) = leveler_execution::WorkspaceSnapshot::restore(
+                                &self.app.layout.repo_root,
+                                &snapshot,
+                            )
+                            .await
+                            {
+                                self.notify_error(
+                                    &session_id,
+                                    format!("对话已回滚,但工作区文件回滚失败: {error}"),
+                                );
+                            } else {
+                                let diff = compute_diff(&self.app.layout.repo_root, false);
+                                let _ = self
+                                    .events_for(&session_id)
+                                    .send(RuntimeEvent::DiffUpdated { diff });
+                            }
+                        }
+                        None => {
+                            let _ = self
+                                .events_for(&session_id)
+                                .send(RuntimeEvent::Notification {
+                                    level: NotificationLevel::Info,
+                                    message: "已回滚对话;工作区非 git 仓库,文件未回滚".to_string(),
+                                });
+                        }
+                    }
+                    // Discard checkpoints that pointed past the restore.
+                    self.prune_checkpoints_after_restore(&session_id, ordinal);
+                    if let Ok(session) = self.snapshot(&session_id).await {
+                        let _ = self
+                            .events_for(&session_id)
+                            .send(RuntimeEvent::SessionOpened { session });
+                    }
+                }
+                Err(error) => self.notify_error(&session_id, format!("恢复检查点失败: {error}")),
+            }
+        } else {
+            self.notify_error(
+                &session_id,
+                "未找到该检查点（可能已被清空、压缩或更早的回滚移除）".to_string(),
+            );
+        }
+        self.active.finish(&session_id);
+        Ok(())
+    }
+    /// Compact the session's context off the request path, owning the
+    /// session so Submit/clear/restore cannot race the transcript rewrite.
+    async fn handle_compact_context(&self, session_id: SessionId) -> Result<(), ClientError> {
+        // Own the session while compact runs so Submit/clear/restore
+        // cannot race the transcript rewrite.
+        let cancel = self.admit_context_op(&session_id, "压缩上下文")?;
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let config = match self.runtime_config(&session_id).await {
+            Ok(config) => config,
+            Err(error) => {
+                self.active.finish(&session_id);
+                // Surface the same way as in-flight compact failures.
+                let _ = events.send(RuntimeEvent::TurnFailed {
+                    error: format!("压缩失败：{error}"),
+                });
+                self.notify_error(&session_id, format!("压缩失败：{error}"));
+                return Ok(());
+            }
+        };
+        let model = config.model;
+        let mode = config.mode;
+        let active = self.active.clone();
+        let checkpoints = self.checkpoints.clone();
+        let checkpoint_snapshots = self.checkpoint_snapshots.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                let rewrote =
+                    compact_conversation(&app, &events, &model, mode, &session_id, cancel).await;
+                // Only wipe checkpoints when the transcript was actually
+                // replaced — a short/no-op compact must keep them.
+                if rewrote {
+                    drop_session_checkpoints_maps(&checkpoints, &checkpoint_snapshots, &session_id);
+                }
+                active.finish(&session_id);
+            });
+        });
+        Ok(())
+    }
+    /// Clear the conversation: drop stored messages and reset task epoch,
+    /// surfacing a DB failure rather than showing a false-empty transcript.
+    async fn handle_clear_conversation(&self, session_id: SessionId) -> Result<(), ClientError> {
+        let _token = self.admit_context_op(&session_id, "清空会话")?;
+        // Drop all stored messages so the next turn starts fresh. A DB
+        // failure must be surfaced — silently keeping the history while
+        // the UI shows an empty conversation is a lie.
+        match self.truncate_messages(&session_id, 0).await {
+            Ok(()) => {
+                if let Err(error) = self.reset_task_epoch(&session_id).await {
+                    self.notify_error(
+                        &session_id,
+                        format!("会话已清空,但任务状态重置失败: {error}"),
+                    );
+                }
+                self.live_views.lock().unwrap().remove(&session_id);
+                self.drop_session_checkpoints(&session_id);
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&session_id)
+                        .send(RuntimeEvent::SessionOpened { session });
+                }
+            }
+            Err(error) => self.notify_error(&session_id, format!("清空会话失败: {error}")),
+        }
+        self.active.finish(&session_id);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1217,160 +1371,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 Ok(())
             }
             ClientCommand::CompactContext { session_id } => {
-                // Own the session while compact runs so Submit/clear/restore
-                // cannot race the transcript rewrite.
-                let cancel = self.admit_context_op(&session_id, "压缩上下文")?;
-                let app = self.app.clone();
-                let events = self.events_for(&session_id);
-                let config = match self.runtime_config(&session_id).await {
-                    Ok(config) => config,
-                    Err(error) => {
-                        self.active.finish(&session_id);
-                        // Surface the same way as in-flight compact failures.
-                        let _ = events.send(RuntimeEvent::TurnFailed {
-                            error: format!("压缩失败：{error}"),
-                        });
-                        self.notify_error(&session_id, format!("压缩失败：{error}"));
-                        return Ok(());
-                    }
-                };
-                let model = config.model;
-                let mode = config.mode;
-                let active = self.active.clone();
-                let checkpoints = self.checkpoints.clone();
-                let checkpoint_snapshots = self.checkpoint_snapshots.clone();
-                let handle = tokio::runtime::Handle::current();
-                tokio::task::spawn_blocking(move || {
-                    handle.block_on(async move {
-                        let rewrote =
-                            compact_conversation(&app, &events, &model, mode, &session_id, cancel)
-                                .await;
-                        // Only wipe checkpoints when the transcript was actually
-                        // replaced — a short/no-op compact must keep them.
-                        if rewrote {
-                            drop_session_checkpoints_maps(
-                                &checkpoints,
-                                &checkpoint_snapshots,
-                                &session_id,
-                            );
-                        }
-                        active.finish(&session_id);
-                    });
-                });
-                Ok(())
+                self.handle_compact_context(session_id).await
             }
             ClientCommand::ClearConversation { session_id } => {
-                let _token = self.admit_context_op(&session_id, "清空会话")?;
-                // Drop all stored messages so the next turn starts fresh. A DB
-                // failure must be surfaced — silently keeping the history while
-                // the UI shows an empty conversation is a lie.
-                match self.truncate_messages(&session_id, 0).await {
-                    Ok(()) => {
-                        if let Err(error) = self.reset_task_epoch(&session_id).await {
-                            self.notify_error(
-                                &session_id,
-                                format!("会话已清空,但任务状态重置失败: {error}"),
-                            );
-                        }
-                        self.live_views.lock().unwrap().remove(&session_id);
-                        self.drop_session_checkpoints(&session_id);
-                        if let Ok(session) = self.snapshot(&session_id).await {
-                            let _ = self
-                                .events_for(&session_id)
-                                .send(RuntimeEvent::SessionOpened { session });
-                        }
-                    }
-                    Err(error) => self.notify_error(&session_id, format!("清空会话失败: {error}")),
-                }
-                self.active.finish(&session_id);
-                Ok(())
+                self.handle_clear_conversation(session_id).await
             }
             ClientCommand::RestoreCheckpoint {
                 session_id,
                 checkpoint_id,
             } => {
-                let _token = self.admit_context_op(&session_id, "恢复检查点")?;
-                let ordinal = self
-                    .checkpoints
-                    .lock()
-                    .unwrap()
-                    .get(&session_id)
-                    .into_iter()
-                    .flatten()
-                    .find(|c| c.id == checkpoint_id)
-                    .map(|c| c.ordinal);
-                if let Some(ordinal) = ordinal {
-                    // A failed truncate means the conversation did NOT roll
-                    // back; the user must know rather than see a fake restore.
-                    match self.truncate_messages(&session_id, ordinal as usize).await {
-                        Ok(()) => {
-                            // Cut post-checkpoint Plan/Evidence/Progress so
-                            // resume does not inherit work after the restore point.
-                            if let Err(error) = self.reset_task_epoch(&session_id).await {
-                                self.notify_error(
-                                    &session_id,
-                                    format!("对话已回滚,但任务状态重置失败: {error}"),
-                                );
-                            }
-                            // Roll the workspace back to the checkpoint's
-                            // snapshot (git repos). A failure is surfaced —
-                            // the transcript rolled back but files did not.
-                            let snapshot = self
-                                .checkpoint_snapshots
-                                .lock()
-                                .unwrap()
-                                .get(&checkpoint_id)
-                                .cloned();
-                            match snapshot {
-                                Some(snapshot) => {
-                                    if let Err(error) =
-                                        leveler_execution::WorkspaceSnapshot::restore(
-                                            &self.app.layout.repo_root,
-                                            &snapshot,
-                                        )
-                                        .await
-                                    {
-                                        self.notify_error(
-                                            &session_id,
-                                            format!("对话已回滚,但工作区文件回滚失败: {error}"),
-                                        );
-                                    } else {
-                                        let diff = compute_diff(&self.app.layout.repo_root, false);
-                                        let _ = self
-                                            .events_for(&session_id)
-                                            .send(RuntimeEvent::DiffUpdated { diff });
-                                    }
-                                }
-                                None => {
-                                    let _ = self.events_for(&session_id).send(
-                                        RuntimeEvent::Notification {
-                                            level: NotificationLevel::Info,
-                                            message: "已回滚对话;工作区非 git 仓库,文件未回滚"
-                                                .to_string(),
-                                        },
-                                    );
-                                }
-                            }
-                            // Discard checkpoints that pointed past the restore.
-                            self.prune_checkpoints_after_restore(&session_id, ordinal);
-                            if let Ok(session) = self.snapshot(&session_id).await {
-                                let _ = self
-                                    .events_for(&session_id)
-                                    .send(RuntimeEvent::SessionOpened { session });
-                            }
-                        }
-                        Err(error) => {
-                            self.notify_error(&session_id, format!("恢复检查点失败: {error}"))
-                        }
-                    }
-                } else {
-                    self.notify_error(
-                        &session_id,
-                        "未找到该检查点（可能已被清空、压缩或更早的回滚移除）".to_string(),
-                    );
-                }
-                self.active.finish(&session_id);
-                Ok(())
+                self.handle_restore_checkpoint(session_id, checkpoint_id)
+                    .await
             }
             ClientCommand::RequestSessionList => {
                 let _ = self.events.send(RuntimeEvent::SessionList {

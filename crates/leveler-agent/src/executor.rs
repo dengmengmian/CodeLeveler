@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_context::load_rules;
 use leveler_core::{ClarificationId, TurnId};
 use leveler_execution::{ApprovalPolicy, Approver, AutoApprove, AutoReviewer, NeedUserReviewer};
+use leveler_memory::MemoryStore;
 use leveler_lifecycle::{
     EvidenceLedger, GateConfig, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, WorkProfile,
 };
@@ -30,6 +31,46 @@ use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOT
 /// Secondary summarization/audit requests improve quality but must never make
 /// an otherwise finished turn look hung for minutes.
 const ADVISORY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Query-conditioned memory recall (tail injection). Each turn we retrieve the
+/// top-scoring memories for the current request and inject their bodies as a
+/// system block right before the (always-new) user message. This keeps the
+/// cached system+history prefix untouched — the block rides the uncached tail —
+/// and is never persisted (see `run_conversation` filtering out `System` roles),
+/// so it stays fresh and never accumulates.
+const RECALL_K: usize = 4;
+/// Minimum BM25 score to inject a hit — `search` only returns positive matches,
+/// so this just drops the weakest ties.
+const RECALL_FLOOR: f64 = 0.1;
+/// Total character budget for injected bodies, to keep the tail from bloating.
+const RECALL_CHAR_BUDGET: usize = 1500;
+
+/// Render scored memory hits into a tail-injection system block, or `None` when
+/// empty. Bodies are included up to `RECALL_CHAR_BUDGET`; the header warns the
+/// model these are retrieved, may not apply, and must be checked against code.
+fn render_recall_block(
+    hits: impl Iterator<Item = (leveler_memory::MemoryEntry, f64)>,
+) -> Option<String> {
+    let mut body = String::new();
+    let mut used = 0usize;
+    for (entry, _score) in hits {
+        let line = format!("- {}: {}\n", entry.title.trim(), entry.body.trim());
+        if used + line.len() > RECALL_CHAR_BUDGET && !body.is_empty() {
+            break;
+        }
+        used += line.len();
+        body.push_str(&line);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "## Relevant memory (retrieved for this turn)\n\
+         These were retrieved by relevance to the current request. They may not \
+         apply — use only what is pertinent, and verify against the current code \
+         before relying on any of it.\n{body}"
+    ))
+}
 
 /// Status of one external verification check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +322,35 @@ pub struct AgentOutcome {
     pub progress: ProgressLedger,
     /// Active objective used for this drive (host-pinned).
     pub objective: ObjectiveAnchor,
+}
+
+impl AgentOutcome {
+    /// Build a drive outcome from the fields that vary per exit plus the drive's
+    /// running state (`metrics`/`progress`/`objective`, always cloned here).
+    /// Every early return in `drive` funnels through this, so a new shared field
+    /// is added once here instead of at each of the ~10 return sites.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn drive_result(
+        final_text: String,
+        rounds: u32,
+        modified_files: Vec<String>,
+        stop_reason: StopReason,
+        stop_detail: Option<String>,
+        metrics: &leveler_lifecycle::DepthUseMetrics,
+        progress: &ProgressLedger,
+        objective: &ObjectiveAnchor,
+    ) -> Self {
+        Self {
+            final_text,
+            rounds,
+            modified_files,
+            stop_reason,
+            stop_detail,
+            metrics: metrics.clone(),
+            progress: progress.clone(),
+            objective: objective.clone(),
+        }
+    }
 }
 
 /// Errors that abort the loop (model failures; tool failures are fed back to
@@ -1030,6 +1100,9 @@ impl Executor {
         if let Some(injection) = self.skill_turn_injection(&request) {
             seed.push(Message::text(Role::System, injection));
         }
+        if let Some(recall) = self.relevant_memory_injection(&request) {
+            seed.push(Message::text(Role::System, recall));
+        }
         seed.push(Message {
             role: Role::User,
             content,
@@ -1044,6 +1117,19 @@ impl Executor {
         let resolution =
             leveler_skills::resolve_mentions(self.tool_context.workspace.root(), request);
         leveler_skills::render_turn_injection(&resolution)
+    }
+
+    /// Retrieve memories relevant to THIS turn and render them as a tail-injected
+    /// system block, or `None` when memory is unconfigured or nothing matches.
+    ///
+    /// Uses the real BM25 `search` (not the pseudo-vector path). Callers push the
+    /// result as a `Role::System` message immediately before the user message so
+    /// the cached prefix is preserved and the block is stripped next turn.
+    fn relevant_memory_injection(&self, request: &str) -> Option<String> {
+        let root = self.tool_context.memory_root.as_ref()?;
+        let store = MemoryStore::open(root).ok()?;
+        let hits = store.search(request, RECALL_K).ok()?;
+        render_recall_block(hits.into_iter().filter(|(_, score)| *score >= RECALL_FLOOR))
     }
 
     /// Continue a conversation: seed the model with the prior transcript plus a
@@ -1079,6 +1165,9 @@ impl Executor {
         }
         // Drop any stale system messages from the prior transcript.
         seed.extend(prior.into_iter().filter(|m| m.role != Role::System));
+        if let Some(recall) = self.relevant_memory_injection(&request) {
+            seed.push(Message::text(Role::System, recall));
+        }
         seed.push(user);
         self.drive(seed, objective, observer, sink, cancellation)
             .await
@@ -1098,6 +1187,78 @@ impl Executor {
             .unwrap_or_else(|| ObjectiveAnchor::from_user_message(first_user_text(&prior)));
         self.drive(prior, objective, observer, sink, cancellation)
             .await
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::{RECALL_CHAR_BUDGET, RECALL_FLOOR, RECALL_K, render_recall_block};
+    use leveler_memory::{MemoryEntry, MemoryStore};
+
+    fn entry(id: &str, title: &str, body: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            tags: Vec::new(),
+            created_at: "t".to_string(),
+            updated_at: "t".to_string(),
+            archived_at: None,
+        }
+    }
+
+    #[test]
+    fn empty_hits_inject_nothing() {
+        assert!(render_recall_block(std::iter::empty::<(MemoryEntry, f64)>()).is_none());
+    }
+
+    #[test]
+    fn block_has_header_titles_and_bodies() {
+        let hits = vec![
+            (entry("a", "Build target", "install to ~/.cargo/bin"), 3.0),
+            (entry("b", "Concurrency", "never git stash"), 2.0),
+        ];
+        let block = render_recall_block(hits.into_iter()).expect("some block");
+        assert!(block.contains("Relevant memory"), "{block}");
+        assert!(block.contains("verify against the current code"), "{block}");
+        assert!(block.contains("Build target: install to ~/.cargo/bin"), "{block}");
+        assert!(block.contains("Concurrency: never git stash"), "{block}");
+    }
+
+    #[test]
+    fn char_budget_drops_overflow_but_keeps_first() {
+        let big = "x".repeat(RECALL_CHAR_BUDGET);
+        let hits = vec![
+            (entry("a", "first", &big), 3.0),
+            (entry("b", "second", "should be dropped"), 2.0),
+        ];
+        let block = render_recall_block(hits.into_iter()).expect("some block");
+        assert!(block.contains("first"), "first must survive: {}", &block[..80]);
+        assert!(!block.contains("should be dropped"), "second must be dropped");
+    }
+
+    #[test]
+    fn retrieval_then_render_surfaces_the_relevant_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        store
+            .remember(entry(
+                "install",
+                "Install target",
+                "cargo bin at ~/.cargo/bin/leveler",
+            ))
+            .unwrap();
+        store
+            .remember(entry("cook", "Cooking", "boil pasta for nine minutes"))
+            .unwrap();
+
+        let hits = store
+            .search("where does install put the binary", RECALL_K)
+            .unwrap();
+        let block = render_recall_block(hits.into_iter().filter(|(_, s)| *s >= RECALL_FLOOR))
+            .expect("the install memory should be retrieved");
+        assert!(block.contains("Install target"), "{block}");
+        assert!(!block.contains("Cooking"), "unrelated memory must not leak: {block}");
     }
 }
 

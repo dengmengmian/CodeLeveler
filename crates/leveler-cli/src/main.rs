@@ -34,8 +34,8 @@ use mcp_lsp_cmds::{cmd_lsp, cmd_mcp};
 use memory_cmds::cmd_memory;
 use permissions_cmds::cmd_permissions;
 use run_cmds::{
-    cmd_discuss, cmd_plan, cmd_resume, cmd_run, cmd_run_orchestrated, cmd_run_parallel, cmd_serve,
-    cmd_tui,
+    cmd_discuss, cmd_plan, cmd_resume, cmd_run, cmd_run_orchestrated, cmd_run_parallel,
+    cmd_run_resume, cmd_serve, cmd_tui,
 };
 use sessions_cmd::cmd_sessions;
 
@@ -186,6 +186,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Sessions(sc) => cmd_sessions(layout, sc).await,
         Command::Run {
             task,
+            resume,
             model,
             mode,
             auto_approve,
@@ -201,6 +202,14 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             collaboration,
             parallel,
         } => {
+            // `--resume <id>` continues an interrupted non-interactive run
+            // (headless event stream); it does not take a fresh task.
+            if let Some(id) = resume {
+                return cmd_run_resume(layout, id, auto_approve, output).await;
+            }
+            let task = task.ok_or_else(|| {
+                anyhow::anyhow!("a task is required (or pass --resume <id> to continue a run)")
+            })?;
             let work_profile: leveler_lifecycle::WorkProfile =
                 work_mode.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
             let collab: leveler_lifecycle::CollaborationMode =
@@ -252,12 +261,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Eval(ec) => cmd_eval(layout, ec).await,
         Command::Lsp { file, diagnostics } => cmd_lsp(layout, file, diagnostics).await,
         Command::Mcp(mc) => cmd_mcp(mc),
-        Command::Resume {
-            id,
-            auto_approve,
-            confirm_recovery,
-            output,
-        } => cmd_resume(layout, id, auto_approve, confirm_recovery, output).await,
+        Command::Resume { id } => cmd_resume(layout, id, config_overridden).await,
         Command::Init => init_cmd::cmd_init(),
         Command::Upgrade {
             check,

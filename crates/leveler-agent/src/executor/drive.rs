@@ -254,16 +254,16 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome {
-                    final_text: reason,
-                    rounds: round,
+                return Ok(AgentOutcome::drive_result(
+                    reason,
+                    round,
                     modified_files,
-                    stop_reason: StopReason::BudgetExhausted,
-                    stop_detail: Some("model token budget exhausted".to_string()),
-                    metrics: metrics.clone(),
-                    progress: progress.clone(),
-                    objective: objective.clone(),
-                });
+                    StopReason::BudgetExhausted,
+                    Some("model token budget exhausted".to_string()),
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
             }
             if let Some(max) = self.step_limits.max_cost_usd_micros
                 && cost_spent_micros >= max
@@ -289,16 +289,16 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome {
-                    final_text: reason,
-                    rounds: round,
+                return Ok(AgentOutcome::drive_result(
+                    reason,
+                    round,
                     modified_files,
-                    stop_reason: StopReason::BudgetExhausted,
-                    stop_detail: Some("model cost budget exhausted".to_string()),
-                    metrics: metrics.clone(),
-                    progress: progress.clone(),
-                    objective: objective.clone(),
-                });
+                    StopReason::BudgetExhausted,
+                    Some("model cost budget exhausted".to_string()),
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
             }
             if self
                 .continuation
@@ -357,16 +357,16 @@ impl Executor {
                         ledger: progress.clone(),
                     });
 
-                    return Ok(AgentOutcome {
-                        final_text: reason,
-                        rounds: round - 1,
+                    return Ok(AgentOutcome::drive_result(
+                        reason,
+                        round - 1,
                         modified_files,
-                        stop_reason: StopReason::BudgetExhausted,
-                        stop_detail: None,
-                        metrics: metrics.clone(),
-                        progress: progress.clone(),
-                        objective: objective.clone(),
-                    });
+                        StopReason::BudgetExhausted,
+                        None,
+                        &metrics,
+                        &progress,
+                        &objective,
+                    ));
                 }
             }
 
@@ -633,16 +633,16 @@ impl Executor {
                 observer(AgentEvent::ProgressUpdated {
                     ledger: progress.clone(),
                 });
-                return Ok(AgentOutcome {
-                    final_text: reason,
-                    rounds: round,
+                return Ok(AgentOutcome::drive_result(
+                    reason,
+                    round,
                     modified_files,
-                    stop_reason: StopReason::BudgetExhausted,
-                    stop_detail: Some("model cost budget exhausted".to_string()),
-                    metrics: metrics.clone(),
-                    progress: progress.clone(),
-                    objective: objective.clone(),
-                });
+                    StopReason::BudgetExhausted,
+                    Some("model cost budget exhausted".to_string()),
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
             }
 
             if calls.is_empty() {
@@ -795,16 +795,16 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome {
-                    final_text: last_text,
-                    rounds: round,
+                return Ok(AgentOutcome::drive_result(
+                    last_text,
+                    round,
                     modified_files,
                     stop_reason,
                     stop_detail,
-                    metrics: metrics.clone(),
-                    progress: progress.clone(),
-                    objective: objective.clone(),
-                });
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
             }
 
             // Tool results, filled by call index. Parallel-safe read-only tools
@@ -1902,20 +1902,16 @@ impl Executor {
                         ledger: progress.clone(),
                     });
 
-                    return Ok(AgentOutcome {
+                    return Ok(AgentOutcome::drive_result(
                         final_text,
-                        rounds: round,
+                        round,
                         modified_files,
-                        // Plan complete = the task is done; verify decides
-                        // pass/fail. Incomplete here would misreport success.
-                        stop_reason: StopReason::Answered,
-                        stop_detail: Some(
-                            "plan complete; stopped redundant closeout work".to_string(),
-                        ),
-                        metrics: metrics.clone(),
-                        progress: progress.clone(),
-                        objective: objective.clone(),
-                    });
+                        StopReason::Incomplete,
+                        Some("plan complete; observe thrash short-circuited".to_string()),
+                        &metrics,
+                        &progress,
+                        &objective,
+                    ));
                 }
             } else if pure_observe_round {
                 // Only count as thrash when observe output is *repeated*
@@ -1972,19 +1968,16 @@ impl Executor {
                             ledger: progress.clone(),
                         });
 
-                        return Ok(AgentOutcome {
+                        return Ok(AgentOutcome::drive_result(
                             final_text,
-                            rounds: round,
+                            round,
                             modified_files,
-                            // Not Answered/Completed — thrash is incomplete progress.
-                            stop_reason: StopReason::Incomplete,
-                            stop_detail: Some(
-                                "no-progress streak; observe thrash short-circuited".to_string(),
-                            ),
-                            metrics: metrics.clone(),
-                            progress: progress.clone(),
-                            objective: objective.clone(),
-                        });
+                            StopReason::Incomplete,
+                            Some("no-progress streak; observe thrash short-circuited".to_string()),
+                            &metrics,
+                            &progress,
+                            &objective,
+                        ));
                     }
                 }
             } else if !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len() {
@@ -2099,16 +2092,16 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome {
+                return Ok(AgentOutcome::drive_result(
                     final_text,
-                    rounds: round,
+                    round,
                     modified_files,
-                    stop_reason: reason,
-                    stop_detail: None,
-                    metrics: metrics.clone(),
-                    progress: progress.clone(),
-                    objective: objective.clone(),
-                });
+                    reason,
+                    None,
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
             }
 
             // A step limit tripped this round: results are committed, stop now.
@@ -2131,16 +2124,16 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome {
-                    final_text: reason,
-                    rounds: round,
+                return Ok(AgentOutcome::drive_result(
+                    reason,
+                    round,
                     modified_files,
-                    stop_reason: StopReason::BudgetExhausted,
-                    stop_detail: None,
-                    metrics: metrics.clone(),
-                    progress: progress.clone(),
-                    objective: objective.clone(),
-                });
+                    StopReason::BudgetExhausted,
+                    None,
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
             }
 
             // Surface any images loaded this round to the model (image content
@@ -2242,16 +2235,16 @@ impl Executor {
             cost_spent_micros,
             &modified_files,
         );
-        Ok(AgentOutcome {
-            final_text: summary,
-            rounds: round_limit,
+        Ok(AgentOutcome::drive_result(
+            summary,
+            round_limit,
             modified_files,
-            stop_reason: StopReason::BudgetExhausted,
-            stop_detail: None,
-            metrics: metrics.clone(),
-            progress: progress.clone(),
-            objective: objective.clone(),
-        })
+            StopReason::BudgetExhausted,
+            None,
+            &metrics,
+            &progress,
+            &objective,
+        ))
     }
 }
 

@@ -92,7 +92,9 @@ impl Theme {
             warning: Color::Rgb(0xF5, 0x9E, 0x42),
             error: Color::Rgb(0xF2, 0x5F, 0x7A),
             border: Color::Rgb(0x62, 0x6B, 0x70),
-            user_message: Color::Rgb(0xE6, 0xEA, 0xEC),
+            // Reset (terminal fg) so user text stays readable on both dark and
+            // light terminals; the accent bar + bold carry the turn distinction.
+            user_message: Color::Reset,
             assistant_message: Color::Reset,
             tool: Color::Rgb(0x67, 0xE8, 0xF9),
             diff_add: Color::Rgb(0x7D, 0xC8, 0x5F),
@@ -239,6 +241,20 @@ mod tests {
             assert_ne!(t.accent, Color::Reset, "{id} accent should be colored");
             assert_eq!(t.id, id);
         }
+    }
+
+    #[test]
+    fn ion_user_message_follows_terminal_fg() {
+        // ion keeps text/assistant at Reset so they adapt to the terminal bg.
+        // user_message must do the same — a hardcoded light color turned gray on
+        // white terminals. Distinction comes from the accent bar + bold, not hue.
+        let t = Theme::ion();
+        assert_eq!(t.text, Color::Reset);
+        assert_eq!(
+            t.user_message,
+            Color::Reset,
+            "ion user_message must adapt to terminal fg, not a fixed light color"
+        );
     }
 
     #[test]

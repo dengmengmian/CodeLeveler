@@ -225,18 +225,12 @@ pub enum GlobalConfigError {
     McpEnvNotString { server: String, key: String },
 }
 impl GlobalConfig {
-    /// The config path: `$LEVELER_HOME/config.toml`, else
-    /// `$HOME/.leveler/config.toml` (or `%USERPROFILE%\.leveler\config.toml` on
-    /// Windows). Matches [`leveler_project::Layout`]'s home resolution so state
-    /// and config never land in different roots on a first Windows install.
+    /// The config path: `<leveler-home>/config.toml`, or `None` when no home is
+    /// known. Home resolution (incl. the Windows `USERPROFILE` fallback) is
+    /// shared via [`leveler_core::leveler_home_dir_from`].
     pub fn path() -> Option<PathBuf> {
-        if let Some(home) = std::env::var_os("LEVELER_HOME").filter(|v| !v.is_empty()) {
-            return Some(PathBuf::from(home).join("config.toml"));
-        }
-        std::env::var_os("HOME")
-            .filter(|v| !v.is_empty())
-            .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
-            .map(|h| PathBuf::from(h).join(".leveler").join("config.toml"))
+        leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+            .map(|home| home.join("config.toml"))
     }
 
     /// Load the global config, or an empty one if the file is absent. A present
