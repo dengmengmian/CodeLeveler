@@ -172,7 +172,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let skill_dir = dir.join(".leveler/skills/pack");
+        // Join per component so the expected path uses native separators,
+        // matching how the tool renders it (`project_skills_dir` joins segment
+        // by segment). A `".leveler/skills/pack"` literal keeps forward slashes
+        // on Windows and would not match the tool's backslash rendering.
+        let skill_dir = dir.join(".leveler").join("skills").join("pack");
         std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
         std::fs::create_dir_all(skill_dir.join("references")).unwrap();
         std::fs::write(skill_dir.join("scripts/run.sh"), "echo run\n").unwrap();

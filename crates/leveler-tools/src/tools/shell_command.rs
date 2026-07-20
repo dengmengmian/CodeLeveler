@@ -157,7 +157,12 @@ mod tests {
             .unwrap();
         let elapsed = start.elapsed();
         assert!(out.is_error, "must not spawn: {out:?}");
+        // Unix refuses via the job-control (`&`) guard (`background=true`
+        // guidance); Windows refuses the same string via the `#`-comment guard.
+        #[cfg(not(windows))]
         assert!(out.content.contains("background=true"), "{out:?}");
+        #[cfg(windows)]
+        assert!(out.content.contains("comment"), "{out:?}");
         assert!(
             elapsed < Duration::from_millis(100),
             "anti-pattern must fail closed immediately, took {elapsed:?}"

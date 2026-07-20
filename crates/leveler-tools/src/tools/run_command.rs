@@ -447,7 +447,13 @@ mod hang_guard_tests {
             .unwrap();
         let elapsed = start.elapsed();
         assert!(out.is_error, "must refuse bypass: {out:?}");
+        // The job-control (`&`) guard is Unix-only; on Windows the same
+        // anti-pattern is refused by the `#`-comment guard instead. Either way
+        // the shell bypass is caught before spawn.
+        #[cfg(not(windows))]
         assert!(out.content.contains("background=true"), "{out:?}");
+        #[cfg(windows)]
+        assert!(out.content.contains("comment"), "{out:?}");
         assert!(
             elapsed < Duration::from_millis(100),
             "must not hang, took {elapsed:?}"
@@ -463,6 +469,9 @@ mod grant_tests {
     use leveler_execution::{PermissionProfile, Workspace};
     use tokio_util::sync::CancellationToken;
 
+    // Unix write-root confinement semantics (seatbelt/bubblewrap); Windows FS
+    // boundaries are covered by the dedicated `windows_` canary tests.
+    #[cfg(unix)]
     #[tokio::test]
     async fn turn_unrestricted_fs_drops_write_root_confinement() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -528,6 +537,7 @@ mod grant_tests {
 
     /// D4 canary: under assisted write_root, agent/shell cannot write into `.git`
     /// (so bare `git pull` fails until the turn gets filesystem elevation).
+    #[cfg(unix)]
     #[tokio::test]
     async fn confined_mode_blocks_git_dir_write() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -567,6 +577,7 @@ mod grant_tests {
 
     /// D4 canary: after turn_unrestricted_fs, the same .git write succeeds
     /// (model path: request_permissions filesystem=unrestricted → retry git).
+    #[cfg(unix)]
     #[tokio::test]
     async fn turn_unrestricted_fs_allows_git_dir_write() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -763,6 +774,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Invokes bare Unix coreutils (`echo`) as a program; Windows has no such
+    // executable (it is a shell builtin). Windows exec is covered by
+    // `shell_command_runs_echo` and the `windows_` canaries.
+    #[cfg(unix)]
     #[tokio::test]
     async fn runs_echo() {
         let dir =
@@ -783,6 +798,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn drops_duplicate_program_from_first_arg() {
         let dir =
@@ -848,6 +864,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Invokes bare Unix `false`; no such executable on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn reports_nonzero_exit_as_error() {
         let dir =
@@ -932,6 +950,10 @@ mod snapshot_tests {
     use leveler_execution::{PermissionProfile, Workspace};
     use tokio_util::sync::CancellationToken;
 
+    // POSIX-shell fixture driver; the git/coreutils rollback assertions below
+    // exercise Unix-shell-driven mutations. Windows rollback is not driven
+    // through `sh -c` here.
+    #[cfg(unix)]
     async fn sh_in(dir: &std::path::Path, script: &str) {
         let out = tokio::process::Command::new("sh")
             .arg("-c")
@@ -947,6 +969,7 @@ mod snapshot_tests {
         ToolContext::new(Workspace::new(dir).unwrap(), PermissionProfile::Assisted)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_mutations_are_reported_as_modified_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -1014,6 +1037,7 @@ mod snapshot_tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn out_of_scope_command_mutations_are_rolled_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -1050,6 +1074,7 @@ mod snapshot_tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_file_budget_violation_is_rolled_back() {
         let dir = tempfile::tempdir().unwrap();

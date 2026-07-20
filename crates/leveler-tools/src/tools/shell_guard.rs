@@ -217,15 +217,26 @@ mod tests {
     #[test]
     fn refuses_server_background_sleep_comment_curl_anti_pattern() {
         let err = refuse_shell_script(HANG_ANTI_PATTERN).expect("must refuse");
-        assert!(
-            err.contains("background") || err.contains("job-control") || err.contains('&'),
-            "{err}"
-        );
-        assert!(
-            err.contains("run_command") && err.contains("background=true"),
-            "must tell the model the correct next step: {err}"
-        );
         assert!(err.contains("[recoverable]"), "{err}");
+        // Unix catches the `&` job-control backgrounding first and points at
+        // `run_command background=true`. That detection is Unix-only; on Windows
+        // the same string is refused by the `#`-comment guard instead.
+        #[cfg(not(windows))]
+        {
+            assert!(
+                err.contains("background") || err.contains("job-control") || err.contains('&'),
+                "{err}"
+            );
+            assert!(
+                err.contains("run_command") && err.contains("background=true"),
+                "must tell the model the correct next step: {err}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert!(err.contains("comment"), "{err}");
+            assert!(err.contains("split into separate tool calls"), "{err}");
+        }
     }
 
     #[test]
@@ -275,7 +286,12 @@ mod tests {
     fn run_command_sh_c_cannot_bypass_guard() {
         let err = refuse_run_command_shell_bypass("sh", &["-c".into(), HANG_ANTI_PATTERN.into()])
             .expect("sh -c must be guarded");
+        // `.expect` already proves the bypass is guarded; the guidance string is
+        // Unix-specific (`background=true`) vs. the Windows `#`-comment refusal.
+        #[cfg(not(windows))]
         assert!(err.contains("background=true"), "{err}");
+        #[cfg(windows)]
+        assert!(err.contains("comment"), "{err}");
     }
 
     #[test]

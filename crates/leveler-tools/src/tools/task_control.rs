@@ -254,7 +254,10 @@ impl Tool for KillTaskTool {
     }
 }
 
-#[cfg(test)]
+// Every test here drives background mutations through a POSIX `sh -c` + git
+// fixture; Windows background/rollback behavior is covered by the `windows_`
+// canary tests.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tool::{Tool, ToolContext};
