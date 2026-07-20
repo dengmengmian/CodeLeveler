@@ -1719,11 +1719,79 @@ async fn repeated_identical_call_is_blocked_by_loop_guard() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// After every plan step is completed, closeout thrash (re-running git status
-/// via different wrappers) must be refused and the turn must hard-stop rather
-/// than burn rounds re-auditing. Plan complete means the task is done, so the
-/// stop is Answered (verify decides pass/fail), NOT Incomplete — Incomplete
-/// would misreport a finished task as a failure.
+/// The stagnation guard must force-stop a run whose command keeps failing, even
+/// when the model varies the args each round (so the identical-call guard never
+/// fires) — the real-world "edit → run a check that keeps failing" spin. Without
+/// it, such a turn loops until the token budget or the user kills it.
+#[tokio::test]
+async fn a_command_that_keeps_failing_is_force_stopped() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-stagnation-{}",
+        std::process::id() as u64 * 29 + 3
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // `false` always exits non-zero; varying the args each round changes the
+    // loop-guard key so the identical-call guard does not short-circuit it. More
+    // responses than the stagnation cap, so the guard (not exhaustion) ends it.
+    let mut responses: Vec<ModelResponse> = (0..8)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "run_command",
+                serde_json::json!({"program": "false", "args": [format!("{i}")]}),
+            )
+        })
+        .collect();
+    responses.push(assistant_text("giving up"));
+    let runtime = Arc::new(MockRuntime::new(responses));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    );
+    let outcome = executor
+        .run(
+            "run the failing check until it passes",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Incomplete,
+        "a check that never passes must be force-stopped, not looped: {outcome:?}"
+    );
+    assert!(
+        outcome.rounds <= 6,
+        "must stop within a few rounds, not consume all attempts: rounds={}",
+        outcome.rounds
+    );
+    assert!(
+        outcome
+            .stop_detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stagnation"),
+        "stop detail should name the stagnation guard: {:?}",
+        outcome.stop_detail
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// After every plan step is completed, pure-observe thrash (git status via
+/// different wrappers) must be refused and the turn must hard-stop rather than
+/// burn rounds re-auditing.
 #[tokio::test]
 async fn completed_plan_refuses_observe_thrash_and_stops() {
     let dir = std::env::temp_dir().join(format!(
@@ -1782,15 +1850,15 @@ async fn completed_plan_refuses_observe_thrash_and_stops() {
 
     assert_eq!(
         outcome.stop_reason,
-        StopReason::Answered,
-        "plan complete = done; closeout thrash must not be misreported as Incomplete"
+        StopReason::Incomplete,
+        "plan complete + observe thrash → hard-stop, recorded as Incomplete"
     );
     assert!(
         outcome
             .stop_detail
             .as_deref()
-            .is_some_and(|d| d.contains("closeout")),
-        "expected a closeout short-circuit detail: {:?}",
+            .is_some_and(|d| d.contains("thrash")),
+        "expected an observe-thrash short-circuit detail: {:?}",
         outcome.stop_detail
     );
     let closeout_denials = events

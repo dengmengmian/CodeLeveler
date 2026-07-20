@@ -182,6 +182,21 @@ impl Executor {
         let mut observe_only_tools_this_round = 0u32;
         #[allow(unused_assignments)]
         let mut non_observe_success_this_round = 0u32;
+        // Stagnation guard signals. A "failing-command" round (a run/shell
+        // command executed and every one failed, with no other progress) is the
+        // stuck pattern the observe-only guard misses. Progress that clears it:
+        // a passing verification, a novel read/search, a succeeding command, or a
+        // newly-touched file. Rounds with no command at all are neutral (goal /
+        // plan / edit work is not penalized), so this never fires on them.
+        #[allow(unused_assignments)]
+        let mut verify_passed_this_round = false;
+        #[allow(unused_assignments)]
+        let mut novel_observe_this_round = false;
+        #[allow(unused_assignments)]
+        let mut command_ran_this_round = false;
+        #[allow(unused_assignments)]
+        let mut command_success_this_round = false;
+        let mut stagnation_nudge_sent = false;
         // Hard step limits (spec §27): wall clock from run start, commands
         // executed so far, and the reason once a limit trips. The round that
         // trips a limit still commits its tool results (well-formed transcript)
@@ -841,6 +856,13 @@ impl Executor {
             // Ids/names survive the consuming loop below so calls the cancel
             // cut short can still be refused in place (transcript pairing).
             let call_snapshot: Vec<ToolCall> = calls.clone();
+            verify_passed_this_round = false;
+            novel_observe_this_round = false;
+            command_ran_this_round = false;
+            command_success_this_round = false;
+            // Distinct files touched before this round — a growth means the round
+            // reached a new file (real progress), not just re-editing the same one.
+            let modified_before = modified_files.len();
 
             for (index, call) in calls.into_iter().enumerate() {
                 // Complex tasks must register a structured plan before mutation.
@@ -1377,6 +1399,14 @@ impl Executor {
                             non_observe_success_this_round.saturating_add(1);
                     }
                 }
+                // Track command execution for the stagnation guard: a command
+                // that keeps failing (test/build/script) is the stuck signal.
+                if matches!(call.name.as_str(), "run_command" | "shell_command") {
+                    command_ran_this_round = true;
+                    if !is_error {
+                        command_success_this_round = true;
+                    }
+                }
                 if let Some(part) = image {
                     pending_images.push(part);
                 }
@@ -1386,6 +1416,15 @@ impl Executor {
                 match call_history.get_mut(&loop_key) {
                     Some(entry) if entry.0 == content => entry.1 += 1,
                     _ => {
+                        // A novel, successful read/search is real exploration —
+                        // it resets the stagnation guard. A repeated (stale)
+                        // result does not.
+                        if !is_error
+                            && (is_pure_observe_call(&call.name, &call.arguments)
+                                || is_search_tool(&call.name))
+                        {
+                            novel_observe_this_round = true;
+                        }
                         call_history.insert(loop_key, (content.clone(), 1));
                     }
                 }
@@ -1437,6 +1476,8 @@ impl Executor {
                 // counts (name gate inside counts_as_verification_evidence).
                 if !is_error && counts_as_verification_evidence(&call.name, &call.arguments) {
                     verification_ran = true;
+                    // A verification-class command that PASSED is real progress.
+                    verify_passed_this_round = true;
                     let (program, args) = extract_command(&call);
                     let fp = EvidenceLedger::normalize_command_fingerprint(
                         program.as_deref().unwrap_or("run_command"),
@@ -2049,6 +2090,94 @@ impl Executor {
             } else {
                 // Successful non-observe work resets the streak.
                 progress.note_progress(round);
+            }
+
+            // Stagnation guard (top-level turns only): the observe-only guard
+            // above misses the common "edit → run a check that keeps failing"
+            // spin. A round with real progress — a passing verification, a novel
+            // read/search, a succeeding command, or a newly-touched file — clears
+            // the streak. A round where a command ran and every one failed with
+            // none of those signals grows it. Rounds with no command are neutral
+            // (goal/plan/edit work is never penalized), so this only bites a
+            // genuinely stuck "the check keeps failing" loop.
+            let new_file_this_round = modified_files.len() > modified_before;
+            let made_progress = verify_passed_this_round
+                || novel_observe_this_round
+                || command_success_this_round
+                || new_file_this_round;
+            if made_progress {
+                progress.note_round_outcome(true);
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+            } else if self.depth == 0 && command_ran_this_round {
+                progress.note_round_outcome(false);
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+                if progress.should_hard_stop_stagnation(progress_caps) {
+                    progress.enter_terminal();
+                    observer(AgentEvent::ProgressUpdated {
+                        ledger: progress.clone(),
+                    });
+                    let final_text = if last_text.trim().is_empty() {
+                        "Stopped: no progress across several rounds — the check kept \
+                         failing or the same information kept coming back. This is \
+                         likely an environment limit or an unsolvable request, so I am \
+                         not looping further."
+                            .to_string()
+                    } else {
+                        last_text.clone()
+                    };
+                    observer(AgentEvent::Finished(final_text.clone()));
+                    sync_epoch_progress(
+                        &mut progress,
+                        &mut metrics,
+                        epoch_rounds_at_start,
+                        epoch_tokens_at_start,
+                        epoch_duration_at_start,
+                        run_started,
+                        round,
+                        model_tokens_spent,
+                        commands_run,
+                        cost_spent_micros,
+                        &modified_files,
+                    );
+                    observer(AgentEvent::ProgressUpdated {
+                        ledger: progress.clone(),
+                    });
+                    return Ok(AgentOutcome::drive_result(
+                        final_text,
+                        round,
+                        modified_files,
+                        StopReason::Incomplete,
+                        Some("no-progress stagnation; force-stopped".to_string()),
+                        &metrics,
+                        &progress,
+                        &objective,
+                    ));
+                }
+                // One round before the cap: warn the model so it can change
+                // approach, work around an environment limit, or stop honestly
+                // instead of repeating the same failing edit-and-recheck.
+                if progress.stagnation_streak + 1 >= progress_caps.stagnation_rounds
+                    && !stagnation_nudge_sent
+                {
+                    stagnation_nudge_sent = true;
+                    messages.push(Message::text(
+                        Role::User,
+                        format!(
+                            "You have gone several rounds without real progress toward:\n\
+                             <objective>\n{original_task}\n</objective>\n\
+                             The same check keeps failing or the same information keeps \
+                             coming back. Do NOT repeat the same edit-and-recheck. Either \
+                             try a fundamentally different approach, treat this as a \
+                             possible environment limitation (e.g. a sandboxed command) \
+                             and work around it, or stop and report honestly what is \
+                             blocking you. One more unproductive round will end the turn."
+                        ),
+                    ));
+                }
             }
             // Per-round counters are zeroed at the top of the next model round.
 
