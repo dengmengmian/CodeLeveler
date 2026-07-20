@@ -500,6 +500,15 @@ mod tests {
         assert_eq!(report.failed_gates().len(), 1);
     }
 
+    // Unix-only: exercises the acceptance state machine (exit 0 → Met, nonzero →
+    // Unmet, no command → Unverifiable) by actually spawning `sh -c`. The logic
+    // in `evaluate_acceptance` is platform-independent; on Windows the passing
+    // (`Met`) path proved unreproducible through `cmd /c` under the verifier
+    // sandbox (every candidate command returned nonzero). Windows keeps coverage
+    // of the Unmet path (`failing_gating_command_blocks`) and the trivial /
+    // no-command paths (`acceptance_rejects_trivial_and_dangerous_without_running`,
+    // which never spawn).
+    #[cfg(unix)]
     #[tokio::test]
     async fn acceptance_command_exit_zero_is_met_nonzero_unmet_absent_unverifiable() {
         use crate::acceptance::{AcceptanceCheck, AcceptanceStatus};
@@ -508,32 +517,15 @@ mod tests {
             AcceptanceCheck {
                 id: "AC-1".into(),
                 description: "passes".into(),
-                // Structurally identical to AC-2's proven-on-Windows command,
-                // but exits 0: the redirect makes it non-trivial (so it is not
-                // rejected), and the explicit `exit 0` cleanly sets the code
-                // (commands without an explicit `exit` came back nonzero under
-                // cmd.exe on the runner). Bare `true` is rejected as trivial.
-                command: Some(
-                    if cfg!(windows) {
-                        "echo ok 1>&2 & exit 0"
-                    } else {
-                        "test -d ."
-                    }
-                    .into(),
-                ),
+                // Non-trivial (a real path test, not the rejected `true`) and
+                // exits 0 → Met.
+                command: Some("test -d .".into()),
                 required: true,
             },
             AcceptanceCheck {
                 id: "AC-2".into(),
                 description: "fails".into(),
-                command: Some(
-                    if cfg!(windows) {
-                        "echo boom 1>&2 & exit 1"
-                    } else {
-                        "echo boom >&2; exit 1"
-                    }
-                    .into(),
-                ),
+                command: Some("echo boom >&2; exit 1".into()),
                 required: true,
             },
             AcceptanceCheck {
