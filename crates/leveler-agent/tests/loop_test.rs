@@ -2284,7 +2284,11 @@ async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
     // Distinct files so each read is "novel" progress — this evades the
     // no-progress / stagnation watchdogs, leaving only the absolute ceiling.
     for i in 0..20 {
-        std::fs::write(dir.join(format!("src/f{i}.rs")), format!("pub fn f{i}() {{}}\n")).unwrap();
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);

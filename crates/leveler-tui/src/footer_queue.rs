@@ -64,7 +64,11 @@ pub(crate) fn queue_panel_height(state: &AppState) -> u16 {
     let body = n.min(QUEUE_BODY_MAX);
     let more = if n > QUEUE_BODY_MAX { 1 } else { 0 };
     // Action hint sits under the list whenever there is something to act on.
-    let hint = if state.input_queues.waiting_len() > 0 { 1 } else { 0 };
+    let hint = if state.input_queues.waiting_len() > 0 {
+        1
+    } else {
+        0
+    };
     // title + body rows (+ overflow marker) (+ action hint)
     (1 + body + more + hint) as u16
 }

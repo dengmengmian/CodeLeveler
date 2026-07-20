@@ -610,15 +610,17 @@ impl ApprovalPolicy {
         risk: RiskLevel,
         command: Option<CommandView>,
     ) -> Requirement {
-        // Durable memory writes always need a human decision (K36), even under
-        // FullAccess / --auto-approve (AutoApprove denies these tools).
-        if is_memory_write_tool(tool) {
-            return Requirement::NeedApproval;
-        }
-
-        // 完全访问: no prompts (except memory, above).
+        // 完全访问 means no prompts at all — the user has explicitly opted into
+        // an unrestricted session, including destructive commands and durable
+        // memory writes/deletes. Check it first so nothing below can re-gate.
         if profile == PermissionProfile::FullAccess {
             return Requirement::Auto;
+        }
+
+        // Under assisted / request-approval, durable memory writes still need a
+        // human decision (K36): a wrong long-term memory is worse than none.
+        if is_memory_write_tool(tool) {
+            return Requirement::NeedApproval;
         }
 
         // 请求批准: always ask for network and anything above workspace writes.
@@ -687,10 +689,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_writes_always_need_approval_even_full_access() {
+    fn memory_writes_auto_under_full_access_but_gated_otherwise() {
         let policy = ApprovalPolicy {
             network_allowed: true,
         };
+        // FullAccess bypasses every prompt, memory writes included.
         assert_eq!(
             policy.evaluate(
                 PermissionProfile::FullAccess,
@@ -698,16 +701,7 @@ mod tests {
                 RiskLevel::WorkspaceWrite,
                 None
             ),
-            Requirement::NeedApproval
-        );
-        assert_eq!(
-            policy.evaluate(
-                PermissionProfile::Assisted,
-                "forget",
-                RiskLevel::WorkspaceWrite,
-                None
-            ),
-            Requirement::NeedApproval
+            Requirement::Auto
         );
         assert_eq!(
             policy.evaluate(
@@ -716,8 +710,17 @@ mod tests {
                 RiskLevel::WorkspaceWrite,
                 None
             ),
-            Requirement::NeedApproval,
-            "K36: consolidate_memory auto_write must not be Auto under FullAccess"
+            Requirement::Auto,
+        );
+        // Assisted / request-approval still confirm memory writes (K36).
+        assert_eq!(
+            policy.evaluate(
+                PermissionProfile::Assisted,
+                "forget",
+                RiskLevel::WorkspaceWrite,
+                None
+            ),
+            Requirement::NeedApproval
         );
         assert_eq!(
             policy.evaluate(PermissionProfile::Assisted, "memory", RiskLevel::Safe, None),
