@@ -25,7 +25,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          # Cross-compile the Intel binary on the Apple Silicon runner: the
+          # macos-13 (Intel) runners queue for tens of minutes and stall the
+          # whole release. Apple's toolchain builds x86_64 from arm64 natively.
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
