@@ -2044,6 +2044,7 @@ fn summary(id: &str, goal: &str) -> leveler_client_protocol::UiSessionSummary {
         status: "completed".into(),
         model: "deepseek/v3".into(),
         updated_at: "2026-07-08".into(),
+        repository: None,
     }
 }
 

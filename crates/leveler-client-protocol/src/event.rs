@@ -546,6 +546,7 @@ mod tests {
                     status: "done".to_string(),
                     model: "openai/gpt-4o".to_string(),
                     updated_at: "now".to_string(),
+                    repository: None,
                 }],
             },
             "session_list",

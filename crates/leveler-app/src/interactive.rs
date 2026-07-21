@@ -617,6 +617,7 @@ impl InProcessRuntimeClient {
                 status: r.status.as_str().to_string(),
                 model: r.model,
                 updated_at: r.updated_at,
+                repository: Some(self.app.layout.repo_root.display().to_string()),
             })
             .collect()
     }

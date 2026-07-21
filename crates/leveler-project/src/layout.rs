@@ -68,8 +68,20 @@ impl Layout {
     }
 
     /// Per-repository local runtime endpoint.
+    ///
+    /// NOT under `state_dir`: Unix socket paths must stay below `SUN_LEN`
+    /// (~104 bytes on macOS) and the hashed state-dir name grows with the
+    /// repository path — deep repos overflow it. The socket instead lives in
+    /// a short per-home dir, keyed by the same 16-hex repo-path hash, so any
+    /// process resolving the same repository derives the same endpoint.
     pub fn socket_path(&self) -> PathBuf {
-        self.state_dir.join("runtime.sock")
+        let hash = path_hash(&self.repo_root.to_string_lossy());
+        match self.state_dir.parent().and_then(Path::parent) {
+            Some(home) => home.join("sock").join(format!("{hash}.sock")),
+            // A state dir with no home above it (hand-built layouts): keep
+            // the socket beside the state.
+            None => self.state_dir.join("runtime.sock"),
+        }
     }
 
     /// Durable project memory root (`active/` + `archive/` JSON entries).
@@ -279,15 +291,42 @@ mod tests {
     }
 
     #[test]
-    fn socket_is_namespaced_with_the_repository_state() {
+    fn socket_lives_in_the_short_per_home_dir_keyed_by_repo_hash() {
         let layout = Layout {
             repo_root: PathBuf::from("/repo"),
             config_dir: PathBuf::from("/config"),
-            state_dir: PathBuf::from("/state/project"),
+            state_dir: PathBuf::from("/home/x/.leveler/projects/-repo-abcdef1234567890"),
         };
+        let socket = layout.socket_path();
         assert_eq!(
-            layout.socket_path(),
-            PathBuf::from("/state/project/runtime.sock")
+            socket,
+            PathBuf::from(format!("/home/x/.leveler/sock/{}.sock", path_hash("/repo")))
+        );
+    }
+
+    #[test]
+    fn socket_path_stays_under_sun_len_for_deep_repositories() {
+        // The regression this guards: state-dir-based sockets overflowed
+        // macOS's ~104-byte sun_path limit for deeply nested repos.
+        let repo = "/Users/someone/Develop/app/codeleveler/fixtures/repos/commander";
+        let layout = Layout::resolve_with_environment(
+            PathBuf::from(repo),
+            None,
+            &leveler_core::EnvSnapshot::new(
+                [(
+                    std::ffi::OsString::from("HOME"),
+                    std::ffi::OsString::from("/Users/someone"),
+                )],
+                PathBuf::from("/"),
+                PathBuf::from("/tmp"),
+            ),
+        );
+        let socket = layout.socket_path();
+        assert!(
+            socket.as_os_str().len() < 100,
+            "socket path must fit sun_path: {} ({} bytes)",
+            socket.display(),
+            socket.as_os_str().len()
         );
     }
 

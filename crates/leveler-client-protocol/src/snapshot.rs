@@ -109,6 +109,12 @@ pub struct UiSessionSummary {
     pub status: String,
     pub model: String,
     pub updated_at: String,
+    /// Repository root the session belongs to. Filled by the runtime that
+    /// owns the session and by the WebUI aggregation router (multi-project
+    /// grouping); omitted on the wire when unknown so old fixtures and
+    /// clients keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 
 /// Everything a client needs to render a session's header and transcript.
