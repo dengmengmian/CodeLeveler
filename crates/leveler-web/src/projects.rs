@@ -457,9 +457,10 @@ mod tests {
         ClientCommand, ClientError, InteractiveRuntimeClient, RuntimeEvent, SessionId,
         UiSessionSnapshot, mock::MockRuntimeClient,
     };
-    use leveler_local_transport::{
-        CreateSessionRequest, LocalRuntimeService, LocalSocketServer, SessionBootstrap,
-    };
+    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
+    // Unix-socket daemon fixture is unix-only (Windows stubs return Unavailable).
+    #[cfg(unix)]
+    use leveler_local_transport::LocalSocketServer;
 
     /// Minimal primary service: the manager tests never exercise commands.
     struct StubService {
@@ -517,7 +518,8 @@ mod tests {
     }
 
     /// Bind AND serve a stub daemon on `socket` — a bound-but-unserved socket
-    /// would hang the client's first request forever.
+    /// would hang the client's first request forever. Unix-socket only.
+    #[cfg(unix)]
     async fn serve_stub_daemon(socket: &Path) -> tokio_util::sync::CancellationToken {
         let server = LocalSocketServer::bind(socket, StubService::new())
             .await
@@ -530,6 +532,7 @@ mod tests {
         shutdown
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn probe_attaches_to_a_live_daemon_and_registry_persists() {
         let dir = tempfile::tempdir().unwrap();
@@ -589,6 +592,7 @@ mod tests {
         assert_eq!(list[1].status, ProjectStatus::Offline);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn load_registry_reattaches_persisted_projects() {
         let dir = tempfile::tempdir().unwrap();
