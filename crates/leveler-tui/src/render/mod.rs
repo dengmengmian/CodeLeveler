@@ -839,6 +839,7 @@ mod tests {
                 status: ToolStatus::Failed,
                 preview: Some("tool error: unknown tool `task`; use `spawn_agent`".into()),
                 duration_ms: None,
+                parallel: false,
             }],
             open: false,
             expanded: false,
@@ -982,6 +983,7 @@ mod tests {
                         id: id.clone(),
                         name: "read_file".into(),
                         arguments: serde_json::json!({ "path": path }).to_string(),
+                        parallel: false,
                     },
                 ),
             );
@@ -1060,6 +1062,7 @@ mod tests {
             first.clone(),
             "read_file".into(),
             r#"{"path":"README.md"}"#.into(),
+            false,
         );
         s.transcript
             .complete_tool(&first, true, "README contents".into(), 10);
@@ -1068,6 +1071,7 @@ mod tests {
             second.clone(),
             "grep".into(),
             r#"{"pattern":"TODO","path":"crates"}"#.into(),
+            false,
         );
         s.transcript
             .complete_tool(&second, false, "grep failed loudly".into(), 20);
@@ -1313,6 +1317,7 @@ mod tests {
             status: ToolStatus::Ok,
             preview: Some("some output".into()),
             duration_ms: Some(ms),
+            parallel: false,
         }
     }
 
@@ -1359,7 +1364,7 @@ mod tests {
         let mut transcript = crate::transcript::TranscriptState::new();
         for id in ["t1", "t2"] {
             let id = ToolCallId::new(id);
-            transcript.push_tool_started(id.clone(), "read_file".into(), "{}".into());
+            transcript.push_tool_started(id.clone(), "read_file".into(), "{}".into(), false);
             transcript.complete_tool(&id, true, "ok".into(), 1);
         }
         assert_eq!(transcript.items().len(), 1);
@@ -1448,6 +1453,7 @@ mod tests {
                     .into(),
             ),
             duration_ms: Some(1),
+            parallel: false,
         };
         let lines = tool_render(&item, true);
         let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
@@ -1466,6 +1472,7 @@ mod tests {
             status: ToolStatus::Ok,
             preview: Some("     1\t# README\n     2\tlots of content".into()),
             duration_ms: Some(1),
+            parallel: false,
         };
         let folded = tool_render(&item, false);
         let text = folded
@@ -1493,6 +1500,7 @@ mod tests {
             status: ToolStatus::Ok,
             preview: Some("Goal resolved.".into()),
             duration_ms: Some(1),
+            parallel: false,
         };
         let lines = tool_render(&item, false);
         let text = lines
@@ -1526,6 +1534,7 @@ mod tests {
             status: ToolStatus::Ok,
             preview: Some("Goal resolved.".into()),
             duration_ms: Some(1),
+            parallel: false,
         };
         // Collapsed head is width-clipped (may end with …).
         let collapsed = tool_render(&item, false);

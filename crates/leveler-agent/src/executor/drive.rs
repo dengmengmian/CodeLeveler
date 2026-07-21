@@ -972,6 +972,7 @@ impl Executor {
                         id: call.id.as_str().to_string(),
                         name: COMPLETE_STEP_TOOL.to_string(),
                         arguments: compact_json(&call.arguments),
+                        parallel: false,
                     });
                     let step_id = call
                         .arguments
@@ -1066,6 +1067,7 @@ impl Executor {
                         id: call.id.as_str().to_string(),
                         name: UPDATE_GOAL_TOOL.to_string(),
                         arguments: compact_json(&call.arguments),
+                        parallel: false,
                     });
                     // A resolution without an explicit status is not accepted as
                     // completion — feed the error back so the model resolves
@@ -1347,10 +1349,19 @@ impl Executor {
                     }
                 }
 
+                // Read-only, side-effect-free tools are deferred to the
+                // concurrent batch below; mark the event so a UI can render them
+                // as one parallel group.
+                let parallel = self
+                    .registry
+                    .get(&call.name)
+                    .map(|t| t.supports_parallel())
+                    .unwrap_or(false);
                 observer(AgentEvent::ToolCall {
                     id: call.id.as_str().to_string(),
                     name: call.name.clone(),
                     arguments: compact_json(&call.arguments),
+                    parallel,
                 });
                 collect_scoped_paths_from_call(&call, &mut scoped_paths);
 
@@ -1370,13 +1381,8 @@ impl Executor {
                     epoch_paths,
                 );
 
-                // Read-only, side-effect-free tools are deferred to the
-                // concurrent batch below; every other tool runs here, in order.
-                let parallel = self
-                    .registry
-                    .get(&call.name)
-                    .map(|t| t.supports_parallel())
-                    .unwrap_or(false);
+                // `parallel` (computed above) also decides deferral to the batch;
+                // every other tool runs here, in order.
                 let (content, is_error, image, workspace_snapshot, plan, newly_modified) =
                     match self
                         .authorize_with_cancellation(&call, &mut session_approved, &cancellation)

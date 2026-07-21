@@ -1,5 +1,6 @@
 //! Command-line argument definitions (clap derive).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -75,6 +76,11 @@ pub enum Command {
         /// Override the per-repository Unix socket path.
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
+        /// Also expose the daemon over loopback TCP at this address (e.g.
+        /// `127.0.0.1:7878`) for external / WebUI clients. A bearer token is
+        /// generated with the OS CSPRNG and printed once at startup.
+        #[arg(long, value_name = "ADDR")]
+        tcp: Option<SocketAddr>,
     },
 
     /// Diagnose the environment, tooling, and configuration.
@@ -768,12 +774,14 @@ mod tests {
                 auto_approve,
                 sandbox,
                 socket,
+                tcp,
             }) => {
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
                 assert!(matches!(mode, RunMode::FullAccess));
                 assert!(!auto_approve);
                 assert!(sandbox);
                 assert_eq!(socket, Some(PathBuf::from("/tmp/leveler.sock")));
+                assert!(tcp.is_none(), "no --tcp given → Unix-only daemon");
             }
             other => panic!("expected Serve, got {other:?}"),
         }

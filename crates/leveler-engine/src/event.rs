@@ -160,6 +160,10 @@ pub enum EngineEvent {
         call_id: String,
         name: String,
         arguments: String,
+        /// True when the call ran in the concurrent read-only batch. Legacy
+        /// events omit it (defaults to false → shown as a normal call).
+        #[serde(default)]
+        parallel: bool,
         /// Risk recorded at execution time. Legacy events omit it; recovery
         /// treats `None` conservatively rather than consulting today's registry.
         #[serde(default)]
@@ -715,10 +719,12 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 id,
                 name,
                 arguments,
+                parallel,
             } => EngineEvent::ToolCallStarted {
                 call_id: id,
                 name,
                 arguments,
+                parallel,
                 risk: None,
             },
             A::ToolResult {
@@ -956,6 +962,7 @@ mod contract_tests {
                 call_id: "call".into(),
                 name: "run_command".into(),
                 arguments: "{\"token\":\"secret\"}".into(),
+                parallel: false,
                 risk: None,
             },
             EngineEvent::ContextSnapshot { messages: vec![] },

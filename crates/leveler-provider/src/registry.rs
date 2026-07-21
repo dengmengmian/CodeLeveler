@@ -17,7 +17,7 @@ use leveler_model::{
     ModelError, ModelErrorKind, ModelEvent, ModelEventStream, ModelProfile, ModelRef, ModelRequest,
     ModelResponse, ModelRuntime, ProtocolAdapter, ProtocolContext, ProtocolKind,
 };
-use leveler_protocol::OpenAiChatAdapter;
+use leveler_protocol::{AnthropicMessagesAdapter, OpenAiChatAdapter};
 
 use crate::catalog::ModelConfigFile;
 use crate::config::ProviderConfig;
@@ -163,12 +163,15 @@ impl ModelRuntime for ProviderRegistry {
     ) -> Result<ModelEventStream, ModelError> {
         let provider = self.provider(&request.model.provider)?;
         let entry = self.entry(&request.model)?;
-        let context = self.context(provider, &entry.profile);
+        let mut context = self.context(provider, &entry.profile);
 
         let encoded = provider
             .adapter
             .encode_request(&request, &context, true)
             .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()))?;
+        // Apply protocol-supplied headers (e.g. Anthropic's `x-api-key` /
+        // `anthropic-version`); the transport only reads `context.extra_headers`.
+        context.extra_headers.extend(encoded.headers.iter().cloned());
         let url = Self::endpoint(&context.base_url, &encoded.path);
 
         let response = send_with_retry(
@@ -202,12 +205,15 @@ impl ModelRuntime for ProviderRegistry {
     ) -> Result<ModelResponse, ModelError> {
         let provider = self.provider(&request.model.provider)?;
         let entry = self.entry(&request.model)?;
-        let context = self.context(provider, &entry.profile);
+        let mut context = self.context(provider, &entry.profile);
 
         let encoded = provider
             .adapter
             .encode_request(&request, &context, false)
             .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()))?;
+        // Apply protocol-supplied headers (see `stream`); the transport only
+        // reads `context.extra_headers`.
+        context.extra_headers.extend(encoded.headers.iter().cloned());
         let url = Self::endpoint(&context.base_url, &encoded.path);
 
         let response = send_with_retry(
@@ -245,6 +251,7 @@ impl ModelRuntime for ProviderRegistry {
 fn adapter_for(config: &ProviderConfig) -> Result<Arc<dyn ProtocolAdapter>, RegistryError> {
     match config.protocol {
         ProtocolKind::OpenAiChat => Ok(Arc::new(OpenAiChatAdapter::new())),
+        ProtocolKind::AnthropicMessages => Ok(Arc::new(AnthropicMessagesAdapter::new())),
         other => Err(RegistryError::UnsupportedProtocol(config.id.clone(), other)),
     }
 }

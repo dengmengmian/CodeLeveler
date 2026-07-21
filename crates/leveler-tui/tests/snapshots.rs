@@ -313,6 +313,7 @@ fn renders_failed_tool_inline_and_tools_screen() {
             id: ToolCallId::new("t1"),
             name: "run_command".into(),
             arguments: "cargo test".into(),
+            parallel: false,
         }),
     );
     reduce(
@@ -379,6 +380,7 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
             id: ToolCallId::new("t1"),
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["test"]}"#.into(),
+            parallel: false,
         }),
     );
     reduce(
@@ -450,6 +452,7 @@ fn command_result_renders_as_important_activity_not_file_list() {
             id: ToolCallId::new("command-1"),
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["test","-p","leveler-tui"]}"#.into(),
+            parallel: false,
         }),
     );
     reduce(
@@ -501,6 +504,7 @@ fn running_command_renders_as_progress_activity() {
             id: ToolCallId::new("command-running"),
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["check"]}"#.into(),
+            parallel: false,
         }),
     );
 
@@ -529,6 +533,7 @@ fn list_files_scan_stays_out_of_conversation() {
                 id: ToolCallId::new(id),
                 name: "list_files".into(),
                 arguments: format!(r#"{{"path":"{path}"}}"#),
+                parallel: false,
             }),
         );
         reduce(
@@ -548,6 +553,7 @@ fn list_files_scan_stays_out_of_conversation() {
             id: ToolCallId::new("edit"),
             name: "apply_patch".into(),
             arguments: r#"{"patch":"*** Begin Patch\n*** Update File: internal/admin/web/web.go\n*** End Patch"}"#.into(),
+            parallel: false,
         }),
     );
     reduce(
@@ -756,6 +762,7 @@ fn recap_does_not_render_raw_markdown_markers() {
                 "next_step": "运行 `release` 发布流程"
             })
             .to_string(),
+            parallel: false,
         }),
     );
     reduce(

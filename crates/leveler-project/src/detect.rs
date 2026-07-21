@@ -35,6 +35,25 @@ impl Language {
             Language::Cpp => "c/c++",
         }
     }
+
+    /// The language of a single file, by extension. `None` for extensions we do
+    /// not map to a recognized language. Used by per-file tools (e.g. diagnostics)
+    /// where the project-wide `detect_languages` is too coarse.
+    pub fn from_path(path: &Path) -> Option<Language> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "rs" => Language::Rust,
+            "go" => Language::Go,
+            "ts" | "tsx" | "mts" | "cts" => Language::TypeScript,
+            "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
+            "py" | "pyi" => Language::Python,
+            "java" => Language::Java,
+            "rb" => Language::Ruby,
+            "cs" => Language::CSharp,
+            "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" => Language::Cpp,
+            _ => return None,
+        })
+    }
 }
 
 /// Detect languages at `root` from marker files. Deterministic order.
@@ -101,6 +120,17 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn from_path_maps_extensions_to_languages() {
+        assert_eq!(Language::from_path(Path::new("src/lib.rs")), Some(Language::Rust));
+        assert_eq!(Language::from_path(Path::new("main.go")), Some(Language::Go));
+        assert_eq!(Language::from_path(Path::new("a/b/App.tsx")), Some(Language::TypeScript));
+        assert_eq!(Language::from_path(Path::new("x.JS")), Some(Language::JavaScript));
+        assert_eq!(Language::from_path(Path::new("m.py")), Some(Language::Python));
+        assert_eq!(Language::from_path(Path::new("README.md")), None);
+        assert_eq!(Language::from_path(Path::new("Makefile")), None);
     }
 
     #[test]

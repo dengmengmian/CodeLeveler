@@ -179,9 +179,12 @@ pub fn full_registry() -> ToolRegistry {
     use crate::tools;
     let mut registry = core_registry();
     registry.register(Arc::new(tools::RepositorySearchTool));
+    registry.register(Arc::new(tools::GlobTool));
     registry.register(Arc::new(tools::FindSymbolTool));
     registry.register(Arc::new(tools::ReadSymbolTool));
     registry.register(Arc::new(tools::FindReferencesTool));
+    registry.register(Arc::new(tools::DiagnosticsTool));
+    registry.register(Arc::new(tools::BlastRadiusTool));
     registry.register(Arc::new(tools::WebSearchTool));
     registry.register(Arc::new(tools::WebFetchTool));
     registry.register(Arc::new(tools::ViewImageTool));
@@ -224,11 +227,14 @@ pub fn expand_tool_category(registry: &mut ToolRegistry, category: &str) {
     match category {
         "search" => {
             registry.register(Arc::new(tools::RepositorySearchTool));
+            registry.register(Arc::new(tools::GlobTool));
         }
         "lsp" => {
             registry.register(Arc::new(tools::FindSymbolTool));
             registry.register(Arc::new(tools::ReadSymbolTool));
             registry.register(Arc::new(tools::FindReferencesTool));
+            registry.register(Arc::new(tools::DiagnosticsTool));
+            registry.register(Arc::new(tools::BlastRadiusTool));
         }
         "git" => {
             registry.register(Arc::new(tools::GitStatusTool));
@@ -266,9 +272,12 @@ mod tests {
         assert!(names.contains(&"run_command".to_string()));
         assert!(names.contains(&"shell_command".to_string()));
         assert!(names.contains(&"repository_search".to_string()));
+        assert!(names.contains(&"glob".to_string()));
         assert!(names.contains(&"find_symbol".to_string()));
         assert!(names.contains(&"read_symbol".to_string()));
         assert!(names.contains(&"find_references".to_string()));
+        assert!(names.contains(&"diagnostics".to_string()));
+        assert!(names.contains(&"blast_radius".to_string()));
         assert!(names.contains(&"restore_checkpoint".to_string()));
         assert!(names.contains(&"update_plan".to_string()));
         assert!(names.contains(&"web_search".to_string()));
@@ -280,7 +289,7 @@ mod tests {
         assert!(names.contains(&"memory".to_string()));
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"forget".to_string()));
-        assert_eq!(names.len(), 29);
+        assert_eq!(names.len(), 32);
     }
 
     #[test]

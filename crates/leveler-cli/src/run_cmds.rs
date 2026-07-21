@@ -1,6 +1,7 @@
 //! Run-style subcommands: run, orchestrated run, parallel run, plan, discuss,
 //! tui, and resume, plus their shared finish/ship helpers.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
@@ -12,7 +13,8 @@ use leveler_agent::StopReason;
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::InteractiveRuntimeClient;
 use leveler_local_transport::{
-    CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer, TransportError,
+    CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer,
+    TransportError,
 };
 use leveler_project::Layout;
 
@@ -659,6 +661,27 @@ pub(crate) async fn cmd_tui(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// A running daemon transport: a per-repo Unix socket, or a loopback TCP
+/// listener whose generated bearer token is printed once for external clients.
+enum BoundServer {
+    Unix(LocalSocketServer),
+    Tcp { server: TcpRuntimeServer, token: String },
+}
+
+/// A 256-bit bearer token from the OS CSPRNG, hex-encoded. Never derived from
+/// time/pid — it is the daemon's only network auth secret, so it must be
+/// unpredictable.
+fn generate_daemon_token() -> String {
+    use std::fmt::Write;
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
+    let mut token = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(token, "{b:02x}");
+    }
+    token
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_serve(
     layout: Layout,
@@ -667,6 +690,7 @@ pub(crate) async fn cmd_serve(
     auto_approve: bool,
     sandbox: bool,
     socket: Option<PathBuf>,
+    tcp: Option<SocketAddr>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let socket_path = socket.unwrap_or_else(|| layout.socket_path());
     let app = Arc::new(Application::assemble(layout)?);
@@ -680,17 +704,34 @@ pub(crate) async fn cmd_serve(
         auto_approve,
     ));
     let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
-    let server = LocalSocketServer::bind(&socket_path, service).await?;
 
-    // The socket is now exclusively ours. Only after proving there is no live
-    // daemon may startup classify old `running` rows as crash leftovers.
+    // Bind first — a successful bind (Unix socket file or TCP port) proves no
+    // live daemon owns this repo, so afterwards startup may classify old
+    // `running` rows as crash leftovers.
+    let bound = match tcp {
+        Some(addr) => {
+            let token = generate_daemon_token();
+            let server = TcpRuntimeServer::bind(addr, token.clone(), service).await?;
+            BoundServer::Tcp { server, token }
+        }
+        None => BoundServer::Unix(LocalSocketServer::bind(&socket_path, service).await?),
+    };
+
     let db = app.open_database().await?;
     let reaped = leveler_engine::reap_running_turns(&db, None).await?.len();
     if reaped > 0 {
         tracing::warn!(reaped, "reaped zombie turns before daemon startup");
     }
     println!("{}", Line::heading("Local runtime ready"));
-    println!("  socket: {}", server.path().display());
+    match &bound {
+        BoundServer::Unix(server) => println!("  socket: {}", server.path().display()),
+        BoundServer::Tcp { server, token } => {
+            println!("  tcp: {}", server.local_addr()?);
+            // Printed once to the operator's own terminal: this is how a WebUI /
+            // external client authenticates. Not logged elsewhere.
+            println!("  token: {token}");
+        }
+    }
     println!("  model: {model_ref}");
     println!("  press Ctrl+C to stop the daemon");
 
@@ -701,7 +742,10 @@ pub(crate) async fn cmd_serve(
             signal_shutdown.cancel();
         }
     });
-    let result = server.serve(shutdown).await;
+    let result = match bound {
+        BoundServer::Unix(server) => server.serve(shutdown).await,
+        BoundServer::Tcp { server, .. } => server.serve(shutdown).await,
+    };
     // Stopping the daemon is an explicit runtime shutdown, unlike closing a
     // TUI client. Cancel and reap any remaining turns before process exit.
     let _ = runtime
@@ -974,6 +1018,15 @@ fn finish(
 #[cfg(test)]
 mod tui_runtime_selection_tests {
     use super::*;
+
+    #[test]
+    fn daemon_token_is_256_bits_of_hex_and_not_constant() {
+        let a = generate_daemon_token();
+        let b = generate_daemon_token();
+        assert_eq!(a.len(), 64, "256-bit token → 64 hex chars: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b, "a CSPRNG token must not repeat");
+    }
 
     #[test]
     fn default_launch_probes_an_existing_daemon_without_requiring_it() {

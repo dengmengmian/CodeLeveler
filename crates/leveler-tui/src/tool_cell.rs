@@ -962,6 +962,7 @@ mod tests {
             status: ToolStatus::Failed,
             preview: Some(preview.to_string()),
             duration_ms: None,
+            parallel: false,
         }
     }
 
@@ -1007,6 +1008,7 @@ mod tests {
                     .to_string(),
             ),
             duration_ms: None,
+            parallel: false,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1048,6 +1050,7 @@ mod tests {
                     .to_string(),
             ),
             duration_ms: None,
+            parallel: false,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1130,6 +1133,7 @@ mod tests {
             status: ToolStatus::Failed,
             preview: Some("tool error: unknown tool `task`".into()),
             duration_ms: None,
+            parallel: false,
         };
         let mut out = Vec::new();
         tool_lines(

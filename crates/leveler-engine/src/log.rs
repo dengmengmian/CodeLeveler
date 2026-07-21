@@ -111,6 +111,7 @@ impl<'a> EventLog<'a> {
                     call_id,
                     name,
                     arguments,
+                    parallel: _,
                     risk,
                 } => open.push(DanglingCall {
                     turn_id: row.turn_id.clone(),
@@ -228,6 +229,7 @@ mod tests {
                     call_id: call_id.into(),
                     name: "read_file".into(),
                     arguments: "{\"path\":\"README.md\"}".into(),
+                    parallel: false,
                     risk: Some(leveler_execution::RiskLevel::Safe),
                 },
                 &mut |_| {},

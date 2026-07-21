@@ -44,6 +44,20 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// A document symbol with position info: enough to map a reference line to its
+/// enclosing symbol, and to locate that symbol's name for a next-hop query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSpan {
+    pub name: String,
+    pub kind: i64,
+    /// 0-based line/character of the symbol's NAME (the `references` anchor).
+    pub name_line: u64,
+    pub name_character: u64,
+    /// 0-based inclusive line range the symbol's body spans.
+    pub start_line: u64,
+    pub end_line: u64,
+}
+
 /// A symbol with its definition location (from `workspace/symbol`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolLocation {
@@ -187,6 +201,18 @@ impl LspClient {
             )
             .await?;
         Ok(parse_symbols(&result))
+    }
+
+    /// List document symbols with their line ranges and name positions, so a
+    /// caller can map a reference line to its enclosing symbol and re-query.
+    pub async fn document_symbol_spans(&self, path: &Path) -> Result<Vec<SymbolSpan>, LspError> {
+        let result = self
+            .request(
+                "textDocument/documentSymbol",
+                json!({ "textDocument": { "uri": path_to_uri(path) } }),
+            )
+            .await?;
+        Ok(parse_symbol_spans(&result))
     }
 
     /// Query workspace symbols by name (`workspace/symbol`), returning each
@@ -392,6 +418,67 @@ fn collect_symbol(item: &Value, container: Option<&str>, out: &mut Vec<SymbolInf
     }
 }
 
+/// Parse a documentSymbol result (`DocumentSymbol[]` or `SymbolInformation[]`)
+/// into positioned spans, flattening nested symbols.
+fn parse_symbol_spans(result: &Value) -> Vec<SymbolSpan> {
+    let mut out = Vec::new();
+    if let Some(arr) = result.as_array() {
+        for item in arr {
+            collect_symbol_span(item, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_symbol_span(item: &Value, out: &mut Vec<SymbolSpan>) {
+    let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+        return;
+    };
+    let kind = item.get("kind").and_then(|k| k.as_i64()).unwrap_or(0);
+    // DocumentSymbol carries `range` (body) + `selectionRange` (name);
+    // SymbolInformation carries `location.range` for both.
+    let body = item
+        .get("range")
+        .or_else(|| item.get("location").and_then(|l| l.get("range")));
+    let name_range = item.get("selectionRange").or(body);
+    let (start_line, end_line) = line_span(body);
+    let (name_line, name_character) = position(name_range);
+    out.push(SymbolSpan {
+        name: name.to_string(),
+        kind,
+        name_line,
+        name_character,
+        start_line,
+        end_line,
+    });
+    if let Some(children) = item.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            collect_symbol_span(child, out);
+        }
+    }
+}
+
+fn line_span(range: Option<&Value>) -> (u64, u64) {
+    let line_at = |key: &str| {
+        range
+            .and_then(|r| r.get(key))
+            .and_then(|p| p.get("line"))
+            .and_then(|l| l.as_u64())
+    };
+    let start = line_at("start").unwrap_or(0);
+    (start, line_at("end").unwrap_or(start))
+}
+
+fn position(range: Option<&Value>) -> (u64, u64) {
+    let start = range.and_then(|r| r.get("start"));
+    let line = start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0);
+    let ch = start
+        .and_then(|s| s.get("character"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    (line, ch)
+}
+
 /// Parse a `workspace/symbol` result (`SymbolInformation[]` or
 /// `WorkspaceSymbol[]`) into located symbols.
 fn parse_workspace_symbols(result: &Value) -> Vec<SymbolLocation> {
@@ -481,6 +568,42 @@ mod tests {
         assert_eq!(locs[0].name, "cancel_order");
         assert_eq!(locs[0].path, "/repo/src/order.rs");
         assert_eq!(locs[0].line, 41);
+    }
+
+    #[test]
+    fn parses_symbol_spans_with_ranges_and_name_positions() {
+        let result = json!([
+            {"name": "Service", "kind": 5,
+             "range": {"start": {"line": 10, "character": 0}, "end": {"line": 40, "character": 1}},
+             "selectionRange": {"start": {"line": 10, "character": 7}, "end": {"line": 10, "character": 14}},
+             "children": [
+                {"name": "cancel", "kind": 6,
+                 "range": {"start": {"line": 20, "character": 4}, "end": {"line": 25, "character": 5}},
+                 "selectionRange": {"start": {"line": 20, "character": 8}, "end": {"line": 20, "character": 14}}}
+             ]}
+        ]);
+        let spans = parse_symbol_spans(&result);
+        assert_eq!(spans.len(), 2);
+        let service = spans.iter().find(|s| s.name == "Service").unwrap();
+        assert_eq!((service.start_line, service.end_line), (10, 40));
+        assert_eq!((service.name_line, service.name_character), (10, 7));
+        let cancel = spans.iter().find(|s| s.name == "cancel").unwrap();
+        assert_eq!((cancel.start_line, cancel.end_line), (20, 25));
+        assert_eq!(cancel.name_line, 20);
+    }
+
+    #[test]
+    fn symbol_span_falls_back_to_location_range_for_symbolinformation() {
+        let result = json!([
+            {"name": "bar", "kind": 12,
+             "location": {"uri": "file:///x.rs",
+                          "range": {"start": {"line": 5, "character": 3},
+                                    "end": {"line": 8, "character": 0}}}}
+        ]);
+        let spans = parse_symbol_spans(&result);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start_line, spans[0].end_line), (5, 8));
+        assert_eq!((spans[0].name_line, spans[0].name_character), (5, 3));
     }
 
     #[test]

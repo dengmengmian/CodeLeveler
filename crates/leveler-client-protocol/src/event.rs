@@ -77,6 +77,10 @@ pub enum RuntimeEvent {
         name: String,
         /// Compacted JSON arguments.
         arguments: String,
+        /// True when this call ran in the concurrent read-only batch; a UI can
+        /// group such calls as one parallel burst.
+        #[serde(default)]
+        parallel: bool,
     },
     /// A tool call finished. `preview` is the runtime's truncated output;
     /// `duration_ms` is measured client-side.
@@ -449,6 +453,7 @@ mod tests {
                 id: ToolCallId::new("tc1"),
                 name: "read".to_string(),
                 arguments: "{}".to_string(),
+                parallel: false,
             },
             "tool_call_started",
         );

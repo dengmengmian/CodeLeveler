@@ -101,6 +101,9 @@ pub enum AgentEvent {
         id: String,
         name: String,
         arguments: String,
+        /// True when this call was dispatched into the concurrent read-only
+        /// batch (a UI can render such calls as one parallel group).
+        parallel: bool,
     },
     /// A tool finished. `id` matches its [`AgentEvent::ToolCall`]; denial/guard
     /// results carry an id with no prior `ToolCall`.

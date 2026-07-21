@@ -171,6 +171,7 @@ fn update_live_view(
             id,
             name,
             arguments,
+            ..
         } => {
             view.active_tools.retain(|tool| tool.id != *id);
             view.active_tools.push(UiActiveToolCall {
@@ -2344,6 +2345,7 @@ mod live_view_tests {
                 id: id.clone(),
                 name: "run_command".to_string(),
                 arguments: r#"{"cmd":"cargo test"}"#.to_string(),
+                parallel: false,
             },
         );
         assert_eq!(

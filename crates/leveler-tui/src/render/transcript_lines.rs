@@ -646,6 +646,7 @@ mod tests {
                 status: ToolStatus::Ok,
                 preview: Some("Goal resolved.".into()),
                 duration_ms: Some(1),
+                parallel: false,
             }],
             open: false,
             expanded: false,

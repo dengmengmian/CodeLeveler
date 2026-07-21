@@ -49,6 +49,8 @@ pub struct ToolCallBlock {
     pub preview: Option<String>,
     /// Wall-clock duration measured by the runtime client.
     pub duration_ms: Option<u64>,
+    /// True when this call ran in the concurrent read-only batch.
+    pub parallel: bool,
 }
 
 /// A consecutive burst of tool calls between two assistant messages.
@@ -433,7 +435,13 @@ impl TranscriptState {
     }
 
     /// Record a started tool call as a running block.
-    pub fn push_tool_started(&mut self, id: ToolCallId, name: String, arguments: String) {
+    pub fn push_tool_started(
+        &mut self,
+        id: ToolCallId,
+        name: String,
+        arguments: String,
+        parallel: bool,
+    ) {
         self.bump();
         let call = ToolCallBlock {
             id,
@@ -442,6 +450,7 @@ impl TranscriptState {
             status: ToolStatus::Running,
             preview: None,
             duration_ms: None,
+            parallel,
         };
         match self.items.last_mut() {
             Some(TranscriptItem::ToolGroup(group)) if group.open => group.calls.push(call),
@@ -669,7 +678,7 @@ mod tests {
         let v1 = t.version();
         assert!(v1 > v, "push_user must bump");
 
-        t.push_tool_started(ToolCallId::new("t1"), "read_file".into(), "{}".into());
+        t.push_tool_started(ToolCallId::new("t1"), "read_file".into(), "{}".into(), false);
         let v2 = t.version();
         assert!(v2 > v1, "push_tool_started must bump");
 
@@ -691,6 +700,7 @@ mod tests {
                 status: ToolStatus::Ok,
                 preview: Some("ok".into()),
                 duration_ms: Some(1),
+                parallel: false,
             }],
             open: false,
             expanded,

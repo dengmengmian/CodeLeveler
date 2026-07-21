@@ -198,6 +198,7 @@ mod tests {
             status: ToolStatus::Ok,
             preview: Some(preview.into()),
             duration_ms: Some(1200),
+            parallel: false,
         }
     }
 

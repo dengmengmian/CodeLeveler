@@ -220,8 +220,10 @@ impl TurnContext {
             Some(named) => format!(
                 "- language: the user writes {named}. Write EVERY user-visible sentence in \
                  {named} — interim progress notes, plans, status narration, reasoning/thinking \
-                 text streamed to the UI, and the final summary. Code, commands, identifiers \
-                 and quoted source stay as they are"
+                 text streamed to the UI, and the final summary. Do not slip into English \
+                 process templates such as \"Now...\", \"First...\", \"Good...\", or \"Let \
+                 me...\"; if a draft sentence comes out in the wrong language, rewrite it \
+                 before sending. Code, commands, identifiers and quoted source stay as they are"
             ),
             None => "- language: use the same natural language as the latest user message for \
                      responses and all reasoning/thinking text streamed to the UI"
@@ -346,18 +348,34 @@ mod tests {
         assert!(prompt.contains("found the root cause"), "{prompt}");
     }
 
+    /// The full language contract — the ban on English process templates and the
+    /// rewrite-before-send rule — now lives in the turn context's NAMED language
+    /// line, not the base prompt. That is the load-bearing copy: it survives a
+    /// model-profile override (which replaces the base) and is not paid for on
+    /// turns whose language we cannot name. The base prompt no longer duplicates
+    /// it.
     #[test]
-    fn base_prompt_requires_user_language_for_visible_messages() {
-        let prompt = PromptBuilder::new().build();
+    fn named_language_context_forbids_english_process_templates() {
+        let prompt = PromptBuilder::new()
+            .turn_context(TurnContext {
+                model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
+                mode: leveler_execution::PermissionProfile::Assisted,
+                network_allowed: false,
+                deny_network: true,
+                cwd: std::path::PathBuf::from("/repo"),
+                project_rules: Vec::new(),
+                user_language: user_language("把这个仓库改造成生产级工具库"),
+            })
+            .build();
 
-        assert!(prompt.contains("every user-visible assistant message"));
-        assert!(prompt.contains("reasoning/thinking text"));
-        assert!(prompt.contains("latest user message"));
+        assert!(prompt.contains("Write EVERY user-visible sentence"));
         assert!(prompt.contains("interim progress notes"));
-        assert!(prompt.contains("final summaries"));
-        assert!(prompt.contains("If the user writes Chinese"));
+        assert!(prompt.contains("reasoning/thinking"));
         assert!(prompt.contains("\"Now...\", \"First...\", \"Good...\", or \"Let me...\""));
-        assert!(prompt.contains("wrong natural language"));
+        assert!(prompt.contains("wrong language"));
+
+        // The base prompt itself no longer carries the language contract.
+        assert!(!PromptBuilder::new().build().contains("Language matching"));
     }
 
     #[test]
@@ -816,9 +834,11 @@ mod tests {
             prompt.contains("request_user_input"),
             "base prompt must advertise the primary clarification tool"
         );
+        // The git-mutate elevation rule depends on the permission mode, so it
+        // lives in the turn context (see operating_rules), not the base prompt.
         assert!(
-            prompt.contains("filesystem=unrestricted") && prompt.contains(".git"),
-            "base prompt must require FS elevation before git mutate under .git"
+            !prompt.contains("filesystem=unrestricted"),
+            "git elevation is a turn-context rule, not a base-prompt one"
         );
         assert!(
             prompt.contains("SKILL TURN INJECTION")

@@ -144,6 +144,7 @@ impl EventBridge {
                 id,
                 name,
                 arguments,
+                parallel,
             } => {
                 // A tool call ends the current assistant thought. Close any open
                 // streamed message so the next round's text opens a fresh block
@@ -158,6 +159,7 @@ impl EventBridge {
                     id: ToolCallId::new(id),
                     name,
                     arguments,
+                    parallel,
                 });
             }
             AgentEvent::ToolResult {
@@ -176,6 +178,7 @@ impl EventBridge {
                             id: ToolCallId::new(id.clone()),
                             name,
                             arguments: String::new(),
+                            parallel: false,
                         });
                         Instant::now()
                     }
@@ -576,11 +579,13 @@ mod bridge_tests {
             id: "g".into(),
             name: "grep".into(),
             arguments: String::new(),
+            parallel: false,
         });
         bridge.forward(AgentEvent::ToolCall {
             id: "p".into(),
             name: "apply_patch".into(),
             arguments: String::new(),
+            parallel: false,
         });
         bridge.forward(AgentEvent::ToolResult {
             id: "p".into(),
@@ -663,6 +668,7 @@ mod bridge_tests {
             id: "c1".into(),
             name: "read_file".into(),
             arguments: String::new(),
+            parallel: false,
         });
         bridge.forward(AgentEvent::AssistantDelta("round two text".into()));
         let events = drain(&mut rx);

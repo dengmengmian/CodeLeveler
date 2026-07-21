@@ -166,6 +166,7 @@ fn visual_inspect() {
             id: ToolCallId::new("t1"),
             name: "grep".into(),
             arguments: "{\"pattern\":\"resolveUsage\"}".into(),
+            parallel: false,
         }),
     );
     reduce(

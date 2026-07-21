@@ -92,6 +92,39 @@ compatibility:
         assert_eq!(cfg.policy, None);
     }
 
+    /// A user can configure a native Claude model end-to-end just by naming the
+    /// `anthropic_messages` protocol — the adapter is wired for it (registry
+    /// `adapter_for`), so this parse must round-trip to the right ProtocolKind.
+    #[test]
+    fn parses_anthropic_messages_protocol() {
+        let yaml = r#"
+id: claude
+provider: anthropic
+model_id: claude-sonnet-5
+protocol: anthropic_messages
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: true
+  structured_output: true
+  reasoning: true
+  vision: true
+limits:
+  context_window: 200000
+  reliable_context: 180000
+  max_output_tokens: 8192
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 4
+compatibility:
+  middleware: []
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+"#;
+        let cfg: ModelConfigFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.profile.provider, "anthropic");
+        assert_eq!(cfg.profile.protocol, ProtocolKind::AnthropicMessages);
+    }
+
     /// Model tiers are retired: a leftover `policy:` binding must fail loudly
     /// with a pointer to the migration doc, never be silently ignored.
     #[test]

@@ -116,6 +116,15 @@ impl WireError {
     }
 }
 
+/// The first frame a TCP client must send: it presents the shared bearer token
+/// before any request is read. Unix-socket clients skip this — the socket file's
+/// `0600` permission is the trust boundary there; a TCP listener has none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(unix)]
+struct Handshake {
+    token: String,
+}
+
 #[cfg(unix)]
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -126,9 +135,12 @@ mod unix {
     use std::time::Duration;
 
     use serde::de::DeserializeOwned;
+    use std::net::SocketAddr;
+
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    use tokio::net::{UnixListener, UnixStream};
+    use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
     use tokio::sync::broadcast;
+    use tokio_util::either::Either;
 
     use super::*;
 
@@ -164,23 +176,25 @@ mod unix {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    async fn send_response(
-        stream: &mut UnixStream,
+    async fn send_response<S: AsyncWrite + Unpin>(
+        stream: &mut S,
         response: WireResponse,
     ) -> Result<(), TransportError> {
         write_frame(stream, &ProtocolEnvelope::wrap(response)).await
     }
 
-    async fn send_result(
-        stream: &mut UnixStream,
+    async fn send_result<S: AsyncWrite + Unpin>(
+        stream: &mut S,
         result: Result<WireResponse, ClientError>,
     ) -> Result<(), TransportError> {
         let response = result.unwrap_or_else(|error| WireResponse::Error(error.into()));
         send_response(stream, response).await
     }
 
-    async fn handle_connection(
-        mut stream: UnixStream,
+    /// Serve one connection. Generic over the stream so the same request
+    /// handling backs both the Unix-socket server and the loopback TCP daemon.
+    async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
         runtime: Arc<dyn LocalRuntimeService>,
         shutdown: CancellationToken,
     ) -> Result<(), TransportError> {
@@ -365,7 +379,7 @@ mod unix {
 
     /// Socket-backed implementation consumed by the TUI.
     pub struct LocalSocketRuntimeClient {
-        path: PathBuf,
+        endpoint: Endpoint,
         events: broadcast::Sender<RuntimeEvent>,
         session_events:
             Arc<Mutex<std::collections::HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>>,
@@ -374,20 +388,36 @@ mod unix {
 
     impl LocalSocketRuntimeClient {
         pub async fn connect(path: impl AsRef<Path>) -> Result<Self, TransportError> {
-            let path = path.as_ref().to_path_buf();
-            let stream = open_subscription(&path, None).await?;
+            Self::open(Endpoint::Unix(path.as_ref().to_path_buf())).await
+        }
+
+        /// Connect to a loopback TCP daemon, authenticating with the bearer token
+        /// on this and every subsequent (per-request, per-subscription) connection.
+        pub async fn connect_tcp(
+            addr: SocketAddr,
+            token: impl Into<String>,
+        ) -> Result<Self, TransportError> {
+            Self::open(Endpoint::Tcp {
+                addr,
+                token: Arc::from(token.into()),
+            })
+            .await
+        }
+
+        async fn open(endpoint: Endpoint) -> Result<Self, TransportError> {
+            let stream = open_subscription(&endpoint, None).await?;
             let (events, _) = broadcast::channel(2048);
             let session_events = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let shutdown = CancellationToken::new();
             tokio::spawn(subscription_loop(
-                path.clone(),
+                endpoint.clone(),
                 stream,
                 events.clone(),
                 None,
                 shutdown.clone(),
             ));
             Ok(Self {
-                path,
+                endpoint,
                 events,
                 session_events,
                 shutdown,
@@ -395,7 +425,7 @@ mod unix {
         }
 
         async fn request(&self, request: WireRequest) -> Result<WireResponse, TransportError> {
-            request_path(&self.path, request).await
+            request_endpoint(&self.endpoint, request).await
         }
 
         async fn ensure_session_subscription(
@@ -405,14 +435,14 @@ mod unix {
             if let Some(events) = self.session_events.lock().unwrap().get(session_id).cloned() {
                 return Ok(events);
             }
-            let stream = open_subscription(&self.path, Some(session_id.clone())).await?;
+            let stream = open_subscription(&self.endpoint, Some(session_id.clone())).await?;
             let (events, _) = broadcast::channel(2048);
             self.session_events
                 .lock()
                 .unwrap()
                 .insert(session_id.clone(), events.clone());
             tokio::spawn(subscription_loop(
-                self.path.clone(),
+                self.endpoint.clone(),
                 stream,
                 events.clone(),
                 Some(session_id.clone()),
@@ -497,14 +527,14 @@ mod unix {
                 .lock()
                 .unwrap()
                 .insert(session_id.clone(), events.clone());
-            let path = self.path.clone();
+            let endpoint = self.endpoint.clone();
             let session_id = session_id.clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
                 loop {
-                    match open_subscription(&path, Some(session_id.clone())).await {
+                    match open_subscription(&endpoint, Some(session_id.clone())).await {
                         Ok(stream) => {
-                            subscription_loop(path, stream, events, Some(session_id), shutdown)
+                            subscription_loop(endpoint, stream, events, Some(session_id), shutdown)
                                 .await;
                             return;
                         }
@@ -538,11 +568,47 @@ mod unix {
         }
     }
 
-    async fn request_path(
-        path: &Path,
+    /// How a client reaches the runtime. A Unix client trusts the socket file's
+    /// `0600` perms; a TCP client presents a bearer token on every connection.
+    #[derive(Clone)]
+    enum Endpoint {
+        Unix(PathBuf),
+        Tcp { addr: SocketAddr, token: Arc<str> },
+    }
+
+    /// One connection over either transport. `Either` yields a single concrete
+    /// type that impls AsyncRead + AsyncWrite for both stream kinds.
+    type ClientStream = Either<UnixStream, TcpStream>;
+
+    /// Open (and, for TCP, authenticate) one connection to the endpoint.
+    async fn connect_endpoint(endpoint: &Endpoint) -> Result<ClientStream, TransportError> {
+        match endpoint {
+            Endpoint::Unix(path) => Ok(Either::Left(UnixStream::connect(path).await?)),
+            Endpoint::Tcp { addr, token } => {
+                let mut stream = TcpStream::connect(addr).await?;
+                write_frame(
+                    &mut stream,
+                    &ProtocolEnvelope::wrap(Handshake {
+                        token: token.to_string(),
+                    }),
+                )
+                .await?;
+                match read_frame::<WireResponse>(&mut stream).await?.into_body()? {
+                    WireResponse::Ack => Ok(Either::Right(stream)),
+                    WireResponse::Error(error) => Err(TransportError::Unavailable(error.message)),
+                    other => Err(TransportError::Unavailable(format!(
+                        "unexpected handshake response: {other:?}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    async fn request_endpoint(
+        endpoint: &Endpoint,
         request: WireRequest,
     ) -> Result<WireResponse, TransportError> {
-        let mut stream = UnixStream::connect(path).await?;
+        let mut stream = connect_endpoint(endpoint).await?;
         write_frame(&mut stream, &ProtocolEnvelope::wrap(request)).await?;
         read_frame::<WireResponse>(&mut stream)
             .await?
@@ -551,10 +617,10 @@ mod unix {
     }
 
     async fn open_subscription(
-        path: &Path,
+        endpoint: &Endpoint,
         session_id: Option<SessionId>,
-    ) -> Result<UnixStream, TransportError> {
-        let mut stream = UnixStream::connect(path).await?;
+    ) -> Result<ClientStream, TransportError> {
+        let mut stream = connect_endpoint(endpoint).await?;
         write_frame(
             &mut stream,
             &ProtocolEnvelope::wrap(WireRequest::Subscribe { session_id }),
@@ -570,8 +636,8 @@ mod unix {
     }
 
     async fn subscription_loop(
-        path: PathBuf,
-        mut stream: UnixStream,
+        endpoint: Endpoint,
+        mut stream: ClientStream,
         events: broadcast::Sender<RuntimeEvent>,
         session_id: Option<SessionId>,
         shutdown: CancellationToken,
@@ -598,12 +664,12 @@ mod unix {
             }
 
             while !shutdown.is_cancelled() {
-                match open_subscription(&path, session_id.clone()).await {
+                match open_subscription(&endpoint, session_id.clone()).await {
                     Ok(new_stream) => {
                         stream = new_stream;
                         if let Some(session_id) = session_id.clone()
                             && let Ok(WireResponse::Snapshot(snapshot)) =
-                                request_path(&path, WireRequest::Snapshot { session_id }).await
+                                request_endpoint(&endpoint, WireRequest::Snapshot { session_id }).await
                         {
                             let _ = events.send(RuntimeEvent::SessionOpened { session: snapshot });
                         }
@@ -625,10 +691,157 @@ mod unix {
     fn transport_client_error(error: TransportError) -> ClientError {
         ClientError::Runtime(error.to_string())
     }
+
+    // ---- Loopback TCP daemon with bearer-token auth ----------------------
+
+    /// Constant-time equality for the bearer token. Length is compared first —
+    /// a token's *length* is not the secret (we mint fixed-length tokens); its
+    /// *value* is, and equal-length values are compared with no early exit so a
+    /// timing side channel cannot recover the token byte by byte.
+    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
+
+    /// Gate one TCP connection on the bearer token, then hand it to the shared
+    /// connection handler. The client MUST send a `Handshake` frame first; a
+    /// wrong or absent token gets a generic "authentication failed" (no token
+    /// echo, no distinct code) and the connection is dropped without service.
+    async fn serve_authenticated_tcp<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        token: &str,
+        runtime: Arc<dyn LocalRuntimeService>,
+        shutdown: CancellationToken,
+    ) -> Result<(), TransportError> {
+        let presented = read_frame::<Handshake>(&mut stream).await?.into_body()?;
+        if !constant_time_eq(presented.token.as_bytes(), token.as_bytes()) {
+            send_response(
+                &mut stream,
+                WireResponse::Error(WireError {
+                    message: "authentication failed".to_string(),
+                    session_id: None,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        send_response(&mut stream, WireResponse::Ack).await?;
+        handle_connection(stream, runtime, shutdown).await
+    }
+
+    /// A loopback TCP runtime server. Every connection presents a shared bearer
+    /// token before any request is served; only loopback peers are accepted.
+    pub struct TcpRuntimeServer {
+        listener: TcpListener,
+        runtime: Arc<dyn LocalRuntimeService>,
+        token: Arc<str>,
+    }
+
+    impl TcpRuntimeServer {
+        pub async fn bind(
+            addr: SocketAddr,
+            token: impl Into<String>,
+            runtime: Arc<dyn LocalRuntimeService>,
+        ) -> Result<Self, TransportError> {
+            let token = token.into();
+            if token.is_empty() {
+                return Err(TransportError::Unavailable(
+                    "refusing to start a TCP daemon with an empty token".to_string(),
+                ));
+            }
+            let listener = TcpListener::bind(addr).await?;
+            Ok(Self {
+                listener,
+                runtime,
+                token: Arc::from(token),
+            })
+        }
+
+        /// The actually-bound address (resolves an ephemeral `:0` port).
+        pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
+            Ok(self.listener.local_addr()?)
+        }
+
+        pub async fn serve(self, shutdown: CancellationToken) -> Result<(), TransportError> {
+            let child_shutdown = shutdown.child_token();
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    accepted = self.listener.accept() => {
+                        let (stream, _peer) = accepted?;
+                        // Loopback only: never serve a non-loopback peer even if
+                        // the OS routed one here (defence in depth vs a misbind).
+                        if !stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false) {
+                            continue;
+                        }
+                        let runtime = self.runtime.clone();
+                        let token = self.token.clone();
+                        let connection_shutdown = child_shutdown.clone();
+                        tasks.spawn(async move {
+                            if let Err(error) =
+                                serve_authenticated_tcp(stream, &token, runtime, connection_shutdown)
+                                    .await
+                            {
+                                tracing::debug!(%error, "tcp daemon connection ended");
+                            }
+                        });
+                    }
+                }
+            }
+            child_shutdown.cancel();
+            while tasks.join_next().await.is_some() {}
+            Ok(())
+        }
+    }
+
+    /// One authenticated request over TCP (the TCP analogue of `request_path`):
+    /// connect, present the token, then send the request and read one response.
+    /// Crate-internal: it speaks the private wire protocol, so a public
+    /// `TcpRuntimeClient` will wrap it rather than exposing `WireRequest`.
+    /// Test-only for now — it is the connect-and-authenticate primitive that a
+    /// production `TcpRuntimeClient` will reuse; un-gate it when that lands.
+    #[cfg(test)]
+    pub(crate) async fn tcp_request(
+        addr: SocketAddr,
+        token: &str,
+        request: WireRequest,
+    ) -> Result<WireResponse, TransportError> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        write_frame(
+            &mut stream,
+            &ProtocolEnvelope::wrap(Handshake {
+                token: token.to_string(),
+            }),
+        )
+        .await?;
+        match read_frame::<WireResponse>(&mut stream).await?.into_body()? {
+            WireResponse::Ack => {}
+            WireResponse::Error(error) => return Err(TransportError::Unavailable(error.message)),
+            other => {
+                return Err(TransportError::Unavailable(format!(
+                    "unexpected handshake response: {other:?}"
+                )));
+            }
+        }
+        write_frame(&mut stream, &ProtocolEnvelope::wrap(request)).await?;
+        read_frame::<WireResponse>(&mut stream)
+            .await?
+            .into_body()
+            .map_err(Into::into)
+    }
 }
 
 #[cfg(unix)]
-pub use unix::{LocalSocketRuntimeClient, LocalSocketServer};
+pub use unix::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
+#[cfg(all(unix, test))]
+pub(crate) use unix::tcp_request;
 
 #[cfg(not(unix))]
 mod unsupported {
@@ -707,6 +920,7 @@ pub use unsupported::{LocalSocketRuntimeClient, LocalSocketServer};
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::net::SocketAddr;
     use std::sync::Mutex;
 
     use leveler_client_protocol::{ClientCommand, RuntimeEvent, SessionId, UiSessionSnapshot};
@@ -790,6 +1004,90 @@ mod tests {
                 context_window: 128_000,
             })
         }
+    }
+
+    async fn tcp_server(token: &str) -> (SocketAddr, Arc<TestRuntime>, CancellationToken) {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let runtime = Arc::new(TestRuntime::new());
+        let server = TcpRuntimeServer::bind(addr, token, runtime.clone())
+            .await
+            .unwrap();
+        let bound = server.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        (bound, runtime, shutdown)
+    }
+
+    #[tokio::test]
+    async fn tcp_daemon_serves_a_request_after_a_correct_token() {
+        let (addr, _runtime, shutdown) = tcp_server("s3cret-token").await;
+        let response = tcp_request(
+            addr,
+            "s3cret-token",
+            WireRequest::CreateSession(CreateSessionRequest {
+                goal: "tcp session".to_string(),
+                model: None,
+                mode: PermissionProfile::Assisted,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, WireResponse::SessionCreated(_)));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn tcp_daemon_rejects_a_wrong_token_and_serves_nothing() {
+        let (addr, runtime, shutdown) = tcp_server("s3cret-token").await;
+        let result = tcp_request(
+            addr,
+            "wrong-token",
+            WireRequest::Send(ClientCommand::OpenSession {
+                session_id: SessionId::new("s1"),
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "wrong token must be rejected: {result:?}");
+        // The rejected connection must never have reached the runtime.
+        assert!(runtime.commands.lock().unwrap().is_empty());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn tcp_daemon_refuses_to_start_without_a_token() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let runtime = Arc::new(TestRuntime::new());
+        let result = TcpRuntimeServer::bind(addr, "", runtime).await;
+        assert!(result.is_err(), "an empty token must be refused at bind");
+    }
+
+    #[tokio::test]
+    async fn tcp_client_round_trips_through_the_authenticated_daemon() {
+        // End-to-end over the production client: connect_tcp authenticates, and
+        // every follow-up request/subscription re-authenticates transparently.
+        let (addr, runtime, shutdown) = tcp_server("e2e-token").await;
+        let client = LocalSocketRuntimeClient::connect_tcp(addr, "e2e-token")
+            .await
+            .unwrap();
+        let bootstrap = client
+            .create_session(CreateSessionRequest {
+                goal: "tcp e2e".to_string(),
+                model: None,
+                mode: PermissionProfile::Assisted,
+            })
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.context_window, 128_000);
+        client
+            .send(ClientCommand::SubmitMessage {
+                session_id: bootstrap.session.id.clone(),
+                content: "hello over tcp".to_string(),
+                attachments: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime.commands.lock().unwrap().len(), 1);
+        shutdown.cancel();
     }
 
     #[cfg(unix)]

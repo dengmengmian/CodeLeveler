@@ -54,6 +54,7 @@ impl SignalCollector {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 self.signals.tool_calls += 1;
                 if !self.signals.touched_relevant_files
@@ -151,6 +152,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             arguments: args.to_string(),
+            parallel: false,
         }
     }
 

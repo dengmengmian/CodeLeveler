@@ -7,8 +7,10 @@
 //! byte-fragmentation-tolerant [`sse::SseDecoder`].
 #![forbid(unsafe_code)]
 
+pub mod anthropic_messages;
 pub mod openai_chat;
 pub mod sse;
 
+pub use anthropic_messages::AnthropicMessagesAdapter;
 pub use openai_chat::OpenAiChatAdapter;
 pub use sse::{SseDecoder, SseEvent};

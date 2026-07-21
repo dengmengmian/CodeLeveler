@@ -93,6 +93,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             id,
             name,
             arguments,
+            parallel,
         } => {
             mark_turn_busy(state);
             state.turn_tool_calls = state.turn_tool_calls.saturating_add(1);
@@ -109,7 +110,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             } else {
                 format!("{verb} {target}")
             });
-            state.transcript.push_tool_started(id, name, arguments);
+            state
+                .transcript
+                .push_tool_started(id, name, arguments, parallel);
         }
         RuntimeEvent::ToolCallCompleted {
             id,
@@ -697,9 +700,11 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     }
     state.turn_tool_calls = session.active_tools.len();
     for tool in session.active_tools {
+        // Restored mid-flight calls are shown as normal (not grouped as parallel);
+        // the snapshot does not carry the batch flag.
         state
             .transcript
-            .push_tool_started(tool.id, tool.name, tool.arguments);
+            .push_tool_started(tool.id, tool.name, tool.arguments, false);
     }
 
     // Welcome card removed: Header owns project context; Input owns model/mode.

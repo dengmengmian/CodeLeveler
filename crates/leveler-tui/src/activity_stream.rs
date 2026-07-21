@@ -25,6 +25,19 @@ pub(crate) fn render_group(
     t: &UiText,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    // A concurrent read-only batch shows as one "parallel" header so the user
+    // sees these calls ran together rather than one after another.
+    let parallel_n = group.calls.iter().filter(|c| c.parallel).count();
+    if parallel_n >= 2 {
+        let label = match locale {
+            Locale::Zh => format!("⇉ {parallel_n} 个工具并发执行"),
+            Locale::En => format!("⇉ {parallel_n} tools in parallel"),
+        };
+        out.push(Line::from(Span::styled(
+            truncate_display(&label, width),
+            Style::default().fg(theme.muted),
+        )));
+    }
     let units = plan_units(&group.calls);
     for unit in units {
         match unit {
@@ -398,6 +411,7 @@ mod tests {
             status,
             preview: Some("ok".into()),
             duration_ms: Some(5),
+            parallel: false,
         }
     }
 
@@ -407,6 +421,40 @@ mod tests {
             open: false,
             expanded: false,
         }
+    }
+
+    fn parallel_call(name: &str, args: &str) -> ToolCallBlock {
+        let mut c = call(name, args, ToolStatus::Ok);
+        c.parallel = true;
+        c
+    }
+
+    #[test]
+    fn parallel_batch_gets_a_concurrency_header() {
+        let g = group(vec![
+            parallel_call("read_file", r#"{"path":"a.rs"}"#),
+            parallel_call("grep", r#"{"pattern":"x"}"#),
+            parallel_call("read_file", r#"{"path":"b.rs"}"#),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines.iter().any(|l| l.contains("并发")),
+            "a ≥2-call parallel batch must show a concurrency header: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_parallel_call_gets_no_concurrency_header() {
+        // One parallel-safe call is not a batch; no header (needs ≥2).
+        let g = group(vec![
+            parallel_call("read_file", r#"{"path":"a.rs"}"#),
+            call("apply_patch", "{}", ToolStatus::Ok),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            !lines.iter().any(|l| l.contains("并发")),
+            "one parallel call is not a batch: {lines:?}"
+        );
     }
 
     #[test]

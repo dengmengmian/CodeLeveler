@@ -340,6 +340,7 @@ fn tui_session_commands_ui_and_logic() {
             id: ToolCallId::new("t-ansi"),
             name: "run_command".into(),
             arguments: r#"{"program":"vitest"}"#.into(),
+            parallel: false,
         }),
     );
     reduce(

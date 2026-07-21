@@ -348,6 +348,7 @@ fn render_event_jsonl(event: AgentEvent) {
             id,
             name,
             arguments,
+            ..
         } => {
             serde_json::json!({ "type": "tool_call", "id": id, "tool": name, "arguments": arguments })
         }

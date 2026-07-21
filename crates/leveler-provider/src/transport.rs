@@ -33,7 +33,16 @@ fn build_request(
     per_request_timeout: Option<Duration>,
 ) -> reqwest::RequestBuilder {
     let mut builder = client.post(url).json(body);
-    if let Some(key) = &context.api_key {
+    // When the protocol supplies its own API-key header (Anthropic's `x-api-key`),
+    // do NOT also attach `Authorization: Bearer` — sending both is redundant and
+    // some gateways reject the pair. The explicit header wins.
+    let has_explicit_api_key = context
+        .extra_headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("x-api-key"));
+    if let Some(key) = &context.api_key
+        && !has_explicit_api_key
+    {
         builder = builder.bearer_auth(key);
     }
     for (k, v) in &context.extra_headers {
@@ -182,5 +191,60 @@ mod tests {
         let s = "áéíóú".repeat(200);
         let t = truncate(&s, 10);
         assert!(t.len() <= 13); // 10 bytes + ellipsis
+    }
+
+    fn ctx(api_key: Option<&str>, extra: Vec<(String, String)>) -> ProtocolContext {
+        ProtocolContext {
+            base_url: "https://x".into(),
+            model_id: "m".into(),
+            api_key: api_key.map(String::from),
+            extra_headers: extra,
+            reasoning: leveler_model::ReasoningConfig::default(),
+            parallel_tool_calls: true,
+            supports_temperature: true,
+        }
+    }
+
+    #[test]
+    fn bearer_auth_used_when_no_explicit_api_key_header() {
+        let client = reqwest::Client::new();
+        let req = build_request(
+            &client,
+            "https://x/y",
+            &serde_json::json!({}),
+            &ctx(Some("k"), vec![]),
+            None,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer k");
+        assert!(req.headers().get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn explicit_x_api_key_suppresses_bearer_auth() {
+        let client = reqwest::Client::new();
+        let extra = vec![
+            ("x-api-key".to_string(), "k".to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ];
+        let req = build_request(
+            &client,
+            "https://x/y",
+            &serde_json::json!({}),
+            &ctx(Some("k"), extra),
+            None,
+        )
+        .build()
+        .unwrap();
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "bearer must be suppressed when x-api-key is explicit"
+        );
+        assert_eq!(req.headers().get("x-api-key").unwrap(), "k");
+        assert_eq!(
+            req.headers().get("anthropic-version").unwrap(),
+            "2023-06-01"
+        );
     }
 }

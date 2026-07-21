@@ -396,6 +396,7 @@ pub(crate) fn deny_call(
         id: call.id.as_str().to_string(),
         name: call.name.clone(),
         arguments: compact_json(&call.arguments),
+        parallel: false,
     });
     observer(AgentEvent::ToolResult {
         id: call.id.as_str().to_string(),

@@ -126,11 +126,13 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             call_id,
             name,
             arguments,
+            parallel,
             ..
         } => AgentEvent::ToolCall {
             id: call_id,
             name,
             arguments,
+            parallel,
         },
         EngineEvent::ToolCallFinished {
             call_id,

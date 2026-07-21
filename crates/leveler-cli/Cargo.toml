@@ -45,6 +45,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 tempfile = "3"
+# OS CSPRNG for the `serve --tcp` daemon bearer token (256-bit, unpredictable).
+getrandom = "0.2"
 
 [dev-dependencies]
 leveler-tools = { workspace = true }

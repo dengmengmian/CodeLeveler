@@ -1,12 +1,15 @@
 //! Built-in tools (spec §18.3).
 
 mod apply_patch;
+mod blast_radius;
 mod checkpoint;
+mod diagnostics;
 mod expand_tools;
 mod find_references;
 mod find_symbol;
 mod format;
 mod git;
+mod glob;
 mod grep;
 mod list_files;
 mod locate_hint;
@@ -28,11 +31,14 @@ mod web_fetch;
 mod web_search;
 
 pub use apply_patch::ApplyPatchTool;
+pub use blast_radius::BlastRadiusTool;
 pub use checkpoint::{CreateCheckpointTool, RestoreCheckpointTool};
+pub use diagnostics::DiagnosticsTool;
 pub use expand_tools::ExpandToolsTool;
 pub use find_references::FindReferencesTool;
 pub use find_symbol::FindSymbolTool;
 pub use git::{GitDiffTool, GitStatusTool};
+pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list_files::ListFilesTool;
 pub use memory::{ConsolidateMemoryTool, ForgetTool, MemoryTool, RememberTool};

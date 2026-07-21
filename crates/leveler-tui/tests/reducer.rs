@@ -431,6 +431,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             id: ToolCallId::new("a1"),
             name: "read_file".into(),
             arguments: r#"{"path":"old.rs"}"#.into(),
+            parallel: false,
         }),
     );
     reduce(
@@ -467,6 +468,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             id: ToolCallId::new("b1"),
             name: "run_command".into(),
             arguments: r#"{"program":"ls"}"#.into(),
+            parallel: false,
         }),
     );
     reduce(
@@ -525,6 +527,7 @@ fn ctrl_o_prefers_live_reasoning_over_tool_groups() {
             id: ToolCallId::new("t1"),
             name: "read_file".into(),
             arguments: r#"{"path":"a.rs"}"#.into(),
+            parallel: false,
         }),
     );
     reduce(
@@ -1568,6 +1571,7 @@ fn tool_started(s: &mut AppState, id: &str, name: &str, args: &str) {
             id: ToolCallId::new(id),
             name: name.into(),
             arguments: args.into(),
+            parallel: false,
         }),
     );
 }
@@ -3205,6 +3209,7 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
                 "next_step": "提交当前改动"
             })
             .to_string(),
+            parallel: false,
         }),
     );
     reduce(
@@ -3241,6 +3246,7 @@ fn goal_completion_without_structured_next_step_has_no_suggestion() {
                 "summary": "实现和测试都已完成。"
             })
             .to_string(),
+            parallel: false,
         }),
     );
     reduce(
@@ -3401,6 +3407,7 @@ fn activity_clears_when_the_tool_completes() {
             id: ToolCallId::new("t1"),
             name: "read_file".into(),
             arguments: r#"{"path":"src/lib.rs"}"#.into(),
+            parallel: false,
         }),
     );
     assert!(s.activity.is_some());
@@ -3499,6 +3506,7 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
             id: ToolCallId::new("t1"),
             name: "read_file".into(),
             arguments: "{}".into(),
+            parallel: false,
         }),
     );
     reduce(
