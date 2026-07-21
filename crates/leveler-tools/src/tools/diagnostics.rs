@@ -99,7 +99,9 @@ impl Tool for DiagnosticsTool {
             }
         }
         let Some(client) = sessions.get(&key) else {
-            return Ok(ToolOutput::ok("(language server unavailable)\n".to_string()));
+            return Ok(ToolOutput::ok(
+                "(language server unavailable)\n".to_string(),
+            ));
         };
         let _ = client.open(&abs, &spec.language_id).await;
         let diags = client.wait_for_diagnostics(&abs, WAIT).await;

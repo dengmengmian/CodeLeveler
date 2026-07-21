@@ -171,7 +171,9 @@ impl ModelRuntime for ProviderRegistry {
             .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()))?;
         // Apply protocol-supplied headers (e.g. Anthropic's `x-api-key` /
         // `anthropic-version`); the transport only reads `context.extra_headers`.
-        context.extra_headers.extend(encoded.headers.iter().cloned());
+        context
+            .extra_headers
+            .extend(encoded.headers.iter().cloned());
         let url = Self::endpoint(&context.base_url, &encoded.path);
 
         let response = send_with_retry(
@@ -213,7 +215,9 @@ impl ModelRuntime for ProviderRegistry {
             .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()))?;
         // Apply protocol-supplied headers (see `stream`); the transport only
         // reads `context.extra_headers`.
-        context.extra_headers.extend(encoded.headers.iter().cloned());
+        context
+            .extra_headers
+            .extend(encoded.headers.iter().cloned());
         let url = Self::endpoint(&context.base_url, &encoded.path);
 
         let response = send_with_retry(
@@ -271,6 +275,37 @@ fn validate_limits(model: &str, limits: &leveler_model::ModelLimits) -> Result<(
     Ok(())
 }
 
+/// Whether `base_url`'s host is loopback (127.0.0.0/8, ::1, or "localhost").
+///
+/// A loopback endpoint must never be routed through an ambient HTTP proxy:
+/// bypassing loopback is standard client behavior (curl and browsers do it) and
+/// it keeps the local `MockServer` that the integration tests spin up
+/// deterministic regardless of the shell's `http_proxy`/`all_proxy`. Remote
+/// endpoints are unaffected and keep honoring the environment's proxy.
+///
+/// Unparseable URLs return `false` — leave proxy behavior unchanged rather than
+/// guess.
+fn base_url_is_loopback(base_url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `host_str()` wraps an IPv6 literal in brackets (`[::1]`); strip them
+    // before parsing so `IpAddr::is_loopback` (127.0.0.0/8 and ::1) can decide.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 fn build_client(config: &ProviderConfig) -> Result<reqwest::Client, RegistryError> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
@@ -283,15 +318,45 @@ fn build_client(config: &ProviderConfig) -> Result<reqwest::Client, RegistryErro
         headers.insert(name, value);
     }
 
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(config.timeouts.connect_seconds))
         .read_timeout(Duration::from_secs(config.timeouts.idle_stream_seconds))
-        .default_headers(headers)
-        .build()
-        .map_err(|source| RegistryError::Client {
-            provider: config.id.clone(),
-            source,
-        })
+        .default_headers(headers);
+    // Never proxy a loopback provider endpoint (see `base_url_is_loopback`).
+    if base_url_is_loopback(&config.base_url) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|source| RegistryError::Client {
+        provider: config.id.clone(),
+        source,
+    })
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::base_url_is_loopback;
+
+    #[test]
+    fn loopback_hosts_bypass_proxy() {
+        assert!(base_url_is_loopback("http://127.0.0.1:8080/v1"));
+        assert!(base_url_is_loopback("http://127.0.0.53:9")); // whole 127/8
+        assert!(base_url_is_loopback("http://localhost:1234"));
+        assert!(base_url_is_loopback("http://LocalHost")); // case-insensitive
+        assert!(base_url_is_loopback("http://[::1]:1234/v1"));
+    }
+
+    #[test]
+    fn remote_hosts_keep_proxy() {
+        assert!(!base_url_is_loopback("https://api.deepseek.com"));
+        assert!(!base_url_is_loopback("https://192.168.1.10:8080")); // LAN, not loopback
+        assert!(!base_url_is_loopback("https://10.0.0.1"));
+    }
+
+    #[test]
+    fn unparseable_leaves_proxy_unchanged() {
+        assert!(!base_url_is_loopback(""));
+        assert!(!base_url_is_loopback("not a url"));
+    }
 }
 
 #[cfg(test)]

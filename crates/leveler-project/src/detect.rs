@@ -124,11 +124,26 @@ mod tests {
 
     #[test]
     fn from_path_maps_extensions_to_languages() {
-        assert_eq!(Language::from_path(Path::new("src/lib.rs")), Some(Language::Rust));
-        assert_eq!(Language::from_path(Path::new("main.go")), Some(Language::Go));
-        assert_eq!(Language::from_path(Path::new("a/b/App.tsx")), Some(Language::TypeScript));
-        assert_eq!(Language::from_path(Path::new("x.JS")), Some(Language::JavaScript));
-        assert_eq!(Language::from_path(Path::new("m.py")), Some(Language::Python));
+        assert_eq!(
+            Language::from_path(Path::new("src/lib.rs")),
+            Some(Language::Rust)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("main.go")),
+            Some(Language::Go)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("a/b/App.tsx")),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("x.JS")),
+            Some(Language::JavaScript)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("m.py")),
+            Some(Language::Python)
+        );
         assert_eq!(Language::from_path(Path::new("README.md")), None);
         assert_eq!(Language::from_path(Path::new("Makefile")), None);
     }

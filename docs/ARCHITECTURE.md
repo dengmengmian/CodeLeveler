@@ -29,7 +29,8 @@ top-level context; reusable library crates expose typed `thiserror` errors.
 User
   │
   ├── leveler-cli ───────────────┐
-  └── leveler-tui                │
+  ├── leveler-tui                │
+  └── leveler-web (browser UI)   │
           │                      │
           ▼                      ▼
   leveler-client-protocol   leveler-app  ◀── composition and configuration
@@ -171,6 +172,16 @@ paths apply redaction before writes.
 The TUI renders client-protocol events and sends commands or interaction
 responses. It does not own agent execution. In daemon mode, closing the TUI does
 not cancel accepted work; shutting down the runtime does.
+
+`leveler-web` is the browser UI over the same seam: an axum server bridging a
+single-page app to a `LocalRuntimeService` (in-process, or a `leveler serve
+--tcp` daemon via `leveler web --connect`) through token-authenticated REST plus
+one WebSocket. It is **loopback-only** by construction — `bind` refuses
+non-loopback addresses — and every endpoint requires a 256-bit bearer token
+compared in constant time; the frontend build is embedded at compile time. Off
+-machine access (e.g. a phone) is expected to go through a tunnel that terminates
+TLS and forwards to loopback, not by binding a public address. See
+`crates/leveler-web/README.md`.
 
 ## Extension points
 

@@ -64,65 +64,64 @@ impl AnthropicStreamAssembler {
                 }
                 Err(e) => vec![decode_error(e)],
             },
-            "content_block_start" => {
-                match serde_json::from_str::<StreamContentBlockStart>(data) {
-                    Ok(s) => match s.content_block {
-                        RespBlock::ToolUse { id, name, .. } => {
-                            self.blocks.insert(
-                                s.index,
-                                BlockState {
-                                    tool: Some((id.clone(), name.clone())),
-                                    json: String::new(),
-                                },
-                            );
-                            vec![ModelEvent::ToolCallStarted {
-                                index: s.index,
-                                id: (!id.is_empty()).then(|| ToolCallId::new(id)),
-                                name: (!name.is_empty()).then_some(name),
+            "content_block_start" => match serde_json::from_str::<StreamContentBlockStart>(data) {
+                Ok(s) => match s.content_block {
+                    RespBlock::ToolUse { id, name, .. } => {
+                        self.blocks.insert(
+                            s.index,
+                            BlockState {
+                                tool: Some((id.clone(), name.clone())),
+                                json: String::new(),
+                            },
+                        );
+                        vec![ModelEvent::ToolCallStarted {
+                            index: s.index,
+                            id: (!id.is_empty()).then(|| ToolCallId::new(id)),
+                            name: (!name.is_empty()).then_some(name),
+                        }]
+                    }
+                    _ => {
+                        self.blocks.insert(s.index, BlockState::default());
+                        Vec::new()
+                    }
+                },
+                Err(e) => vec![decode_error(e)],
+            },
+            "content_block_delta" => match serde_json::from_str::<StreamContentBlockDelta>(data) {
+                Ok(d) => match d.delta {
+                    BlockDelta::TextDelta { text } if !text.is_empty() => {
+                        vec![ModelEvent::TextDelta { delta: text }]
+                    }
+                    BlockDelta::ThinkingDelta { thinking } if !thinking.is_empty() => {
+                        vec![ModelEvent::ReasoningDelta { delta: thinking }]
+                    }
+                    BlockDelta::InputJsonDelta { partial_json } => {
+                        if let Some(b) = self.blocks.get_mut(&d.index) {
+                            b.json.push_str(&partial_json);
+                        }
+                        if partial_json.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![ModelEvent::ToolCallArgumentsDelta {
+                                index: d.index,
+                                delta: partial_json,
                             }]
                         }
-                        _ => {
-                            self.blocks.insert(s.index, BlockState::default());
-                            Vec::new()
-                        }
-                    },
-                    Err(e) => vec![decode_error(e)],
-                }
-            }
-            "content_block_delta" => {
-                match serde_json::from_str::<StreamContentBlockDelta>(data) {
-                    Ok(d) => match d.delta {
-                        BlockDelta::TextDelta { text } if !text.is_empty() => {
-                            vec![ModelEvent::TextDelta { delta: text }]
-                        }
-                        BlockDelta::ThinkingDelta { thinking } if !thinking.is_empty() => {
-                            vec![ModelEvent::ReasoningDelta { delta: thinking }]
-                        }
-                        BlockDelta::InputJsonDelta { partial_json } => {
-                            if let Some(b) = self.blocks.get_mut(&d.index) {
-                                b.json.push_str(&partial_json);
-                            }
-                            if partial_json.is_empty() {
-                                Vec::new()
-                            } else {
-                                vec![ModelEvent::ToolCallArgumentsDelta {
-                                    index: d.index,
-                                    delta: partial_json,
-                                }]
-                            }
-                        }
-                        _ => Vec::new(),
-                    },
-                    Err(e) => vec![decode_error(e)],
-                }
-            }
+                    }
+                    _ => Vec::new(),
+                },
+                Err(e) => vec![decode_error(e)],
+            },
             "content_block_stop" => Vec::new(),
             "message_delta" => match serde_json::from_str::<StreamMessageDelta>(data) {
                 Ok(m) => {
                     if let Some(u) = m.usage {
                         self.output_tokens = u.output_tokens;
                     }
-                    let reason = m.delta.stop_reason.unwrap_or_else(|| "end_turn".to_string());
+                    let reason = m
+                        .delta
+                        .stop_reason
+                        .unwrap_or_else(|| "end_turn".to_string());
                     self.finalize(&reason)
                 }
                 Err(e) => vec![decode_error(e)],
@@ -229,13 +228,21 @@ mod tests {
             "content_block_delta",
             r#"{"index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
         );
-        assert_eq!(evs, vec![ModelEvent::TextDelta { delta: "Hel".into() }]);
+        assert_eq!(
+            evs,
+            vec![ModelEvent::TextDelta {
+                delta: "Hel".into()
+            }]
+        );
     }
 
     #[test]
     fn tool_use_input_reassembled_across_deltas() {
         let mut a = AnthropicStreamAssembler::new();
-        a.on_event("message_start", r#"{"message":{"usage":{"input_tokens":10}}}"#);
+        a.on_event(
+            "message_start",
+            r#"{"message":{"usage":{"input_tokens":10}}}"#,
+        );
         a.on_event(
             "content_block_start",
             r#"{"index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"grep","input":{}}}"#,
@@ -263,12 +270,12 @@ mod tests {
         assert_eq!(call.name, "grep");
         assert_eq!(call.id.as_str(), "tu_1");
         assert_eq!(call.arguments["pattern"], "x");
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, ModelEvent::MessageCompleted {
-                    finish_reason: FinishReason::ToolCalls
-                }))
-        );
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ModelEvent::MessageCompleted {
+                finish_reason: FinishReason::ToolCalls
+            }
+        )));
     }
 
     #[test]

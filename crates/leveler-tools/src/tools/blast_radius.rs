@@ -314,13 +314,29 @@ mod tests {
     #[test]
     fn report_groups_by_hop_and_file() {
         let by_depth = vec![
-            (1, vec![r("src/a.rs", "foo"), r("src/a.rs", "bar"), r("src/b.rs", "baz")]),
+            (
+                1,
+                vec![
+                    r("src/a.rs", "foo"),
+                    r("src/a.rs", "bar"),
+                    r("src/b.rs", "baz"),
+                ],
+            ),
             (2, vec![r("src/c.rs", "qux")]),
         ];
         let out = format_report("target", &by_depth);
-        assert!(out.contains("DIRECT (hop 1): 3 symbol(s) in 2 file(s)"), "{out}");
+        assert!(
+            out.contains("DIRECT (hop 1): 3 symbol(s) in 2 file(s)"),
+            "{out}"
+        );
         assert!(out.contains("src/a.rs: bar, foo"), "{out}");
-        assert!(out.contains("INDIRECT (hop 2): 1 symbol(s) in 1 file(s)"), "{out}");
-        assert!(out.contains("TOTAL: 4 impacted symbol(s) across 3 file(s)"), "{out}");
+        assert!(
+            out.contains("INDIRECT (hop 2): 1 symbol(s) in 1 file(s)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("TOTAL: 4 impacted symbol(s) across 3 file(s)"),
+            "{out}"
+        );
     }
 }

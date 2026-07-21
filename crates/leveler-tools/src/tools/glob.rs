@@ -152,14 +152,21 @@ async fn list_files(context: &ToolContext, cancellation: &CancellationToken) -> 
         context.workspace.root().to_path_buf(),
     );
     request.timeout = Duration::from_secs(30);
-    if let Ok(output) = context.runner.run(request, cancellation.child_token()).await
+    if let Ok(output) = context
+        .runner
+        .run(request, cancellation.child_token())
+        .await
         && output.success()
         && !output.stdout.trim().is_empty()
     {
         return output.stdout.lines().map(str::to_string).collect();
     }
     let mut files = Vec::new();
-    walk(context.workspace.root(), context.workspace.root(), &mut files);
+    walk(
+        context.workspace.root(),
+        context.workspace.root(),
+        &mut files,
+    );
     files
 }
 

@@ -88,7 +88,10 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
 
         // Anthropic auth is a header pair, not a bearer token; the transport
         // suppresses `Authorization` when it sees an explicit `x-api-key`.
-        let mut headers = vec![("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string())];
+        let mut headers = vec![(
+            "anthropic-version".to_string(),
+            ANTHROPIC_VERSION.to_string(),
+        )];
         if let Some(key) = &context.api_key {
             headers.push(("x-api-key".to_string(), key.clone()));
         }
@@ -404,10 +407,7 @@ mod tests {
             .unwrap();
         assert_eq!(enc.body["messages"][0]["role"], "user");
         assert_eq!(enc.body["messages"][0]["content"][0]["type"], "tool_result");
-        assert_eq!(
-            enc.body["messages"][0]["content"][0]["tool_use_id"],
-            "tu_1"
-        );
+        assert_eq!(enc.body["messages"][0]["content"][0]["tool_use_id"], "tu_1");
         assert_eq!(enc.body["messages"][0]["content"][0]["content"], "42");
     }
 

@@ -471,7 +471,10 @@ fn line_span(range: Option<&Value>) -> (u64, u64) {
 
 fn position(range: Option<&Value>) -> (u64, u64) {
     let start = range.and_then(|r| r.get("start"));
-    let line = start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0);
+    let line = start
+        .and_then(|s| s.get("line"))
+        .and_then(|l| l.as_u64())
+        .unwrap_or(0);
     let ch = start
         .and_then(|s| s.get("character"))
         .and_then(|c| c.as_u64())
