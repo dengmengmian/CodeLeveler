@@ -128,7 +128,7 @@ fn gate_config(unix_body: &str, windows_body: &str) -> String {
 
 #[tokio::test]
 async fn direct_run_fails_when_post_edit_verification_fails() {
-    let patch = "*** Begin Patch\n*** Update File: README.md\n old\n+new\n*** End Patch";
+    let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+new\n*** End Patch";
     let server = MockServer::start(vec![
         sse(vec![
             tool_call_frame("apply_patch", serde_json::json!({ "patch": patch })),
@@ -146,7 +146,8 @@ async fn direct_run_fails_when_post_edit_verification_fails() {
     .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("README.md"), "old\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "old\n").unwrap();
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
@@ -202,7 +203,7 @@ async fn direct_run_fails_when_post_edit_verification_fails() {
 
 #[tokio::test]
 async fn direct_content_run_fails_when_post_edit_verification_fails() {
-    let patch = "*** Begin Patch\n*** Update File: README.md\n old\n+new\n*** End Patch";
+    let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+new\n*** End Patch";
     let server = MockServer::start(vec![
         sse(vec![
             tool_call_frame("apply_patch", serde_json::json!({ "patch": patch })),
@@ -213,7 +214,8 @@ async fn direct_content_run_fails_when_post_edit_verification_fails() {
     .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("README.md"), "old\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "old\n").unwrap();
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
@@ -384,7 +386,7 @@ async fn direct_run_without_gating_verification_is_completed_unverified() {
 
 #[tokio::test]
 async fn direct_content_run_emits_verification_events() {
-    let patch = "*** Begin Patch\n*** Update File: README.md\n old\n+new\n*** End Patch";
+    let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+new\n*** End Patch";
     let server = MockServer::start(vec![
         sse(vec![
             tool_call_frame("apply_patch", serde_json::json!({ "patch": patch })),
@@ -395,7 +397,8 @@ async fn direct_content_run_emits_verification_events() {
     .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("README.md"), "old\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "old\n").unwrap();
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
@@ -462,9 +465,9 @@ async fn direct_content_run_emits_verification_events() {
 
 #[tokio::test]
 async fn direct_run_repairs_once_after_failed_verification() {
-    let first_patch = "*** Begin Patch\n*** Update File: README.md\n old\n+bad\n*** End Patch";
+    let first_patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+bad\n*** End Patch";
     let repair_patch =
-        "*** Begin Patch\n*** Update File: README.md\n old\n-bad\n+fixed\n*** End Patch";
+        "*** Begin Patch\n*** Update File: src/lib.rs\n old\n-bad\n+fixed\n*** End Patch";
     let server = MockServer::start(vec![
         sse(vec![
             tool_call_frame("apply_patch", serde_json::json!({ "patch": first_patch })),
@@ -486,11 +489,12 @@ async fn direct_run_repairs_once_after_failed_verification() {
     .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("README.md"), "old\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "old\n").unwrap();
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        gate_config("grep fixed README.md", "findstr fixed README.md"),
+        gate_config("grep fixed src/lib.rs", "findstr fixed src\\lib.rs"),
     )
     .unwrap();
     write_config(tmp.path(), &server.base_url());
@@ -520,9 +524,9 @@ async fn direct_run_repairs_once_after_failed_verification() {
         .await
         .expect("repair should make verification pass");
 
-    assert_eq!(outcome.modified_files, vec!["README.md"]);
+    assert_eq!(outcome.modified_files, vec!["src/lib.rs"]);
     assert!(
-        std::fs::read_to_string(tmp.path().join("README.md"))
+        std::fs::read_to_string(tmp.path().join("src/lib.rs"))
             .unwrap()
             .contains("fixed")
     );
