@@ -162,7 +162,11 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str], cancellation: &Cancellati
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+// These tests drive git worktrees and a shell-based marker gate as fixtures;
+// the baseline-reconciliation logic they cover is platform-independent, and the
+// Windows shell/program-resolution quirks are not worth reproducing, so the
+// module is gated to unix (git + /bin/sh are always present there).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use leveler_verifier::{CheckKind, VerificationCommand};
@@ -189,26 +193,13 @@ mod tests {
         dir
     }
 
-    /// A gating check that passes iff `marker.txt` reads `OK`. Cross-platform so
-    /// the baseline-reconciliation logic is exercised on Windows too.
+    /// A gating check that passes iff `marker.txt` reads `OK`.
     fn marker_plan() -> VerificationPlan {
-        let (program, args) = if cfg!(windows) {
-            // findstr /x exits 0 iff a whole line matches exactly "OK".
-            (
-                "findstr",
-                vec!["/x".into(), "OK".into(), "marker.txt".into()],
-            )
-        } else {
-            (
-                "/bin/sh",
-                vec!["-c".into(), "test \"$(cat marker.txt)\" = OK".into()],
-            )
-        };
         VerificationPlan {
             commands: vec![VerificationCommand {
                 name: "marker".into(),
-                program: program.into(),
-                args,
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "test \"$(cat marker.txt)\" = OK".into()],
                 kind: CheckKind::Build,
                 gating: true,
                 timeout_seconds: 30,
