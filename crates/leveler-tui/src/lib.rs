@@ -41,6 +41,7 @@ mod workbench;
 
 mod run;
 
+pub use action::WebLauncher;
 pub use i18n::Locale;
 pub use run::{TuiError, run};
 pub use state::Boot;

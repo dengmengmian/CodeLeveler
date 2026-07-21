@@ -678,7 +678,12 @@ mod tests {
         let v1 = t.version();
         assert!(v1 > v, "push_user must bump");
 
-        t.push_tool_started(ToolCallId::new("t1"), "read_file".into(), "{}".into(), false);
+        t.push_tool_started(
+            ToolCallId::new("t1"),
+            "read_file".into(),
+            "{}".into(),
+            false,
+        );
         let v2 = t.version();
         assert!(v2 > v1, "push_tool_started must bump");
 

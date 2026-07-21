@@ -27,7 +27,7 @@ use leveler_client_protocol::{
     ProtocolEnvelope, RuntimeEvent, SessionId,
 };
 
-use crate::action::{Action, Effect, EffectCompletion};
+use crate::action::{Action, Effect, EffectCompletion, WebLauncher};
 use crate::inline::InlineTerminal;
 use crate::reducer::reduce;
 use crate::render::render;
@@ -79,7 +79,11 @@ pub enum TuiError {
 
 /// Run the interactive terminal UI against a runtime client until the user
 /// quits. Restores the terminal on any exit path.
-pub async fn run(client: Arc<dyn InteractiveRuntimeClient>, boot: Boot) -> Result<(), TuiError> {
+pub async fn run(
+    client: Arc<dyn InteractiveRuntimeClient>,
+    web_launcher: Option<WebLauncher>,
+    boot: Boot,
+) -> Result<(), TuiError> {
     let (mut guard, mut stdout) = TerminalGuard::enter()?;
     execute!(stdout, Clear(ClearType::Purge), cursor::MoveTo(0, 0))?;
 
@@ -315,7 +319,13 @@ pub async fn run(client: Arc<dyn InteractiveRuntimeClient>, boot: Boot) -> Resul
             }
         }
 
-        dispatch_effects(&mut state, effects, &completion_tx, &delivery_tx);
+        dispatch_effects(
+            &mut state,
+            effects,
+            &completion_tx,
+            &delivery_tx,
+            &web_launcher,
+        );
 
         // Busy spinner + elapsed clock, and draining queued input when idle.
         state.tick = state.tick.wrapping_add(1);
@@ -326,7 +336,13 @@ pub async fn run(client: Arc<dyn InteractiveRuntimeClient>, boot: Boot) -> Resul
             state.turn_started_at = None;
             state.elapsed_secs = 0;
             let queued = crate::reducer::drain_queued(&mut state);
-            dispatch_effects(&mut state, queued, &completion_tx, &delivery_tx);
+            dispatch_effects(
+                &mut state,
+                queued,
+                &completion_tx,
+                &delivery_tx,
+                &web_launcher,
+            );
         }
 
         // Wall clock in the header — repaint when the minute rolls over.
@@ -457,6 +473,7 @@ fn dispatch_effects(
     effects: Vec<Effect>,
     completion_tx: &mpsc::UnboundedSender<Action>,
     delivery_tx: &mpsc::UnboundedSender<DeliveryJob>,
+    web_launcher: &Option<WebLauncher>,
 ) {
     for effect in effects {
         match effect {
@@ -511,6 +528,23 @@ fn dispatch_effects(
                     let _ = tx.send(Action::FileCandidatesLoaded(files));
                 });
             }
+            Effect::StartWeb => match web_launcher {
+                Some(launcher) => {
+                    let launcher = Arc::clone(launcher);
+                    let tx = completion_tx.clone();
+                    tokio::spawn(async move {
+                        let result = launcher().await;
+                        let _ = tx.send(Action::WebLaunched(result));
+                    });
+                }
+                None => {
+                    let _ = completion_tx.send(Action::WebLaunched(Err(
+                        "当前 TUI 连接的是远程 daemon，不能就地起 Web UI；\
+                         请改用 `leveler web --connect`"
+                            .to_string(),
+                    )));
+                }
+            },
             Effect::Quit => state.running = false,
         }
     }

@@ -173,6 +173,28 @@ pub(super) fn request_file_candidates(state: &mut AppState) -> Vec<Effect> {
     }
 }
 
+/// Start (or re-surface) the embedded browser Web UI. The server is bound and
+/// served at the event-loop edge via the injected `WebLauncher`; here we only
+/// guard against launching twice and give immediate feedback.
+fn start_web(state: &mut AppState) -> Vec<Effect> {
+    if let Some(url) = &state.web_url {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: format!("Web UI 已在运行：{url}"),
+        });
+        return Vec::new();
+    }
+    if state.web_starting {
+        return Vec::new();
+    }
+    state.web_starting = true;
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: "正在启动 Web UI…".to_string(),
+    });
+    vec![Effect::StartWeb]
+}
+
 /// Whether `name` (without the leading `/`) is a command `handle_slash` accepts.
 fn is_known_slash(name: &str) -> bool {
     matches!(
@@ -209,6 +231,7 @@ fn is_known_slash(name: &str) -> bool {
             | "confirm_plan"
             | "memory"
             | "skill"
+            | "web"
             | "clear"
             | "new"
             | "quit"
@@ -241,6 +264,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "confirm-plan" | "confirm_plan" => confirm_plan_to_goal(state),
         "memory" => memory_slash(state, command),
         "skill" => skill_slash(state, command),
+        "web" => start_web(state),
         "verify" => toggle_screen(state, Screen::Verification),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
@@ -867,6 +891,50 @@ mod export_tests {
         assert!(
             matches!(&s.notification, Some(n) if n.message.contains("没有可导出的内容")),
             "empty transcript should report nothing to export"
+        );
+    }
+
+    #[test]
+    fn web_slash_launches_once_then_re_surfaces_the_url() {
+        let mut s = state_with_dialogue();
+
+        // First /web asks the edge to start the server and arms the guard.
+        assert_eq!(handle_slash(&mut s, "web"), vec![Effect::StartWeb]);
+        assert!(s.web_starting);
+        assert!(s.web_url.is_none());
+
+        // A second /web while it is still starting is a no-op (no double bind).
+        assert!(handle_slash(&mut s, "web").is_empty());
+
+        // The launch completes: URL is stored and the guard clears.
+        crate::reducer::reduce(
+            &mut s,
+            crate::action::Action::WebLaunched(Ok("http://127.0.0.1:9/?token=abc".to_string())),
+        );
+        assert!(!s.web_starting);
+        assert_eq!(s.web_url.as_deref(), Some("http://127.0.0.1:9/?token=abc"));
+
+        // Now /web only re-surfaces the running URL — no new StartWeb effect.
+        assert!(handle_slash(&mut s, "web").is_empty());
+        assert!(
+            matches!(&s.notification, Some(n) if n.message.contains("已在运行")),
+            "should report the already-running URL"
+        );
+    }
+
+    #[test]
+    fn web_launch_failure_clears_guard_and_warns() {
+        let mut s = state_with_dialogue();
+        s.web_starting = true;
+        crate::reducer::reduce(
+            &mut s,
+            crate::action::Action::WebLaunched(Err("boom".to_string())),
+        );
+        assert!(!s.web_starting);
+        assert!(s.web_url.is_none(), "a failed launch must not record a URL");
+        assert!(
+            matches!(&s.notification, Some(n) if n.message.contains("启动失败")),
+            "should warn on failure"
         );
     }
 }

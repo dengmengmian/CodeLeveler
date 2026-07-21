@@ -45,6 +45,25 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             apply_effect_completion(state, completion);
             Vec::new()
         }
+        Action::WebLaunched(result) => {
+            state.web_starting = false;
+            match result {
+                Ok(url) => {
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Info,
+                        message: format!("Web UI 已启动：{url}"),
+                    });
+                    state.web_url = Some(url);
+                }
+                Err(message) => {
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Warning,
+                        message: format!("Web UI 启动失败：{message}"),
+                    });
+                }
+            }
+            Vec::new()
+        }
         Action::Paste(text) => {
             state.disarm_ctrlc();
             // Only a truly empty payload is treated as a clipboard image

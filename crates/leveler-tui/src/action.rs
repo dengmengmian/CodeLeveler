@@ -58,6 +58,9 @@ pub enum Action {
     FileCandidatesLoaded(Vec<String>),
     /// An asynchronous edge effect completed.
     EffectCompleted(EffectCompletion),
+    /// The embedded Web UI server finished starting: `Ok(url)` with the
+    /// token-carrying URL, or `Err(message)` if it could not start.
+    WebLaunched(Result<String, String>),
 }
 
 /// A side effect for the event loop to carry out.
@@ -76,6 +79,21 @@ pub enum Effect {
     },
     /// Load repository files without blocking the pure reducer.
     LoadFileCandidates { repository: String },
+    /// Start the embedded browser Web UI server (`/web`). The event loop runs
+    /// the injected [`WebLauncher`] and folds its result back as
+    /// [`Action::WebLaunched`].
+    StartWeb,
     /// Tear down the UI and exit.
     Quit,
 }
+
+/// Injected at startup by the CLI: binds and serves the browser Web UI over the
+/// current in-process runtime, returning the token-carrying URL (or an error
+/// message). Kept as an opaque closure so `leveler-tui` need not depend on the
+/// web server or the local-transport service trait. `None` when the runtime
+/// cannot back a Web UI (e.g. a TUI attached to a remote daemon).
+pub type WebLauncher = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;

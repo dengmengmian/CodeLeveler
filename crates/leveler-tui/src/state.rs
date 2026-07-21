@@ -212,6 +212,12 @@ pub struct AppState {
     pub activity: Option<String>,
     pub notification: Option<Notification>,
 
+    /// The running embedded Web UI URL (with token), once `/web` has started it.
+    /// `Some` also guards against launching a second server.
+    pub web_url: Option<String>,
+    /// True while `/web`'s server is starting (guards against double-launch).
+    pub web_starting: bool,
+
     /// Models the user can switch to, and the current execution mode — used to
     /// build the model/mode pickers.
     pub available_models: Vec<ModelRef>,
@@ -368,6 +374,8 @@ impl AppState {
             turn_tool_calls: 0,
             activity: None,
             notification: None,
+            web_url: None,
+            web_starting: false,
             available_models: Vec::new(),
             mode: PermissionProfile::Assisted,
             screen_scroll: 0,
