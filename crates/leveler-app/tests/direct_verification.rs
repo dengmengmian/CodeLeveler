@@ -465,9 +465,9 @@ async fn direct_content_run_emits_verification_events() {
 
 #[tokio::test]
 async fn direct_run_repairs_once_after_failed_verification() {
-    let first_patch = "*** Begin Patch\n*** Update File: src/lib.rs\n old\n+bad\n*** End Patch";
+    let first_patch = "*** Begin Patch\n*** Update File: code.rs\n old\n+bad\n*** End Patch";
     let repair_patch =
-        "*** Begin Patch\n*** Update File: src/lib.rs\n old\n-bad\n+fixed\n*** End Patch";
+        "*** Begin Patch\n*** Update File: code.rs\n old\n-bad\n+fixed\n*** End Patch";
     let server = MockServer::start(vec![
         sse(vec![
             tool_call_frame("apply_patch", serde_json::json!({ "patch": first_patch })),
@@ -489,12 +489,13 @@ async fn direct_run_repairs_once_after_failed_verification() {
     .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-    std::fs::write(tmp.path().join("src/lib.rs"), "old\n").unwrap();
+    // A root-level `.rs` file is build-relevant (keeps the gate active) and its
+    // bare name avoids path-separator quirks in the cross-platform gate command.
+    std::fs::write(tmp.path().join("code.rs"), "old\n").unwrap();
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        gate_config("grep fixed src/lib.rs", "findstr fixed src\\lib.rs"),
+        gate_config("grep fixed code.rs", "findstr fixed code.rs"),
     )
     .unwrap();
     write_config(tmp.path(), &server.base_url());
@@ -524,9 +525,9 @@ async fn direct_run_repairs_once_after_failed_verification() {
         .await
         .expect("repair should make verification pass");
 
-    assert_eq!(outcome.modified_files, vec!["src/lib.rs"]);
+    assert_eq!(outcome.modified_files, vec!["code.rs"]);
     assert!(
-        std::fs::read_to_string(tmp.path().join("src/lib.rs"))
+        std::fs::read_to_string(tmp.path().join("code.rs"))
             .unwrap()
             .contains("fixed")
     );
