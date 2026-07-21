@@ -3,10 +3,11 @@
 // 搜索（内容搜索）/ Git（工作区改动）。数据走 REST，按当前会话定位仓库；
 // 底部 daemon 连接状态。
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
 import { BrandMark } from './BrandMark';
+import { ProjectPicker } from './ProjectPicker';
 import { useOpenFile } from './FileViewer';
 import { gitStatus, listFiles, searchFiles, type GitStatus, type SearchMatch } from '../lib/api';
 import { formatRelative, repoShortName, statusDot } from '../lib/format';
@@ -78,9 +79,7 @@ function SessionsPanel() {
   const state = useAppState();
   const bridge = useBridge();
   const [closed, setClosed] = useState<ReadonlySet<string>>(new Set());
-  const [adding, setAdding] = useState(false);
-  const [newPath, setNewPath] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [picking, setPicking] = useState(false);
 
   // 按 repository 分组；保持首见顺序，组内按 updated_at 倒序（新的在前）
   const groups = useMemo<ProjectGroup[]>(() => {
@@ -109,44 +108,15 @@ function SessionsPanel() {
   const projectStatus = (repo: string) =>
     state.projects.find((p) => p.path === repo)?.status ?? null;
 
-  const submitAdd = async () => {
-    const path = newPath.trim();
-    if (!path || busy) return;
-    setBusy(true);
-    const ok = await bridge.addProject(path);
-    setBusy(false);
-    if (ok) {
-      setNewPath('');
-      setAdding(false);
-    }
-  };
-
   return (
     <div className="sessions">
+      {picking && <ProjectPicker onClose={() => setPicking(false)} />}
       <div className="rail-head">
         <span>项目</span>
-        <button className="p-open" title="打开项目（注册一个仓库目录）" onClick={() => setAdding((v) => !v)}>
+        <button className="p-open" title="打开项目（浏览并选择一个仓库目录）" onClick={() => setPicking(true)}>
           ＋ 打开项目
         </button>
       </div>
-      {adding && (
-        <div className="add-proj">
-          <input
-            className="rp-input"
-            placeholder="仓库绝对路径，如 /Users/me/repo"
-            value={newPath}
-            autoFocus
-            onChange={(e) => setNewPath(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') void submitAdd();
-              if (e.key === 'Escape') setAdding(false);
-            }}
-          />
-          <button className="add-go" disabled={busy || !newPath.trim()} onClick={() => void submitAdd()}>
-            {busy ? '打开中…' : '打开'}
-          </button>
-        </div>
-      )}
       {groups.length === 0 && (
         <div className="rail-empty">
           还没有会话。
@@ -270,16 +240,106 @@ function FilesPanel() {
       {error && <div className="rail-empty">{error}</div>}
       {!error && files === null && <div className="rail-empty">加载中…</div>}
       {files !== null && shown.length === 0 && <div className="rail-empty">无匹配文件。</div>}
-      <div className="rp-list">
-        {shown.slice(0, 500).map((f) => (
-          <button className="rp-item" key={f} title={f} onClick={() => openFile(f)}>
-            {f}
-          </button>
-        ))}
-        {shown.length > 500 && <div className="rail-empty">… 共 {shown.length} 个，继续过滤以缩小范围</div>}
-      </div>
+      {files !== null && shown.length > 0 && (
+        <FileTree paths={shown} filtering={filter.trim().length > 0} onOpen={openFile} />
+      )}
     </div>
   );
+}
+
+// ── 文件树 ──────────────────────────────────────────────────────────
+// 平铺路径拼成目录树；目录可折叠。过滤时全部展开只显示命中路径的分支。
+
+interface TreeNode {
+  name: string;
+  path: string;
+  dir: boolean;
+  children: TreeNode[];
+}
+
+function buildTree(paths: string[]): TreeNode[] {
+  const root: TreeNode = { name: '', path: '', dir: true, children: [] };
+  for (const full of paths) {
+    const parts = full.split('/');
+    let node = root;
+    parts.forEach((part, i) => {
+      const isLeaf = i === parts.length - 1;
+      const path = parts.slice(0, i + 1).join('/');
+      let child = node.children.find((c) => c.name === part && c.dir === !isLeaf);
+      if (!child) {
+        child = { name: part, path, dir: !isLeaf, children: [] };
+        node.children.push(child);
+      }
+      node = child;
+    });
+  }
+  const sort = (nodes: TreeNode[]) => {
+    nodes.sort((a, b) =>
+      a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name),
+    );
+    for (const n of nodes) if (n.dir) sort(n.children);
+  };
+  sort(root.children);
+  return root.children;
+}
+
+function FileTree({
+  paths,
+  filtering,
+  onOpen,
+}: {
+  paths: string[];
+  filtering: boolean;
+  onOpen: (path: string) => void;
+}) {
+  // 默认全部折叠（大仓库友好）；用户展开的目录记在集合里。过滤时忽略折叠状态。
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
+  const tree = useMemo(() => buildTree(paths.slice(0, 4000)), [paths]);
+
+  const toggle = (path: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+
+  const rows: ReactNode[] = [];
+  const walk = (nodes: TreeNode[], depth: number) => {
+    for (const node of nodes) {
+      const pad = { paddingLeft: `${6 + depth * 12}px` };
+      if (node.dir) {
+        const open = filtering || expanded.has(node.path);
+        rows.push(
+          <button
+            className="ft-dir"
+            key={`d:${node.path}`}
+            style={pad}
+            onClick={() => toggle(node.path)}
+          >
+            <span className="ft-caret">{open ? '▾' : '▸'}</span>
+            <span className="ft-name">{node.name}</span>
+          </button>,
+        );
+        if (open) walk(node.children, depth + 1);
+      } else {
+        rows.push(
+          <button
+            className="ft-file"
+            key={`f:${node.path}`}
+            style={pad}
+            title={node.path}
+            onClick={() => onOpen(node.path)}
+          >
+            <span className="ft-name">{node.name}</span>
+          </button>,
+        );
+      }
+    }
+  };
+  walk(tree, 0);
+
+  return <div className="ft">{rows}</div>;
 }
 
 // ── 搜索面板 ────────────────────────────────────────────────────────

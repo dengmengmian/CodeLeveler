@@ -635,6 +635,102 @@ async fn git_status_summarizes_changes_in_a_git_repo() {
     assert_eq!(fresh["removed"], 0);
 }
 
+// ---------------------------------------------------------------------------
+// Filesystem browser (the "open project" modal)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fs_list_lists_subdirectories_and_marks_repos() {
+    let server = TestServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+    std::fs::create_dir_all(root.path().join("beta")).unwrap();
+    std::fs::create_dir_all(root.path().join("repo/.git")).unwrap();
+    std::fs::write(root.path().join("notme.txt"), "x").unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+
+    let response = http_get(
+        &server,
+        &format!(
+            "/api/fs/list?token={TOKEN}&path={}",
+            canonical.to_string_lossy()
+        ),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["path"], canonical.to_string_lossy().as_ref());
+    assert_eq!(
+        body["parent"],
+        canonical.parent().unwrap().to_string_lossy().as_ref()
+    );
+    let entries = body["entries"].as_array().unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    // Directories only, sorted; the plain file is excluded.
+    assert_eq!(names, ["alpha", "beta", "repo"]);
+    let repo = entries.iter().find(|e| e["name"] == "repo").unwrap();
+    assert_eq!(repo["is_repo"], true);
+    let alpha = entries.iter().find(|e| e["name"] == "alpha").unwrap();
+    assert_eq!(alpha["is_repo"], false);
+    assert_eq!(
+        repo["path"],
+        canonical.join("repo").to_string_lossy().as_ref()
+    );
+}
+
+#[tokio::test]
+async fn fs_list_rejects_missing_path_and_files() {
+    let server = TestServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("a-file.txt");
+    std::fs::write(&file, "x").unwrap();
+    let missing = root.path().join("does-not-exist");
+
+    for (path, expected) in [
+        (file, reqwest::StatusCode::BAD_REQUEST),
+        (missing, reqwest::StatusCode::NOT_FOUND),
+    ] {
+        let response = http_get(
+            &server,
+            &format!("/api/fs/list?token={TOKEN}&path={}", path.to_string_lossy()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), expected, "path {path:?}");
+    }
+}
+
+#[tokio::test]
+async fn fs_list_requires_a_token() {
+    let server = TestServer::start().await;
+    let response = http_get(&server, "/api/fs/list?path=/")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn fs_list_defaults_to_home_when_path_is_absent() {
+    let server = TestServer::start().await;
+    let response = http_get(&server, &format!("/api/fs/list?token={TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body["path"].as_str().is_some_and(|p| p.starts_with('/')),
+        "defaults to an absolute directory: {body}"
+    );
+}
+
 #[tokio::test]
 async fn attachments_store_uploads_and_deliver_commands() {
     let server = TestServer::start().await;

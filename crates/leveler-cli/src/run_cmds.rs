@@ -878,7 +878,19 @@ pub(crate) async fn cmd_web(
             let client = LocalSocketRuntimeClient::connect_tcp(daemon_addr, token.clone()).await?;
             let service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
                 Arc::new(DaemonService(client));
-            let server = leveler_web::bind(service, addr, token.clone()).await?;
+            // Aggregation is available in --connect mode too, so the WebUI's
+            // "open project" flow works (POST /api/projects) instead of 404ing.
+            // The daemon is the primary behind the RouterService; added projects
+            // get their own probe-or-spawn daemons like the in-process path.
+            let router = leveler_web::RouterService::new(service, layout.repo_root.clone());
+            let registry_path = web_projects_registry_path();
+            let manager = leveler_web::ProjectManager::new(
+                router.clone(),
+                registry_path,
+                std::env::current_exe().ok(),
+            );
+            tokio::spawn(manager.clone().load_registry());
+            let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
             (server, None, token)
         }
         None => {

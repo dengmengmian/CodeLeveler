@@ -68,6 +68,25 @@ export function addProject(path: string): Promise<{ project: ProjectInfo }> {
   });
 }
 
+export interface FsEntry {
+  name: string;
+  path: string;
+  is_repo: boolean;
+  hidden: boolean;
+}
+
+export interface FsListing {
+  path: string;
+  parent: string | null;
+  entries: FsEntry[];
+}
+
+/** 浏览服务端文件系统的某个目录（缺省从 $HOME 起）——「打开项目」选择器用。 */
+export function listDir(path?: string): Promise<FsListing> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : '';
+  return request<FsListing>(`/api/fs/list${query}`);
+}
+
 export function removeProject(path: string): Promise<void> {
   return request<void>(`/api/projects?path=${encodeURIComponent(path)}`, {
     method: 'DELETE',

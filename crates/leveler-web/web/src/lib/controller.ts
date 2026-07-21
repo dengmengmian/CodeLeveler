@@ -205,7 +205,15 @@ export class RuntimeBridge {
     }
 
     if (TURN_TERMINAL_TYPES.has(ev.type)) {
-      this.dispatch({ type: 'turn_terminal' });
+      const outcome =
+        ev.type === 'turn_failed' || ev.type === 'turn_truncated'
+          ? 'failed'
+          : ev.type === 'turn_cancelled'
+            ? 'cancelled'
+            : 'completed';
+      const error =
+        ev.type === 'turn_failed' || ev.type === 'turn_truncated' ? ev.error : undefined;
+      this.dispatch({ type: 'turn_terminal', outcome, error });
       // dispatch 是异步的，getState() 还没落地，强制跳过 turnActive 检查
       this.flushQueue(true);
     }
@@ -250,6 +258,19 @@ export class RuntimeBridge {
     } catch {
       // 单项目模式（无聚合层）或瞬时失败：静默，项目分组仍按会话列表渲染
     }
+  }
+
+  /** 把文本注入输入框（空状态快捷操作用）；Composer 消费后回传 null 清空。 */
+  seedComposer(text: string | null): void {
+    this.dispatch({ type: 'seed_composer', text });
+  }
+
+  /** 重新运行 / 重试：取当前会话最后一条用户消息重发。 */
+  rerunLast(): void {
+    const current = this.getState().current;
+    if (!current) return;
+    const lastUser = [...current.messages].reverse().find((m) => m.role === 'user');
+    if (lastUser) void this.sendUserMessage(lastUser.text);
   }
 
   async addProject(path: string): Promise<boolean> {

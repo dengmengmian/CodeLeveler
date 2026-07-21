@@ -128,6 +128,7 @@ fn build_router_with(state: AppState) -> Router {
             get(list_projects).post(add_project).delete(remove_project),
         )
         .route("/api/projects/restart", post(restart_project))
+        .route("/api/fs/list", get(crate::browse::list_dir))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .merge(api)

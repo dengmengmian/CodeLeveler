@@ -30,11 +30,11 @@ const EXEC_IMMEDIATELY = new Set(['/compact', '/clear', '/diff', '/cancel', '/me
 /** 选中后打开弹层的命令 → 弹层名 */
 const OPEN_POPUP: Record<string, Popup> = {
   '/model': 'model',
-  '/mode': 'settings',
-  '/perm': 'settings',
+  '/mode': 'mode',
+  '/perm': 'perm',
 };
 
-type Popup = 'settings' | 'model' | null;
+type Popup = 'perm' | 'mode' | 'model' | null;
 
 const PERMISSIONS: ReadonlyArray<{
   profile: PermissionProfile;
@@ -89,6 +89,22 @@ export function Composer() {
     const t = setTimeout(() => bridge.dismissNotice(), 6000);
     return () => clearTimeout(t);
   }, [state.notice, bridge]);
+
+  // 空状态快捷操作注入的起手语：填入输入框、聚焦、把光标放到末尾，随后清空 seed。
+  useEffect(() => {
+    if (state.composerSeed === null) return;
+    setText(state.composerSeed);
+    bridge.seedComposer(null);
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (ta) {
+        ta.focus();
+        ta.selectionStart = ta.selectionEnd = ta.value.length;
+        ta.style.height = 'auto';
+        ta.style.height = `${ta.scrollHeight}px`;
+      }
+    });
+  }, [state.composerSeed, bridge]);
 
   const autosize = useCallback(() => {
     const ta = taRef.current;
@@ -300,19 +316,17 @@ export function Composer() {
               <span className="perm-wrap">
                 <button
                   className={`c-chip perm-btn ${perm.cls}`}
-                  title="运行设置：权限档位 + 执行模式"
+                  title="权限档位"
                   onClick={(e) => {
                     e.stopPropagation();
-                    setPopup(popup === 'settings' ? null : 'settings');
+                    setPopup(popup === 'perm' ? null : 'perm');
                   }}
                 >
                   <span className="shield">◈</span>
                   <span>{perm.label}</span>
-                  <span className="sep">·</span>
-                  <span>{agentModeLabel(mode)}</span>
                   <span className="caret">▴</span>
                 </button>
-                {popup === 'settings' && (
+                {popup === 'perm' && (
                   <div className="pop">
                     <div className="pop-head">权限档位 · 全局生效</div>
                     {PERMISSIONS.map((p) => (
@@ -321,6 +335,7 @@ export function Composer() {
                         className={`pop-item${current?.permission === p.profile ? ' sel' : ''}`}
                         onClick={() => {
                           bridge.setPermission(p.profile);
+                          setPopup(null);
                         }}
                       >
                         <span className="cmd" style={{ color: p.color }}>
@@ -330,6 +345,24 @@ export function Composer() {
                         <span className="cur">{current?.permission === p.profile ? '当前' : p.tag}</span>
                       </button>
                     ))}
+                  </div>
+                )}
+              </span>
+
+              <span className="perm-wrap">
+                <button
+                  className="c-chip"
+                  title="执行模式"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPopup(popup === 'mode' ? null : 'mode');
+                  }}
+                >
+                  <span>{agentModeLabel(mode)}</span>
+                  <span className="caret">▴</span>
+                </button>
+                {popup === 'mode' && (
+                  <div className="pop">
                     <div className="pop-head">执行模式</div>
                     {MODES.map(([m, desc]) => (
                       <button
@@ -337,6 +370,7 @@ export function Composer() {
                         className={`pop-item${mode === m ? ' sel' : ''}`}
                         onClick={() => {
                           bridge.setAgentMode(m);
+                          setPopup(null);
                         }}
                       >
                         <span className="cmd">{agentModeLabel(m)}</span>
