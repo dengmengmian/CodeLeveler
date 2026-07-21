@@ -726,7 +726,9 @@ async fn fs_list_defaults_to_home_when_path_is_absent() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
     assert!(
-        body["path"].as_str().is_some_and(|p| p.starts_with('/')),
+        body["path"]
+            .as_str()
+            .is_some_and(|p| std::path::Path::new(p).is_absolute()),
         "defaults to an absolute directory: {body}"
     );
 }
