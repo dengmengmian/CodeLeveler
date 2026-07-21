@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CodeLeveler WebUI — 设计稿</title>
+<style>
+  /* ============ 设计令牌 ============ */
+  :root {
+    --bg:        #0B0F14;   /* 品牌底色 */
+    --panel:     #0E141B;
+    --panel-2:   #121922;
+    --rail:      #1B2634;
+    --line:      #1E2A38;
+    --ink:       #E6EDF3;
+    --ink-dim:   #8A99A8;
+    --ink-faint: #54616F;
+    --accent:    #A3E635;   /* level green — 唯一主强调色 */
+    --accent-dim:#3F5218;
+    --amber:     #F5B83D;
+    --red:       #F0635A;
+    --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+    --sans: -apple-system, "PingFang SC", "Inter", "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: var(--sans); font-size: 14px; line-height: 1.6;
+    overflow: hidden;
+  }
+  ::selection { background: var(--accent-dim); }
+
+  /* ============ 总体布局：三栏控制室 ============ */
+  .deck { display: grid; grid-template-columns: 232px 1fr 300px; height: 100vh; }
+
+  /* ============ 左栏：会话轨 ============ */
+  .rail {
+    background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+  }
+  .brand svg { width: 22px; height: 22px; color: var(--ink); flex: none; }
+  .brand .name { font-family: var(--mono); font-size: 13px; letter-spacing: .04em; }
+  .brand .ver  { font-family: var(--mono); font-size: 10px; color: var(--ink-faint); margin-top: 1px; }
+  .rail-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 16px 6px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .14em; color: var(--ink-faint);
+  }
+  .btn-new {
+    font-family: var(--mono); font-size: 11px; color: var(--accent);
+    background: none; border: 1px solid var(--accent-dim); padding: 2px 8px;
+    cursor: pointer; border-radius: 2px;
+  }
+  .btn-new:hover { background: var(--accent); color: var(--bg); }
+  .sessions { flex: 1; overflow-y: auto; padding: 4px 8px 12px; }
+
+  /* 项目分组：项目 → 会话 两级 */
+  .proj { margin: 4px 0 6px; }
+  .proj-head {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    background: none; border: none; cursor: pointer; text-align: left;
+    padding: 6px 8px; border-radius: 3px; color: var(--ink);
+  }
+  .proj-head:hover { background: var(--panel-2); }
+  .proj-head .fold {
+    font-family: var(--mono); font-size: 9px; color: var(--ink-faint);
+    width: 10px; flex: none; transition: transform .12s;
+  }
+  .proj.closed .fold { transform: rotate(-90deg); }
+  .proj-head .pname { font-size: 12.5px; font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .proj-head .pcount {
+    font-family: var(--mono); font-size: 9px; color: var(--ink-faint);
+    border: 1px solid var(--line); border-radius: 2px; padding: 0 5px; flex: none;
+  }
+  /* 项目级"新对话"按钮：hover 显现 */
+  .p-add {
+    font-family: var(--mono); font-size: 11px; line-height: 1;
+    background: none; border: 1px solid var(--line); border-radius: 2px;
+    color: var(--ink-faint); padding: 2px 6px; cursor: pointer; flex: none;
+    opacity: 0; transition: opacity .12s;
+  }
+  .proj-head:hover .p-add, .p-add:hover { opacity: 1; }
+  .p-add:hover { color: var(--accent); border-color: var(--accent-dim); }
+  .proj-head .ppath {
+    display: block; font-family: var(--mono); font-size: 9px; color: var(--ink-faint);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .proj-head .pmeta { flex: 1; min-width: 0; }
+  .proj.closed .proj-sessions { display: none; }
+  .proj-sessions { margin-left: 12px; border-left: 1px solid var(--line); padding-left: 4px; }
+
+  .sess {
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    border-left: 2px solid transparent;
+    padding: 7px 10px; margin: 2px 0; cursor: pointer; border-radius: 0 3px 3px 0;
+    color: var(--ink-dim);
+  }
+  .sess:hover { background: var(--panel-2); color: var(--ink); }
+  .sess.active { background: var(--panel-2); border-left-color: var(--accent); color: var(--ink); }
+  .sess .t { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .m {
+    display: flex; gap: 8px; align-items: center;
+    font-family: var(--mono); font-size: 10px; color: var(--ink-faint); margin-top: 2px;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .dot.run  { background: var(--accent); box-shadow: 0 0 6px var(--accent); animation: pulse 1.6s infinite; }
+  .dot.idle { background: var(--ink-faint); }
+  .dot.wait { background: var(--amber); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .rail-foot {
+    border-top: 1px solid var(--line); padding: 10px 16px;
+    font-family: var(--mono); font-size: 10px; color: var(--ink-faint);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .led { width: 7px; height: 7px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 6px var(--accent); }
+
+  /* ============ 中栏：对话时间线 ============ */
+  .stage { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .stage-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .stage-head .title { font-size: 14px; font-weight: 600; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-dim);
+    border: 1px solid var(--line); background: var(--panel-2);
+    padding: 3px 10px; border-radius: 2px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .chip:hover { border-color: var(--ink-faint); color: var(--ink); }
+  .chip b { color: var(--ink); font-weight: 500; }
+  .chip .caret { font-size: 8px; color: var(--ink-faint); }
+  .spacer { flex: 1; }
+
+  /* 等级计：品牌台阶即上下文用量表 */
+  .levelmeter { display: flex; align-items: flex-end; gap: 3px; height: 18px; cursor: default; }
+  .levelmeter i {
+    width: 7px; background: var(--rail); border-radius: 1px 1px 0 0; display: block;
+  }
+  .levelmeter i:nth-child(1) { height: 5px;  }
+  .levelmeter i:nth-child(2) { height: 8px;  }
+  .levelmeter i:nth-child(3) { height: 11px; }
+  .levelmeter i:nth-child(4) { height: 14px; }
+  .levelmeter i:nth-child(5) { height: 17px; }
+  .levelmeter i.on { background: var(--accent); }
+  .levelmeter i.on.half { background: linear-gradient(to top, var(--accent) 55%, var(--rail) 55%); }
+  .levelmeter-label { font-family: var(--mono); font-size: 10px; color: var(--ink-faint); margin-left: 6px; }
+
+  .timeline { flex: 1; overflow-y: auto; padding: 24px 28px 12px; }
+  .tl-inner { max-width: 760px; margin: 0 auto; }
+
+  /* 回合分隔：楼层刻度 */
+  .floor {
+    display: flex; align-items: center; gap: 10px; margin: 26px 0 14px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .18em; color: var(--ink-faint);
+  }
+  .floor::before, .floor::after { content: ""; height: 1px; background: var(--line); flex: 1; }
+
+  .msg { margin: 14px 0; }
+  .msg .who {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .16em;
+    color: var(--ink-faint); margin-bottom: 6px; display: flex; gap: 10px; align-items: baseline;
+  }
+  .msg.user .who { color: var(--accent); }
+  .msg .who time { letter-spacing: 0; color: var(--ink-faint); }
+  .msg .body { font-size: 14px; }
+  .msg.user .body {
+    background: var(--panel-2); border: 1px solid var(--line); border-left: 2px solid var(--accent);
+    padding: 10px 14px; border-radius: 0 4px 4px 0;
+  }
+  .msg.assistant .body { padding-left: 2px; }
+  .msg .body pre {
+    font-family: var(--mono); font-size: 12.5px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px;
+    overflow-x: auto; margin: 10px 0; line-height: 1.55;
+  }
+  .msg .body code { font-family: var(--mono); font-size: .92em; background: var(--panel-2); padding: 1px 5px; border-radius: 3px; }
+  .msg .body pre code { background: none; padding: 0; }
+  .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* 工具调用：台阶轨 */
+  .tools { margin: 10px 0 10px 2px; }
+  .tool {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 12px;
+    padding: 6px 10px; margin: 3px 0;
+    background: var(--panel); border: 1px solid var(--line); border-left: 2px solid var(--rail);
+    border-radius: 0 3px 3px 0; cursor: pointer; color: var(--ink-dim);
+  }
+  .tool:hover { border-left-color: var(--ink-faint); color: var(--ink); }
+  .tool.done  { border-left-color: var(--accent); }
+  .tool.run   { border-left-color: var(--amber); color: var(--ink); }
+  .tool.fail  { border-left-color: var(--red); }
+  .tool .glyph { width: 14px; text-align: center; flex: none; }
+  .tool.done .glyph  { color: var(--accent); }
+  .tool.run  .glyph  { color: var(--amber); animation: spin 1s steps(8) infinite; display: inline-block; }
+  .tool.fail .glyph  { color: var(--red); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tool .cmd { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tool .cmd .path { color: var(--ink); }
+  .tool .dur { font-size: 10px; color: var(--ink-faint); flex: none; }
+  .tool .expand-hint { font-size: 9px; color: var(--ink-faint); flex: none; }
+  .tool-preview {
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim);
+    background: var(--panel); border: 1px solid var(--line); border-top: none;
+    margin: -3px 0 3px; padding: 8px 12px; border-radius: 0 0 3px 3px;
+    white-space: pre-wrap; max-height: 160px; overflow-y: auto;
+  }
+
+  /* 审批卡：钉在时间线里 */
+  .approval {
+    margin: 16px 0; border: 1px solid var(--amber); border-left: 3px solid var(--amber);
+    background: var(--panel); border-radius: 0 4px 4px 0; overflow: hidden;
+  }
+  .approval .a-head {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em; color: var(--amber);
+  }
+  .approval .a-body { padding: 12px 14px; font-size: 13px; }
+  .approval .a-body pre {
+    font-family: var(--mono); font-size: 12px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 3px; padding: 10px 12px; margin-top: 8px;
+    overflow-x: auto;
+  }
+  .approval .a-actions { display: flex; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+  .abtn {
+    font-family: var(--mono); font-size: 12px; padding: 6px 14px; cursor: pointer;
+    background: none; border: 1px solid var(--rail); color: var(--ink-dim); border-radius: 2px;
+  }
+  .abtn:hover { border-color: var(--ink); color: var(--ink); }
+  .abtn.primary { border-color: var(--accent); color: var(--accent); }
+  .abtn.primary:hover { background: var(--accent); color: var(--bg); }
+  .abtn.danger { border-color: var(--red); color: var(--red); margin-left: auto; }
+  .abtn.danger:hover { background: var(--red); color: var(--bg); }
+  .abtn kbd {
+    font-family: var(--mono); font-size: 10px; border: 1px solid currentColor;
+    border-radius: 2px; padding: 0 4px; margin-left: 6px; opacity: .7;
+  }
+
+  /* ============ 输入舱 ============ */
+  .composer-wrap { padding: 12px 28px 18px; }
+  .composer { max-width: 760px; margin: 0 auto; }
+  .composer .box {
+    background: var(--panel); border: 1px solid var(--rail); border-radius: 4px;
+    transition: border-color .15s;
+  }
+  .composer .box:focus-within { border-color: var(--accent-dim); }
+  .composer textarea {
+    width: 100%; background: none; border: none; outline: none; resize: none;
+    color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.6;
+    padding: 12px 14px 6px; min-height: 44px; max-height: 180px; display: block;
+  }
+  .composer .c-bar {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px 10px;
+  }
+  .c-chip {
+    font-family: var(--mono); font-size: 10.5px; color: var(--ink-faint);
+    border: 1px solid var(--line); padding: 2px 8px; border-radius: 2px; cursor: pointer; background: none;
+  }
+  .c-chip:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .c-chip.on { color: var(--accent); border-color: var(--accent-dim); }
+  .send {
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    background: var(--accent); color: var(--bg); border: none;
+    padding: 6px 16px; border-radius: 2px; cursor: pointer;
+  }
+  .send:hover { filter: brightness(1.1); }
+  .composer .hint {
+    text-align: center; font-family: var(--mono); font-size: 10px; color: var(--ink-faint); margin-top: 8px;
+  }
+  .composer .hint kbd { border: 1px solid var(--line); border-radius: 2px; padding: 0 4px; }
+
+  /* 权限档位选择器 */
+  .perm-wrap { position: relative; }
+  .perm-btn { display: inline-flex; align-items: center; gap: 6px; }
+  .perm-btn .shield { font-size: 11px; }
+  .perm-btn.p-ask   { color: var(--amber); border-color: #4a3a18; }
+  .perm-btn.p-assist{ color: var(--accent); border-color: var(--accent-dim); }
+  .perm-btn.p-full  { color: var(--red); border-color: #52231f; }
+
+  /* 弹出层（权限菜单 / 斜杠命令面板共用） */
+  .pop {
+    position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 30;
+    background: var(--panel-2); border: 1px solid var(--rail); border-radius: 4px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.55);
+    min-width: 260px; overflow: hidden;
+  }
+  .pop-head {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: .14em; color: var(--ink-faint);
+    padding: 8px 12px 6px; border-bottom: 1px solid var(--line);
+  }
+  .pop-item {
+    display: flex; align-items: baseline; gap: 10px; width: 100%;
+    background: none; border: none; cursor: pointer; text-align: left;
+    padding: 8px 12px; color: var(--ink-dim); font-size: 12.5px;
+  }
+  .pop-item:hover, .pop-item.sel { background: var(--panel); color: var(--ink); }
+  .pop-item .cmd { font-family: var(--mono); font-size: 12px; color: var(--accent); width: 108px; flex: none; }
+  .pop-item .desc { flex: 1; }
+  .pop-item .cur { font-family: var(--mono); font-size: 9px; color: var(--ink-faint); flex: none; }
+  .pop-item.sel .cur, .pop-item:hover .cur { color: var(--accent); }
+
+  /* 斜杠命令面板：吸附在输入框上方 */
+  .slash-pop {
+    position: absolute; bottom: calc(100% + 8px); left: 0; right: 0; z-index: 30;
+    background: var(--panel-2); border: 1px solid var(--rail); border-radius: 4px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.55); overflow: hidden;
+  }
+  .slash-pop .pop-item .cmd { color: var(--ink); width: 148px; }
+  .composer .box-outer { position: relative; }
+
+  /* ============ 右栏：检视台 ============ */
+  .inspector {
+    background: var(--panel); border-left: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .insp-tabs {
+    display: flex; border-bottom: 1px solid var(--line);
+  }
+  .insp-tab {
+    flex: 1; font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em;
+    padding: 10px 0; text-align: center; color: var(--ink-faint);
+    background: none; border: none; border-bottom: 2px solid transparent; cursor: pointer;
+  }
+  .insp-tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+  .insp-body { flex: 1; overflow-y: auto; padding: 14px 16px; }
+
+  /* 计划：真正的台阶 */
+  .stairs { margin-top: 6px; }
+  .stair {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 12px; color: var(--ink-dim);
+    padding: 5px 8px; margin-bottom: 4px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 2px;
+  }
+  .stair:nth-child(1) { margin-left: 0; }
+  .stair:nth-child(2) { margin-left: 12px; }
+  .stair:nth-child(3) { margin-left: 24px; }
+  .stair:nth-child(4) { margin-left: 36px; }
+  .stair:nth-child(5) { margin-left: 48px; }
+  .stair .st { width: 14px; flex: none; text-align: center; }
+  .stair.done  { color: var(--ink-faint); text-decoration: line-through; }
+  .stair.done .st { color: var(--accent); text-decoration: none; }
+  .stair.now   { color: var(--ink); border-color: var(--accent-dim); }
+  .stair.now .st { color: var(--amber); animation: spin 1s steps(8) infinite; display: inline-block; }
+
+  .insp-sec {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .14em; color: var(--ink-faint);
+    margin: 18px 0 8px; display: flex; align-items: center; gap: 8px;
+  }
+  .insp-sec::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .checks { font-family: var(--mono); font-size: 12px; }
+  .check { display: flex; gap: 8px; padding: 4px 0; color: var(--ink-dim); }
+  .check .st { width: 14px; flex: none; }
+  .check.ok .st { color: var(--accent); }
+  .check.wait .st { color: var(--ink-faint); }
+  .check.bad .st { color: var(--red); }
+  .kv { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  .kv dt { color: var(--ink-faint); }
+  .kv dd { text-align: right; }
+  .kv dd.good { color: var(--accent); }
+
+  /* 新建项目模态框 */
+  .modal-mask {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(4, 7, 10, .72); backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal {
+    width: 420px; background: var(--panel-2); border: 1px solid var(--rail);
+    border-radius: 6px; box-shadow: 0 16px 48px rgba(0,0,0,.6); overflow: hidden;
+  }
+  .modal .m-head {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--ink-faint);
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .modal .m-close { background: none; border: none; color: var(--ink-faint); cursor: pointer; font-size: 14px; }
+  .modal .m-close:hover { color: var(--ink); }
+  .modal .m-body { padding: 16px; }
+  .modal label {
+    display: block; font-family: var(--mono); font-size: 10px; letter-spacing: .1em;
+    color: var(--ink-faint); margin: 0 0 6px;
+  }
+  .modal input {
+    width: 100%; background: var(--bg); border: 1px solid var(--rail); border-radius: 3px;
+    color: var(--ink); font-family: var(--mono); font-size: 12.5px;
+    padding: 8px 10px; outline: none;
+  }
+  .modal input:focus { border-color: var(--accent-dim); }
+  .modal .m-tip { font-size: 11.5px; color: var(--ink-faint); margin-top: 8px; }
+  .modal .m-tip code { font-family: var(--mono); color: var(--ink-dim); }
+  .modal .m-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+    padding: 12px 16px; border-top: 1px solid var(--line);
+  }
+  .mbtn {
+    font-family: var(--mono); font-size: 12px; padding: 6px 16px; cursor: pointer;
+    background: none; border: 1px solid var(--rail); color: var(--ink-dim); border-radius: 2px;
+  }
+  .mbtn:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .mbtn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+  .mbtn.primary:hover { filter: brightness(1.1); }
+
+  /* 空状态：新建对话欢迎页 */
+  .hero {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; padding-bottom: 8vh; user-select: none;
+  }
+  .hero svg { width: 56px; height: 56px; color: var(--ink); }
+  .hero .h-word { font-family: var(--mono); font-size: 20px; letter-spacing: .22em; }
+  .hero .h-sub { font-size: 13px; color: var(--ink-faint); }
+  .hero .h-proj { position: relative; margin-top: 4px; }
+  .hero .h-proj-btn {
+    font-family: var(--mono); font-size: 12px; color: var(--ink-dim);
+    background: var(--panel-2); border: 1px solid var(--rail); border-radius: 3px;
+    padding: 6px 14px; cursor: pointer; display: inline-flex; gap: 8px; align-items: center;
+  }
+  .hero .h-proj-btn:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .hero .h-proj-btn .caret { font-size: 8px; color: var(--ink-faint); }
+  .hero .pop { bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); min-width: 300px; }
+  .hero .pop .ppath { font-size: 9px; color: var(--ink-faint); display: block; }
+
+  /* 消息队列：回合进行中排队 */
+  .queue { margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
+  .q-item {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--panel); border: 1px solid var(--line); border-left: 2px solid var(--amber);
+    border-radius: 0 3px 3px 0; padding: 7px 12px;
+    font-size: 12.5px; color: var(--ink-dim);
+  }
+  .q-item .q-tag {
+    font-family: var(--mono); font-size: 9px; letter-spacing: .1em; color: var(--amber);
+    border: 1px solid #4a3a18; border-radius: 2px; padding: 0 5px; flex: none;
+  }
+  .q-item .q-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .q-item .q-x {
+    background: none; border: none; color: var(--ink-faint); cursor: pointer;
+    font-family: var(--mono); font-size: 11px; flex: none;
+  }
+  .q-item .q-x:hover { color: var(--red); }
+
+  /* 滚动条 */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--rail); border-radius: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  @media (max-width: 1100px) { .deck { grid-template-columns: 232px 1fr; } .inspector { display: none; } }
+</style>
+</head>
+<body>
+<div class="deck">
+
+  <!-- ═══════ 左栏：会话轨 ═══════ -->
+  <aside class="rail">
+    <div class="brand">
+      <!-- 品牌 CL 标记（来自 assets/brand/codeleveler-mark.svg） -->
+      <svg viewBox="0 0 64 64" fill="currentColor" aria-label="CodeLeveler">
+        <path d="M 27 9 A 23 23 0 1 0 27 55 L 27 47 A 15 15 0 1 1 27 17 Z"/>
+        <path d="M 29 22 H 37 V 54 H 29 Z M 29 46 H 51 V 54 H 29 Z M 29 38 H 47 V 46 H 29 Z M 29 30 H 43 V 38 H 29 Z"/>
+      </svg>
+      <div>
+        <div class="name">CODELEVELER</div>
+        <div class="ver">web · v0.1</div>
+      </div>
+    </div>
+    <div class="rail-head">
+      <span>PROJECTS</span>
+      <button class="btn-new" onclick="openProjModal()">+ 项目</button>
+    </div>
+    <div class="sessions" id="sessions">
+
+      <div class="proj" data-proj>
+        <button class="proj-head" onclick="toggleProj(this)">
+          <span class="fold">▼</span>
+          <span class="pmeta">
+            <span class="pname">codeleveler</span>
+            <span class="ppath">~/Develop/app/codeleveler</span>
+          </span>
+          <span class="pcount">3</span>
+          <button class="p-add" title="在此项目中新建对话" onclick="newSession(this, 'codeleveler')">＋</button>
+        </button>
+        <div class="proj-sessions">
+          <button class="sess active">
+            <div class="t">给 leveler 加 WebUI</div>
+            <div class="m"><i class="dot run"></i><span>RUNNING</span><span>·</span><span>2m ago</span></div>
+          </button>
+          <button class="sess">
+            <div class="t">修复 storage 迁移 0014 索引</div>
+            <div class="m"><i class="dot wait"></i><span>WAITING</span><span>·</span><span>1h ago</span></div>
+          </button>
+          <button class="sess">
+            <div class="t">evals smoke 提速</div>
+            <div class="m"><i class="dot idle"></i><span>DONE</span><span>·</span><span>3 天前</span></div>
+          </button>
+        </div>
+      </div>
+
+      <div class="proj" data-proj>
+        <button class="proj-head" onclick="toggleProj(this)">
+          <span class="fold">▼</span>
+          <span class="pmeta">
+            <span class="pname">shop-backend</span>
+            <span class="ppath">~/Develop/work/shop-backend</span>
+          </span>
+          <span class="pcount">2</span>
+          <button class="p-add" title="在此项目中新建对话" onclick="newSession(this, 'shop-backend')">＋</button>
+        </button>
+        <div class="proj-sessions">
+          <button class="sess">
+            <div class="t">orchestrator 任务图重构</div>
+            <div class="m"><i class="dot idle"></i><span>DONE</span><span>·</span><span>昨天</span></div>
+          </button>
+          <button class="sess">
+            <div class="t">订单超时关单定时任务</div>
+            <div class="m"><i class="dot idle"></i><span>DONE</span><span>·</span><span>上周</span></div>
+          </button>
+        </div>
+      </div>
+
+      <div class="proj closed" data-proj>
+        <button class="proj-head" onclick="toggleProj(this)">
+          <span class="fold">▼</span>
+          <span class="pmeta">
+            <span class="pname">dotfiles</span>
+            <span class="ppath">~/Develop/dotfiles</span>
+          </span>
+          <span class="pcount">1</span>
+        </button>
+        <div class="proj-sessions">
+          <button class="sess">
+            <div class="t">zsh 启动提速</div>
+            <div class="m"><i class="dot idle"></i><span>DONE</span><span>·</span><span>2 周前</span></div>
+          </button>
+        </div>
+      </div>
+
+    </div>
+    <div class="rail-foot">
+      <span class="led"></span><span>DAEMON · 127.0.0.1:7331</span>
+    </div>
+  </aside>
+
+  <!-- ═══════ 中栏：对话舞台 ═══════ -->
+  <main class="stage">
+    <header class="stage-head">
+      <span class="title" id="stage-title">给 leveler 加 WebUI</span>
+      <span class="spacer"></span>
+      <!-- 品牌台阶 = 上下文等级计 -->
+      <span class="levelmeter" title="上下文用量 61%">
+        <i class="on"></i><i class="on"></i><i class="on"></i><i class="on half"></i><i></i>
+        <span class="levelmeter-label">CTX 61%</span>
+      </span>
+    </header>
+
+    <!-- 空状态：新建对话（选项目 → 输入首条消息） -->
+    <div class="hero" id="hero" hidden>
+      <svg viewBox="0 0 64 64" fill="currentColor" aria-label="CodeLeveler">
+        <path d="M 27 9 A 23 23 0 1 0 27 55 L 27 47 A 15 15 0 1 1 27 17 Z"/>
+        <path d="M 29 22 H 37 V 54 H 29 Z M 29 46 H 51 V 54 H 29 Z M 29 38 H 47 V 46 H 29 Z M 29 30 H 43 V 38 H 29 Z"/>
+      </svg>
+      <div class="h-word">CODELEVELER</div>
+      <div class="h-sub">还没有消息 —— 在下方输入开始对话</div>
+      <div class="h-proj">
+        <button class="h-proj-btn" onclick="toggleHeroProj(event)">
+          <span>⌂</span><span id="hero-proj-name">codeleveler</span><span class="caret">▼</span>
+        </button>
+        <div class="pop" id="hero-proj-pop" hidden>
+          <div class="pop-head">选择项目 · 新对话将在此工作区创建</div>
+          <button class="pop-item sel" onclick="pickHeroProj(this, 'codeleveler')">
+            <span class="desc">codeleveler<span class="ppath">~/Develop/app/codeleveler</span></span>
+          </button>
+          <button class="pop-item" onclick="pickHeroProj(this, 'shop-backend')">
+            <span class="desc">shop-backend<span class="ppath">~/Develop/work/shop-backend</span></span>
+          </button>
+          <button class="pop-item" onclick="pickHeroProj(this, 'dotfiles')">
+            <span class="desc">dotfiles<span class="ppath">~/Develop/dotfiles</span></span>
+          </button>
+          <button class="pop-item" onclick="closeHeroProj();openProjModal()">
+            <span class="cmd" style="width:auto">＋ 添加新项目…</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="timeline" id="timeline">
+      <div class="tl-inner">
+
+        <div class="floor">TURN 3</div>
+
+        <div class="msg user">
+          <div class="who">YOU <time>14:02:11</time></div>
+          <div class="body">给 leveler-web 的 ws handler 加上 Lagged 重同步逻辑，参考 local-transport 的做法。</div>
+        </div>
+
+        <div class="msg assistant">
+          <div class="who">LEVELER <time>14:02:14</time></div>
+          <div class="body">
+            看一下现有 transport 层怎么处理 broadcast 滞后，然后照搬到 web 网关。
+          </div>
+        </div>
+
+        <div class="tools">
+          <div class="tool done">
+            <span class="glyph">✓</span>
+            <span class="cmd">read <span class="path">crates/leveler-local-transport/src/lib.rs</span></span>
+            <span class="dur">12ms</span>
+          </div>
+          <div class="tool done" id="tool-expand">
+            <span class="glyph">✓</span>
+            <span class="cmd">grep <span class="path">"RecvError::Lagged"</span> --type rust</span>
+            <span class="dur">8ms</span>
+            <span class="expand-hint">▼ 3 hits</span>
+          </div>
+          <div class="tool-preview" id="tool-preview" hidden>crates/leveler-local-transport/src/lib.rs:270
+crates/leveler-local-transport/src/lib.rs:638
+crates/leveler-tui/src/run.rs:272</div>
+          <div class="tool done">
+            <span class="glyph">✓</span>
+            <span class="cmd">edit <span class="path">crates/leveler-web/src/ws.rs</span> <span style="color:var(--ink-faint)">(+46 −4)</span></span>
+            <span class="dur">31ms</span>
+          </div>
+          <div class="tool run">
+            <span class="glyph">◍</span>
+            <span class="cmd">bash <span class="path">cargo test -p leveler-web</span></span>
+            <span class="dur">3.2s</span>
+          </div>
+        </div>
+
+        <div class="msg assistant">
+          <div class="who">LEVELER <time>14:02:31</time></div>
+          <div class="body">
+            <p>Lagged 分支已经接好：订阅任务检测到 <code>RecvError::Lagged</code> 时先给客户端推一帧
+            <code>{"type":"resync_required"}</code>，再主动关闭 WS。浏览器重连后走 snapshot 整量重同步，和 TUI 的语义完全一致。</p>
+            <pre><code>RecvError::Lagged(_) =&gt; {
+    send(&amp;mut ws, DownMsg::ResyncRequired { session_id }).await?;
+    ws.close().await?;
+    break;
+}</code></pre>
+            <p>测试还在跑，通过后我会把 <code>subscription_loop</code> 的重连退避也对齐到 200ms 起步。</p>
+            <span id="stream-tail"></span><span class="cursor"></span>
+          </div>
+        </div>
+
+        <!-- 审批卡（钉在流中，也可悬浮） -->
+        <div class="approval" id="approval">
+          <div class="a-head"><span>◍</span> APPROVAL REQUIRED <span style="margin-left:auto;color:var(--ink-faint)">ap_01J9…X4</span></div>
+          <div class="a-body">
+            允许执行以下命令？该命令会修改工作区文件。
+            <pre>$ cargo clippy --workspace --all-targets --fix</pre>
+          </div>
+          <div class="a-actions">
+            <button class="abtn primary" onclick="dismissApproval()">批准一次<kbd>y</kbd></button>
+            <button class="abtn" onclick="dismissApproval()">本会话内批准<kbd>s</kbd></button>
+            <button class="abtn" onclick="dismissApproval()">始终允许<kbd>a</kbd></button>
+            <button class="abtn danger" onclick="dismissApproval()">拒绝<kbd>n</kbd></button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- 输入舱 -->
+    <div class="composer-wrap">
+      <div class="composer">
+        <!-- 消息队列：回合进行中，消息排队等待 -->
+        <div class="queue" id="queue">
+          <div class="q-item">
+            <span class="q-tag">QUEUED</span>
+            <span class="q-text">顺便把 README 里的 WebUI 章节也补上</span>
+            <button class="q-x" onclick="dequeue(this)" title="取消排队">✕</button>
+          </div>
+          <div class="q-item">
+            <span class="q-tag">QUEUED</span>
+            <span class="q-text">测试如果挂了先别修，报给我</span>
+            <button class="q-x" onclick="dequeue(this)" title="取消排队">✕</button>
+          </div>
+        </div>
+        <div class="box-outer">
+          <!-- 斜杠命令面板：输入 / 时浮出 -->
+          <div class="slash-pop" id="slash-pop" hidden>
+            <div class="pop-head">COMMANDS · 输入继续过滤，↑↓ 选择，Tab 补全</div>
+            <div id="slash-list"></div>
+          </div>
+          <div class="box">
+            <textarea id="composer" rows="2" placeholder="回合进行中…发送将排队 ( / 唤起命令，# 引用文件 )"></textarea>
+            <div class="c-bar">
+              <button class="c-chip" title="添加附件">📎</button>
+              <!-- 全局权限档位 -->
+              <span class="perm-wrap">
+                <button class="c-chip perm-btn p-assist" id="perm-btn" onclick="togglePerm(event)">
+                  <span class="shield">◈</span><span id="perm-label">ASSISTED</span><span class="caret">▴</span>
+                </button>
+                <div class="pop" id="perm-pop" hidden>
+                  <div class="pop-head">PERMISSION PROFILE · 全局生效</div>
+                  <button class="pop-item" onclick="setPerm(this,'ask')">
+                    <span class="cmd" style="color:var(--amber)">◈ ASK</span>
+                    <span class="desc">每个写操作都询问</span>
+                    <span class="cur">最严</span>
+                  </button>
+                  <button class="pop-item sel" onclick="setPerm(this,'assist')">
+                    <span class="cmd" style="color:var(--accent)">◈ ASSISTED</span>
+                    <span class="desc">低风险自动，高风险询问</span>
+                    <span class="cur">当前</span>
+                  </button>
+                  <button class="pop-item" onclick="setPerm(this,'full')">
+                    <span class="cmd" style="color:var(--red)">◈ FULL ACCESS</span>
+                    <span class="desc">全部自动执行，不询问</span>
+                    <span class="cur">危险</span>
+                  </button>
+                </div>
+              </span>
+              <!-- 执行模式 -->
+              <span class="perm-wrap">
+                <button class="c-chip" id="mode-btn" onclick="toggleMode(event)">
+                  模式 <b id="mode-label" style="color:var(--ink)">DIRECT</b> <span class="caret">▴</span>
+                </button>
+                <div class="pop" id="mode-pop" hidden>
+                  <div class="pop-head">EXECUTION MODE</div>
+                  <button class="pop-item sel" onclick="setMode(this,'DIRECT')">
+                    <span class="cmd">DIRECT</span><span class="desc">直接执行，单 agent 循环</span>
+                  </button>
+                  <button class="pop-item" onclick="setMode(this,'PLAN')">
+                    <span class="cmd">PLAN</span><span class="desc">先出计划，确认后执行</span>
+                  </button>
+                </div>
+              </span>
+              <span class="spacer"></span>
+              <!-- 模型选择 -->
+              <span class="perm-wrap">
+                <button class="c-chip" id="model-btn" onclick="toggleModel(event)">
+                  <b id="model-label" style="color:var(--ink)">k2-thinking</b> <span class="caret">▴</span>
+                </button>
+                <div class="pop" id="model-pop" hidden style="left:auto;right:0">
+                  <div class="pop-head">MODEL · 来自 snapshot.available_models</div>
+                  <button class="pop-item sel" onclick="setModel(this,'k2-thinking')">
+                    <span class="cmd">k2-thinking</span><span class="desc">推理加强</span><span class="cur">当前</span>
+                  </button>
+                  <button class="pop-item" onclick="setModel(this,'k2')">
+                    <span class="cmd">k2</span><span class="desc">均衡快速</span><span class="cur"></span>
+                  </button>
+                  <button class="pop-item" onclick="setModel(this,'gpt-5-codex')">
+                    <span class="cmd">gpt-5-codex</span><span class="desc">OpenAI 兼容端点</span><span class="cur"></span>
+                  </button>
+                </div>
+              </span>
+              <button class="c-chip" title="取消当前 turn">■ 停止</button>
+              <button class="send" id="send-btn" onclick="fakeSend()">发送 ⏎</button>
+            </div>
+          </div>
+        </div>
+        <div class="hint"><kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · <kbd>/</kbd> 命令 · 回合进行中发送将<b>排队</b> · <kbd>Esc</kbd> 取消当前回合</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ═══════ 右栏：检视台 ═══════ -->
+  <aside class="inspector">
+    <div class="insp-tabs">
+      <button class="insp-tab on">PLAN</button>
+      <button class="insp-tab">VERIFY</button>
+      <button class="insp-tab">DIFF</button>
+      <button class="insp-tab">CKPT</button>
+    </div>
+    <div class="insp-body">
+
+      <div class="insp-sec">计划 · 台阶</div>
+      <div class="stairs">
+        <div class="stair done"><span class="st">✓</span><span>探索 client-protocol 契约</span></div>
+        <div class="stair done"><span class="st">✓</span><span>搭建 leveler-web 骨架</span></div>
+        <div class="stair now"><span class="st">◍</span><span>WS 桥接 + Lagged 重同步</span></div>
+        <div class="stair"><span class="st">·</span><span>REST: sessions / snapshot</span></div>
+        <div class="stair"><span class="st">·</span><span>嵌入前端 + CLI 接入</span></div>
+      </div>
+
+      <div class="insp-sec">验证</div>
+      <div class="checks">
+        <div class="check ok"><span class="st">✓</span><span>cargo check --workspace</span></div>
+        <div class="check ok"><span class="st">✓</span><span>cargo test -p leveler-web</span></div>
+        <div class="check wait"><span class="st">·</span><span>cargo clippy --all-targets</span></div>
+      </div>
+
+      <div class="insp-sec">本回合</div>
+      <dl class="kv">
+        <dt>tokens in/out</dt><dd>48.2k / 6.1k</dd>
+        <dt>tool calls</dt><dd>17</dd>
+        <dt>files touched</dt><dd>6</dd>
+        <dt>elapsed</dt><dd>2m 41s</dd>
+        <dt>checkpoints</dt><dd class="good">2 saved</dd>
+      </dl>
+
+      <div class="insp-sec">活动工具</div>
+      <div class="checks">
+        <div class="check wait"><span class="st" style="color:var(--amber)">◍</span><span>bash: cargo test -p leveler-web</span></div>
+      </div>
+
+    </div>
+  </aside>
+</div>
+
+<!-- ═══════ 新建项目模态框 ═══════ -->
+<div class="modal-mask" id="proj-modal" hidden onclick="if(event.target===this)closeProjModal()">
+  <div class="modal">
+    <div class="m-head">
+      <span>NEW PROJECT · 添加项目</span>
+      <button class="m-close" onclick="closeProjModal()">✕</button>
+    </div>
+    <div class="m-body">
+      <label for="proj-path">REPOSITORY PATH</label>
+      <input id="proj-path" placeholder="~/Develop/app/my-repo" spellcheck="false">
+      <div class="m-tip">
+        该路径会成为新会话的工作区根目录。实现上对应
+        <code>CreateSessionRequest.repository</code>（协议需新增字段），
+        网关按仓库懒加载独立的 runtime。
+      </div>
+    </div>
+    <div class="m-actions">
+      <button class="mbtn" onclick="closeProjModal()">取消</button>
+      <button class="mbtn primary" onclick="addProject()">添加项目</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── 演示：流式追加 ──
+  const tail = document.getElementById('stream-tail');
+  const demo = " 另外我把审批卡的快捷键（y/s/a/n）接进了全局 keymap，焦点在输入框时自动忽略。";
+  let i = 0;
+  setTimeout(function tick() {
+    if (i < demo.length) {
+      // 处理 < > 以外的纯文本逐字追加
+      tail.textContent += demo.slice(i, i + 2);
+      i += 2;
+      setTimeout(tick, 40);
+    }
+  }, 1200);
+
+  // ── 演示：工具展开 ──
+  const t = document.getElementById('tool-expand');
+  const p = document.getElementById('tool-preview');
+  t.addEventListener('click', () => { p.hidden = !p.hidden; });
+
+  // ── 演示：审批 ──
+  function dismissApproval() {
+    const a = document.getElementById('approval');
+    a.style.transition = 'opacity .3s, transform .3s';
+    a.style.opacity = '0';
+    a.style.transform = 'translateY(-6px)';
+    setTimeout(() => a.remove(), 320);
+  }
+  document.addEventListener('keydown', (e) => {
+    if (['y','s','a','n'].includes(e.key) && document.activeElement.tagName !== 'TEXTAREA') dismissApproval();
+  });
+
+  // ── 演示：发送（回合进行中 → 排队）──
+  let RUNNING = true; // 演示：当前回合进行中
+  function fakeSend() {
+    const ta = document.getElementById('composer');
+    const text = ta.value.trim();
+    if (!text) { ta.focus(); return; }
+    if (RUNNING) {
+      enqueue(text);
+    }
+    // 空状态页发送首条消息 → 进入对话视图
+    if (!document.getElementById('hero').hidden) showChat();
+    ta.value = '';
+    ta.focus();
+  }
+  function enqueue(text) {
+    const item = document.createElement('div');
+    item.className = 'q-item';
+    item.innerHTML =
+      `<span class="q-tag">QUEUED</span>
+       <span class="q-text"></span>
+       <button class="q-x" onclick="dequeue(this)" title="取消排队">✕</button>`;
+    item.querySelector('.q-text').textContent = text;
+    document.getElementById('queue').appendChild(item);
+  }
+  function dequeue(btn) {
+    const item = btn.closest('.q-item');
+    item.style.transition = 'opacity .2s';
+    item.style.opacity = '0';
+    setTimeout(() => item.remove(), 200);
+  }
+
+  // ── 视图切换：空状态 ⇄ 对话 ──
+  function showChat() {
+    document.getElementById('hero').hidden = true;
+    document.getElementById('timeline').hidden = false;
+  }
+  function showHero(projName) {
+    if (projName) document.getElementById('hero-proj-name').textContent = projName;
+    document.getElementById('hero').hidden = false;
+    document.getElementById('timeline').hidden = true;
+  }
+  // 点击已有会话 → 对话视图（事件委托，动态新增的会话也生效）
+  document.getElementById('sessions').addEventListener('click', (e) => {
+    const sess = e.target.closest('.sess');
+    if (!sess) return;
+    document.querySelectorAll('.sess.active').forEach(s => s.classList.remove('active'));
+    sess.classList.add('active');
+    const t = sess.querySelector('.t').textContent;
+    if (!t.includes('未开始')) {
+      document.getElementById('stage-title').textContent = t;
+      showChat();
+    }
+  });
+
+  // ── 空状态：项目选择器 ──
+  const heroPop = document.getElementById('hero-proj-pop');
+  function toggleHeroProj(e) { e.stopPropagation(); heroPop.hidden = !heroPop.hidden; }
+  function closeHeroProj() { heroPop.hidden = true; }
+  function pickHeroProj(item, name) {
+    document.getElementById('hero-proj-name').textContent = name;
+    heroPop.querySelectorAll('.pop-item').forEach(el => el.classList.remove('sel'));
+    item.classList.add('sel');
+    heroPop.hidden = true;
+  }
+
+  // ── 执行模式 ──
+  const modePop = document.getElementById('mode-pop');
+  function toggleMode(e) { e.stopPropagation(); modePop.hidden = !modePop.hidden; }
+  function setMode(item, mode) {
+    document.getElementById('mode-label').textContent = mode;
+    modePop.querySelectorAll('.pop-item').forEach(el => el.classList.remove('sel'));
+    item.classList.add('sel');
+    modePop.hidden = true;
+  }
+
+  // ── 模型选择（→ ClientCommand::SelectModel）──
+  const modelPop = document.getElementById('model-pop');
+  function toggleModel(e) { e.stopPropagation(); modelPop.hidden = !modelPop.hidden; }
+  function setModel(item, model) {
+    document.getElementById('model-label').textContent = model;
+    modelPop.querySelectorAll('.pop-item').forEach(el => el.classList.remove('sel'));
+    modelPop.querySelectorAll('.cur').forEach(el => el.textContent = '');
+    item.classList.add('sel');
+    item.querySelector('.cur').textContent = '当前';
+    modelPop.hidden = true;
+  }
+
+  // ── 项目分组折叠 ──
+  function toggleProj(btn) {
+    btn.closest('[data-proj]').classList.toggle('closed');
+  }
+
+  // ── 新建项目 ──
+  const projModal = document.getElementById('proj-modal');
+  const projPath = document.getElementById('proj-path');
+  function openProjModal() {
+    projModal.hidden = false;
+    projPath.value = '';
+    setTimeout(() => projPath.focus(), 30);
+  }
+  function closeProjModal() { projModal.hidden = true; }
+  function addProject() {
+    const path = projPath.value.trim() || '~/Develop/app/my-repo';
+    const name = path.replace(/\/+$/, '').split('/').pop();
+    const el = document.createElement('div');
+    el.className = 'proj';
+    el.setAttribute('data-proj', '');
+    el.innerHTML =
+      `<button class="proj-head" onclick="toggleProj(this)">
+         <span class="fold">▼</span>
+         <span class="pmeta">
+           <span class="pname">${name}</span>
+           <span class="ppath">${path}</span>
+         </span>
+         <span class="pcount">0</span>
+         <button class="p-add" title="在此项目中新建对话" onclick="newSession(this, '${name}')">＋</button>
+       </button>
+       <div class="proj-sessions"></div>`;
+    document.getElementById('sessions').appendChild(el);
+    closeProjModal();
+  }
+  projPath.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') addProject();
+    if (e.key === 'Escape') closeProjModal();
+  });
+
+  // ── 项目内新建对话：空状态页 + 项目预选，首条消息即 goal ──
+  function newSession(btn, projName) {
+    event.stopPropagation();
+    const list = btn.closest('[data-proj]').querySelector('.proj-sessions');
+    document.querySelectorAll('.sess.active').forEach(s => s.classList.remove('active'));
+    const sess = document.createElement('button');
+    sess.className = 'sess active';
+    sess.innerHTML =
+      `<div class="t" style="color:var(--ink-faint);font-style:italic">新对话（未开始）</div>
+       <div class="m"><i class="dot wait"></i><span>DRAFT</span><span>·</span><span>now</span></div>`;
+    list.prepend(sess);
+    const count = btn.closest('.proj-head').querySelector('.pcount');
+    count.textContent = parseInt(count.textContent) + 1;
+    document.getElementById('stage-title').textContent = projName + ' · 新对话';
+    showHero(projName);
+    document.getElementById('composer').focus();
+  }
+
+  // ── 权限档位（→ ClientCommand::SetPermissionProfile）──
+  const PERMS = {
+    ask:    { label: 'ASK',         cls: 'p-ask',    profile: 'request_approval' },
+    assist: { label: 'ASSISTED',    cls: 'p-assist', profile: 'assisted' },
+    full:   { label: 'FULL ACCESS', cls: 'p-full',   profile: 'full_access' },
+  };
+  const permBtn = document.getElementById('perm-btn');
+  const permPop = document.getElementById('perm-pop');
+  function togglePerm(e) {
+    e.stopPropagation();
+    permPop.hidden = !permPop.hidden;
+  }
+  function setPerm(item, key) {
+    const p = PERMS[key];
+    permBtn.className = 'c-chip perm-btn ' + p.cls;
+    document.getElementById('perm-label').textContent = p.label;
+    permPop.querySelectorAll('.pop-item').forEach(el => el.classList.remove('sel'));
+    permPop.querySelectorAll('.cur').forEach(el => el.textContent = '');
+    item.classList.add('sel');
+    item.querySelector('.cur').textContent = '当前';
+    permPop.hidden = true;
+    // 实际实现：deliver SetPermissionProfile { profile: p.profile }
+  }
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.perm-wrap')) {
+      permPop.hidden = true;
+      document.getElementById('mode-pop').hidden = true;
+      document.getElementById('model-pop').hidden = true;
+    }
+    if (!e.target.closest('.h-proj')) heroPop.hidden = true;
+  });
+
+  // ── 斜杠命令面板（映射 ClientCommand 变体）──
+  const SLASH = [
+    ['/model',      '切换模型',                'SelectModel'],
+    ['/mode',       '切换 agent 模式',          'SetAgentMode'],
+    ['/perm',       '切换权限档位',             'SetPermissionProfile'],
+    ['/compact',    '压缩上下文',               'CompactContext'],
+    ['/clear',      '清空对话',                 'ClearConversation'],
+    ['/diff',       '查看当前变更',             'RequestDiff'],
+    ['/checkpoint', '回滚到检查点',             'RestoreCheckpoint'],
+    ['/memory',     '查看 / 遗忘项目记忆',      'ListMemory / ForgetMemory'],
+    ['/cancel',     '取消当前回合',             'CancelCurrentTurn'],
+    ['/btw',        '侧问（不打断当前回合）',   'Btw'],
+  ];
+  const ta = document.getElementById('composer');
+  const slashPop = document.getElementById('slash-pop');
+  const slashList = document.getElementById('slash-list');
+  ta.addEventListener('input', () => {
+    const v = ta.value;
+    if (!v.startsWith('/')) { slashPop.hidden = true; return; }
+    const q = v.slice(1).toLowerCase();
+    const hits = SLASH.filter(c => c[0].slice(1).startsWith(q));
+    if (!hits.length) { slashPop.hidden = true; return; }
+    slashList.innerHTML = hits.map((c, idx) =>
+      `<button class="pop-item${idx === 0 ? ' sel' : ''}" onclick="pickSlash('${c[0]}')">
+         <span class="cmd">${c[0]}</span>
+         <span class="desc">${c[1]}</span>
+         <span class="cur">${c[2]}</span>
+       </button>`).join('');
+    slashPop.hidden = false;
+  });
+  function pickSlash(cmd) {
+    ta.value = cmd + ' ';
+    slashPop.hidden = true;
+    ta.focus();
+  }
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') slashPop.hidden = true;
+    if (e.key === 'Tab' && !slashPop.hidden) {
+      e.preventDefault();
+      const first = slashList.querySelector('.cmd');
+      if (first) pickSlash(first.textContent);
+    }
+  });
+
+  // 自动滚动到底部
+  const tl = document.getElementById('timeline');
+  tl.scrollTop = tl.scrollHeight;
+</script>
+</body>
+</html>

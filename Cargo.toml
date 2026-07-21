@@ -25,6 +25,7 @@ members = [
     "crates/leveler-local-transport",
     "crates/leveler-media",
     "crates/leveler-tui",
+    "crates/leveler-web",
     "crates/leveler-cli",
     "crates/leveler-test-support",
 ]
@@ -63,6 +64,7 @@ leveler-client-protocol = { version = "0.1.1", path = "crates/leveler-client-pro
 leveler-local-transport = { version = "0.1.1", path = "crates/leveler-local-transport" }
 leveler-media = { version = "0.1.1", path = "crates/leveler-media" }
 leveler-tui = { version = "0.1.1", path = "crates/leveler-tui" }
+leveler-web = { version = "0.1.1", path = "crates/leveler-web" }
 leveler-test-support = { version = "0.1.1", path = "crates/leveler-test-support" }
 
 # Async runtime
@@ -81,6 +83,12 @@ reqwest = { version = "0.12", default-features = false, features = [
     "gzip",
 ] }
 bytes = "1"
+
+# Web UI server (browser client)
+axum = { version = "0.8", features = ["ws", "json", "multipart"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
+ignore = "0.4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
