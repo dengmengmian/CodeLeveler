@@ -42,6 +42,7 @@ export class RuntimeBridge {
   start(): void {
     this.ws.connect();
     this.requestSessionList();
+    void this.refreshProjects();
   }
 
   dispose(): void {
@@ -60,6 +61,9 @@ export class RuntimeBridge {
         return;
       case 'ack':
         return; // 送达回执，目前无需展示
+      case 'project_status':
+        this.dispatch({ type: 'project_status', path: frame.path, status: frame.status });
+        return;
       case 'error':
         this.dispatch({ type: 'notice', message: `服务端错误 ${frame.code}: ${frame.message}` });
         return;
@@ -233,8 +237,49 @@ export class RuntimeBridge {
     this.deliver({ type: 'open_session', session_id: id });
   }
 
-  newDraft(): void {
-    this.dispatch({ type: 'new_draft' });
+  newDraft(project?: string): void {
+    this.dispatch({ type: 'new_draft', project: project ?? null });
+  }
+
+  // ── 多项目（聚合层）─────────────────────────────────────────────────
+
+  async refreshProjects(): Promise<void> {
+    try {
+      const { projects } = await api.listProjects();
+      this.dispatch({ type: 'projects', projects });
+    } catch {
+      // 单项目模式（无聚合层）或瞬时失败：静默，项目分组仍按会话列表渲染
+    }
+  }
+
+  async addProject(path: string): Promise<boolean> {
+    try {
+      await api.addProject(path);
+      await this.refreshProjects();
+      this.requestSessionList();
+      return true;
+    } catch (err) {
+      this.notice(`打开项目失败：${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  async removeProject(path: string): Promise<void> {
+    try {
+      await api.removeProject(path);
+      await this.refreshProjects();
+    } catch (err) {
+      this.notice(`移除项目失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async restartProject(path: string): Promise<void> {
+    try {
+      await api.restartProject(path);
+      this.notice('项目 daemon 重启中…');
+    } catch (err) {
+      this.notice(`重启失败：${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // ── 发消息（含排队）────────────────────────────────────────────────
@@ -256,6 +301,7 @@ export class RuntimeBridge {
           text,
           state.current?.model ?? null,
           state.current?.permission ?? 'assisted',
+          state.draftProject ?? undefined,
         );
         this.dispatch({
           type: 'snapshot',

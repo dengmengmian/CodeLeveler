@@ -766,3 +766,26 @@ button { font-family: inherit; }
   font-family: var(--mono); font-size: 11px; padding: 0;
 }
 .attach-x:hover { color: var(--danger); }
+
+/* ============ 多项目：打开项目 / 项目状态点 ============ */
+.p-open {
+  font-family: var(--mono); font-size: 11px; color: var(--accent);
+  background: none; border: 1px solid var(--accent-border); border-radius: 3px;
+  padding: 2px 8px; cursor: pointer;
+}
+.p-open:hover { background: var(--accent); color: var(--send-ink); }
+.add-proj { display: flex; gap: 6px; padding: 4px 4px 8px; }
+.add-proj .rp-input { margin-bottom: 0; flex: 1; }
+.add-go {
+  font-family: var(--mono); font-size: 11.5px; color: var(--send-ink);
+  background: var(--send); border: none; border-radius: 3px;
+  padding: 0 12px; cursor: pointer; flex: none;
+}
+.add-go:disabled { opacity: .5; cursor: not-allowed; }
+.pdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.pdot.online { background: var(--success); }
+.pdot.starting { background: var(--warning); animation: pulse 1.6s infinite; }
+.pdot.offline { background: var(--danger); }
+.proj-head .pname { display: flex; align-items: center; }
+.p-add.restart { color: var(--danger); border-color: var(--danger-border); opacity: 1; }
+.p-add.restart:hover { background: var(--danger); color: var(--send-ink); }

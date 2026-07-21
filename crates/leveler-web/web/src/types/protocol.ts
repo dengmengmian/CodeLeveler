@@ -273,14 +273,26 @@ export type DownFrame =
   | { type: 'snapshot'; session: UiSessionSnapshot }
   | { type: 'ack'; command_id: CommandId }
   | { type: 'error'; code: string; message: string; command_id: CommandId | null }
+  | { type: 'project_status'; path: string; status: ProjectStatus }
   | { type: 'resync_required'; session_id: SessionId };
 
+// ── 多项目（leveler-web 聚合层 REST）─────────────────────────────────
+export type ProjectStatus = 'online' | 'starting' | 'offline';
+
+export interface ProjectInfo {
+  path: string;
+  name: string;
+  status: ProjectStatus;
+  sessions: number;
+}
+
 // ── leveler-local-transport：REST DTO ───────────────────────────────
-/** CreateSessionRequest（leveler-local-transport/src/lib.rs） */
+/** CreateSessionRequest（leveler-local-transport/src/lib.rs；`project` 是 WebUI 聚合层扩展） */
 export interface CreateSessionRequest {
   goal: string;
   model: ModelRef | null;
   mode: PermissionProfile;
+  project?: string;
 }
 
 /** SessionBootstrap = POST /api/sessions 的响应。 */

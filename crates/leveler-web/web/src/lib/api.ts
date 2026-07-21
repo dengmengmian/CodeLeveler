@@ -5,6 +5,7 @@ import type {
   CreateSessionRequest,
   PermissionProfile,
   ModelRef,
+  ProjectInfo,
   SessionBootstrap,
   SessionId,
   UiSessionSnapshot,
@@ -45,11 +46,38 @@ export function createSession(
   goal: string,
   model: ModelRef | null,
   mode: PermissionProfile,
+  project?: string,
 ): Promise<SessionBootstrap> {
-  const body: CreateSessionRequest = { goal, model, mode };
+  const body: CreateSessionRequest = { goal, model, mode, ...(project ? { project } : {}) };
   return request<SessionBootstrap>('/api/sessions', {
     method: 'POST',
     body: JSON.stringify(body),
+  });
+}
+
+// ── 多项目管理（聚合层）──────────────────────────────────────────────
+
+export function listProjects(): Promise<{ projects: ProjectInfo[] }> {
+  return request<{ projects: ProjectInfo[] }>('/api/projects');
+}
+
+export function addProject(path: string): Promise<{ project: ProjectInfo }> {
+  return request<{ project: ProjectInfo }>('/api/projects', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
+
+export function removeProject(path: string): Promise<void> {
+  return request<void>(`/api/projects?path=${encodeURIComponent(path)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function restartProject(path: string): Promise<void> {
+  return request<void>('/api/projects/restart', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
   });
 }
 

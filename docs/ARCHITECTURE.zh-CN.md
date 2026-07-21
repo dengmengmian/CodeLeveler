@@ -154,6 +154,21 @@ loopback**——`bind` 拒绝非 loopback 地址——且每个入口都要求 2
 （常数时间比较）；前端构建在编译期嵌入。跨机访问（如手机）应经隧道终止 TLS 再转发
 到 loopback，而非直接绑定公网地址。详见 `crates/leveler-web/README.md`。
 
+**多项目。** `leveler web` 可以在一个页面聚合多个仓库：当前仓库保持进程内
+runtime 不变；其他项目由 per-repo daemon 承载。打开项目时先探测该仓库的
+daemon Unix socket（复用已在跑的 daemon，比如用户自己的 `leveler tui`）；
+探测不到才 spawn `leveler --repo <path> serve --ready-json <file>`，就绪文件
+出现后经 Unix socket 连接——spawn 的 daemon 无需 token。`RouterService`
+（自身也是 `LocalRuntimeService`）按 session→项目 映射路由命令、快照与按
+会话的事件订阅，REST 与 WS 层看到的仍是单一门面；WS 按连接订阅会话流，
+不同会话/项目的标签页互不串台。daemon socket 位于
+`<home>/sock/<仓库路径哈希>.sock`——短且稳定（macOS 的 `sun_path` 约 104
+字节，装不下深路径仓库的哈希 state 目录）——同时兼任所有权锁：`serve --tcp`
+也会绑定它，同一仓库上的第二个 daemon 立即失败，而不是把第一个的活跃 turn
+当僵尸回收（TCP 模式的 token 经 `LEVELER_DAEMON_TOKEN` 环境变量传入，永不
+走 argv）。项目注册表 `~/.leveler/web-projects.json` 只存仓库路径；web 重启
+后仍活着的 daemon 靠 socket 探测重新接管，不信任 pid。
+
 ## 扩展点
 
 - **Provider / 协议：** 实现 runtime 与 protocol adapter，或配置兼容 endpoint。

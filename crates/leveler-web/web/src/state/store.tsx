@@ -8,6 +8,8 @@ import type {
   AttachmentRef,
   ModelRef,
   PermissionProfile,
+  ProjectInfo,
+  ProjectStatus,
   SessionId,
   ToolCallId,
   UiApprovalRequest,
@@ -106,6 +108,10 @@ export interface AppState {
   notice: string | null;
   /** 已上传、待随下一条消息提交的附件 */
   pendingAttachments: AttachmentRef[];
+  /** 聚合层注册的项目（含状态）；空数组表示尚未拉取或单项目模式 */
+  projects: ProjectInfo[];
+  /** 新对话的目标项目（= 项目分组上的 ＋ 入口）；null = 当前仓库 */
+  draftProject: string | null;
 }
 
 export const initialState: AppState = {
@@ -117,6 +123,8 @@ export const initialState: AppState = {
   queue: [],
   notice: null,
   pendingAttachments: [],
+  projects: [],
+  draftProject: null,
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -126,7 +134,7 @@ export type Action =
   | { type: 'session_list'; sessions: UiSessionSummary[] }
   | { type: 'snapshot'; session: UiSessionSnapshot; contextWindow?: number | null }
   | { type: 'select_session'; id: SessionId }
-  | { type: 'new_draft' }
+  | { type: 'new_draft'; project?: string | null }
   | { type: 'user_message'; id: string; text: string; time: string }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
@@ -158,6 +166,8 @@ export type Action =
   | { type: 'attachment_added'; attachment: AttachmentRef }
   | { type: 'attachment_removed'; id: string }
   | { type: 'attachments_cleared' }
+  | { type: 'projects'; projects: ProjectInfo[] }
+  | { type: 'project_status'; path: string; status: ProjectStatus }
   | { type: 'notice'; message: string | null };
 
 // ── snapshot → SessionView ──────────────────────────────────────────
@@ -258,6 +268,7 @@ export function reducer(state: AppState, action: Action): void {
     case 'new_draft':
       state.draft = true;
       state.current = null;
+      state.draftProject = action.project ?? null;
       return;
     case 'user_message': {
       if (!state.current) return;
@@ -462,6 +473,14 @@ export function reducer(state: AppState, action: Action): void {
     case 'attachments_cleared':
       state.pendingAttachments = [];
       return;
+    case 'projects':
+      state.projects = action.projects;
+      return;
+    case 'project_status': {
+      const p = state.projects.find((p) => p.path === action.path);
+      if (p) p.status = action.status;
+      return;
+    }
     case 'notice':
       state.notice = action.message;
       return;

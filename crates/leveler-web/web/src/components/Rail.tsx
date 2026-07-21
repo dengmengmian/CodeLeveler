@@ -78,6 +78,9 @@ function SessionsPanel() {
   const state = useAppState();
   const bridge = useBridge();
   const [closed, setClosed] = useState<ReadonlySet<string>>(new Set());
+  const [adding, setAdding] = useState(false);
+  const [newPath, setNewPath] = useState('');
+  const [busy, setBusy] = useState(false);
 
   // 按 repository 分组；保持首见顺序，组内按 updated_at 倒序（新的在前）
   const groups = useMemo<ProjectGroup[]>(() => {
@@ -103,8 +106,47 @@ function SessionsPanel() {
     });
   };
 
+  const projectStatus = (repo: string) =>
+    state.projects.find((p) => p.path === repo)?.status ?? null;
+
+  const submitAdd = async () => {
+    const path = newPath.trim();
+    if (!path || busy) return;
+    setBusy(true);
+    const ok = await bridge.addProject(path);
+    setBusy(false);
+    if (ok) {
+      setNewPath('');
+      setAdding(false);
+    }
+  };
+
   return (
     <div className="sessions">
+      <div className="rail-head">
+        <span>项目</span>
+        <button className="p-open" title="打开项目（注册一个仓库目录）" onClick={() => setAdding((v) => !v)}>
+          ＋ 打开项目
+        </button>
+      </div>
+      {adding && (
+        <div className="add-proj">
+          <input
+            className="rp-input"
+            placeholder="仓库绝对路径，如 /Users/me/repo"
+            value={newPath}
+            autoFocus
+            onChange={(e) => setNewPath(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void submitAdd();
+              if (e.key === 'Escape') setAdding(false);
+            }}
+          />
+          <button className="add-go" disabled={busy || !newPath.trim()} onClick={() => void submitAdd()}>
+            {busy ? '打开中…' : '打开'}
+          </button>
+        </div>
+      )}
       {groups.length === 0 && (
         <div className="rail-empty">
           还没有会话。
@@ -112,49 +154,69 @@ function SessionsPanel() {
           点击「＋ 新对话」或在下方输入开始。
         </div>
       )}
-      {groups.map((g) => (
-        <div className={`proj${closed.has(g.repository) ? ' closed' : ''}`} key={g.repository || '_'}>
-          <button className="proj-head" onClick={() => toggle(g.repository)}>
-            <span className="fold">▼</span>
-            <span className="pmeta">
-              <span className="pname">{repoShortName(g.repository)}</span>
-              <span className="ppath">{g.repository || '当前仓库'}</span>
-            </span>
-            <span className="pcount">{g.sessions.length}</span>
-            <span
-              className="p-add"
-              role="button"
-              title="在此项目中新建对话"
-              onClick={(e) => {
-                e.stopPropagation();
-                bridge.newDraft();
-              }}
-            >
-              ＋
-            </span>
-          </button>
-          <div className="proj-sessions">
-            {g.sessions.map((s) => {
-              const dot = statusDot(s.status);
-              return (
-                <button
-                  key={s.id}
-                  className={`sess${state.current?.id === s.id ? ' active' : ''}`}
-                  onClick={() => bridge.selectSession(s.id)}
+      {groups.map((g) => {
+        const status = projectStatus(g.repository);
+        return (
+          <div className={`proj${closed.has(g.repository) ? ' closed' : ''}`} key={g.repository || '_'}>
+            <button className="proj-head" onClick={() => toggle(g.repository)}>
+              <span className="fold">▼</span>
+              <span className="pmeta">
+                <span className="pname">
+                  {status && <i className={`pdot ${status}`} />}
+                  {repoShortName(g.repository)}
+                </span>
+                <span className="ppath">{g.repository || '当前仓库'}</span>
+              </span>
+              <span className="pcount">{g.sessions.length}</span>
+              {status === 'offline' ? (
+                <span
+                  className="p-add restart"
+                  role="button"
+                  title="重启该项目 daemon"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void bridge.restartProject(g.repository);
+                  }}
                 >
-                  <div className="t">{s.goal || '未命名会话'}</div>
-                  <div className="m">
-                    <i className={`dot ${dot.cls}`} />
-                    <span>{dot.label}</span>
-                    <span>·</span>
-                    <span>{formatRelative(s.updated_at)}</span>
-                  </div>
-                </button>
-              );
-            })}
+                  ⟳
+                </span>
+              ) : (
+                <span
+                  className="p-add"
+                  role="button"
+                  title="在此项目中新建对话"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    bridge.newDraft(g.repository || undefined);
+                  }}
+                >
+                  ＋
+                </span>
+              )}
+            </button>
+            <div className="proj-sessions">
+              {g.sessions.map((s) => {
+                const dot = statusDot(s.status);
+                return (
+                  <button
+                    key={s.id}
+                    className={`sess${state.current?.id === s.id ? ' active' : ''}`}
+                    onClick={() => bridge.selectSession(s.id)}
+                  >
+                    <div className="t">{s.goal || '未命名会话'}</div>
+                    <div className="m">
+                      <i className={`dot ${dot.cls}`} />
+                      <span>{dot.label}</span>
+                      <span>·</span>
+                      <span>{formatRelative(s.updated_at)}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

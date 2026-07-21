@@ -183,6 +183,25 @@ compared in constant time; the frontend build is embedded at compile time. Off
 TLS and forwards to loopback, not by binding a public address. See
 `crates/leveler-web/README.md`.
 
+**Multi-project.** `leveler web` can aggregate several repositories in one UI.
+The current repo keeps its in-process runtime; additional projects are served
+by per-repo daemons. Opening a project probes the repo's daemon Unix socket
+first (reusing e.g. a running `leveler tui` daemon); otherwise the web process
+spawns `leveler --repo <path> serve --ready-json <file>` and connects over the
+Unix socket once the readiness file appears — spawned daemons need no token. A
+`RouterService` (itself a `LocalRuntimeService`) routes commands, snapshots,
+and per-session event subscriptions by session→project mapping, so the REST
+and WS layers see one facade; per-session WS subscriptions keep tabs on
+different sessions or projects from seeing each other's traffic. The daemon
+socket lives at `<home>/sock/<repo-path-hash>.sock` — short and stable, since
+`sun_path` (~104 bytes on macOS) cannot fit the hashed state-dir path for deep
+repos — and doubles as the ownership lock: `serve --tcp` binds it too, so a
+second daemon on the same repo fails fast instead of reaping the first
+daemon's active turns. (TCP mode reads its bearer token from
+`LEVELER_DAEMON_TOKEN` — never argv.) The project registry at
+`~/.leveler/web-projects.json` stores repository paths only; daemons that
+outlive a web restart are rediscovered by socket probe, not by trusting pids.
+
 ## Extension points
 
 - **Providers and protocols:** implement the model runtime and protocol adapter
