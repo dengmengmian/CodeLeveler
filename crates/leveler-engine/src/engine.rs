@@ -43,6 +43,7 @@ fn recovery_preview(text: &str) -> String {
 }
 
 /// Everything needed to create a task.
+#[derive(Clone)]
 pub struct TaskSpec {
     pub repository: PathBuf,
     pub goal: String,
@@ -58,6 +59,10 @@ pub struct TaskSpec {
     /// The post-edit verification plan (empty = nothing to verify → the task
     /// can at best finish `CompletedUnverified`).
     pub verification: VerificationPlan,
+    /// The repo's `HEAD` at task start, used as the baseline for delta
+    /// attribution of gate failures. Callers leave this `None`; the engine
+    /// stamps it (from `git rev-parse HEAD`) before the first turn edits.
+    pub base_commit: Option<String>,
 }
 
 fn goal_profile(spec: &TaskSpec) -> TurnProfile {
@@ -310,6 +315,26 @@ impl TaskEngine {
             observer,
         )
         .await?;
+
+        // Stamp the pre-change baseline anchor onto the spec, captured before
+        // any turn edits so the post-edit gate can tell this change's failures
+        // from ones the repo already carried (see `baseline`). Carried on the
+        // spec so every path that reaches `verify` — including resume — sees it
+        // without threading. None (left as-is) outside a git work tree.
+        let owned_spec;
+        let spec = if spec.base_commit.is_none() {
+            if let Some(head) = crate::baseline::capture_head(&spec.repository).await {
+                owned_spec = TaskSpec {
+                    base_commit: Some(head),
+                    ..spec.clone()
+                };
+                &owned_spec
+            } else {
+                spec
+            }
+        } else {
+            spec
+        };
 
         let result = match spec.kind {
             ExecutionKind::Direct => {
@@ -1891,8 +1916,12 @@ impl TaskEngine {
             &spec.repository,
             self.factory.tool_context.environment.clone(),
         );
-        let plan = gate_plan(spec);
-        let report = verifier
+        let mut plan = gate_plan(spec);
+        // Blast-radius scoping: a change that touches no compiled input (docs,
+        // scripts, lock files) must not run — and be blamed for — the whole
+        // workspace's pre-existing red. Downgrades those gates to non-gating.
+        plan.scope_gates_to_changes(modified_files);
+        let mut report = verifier
             .verify(
                 &plan,
                 allowed_paths,
@@ -1901,6 +1930,22 @@ impl TaskEngine {
                 &mut |_| {},
             )
             .await;
+
+        // Attribute pre-existing/flaky failures to the baseline so only THIS
+        // change's failures gate completion. No-op when the gate is green or no
+        // baseline is available (`base_commit` captured at task start).
+        if let Some(base_commit) = spec.base_commit.as_deref() {
+            crate::baseline::reconcile_with_baseline(
+                &mut report,
+                &spec.repository,
+                base_commit,
+                &plan,
+                modified_files,
+                self.factory.tool_context.environment.clone(),
+                cancellation,
+            )
+            .await;
+        }
         for check in &report.checks {
             log.append(
                 None,
@@ -2337,6 +2382,7 @@ mod gate_plan_tests {
             continuation: ContinuationPolicy::UntilTerminal,
             limits: StepLimits::default(),
             verification,
+            base_commit: None,
         }
     }
 

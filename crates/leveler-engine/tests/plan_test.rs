@@ -217,6 +217,7 @@ fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
         continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
         limits: leveler_agent::StepLimits::default(),
         verification: plan,
+        base_commit: None,
     }
 }
 

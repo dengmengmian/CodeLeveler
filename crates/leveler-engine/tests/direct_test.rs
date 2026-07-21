@@ -244,6 +244,7 @@ fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
         continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
         limits: leveler_agent::StepLimits::default(),
         verification: plan,
+        base_commit: None,
     }
 }
 
@@ -978,6 +979,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
         limits: leveler_agent::StepLimits::default(),
         verification: VerificationPlan::default(),
+        base_commit: None,
     };
 
     let report = engine2

@@ -116,9 +116,11 @@ mod tests {
                 status: CheckStatus::Passed,
                 evidence: String::new(),
                 failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: vec![],
+            baseline_failures: Vec::new(),
         }
     }
 
@@ -131,9 +133,11 @@ mod tests {
                 status: CheckStatus::Failed,
                 evidence: String::new(),
                 failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: vec![],
+            baseline_failures: Vec::new(),
         }
     }
 
@@ -146,9 +150,11 @@ mod tests {
                 status: CheckStatus::ToolMissing,
                 evidence: String::new(),
                 failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: vec![],
+            baseline_failures: Vec::new(),
         }
     }
 

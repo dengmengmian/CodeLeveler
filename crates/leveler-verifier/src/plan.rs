@@ -159,6 +159,90 @@ impl VerificationPlan {
     pub fn has_gates(&self) -> bool {
         self.commands.iter().any(|c| c.gating)
     }
+
+    /// Downgrade build/test/lint gates to non-gating when the change cannot
+    /// affect them, so a whole-workspace `cargo test` (etc.) is neither run nor
+    /// blamed for its pre-existing red on a commit that only touched docs,
+    /// scripts, lock files, or other non-compiled inputs.
+    ///
+    /// Conservative by construction — the gates stand unless EVERY modified file
+    /// is provably inert:
+    /// - Anything inside a compiled/consumed source tree (`src/`, `tests/`,
+    ///   `benches/`, `examples/`) keeps the gates: a fixture there could be an
+    ///   `include_str!` input.
+    /// - Any known source / manifest / build-driver file (by name or extension,
+    ///   across the ecosystems we gate) keeps them.
+    /// - Empty `modified_files` (unknown blast radius) keeps them.
+    ///
+    /// Known blind spot: a repo whose tests read a tracked top-level `*.sh` or
+    /// `include_str!` a `.md` living outside a source dir would have that
+    /// dependency treated as inert. Fixtures under `src/`/`tests/` are covered.
+    pub fn scope_gates_to_changes(&mut self, modified_files: &[String]) {
+        if modified_files.is_empty() || modified_files.iter().any(|f| is_build_relevant(f)) {
+            return;
+        }
+        for cmd in &mut self.commands {
+            if matches!(
+                cmd.kind,
+                CheckKind::Build | CheckKind::Test | CheckKind::Lint
+            ) {
+                cmd.gating = false;
+            }
+        }
+    }
+}
+
+/// Whether a modified path could affect a build or test outcome. Conservative:
+/// unknown files outside a source tree are treated as inert (return `false`);
+/// see [`VerificationPlan::scope_gates_to_changes`] for the trade-off.
+fn is_build_relevant(path: &str) -> bool {
+    let norm = path.trim_start_matches("./");
+
+    // Inside a compiled/consumed source tree → may be an include!/fixture input.
+    for seg in ["src", "tests", "test", "benches", "examples"] {
+        if norm == seg || norm.starts_with(&format!("{seg}/")) || norm.contains(&format!("/{seg}/"))
+        {
+            return true;
+        }
+    }
+
+    let base = norm.rsplit('/').next().unwrap_or(norm);
+
+    // Manifests and build drivers across the ecosystems whose default gates we
+    // emit (Rust/Go/Python/Node) plus common native ones.
+    const NAMES: &[&str] = &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "go.mod",
+        "go.sum",
+        "package.json",
+        "tsconfig.json",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "Makefile",
+        "makefile",
+        "CMakeLists.txt",
+        "Dockerfile",
+    ];
+    if NAMES.contains(&base) {
+        return true;
+    }
+    if base.starts_with("requirements") && base.ends_with(".txt") {
+        return true;
+    }
+
+    // Source and build-config extensions. Docs (.md/.txt/.rst), shell scripts,
+    // and lock/metadata files deliberately fall through to inert.
+    const EXTS: &[&str] = &[
+        "rs", "go", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "c", "cc", "cpp", "cxx", "h",
+        "hpp", "java", "rb", "cs", "vue", "svelte", "toml", "json",
+    ];
+    match base.rsplit_once('.') {
+        Some((_, ext)) => EXTS.contains(&ext.to_ascii_lowercase().as_str()),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +303,81 @@ mod tests {
     #[test]
     fn empty_languages_has_no_gates() {
         assert!(!VerificationPlan::for_languages(&[]).has_gates());
+    }
+
+    // ── Blast-radius gate scoping ─────────────────────────────────────────
+    // A change that cannot affect compilation/tests must not run (and be blamed
+    // by) the whole-workspace `cargo test`.
+
+    fn gating_kinds(plan: &VerificationPlan) -> Vec<CheckKind> {
+        plan.commands
+            .iter()
+            .filter(|c| c.gating)
+            .map(|c| c.kind)
+            .collect()
+    }
+
+    #[test]
+    fn inert_change_downgrades_all_gates() {
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&["scripts/foo.sh".into(), "docs/notes.md".into()]);
+        assert!(
+            !plan.has_gates(),
+            "docs+script change must not gate cargo test, got {:?}",
+            gating_kinds(&plan)
+        );
+        // The commands are still present (for evidence), just non-gating.
+        assert!(plan.commands.iter().any(|c| c.name == "cargo test"));
+    }
+
+    #[test]
+    fn screenshot_case_sh_lock_and_symlink_are_inert() {
+        // The exact reported case: a shell script, its `.leveler-lock`, and an
+        // extensionless symlink — none touch Rust.
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&[
+            "scripts/atomcode-doc-test-audit.sh".into(),
+            "scripts/.atomcode-doc-test-audit.sh.leveler-lock".into(),
+            "到桌面".into(),
+        ]);
+        assert!(!plan.has_gates(), "got {:?}", gating_kinds(&plan));
+    }
+
+    #[test]
+    fn empty_modified_keeps_gates() {
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&[]);
+        assert!(plan.has_gates(), "unknown blast radius must keep gates");
+    }
+
+    #[test]
+    fn rust_source_change_keeps_gates() {
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&["crates/x/src/lib.rs".into()]);
+        assert!(plan.has_gates());
+    }
+
+    #[test]
+    fn manifest_change_keeps_gates() {
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&["Cargo.toml".into()]);
+        assert!(plan.has_gates());
+    }
+
+    #[test]
+    fn any_relevant_file_keeps_gates_even_amid_docs() {
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&["README.md".into(), "crates/x/src/main.rs".into()]);
+        assert!(plan.has_gates(), "one source file keeps the whole gate");
+    }
+
+    #[test]
+    fn fixture_under_tests_dir_keeps_gates() {
+        // A non-source extension living under a source tree may be an
+        // include_str! input, so it stays build-relevant.
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&["crates/x/tests/data/golden.txt".into()]);
+        assert!(plan.has_gates());
     }
 
     #[test]

@@ -188,6 +188,7 @@ fn direct_spec(dir: &Path) -> TaskSpec {
         // No gates: the resume turn can at best land CompletedUnverified, which
         // keeps these tests focused on the crash-window reconciliation.
         verification: VerificationPlan::default(),
+        base_commit: None,
     }
 }
 

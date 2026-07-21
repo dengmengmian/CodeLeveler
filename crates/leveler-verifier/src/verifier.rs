@@ -12,9 +12,12 @@ use leveler_execution::{
     process_request_for_verify_check,
 };
 
+use std::collections::BTreeSet;
+
 use crate::failure::classify;
-use crate::plan::{VerificationCommand, VerificationPlan};
+use crate::plan::{CheckKind, VerificationCommand, VerificationPlan};
 use crate::report::{CheckOutcome, CheckStatus, VerificationReport};
+use crate::test_results::{parse_go_failures, parse_rust_failures};
 
 const MAX_EVIDENCE: usize = 4000;
 
@@ -70,6 +73,7 @@ impl Verifier {
             checks,
             scope_ok,
             scope_violations,
+            baseline_failures: Vec::new(),
         }
     }
 
@@ -87,6 +91,7 @@ impl Verifier {
                 status: CheckStatus::ToolMissing,
                 evidence: format!("`{}` not found on PATH", command.program),
                 failure: None,
+                failed_tests: BTreeSet::new(),
             };
         }
 
@@ -113,6 +118,7 @@ impl Verifier {
                         status: CheckStatus::Passed,
                         evidence: truncate(&combined),
                         failure: None,
+                        failed_tests: BTreeSet::new(),
                     }
                 } else {
                     let failure = classify(command.kind, &combined);
@@ -123,9 +129,13 @@ impl Verifier {
                         status: CheckStatus::Failed,
                         evidence: truncate(&combined),
                         failure: Some(failure),
+                        // Full (untruncated) output: the trailing `failures:`
+                        // block / `--- FAIL:` lines may lie past the evidence cap.
+                        failed_tests: parse_failed_tests(command, &combined),
                     }
                 }
             }
+            // Could not run the command at all — no test-level signal to parse.
             Err(e) => CheckOutcome {
                 name: command.name.clone(),
                 kind: command.kind,
@@ -133,6 +143,7 @@ impl Verifier {
                 status: CheckStatus::Failed,
                 evidence: format!("failed to run: {e}"),
                 failure: Some(classify(command.kind, &e.to_string())),
+                failed_tests: BTreeSet::new(),
             },
         }
     }
@@ -306,6 +317,26 @@ fn scope_args(args: &[String], modified_files: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Parse a failed check's output into test-level failure ids, dispatching on
+/// the toolchain. Only Test checks carry test granularity; build/fmt/lint and
+/// toolchains without a parser (Node, …) yield an empty set and fall back to
+/// exit-code-level baseline attribution.
+fn parse_failed_tests(command: &VerificationCommand, output: &str) -> BTreeSet<String> {
+    if command.kind != CheckKind::Test {
+        return BTreeSet::new();
+    }
+    // `program` may be a bare name or an absolute path; match on the stem.
+    let program = std::path::Path::new(&command.program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command.program.as_str());
+    match program {
+        "cargo" => parse_rust_failures(output),
+        "go" => parse_go_failures(output),
+        _ => BTreeSet::new(),
+    }
 }
 
 fn combine(stdout: &str, stderr: &str) -> String {

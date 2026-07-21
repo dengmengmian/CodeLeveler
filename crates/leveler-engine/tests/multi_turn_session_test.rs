@@ -168,6 +168,7 @@ fn spec(h: &Harness, goal: &str) -> TaskSpec {
         continuation: ContinuationPolicy::bounded(6),
         limits: StepLimits::default(),
         verification: VerificationPlan::default(),
+        base_commit: None,
     }
 }
 

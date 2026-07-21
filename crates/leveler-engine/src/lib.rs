@@ -7,6 +7,7 @@
 //! previously-divergent direct and orchestrate paths.
 #![forbid(unsafe_code)]
 
+mod baseline;
 mod engine;
 mod event;
 mod factory;

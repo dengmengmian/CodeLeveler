@@ -11,6 +11,7 @@ pub mod failure;
 pub mod outcome;
 pub mod plan;
 pub mod report;
+pub mod test_results;
 mod verifier;
 
 pub use acceptance::{
