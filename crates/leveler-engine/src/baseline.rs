@@ -189,13 +189,26 @@ mod tests {
         dir
     }
 
-    /// A gating check that passes iff `marker.txt` reads `OK`.
+    /// A gating check that passes iff `marker.txt` reads `OK`. Cross-platform so
+    /// the baseline-reconciliation logic is exercised on Windows too.
     fn marker_plan() -> VerificationPlan {
+        let (program, args) = if cfg!(windows) {
+            // findstr /x exits 0 iff a whole line matches exactly "OK".
+            (
+                "findstr",
+                vec!["/x".into(), "OK".into(), "marker.txt".into()],
+            )
+        } else {
+            (
+                "/bin/sh",
+                vec!["-c".into(), "test \"$(cat marker.txt)\" = OK".into()],
+            )
+        };
         VerificationPlan {
             commands: vec![VerificationCommand {
                 name: "marker".into(),
-                program: "/bin/sh".into(),
-                args: vec!["-c".into(), "test \"$(cat marker.txt)\" = OK".into()],
+                program: program.into(),
+                args,
                 kind: CheckKind::Build,
                 gating: true,
                 timeout_seconds: 30,
