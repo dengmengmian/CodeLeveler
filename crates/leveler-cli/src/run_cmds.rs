@@ -1333,7 +1333,9 @@ mod tui_runtime_selection_tests {
     }
 }
 
-#[cfg(test)]
+// Unix sockets + the loopback TCP daemon are unix-only; on Windows the
+// transport returns Unavailable by design, so these binding tests are gated.
+#[cfg(all(test, unix))]
 mod daemon_bind_tests {
     use super::*;
     use leveler_client_protocol::{
