@@ -669,7 +669,8 @@ mod unix {
                         stream = new_stream;
                         if let Some(session_id) = session_id.clone()
                             && let Ok(WireResponse::Snapshot(snapshot)) =
-                                request_endpoint(&endpoint, WireRequest::Snapshot { session_id }).await
+                                request_endpoint(&endpoint, WireRequest::Snapshot { session_id })
+                                    .await
                         {
                             let _ = events.send(RuntimeEvent::SessionOpened { session: snapshot });
                         }
@@ -838,10 +839,10 @@ mod unix {
     }
 }
 
-#[cfg(unix)]
-pub use unix::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
 #[cfg(all(unix, test))]
 pub(crate) use unix::tcp_request;
+#[cfg(unix)]
+pub use unix::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
 
 #[cfg(not(unix))]
 mod unsupported {

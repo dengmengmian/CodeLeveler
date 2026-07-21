@@ -594,7 +594,9 @@ pub(crate) async fn cmd_tui(
             locale: leveler_tui::Locale::resolve(global.lang.as_deref()),
         };
         let client: Arc<dyn InteractiveRuntimeClient> = client;
-        leveler_tui::run(client, boot).await?;
+        // Daemon-attached TUI: no local runtime to bind a Web UI onto. `/web`
+        // reports this and points at `leveler web --connect`.
+        leveler_tui::run(client, None, boot).await?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
@@ -632,6 +634,32 @@ pub(crate) async fn cmd_tui(
     if session.is_none() {
         in_process_client.attach_session(session_id.clone());
     }
+    // `/web` inside the TUI binds the browser Web UI over this same in-process
+    // runtime. The service is the `InProcessRuntimeClient` itself (it implements
+    // `LocalRuntimeService`); the launcher mints a fresh token and serves on an
+    // ephemeral loopback port, returning the token-carrying URL.
+    let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
+        in_process_client.clone();
+    let web_launcher: leveler_tui::WebLauncher = Arc::new(move || {
+        let service = web_service.clone();
+        Box::pin(async move {
+            let token = generate_daemon_token();
+            let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+            let server = leveler_web::bind(service, addr, token.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            let url = format!("http://{}/?token={token}", server.local_addr());
+            // Serve until the process exits (the TUI owns the only runtime).
+            tokio::spawn(async move {
+                let _ = server.serve(CancellationToken::new()).await;
+            });
+            // The token URL is only printed to the transient notification line;
+            // open it in the default browser so it is not missed.
+            open_in_browser(&url);
+            Ok(url)
+        })
+    });
+
     let client: Arc<dyn InteractiveRuntimeClient> = in_process_client;
 
     let draft_path = app.layout.state_dir.join("draft.txt");
@@ -657,7 +685,7 @@ pub(crate) async fn cmd_tui(
         locale: leveler_tui::Locale::resolve(app.config.lang.as_deref()),
     };
 
-    leveler_tui::run(client, boot).await?;
+    leveler_tui::run(client, Some(web_launcher), boot).await?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -665,7 +693,10 @@ pub(crate) async fn cmd_tui(
 /// listener whose generated bearer token is printed once for external clients.
 enum BoundServer {
     Unix(LocalSocketServer),
-    Tcp { server: TcpRuntimeServer, token: String },
+    Tcp {
+        server: TcpRuntimeServer,
+        token: String,
+    },
 }
 
 /// A 256-bit bearer token from the OS CSPRNG, hex-encoded. Never derived from
@@ -680,6 +711,20 @@ fn generate_daemon_token() -> String {
         let _ = write!(token, "{b:02x}");
     }
     token
+}
+
+/// Open `url` in the OS default browser, best-effort (any failure is ignored —
+/// the URL is still shown in the TUI notification as a fallback).
+fn open_in_browser(url: &str) {
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        // `start` needs an empty title argument before the URL.
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    let _ = std::process::Command::new(program).args(args).spawn();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,6 +798,119 @@ pub(crate) async fn cmd_serve(
         .await;
     result?;
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Start the browser WebUI server. Default: assemble an in-process runtime
+/// (like `serve`); with `--connect`, bridge an existing TCP daemon instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cmd_web(
+    layout: Layout,
+    addr: SocketAddr,
+    connect: Option<SocketAddr>,
+    token: Option<String>,
+    model: Option<String>,
+    mode: RunMode,
+    auto_approve: bool,
+    sandbox: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    // The owned runtime is kept only so an in-process server can shut it down
+    // explicitly on exit; a connected daemon belongs to another process.
+    let (service, runtime, token) = match connect {
+        Some(daemon_addr) => {
+            let token =
+                token.ok_or_else(|| anyhow::anyhow!("--token is required with --connect"))?;
+            let client = LocalSocketRuntimeClient::connect_tcp(daemon_addr, token.clone()).await?;
+            let service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
+                Arc::new(DaemonService(client));
+            (service, None, token)
+        }
+        None => {
+            if token.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--token is only meaningful with --connect (without it, a token is generated)"
+                ));
+            }
+            let app = Arc::new(Application::assemble(layout)?);
+            let model_ref = resolve_model(app.as_ref(), model)?;
+            let runtime = Arc::new(InProcessRuntimeClient::new_with_options(
+                app.clone(),
+                model_ref,
+                map_mode(mode),
+                sandbox,
+                auto_approve,
+            ));
+            let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
+            let db = app.open_database().await?;
+            let reaped = leveler_engine::reap_running_turns(&db, None).await?.len();
+            if reaped > 0 {
+                tracing::warn!(reaped, "reaped zombie turns before WebUI startup");
+            }
+            (service, Some(runtime), generate_daemon_token())
+        }
+    };
+
+    let server = leveler_web::bind(service, addr, token.clone()).await?;
+    println!("{}", Line::heading("Web UI ready"));
+    // Printed once to the operator's own terminal: the URL carries the bearer
+    // token the browser needs. Not logged elsewhere.
+    println!("  url: http://{}/?token={token}", server.local_addr());
+    println!("  press Ctrl+C to stop the server");
+
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_shutdown.cancel();
+        }
+    });
+    let result = server.serve(shutdown).await;
+    if let Some(runtime) = runtime {
+        // Stopping an in-process server is an explicit runtime shutdown,
+        // unlike closing a browser tab. Cancel and reap remaining turns.
+        let _ = runtime
+            .send(leveler_client_protocol::ClientCommand::Quit)
+            .await;
+    }
+    result?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// A `LocalRuntimeService` facade over a TCP-connected daemon client: the
+/// transport client has the right methods but cannot implement the trait in
+/// its own crate without a dependency cycle, so the impl lives here.
+struct DaemonService(LocalSocketRuntimeClient);
+
+#[async_trait::async_trait]
+impl InteractiveRuntimeClient for DaemonService {
+    async fn send(
+        &self,
+        command: leveler_client_protocol::ClientCommand,
+    ) -> Result<(), leveler_client_protocol::ClientError> {
+        self.0.send(command).await
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
+        self.0.subscribe()
+    }
+
+    async fn snapshot(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<leveler_client_protocol::UiSessionSnapshot, leveler_client_protocol::ClientError>
+    {
+        self.0.snapshot(session_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl leveler_local_transport::LocalRuntimeService for DaemonService {
+    async fn create_session(
+        &self,
+        request: CreateSessionRequest,
+    ) -> Result<leveler_local_transport::SessionBootstrap, leveler_client_protocol::ClientError>
+    {
+        self.0.create_session(request).await
+    }
 }
 
 /// Interactive resume: reopen a session in the TUI (the mainstream `resume`).

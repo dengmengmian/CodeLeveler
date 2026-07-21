@@ -382,6 +382,7 @@ impl Application {
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: self.top_level_limits(),
             verification: crate::orchestrate::verification_plan_for_root(&self.layout.repo_root),
+            base_commit: None,
         }
     }
 
@@ -863,9 +864,11 @@ mod tests {
                 status: CheckStatus::Passed,
                 evidence: String::new(),
                 failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: Vec::new(),
+            baseline_failures: Vec::new(),
         });
         task.acceptance = Some(AcceptanceLedger {
             items: vec![AcceptanceEvidence {
@@ -906,9 +909,11 @@ mod tests {
                 status: CheckStatus::Passed,
                 evidence: String::new(),
                 failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: Vec::new(),
+            baseline_failures: Vec::new(),
         });
         task.acceptance = Some(AcceptanceLedger {
             items: vec![AcceptanceEvidence {
@@ -940,9 +945,11 @@ mod tests {
                 status: leveler_verifier::CheckStatus::ToolMissing,
                 evidence: String::new(),
                 failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
             }],
             scope_ok: true,
             scope_violations: Vec::new(),
+            baseline_failures: Vec::new(),
         });
 
         let out = report_to_result(task).unwrap();

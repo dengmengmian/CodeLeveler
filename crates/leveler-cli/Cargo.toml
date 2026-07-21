@@ -31,6 +31,7 @@ leveler-app = { workspace = true }
 leveler-client-protocol = { workspace = true }
 leveler-local-transport = { workspace = true }
 leveler-tui = { workspace = true }
+leveler-web = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

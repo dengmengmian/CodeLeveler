@@ -35,7 +35,7 @@ use memory_cmds::cmd_memory;
 use permissions_cmds::cmd_permissions;
 use run_cmds::{
     cmd_discuss, cmd_plan, cmd_resume, cmd_run, cmd_run_orchestrated, cmd_run_parallel,
-    cmd_run_resume, cmd_serve, cmd_tui,
+    cmd_run_resume, cmd_serve, cmd_tui, cmd_web,
 };
 use sessions_cmd::cmd_sessions;
 
@@ -175,6 +175,27 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             socket,
             tcp,
         } => cmd_serve(layout, model, mode, auto_approve, sandbox, socket, tcp).await,
+        Command::Web {
+            addr,
+            connect,
+            token,
+            model,
+            mode,
+            auto_approve,
+            sandbox,
+        } => {
+            cmd_web(
+                layout,
+                addr,
+                connect,
+                token,
+                model,
+                mode,
+                auto_approve,
+                sandbox,
+            )
+            .await
+        }
         Command::Doctor => cmd_doctor(layout),
         Command::Memory(mc) => cmd_memory(layout, mc),
         Command::Permissions(pc) => cmd_permissions(layout, pc),

@@ -483,6 +483,7 @@ async fn run_bare_case(
         limits: leveler_agent::StepLimits::default(),
         // THE ablated variable: an empty plan means there is nothing to verify.
         verification: leveler_verifier::VerificationPlan::default(),
+        base_commit: None,
     };
     let session_id = match engine.create_task(&spec).await {
         Ok(id) => id,
@@ -1035,6 +1036,7 @@ mod ablation_tests {
             continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
             limits: leveler_agent::StepLimits::default(),
             verification: leveler_verifier::VerificationPlan::default(),
+            base_commit: None,
         };
 
         assert!(

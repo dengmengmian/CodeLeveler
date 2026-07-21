@@ -86,6 +86,34 @@ pub enum Command {
     /// Diagnose the environment, tooling, and configuration.
     Doctor,
 
+    /// Start the browser WebUI server for this repository.
+    Web {
+        /// Bind address (loopback only; defaults to an ephemeral port).
+        #[arg(long, default_value = "127.0.0.1:0")]
+        addr: SocketAddr,
+        /// Connect to an existing `leveler serve --tcp` daemon at this address
+        /// instead of running the runtime in-process.
+        #[arg(long, value_name = "ADDR")]
+        connect: Option<SocketAddr>,
+        /// Bearer token. Required with --connect (the daemon's token, reused as
+        /// the WebUI token); without --connect a fresh token is generated.
+        #[arg(long)]
+        token: Option<String>,
+        /// Default model for newly created sessions (in-process runtime only).
+        #[arg(long)]
+        model: Option<String>,
+        /// Default permission profile: request-approval | assisted | full-access.
+        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
+        mode: RunMode,
+        /// Auto-approve risky actions for sessions owned by this runtime
+        /// (in-process runtime only).
+        #[arg(long)]
+        auto_approve: bool,
+        /// Deny network access to run_command processes (in-process runtime only).
+        #[arg(long)]
+        sandbox: bool,
+    },
+
     /// Manage project-scoped durable memory (approved conclusions / preferences).
     #[command(subcommand)]
     Memory(MemoryCommand),
@@ -784,6 +812,54 @@ mod tests {
                 assert!(tcp.is_none(), "no --tcp given → Unix-only daemon");
             }
             other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_parses_addr_connect_and_token() {
+        let cli = parse(&[
+            "leveler",
+            "web",
+            "--addr",
+            "127.0.0.1:9000",
+            "--connect",
+            "127.0.0.1:7878",
+            "--token",
+            "abc123",
+        ]);
+        match cli.command {
+            Some(Command::Web {
+                addr,
+                connect,
+                token,
+                ..
+            }) => {
+                assert_eq!(addr.to_string(), "127.0.0.1:9000");
+                assert_eq!(
+                    connect.map(|addr| addr.to_string()).as_deref(),
+                    Some("127.0.0.1:7878")
+                );
+                assert_eq!(token.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected Web, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_defaults_to_ephemeral_loopback_in_process() {
+        let cli = parse(&["leveler", "web"]);
+        match cli.command {
+            Some(Command::Web {
+                addr,
+                connect,
+                token,
+                ..
+            }) => {
+                assert_eq!(addr.to_string(), "127.0.0.1:0");
+                assert!(connect.is_none());
+                assert!(token.is_none(), "no --connect → token is generated");
+            }
+            other => panic!("expected Web, got {other:?}"),
         }
     }
 

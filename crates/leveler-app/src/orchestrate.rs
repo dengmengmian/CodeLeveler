@@ -194,6 +194,7 @@ impl Application {
             continuation,
             limits,
             verification: verification_plan_for_root(&self.layout.repo_root),
+            base_commit: None,
         };
         let db = self.open_database().await?;
         let repo = SessionRepository::new(&db);

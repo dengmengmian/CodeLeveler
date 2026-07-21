@@ -1504,6 +1504,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 target.as_str()
             )));
         }
+
+        // Session-less commands (global queries like `RequestSessionList`,
+        // `Quit`) carry no session target, so they must not be receipted: the
+        // command_receipts.session_id foreign key requires a real session row,
+        // and clients (the WebUI) send these with an empty session id, which
+        // would violate that FK. They are idempotent global dispatches — run
+        // them directly, skipping the per-session dedup machinery.
+        if envelope.command.session_id().is_none() {
+            return self.send(envelope.command).await;
+        }
+
         let db = self
             .app
             .open_database()
