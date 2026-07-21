@@ -118,8 +118,9 @@ fn read_subdirectories(dir: &Path) -> std::io::Result<Vec<DirEntry>> {
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }))
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {

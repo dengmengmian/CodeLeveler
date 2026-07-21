@@ -53,6 +53,15 @@ pub(crate) async fn read_file(
     Query(query): Query<FileQuery>,
 ) -> Result<Json<FileContentResponse>, EndpointError> {
     let root = repository_root(&state, &id).await?;
+    // Reject rooted/absolute inputs outright (cross-platform): on Windows an
+    // absolute-looking "/etc/hosts" is not `is_absolute()` but does have a root,
+    // and `join` would silently reinterpret it against the current drive.
+    if std::path::Path::new(&query.path).has_root() {
+        return Err(EndpointError::new(
+            StatusCode::FORBIDDEN,
+            format!("{} is not repository-relative", query.path),
+        ));
+    }
     let target = root
         .join(&query.path)
         .canonicalize()
@@ -270,7 +279,11 @@ fn collect_files(root: &Path, prefix: Option<&str>, limit: usize) -> Vec<String>
         let Ok(relative) = entry.path().strip_prefix(root) else {
             continue;
         };
-        let relative = relative.to_string_lossy().into_owned();
+        // Repo-relative paths use forward slashes on every platform so the WebUI
+        // (and the API contract) never sees Windows backslashes.
+        let relative = relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         if prefix.is_some_and(|prefix| !relative.starts_with(prefix)) {
             continue;
         }
@@ -304,7 +317,9 @@ fn collect_matches(root: &Path, needle: &str, limit: usize) -> Vec<SearchMatch> 
         let Ok(relative) = entry.path().strip_prefix(root) else {
             continue;
         };
-        let relative = relative.to_string_lossy().into_owned();
+        let relative = relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         for (index, line) in text.lines().enumerate() {
             if line.to_lowercase().contains(needle) {
                 matches.push(SearchMatch {
