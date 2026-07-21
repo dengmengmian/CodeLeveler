@@ -1,10 +1,21 @@
 //! The WebSocket endpoint: one connection per browser tab.
 //!
 //! Lifecycle: authenticate → upgrade → (optional, when `?session=` is given)
-//! push that session's snapshot → forward the runtime's global event stream
-//! downstream while parsing upstream frames. A lagging event subscription
-//! forces a resync: the client reloads from a fresh snapshot after reconnect,
-//! so canonical state is never silently skipped.
+//! push that session's snapshot → forward runtime events downstream while
+//! parsing upstream frames. A lagging event subscription forces a resync: the
+//! client reloads from a fresh snapshot after reconnect, so canonical state is
+//! never silently skipped.
+//!
+//! Event routing depends on the server mode:
+//! - **Single-project** (`--connect` bridge, embedding, tests): the global
+//!   stream carries everything; it is forwarded wholesale — the historical
+//!   behavior, unchanged.
+//! - **Aggregation** (multi-project): the router's global stream carries only
+//!   cross-project facts (merged session lists, readiness). Session-internal
+//!   events flow through a per-connection `subscribe_session` that follows
+//!   the tab's active session, so two tabs on different sessions or projects
+//!   never see each other's traffic. Project daemon state changes arrive as
+//!   `project_status` frames.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, RawQuery, State};
@@ -17,10 +28,12 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use leveler_client_protocol::{
-    ClientError, CommandEnvelope, CommandId, ProtocolEnvelope, RuntimeEvent, SessionId,
+    ClientCommand, ClientError, CommandEnvelope, CommandId, ProtocolEnvelope, RuntimeEvent,
+    SessionId,
 };
 
 use crate::auth;
+use crate::projects::ProjectStatus;
 use crate::protocol::{DownstreamMessage, UpstreamMessage};
 use crate::server::AppState;
 
@@ -31,6 +44,10 @@ pub(crate) struct WsQuery {
     /// Session to snapshot-push immediately after connect.
     session: Option<String>,
 }
+
+/// A change of the tab's active session: its id plus a fresh per-session
+/// event receiver, handed from the read side to the write task.
+type SessionSwitch = (String, broadcast::Receiver<RuntimeEvent>);
 
 /// Upgrade to a WebSocket when the presented token matches; otherwise 401
 /// before any protocol bytes are exchanged.
@@ -54,8 +71,27 @@ async fn handle_socket(socket: WebSocket, state: AppState, session: Option<Strin
     // All outbound frames funnel through one channel so the write task is the
     // sole owner of the sink.
     let (outgoing, outgoing_rx) = mpsc::channel::<DownstreamMessage>(64);
+    let (switch_tx, switch_rx) = mpsc::channel::<SessionSwitch>(4);
     let events = state.service.subscribe();
-    let mut write_task = tokio::spawn(write_loop(sink, outgoing_rx, events, session.clone()));
+    // Aggregation mode: session events come from a dedicated per-session
+    // stream (the global stream carries only cross-project facts).
+    let session_events = match (&state.multi, &session) {
+        (Some(_), Some(id)) => Some(state.service.subscribe_session(&SessionId::new(id))),
+        _ => None,
+    };
+    let statuses = state
+        .multi
+        .as_ref()
+        .map(|multi| multi.manager.subscribe_status());
+    let mut write_task = tokio::spawn(write_loop(
+        sink,
+        outgoing_rx,
+        events,
+        session_events,
+        switch_rx,
+        statuses,
+        session.clone(),
+    ));
 
     // Greeting frame: the requested session's snapshot, or an error frame if
     // the session is unknown — the connection stays up either way.
@@ -70,7 +106,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, session: Option<Strin
         }
     }
 
-    read_loop(&state, &mut stream, &outgoing, &mut write_task).await;
+    read_loop(&state, &mut stream, &outgoing, &switch_tx, &mut write_task).await;
     write_task.abort();
 }
 
@@ -79,13 +115,14 @@ async fn read_loop(
     state: &AppState,
     stream: &mut SplitStream<WebSocket>,
     outgoing: &mpsc::Sender<DownstreamMessage>,
+    switch: &mpsc::Sender<SessionSwitch>,
     write_task: &mut JoinHandle<()>,
 ) {
     loop {
         tokio::select! {
             message = stream.next() => match message {
                 Some(Ok(Message::Text(text))) => {
-                    handle_upstream(state, &text, outgoing).await;
+                    handle_upstream(state, &text, outgoing, switch).await;
                 }
                 // Binary frames carry no meaning on this protocol; ping/pong is
                 // answered by the transport itself.
@@ -99,12 +136,26 @@ async fn read_loop(
     }
 }
 
+/// Receive from an optional broadcast stream; absent streams pend forever, so
+/// they never win the select.
+async fn recv_opt<T: Clone>(
+    receiver: &mut Option<broadcast::Receiver<T>>,
+) -> Result<T, broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Forward runtime events and queued outbound frames to the socket.
 async fn write_loop(
     mut sink: SplitSink<WebSocket, Message>,
     mut outgoing: mpsc::Receiver<DownstreamMessage>,
     mut events: broadcast::Receiver<RuntimeEvent>,
-    session: Option<String>,
+    mut session_events: Option<broadcast::Receiver<RuntimeEvent>>,
+    mut switch: mpsc::Receiver<SessionSwitch>,
+    mut statuses: Option<broadcast::Receiver<(String, ProjectStatus)>>,
+    mut session: Option<String>,
 ) {
     loop {
         tokio::select! {
@@ -126,17 +177,61 @@ async fn write_loop(
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(skipped, "web event subscriber lagged; forcing resync");
-                    let frame = DownstreamMessage::ResyncRequired {
-                        session_id: session.unwrap_or_default(),
-                    };
-                    let _ = send_frame(&mut sink, &frame).await;
-                    let _ = sink.send(Message::Close(None)).await;
+                    resync_and_close(&mut sink, session.take()).await;
                     return;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+            Some((id, receiver)) = switch.recv() => {
+                session = Some(id);
+                session_events = Some(receiver);
+            }
+            event = recv_opt(&mut session_events) => match event {
+                // Cross-project facts (merged lists, readiness) come from the
+                // global stream; a per-session stream that also carries them
+                // (in-process runtimes) must not duplicate them here.
+                Ok(RuntimeEvent::SessionList { .. } | RuntimeEvent::RuntimeReady) => {}
+                Ok(event) => {
+                    if send_frame(&mut sink, &DownstreamMessage::Event { event })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "web session subscriber lagged; forcing resync");
+                    resync_and_close(&mut sink, session.take()).await;
+                    return;
+                }
+                // The owning daemon's client was replaced (project removed or
+                // restarted); the tab keeps its global stream and resubscribes
+                // on its next session switch.
+                Err(broadcast::error::RecvError::Closed) => session_events = None,
+            },
+            status = recv_opt(&mut statuses) => match status {
+                Ok((path, status)) => {
+                    if send_frame(&mut sink, &DownstreamMessage::ProjectStatus { path, status })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => statuses = None,
+            },
         }
     }
+}
+
+/// Ask the client to resync from a fresh snapshot, then close.
+async fn resync_and_close(sink: &mut SplitSink<WebSocket, Message>, session: Option<String>) {
+    let frame = DownstreamMessage::ResyncRequired {
+        session_id: session.unwrap_or_default(),
+    };
+    let _ = send_frame(sink, &frame).await;
+    let _ = sink.send(Message::Close(None)).await;
 }
 
 /// Serialize and send one downstream frame.
@@ -150,7 +245,12 @@ async fn send_frame(
 
 /// Handle one upstream text frame: deliver a command, or answer a snapshot
 /// request. Failures produce an `error` frame; the connection stays open.
-async fn handle_upstream(state: &AppState, text: &str, outgoing: &mpsc::Sender<DownstreamMessage>) {
+async fn handle_upstream(
+    state: &AppState,
+    text: &str,
+    outgoing: &mpsc::Sender<DownstreamMessage>,
+    switch: &mpsc::Sender<SessionSwitch>,
+) {
     let message = match serde_json::from_str::<UpstreamMessage>(text) {
         Ok(message) => message,
         Err(error) => {
@@ -172,6 +272,7 @@ async fn handle_upstream(state: &AppState, text: &str, outgoing: &mpsc::Sender<D
             session_id,
             command,
         } => {
+            follow_session_switch(state, &command, switch).await;
             let envelope = CommandEnvelope {
                 command_id: CommandId::new(command_id.clone()),
                 session_id: SessionId::new(session_id),
@@ -190,6 +291,12 @@ async fn handle_upstream(state: &AppState, text: &str, outgoing: &mpsc::Sender<D
             send_or_ignore(outgoing, frame).await;
         }
         UpstreamMessage::Snapshot { session_id } => {
+            if state.multi.is_some() {
+                let id = SessionId::new(session_id.clone());
+                let _ = switch
+                    .send((session_id.clone(), state.service.subscribe_session(&id)))
+                    .await;
+            }
             let frame = match state.service.snapshot(&SessionId::new(session_id)).await {
                 Ok(session) => DownstreamMessage::Snapshot { session },
                 Err(error) => error_frame(&error, None),
@@ -197,6 +304,29 @@ async fn handle_upstream(state: &AppState, text: &str, outgoing: &mpsc::Sender<D
             send_or_ignore(outgoing, frame).await;
         }
     }
+}
+
+/// In aggregation mode, an `open_session` command moves the tab to another
+/// session — retarget the per-connection session stream with it.
+async fn follow_session_switch(
+    state: &AppState,
+    command: &ClientCommand,
+    switch: &mpsc::Sender<SessionSwitch>,
+) {
+    if state.multi.is_none() {
+        return;
+    }
+    let target = match command {
+        ClientCommand::OpenSession { session_id }
+        | ClientCommand::OpenSessionFor { session_id, .. } => session_id,
+        _ => return,
+    };
+    let _ = switch
+        .send((
+            target.as_str().to_string(),
+            state.service.subscribe_session(target),
+        ))
+        .await;
 }
 
 /// Render a client error as an `error` frame, correlating it when known.

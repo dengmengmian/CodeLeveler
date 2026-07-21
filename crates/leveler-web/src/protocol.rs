@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use leveler_client_protocol::{ClientCommand, RuntimeEvent, UiSessionSnapshot};
 
+use crate::projects::ProjectStatus;
+
 /// A message the browser sends upstream over the WebSocket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -43,6 +45,9 @@ pub enum DownstreamMessage {
         message: String,
         command_id: Option<String>,
     },
+    /// A registered project's daemon changed state (aggregation mode only):
+    /// the sidebar updates its status dot without re-fetching `/api/projects`.
+    ProjectStatus { path: String, status: ProjectStatus },
     /// The event subscription lagged: the client must resync from a fresh
     /// snapshot. The server closes the connection right after this frame.
     ResyncRequired { session_id: String },
@@ -112,6 +117,18 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&resync).unwrap(),
             r#"{"type":"resync_required","session_id":"s1"}"#
+        );
+    }
+
+    #[test]
+    fn downstream_project_status_matches_golden_fixture() {
+        let frame = DownstreamMessage::ProjectStatus {
+            path: "/Users/me/repo".to_string(),
+            status: ProjectStatus::Offline,
+        };
+        assert_eq!(
+            serde_json::to_string(&frame).unwrap(),
+            r#"{"type":"project_status","path":"/Users/me/repo","status":"offline"}"#
         );
     }
 

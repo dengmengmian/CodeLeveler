@@ -14,13 +14,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +29,8 @@ use leveler_client_protocol::{ClientError, SessionId, UiSessionSnapshot};
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
 
 use crate::auth;
+use crate::projects::ProjectManager;
+use crate::router::RouterService;
 
 use super::WebError;
 
@@ -44,6 +47,14 @@ const DIST_DIR_ENV: &str = "LEVELER_WEB_DIST";
 #[allow_missing = true]
 struct Assets;
 
+/// The multi-project aggregation pieces, present when the server was started
+/// as an aggregator (`leveler web` over an in-process primary).
+#[derive(Clone)]
+pub(crate) struct MultiProject {
+    pub(crate) router: Arc<RouterService>,
+    pub(crate) manager: Arc<ProjectManager>,
+}
+
 /// Shared state handed to every handler.
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -51,10 +62,17 @@ pub(crate) struct AppState {
     pub(crate) token: Arc<str>,
     /// On-disk asset directory override (`LEVELER_WEB_DIST`), if set.
     dist_dir: Option<Arc<Path>>,
+    /// `Some` in aggregation mode; `None` for a single-project server
+    /// (`--connect` bridge, embedding, tests) — project routes answer 404.
+    pub(crate) multi: Option<MultiProject>,
 }
 
 impl AppState {
-    fn new(service: Arc<dyn LocalRuntimeService>, token: String) -> Self {
+    fn new(
+        service: Arc<dyn LocalRuntimeService>,
+        token: String,
+        multi: Option<MultiProject>,
+    ) -> Self {
         let dist_dir = std::env::var_os(DIST_DIR_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -64,6 +82,7 @@ impl AppState {
             service,
             token: Arc::from(token),
             dist_dir,
+            multi,
         }
     }
 }
@@ -71,7 +90,24 @@ impl AppState {
 /// Build the WebUI router over `service`, guarded by `token`. Exposed so
 /// embedding binaries (and tests) can mount the routes without `bind`.
 pub fn build_router(service: Arc<dyn LocalRuntimeService>, token: String) -> Router {
-    let state = AppState::new(service, token);
+    build_router_with(AppState::new(service, token, None))
+}
+
+/// [`build_router`] in aggregation mode: the [`RouterService`] is the service,
+/// and the project routes are live.
+pub fn build_router_multi(
+    router: Arc<RouterService>,
+    manager: Arc<ProjectManager>,
+    token: String,
+) -> Router {
+    let multi = MultiProject {
+        router: router.clone(),
+        manager,
+    };
+    build_router_with(AppState::new(router, token, Some(multi)))
+}
+
+fn build_router_with(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", post(create_session))
@@ -87,6 +123,11 @@ pub fn build_router(service: Arc<dyn LocalRuntimeService>, token: String) -> Rou
             "/api/sessions/{id}/attachments",
             post(crate::repo::upload_attachments),
         )
+        .route(
+            "/api/projects",
+            get(list_projects).post(add_project).delete(remove_project),
+        )
+        .route("/api/projects/restart", post(restart_project))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .merge(api)
@@ -144,6 +185,28 @@ pub async fn bind(
     })
 }
 
+/// [`bind`] in aggregation mode (multi-project routes + WS status frames).
+pub async fn bind_multi(
+    router: Arc<RouterService>,
+    manager: Arc<ProjectManager>,
+    addr: SocketAddr,
+    token: String,
+) -> Result<WebServer, WebError> {
+    if token.is_empty() {
+        return Err(WebError::EmptyToken);
+    }
+    if !addr.ip().is_loopback() {
+        return Err(WebError::NonLoopback(addr));
+    }
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    Ok(WebServer {
+        listener,
+        local_addr,
+        app: build_router_multi(router, manager, token),
+    })
+}
+
 /// One-call convenience: [`bind`] and serve until `shutdown` is cancelled.
 pub async fn serve(
     service: Arc<dyn LocalRuntimeService>,
@@ -171,12 +234,97 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// `POST /api/sessions` body: the transport DTO plus the aggregation layer's
+/// optional `project` (canonical repository path). Absent → the primary.
+#[derive(Deserialize)]
+struct WebCreateSessionRequest {
+    #[serde(flatten)]
+    inner: CreateSessionRequest,
+    #[serde(default)]
+    project: Option<String>,
+}
+
 async fn create_session(
     State(state): State<AppState>,
-    Json(request): Json<CreateSessionRequest>,
+    Json(request): Json<WebCreateSessionRequest>,
 ) -> Result<Json<SessionBootstrap>, ApiError> {
-    let bootstrap = state.service.create_session(request).await?;
+    let bootstrap = match (&state.multi, &request.project) {
+        (Some(multi), Some(project)) => {
+            multi
+                .router
+                .create_session_for(Path::new(project), request.inner)
+                .await?
+        }
+        _ => state.service.create_session(request.inner).await?,
+    };
     Ok(Json(bootstrap))
+}
+
+// ── 多项目管理（聚合层）─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ProjectPathRequest {
+    path: String,
+}
+
+/// `GET /api/projects` — primary first, then registered projects. 404 outside
+/// aggregation mode, which the frontend treats as "single-project server".
+async fn list_projects(State(state): State<AppState>) -> Response {
+    match &state.multi {
+        Some(multi) => {
+            Json(serde_json::json!({ "projects": multi.manager.list() })).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn add_project(
+    State(state): State<AppState>,
+    Json(request): Json<ProjectPathRequest>,
+) -> Response {
+    let Some(multi) = &state.multi else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match multi.manager.add(&request.path).await {
+        Ok(project) => Json(serde_json::json!({ "project": project })).into_response(),
+        Err(error) => project_error(error),
+    }
+}
+
+async fn remove_project(
+    State(state): State<AppState>,
+    Query(request): Query<ProjectPathRequest>,
+) -> Response {
+    let Some(multi) = &state.multi else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match multi.manager.remove(&request.path) {
+        // A JSON body (not 204) — the frontend helper parses every response.
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) => project_error(error),
+    }
+}
+
+async fn restart_project(
+    State(state): State<AppState>,
+    Json(request): Json<ProjectPathRequest>,
+) -> Response {
+    let Some(multi) = &state.multi else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match multi.manager.restart(&request.path).await {
+        // A JSON body (not 202) — the frontend helper parses every response.
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) => project_error(error),
+    }
+}
+
+fn project_error(error: crate::projects::ProjectError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
 }
 
 async fn session_snapshot(

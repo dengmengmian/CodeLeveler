@@ -478,6 +478,19 @@ mod unix {
         }
     }
 
+    /// The socket client speaks the full local-transport wire protocol, so it
+    /// satisfies the daemon service contract directly; `create_session`
+    /// delegates to the inherent method of the same name.
+    #[async_trait]
+    impl LocalRuntimeService for LocalSocketRuntimeClient {
+        async fn create_session(
+            &self,
+            request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            LocalSocketRuntimeClient::create_session(self, request).await
+        }
+    }
+
     #[async_trait]
     impl InteractiveRuntimeClient for LocalSocketRuntimeClient {
         async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
@@ -912,6 +925,16 @@ mod unsupported {
             Err(ClientError::Runtime(
                 "Unix sockets are not supported on this platform".to_string(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl LocalRuntimeService for LocalSocketRuntimeClient {
+        async fn create_session(
+            &self,
+            request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            LocalSocketRuntimeClient::create_session(self, request).await
         }
     }
 }
