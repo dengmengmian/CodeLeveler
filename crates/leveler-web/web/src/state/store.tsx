@@ -63,6 +63,13 @@ export interface QueuedMessage {
 
 export type AgentMode = 'direct' | 'plan';
 
+/** 上一回合终态：用于在对话流内显示「已完成 / 执行失败 / 已停止 + 用时」。 */
+export interface LastTurn {
+  outcome: 'completed' | 'failed' | 'cancelled';
+  ms: number;
+  error: string | null;
+}
+
 export interface SessionView {
   id: SessionId;
   title: string;
@@ -84,6 +91,8 @@ export interface SessionView {
   activity: string | null;
   /** 当前回合开始时间（epoch ms）；空闲时为 null，用于运行计时 */
   turnStartedAt: number | null;
+  /** 上一回合终态（完成/失败/取消）；新回合开始时清空 */
+  lastTurn: LastTurn | null;
   model: ModelRef | null;
   availableModels: ModelRef[];
   permission: PermissionProfile;
@@ -112,6 +121,8 @@ export interface AppState {
   projects: ProjectInfo[];
   /** 新对话的目标项目（= 项目分组上的 ＋ 入口）；null = 当前仓库 */
   draftProject: string | null;
+  /** 待注入到输入框的文本（空状态快捷操作 → Composer 消费后清空） */
+  composerSeed: string | null;
 }
 
 export const initialState: AppState = {
@@ -125,6 +136,7 @@ export const initialState: AppState = {
   pendingAttachments: [],
   projects: [],
   draftProject: null,
+  composerSeed: null,
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -156,7 +168,8 @@ export type Action =
   | { type: 'completion'; report: UiCompletionReport }
   | { type: 'token_usage'; input: number; output: number }
   | { type: 'turn_active'; value: boolean }
-  | { type: 'turn_terminal' }
+  | { type: 'turn_terminal'; outcome: 'completed' | 'failed' | 'cancelled'; error?: string }
+  | { type: 'seed_composer'; text: string | null }
   | { type: 'enqueue'; item: QueuedMessage }
   | { type: 'dequeue'; id: string }
   | { type: 'set_permission'; mode: PermissionProfile }
@@ -229,6 +242,7 @@ function viewFromSnapshot(
     turnActive,
     activity: sameSession ? prev.activity : null,
     turnStartedAt: sameSession ? prev.turnStartedAt : turnActive ? Date.now() : null,
+    lastTurn: sameSession ? prev.lastTurn : null,
     model: snap.model,
     availableModels: snap.available_models ?? [],
     permission: snap.mode,
@@ -281,11 +295,12 @@ export function reducer(state: AppState, action: Action): void {
         time: action.time,
         seq: nextSeq(),
       });
-      // 新回合开始：清掉上一回合的工具轨
+      // 新回合开始：清掉上一回合的工具轨与终态
       state.current.tools = [];
       state.current.turnActive = true;
       state.current.turnStartedAt = Date.now();
       state.current.activity = null;
+      state.current.lastTurn = null;
       return;
     }
     case 'assistant_started': {
@@ -431,6 +446,7 @@ export function reducer(state: AppState, action: Action): void {
         if (action.value && !state.current.turnActive) {
           state.current.turnStartedAt = Date.now();
           state.current.activity = null;
+          state.current.lastTurn = null;
         }
         if (!action.value) state.current.turnStartedAt = null;
         state.current.turnActive = action.value;
@@ -438,11 +454,22 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'turn_terminal':
       if (state.current) {
+        const ms = state.current.turnStartedAt
+          ? Math.max(0, Date.now() - state.current.turnStartedAt)
+          : 0;
+        state.current.lastTurn = {
+          outcome: action.outcome,
+          ms,
+          error: action.error ?? null,
+        };
         state.current.turnActive = false;
         state.current.turnStartedAt = null;
         state.current.activity = null;
         for (const m of state.current.messages) m.streaming = false;
       }
+      return;
+    case 'seed_composer':
+      state.composerSeed = action.text;
       return;
     case 'enqueue':
       state.queue.push(action.item);

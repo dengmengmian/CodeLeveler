@@ -859,7 +859,9 @@ impl InProcessRuntimeClient {
                     .await;
                 match result {
                     Ok((_session_id, report)) => {
-                        let diff = compute_diff(&repo, false);
+                        // with_patch=true: the WebUI/TUI show the actual code diff
+                        // (not just file counts) inline after each turn.
+                        let diff = compute_diff(&repo, true);
                         let _ = events.send(RuntimeEvent::DiffUpdated { diff: diff.clone() });
                         if cancel_probe.is_cancelled() {
                             let _ = events.send(RuntimeEvent::TurnCancelled);
@@ -935,7 +937,7 @@ impl InProcessRuntimeClient {
                                     format!("对话已回滚,但工作区文件回滚失败: {error}"),
                                 );
                             } else {
-                                let diff = compute_diff(&self.app.layout.repo_root, false);
+                                let diff = compute_diff(&self.app.layout.repo_root, true);
                                 let _ = self
                                     .events_for(&session_id)
                                     .send(RuntimeEvent::DiffUpdated { diff });

@@ -5,7 +5,15 @@ import { useEffect, useRef, useState } from 'react';
 import { useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
 import { BrandMark } from './BrandMark';
-import { repoShortName } from '../lib/format';
+import { repoShortName, formatRelative } from '../lib/format';
+
+/** 空状态快捷操作：点击把起手语注入输入框，用户补全后发送。 */
+const QUICK_ACTIONS: ReadonlyArray<{ label: string; hint: string; seed: string }> = [
+  { label: '分析当前项目', hint: '架构与主要风险', seed: '分析当前项目的架构与主要风险，并给出改进建议。' },
+  { label: '修复一个问题', hint: '定位并修复', seed: '我遇到一个问题需要修复：' },
+  { label: '实现新功能', hint: '从需求到实现', seed: '我想实现一个新功能：' },
+  { label: '检查代码改动', hint: '评审当前 diff', seed: '检查当前的代码改动并做一次评审。' },
+];
 
 export function Hero() {
   const state = useAppState();
@@ -25,12 +33,15 @@ export function Hero() {
   // 当前选择：draftProject ?? 当前仓库
   const selected = state.draftProject ?? state.repository;
   const projects = state.projects;
+  const recent = state.sessions.slice(0, 5);
 
   return (
     <div className="hero">
-      <BrandMark />
+      <div className="h-mark">
+        <BrandMark />
+      </div>
       <div className="h-word">CodeLeveler</div>
-      <div className="h-sub">还没有消息 —— 在下方输入开始对话</div>
+      <div className="h-sub">选一个快捷操作，或在下方直接告诉 Agent 要做什么</div>
       <div className="h-proj" ref={wrapRef}>
         <button className="h-proj-btn" onClick={() => setOpen((v) => !v)}>
           <span>⌂</span>
@@ -74,6 +85,27 @@ export function Hero() {
           ))}
         </div>
       </div>
+
+      <div className="h-actions">
+        {QUICK_ACTIONS.map((a) => (
+          <button key={a.label} className="h-action" onClick={() => bridge.seedComposer(a.seed)}>
+            <span className="ha-label">{a.label}</span>
+            <span className="ha-hint">{a.hint}</span>
+          </button>
+        ))}
+      </div>
+
+      {recent.length > 0 && (
+        <div className="h-recent">
+          <div className="h-recent-head">最近会话</div>
+          {recent.map((s) => (
+            <button key={s.id} className="h-recent-item" onClick={() => bridge.selectSession(s.id)}>
+              <span className="hr-goal">{s.goal || '未命名会话'}</span>
+              <span className="hr-time">{formatRelative(s.updated_at)}</span>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

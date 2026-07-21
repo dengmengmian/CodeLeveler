@@ -4,6 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CodeLeveler</title>
+    <script>
+      // 首帧前写入 data-theme，避免主题闪烁。与 lib/theme.ts 的解析规则一致。
+      (function () {
+        try {
+          var c = localStorage.getItem('leveler.web.theme') || 'system';
+          var t = c;
+          if (c === 'system') {
+            t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'paper' : 'graphite';
+          }
+          if (['graphite', 'midnight', 'paper'].indexOf(t) < 0) t = 'graphite';
+          document.documentElement.dataset.theme = t;
+        } catch (e) {
+          document.documentElement.dataset.theme = 'graphite';
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

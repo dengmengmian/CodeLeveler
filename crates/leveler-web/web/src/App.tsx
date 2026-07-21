@@ -7,6 +7,7 @@ import { RuntimeBridge } from './lib/controller';
 import { repoShortName } from './lib/format';
 import { AppProvider, useAppDispatch, useAppState, type AppState } from './state/store';
 import { BridgeProvider, useBridge } from './state/bridge';
+import { ThemeMenu, SettingsButton } from './components/Appearance';
 import { Composer } from './components/Composer';
 import { DiffView } from './components/DiffView';
 import { FileViewerProvider } from './components/FileViewer';
@@ -104,6 +105,9 @@ function Shell() {
               </span>
               <RunStatus />
               <LevelMeter />
+              <span className="sh-sep" />
+              <ThemeMenu />
+              <SettingsButton />
             </header>
             {view === 'diff' && !state.draft ? (
               <DiffView />

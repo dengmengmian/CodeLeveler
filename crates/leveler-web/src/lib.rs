@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod browse;
 mod projects;
 mod protocol;
 mod repo;

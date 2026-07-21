@@ -7,7 +7,27 @@
 import { useRef } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { CopyButtonLazy } from './CopyButton';
+import { DiffBlock } from './DiffBlock';
 import { useOpenFile } from './FileViewer';
+
+/** 提取 ``` 围栏代码块的语言标记（class 形如 `language-diff`）。 */
+function fenceLanguage(children: React.ReactNode): string | null {
+  const child = Array.isArray(children) ? children[0] : children;
+  if (child && typeof child === 'object' && 'props' in child) {
+    const cls = (child as { props?: { className?: string } }).props?.className ?? '';
+    const m = /language-(\w+)/.exec(cls);
+    return m ? m[1] : null;
+  }
+  return null;
+}
+
+/** 取围栏代码块的纯文本内容。 */
+function fenceText(children: React.ReactNode): string {
+  const child = Array.isArray(children) ? children[0] : children;
+  const kids = (child as { props?: { children?: unknown } })?.props?.children;
+  return String(Array.isArray(kids) ? kids.join('') : (kids ?? ''));
+}
 
 /** 仓库相对路径（必须含 / 和扩展名），可带 :行号 */
 const FILE_REF = /^([\w.\-/]+\/[\w.\-/]*\.\w{1,12})(?::(\d+))?$/;
@@ -24,21 +44,18 @@ function TableWrap(props: React.ComponentPropsWithoutRef<'table'> & { node?: unk
 function PreBlock(props: React.ComponentPropsWithoutRef<'pre'> & { node?: unknown }) {
   const { node: _node, children, ...rest } = props;
   const ref = useRef<HTMLPreElement>(null);
+  // ```diff / ```patch 围栏 → 真正的 DiffViewer（着色 + 行号 + 复制完整 diff），
+  // 而非普通 pre/code。其余语言仍走普通代码块。
+  const lang = fenceLanguage(children);
+  if (lang === 'diff' || lang === 'patch') {
+    return <DiffBlock source={fenceText(children)} />;
+  }
   return (
     <div className="pre-wrap">
       <pre ref={ref} {...rest}>
         {children}
       </pre>
-      <button
-        className="pre-copy"
-        title="复制代码"
-        onClick={() => {
-          const text = ref.current?.innerText ?? '';
-          void navigator.clipboard.writeText(text);
-        }}
-      >
-        复制
-      </button>
+      <CopyButtonLazy className="pre-copy" getText={() => ref.current?.innerText ?? ''} />
     </div>
   );
 }
