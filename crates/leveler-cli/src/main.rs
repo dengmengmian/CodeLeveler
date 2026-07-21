@@ -174,7 +174,20 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             sandbox,
             socket,
             tcp,
-        } => cmd_serve(layout, model, mode, auto_approve, sandbox, socket, tcp).await,
+            ready_json,
+        } => {
+            cmd_serve(
+                layout,
+                model,
+                mode,
+                auto_approve,
+                sandbox,
+                socket,
+                tcp,
+                ready_json,
+            )
+            .await
+        }
         Command::Web {
             addr,
             connect,

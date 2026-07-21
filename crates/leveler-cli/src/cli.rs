@@ -77,10 +77,16 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
         /// Also expose the daemon over loopback TCP at this address (e.g.
-        /// `127.0.0.1:7878`) for external / WebUI clients. A bearer token is
-        /// generated with the OS CSPRNG and printed once at startup.
+        /// `127.0.0.1:7878`) for external / WebUI clients. The per-repo Unix
+        /// socket is still bound (ownership lock + token-less local clients).
+        /// The bearer token comes from LEVELER_DAEMON_TOKEN when set, else a
+        /// fresh one is generated with the OS CSPRNG and printed once.
         #[arg(long, value_name = "ADDR")]
         tcp: Option<SocketAddr>,
+        /// Write a machine-readable readiness JSON ({pid, socket, addr, token})
+        /// to this path once bound. Used by the supervising WebUI aggregator.
+        #[arg(long, value_name = "PATH")]
+        ready_json: Option<PathBuf>,
     },
 
     /// Diagnose the environment, tooling, and configuration.
@@ -803,6 +809,7 @@ mod tests {
                 sandbox,
                 socket,
                 tcp,
+                ready_json,
             }) => {
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
                 assert!(matches!(mode, RunMode::FullAccess));
@@ -810,6 +817,28 @@ mod tests {
                 assert!(sandbox);
                 assert_eq!(socket, Some(PathBuf::from("/tmp/leveler.sock")));
                 assert!(tcp.is_none(), "no --tcp given → Unix-only daemon");
+                assert!(ready_json.is_none());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_tcp_and_ready_json() {
+        let cli = parse(&[
+            "leveler",
+            "serve",
+            "--tcp",
+            "127.0.0.1:0",
+            "--ready-json",
+            "/tmp/leveler-ready.json",
+        ]);
+        match cli.command {
+            Some(Command::Serve {
+                tcp, ready_json, ..
+            }) => {
+                assert_eq!(tcp, Some("127.0.0.1:0".parse().unwrap()));
+                assert_eq!(ready_json, Some(PathBuf::from("/tmp/leveler-ready.json")));
             }
             other => panic!("expected Serve, got {other:?}"),
         }

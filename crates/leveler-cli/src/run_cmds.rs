@@ -689,14 +689,39 @@ pub(crate) async fn cmd_tui(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// A running daemon transport: a per-repo Unix socket, or a loopback TCP
-/// listener whose generated bearer token is printed once for external clients.
-enum BoundServer {
-    Unix(LocalSocketServer),
-    Tcp {
-        server: TcpRuntimeServer,
-        token: String,
-    },
+/// The daemon's bound transports. In TCP mode the per-repo Unix socket is
+/// bound too — as the ownership lock that proves no other live daemon serves
+/// this repository (a fresh ephemeral TCP port proves nothing, and startup
+/// reaps `running` turns on that proof). The Unix socket is served as well,
+/// so same-machine clients can attach token-less.
+struct BoundServers {
+    unix: Option<LocalSocketServer>,
+    tcp: Option<(TcpRuntimeServer, String)>,
+}
+
+/// Bind the daemon transports: always the per-repo Unix socket (ownership
+/// lock + local clients), plus the loopback TCP listener when `tcp` is set.
+/// Binding the socket FIRST is what makes a second daemon on the same repo
+/// fail fast instead of reaping the first daemon's active turns.
+async fn bind_daemon_transports(
+    socket_path: &Path,
+    tcp: Option<SocketAddr>,
+    token: Option<String>,
+    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
+) -> anyhow::Result<BoundServers> {
+    let unix = LocalSocketServer::bind(socket_path, service.clone()).await?;
+    let tcp = match tcp {
+        Some(addr) => {
+            let token = token.unwrap_or_else(generate_daemon_token);
+            let server = TcpRuntimeServer::bind(addr, token.clone(), service).await?;
+            Some((server, token))
+        }
+        None => None,
+    };
+    Ok(BoundServers {
+        unix: Some(unix),
+        tcp,
+    })
 }
 
 /// A 256-bit bearer token from the OS CSPRNG, hex-encoded. Never derived from
@@ -727,6 +752,10 @@ fn open_in_browser(url: &str) {
     let _ = std::process::Command::new(program).args(args).spawn();
 }
 
+/// Environment variable carrying the daemon bearer token. Secrets never go on
+/// argv (`ps` exposes it); the spawning WebUI passes the token this way.
+pub(crate) const DAEMON_TOKEN_ENV: &str = "LEVELER_DAEMON_TOKEN";
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_serve(
     layout: Layout,
@@ -736,6 +765,7 @@ pub(crate) async fn cmd_serve(
     sandbox: bool,
     socket: Option<PathBuf>,
     tcp: Option<SocketAddr>,
+    ready_json: Option<PathBuf>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let socket_path = socket.unwrap_or_else(|| layout.socket_path());
     let app = Arc::new(Application::assemble(layout)?);
@@ -750,32 +780,47 @@ pub(crate) async fn cmd_serve(
     ));
     let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
 
-    // Bind first — a successful bind (Unix socket file or TCP port) proves no
-    // live daemon owns this repo, so afterwards startup may classify old
-    // `running` rows as crash leftovers.
-    let bound = match tcp {
-        Some(addr) => {
-            let token = generate_daemon_token();
-            let server = TcpRuntimeServer::bind(addr, token.clone(), service).await?;
-            BoundServer::Tcp { server, token }
-        }
-        None => BoundServer::Unix(LocalSocketServer::bind(&socket_path, service).await?),
-    };
+    // Token comes from the environment when a supervising process (the WebUI
+    // aggregator) supplied one; otherwise mint a fresh one. Never from argv.
+    let token = tcp.map(|_| {
+        std::env::var(DAEMON_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(generate_daemon_token)
+    });
+    // Bind first — a successful Unix socket bind proves no live daemon owns
+    // this repo, so afterwards startup may classify old `running` rows as
+    // crash leftovers. TCP mode binds the socket too (ownership lock + local
+    // token-less clients); an ephemeral TCP port alone proves nothing.
+    let bound = bind_daemon_transports(&socket_path, tcp, token, service).await?;
 
     let db = app.open_database().await?;
     let reaped = leveler_engine::reap_running_turns(&db, None).await?.len();
     if reaped > 0 {
         tracing::warn!(reaped, "reaped zombie turns before daemon startup");
     }
+
+    if let Some(path) = &ready_json {
+        // Machine-readable readiness for the supervising process (spawned by
+        // the WebUI aggregator): where to connect and how to authenticate.
+        let ready = serde_json::json!({
+            "pid": std::process::id(),
+            "socket": socket_path,
+            "addr": bound.tcp.as_ref().map(|(s, _)| s.local_addr()).transpose()?.map(|a| a.to_string()),
+            "token": bound.tcp.as_ref().map(|(_, t)| t.clone()),
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&ready)?)?;
+    }
+
     println!("{}", Line::heading("Local runtime ready"));
-    match &bound {
-        BoundServer::Unix(server) => println!("  socket: {}", server.path().display()),
-        BoundServer::Tcp { server, token } => {
-            println!("  tcp: {}", server.local_addr()?);
-            // Printed once to the operator's own terminal: this is how a WebUI /
-            // external client authenticates. Not logged elsewhere.
-            println!("  token: {token}");
-        }
+    if let Some(server) = &bound.unix {
+        println!("  socket: {}", server.path().display());
+    }
+    if let Some((server, token)) = &bound.tcp {
+        println!("  tcp: {}", server.local_addr()?);
+        // Printed once to the operator's own terminal: this is how a WebUI /
+        // external client authenticates. Not logged elsewhere.
+        println!("  token: {token}");
     }
     println!("  model: {model_ref}");
     println!("  press Ctrl+C to stop the daemon");
@@ -787,10 +832,19 @@ pub(crate) async fn cmd_serve(
             signal_shutdown.cancel();
         }
     });
-    let result = match bound {
-        BoundServer::Unix(server) => server.serve(shutdown).await,
-        BoundServer::Tcp { server, .. } => server.serve(shutdown).await,
+    let unix_serve = async {
+        match bound.unix {
+            Some(server) => server.serve(shutdown.clone()).await,
+            None => Ok(()),
+        }
     };
+    let tcp_serve = async {
+        match bound.tcp {
+            Some((server, _)) => server.serve(shutdown.clone()).await,
+            None => Ok(()),
+        }
+    };
+    let result = tokio::try_join!(unix_serve, tcp_serve);
     // Stopping the daemon is an explicit runtime shutdown, unlike closing a
     // TUI client. Cancel and reap any remaining turns before process exit.
     let _ = runtime
@@ -814,15 +868,18 @@ pub(crate) async fn cmd_web(
     sandbox: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
     // The owned runtime is kept only so an in-process server can shut it down
-    // explicitly on exit; a connected daemon belongs to another process.
-    let (service, runtime, token) = match connect {
+    // explicitly on exit; a connected daemon belongs to another process. The
+    // in-process path runs in aggregation mode: the primary repository behind
+    // a RouterService, plus registered project daemons (probe-or-spawn).
+    let (server, runtime, token) = match connect {
         Some(daemon_addr) => {
             let token =
                 token.ok_or_else(|| anyhow::anyhow!("--token is required with --connect"))?;
             let client = LocalSocketRuntimeClient::connect_tcp(daemon_addr, token.clone()).await?;
             let service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
                 Arc::new(DaemonService(client));
-            (service, None, token)
+            let server = leveler_web::bind(service, addr, token.clone()).await?;
+            (server, None, token)
         }
         None => {
             if token.is_some() {
@@ -845,11 +902,22 @@ pub(crate) async fn cmd_web(
             if reaped > 0 {
                 tracing::warn!(reaped, "reaped zombie turns before WebUI startup");
             }
-            (service, Some(runtime), generate_daemon_token())
+            let router = leveler_web::RouterService::new(service, app.layout.repo_root.clone());
+            let registry_path = web_projects_registry_path();
+            let manager = leveler_web::ProjectManager::new(
+                router.clone(),
+                registry_path,
+                std::env::current_exe().ok(),
+            );
+            // Bring persisted projects online in the background — the server
+            // must not wait on daemons that need spawning.
+            tokio::spawn(manager.clone().load_registry());
+            let token = generate_daemon_token();
+            let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
+            (server, Some(runtime), token)
         }
     };
 
-    let server = leveler_web::bind(service, addr, token.clone()).await?;
     println!("{}", Line::heading("Web UI ready"));
     // Printed once to the operator's own terminal: the URL carries the bearer
     // token the browser needs. Not logged elsewhere.
@@ -873,6 +941,15 @@ pub(crate) async fn cmd_web(
     }
     result?;
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The multi-project registry lives at the top of the CodeLeveler home
+/// (default `~/.leveler/web-projects.json`) — it is cross-repository state,
+/// unlike the per-repo dirs under `projects/`.
+fn web_projects_registry_path() -> PathBuf {
+    leveler_core::leveler_home_dir(leveler_core::environment())
+        .unwrap_or_else(std::env::temp_dir)
+        .join("web-projects.json")
 }
 
 /// A `LocalRuntimeService` facade over a TCP-connected daemon client: the
@@ -1240,6 +1317,94 @@ mod tui_runtime_selection_tests {
         assert_eq!(
             socket_intent(false, false, true, true),
             SocketIntent::RequireExplicit,
+        );
+    }
+}
+
+#[cfg(test)]
+mod daemon_bind_tests {
+    use super::*;
+    use leveler_client_protocol::{
+        ClientCommand, ClientError, RuntimeEvent, SessionId, UiSessionSnapshot,
+        mock::MockRuntimeClient,
+    };
+    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
+    use tokio::sync::broadcast;
+
+    /// Minimal LocalRuntimeService for bind tests: command surface is never
+    /// exercised, only the transports are bound.
+    struct TestService {
+        mock: MockRuntimeClient,
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveRuntimeClient for TestService {
+        async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+            self.mock.send(command).await
+        }
+        fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+            self.mock.subscribe()
+        }
+        async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+            self.mock.snapshot(session_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LocalRuntimeService for TestService {
+        async fn create_session(
+            &self,
+            _request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            Err(ClientError::Runtime("not exercised".to_string()))
+        }
+    }
+
+    fn test_service() -> Arc<dyn LocalRuntimeService> {
+        Arc::new(TestService {
+            mock: MockRuntimeClient::new(SessionId::new("s-test")),
+        })
+    }
+
+    #[tokio::test]
+    async fn tcp_mode_binds_the_unix_ownership_socket_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let bound = bind_daemon_transports(
+            &sock,
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some("test-token".to_string()),
+            test_service(),
+        )
+        .await
+        .expect("binds");
+        assert!(bound.unix.is_some(), "TCP 模式也必须占住 Unix 锁 socket");
+        assert!(sock.exists(), "锁 socket 文件必须真的落盘");
+        let (tcp_server, token) = bound.tcp.as_ref().expect("tcp bound");
+        assert_eq!(
+            token, "test-token",
+            "env 提供的 token 必须被沿用而不是重新生成"
+        );
+        assert!(tcp_server.local_addr().unwrap().port() > 0);
+    }
+
+    #[tokio::test]
+    async fn second_daemon_on_the_same_socket_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let _first = bind_daemon_transports(&sock, None, None, test_service())
+            .await
+            .expect("first daemon binds");
+        let second = bind_daemon_transports(
+            &sock,
+            Some("127.0.0.1:0".parse().unwrap()),
+            None,
+            test_service(),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "同一仓库上的第二个 daemon 必须 bind 失败（否则会把第一个的活跃 turn 当僵尸 reap）"
         );
     }
 }

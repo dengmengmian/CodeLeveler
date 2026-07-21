@@ -50,6 +50,8 @@ tempfile = "3"
 getrandom = "0.2"
 
 [dev-dependencies]
+async-trait = { workspace = true }
+leveler-client-protocol = { workspace = true, features = ["testing"] }
 leveler-tools = { workspace = true }
 futures = { workspace = true }
 tempfile = "3"

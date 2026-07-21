@@ -2225,6 +2225,7 @@ dependencies = [
  "leveler-client-protocol",
  "leveler-core",
  "leveler-local-transport",
+ "leveler-project",
  "mime_guess",
  "reqwest",
  "rust-embed",
