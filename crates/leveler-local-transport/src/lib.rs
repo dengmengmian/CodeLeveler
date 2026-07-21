@@ -895,6 +895,15 @@ mod unsupported {
             ))
         }
 
+        pub async fn connect_tcp(
+            _addr: std::net::SocketAddr,
+            _token: impl Into<String>,
+        ) -> Result<Self, TransportError> {
+            Err(TransportError::Unavailable(
+                "the TCP daemon is not supported on this platform".to_string(),
+            ))
+        }
+
         pub async fn create_session(
             &self,
             _request: CreateSessionRequest,
@@ -937,10 +946,36 @@ mod unsupported {
             LocalSocketRuntimeClient::create_session(self, request).await
         }
     }
+
+    pub struct TcpRuntimeServer;
+
+    impl TcpRuntimeServer {
+        pub async fn bind(
+            _addr: std::net::SocketAddr,
+            _token: impl Into<String>,
+            _runtime: Arc<dyn LocalRuntimeService>,
+        ) -> Result<Self, TransportError> {
+            Err(TransportError::Unavailable(
+                "the TCP daemon is not supported on this platform".to_string(),
+            ))
+        }
+
+        pub fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
+            Err(TransportError::Unavailable(
+                "the TCP daemon is not supported on this platform".to_string(),
+            ))
+        }
+
+        pub async fn serve(self, _shutdown: CancellationToken) -> Result<(), TransportError> {
+            Err(TransportError::Unavailable(
+                "the TCP daemon is not supported on this platform".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(not(unix))]
-pub use unsupported::{LocalSocketRuntimeClient, LocalSocketServer};
+pub use unsupported::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
 
 #[cfg(all(test, unix))]
 mod tests {
