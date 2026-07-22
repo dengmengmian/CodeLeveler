@@ -38,6 +38,30 @@ function AssistantTurn({ m }: { m: ChatMessage }) {
   );
 }
 
+// 旁问侧答：独立卡片，回显问题 + 答案，标注不打断主回合。
+function BtwTurn({ m }: { m: ChatMessage }) {
+  return (
+    <div className="turn turn-btw">
+      <div className="btw-card">
+        <div className="btw-head">
+          <span className="btw-badge">旁问</span>
+          <span className="btw-q">{m.btw}</span>
+          <span className="btw-note">不打断当前回合</span>
+        </div>
+        <div className="btw-body">
+          <MessageBody text={m.text} streaming={m.streaming} />
+        </div>
+        {!m.streaming && m.text && (
+          <div className="msg-foot">
+            <CopyButton text={m.text} />
+            {m.time && <time className="msg-time">{m.time}</time>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function Timeline() {
   const current = useAppState().current;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -121,7 +145,13 @@ export function Timeline() {
     <div className="timeline" ref={scrollRef} onScroll={onScroll}>
       <div className="tl-inner">
         {current.messages.map((m) =>
-          m.role === 'user' ? <UserTurn key={m.id} m={m} /> : <AssistantTurn key={m.id} m={m} />,
+          m.btw !== undefined ? (
+            <BtwTurn key={m.id} m={m} />
+          ) : m.role === 'user' ? (
+            <UserTurn key={m.id} m={m} />
+          ) : (
+            <AssistantTurn key={m.id} m={m} />
+          ),
         )}
 
         <AgentRunBlock />

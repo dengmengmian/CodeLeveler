@@ -41,6 +41,8 @@ export interface ChatMessage {
   time: string | null;
   /** 时间线排序戳（越小越早） */
   seq: number;
+  /** 旁问（/btw）侧答：存被问的问题，非空即渲染为独立侧答卡片 */
+  btw?: string;
 }
 
 export interface ToolCallView {
@@ -353,6 +355,7 @@ export function reducer(state: AppState, action: Action): void {
         streaming: true,
         time: action.time,
         seq: nextSeq(),
+        btw: action.question,
       });
       return;
     }

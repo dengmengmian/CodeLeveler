@@ -34,9 +34,10 @@ export function Rail() {
 
   return (
     <aside className="rail">
-      <div className="brand" title="CodeLeveler web · v0.1">
+      <div className="brand" title={`CodeLeveler web · v${__APP_VERSION__}`}>
         <BrandMark />
         <div className="name">CodeLeveler</div>
+        <span className="ver">v{__APP_VERSION__}</span>
       </div>
 
       <button className="rail-new" onClick={() => bridge.newDraft()}>

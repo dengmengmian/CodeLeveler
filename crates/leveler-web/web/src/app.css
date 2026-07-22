@@ -166,7 +166,7 @@ button { font-family: inherit; }
 
 /* ============ 总体布局：三栏工作台 ============ */
 /* 左 220 项目导航 / 中间自适应工作台 / 右 340 执行状态 */
-.deck { display: grid; grid-template-columns: 220px 1fr 340px; height: 100vh; }
+.deck { display: grid; grid-template-columns: 260px 1fr 340px; height: 100vh; }
 
 /* ============ 左栏：项目导航 ============ */
 .rail {
@@ -180,6 +180,10 @@ button { font-family: inherit; }
 }
 .brand svg { width: 18px; height: 18px; color: var(--accent); flex: none; }
 .brand .name { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: .04em; }
+.brand .ver {
+  margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-secondary);
+  padding: 1px 6px; border: 1px solid var(--border-default); border-radius: 5px;
+}
 
 .rail-new {
   margin: 12px 12px 4px; padding: 8px 12px;
@@ -354,6 +358,24 @@ button { font-family: inherit; }
   font-size: 15px;
   line-height: 1.7;
 }
+
+/* 旁问（/btw）侧答：独立卡片，与主回合正文明显区分，不打断主流 */
+.turn-btw { margin: 18px 0 28px; }
+.btw-card {
+  border: 1px solid var(--border-default); border-left: 3px solid var(--accent);
+  border-radius: 10px; background: var(--bg-hover); padding: 10px 14px 12px;
+}
+.btw-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed var(--border-subtle);
+}
+.btw-badge {
+  font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--send-ink);
+  background: var(--accent); border-radius: 5px; padding: 1px 7px; flex: none;
+}
+.btw-q { font-size: 14px; font-weight: 500; color: var(--text-primary); }
+.btw-note { margin-left: auto; font-size: 11px; color: var(--text-muted); flex: none; }
+.btw-body { font-size: 15px; line-height: 1.7; }
 
 /* 时间戳：默认隐藏，hover 所在消息时显示 */
 .msg-time {
@@ -779,7 +801,7 @@ button { font-family: inherit; }
 ::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-@media (max-width: 1240px) { .deck { grid-template-columns: 220px 1fr; } .inspector { display: none; } }
+@media (max-width: 1240px) { .deck { grid-template-columns: 260px 1fr; } .inspector { display: none; } }
 
 /* ============ 顶部：视图切换 + 运行状态行 ============ */
 .view-tabs {
