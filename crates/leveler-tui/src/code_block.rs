@@ -236,7 +236,7 @@ fn render_container<F>(
                     Span::styled("  ", Style::default().fg(theme.border)),
                     Span::styled(
                         format!("⋮ {count} lines omitted"),
-                        Style::default().fg(theme.muted),
+                        Style::default().fg(theme.dim),
                     ),
                 ]));
             }

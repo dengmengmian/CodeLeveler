@@ -510,7 +510,7 @@ fn running_command_renders_as_progress_activity() {
 
     let text = render_at(100, 24, &mut state);
     assert!(
-        text.contains('⟳') && text.contains("执行") && text.contains("cargo"),
+        text.contains('◌') && text.contains("执行") && text.contains("cargo"),
         "running important tool must show progress: {text}"
     );
     assert!(!text.contains("工具活动"), "{text}");

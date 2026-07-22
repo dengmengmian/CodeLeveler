@@ -22,7 +22,9 @@ mod transcript_lines;
 
 pub use footer::conversation_footer;
 pub(crate) use footer::user_turn_summaries;
-pub use transcript_lines::{assistant_split, item_is_final, item_render, items_need_gap};
+pub use transcript_lines::{
+    assistant_split, item_is_final, item_render, items_need_gap, sub_agent_tree_lines,
+};
 pub(crate) use transcript_lines::{
     btw_card_lines, sub_agent_detail, sub_agent_display_name, sub_agent_status, sub_agent_usage,
 };
@@ -749,11 +751,13 @@ mod tests {
             );
         }
 
+        // Consecutive sub-agents aggregate into one tree: a parent header plus
+        // one ├─/└─ child per agent (nickname first).
         let waiting = render_text(&mut state, 100, 28);
-        assert!(waiting.contains("探索 Agent 1 · 等待执行"), "{waiting}");
-        assert!(waiting.contains("探索 Agent 2 · 等待执行"), "{waiting}");
-        assert!(waiting.contains("任务：检查 provider 架构"), "{waiting}");
-        assert!(waiting.contains("任务：检查协议适配层"), "{waiting}");
+        assert!(waiting.contains("2 个 agents 正在运行"), "{waiting}");
+        assert!(waiting.contains("├─ Euclid"), "{waiting}");
+        assert!(waiting.contains("└─ Newton"), "{waiting}");
+        assert!(waiting.contains("等待执行"), "{waiting}");
 
         for (id, input, output, cached) in
             [("agent-1", 1_200, 80, 600), ("agent-2", 2_400, 160, 1_200)]
@@ -771,13 +775,10 @@ mod tests {
         }
 
         let active = render_text(&mut state, 100, 28);
+        assert!(active.contains("进行中"), "{active}");
         assert!(
-            active.contains("探索 Agent 1 · 执行中 · ↑ 1,200 · ↓ 80"),
-            "{active}"
-        );
-        assert!(
-            active.contains("探索 Agent 2 · 执行中 · ↑ 2,400 · ↓ 160"),
-            "{active}"
+            active.contains("↑ 3.6k · ↓ 240"),
+            "parent aggregates reported usage: {active}"
         );
     }
 
@@ -1051,7 +1052,7 @@ mod tests {
         );
         let (lines, _) = super::conversation_footer(&s, 80, 0, 0, false);
         let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(joined.contains("已停止"), "{joined}");
+        assert!(joined.contains("✗ 失败"), "{joined}");
     }
 
     #[test]
@@ -1064,8 +1065,12 @@ mod tests {
             r#"{"path":"README.md"}"#.into(),
             false,
         );
-        s.transcript
-            .complete_tool(&first, true, "README contents".into(), 10);
+        s.transcript.complete_tool(
+            &first,
+            true,
+            "README contents\nrest of the readme body".into(),
+            10,
+        );
         let second = ToolCallId::new("t2");
         s.transcript.push_tool_started(
             second.clone(),
@@ -1076,13 +1081,13 @@ mod tests {
         s.transcript
             .complete_tool(&second, false, "grep failed loudly".into(), 20);
 
-        // Product activity stream: successful reads collapse into a summary;
-        // the failed grep stays one honest line with its error.
+        // Product activity stream: the successful read renders its own compact
+        // unit; the failed grep keeps an honest result line with its error.
         let (auto, _) = super::conversation_footer(&s, 100, 0, 0, false);
         let auto = auto.iter().map(line_str).collect::<Vec<_>>().join("\n");
         assert!(
             auto.contains("读取") || auto.contains("检查") || auto.contains("找到"),
-            "success exploration should aggregate: {auto}"
+            "successful read renders its own unit: {auto}"
         );
         assert!(
             auto.contains("搜索") && auto.contains("grep failed loudly"),
@@ -1092,8 +1097,12 @@ mod tests {
             assert!(!group.expanded, "failed groups must not auto-expand");
         }
         assert!(
-            !auto.contains("README contents"),
-            "collapsed group leaked successful output: {auto}"
+            auto.contains("README contents"),
+            "collapsed unit shows the bounded first content line: {auto}"
+        );
+        assert!(
+            !auto.contains("rest of the readme body"),
+            "collapsed group must not leak output beyond the first line: {auto}"
         );
 
         // Expand the current (only) group via its own flag — not a global blast.
@@ -1434,7 +1443,10 @@ mod tests {
         let folded = tool_render(&item, false);
         let text = folded.iter().map(line_str).collect::<Vec<_>>().join("\n");
         assert!(!text.contains("+line 30"), "folded diff is capped: {text}");
-        assert!(text.contains("还有"), "must say how much is hidden: {text}");
+        assert!(
+            text.contains("Ctrl+O") && text.contains("…"),
+            "must hint how to see the full diff: {text}"
+        );
 
         let expanded = tool_render(&item, true);
         let text = expanded.iter().map(line_str).collect::<Vec<_>>().join("\n");

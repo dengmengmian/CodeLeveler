@@ -14,7 +14,7 @@ use crate::i18n::Locale;
 pub enum ActivityVisibility {
     /// Do not enter Conversation (file scans, path enumeration, existence probes).
     Silent,
-    /// Compact one-line progress (reads/searches); may be aggregated.
+    /// Compact per-call progress unit (reads/searches) — one three-line unit each.
     Normal,
     /// Always show: edits, shell runs, plans, user prompts.
     /// (Goal bookkeeping is Silent — not a product activity line.)
@@ -60,8 +60,8 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     ToolTaxonomyEntry {
         name: "read_file",
         kind: ToolKind::Read,
-        presentation_en: "Read",
-        presentation_zh: "读取",
+        presentation_en: "Read file",
+        presentation_zh: "读取文件",
         read_only_default: true,
         visibility: ActivityVisibility::Normal,
     },
@@ -76,24 +76,24 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     ToolTaxonomyEntry {
         name: "grep",
         kind: ToolKind::Search,
-        presentation_en: "Search",
-        presentation_zh: "搜索",
+        presentation_en: "Search code",
+        presentation_zh: "搜索代码",
         read_only_default: true,
         visibility: ActivityVisibility::Normal,
     },
     ToolTaxonomyEntry {
         name: "repository_search",
         kind: ToolKind::Search,
-        presentation_en: "Search",
-        presentation_zh: "搜索",
+        presentation_en: "Search code",
+        presentation_zh: "搜索代码",
         read_only_default: true,
         visibility: ActivityVisibility::Normal,
     },
     ToolTaxonomyEntry {
         name: "glob",
         kind: ToolKind::Search,
-        presentation_en: "Search",
-        presentation_zh: "搜索",
+        presentation_en: "Search code",
+        presentation_zh: "搜索代码",
         read_only_default: true,
         visibility: ActivityVisibility::Normal,
     },
@@ -140,24 +140,24 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     ToolTaxonomyEntry {
         name: "apply_patch",
         kind: ToolKind::Edit,
-        presentation_en: "Edit",
-        presentation_zh: "编辑",
+        presentation_en: "Edit file",
+        presentation_zh: "编辑文件",
         read_only_default: false,
         visibility: ActivityVisibility::Important,
     },
     ToolTaxonomyEntry {
         name: "replace",
         kind: ToolKind::Edit,
-        presentation_en: "Edit",
-        presentation_zh: "替换",
+        presentation_en: "Edit file",
+        presentation_zh: "编辑文件",
         read_only_default: false,
         visibility: ActivityVisibility::Important,
     },
     ToolTaxonomyEntry {
         name: "run_command",
         kind: ToolKind::Execute,
-        presentation_en: "Run",
-        presentation_zh: "执行",
+        presentation_en: "Run command",
+        presentation_zh: "执行命令",
         read_only_default: false,
         // Shell may still demote to Silent for ls/tree/find/pwd probes.
         visibility: ActivityVisibility::Important,
@@ -165,8 +165,8 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     ToolTaxonomyEntry {
         name: "shell_command",
         kind: ToolKind::Execute,
-        presentation_en: "Run",
-        presentation_zh: "执行",
+        presentation_en: "Run command",
+        presentation_zh: "执行命令",
         read_only_default: false,
         visibility: ActivityVisibility::Important,
     },
@@ -593,7 +593,7 @@ mod tests {
             Locale::En,
             |_n, _a| "src/lib.rs".to_string(),
         );
-        assert_eq!(line, "✓  Read  src/lib.rs");
+        assert_eq!(line, "✓  Read file  src/lib.rs");
         let run = compact_tool_line(
             "●",
             "run_command",
@@ -601,11 +601,11 @@ mod tests {
             Locale::En,
             |_n, _a| "cargo test".to_string(),
         );
-        assert_eq!(run, "●  Run  cargo test");
+        assert_eq!(run, "●  Run command  cargo test");
         let edit = compact_tool_line("!", "apply_patch", "{}", Locale::Zh, |_n, _a| {
             "src/a.rs".to_string()
         });
-        assert_eq!(edit, "!  编辑  src/a.rs");
+        assert_eq!(edit, "!  编辑文件  src/a.rs");
     }
 
     #[test]

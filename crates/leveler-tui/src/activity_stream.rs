@@ -1,19 +1,24 @@
-//! Conversation activity stream: filter Internal Trace and aggregate exploration.
+//! Conversation activity stream: per-call two-line tool units.
 //!
 //! Product surface, not a tool trace:
-//! - **Internal Trace** (grep/search/read_file/list/symbol): hidden per-call;
-//!   consecutive successes collapse into one Activity Summary.
-//! - **User-visible**: Important edits/runs and Failed tools stay one line each.
-//! - Expanded groups can reveal trace details under the summary.
+//! - **Silent** tools (ls/find probes, goal bookkeeping): hidden per-call.
+//! - **User-visible**: every Normal/Important call renders its own unit —
+//!   a head row (status glyph + action + inline target) and a `└` result
+//!   line. No whole-line tinting: only the glyph carries a status color.
+//! - Consecutive same-file patches merge into one edit node with a combined
+//!   hunk stat line and folded diff rows; consecutive identical failures
+//!   merge into one unit with a `×N` retry count.
+//! - Expanded groups reveal output details under the unit.
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::i18n::{Locale, UiText};
 use crate::render::truncate_display;
 use crate::theme::Theme;
 use crate::tool_cell::{tool_action_label_for, tool_summary_pub};
-use crate::tool_taxonomy::{ActivityVisibility, ToolKind, activity_visibility};
+use crate::tool_taxonomy::{ActivityVisibility, activity_visibility};
 use crate::transcript::{ToolCallBlock, ToolGroupBlock, ToolStatus};
 
 /// Render a tool group for the Conversation activity stream.
@@ -25,27 +30,20 @@ pub(crate) fn render_group(
     t: &UiText,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    // A concurrent read-only batch shows as one "parallel" header so the user
-    // sees these calls ran together rather than one after another.
+    // A concurrent batch gets one quiet dim header so the user sees these
+    // calls ran together rather than one after another.
     let parallel_n = group.calls.iter().filter(|c| c.parallel).count();
     if parallel_n >= 2 {
-        let label = match locale {
-            Locale::Zh => format!("⇉ {parallel_n} 个工具并发执行"),
-            Locale::En => format!("⇉ {parallel_n} tools in parallel"),
-        };
+        let label = t.parallel_header.replace("{}", &parallel_n.to_string());
         out.push(Line::from(Span::styled(
             truncate_display(&label, width),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.dim),
         )));
     }
-    let units = plan_units(&group.calls);
-    for unit in units {
+    for unit in plan_units(&group.calls) {
         match unit {
             StreamUnit::Single(call) => {
-                // Failed tools always keep a one-line summary on the activity
-                // row (status + first error line). Multi-line dumps only when
-                // the group is expanded — never flood on collapse.
-                out.push(single_activity_line(call, theme, width, locale, t));
+                out.extend(unit_lines(call, theme, width, locale, t, group.expanded, 1, None));
                 if !group.expanded {
                     continue;
                 }
@@ -56,21 +54,30 @@ pub(crate) fn render_group(
                 }
                 append_call_detail(call, theme, width, true, locale, t, &mut out);
             }
-            StreamUnit::Aggregate {
-                reads,
-                searches,
-                symbols,
-                other,
-                samples,
-            } => {
-                out.push(aggregate_line(
-                    theme, width, t, reads, searches, symbols, other,
+            StreamUnit::EditMerge(calls) => {
+                out.extend(edit_unit_lines(
+                    &calls,
+                    theme,
+                    width,
+                    locale,
+                    t,
+                    group.expanded,
                 ));
-                // Details: only when the group is expanded (user-requested).
+            }
+            StreamUnit::FailMerge(calls) => {
+                let total_ms: u64 = calls.iter().filter_map(|c| c.duration_ms).sum();
+                out.extend(unit_lines(
+                    calls[0],
+                    theme,
+                    width,
+                    locale,
+                    t,
+                    group.expanded,
+                    calls.len(),
+                    (total_ms >= 100).then_some(total_ms),
+                ));
                 if group.expanded {
-                    for call in samples {
-                        out.push(detail_trace_line(call, theme, width, locale));
-                    }
+                    append_call_detail(calls[0], theme, width, true, locale, t, &mut out);
                 }
             }
         }
@@ -78,32 +85,20 @@ pub(crate) fn render_group(
     out
 }
 
-/// Whether a completed/running call may appear as its own Conversation line.
+/// Whether a completed/running call may appear as its own Conversation unit.
 pub(crate) fn is_conversation_visible(call: &ToolCallBlock) -> bool {
-    // Internal Trace successes never appear as per-path lines (only in aggregates).
-    if is_internal_trace(call) && call.status == ToolStatus::Ok {
-        return false;
-    }
-    // Running Trace is noise while the model thinks.
-    if is_internal_trace(call) && call.status == ToolStatus::Running {
-        return false;
-    }
+    // Silent tools (exploration probes, goal bookkeeping) stay out unless they
+    // failed — a failure is always user-facing.
     match activity_visibility(&call.name, &call.arguments) {
         ActivityVisibility::Silent => call.status == ToolStatus::Failed,
         ActivityVisibility::Normal | ActivityVisibility::Important => true,
     }
 }
 
-#[derive(Debug)]
 enum StreamUnit<'a> {
     Single(&'a ToolCallBlock),
-    Aggregate {
-        reads: usize,
-        searches: usize,
-        symbols: usize,
-        other: usize,
-        samples: Vec<&'a ToolCallBlock>,
-    },
+    EditMerge(Vec<&'a ToolCallBlock>),
+    FailMerge(Vec<&'a ToolCallBlock>),
 }
 
 fn plan_units(calls: &[ToolCallBlock]) -> Vec<StreamUnit<'_>> {
@@ -111,38 +106,60 @@ fn plan_units(calls: &[ToolCallBlock]) -> Vec<StreamUnit<'_>> {
     let mut i = 0;
     while i < calls.len() {
         let call = &calls[i];
-        // Batch consecutive successful Internal Trace tools into one summary.
-        if is_trace_success(call) {
-            let mut reads = 0usize;
-            let mut searches = 0usize;
-            let mut symbols = 0usize;
-            let mut other = 0usize;
-            let mut samples = Vec::new();
-            while i < calls.len() && is_trace_success(&calls[i]) {
-                tally(
-                    &calls[i],
-                    &mut reads,
-                    &mut searches,
-                    &mut symbols,
-                    &mut other,
-                );
-                if samples.len() < 8 {
-                    samples.push(&calls[i]);
-                }
-                i += 1;
-            }
-            out.push(StreamUnit::Aggregate {
-                reads,
-                searches,
-                symbols,
-                other,
-                samples,
-            });
-            continue;
-        }
         if !is_conversation_visible(call) {
             i += 1;
             continue;
+        }
+        if mergeable_edit(call) {
+            // Merge render-adjacent patches to the same file (hidden probes in
+            // between do not break adjacency; a visible different tool does).
+            let key = edit_merge_key(call);
+            let mut group = vec![call];
+            let mut j = i + 1;
+            while j < calls.len() {
+                let next = &calls[j];
+                if !is_conversation_visible(next) {
+                    j += 1;
+                    continue;
+                }
+                if mergeable_edit(next) && edit_merge_key(next) == key {
+                    group.push(next);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            out.push(StreamUnit::EditMerge(group));
+            i = j;
+            continue;
+        }
+        if call.status == ToolStatus::Failed {
+            // Merge render-adjacent identical failures (same tool, same args —
+            // the model retrying the exact same call). Nine lines of repeated
+            // error collapse into one unit with a `×N` retry count.
+            let mut group = vec![call];
+            let mut j = i + 1;
+            while j < calls.len() {
+                let next = &calls[j];
+                if !is_conversation_visible(next) {
+                    j += 1;
+                    continue;
+                }
+                if next.status == ToolStatus::Failed
+                    && next.name == call.name
+                    && next.arguments == call.arguments
+                {
+                    group.push(next);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if group.len() > 1 {
+                out.push(StreamUnit::FailMerge(group));
+                i = j;
+                continue;
+            }
         }
         out.push(StreamUnit::Single(call));
         i += 1;
@@ -150,119 +167,358 @@ fn plan_units(calls: &[ToolCallBlock]) -> Vec<StreamUnit<'_>> {
     out
 }
 
-fn is_trace_success(call: &ToolCallBlock) -> bool {
-    // Only real exploration tools enter the summary batch — demoted shell probes
-    // (`ls`/`find`) stay fully Silent and never produce a summary line alone.
-    call.status == ToolStatus::Ok && is_summary_exploration(call)
+/// A non-failed patch with a real file target can merge with its neighbors.
+fn mergeable_edit(call: &ToolCallBlock) -> bool {
+    call.name == "apply_patch"
+        && call.status != ToolStatus::Failed
+        && !crate::tool_cell::patch_files_key(&call.arguments).is_empty()
 }
 
-/// Tools whose successful runs collapse into an Activity Summary line.
-fn is_summary_exploration(call: &ToolCallBlock) -> bool {
-    match crate::tool_taxonomy::lookup(&call.name).map(|e| e.kind) {
-        Some(
-            ToolKind::Read
-            | ToolKind::Search
-            | ToolKind::Lsp
-            | ToolKind::ListDir
-            | ToolKind::WebSearch
-            | ToolKind::Media,
-        ) => true,
-        _ => matches!(
-            call.name.as_str(),
-            "read_file"
-                | "list_files"
-                | "grep"
-                | "repository_search"
-                | "find_symbol"
-                | "read_symbol"
-                | "find_references"
-                | "git_status"
-                | "git_diff"
-                | "web_search"
-                | "view_image"
-        ),
-    }
+/// Merge identity: same touched files, same status. Different files or a
+/// status change (running → ok) never merge.
+fn edit_merge_key(call: &ToolCallBlock) -> (String, ToolStatus) {
+    (
+        crate::tool_cell::patch_files_key(&call.arguments),
+        call.status,
+    )
 }
 
-/// Internal Trace: exploration tools + demoted Silent probes — not user decisions.
-fn is_internal_trace(call: &ToolCallBlock) -> bool {
-    is_summary_exploration(call)
-        || activity_visibility(&call.name, &call.arguments) == ActivityVisibility::Silent
+fn is_shell_call(call: &ToolCallBlock) -> bool {
+    matches!(call.name.as_str(), "run_command" | "shell_command")
 }
 
-fn tally(
-    call: &ToolCallBlock,
-    reads: &mut usize,
-    searches: &mut usize,
-    symbols: &mut usize,
-    other: &mut usize,
-) {
-    match crate::tool_taxonomy::lookup(&call.name).map(|e| e.kind) {
-        Some(ToolKind::Read) => *reads += 1,
-        Some(ToolKind::Search | ToolKind::WebSearch) => *searches += 1,
-        Some(ToolKind::Lsp) => *symbols += 1,
-        _ if call.name == "read_file" => *reads += 1,
-        _ if matches!(
-            call.name.as_str(),
-            "grep" | "repository_search" | "web_search" | "git_diff" | "git_status"
-        ) =>
-        {
-            *searches += 1
-        }
-        _ if matches!(
-            call.name.as_str(),
-            "find_symbol" | "read_symbol" | "find_references"
-        ) =>
-        {
-            *symbols += 1
-        }
-        _ => *other += 1,
-    }
-}
-
-fn single_activity_line(
+/// One visible tool call as a two-line unit:
+/// `✓ 动作  参数 · 0.4s` / `  └ 结果`.
+///
+/// `repeat` > 1 marks a FailMerge unit: identical consecutive failures shown
+/// once with a `×N` suffix on the result row. `duration_override` lets the
+/// merged unit show the summed duration instead of the first call's.
+#[allow(clippy::too_many_arguments)]
+fn unit_lines(
     call: &ToolCallBlock,
     theme: &Theme,
     width: usize,
     locale: Locale,
     t: &UiText,
-) -> Line<'static> {
-    let (glyph, color) = match call.status {
-        ToolStatus::Running => ("⟳", theme.accent),
-        ToolStatus::Ok => ("✓", theme.success),
-        ToolStatus::Failed => ("✗", theme.error),
+    expanded: bool,
+    repeat: usize,
+    duration_override: Option<u64>,
+) -> Vec<Line<'static>> {
+    // Plan/goal guard rejections carry internal English validation text for the
+    // model — show a warning glyph and a localized note instead. Other failures
+    // are real errors: the result row shows the first error line.
+    let guard_denial = call.status == ToolStatus::Failed
+        && matches!(call.name.as_str(), "update_plan" | "update_goal");
+    let (glyph, glyph_color) = if guard_denial {
+        ("⚠", theme.warning)
+    } else {
+        status_glyph(call.status, theme)
     };
     let action = if call.name == "task" {
         t.unsupported_task_action.to_string()
     } else {
         tool_action_label_for(&call.name, locale)
     };
-    let summary = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments));
-    let mut body = if summary.is_empty() || summary == "{}" {
-        action
-    } else {
-        format!("{action}  {summary}")
+
+    // Trailing status marker: running ellipsis or duration.
+    let tail = match call.status {
+        ToolStatus::Running => " …".to_string(),
+        _ => duration_override
+            .or(call.duration_ms)
+            .filter(|ms| *ms >= 100)
+            .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
+            .unwrap_or_default(),
     };
-    // Collapsed failure: keep the error visible on the same line.
+
+    let mut head = vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+        Span::styled(action.clone(), Style::default().fg(theme.tool)),
+    ];
+
+    // The head carries the one-line target inline (text color; `$` highlighted
+    // for shell). Width budget reserves the tail plus a small margin.
+    let mut summary = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    // A failed patch whose arguments can't be parsed falls back to a generic
+    // placeholder ("补丁"); recover the real target from the error preview.
     if call.status == ToolStatus::Failed
-        && let Some(err) = failed_one_line_summary(call, t)
+        && call.name == "apply_patch"
+        && (summary.is_empty() || summary == t.tool_label_patch)
+        && let Some(file) = failed_patch_target(call.preview.as_deref())
     {
-        body.push_str(" — ");
-        body.push_str(&err);
+        summary = file;
     }
-    let dur = call
-        .duration_ms
-        .filter(|ms| *ms >= 100)
-        .map(|ms| format!("  {:.1}s", ms as f64 / 1000.0))
-        .unwrap_or_default();
-    let text = format!("{glyph} {body}{dur}");
-    let style = if activity_visibility(&call.name, &call.arguments) == ActivityVisibility::Important
-    {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    if !summary.is_empty() && summary != "{}" {
+        let shell = is_shell_call(call);
+        let used = 2 + UnicodeWidthStr::width(action.as_str()) + 2 + usize::from(shell) * 2;
+        let avail = width
+            .saturating_sub(used + UnicodeWidthStr::width(tail.as_str()) + 8)
+            .max(8);
+        head.push(Span::raw("  "));
+        if shell {
+            head.push(Span::styled("$ ", Style::default().fg(theme.shell_prompt)));
+        }
+        head.push(Span::styled(
+            truncate_display(&summary, avail),
+            Style::default().fg(theme.text),
+        ));
+    }
+    if !tail.is_empty() {
+        head.push(Span::styled(tail, Style::default().fg(theme.dim)));
+    }
+    let mut out = vec![Line::from(head)];
+
+    // Line 2: result summary.
+    out.extend(result_lines_for(call, theme, width, t, expanded, guard_denial, repeat));
+    out
+}
+
+/// Recover the target file of a failed patch from its error preview
+/// (`failed to apply hunk to <file>: …`).
+fn failed_patch_target(preview: Option<&str>) -> Option<String> {
+    let first = preview?.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let rest = first.strip_prefix("failed to apply hunk to ")?;
+    let file = rest.split(':').next()?.trim();
+    if file.is_empty() {
+        None
     } else {
-        Style::default().fg(color)
+        Some(file.to_string())
+    }
+}
+
+fn status_glyph(status: ToolStatus, theme: &Theme) -> (&'static str, ratatui::style::Color) {
+    match status {
+        ToolStatus::Running => ("◌", theme.accent),
+        ToolStatus::Ok => ("✓", theme.success),
+        ToolStatus::Failed => ("✗", theme.error),
+    }
+}
+
+/// The `└ …` result row: first error line for failures (with a fold hint for
+/// the hidden rest and a `×N` retry count for merged repeats), a first-content
+/// preview plus a quiet output-line count for successes.
+#[allow(clippy::too_many_arguments)]
+fn result_lines_for(
+    call: &ToolCallBlock,
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+    expanded: bool,
+    guard_denial: bool,
+    repeat: usize,
+) -> Vec<Line<'static>> {
+    if call.status == ToolStatus::Failed {
+        let note = if guard_denial {
+            Some(crate::tool_cell::guard_denial_note(&call.name, t).to_string())
+        } else {
+            failed_one_line_summary(call, t)
+        };
+        let Some(note) = note else {
+            return Vec::new();
+        };
+        let retry_w = if repeat > 1 {
+            UnicodeWidthStr::width(format!(" ×{repeat}").as_str())
+        } else {
+            0
+        };
+        let mut spans = vec![
+            Span::styled("  └ ", Style::default().fg(theme.muted)),
+            Span::styled(
+                truncate_display(&note, width.saturating_sub(4 + retry_w).max(1)),
+                Style::default().fg(theme.muted),
+            ),
+        ];
+        if !expanded && !guard_denial {
+            let more = preview_line_count(call).saturating_sub(1);
+            if more > 0 {
+                spans.push(Span::styled(
+                    format!(" {}", t.fold_more_lines_short.replace("{}", &more.to_string())),
+                    Style::default().fg(theme.dim),
+                ));
+            }
+        }
+        if repeat > 1 {
+            spans.push(Span::styled(
+                format!(" ×{repeat}"),
+                Style::default().fg(theme.dim),
+            ));
+        }
+        return vec![Line::from(spans)];
+    }
+    if call.status == ToolStatus::Running {
+        return Vec::new();
+    }
+    // Ok: lead with the first content line so a successful read shows WHAT was
+    // read, not just how much; the quiet count keeps the unit honest. Shell
+    // output stays count-only (its first line is usually noise).
+    let n = content_line_count(call);
+    if n == 0 {
+        return Vec::new();
+    }
+    let (pre, post) = split_placeholder(t.tool_output_lines);
+    let first = if is_shell_call(call) {
+        None
+    } else {
+        first_content_line(call)
     };
-    Line::from(Span::styled(truncate_display(&text, width), style))
+    let mut spans = vec![Span::styled("  └ ", Style::default().fg(theme.muted))];
+    if let Some(first) = first {
+        let count_w = UnicodeWidthStr::width(pre) + n.to_string().len() + UnicodeWidthStr::width(post);
+        let avail = width.saturating_sub(4 + count_w + 3 + 2).max(8);
+        spans.push(Span::styled(
+            truncate_display(&first, avail),
+            Style::default().fg(theme.muted),
+        ));
+        spans.push(Span::styled(" · ".to_string(), Style::default().fg(theme.dim)));
+    }
+    spans.push(Span::styled(pre.to_string(), Style::default().fg(theme.muted)));
+    spans.push(Span::styled(n.to_string(), Style::default().fg(theme.dim)));
+    spans.push(Span::styled(post.to_string(), Style::default().fg(theme.muted)));
+    if call_timed_out(call) {
+        spans.push(Span::styled(
+            t.result_timeout.to_string(),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    vec![Line::from(spans)]
+}
+
+/// First non-empty content line of an Ok preview, with read_file's
+/// line-number gutter (`   12\tfoo`) stripped.
+fn first_content_line(call: &ToolCallBlock) -> Option<String> {
+    let preview = call.preview.as_deref()?.trim();
+    let line = preview.lines().find(|l| !l.trim().is_empty())?;
+    let stripped = strip_line_gutter(line).trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+/// Strip a leading `<digits>\t` gutter that read_file adds to every row.
+fn strip_line_gutter(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let digits = trimmed.len() - trimmed.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits > 0 && trimmed[digits..].starts_with('\t') {
+        trimmed[digits + 1..].trim_start()
+    } else {
+        trimmed
+    }
+}
+
+/// Merged same-file edit node: one head (glyph + action + inline files), one
+/// hunk-stats line, then the combined diff rows (folded unless the group is
+/// expanded).
+fn edit_unit_lines(
+    calls: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    let Some(first) = calls.first() else {
+        return Vec::new();
+    };
+    let (glyph, glyph_color) = status_glyph(first.status, theme);
+    let action = tool_action_label_for("apply_patch", locale);
+    let tail = match first.status {
+        ToolStatus::Running => " …".to_string(),
+        _ => {
+            let total_ms: u64 = calls.iter().filter_map(|c| c.duration_ms).sum();
+            if total_ms >= 100 {
+                format!(" · {:.1}s", total_ms as f64 / 1000.0)
+            } else {
+                String::new()
+            }
+        }
+    };
+    let mut head = vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+        Span::styled(action.clone(), Style::default().fg(theme.tool)),
+    ];
+    // The touched file(s) ride inline on the head row.
+    let files = crate::tool_cell::patch_files_key(&first.arguments).replace('\u{1}', ", ");
+    if !files.is_empty() {
+        let used = 2 + UnicodeWidthStr::width(action.as_str()) + 2;
+        let avail = width
+            .saturating_sub(used + UnicodeWidthStr::width(tail.as_str()) + 8)
+            .max(8);
+        head.push(Span::raw("  "));
+        head.push(Span::styled(
+            truncate_display(&files, avail),
+            Style::default().fg(theme.text),
+        ));
+    }
+    if !tail.is_empty() {
+        head.push(Span::styled(tail, Style::default().fg(theme.dim)));
+    }
+    let mut out = vec![Line::from(head)];
+
+    // Line 2: `└ N 处修改 · +A −R`.
+    let mut hunks = 0usize;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for call in calls {
+        let stats = crate::tool_cell::patch_stats(&call.arguments);
+        hunks += stats.hunks;
+        added += stats.added;
+        removed += stats.removed;
+    }
+    let edits = if hunks == 0 { calls.len() } else { hunks };
+    let (pre, post) = split_placeholder(t.edit_merge_summary);
+    out.push(Line::from(vec![
+        Span::styled("  └ ", Style::default().fg(theme.muted)),
+        Span::styled(pre.to_string(), Style::default().fg(theme.muted)),
+        Span::styled(edits.to_string(), Style::default().fg(theme.dim)),
+        Span::styled(post.to_string(), Style::default().fg(theme.muted)),
+        Span::styled(" · ".to_string(), Style::default().fg(theme.muted)),
+        Span::styled(format!("+{added} −{removed}"), Style::default().fg(theme.dim)),
+    ]));
+
+    crate::tool_cell::merged_diff_rows(calls, theme, width, expanded, t, &mut out);
+    out
+}
+
+/// Split a "{} …" i18n template around its placeholder.
+fn split_placeholder(template: &str) -> (&str, &str) {
+    template.split_once("{}").unwrap_or((template, ""))
+}
+
+/// Output line count for an Ok result row, skipping shell metadata rows.
+fn content_line_count(call: &ToolCallBlock) -> usize {
+    let Some(preview) = call.preview.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
+        return 0;
+    };
+    if is_shell_call(call) {
+        preview
+            .lines()
+            .filter(|l| {
+                !l.starts_with("exit: ")
+                    && *l != "[timed out]"
+                    && !(l.starts_with("--- ") && l.ends_with(" ---"))
+            })
+            .count()
+    } else {
+        preview.lines().count()
+    }
+}
+
+fn preview_line_count(call: &ToolCallBlock) -> usize {
+    call.preview
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.lines().count())
+        .unwrap_or(0)
+}
+
+fn call_timed_out(call: &ToolCallBlock) -> bool {
+    is_shell_call(call)
+        && call
+            .preview
+            .as_deref()
+            .is_some_and(|p| p.lines().any(|l| l == "[timed out]"))
 }
 
 /// First non-empty preview line for a failed tool (honest one-line error).
@@ -284,64 +540,6 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
         .find(|l| !l.is_empty())
         .unwrap_or(preview);
     Some(truncate_display(first, 72))
-}
-
-fn detail_trace_line(
-    call: &ToolCallBlock,
-    theme: &Theme,
-    width: usize,
-    locale: Locale,
-) -> Line<'static> {
-    let action = tool_action_label_for(&call.name, locale);
-    let summary = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments));
-    let body = if summary.is_empty() || summary == "{}" {
-        action
-    } else {
-        format!("{action}  {summary}")
-    };
-    Line::from(Span::styled(
-        truncate_display(&format!("  · {body}"), width),
-        Style::default().fg(theme.muted),
-    ))
-}
-
-fn aggregate_line(
-    theme: &Theme,
-    width: usize,
-    t: &UiText,
-    reads: usize,
-    searches: usize,
-    symbols: usize,
-    other: usize,
-) -> Line<'static> {
-    let total = reads + searches + symbols + other;
-    // Search-heavy bursts → "found N related locations".
-    let body = if searches > 0 && searches >= reads && searches >= symbols {
-        t.activity_found_locations
-            .replace("{}", &total.max(searches).to_string())
-    } else if total == 0 {
-        t.activity_explored.to_string()
-    } else {
-        let mut parts = Vec::new();
-        if reads > 0 {
-            parts.push(t.activity_reads.replace("{}", &reads.to_string()));
-        }
-        if searches > 0 {
-            parts.push(t.activity_searches.replace("{}", &searches.to_string()));
-        }
-        if symbols > 0 {
-            parts.push(t.activity_symbols.replace("{}", &symbols.to_string()));
-        }
-        if other > 0 {
-            parts.push(other.to_string());
-        }
-        format!("{}（{}）", t.activity_explored, parts.join(" · "))
-    };
-    let text = format!("✓ {body}");
-    Line::from(Span::styled(
-        truncate_display(&text, width),
-        Style::default().fg(theme.success),
-    ))
 }
 
 fn strip_inline_md(s: &str) -> String {
@@ -429,6 +627,19 @@ mod tests {
         c
     }
 
+    fn patch_call(file: &str, old: &str, new: &str) -> ToolCallBlock {
+        call(
+            "apply_patch",
+            &serde_json::json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {file}\n@@\n-{old}\n+{new}\n*** End Patch"
+                )
+            })
+            .to_string(),
+            ToolStatus::Ok,
+        )
+    }
+
     #[test]
     fn parallel_batch_gets_a_concurrency_header() {
         let g = group(vec![
@@ -438,8 +649,21 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines.iter().any(|l| l.contains("并发")),
+            lines.iter().any(|l| l.contains("并行执行 3 个工具")),
             "a ≥2-call parallel batch must show a concurrency header: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_header_is_localized() {
+        let g = group(vec![
+            parallel_call("read_file", r#"{"path":"a.rs"}"#),
+            parallel_call("grep", r#"{"pattern":"x"}"#),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::En);
+        assert!(
+            lines.iter().any(|l| l.contains("2 tools in parallel")),
+            "{lines:?}"
         );
     }
 
@@ -452,7 +676,7 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            !lines.iter().any(|l| l.contains("并发")),
+            !lines.iter().any(|l| l.contains("并行执行")),
             "one parallel call is not a batch: {lines:?}"
         );
     }
@@ -464,14 +688,8 @@ mod tests {
             call("list_files", r#"{"path":"cmd"}"#, ToolStatus::Ok),
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        // list_files is Silent/Trace — still summarized as exploration, not path dump.
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains("PROJECT_RULES") || l == "✓ ."),
-            "{lines:?}"
-        );
+        // list_files is Silent — successful probes never reach Conversation.
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     #[test]
@@ -508,15 +726,18 @@ mod tests {
             ToolStatus::Ok,
         )]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].contains("目标收尾") && lines[0].contains("受阻"),
+            lines.iter().any(|l| l.contains("目标收尾")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("受阻") && l.contains("缺 API key")),
             "{lines:?}"
         );
     }
 
     #[test]
-    fn consecutive_reads_and_greps_aggregate_without_paths() {
+    fn exploration_calls_render_as_individual_units() {
         let g = group(vec![
             call(
                 "read_file",
@@ -532,34 +753,74 @@ mod tests {
             ),
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains("PROJECT_RULES.md") || l.contains("Makefile")),
-            "paths must not list out: {lines:?}"
+        // No aggregation: each call is its own three-line unit.
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("读取文件")).count(),
+            2,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("搜索代码")).count(),
+            2,
+            "{lines:?}"
         );
         assert!(
-            lines[0].contains("找到") || lines[0].contains("检查") || lines[0].contains("搜索"),
-            "{lines:?}"
+            lines.iter().any(|l| l.contains("PROJECT_RULES.md"))
+                && lines.iter().any(|l| l.contains("Makefile")),
+            "each unit shows its own target: {lines:?}"
         );
     }
 
     #[test]
-    fn single_read_is_summary_not_path_line() {
+    fn single_read_renders_a_two_line_unit() {
         let g = group(vec![call(
             "read_file",
             r#"{"path":"src/auth.go"}"#,
             ToolStatus::Ok,
         )]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
-            !lines[0].contains("auth.go") || lines[0].contains("检查") || lines[0].contains("读取"),
-            "prefer summary over path dump: {lines:?}"
+            lines[0].starts_with('✓')
+                && lines[0].contains("读取文件")
+                && lines[0].contains("auth.go"),
+            "head carries glyph + action + inline target: {lines:?}"
         );
-        // Must not look like a raw path-only activity line.
-        assert!(!lines[0].ends_with("auth.go"), "{lines:?}");
+        assert!(lines[1].starts_with("  └ "), "{lines:?}");
+    }
+
+    #[test]
+    fn ok_read_result_shows_first_content_line_and_count() {
+        let mut c = call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok);
+        c.preview = Some("     1\t# GitCode AI 中间件服务\n     2\t\n     3\tbody".into());
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].contains("# GitCode AI 中间件服务") && lines[1].contains("3 行"),
+            "first content line (gutter stripped) + line count: {lines:?}"
+        );
+        assert!(
+            !lines[1].contains("1\t"),
+            "line-number gutter must be stripped: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn ok_shell_result_stays_count_only() {
+        let mut c = call(
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Ok,
+        );
+        c.preview = Some("warning: unused import\nexit: 0".into());
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines[1].starts_with("  └ ") && lines[1].contains("1 行"),
+            "shell result keeps the quiet count, no first-line dump: {lines:?}"
+        );
+        assert!(!lines[1].contains("unused import"), "{lines:?}");
     }
 
     #[test]
@@ -574,11 +835,10 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("编辑") && l.contains("web.go")),
+            lines.iter().any(|l| l.contains("编辑文件")),
             "{lines:?}"
         );
+        assert!(lines.iter().any(|l| l.contains("web.go")), "{lines:?}");
     }
 
     #[test]
@@ -593,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_failed_tool_keeps_one_line_error_summary() {
+    fn collapsed_failed_tool_shows_first_error_and_a_fold_hint() {
         let mut c = call(
             "run_command",
             r#"{"program":"cargo","args":["test"]}"#,
@@ -604,19 +864,40 @@ mod tests {
         let g = group(vec![c]);
         assert!(!g.expanded);
         let lines = render_group_text(&g, 120, Locale::Zh);
-        assert_eq!(
-            lines.len(),
-            1,
-            "collapsed failed tool must not dump multi-line body: {lines:?}"
-        );
+        assert_eq!(lines.len(), 2, "head / result rows: {lines:?}");
         assert!(lines[0].starts_with('✗'), "{lines:?}");
         assert!(
-            lines[0].contains("error: no such command"),
-            "one-line error summary: {lines:?}"
+            lines[1].starts_with("  └ ") && lines[1].contains("error: no such command"),
+            "result row carries the first error line: {lines:?}"
         );
         assert!(
-            !lines[0].contains("long help dump line 2"),
-            "must not include rest of dump on the summary line: {lines:?}"
+            lines[1].contains("+2 行") && lines[1].contains("Ctrl+O"),
+            "the hidden rest gets a fold hint: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("long help dump line 2")),
+            "must not dump the log while collapsed: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn guard_denied_plan_reads_as_warning_not_error() {
+        let mut c = call(
+            "update_plan",
+            r#"{"explanation":"现在开始第3步"}"#,
+            ToolStatus::Failed,
+        );
+        c.preview = Some(
+            "— plan step \"创建项目结构\" cannot be completed while step 1 is in_progress".into(),
+        );
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(lines[0].starts_with('⚠'), "{lines:?}");
+        let joined = lines.join("\n");
+        assert!(joined.contains("计划未更新"), "{joined}");
+        assert!(
+            !joined.contains("plan step") && !joined.contains("cannot"),
+            "internal guard text must not leak: {joined}"
         );
     }
 
@@ -632,70 +913,203 @@ mod tests {
         g.expanded = true;
         let lines = render_group_text(&g, 120, Locale::Zh);
         assert!(
-            lines.len() >= 2,
-            "expanded should reveal detail under the summary: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn mix_of_exploration_and_run_keeps_run_separate() {
-        let g = group(vec![
-            call("read_file", r#"{"path":"a.go"}"#, ToolStatus::Ok),
-            call("read_file", r#"{"path":"b.go"}"#, ToolStatus::Ok),
-            call(
-                "run_command",
-                r#"{"program":"cargo","args":["test"]}"#,
-                ToolStatus::Ok,
-            ),
-        ]);
-        let lines = render_group_text(&g, 80, Locale::Zh);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(
-            lines[0].contains("检查") || lines[0].contains("读取") || lines[0].contains("找到"),
-            "{lines:?}"
+            lines.len() > 2,
+            "expanded should reveal detail under the unit: {lines:?}"
         );
         assert!(
-            lines[1].contains("执行") && lines[1].contains("cargo"),
+            lines.iter().any(|l| l.contains("extra context line")),
             "{lines:?}"
         );
     }
 
     #[test]
-    fn shell_command_activity_hides_json_and_cd_prefix() {
+    fn shell_command_renders_dollar_prompt_and_hides_json_and_cd() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/example".into());
         let args =
             format!(r#"{{"cmd":"cd {home}/Develop/app/codeleveler && cargo test --workspace"}}"#);
         let g = group(vec![call("shell_command", &args, ToolStatus::Ok)]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
-            lines[0].contains("cargo test --workspace"),
-            "expected command body: {lines:?}"
+            lines[0].contains("执行命令")
+                && lines[0].contains("$ ")
+                && lines[0].contains("cargo test --workspace"),
+            "head carries the command body with a shell prompt: {lines:?}"
         );
         assert!(
-            !lines[0].contains("cmd") && !lines[0].contains('{'),
+            !lines.iter().any(|l| l.contains('{') || l.contains("\"cmd\"")),
             "must not leak JSON args: {lines:?}"
         );
         assert!(
-            !lines[0].contains(&home) && !lines[0].contains("Develop/app"),
+            !lines.iter().any(|l| l.contains(&home) || l.contains("Develop/app")),
             "must not leak absolute cwd: {lines:?}"
         );
     }
 
     #[test]
-    fn expanded_group_reveals_trace_details() {
+    fn running_tool_uses_the_running_glyph() {
+        let g = group(vec![call(
+            "run_command",
+            r#"{"program":"cargo","args":["build"]}"#,
+            ToolStatus::Running,
+        )]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(lines[0].starts_with('◌'), "{lines:?}");
+        assert!(
+            lines[0].contains("$ ") && lines[0].contains("cargo build"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_same_file_patches_merge_into_one_edit_node() {
+        let g = group(vec![
+            patch_call("src/a.rs", "old1", "new1"),
+            patch_call("src/a.rs", "old2", "new2"),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("编辑文件")).count(),
+            1,
+            "one merged node, one head: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2 处修改") && l.contains("+2 −2")),
+            "combined hunk stats: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("+new1"))
+                && lines.iter().any(|l| l.contains("-old2")),
+            "both patches' diff rows: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn different_file_patches_do_not_merge() {
+        let g = group(vec![
+            patch_call("src/a.rs", "old1", "new1"),
+            patch_call("src/b.rs", "old2", "new2"),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("编辑文件")).count(),
+            2,
+            "different files stay separate nodes: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn non_adjacent_same_file_patches_do_not_merge() {
+        let g = group(vec![
+            patch_call("src/a.rs", "old1", "new1"),
+            call("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok),
+            patch_call("src/a.rs", "old2", "new2"),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("编辑文件")).count(),
+            2,
+            "a visible different tool breaks the merge: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn single_patch_shows_stats_and_folded_diff_rows() {
+        let g = group(vec![patch_call("src/a.rs", "old", "new")]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines[0].starts_with('✓')
+                && lines[0].contains("编辑文件")
+                && lines[0].contains("src/a.rs"),
+            "head carries glyph + action + inline file: {lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("  └ ") && lines[1].contains("1 处修改") && lines[1].contains("+1 −1"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("+new")) && lines.iter().any(|l| l.contains("-old")),
+            "diff rows visible by default: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn failed_patch_recovers_target_file_from_error_preview() {
+        // Unparseable patch args leave the summary at the generic placeholder;
+        // the error preview still names the file — show that instead.
+        let mut c = call("apply_patch", "{}", ToolStatus::Failed);
+        c.preview =
+            Some("failed to apply hunk to README.md: could not find context line `Archite".into());
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines[0].contains("编辑文件") && lines[0].contains("README.md"),
+            "head names the failed patch's target file: {lines:?}"
+        );
+        assert!(!lines[0].contains("补丁"), "{lines:?}");
+        assert!(
+            lines[1].starts_with("  └ ") && lines[1].contains("could not find context line"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_identical_failures_merge_with_retry_count() {
+        let args = r#"{"patch":"*** Begin Patch\n*** Update File: README.md\n*** End Patch"}"#;
+        let mut failed = || {
+            let mut c = call("apply_patch", args, ToolStatus::Failed);
+            c.preview = Some("invalid patch: line 1: bad hunk".into());
+            c
+        };
+        let g = group(vec![failed(), failed(), failed()]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("编辑文件")).count(),
+            1,
+            "identical retries collapse into one unit: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("invalid patch") && lines[1].contains("×3"),
+            "result row carries the error and the retry count: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_failures_do_not_merge() {
+        let mut c1 = call("apply_patch", r#"{"patch":"a"}"#, ToolStatus::Failed);
+        c1.preview = Some("invalid patch: a".into());
+        let mut c2 = call("apply_patch", r#"{"patch":"b"}"#, ToolStatus::Failed);
+        c2.preview = Some("invalid patch: b".into());
+        let g = group(vec![c1, c2]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("编辑文件")).count(),
+            2,
+            "different arguments stay separate units: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains('×')), "{lines:?}");
+    }
+
+    #[test]
+    fn expanded_group_reveals_output_details() {
         let mut g = group(vec![
             call("grep", r#"{"pattern":"dist"}"#, ToolStatus::Ok),
             call("grep", r#"{"pattern":"build"}"#, ToolStatus::Ok),
         ]);
         g.expanded = true;
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert!(lines.len() >= 2, "summary + detail lines: {lines:?}");
+        assert!(lines.len() >= 2, "units + detail lines: {lines:?}");
         assert!(
             lines
                 .iter()
                 .any(|l| l.contains("dist") || l.contains("搜索")),
             "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("ok")),
+            "expanded detail shows the output body: {lines:?}"
         );
     }
 }

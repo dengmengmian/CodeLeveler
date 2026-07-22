@@ -188,7 +188,7 @@ pub fn render_diff_view(
             Folded::Omitted(n) => {
                 out.push(Line::from(Span::styled(
                     format!("  ⋮ {n} lines hidden"),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.dim),
                 )));
             }
         }

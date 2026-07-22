@@ -398,9 +398,9 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
         match block {
             MdBlock::Heading { level, spans } => {
                 // Render as a styled heading (no literal "#" markers). H1/H2
-                // get an accent bar so the level still reads at a glance.
+                // get a heading-colored bar so the level still reads at a glance.
                 let style = Style::default()
-                    .fg(theme.accent)
+                    .fg(theme.heading)
                     .add_modifier(Modifier::BOLD);
                 let mut heading = Vec::new();
                 if *level <= 2 {
@@ -442,7 +442,7 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                         } else {
                             indent.clone()
                         };
-                        let mut spans = vec![Span::styled(lead, Style::default().fg(theme.accent))];
+                        let mut spans = vec![Span::styled(lead, Style::default().fg(theme.heading))];
                         spans.extend(line.spans);
                         out.push(Line::from(spans));
                     }
@@ -701,7 +701,7 @@ fn table_lines(
 
     let border = Style::default().fg(theme.border);
     let head_style = Style::default()
-        .fg(theme.accent)
+        .fg(theme.heading)
         .add_modifier(Modifier::BOLD);
 
     // Full-grid layout: an outer box with a rule between every row.
@@ -759,7 +759,7 @@ fn table_lines_stacked(
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let label_style = Style::default()
-        .fg(theme.accent)
+        .fg(theme.heading)
         .add_modifier(Modifier::BOLD);
 
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -877,7 +877,7 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
             style = style.add_modifier(Modifier::ITALIC);
         }
         if s.code {
-            style = Style::default().fg(theme.warning);
+            style = Style::default().fg(theme.code);
         }
         if s.link.is_some() {
             style = style.fg(theme.accent).add_modifier(Modifier::UNDERLINED);
