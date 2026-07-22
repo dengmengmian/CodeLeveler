@@ -461,6 +461,7 @@ impl TargetLock {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        #[allow(clippy::never_loop)]
         loop {
             let file = std::fs::OpenOptions::new()
                 .read(true)
