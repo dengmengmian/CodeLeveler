@@ -34,12 +34,9 @@ export function Rail() {
 
   return (
     <aside className="rail">
-      <div className="brand">
+      <div className="brand" title="CodeLeveler web · v0.1">
         <BrandMark />
-        <div>
-          <div className="name">CodeLeveler</div>
-          <div className="ver">web · v0.1</div>
-        </div>
+        <div className="name">CodeLeveler</div>
       </div>
 
       <button className="rail-new" onClick={() => bridge.newDraft()}>
@@ -237,18 +234,17 @@ function SessionsPanel() {
               ).map((s) => {
                 const dot = statusDot(s.status);
                 return (
+                  // 单行紧凑式：标题 + 右侧相对时间;状态点只在「运行中/等待
+                  // 输入」时出现,完成态不再各占一行刷 COMPLETED 噪声。
                   <button
                     key={s.id}
                     className={`sess${state.current?.id === s.id ? ' active' : ''}`}
                     onClick={() => bridge.selectSession(s.id)}
+                    title={`${dot.label} · ${formatRelative(s.updated_at)}`}
                   >
-                    <div className="t">{s.goal || '未命名会话'}</div>
-                    <div className="m">
-                      <i className={`dot ${dot.cls}`} />
-                      <span>{dot.label}</span>
-                      <span>·</span>
-                      <span>{formatRelative(s.updated_at)}</span>
-                    </div>
+                    {dot.cls !== 'idle' && <i className={`dot ${dot.cls}`} />}
+                    <span className="t">{s.goal || '未命名会话'}</span>
+                    <span className="ago">{formatRelative(s.updated_at)}</span>
                   </button>
                 );
               })}

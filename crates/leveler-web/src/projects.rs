@@ -63,6 +63,11 @@ struct Registry {
     /// readable.
     #[serde(default)]
     aliases: HashMap<PathBuf, String>,
+    /// Removed by the user: historical discovery must not re-list these even
+    /// though their state dirs under `<home>/projects` still exist. An
+    /// explicit open clears the entry.
+    #[serde(default)]
+    ignored: Vec<PathBuf>,
 }
 
 /// Runtime state of one registered project.
@@ -84,6 +89,8 @@ struct State {
     entries: Mutex<HashMap<PathBuf, Entry>>,
     /// Display aliases (loaded from / persisted with the registry).
     aliases: Mutex<HashMap<PathBuf, String>>,
+    /// User-removed repositories discovery must skip (persisted).
+    ignored: Mutex<std::collections::HashSet<PathBuf>>,
     /// Live status changes, fanned out to WS connections as `project_status`.
     status_tx: broadcast::Sender<(String, ProjectStatus)>,
 }
@@ -135,6 +142,7 @@ impl ProjectManager {
             state: Arc::new(State {
                 entries: Mutex::new(HashMap::new()),
                 aliases: Mutex::new(HashMap::new()),
+                ignored: Mutex::new(std::collections::HashSet::new()),
                 status_tx: broadcast::channel(64).0,
             }),
         })
@@ -179,6 +187,8 @@ impl ProjectManager {
         if repo == self.router.primary_repo() {
             return Ok(self.info_for(&repo, ProjectStatus::Online));
         }
+        // Explicit open overrides an earlier removal.
+        self.state.ignored.lock().unwrap().remove(&repo);
         {
             let mut entries = self.state.entries.lock().unwrap();
             if let Some(entry) = entries.get_mut(&repo) {
@@ -236,6 +246,10 @@ impl ProjectManager {
             let _ = kill.send(());
         }
         self.state.aliases.lock().unwrap().remove(&repo);
+        // Removal must stick across discovery passes and server restarts:
+        // the repo's state dir still exists, so without this every start
+        // would re-list what the user just removed.
+        self.state.ignored.lock().unwrap().insert(repo.clone());
         self.router.remove_daemon(&repo);
         self.persist();
         Ok(())
@@ -305,6 +319,7 @@ impl ProjectManager {
             Err(_) => return, // no registry yet
         };
         *self.state.aliases.lock().unwrap() = registry.aliases;
+        *self.state.ignored.lock().unwrap() = registry.ignored.into_iter().collect();
         for repo in registry.projects {
             let Some(repo_str) = repo.to_str() else {
                 continue;
@@ -347,6 +362,7 @@ impl ProjectManager {
         let repo = repo.canonicalize().unwrap_or(repo);
         if repo == self.router.primary_repo()
             || self.state.entries.lock().unwrap().contains_key(&repo)
+            || self.state.ignored.lock().unwrap().contains(&repo)
         {
             return;
         }
@@ -478,6 +494,12 @@ impl ProjectManager {
                 paths
             },
             aliases: self.state.aliases.lock().unwrap().clone(),
+            ignored: {
+                let mut paths: Vec<PathBuf> =
+                    self.state.ignored.lock().unwrap().iter().cloned().collect();
+                paths.sort();
+                paths
+            },
         };
         let write = || -> std::io::Result<()> {
             if let Some(parent) = self.registry_path.parent() {
@@ -813,6 +835,7 @@ mod tests {
             serde_json::to_vec(&Registry {
                 projects: vec![canonical_repo.clone()],
                 aliases: HashMap::from([(canonical_repo, "历史别名".to_string())]),
+                ignored: Vec::new(),
             })
             .unwrap(),
         )
@@ -839,6 +862,7 @@ mod tests {
             serde_json::to_vec(&Registry {
                 projects: vec![canonical_repo.clone()],
                 aliases: HashMap::new(),
+                ignored: Vec::new(),
             })
             .unwrap(),
         )
@@ -975,6 +999,53 @@ mod tests {
         // …but the user can still open it deliberately.
         let _ = manager.add(repo.to_str().unwrap()).await;
         assert_eq!(manager.list().len(), 2);
+    }
+
+    /// 移除 must stick: a removed project is recorded in the registry's
+    /// ignore list, so discovery (this run AND the next server start) stops
+    /// re-listing it — its state dir under `<home>/projects` still exists.
+    /// Explicitly opening the path again clears the ignore.
+    #[tokio::test]
+    async fn removed_project_is_not_rediscovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("removed-project");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = repo.canonicalize().unwrap();
+        let state_dir = dir.path().join("projects").join("-removed-slug");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join(".repository-root"),
+            canonical_repo.display().to_string(),
+        )
+        .unwrap();
+
+        let tempzone = dir.path().join("tempzone");
+        let (manager, _router) = manager_in(dir.path(), dir.path().join("dead.sock"));
+        manager.discover_historical_projects(&tempzone).await;
+        assert_eq!(manager.list().len(), 2, "discovered before removal");
+
+        manager
+            .remove(canonical_repo.to_str().unwrap())
+            .expect("removes");
+        // Same run: a re-discovery pass must not resurrect it.
+        manager.discover_historical_projects(&tempzone).await;
+        assert_eq!(manager.list().len(), 1, "removed project must stay gone");
+
+        // Fresh server start: load_registry + discovery still honors the
+        // persisted ignore.
+        let (manager2, _router2) = manager_in(dir.path(), dir.path().join("dead.sock"));
+        manager2.clone().load_registry().await;
+        manager2.discover_historical_projects(&tempzone).await;
+        assert_eq!(
+            manager2.list().len(),
+            1,
+            "ignore must survive a restart: {:?}",
+            manager2.list()
+        );
+
+        // Explicit open clears the ignore (user changed their mind).
+        let _ = manager2.add(canonical_repo.to_str().unwrap()).await;
+        assert_eq!(manager2.list().len(), 2, "explicit open re-registers");
     }
 
     /// A discovered (offline, ephemeral) project becomes a real registry

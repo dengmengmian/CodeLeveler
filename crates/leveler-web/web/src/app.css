@@ -173,13 +173,13 @@ button { font-family: inherit; }
   background: var(--bg-sidebar); border-right: 1px solid var(--border-subtle);
   display: flex; flex-direction: column; min-height: 0;
 }
+/* 收缩为单行：小标记 + 名称，版本进 title 提示 */
 .brand {
-  display: flex; align-items: center; gap: 10px;
-  padding: 14px 14px; border-bottom: 1px solid var(--border-subtle);
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-bottom: 1px solid var(--border-subtle);
 }
-.brand svg { width: 24px; height: 24px; color: var(--accent); flex: none; }
+.brand svg { width: 18px; height: 18px; color: var(--accent); flex: none; }
 .brand .name { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: .04em; }
-.brand .ver  { font-family: var(--mono); font-size: 11px; color: var(--text-tertiary); margin-top: 1px; }
 
 .rail-new {
   margin: 12px 12px 4px; padding: 8px 12px;
@@ -238,18 +238,21 @@ button { font-family: inherit; }
 .proj.closed .proj-sessions { display: none; }
 .proj-sessions { margin-left: 12px; border-left: 1px solid var(--border-subtle); padding-left: 4px; }
 
+/* 单行紧凑式（参考 Kimi）：标题 + 右侧时间;状态点仅运行/等待时出现 */
 .sess {
-  display: block; width: 100%; text-align: left; background: none; border: none;
-  border-left: 2px solid transparent;
-  padding: 7px 10px; margin: 2px 0; cursor: pointer; border-radius: 0 3px 3px 0;
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  background: none; border: none; border-left: 2px solid transparent;
+  padding: 5px 10px; margin: 1px 0; cursor: pointer; border-radius: 0 3px 3px 0;
   color: var(--text-secondary);
 }
 .sess:hover { background: var(--bg-hover); color: var(--text-primary); }
 .sess.active { background: var(--bg-hover); border-left-color: var(--accent); color: var(--text-primary); }
-.sess .t { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sess .m {
-  display: flex; gap: 8px; align-items: center;
-  font-family: var(--mono); font-size: 11px; color: var(--text-tertiary); margin-top: 2px;
+.sess .t {
+  flex: 1; min-width: 0; font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sess .ago {
+  flex: none; font-family: var(--mono); font-size: 10px; color: var(--text-tertiary);
 }
 /* 会话列表折叠：默认 5 条，加载更多 / 收起 */
 .sess-more {
