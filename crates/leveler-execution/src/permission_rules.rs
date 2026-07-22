@@ -232,15 +232,26 @@ pub fn load_rules_file(path: &Path) -> Result<PermissionRuleSet, String> {
     Ok(PermissionRuleSet::from_rules(file.rules))
 }
 
-/// Global then project (project last can tighten via deny).
-pub fn load_merged_rules(global_home: &Path, repo_root: &Path) -> PermissionRuleSet {
+/// Merge the three rule sources. Order is cosmetic — evaluation is
+/// deny > ask > allow regardless:
+/// - global: `<global_home>/permissions.yaml` (user-authored);
+/// - project state: `state_rules` — the per-project file under the global
+///   home (`Layout::permissions_path()`), where `ApproveAlways` persists
+///   rules — never inside the repo;
+/// - in-repo: `<repo>/.leveler/permissions.yaml` (user-authored / legacy
+///   ApproveAlways target, still honored).
+pub fn load_merged_rules(
+    global_home: &Path,
+    state_rules: &Path,
+    repo_root: &Path,
+) -> PermissionRuleSet {
     let mut set = load_rules_file(&global_home.join("permissions.yaml")).unwrap_or_default();
-    let project = load_rules_file(&project_rules_path(repo_root)).unwrap_or_default();
-    set.extend(project);
+    set.extend(load_rules_file(state_rules).unwrap_or_default());
+    set.extend(load_rules_file(&project_rules_path(repo_root)).unwrap_or_default());
     set
 }
 
-/// Path of the project rules file under a repo root.
+/// Path of the user-authored rules file under a repo root.
 pub fn project_rules_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".leveler/permissions.yaml")
 }
@@ -380,8 +391,12 @@ pub fn append_rule_file(path: &Path, rule: &PermissionRule) -> Result<(), String
 /// file is a no-op). Kept as a file delete rather than an empty `rules:`
 /// list so the loaders' missing-file fast path stays the steady state.
 pub fn clear_project_rules(repo_root: &Path) -> Result<(), String> {
-    let path = project_rules_path(repo_root);
-    match std::fs::remove_file(&path) {
+    clear_rules_file(&project_rules_path(repo_root))
+}
+
+/// Remove one rules file; missing file is a no-op.
+pub fn clear_rules_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("remove {}: {e}", path.display())),
@@ -687,6 +702,32 @@ rules:
         assert_eq!(load_rules_file(&path).unwrap().rules().len(), 1);
     }
 
+    /// ApproveAlways persists into the per-project state dir under the global
+    /// home (`~/.leveler/projects/<hash>/permissions.yaml`); merged loading
+    /// must read that file alongside the global and in-repo ones.
+    #[test]
+    fn merged_rules_include_the_state_dir_project_file() {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let rule = PermissionRule {
+            match_: RuleMatch {
+                tool: Some("run_command".into()),
+                command_prefix: Some("git push".into()),
+                command_exact: None,
+                path_glob: None,
+            },
+            effect: RuleEffect::Allow,
+        };
+        let state_rules = state.path().join("permissions.yaml");
+        append_rule_file(&state_rules, &rule).unwrap();
+        let set = load_merged_rules(home.path(), &state_rules, repo.path());
+        assert_eq!(
+            set.evaluate("run_command", Some("git push origin main"), &[]),
+            RuleDecision::Allow
+        );
+    }
+
     #[test]
     fn clear_project_rules_removes_file_and_tolerates_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -704,7 +745,7 @@ rules:
         clear_project_rules(dir.path()).unwrap();
         assert!(!project_rules_path(dir.path()).exists());
         // Freshly merged rules no longer contain the cleared project rule.
-        let set = load_merged_rules(dir.path(), dir.path());
+        let set = load_merged_rules(dir.path(), &dir.path().join("state/permissions.yaml"), dir.path());
         assert!(set.is_empty());
     }
 

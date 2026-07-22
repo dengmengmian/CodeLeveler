@@ -133,59 +133,14 @@ impl Tool for ReplaceTool {
         // Serialize CodeLeveler writers for this target. The lock is advisory,
         // cross-platform, and held across the final compare + rename, making
         // the CAS real for concurrent replace invocations (including separate
-        // CodeLeveler processes).
+        // CodeLeveler processes). It lives under the global leveler home, keyed
+        // by the resolved path — never inside the workspace, which must not
+        // accumulate lock files.
         context.checkpoint.record(&resolved);
-        let parent = resolved
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let lock_path = parent.join(format!(
-            ".{}.leveler-lock",
-            resolved
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file")
-        ));
-        #[cfg(unix)]
-        let lock = tokio::task::spawn_blocking({
-            let root = context.workspace.root().to_path_buf();
-            let relative = resolved
-                .strip_prefix(&root)
-                .map_err(|_| ToolError::Io("target left workspace".into()))?
-                .to_path_buf();
-            let lock_name = lock_path.file_name().unwrap_or_default().to_os_string();
-            move || open_descriptor_lock(&root, &relative, &lock_name)
-        })
-        .await
-        .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
-        .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
-        #[cfg(windows)]
-        let lock = tokio::task::spawn_blocking({
-            let root = context.workspace.root().to_path_buf();
-            let root_dir = context.workspace.root_dir();
-            let relative = resolved
-                .strip_prefix(&root)
-                .map_err(|_| ToolError::Io("target left workspace".into()))?
-                .to_path_buf();
-            let lock_name = lock_path.file_name().unwrap_or_default().to_os_string();
-            move || open_windows_replace_context(&root_dir, &relative, &lock_name)
-        })
-        .await
-        .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
-        .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
-        #[cfg(all(not(unix), not(windows)))]
+        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &resolved);
         let lock = tokio::task::spawn_blocking({
             let lock_path = lock_path.clone();
-            move || -> std::io::Result<std::fs::File> {
-                use fs2::FileExt;
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(lock_path)?;
-                file.lock_exclusive()?;
-                Ok(file)
-            }
+            move || TargetLock::acquire(lock_path)
         })
         .await
         .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
@@ -238,10 +193,17 @@ impl Tool for ReplaceTool {
         }
         #[cfg(windows)]
         {
+            let root = context.workspace.root().to_path_buf();
+            let root_dir = context.workspace.root_dir();
+            let relative = resolved
+                .strip_prefix(&root)
+                .map_err(|_| ToolError::Io("target left workspace".into()))?
+                .to_path_buf();
             let expected = existing.clone();
             let replacement = new_content.clone();
-            let committed = tokio::task::spawn_blocking(move || {
-                windows_capability_replace(lock, &expected, &replacement)
+            let committed = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+                let commit = open_windows_replace_context(&root_dir, &relative)?;
+                windows_capability_replace(commit, &expected, &replacement)
             })
             .await
             .map_err(|e| ToolError::Io(format!("join capability write: {e}")))?
@@ -255,6 +217,9 @@ impl Tool for ReplaceTool {
         }
         #[cfg(all(not(unix), not(windows)))]
         {
+            let parent = resolved
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
             let tmp = parent.join(unique);
             // create_new: fail if the name somehow collides instead of overwriting.
             {
@@ -296,7 +261,6 @@ impl Tool for ReplaceTool {
                 )));
             }
         }
-        #[cfg(not(windows))]
         drop(lock);
 
         // Re-fingerprint so our own edit isn't seen as an outside change next time.
@@ -325,17 +289,13 @@ impl Tool for ReplaceTool {
 struct WindowsReplaceContext {
     parent: cap_std::fs::Dir,
     target_name: std::ffi::OsString,
-    _lock: std::fs::File,
 }
 
 #[cfg(windows)]
 fn open_windows_replace_context(
     root: &cap_std::fs::Dir,
     target_relative: &std::path::Path,
-    lock_name: &std::ffi::OsStr,
 ) -> std::io::Result<WindowsReplaceContext> {
-    use fs2::FileExt;
-
     let target_name = target_relative
         .file_name()
         .filter(|name| !name.is_empty())
@@ -355,14 +315,9 @@ fn open_windows_replace_context(
         Some(path) if !path.as_os_str().is_empty() => root.open_dir(path)?,
         _ => root.try_clone()?,
     };
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    let lock = parent.open_with(lock_name, &options)?.into_std();
-    lock.lock_exclusive()?;
     Ok(WindowsReplaceContext {
         parent,
         target_name,
-        _lock: lock,
     })
 }
 
@@ -485,61 +440,63 @@ fn descriptor_relative_replace(
     Ok(true)
 }
 
-#[cfg(unix)]
-fn open_descriptor_lock(
-    root: &std::path::Path,
-    target_relative: &std::path::Path,
-    lock_name: &std::ffi::OsStr,
-) -> std::io::Result<std::fs::File> {
-    use fs2::FileExt;
-    use rustix::fs::{Mode, OFlags, open, openat};
-    let mut directory = open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    let mut components = target_relative.components().peekable();
-    while let Some(component) = components.next() {
-        if components.peek().is_none() {
-            break;
+/// Advisory cross-process write lock for one target file, held across the
+/// compare + rename commit. The lock file lives under `<leveler home>/locks/`
+/// (see [`leveler_project::layout::target_lock_path`]), never in the
+/// workspace.
+///
+/// On unix, release unlinks the path while the flock is still held, and
+/// acquisition re-checks that the path still names the locked inode — a
+/// waiter that locked a just-unlinked file detects the corpse and retries.
+/// On other platforms the file persists (unlink-while-locked is not safe
+/// there); it is a few bytes in a leveler-private directory.
+struct TargetLock {
+    path: std::path::PathBuf,
+    _file: std::fs::File,
+}
+
+impl TargetLock {
+    fn acquire(path: std::path::PathBuf) -> std::io::Result<Self> {
+        use fs2::FileExt;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        let std::path::Component::Normal(name) = component else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "non-normal workspace path",
-            ));
-        };
-        directory = openat(
-            &directory,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+        loop {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            file.lock_exclusive()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let held = file.metadata()?;
+                match std::fs::metadata(&path) {
+                    Ok(live) if live.ino() == held.ino() && live.dev() == held.dev() => {}
+                    // The holder unlinked (and possibly a new waiter re-created)
+                    // the path while we blocked: we locked a dead inode.
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok(Self { path, _file: file });
+        }
     }
-    let fd = loop {
-        match openat(
-            &directory,
-            lock_name,
-            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => break fd,
-            Err(rustix::io::Errno::NOENT) => match openat(
-                &directory,
-                lock_name,
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            ) {
-                Ok(fd) => break fd,
-                Err(rustix::io::Errno::EXIST) => continue,
-                Err(error) => return Err(error.into()),
-            },
-            Err(error) => return Err(error.into()),
-        }
-    };
-    let file = std::fs::File::from(fd);
-    file.lock_exclusive()?;
-    Ok(file)
+}
+
+impl Drop for TargetLock {
+    fn drop(&mut self) {
+        // Unlink before `_file` drops (which releases the flock): waiters
+        // verify inode identity after locking, so removing the path first is
+        // race-free.
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&self.path);
+        #[cfg(not(unix))]
+        let _ = &self.path;
+    }
 }
 
 #[cfg(test)]
@@ -757,6 +714,63 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The write lock must never touch the workspace: no `.leveler-lock`
+    /// file may appear next to the target, and (on unix) the global lock
+    /// file under `<home>/locks/` is unlinked once the replace completes.
+    #[tokio::test]
+    async fn replace_leaves_no_lock_files_behind() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-replace-lockfree-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "value = old\n").unwrap();
+        let home = dir.join("leveler-home");
+        let env = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().chain([(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                home.clone().into_os_string(),
+            )]),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        ));
+        let c = ToolContext::with_environment(
+            leveler_execution::Workspace::new(&dir).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+            env,
+        );
+        let out = run(
+            c,
+            serde_json::json!({"path": "src/lib.rs", "old": "old", "new": "new"}),
+        )
+        .await;
+        assert!(!out.is_error, "replace failed: {}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+            "value = new\n"
+        );
+
+        let residue: Vec<String> = std::fs::read_dir(dir.join("src"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("leveler-lock"))
+            .collect();
+        assert!(residue.is_empty(), "lock residue in workspace: {residue:?}");
+
+        #[cfg(unix)]
+        {
+            let leftover: Vec<std::path::PathBuf> = std::fs::read_dir(home.join("locks"))
+                .map(|it| it.filter_map(Result::ok).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert!(
+                leftover.is_empty(),
+                "lock files must be unlinked on release: {leftover:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Windows directory capabilities are opened without FILE_SHARE_DELETE.
     /// A hostile process therefore cannot rename the parent away and install
     /// a junction between our CAS read and final rename.
@@ -768,12 +782,8 @@ mod tests {
         std::fs::write(root.path().join("src/lib.rs"), "old\n").unwrap();
         let workspace = leveler_execution::Workspace::new(root.path()).unwrap();
         let root_dir = workspace.root_dir();
-        let context = open_windows_replace_context(
-            &root_dir,
-            std::path::Path::new("src/lib.rs"),
-            std::ffi::OsStr::new(".lib.rs.leveler-lock"),
-        )
-        .unwrap();
+        let context =
+            open_windows_replace_context(&root_dir, std::path::Path::new("src/lib.rs")).unwrap();
 
         assert!(
             std::fs::rename(root.path().join("src"), root.path().join("src-old")).is_err(),
@@ -808,7 +818,6 @@ mod tests {
         let result = open_windows_replace_context(
             &workspace.root_dir(),
             std::path::Path::new("escape/victim.txt"),
-            std::ffi::OsStr::new(".victim.txt.leveler-lock"),
         );
         assert!(
             result.is_err(),

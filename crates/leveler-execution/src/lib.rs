@@ -52,8 +52,8 @@ pub use permission_grants::{
 };
 pub use permission_rules::{
     PermissionRule, PermissionRuleSet, RuleDecision, RuleEffect, RuleMatch, always_rules_for,
-    append_project_rule, append_rule_file, clear_project_rules, load_merged_rules, load_rules_file,
-    project_rules_path,
+    append_project_rule, append_rule_file, clear_project_rules, clear_rules_file,
+    load_merged_rules, load_rules_file, project_rules_path,
 };
 pub use risk::{PermissionProfile, RiskLevel};
 pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};

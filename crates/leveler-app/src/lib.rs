@@ -434,8 +434,11 @@ impl Application {
         let memory_index = load_memory_index(&self.layout.memory_dir());
         let leveler_home = leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
             .unwrap_or_else(|| std::path::PathBuf::from(".leveler"));
-        let permission_rules =
-            leveler_execution::load_merged_rules(&leveler_home, &self.layout.repo_root);
+        let permission_rules = leveler_execution::load_merged_rules(
+            &leveler_home,
+            &self.layout.permissions_path(),
+            &self.layout.repo_root,
+        );
         let hook_runner =
             leveler_execution::HookRunner::load(&leveler_home, &self.layout.repo_root);
         let runtime: Arc<dyn ModelRuntime> = self.registry.clone();
@@ -451,9 +454,7 @@ impl Application {
                 work_profile,
                 memory_index,
                 permission_rules,
-                permission_rules_path: Some(leveler_execution::project_rules_path(
-                    &self.layout.repo_root,
-                )),
+                permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,
                 grants_state_dir: Some(self.layout.state_dir.clone()),
             },

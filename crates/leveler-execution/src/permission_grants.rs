@@ -2,7 +2,8 @@
 //!
 //! Stores only action signatures (not secrets). `ApproveSession` used to
 //! append here; durable standing permission is now expressed as SEC-1
-//! permission rules (`.leveler/permissions.yaml`) written on `ApproveAlways`,
+//! permission rules (`<state_dir>/permissions.yaml` under the global home)
+//! written on `ApproveAlways`,
 //! and `ApproveSession` is strictly session-scoped. The file is still LOADED
 //! at drive start so grants remembered by older versions keep working, but it
 //! is no longer written.
