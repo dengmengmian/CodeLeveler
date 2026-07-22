@@ -175,8 +175,36 @@ pub enum AgentEvent {
     EvidenceLedgerUpdated { ledger: EvidenceLedger },
     /// Cross-round progress / closeout ledger (resume + engine continue).
     ProgressUpdated { ledger: ProgressLedger },
+    /// The harness started an advisory (tool-free) model call during closeout —
+    /// a completeness audit or a compaction summary. These are extra model round
+    /// trips that happen AFTER the visible answer, so without this a UI shows a
+    /// bare "waiting for model" for many seconds with no idea why. Emitting the
+    /// kind lets the status line name the wait ("completeness audit…").
+    AdvisoryStarted { kind: AdvisoryKind },
     /// The loop finished with a final answer.
     Finished(String),
+}
+
+/// Which advisory (tool-free, non-user-visible) model call the harness is making
+/// during closeout. Carried by [`AgentEvent::AdvisoryStarted`] so a UI can label
+/// the wait instead of showing a bare "waiting for model".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryKind {
+    /// Post-answer completeness audit (`answer_audit`): a separate model call
+    /// that checks the answer covered everything the request asked for.
+    CompletenessAudit,
+    /// Context compaction: summarizing older transcript to fit the window.
+    ContextCompaction,
+}
+
+impl AdvisoryKind {
+    /// Stable key for crossing the (serialized) engine event boundary.
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            AdvisoryKind::CompletenessAudit => "completeness_audit",
+            AdvisoryKind::ContextCompaction => "context_compaction",
+        }
+    }
 }
 
 // PlanStep lives in leveler-lifecycle; re-exported from crate root.
@@ -1458,7 +1486,7 @@ mod compaction_tests {
             msgs.push(tool_result("... file contents ..."));
         }
 
-        let out = compact_messages(&msgs, 4, None, None);
+        let out = compact_messages(&msgs, 4, 0, None, None);
         assert!(out.len() < msgs.len(), "should shrink");
         assert!(
             out.iter()
@@ -1470,7 +1498,7 @@ mod compaction_tests {
     #[test]
     fn keeps_anchors_and_recent_and_reduces_length() {
         let msgs = long_transcript();
-        let out = compact_messages(&msgs, 4, None, Some("fix the bug"));
+        let out = compact_messages(&msgs, 4, 0, None, Some("fix the bug"));
 
         assert!(
             out.len() < msgs.len(),
@@ -1519,6 +1547,7 @@ mod compaction_tests {
         let out = compact_messages(
             &msgs,
             4,
+            0,
             None,
             Some("update docs/ARCHITECTURE.md for the runtime"),
         );
@@ -1541,7 +1570,7 @@ mod compaction_tests {
     fn tail_never_starts_on_an_orphan_tool_result() {
         let msgs = long_transcript();
         // keep_recent=3 would land the tail on a Tool result; it must back up.
-        let out = compact_messages(&msgs, 3, None, None);
+        let out = compact_messages(&msgs, 3, 0, None, None);
         // system + first user + breadcrumb → index of first tail message.
         let first_after_breadcrumb = out
             .iter()
@@ -1563,7 +1592,7 @@ mod compaction_tests {
             assistant_call("read_file", "a.rs"),
             tool_result("x"),
         ];
-        assert_eq!(compact_messages(&msgs, 4, None, None), msgs);
+        assert_eq!(compact_messages(&msgs, 4, 0, None, None), msgs);
     }
 
     #[test]
@@ -1574,7 +1603,7 @@ mod compaction_tests {
             assistant_call("read_file", "a.rs"),
             tool_result("x"),
         ];
-        let out = compact_messages(&msgs, 4, None, Some("new objective only"));
+        let out = compact_messages(&msgs, 4, 0, None, Some("new objective only"));
         assert!(
             out.iter()
                 .any(|m| m.text_content().contains(ACTIVE_OBJECTIVE_MARKER)

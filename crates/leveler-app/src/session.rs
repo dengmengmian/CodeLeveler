@@ -11,7 +11,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::{
-    AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify, Clarifier,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
+    Clarifier,
     StopReason,
 };
 use leveler_engine::{
@@ -158,6 +159,12 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             cached_input_tokens,
         },
         EngineEvent::Compacted { from, to } => AgentEvent::Compacted { from, to },
+        EngineEvent::AdvisoryStarted { kind } => AgentEvent::AdvisoryStarted {
+            kind: match kind.as_str() {
+                "context_compaction" => AdvisoryKind::ContextCompaction,
+                _ => AdvisoryKind::CompletenessAudit,
+            },
+        },
         EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }
@@ -241,12 +248,22 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
             // Stable token for TUI: "◇ 结束 · 未改仓库" (not "未验证" delivery).
             Some(leveler_client_protocol::REASON_NO_CODE_CHANGES.to_string())
         } else if let Some(verification) = &report.verification {
-            match verification.verdict() {
-                Verdict::Unverified(reason) => Some(reason),
-                _ => Some(unverified_acceptance_detail(
-                    report.acceptance.as_ref(),
-                    !report.modified_files.is_empty(),
-                )),
+            if !verification.has_gating_checks() {
+                // The project configured no gating checks, so there was nothing
+                // to verify against. That is a calm "not auto-verified" finish,
+                // not a warning about THIS task — route it to the same soft copy
+                // as the no-verification-report case instead of leaking the raw
+                // verifier string ("no gating verification checks were configured")
+                // into the UI as a ⚠ warning.
+                Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string())
+            } else {
+                match verification.verdict() {
+                    Verdict::Unverified(reason) => Some(reason),
+                    _ => Some(unverified_acceptance_detail(
+                        report.acceptance.as_ref(),
+                        !report.modified_files.is_empty(),
+                    )),
+                }
             }
         } else {
             Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string())

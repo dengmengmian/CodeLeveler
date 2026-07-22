@@ -20,7 +20,7 @@ use super::dispatch::{
     newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
 };
 use super::{
-    AgentError, AgentEvent, AgentOutcome, AnswerAudit, Executor, LOOP_GUARD_THRESHOLD,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AnswerAudit, Executor, LOOP_GUARD_THRESHOLD,
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
@@ -786,6 +786,11 @@ impl Executor {
                 if self.answer_audit && had_tool_calls && !self.goal_mode {
                     metrics.answer_audit_invocations += 1;
                     metrics.extra_model_calls += 1;
+                    // Name this extra closeout round trip so the UI does not show
+                    // a bare "waiting for model" while the audit runs.
+                    observer(AgentEvent::AdvisoryStarted {
+                        kind: AdvisoryKind::CompletenessAudit,
+                    });
                     match self.audit_answer(&messages, &cancellation).await? {
                         AnswerAudit::Complete => {}
                         AnswerAudit::Missing(missing)
@@ -2348,12 +2353,28 @@ impl Executor {
                 && has_next_round
             {
                 let before = messages.len();
+                // Cap the retained working set at half the context budget so a
+                // huge recent tool output can't keep the fold over the window;
+                // the other half leaves room for the head, summary, and next
+                // response. (context_budget > 0 is guaranteed by the guard above.)
+                let keep_recent_tokens = self.context_budget as u64 / 2;
+                // Name this extra round trip so the UI shows "compacting…" instead
+                // of a bare "waiting for model" during the summary call.
+                observer(AgentEvent::AdvisoryStarted {
+                    kind: AdvisoryKind::ContextCompaction,
+                });
                 let summary = self
-                    .summarize_for_compaction(&messages, COMPACT_KEEP_RECENT, &cancellation)
+                    .summarize_for_compaction(
+                        &messages,
+                        COMPACT_KEEP_RECENT,
+                        keep_recent_tokens,
+                        &cancellation,
+                    )
                     .await;
                 messages = compact_messages(
                     &messages,
                     COMPACT_KEEP_RECENT,
+                    keep_recent_tokens,
                     summary.as_deref(),
                     Some(objective.text()),
                 );

@@ -22,7 +22,7 @@ pub use compaction::{
     summarize_with_model,
 };
 pub use executor::{
-    AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
     ClarificationRequest, Clarifier, ContinuationPolicy, Executor, ModelRequestRecord, NoopSink,
     StepLimits, StopReason, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink,
 };

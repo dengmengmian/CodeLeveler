@@ -241,6 +241,18 @@ impl EventBridge {
             AgentEvent::EvidenceLedgerUpdated { .. } => {
                 // Persisted by engine; no dedicated UI cell in v1.
             }
+            AgentEvent::AdvisoryStarted { kind } => {
+                // Closeout round trips that happen after the visible answer.
+                // Label them so the status line does not read "等待模型" with no
+                // hint of why the wait continues.
+                let label = match kind {
+                    leveler_agent::AdvisoryKind::CompletenessAudit => "完成度审计中…",
+                    leveler_agent::AdvisoryKind::ContextCompaction => "压缩上下文中…",
+                };
+                let _ = self.events.send(RuntimeEvent::AgentActivity {
+                    label: label.to_string(),
+                });
+            }
             AgentEvent::ProgressUpdated { ledger } => {
                 let phase = match ledger.phase {
                     leveler_lifecycle::TurnPhase::Active => "active",
@@ -494,6 +506,32 @@ mod bridge_tests {
             out.push(ev);
         }
         out
+    }
+
+    /// Closeout advisory calls (completeness audit / compaction) must surface as
+    /// a labeled AgentActivity so the status line names the wait instead of a
+    /// bare "waiting for model".
+    #[test]
+    fn advisory_started_becomes_a_labeled_activity() {
+        for (kind, needle) in [
+            (leveler_agent::AdvisoryKind::CompletenessAudit, "审计"),
+            (leveler_agent::AdvisoryKind::ContextCompaction, "压缩"),
+        ] {
+            let (tx, mut rx) = broadcast::channel(16);
+            let mut bridge = EventBridge::new(tx);
+            bridge.forward(AgentEvent::AdvisoryStarted { kind });
+            let labels: Vec<String> = drain(&mut rx)
+                .into_iter()
+                .filter_map(|e| match e {
+                    RuntimeEvent::AgentActivity { label } => Some(label),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                labels.iter().any(|l| l.contains(needle)),
+                "advisory {kind:?} did not surface a '{needle}' activity label: {labels:?}"
+            );
+        }
     }
 
     /// The direct path's structured plan must reach the client as PlanUpdated,

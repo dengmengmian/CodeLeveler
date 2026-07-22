@@ -112,6 +112,7 @@ pub fn budget_prior_messages(
     let folded = leveler_agent::compact_messages(
         &base,
         leveler_agent::COMPACT_KEEP_RECENT,
+        0,
         summary,
         active_objective,
     );
@@ -619,6 +620,7 @@ impl TaskEngine {
             None,
             raw,
             leveler_agent::COMPACT_KEEP_RECENT,
+            0,
             cancellation,
         )
         .await

@@ -25,11 +25,44 @@ pub(crate) const COMPACT_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT
      - What remains to be done, as concrete next steps\n\
      Be specific and cite real paths. Reply with ONLY the briefing.";
 
+/// Stable prefix of the fold breadcrumb (see `compact_messages`). Used both to
+/// build the breadcrumb and to detect, on a later fold, that an earlier briefing
+/// already exists so the summarizer can UPDATE it instead of re-deriving it.
+pub(crate) const COMPACTION_BREADCRUMB_MARKER: &str = "[Earlier context was compacted";
+
+/// The instruction used when the range being summarized already contains a prior
+/// fold briefing. Re-summarizing a summary from scratch loses fidelity a little
+/// more each fold; this tells the model to carry the earlier briefing's still-
+/// relevant facts forward verbatim and only fold in what happened since.
+pub(crate) const COMPACT_UPDATE_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. \
+     An EARLIER handoff briefing already appears in the messages above (it starts with \
+     \"[Earlier context was compacted\"). Produce an UPDATED briefing that MERGES that earlier \
+     briefing with the newer work about to be dropped.\n\
+     Rules:\n\
+     - Preserve every still-relevant fact, decision, failed approach, real path, and constraint \
+     from the earlier briefing — do not drop them just because they are older.\n\
+     - Fold in what happened since: new progress, decisions, findings, and failed approaches.\n\
+     - Drop only what later work has made obsolete or superseded, and say what replaced it.\n\
+     Keep the same sections (progress, learnings, failed approaches, constraints, next steps). \
+     Be specific and cite real paths. Reply with ONLY the updated briefing.";
+
 /// The head/middle/tail split for compaction: `(head_end, tail_start)`, or None
 /// when there is nothing worth folding. Cuts only at round boundaries so a
 /// tool-call is never separated from its tool-result (the provider rejects
 /// orphaned tool calls).
-pub(crate) fn compaction_span(messages: &[Message], keep_recent: usize) -> Option<(usize, usize)> {
+///
+/// `keep_recent` bounds the working set by MESSAGE COUNT; `keep_recent_tokens`
+/// (0 = disabled) additionally bounds it by an estimated TOKEN budget. A fixed
+/// count is fragile: a single huge tool output inside the last `keep_recent`
+/// messages keeps the folded transcript over the window and defeats the fold.
+/// The token cap can only *shrink* the retained tail (drop older-of-recent into
+/// the summarized middle), never grow it, so count-based behavior is unchanged
+/// whenever the recent window fits the budget.
+pub(crate) fn compaction_span(
+    messages: &[Message],
+    keep_recent: usize,
+    keep_recent_tokens: u64,
+) -> Option<(usize, usize)> {
     // Head: the system prompt(s) plus the first user message (the task anchor).
     let head_end = messages
         .iter()
@@ -37,9 +70,22 @@ pub(crate) fn compaction_span(messages: &[Message], keep_recent: usize) -> Optio
         .map(|i| i + 1)
         .unwrap_or(0);
 
-    // Tail start: keep the last `keep_recent` messages, but never begin the tail
-    // on a Tool result — back up to its owning assistant so the pair stays whole.
+    // Tail start: keep the last `keep_recent` messages…
     let mut tail_start = messages.len().saturating_sub(keep_recent).max(head_end);
+
+    // …but if that working set blows the token budget, walk the start forward
+    // (drop the oldest recent messages into the summarized middle) until it fits.
+    // Always keep at least the newest message — it is usually what just overflowed.
+    if keep_recent_tokens > 0 {
+        while tail_start < messages.len().saturating_sub(1)
+            && estimate_tokens(&messages[tail_start..]) > keep_recent_tokens
+        {
+            tail_start += 1;
+        }
+    }
+
+    // Never begin the tail on a Tool result — back up to its owning assistant so
+    // the pair stays whole (the provider rejects orphaned tool results).
     while tail_start > head_end && messages[tail_start].role == Role::Tool {
         tail_start -= 1;
     }
@@ -99,6 +145,7 @@ pub(crate) fn transcript_has_objective_pin(messages: &[Message], objective: &str
 pub fn compact_messages(
     messages: &[Message],
     keep_recent: usize,
+    keep_recent_tokens: u64,
     summary: Option<&str>,
     active_objective: Option<&str>,
 ) -> Vec<Message> {
@@ -107,7 +154,8 @@ pub fn compact_messages(
         .filter(|s| !s.is_empty())
         .map(objective_pin_message);
 
-    let Some((head_end, tail_start)) = compaction_span(messages, keep_recent) else {
+    let Some((head_end, tail_start)) = compaction_span(messages, keep_recent, keep_recent_tokens)
+    else {
         // Nothing to fold — still ensure the host objective is present.
         if let Some(pin) = pin
             && !transcript_has_objective_pin(messages, active_objective.unwrap_or(""))
@@ -184,6 +232,21 @@ pub fn compact_messages(
     out
 }
 
+/// Which briefing instruction applies to the range about to be summarized: if it
+/// already contains an earlier fold breadcrumb, UPDATE that briefing rather than
+/// re-summarizing a summary from scratch (repeated from-scratch folds lose the
+/// oldest facts a little more each time).
+pub(crate) fn summary_prompt_for(to_summarize: &[Message]) -> &'static str {
+    let has_prior_briefing = to_summarize
+        .iter()
+        .any(|m| m.text_content().contains(COMPACTION_BREADCRUMB_MARKER));
+    if has_prior_briefing {
+        COMPACT_UPDATE_PROMPT
+    } else {
+        COMPACT_PROMPT
+    }
+}
+
 /// Ask `runtime` for a compaction handoff briefing over the middle the fold
 /// is about to elide. Returns `None` when there is nothing to fold or the
 /// call fails/times out — callers then fold with a bare breadcrumb, which
@@ -194,13 +257,15 @@ pub async fn summarize_with_model(
     reasoning_effort: Option<leveler_model::ReasoningEffort>,
     messages: &[Message],
     keep_recent: usize,
+    keep_recent_tokens: u64,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Option<String> {
     // Advisory call: never let a slow summarizer stall the main loop.
     const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    let (_, tail_start) = compaction_span(messages, keep_recent)?;
-    let mut summary_messages = messages[..tail_start].to_vec();
-    summary_messages.push(Message::text(Role::User, COMPACT_PROMPT));
+    let (_, tail_start) = compaction_span(messages, keep_recent, keep_recent_tokens)?;
+    let to_summarize = &messages[..tail_start];
+    let mut summary_messages = to_summarize.to_vec();
+    summary_messages.push(Message::text(Role::User, summary_prompt_for(to_summarize)));
 
     let mut request = leveler_model::ModelRequest::new(model.clone(), summary_messages);
     request.tool_choice = leveler_model::ToolChoice::None;
@@ -278,6 +343,112 @@ mod estimate_tests {
         assert!(
             (200..=300).contains(&est),
             "ASCII estimate drifted from ~len/4: {est}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+    use leveler_model::Role;
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message::text(role, text)
+    }
+
+    #[test]
+    fn token_cap_disabled_keeps_last_n_by_count() {
+        // keep_recent_tokens = 0 → pure message-count behavior (engine path).
+        let mut msgs = vec![msg(Role::User, "task")];
+        for i in 0..20 {
+            msgs.push(msg(Role::Assistant, &format!("m{i}")));
+        }
+        let (head_end, tail_start) = compaction_span(&msgs, 12, 0).unwrap();
+        assert_eq!(head_end, 1);
+        assert_eq!(tail_start, msgs.len() - 12, "tail should be exactly last 12");
+    }
+
+    #[test]
+    fn oversized_recent_output_is_dropped_from_the_retained_tail() {
+        // A single huge tool output inside the last `keep_recent` messages must
+        // be folded into the summarized middle, not kept verbatim — otherwise the
+        // fold stays over the window and compaction achieves nothing.
+        const BUDGET: u64 = 8_000;
+        let mut msgs = vec![msg(Role::User, "task")];
+        for i in 0..20 {
+            msgs.push(msg(Role::Assistant, &format!("small {i}")));
+        }
+        // ~ (BUDGET * 8) / 4 tokens ≫ BUDGET, sitting inside the last 12 messages.
+        msgs.push(msg(Role::Assistant, &"x".repeat(BUDGET as usize * 8)));
+        for i in 0..3 {
+            msgs.push(msg(Role::Assistant, &format!("tail {i}")));
+        }
+
+        // Without the cap the last 12 include the giant and blow the budget…
+        let (_, uncapped) = compaction_span(&msgs, 12, 0).unwrap();
+        assert!(
+            estimate_tokens(&msgs[uncapped..]) > BUDGET,
+            "precondition: uncapped tail should exceed the budget"
+        );
+
+        // …with the cap the retained tail fits, and the giant sits before it.
+        let (_, tail_start) = compaction_span(&msgs, 12, BUDGET).unwrap();
+        assert!(
+            estimate_tokens(&msgs[tail_start..]) <= BUDGET,
+            "retained tail still exceeds budget: {}",
+            estimate_tokens(&msgs[tail_start..])
+        );
+    }
+
+    #[test]
+    fn token_cap_always_keeps_the_newest_message() {
+        // Even a single message larger than the budget must be retained — it is
+        // usually what just overflowed and the model needs it.
+        let msgs = vec![
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "a"),
+            msg(Role::Assistant, &"x".repeat(100_000)),
+        ];
+        let span = compaction_span(&msgs, 12, 1_000);
+        // Nothing meaningful to fold (middle < 2) → None, and we never panic
+        // trying to walk past the last message.
+        assert!(span.is_none() || span.unwrap().1 == msgs.len() - 1);
+    }
+
+    #[test]
+    fn update_prompt_selected_only_when_a_prior_briefing_is_present() {
+        let fresh = vec![
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "did some work"),
+        ];
+        assert_eq!(summary_prompt_for(&fresh), COMPACT_PROMPT);
+
+        // A range that already carries a fold breadcrumb takes the UPDATE path.
+        let with_prior = vec![
+            msg(Role::User, "task"),
+            msg(
+                Role::User,
+                &format!("{COMPACTION_BREADCRUMB_MARKER} to fit the window: 9 steps elided.]"),
+            ),
+            msg(Role::Assistant, "more work"),
+        ];
+        assert_eq!(summary_prompt_for(&with_prior), COMPACT_UPDATE_PROMPT);
+    }
+
+    #[test]
+    fn fold_breadcrumb_carries_the_detection_marker() {
+        // The breadcrumb compact_messages writes must contain the exact marker
+        // summary_prompt_for keys off, or repeated folds silently lose the
+        // incremental-update path.
+        let mut msgs = vec![msg(Role::System, "sys"), msg(Role::User, "task")];
+        for i in 0..10 {
+            msgs.push(msg(Role::Assistant, &format!("step {i}")));
+        }
+        let out = compact_messages(&msgs, 4, 0, Some("a briefing"), None);
+        assert!(
+            out.iter()
+                .any(|m| m.text_content().contains(COMPACTION_BREADCRUMB_MARKER)),
+            "fold breadcrumb no longer contains the detection marker"
         );
     }
 }
