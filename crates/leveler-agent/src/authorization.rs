@@ -353,18 +353,25 @@ fn classify_observe_cmdline(program: &str, args: &str) -> Option<&'static str> {
         .and_then(|s| s.to_str())
         .unwrap_or(program)
         .to_ascii_lowercase();
-    if base != "git" {
-        return None;
+    match base.as_str() {
+        "git" => classify_git_observe_args(args),
+        "gh" => classify_gh_observe_args(args),
+        _ => None,
     }
-    classify_git_observe_args(args)
 }
 
 fn classify_observe_shell(cmd: &str) -> Option<&'static str> {
     let lower = cmd.to_ascii_lowercase();
     // Strip common prefixes so `cd … && git status` still classifies.
-    let git_idx = lower.find("git ")?;
-    let rest = lower[git_idx + 4..].trim();
-    classify_git_observe_args(rest)
+    if let Some(idx) = lower.find("git ")
+        && let Some(class) = classify_git_observe_args(lower[idx + 4..].trim())
+    {
+        return Some(class);
+    }
+    if let Some(idx) = lower.find("gh ") {
+        return classify_gh_observe_args(lower[idx + 3..].trim());
+    }
+    None
 }
 
 fn classify_git_observe_args(args: &str) -> Option<&'static str> {
@@ -380,6 +387,22 @@ fn classify_git_observe_args(args: &str) -> Option<&'static str> {
         "log" | "show" | "branch" | "remote" | "rev-parse" | "symbolic-ref" => {
             Some("observe:git_read")
         }
+        _ => None,
+    }
+}
+
+/// Read-only `gh` (GitHub CLI) subcommands: CI/PR polling and watching. These
+/// change nothing, so re-running them after CI has settled is thrash — routing
+/// them here lets the no-progress guard stop a "keep watching green CI" spin.
+/// State-changing verbs (create/merge/close/edit/delete/comment/…) are NOT
+/// listed: crediting them as observe could miscount real work as no progress.
+fn classify_gh_observe_args(args: &str) -> Option<&'static str> {
+    let mut tokens = args.split_whitespace().filter(|t| !t.starts_with('-'));
+    let sub = tokens.next().unwrap_or("");
+    let action = tokens.next().unwrap_or("");
+    match (sub, action) {
+        ("run", "watch" | "view" | "list") => Some("observe:gh_run"),
+        ("pr", "checks" | "view" | "list" | "status") => Some("observe:gh_pr"),
         _ => None,
     }
 }
@@ -422,6 +445,50 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn gh_ci_watch_is_pure_observe() {
+        // CI polling/watching is read-only: re-running it after CI settled is
+        // thrash, so it must classify as observe (both wrapper shapes).
+        let run = observe_class(
+            "run_command",
+            &serde_json::json!({"program": "gh", "args": ["run", "watch", "29931266375"]}),
+        );
+        let shell = observe_class(
+            "shell_command",
+            &serde_json::json!({"cmd": "gh run watch 29931266375"}),
+        );
+        assert_eq!(run.as_deref(), Some("observe:gh_run"));
+        assert_eq!(shell.as_deref(), Some("observe:gh_run"));
+
+        let list = observe_class(
+            "run_command",
+            &serde_json::json!({"program": "gh", "args": ["run", "list"]}),
+        );
+        assert_eq!(list.as_deref(), Some("observe:gh_run"));
+
+        let checks = observe_class(
+            "run_command",
+            &serde_json::json!({"program": "gh", "args": ["pr", "checks", "12"]}),
+        );
+        assert_eq!(checks.as_deref(), Some("observe:gh_pr"));
+    }
+
+    #[test]
+    fn gh_state_changing_is_not_observe() {
+        // Guard against killing real work: state-changing gh commands must NOT
+        // be treated as observe, or their success would be miscounted as thrash.
+        for args in [
+            serde_json::json!({"program": "gh", "args": ["pr", "create"]}),
+            serde_json::json!({"program": "gh", "args": ["pr", "merge", "12"]}),
+            serde_json::json!({"program": "gh", "args": ["release", "create", "v1"]}),
+        ] {
+            assert!(
+                observe_class("run_command", &args).is_none(),
+                "must not classify state-changing gh as observe: {args}"
+            );
+        }
     }
 
     #[test]

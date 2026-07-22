@@ -34,7 +34,11 @@ fn unverified_acceptance_detail(
     match acceptance {
         Some(ledger) => {
             if let Some(unmet) = ledger.unmet_required().first() {
-                return format!("验收未通过：{}", unmet.id);
+                return format!(
+                    "验收未通过：{}{}",
+                    unmet.id,
+                    acceptance_failure_suffix(unmet)
+                );
             }
             if ledger.has_required_unverifiable() {
                 return "验收项缺少可执行检查命令".to_string();
@@ -47,6 +51,45 @@ fn unverified_acceptance_detail(
         }
         None if has_mutation => "有改动但缺少系统级验收背书".to_string(),
         None => "任务已完成，但没有足够的独立验收证据".to_string(),
+    }
+}
+
+/// Concise "why this AC failed" tail for the turn-end detail: the check command
+/// and the first line of its failure output. Without this the user only sees a
+/// bare criterion id and cannot tell what ran or why it failed.
+fn acceptance_failure_suffix(unmet: &leveler_verifier::AcceptanceEvidence) -> String {
+    let cmd = unmet
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Prefer the explicit reject reason; fall back to the raw command output.
+    let reason = unmet
+        .reject_reason
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(unmet.evidence.as_str());
+    let reason = first_line_capped(reason, 100);
+    match (cmd, reason.is_empty()) {
+        (Some(cmd), false) => format!(" · 检查「{}」：{}", first_line_capped(cmd, 80), reason),
+        (Some(cmd), true) => format!(" · 检查「{}」", first_line_capped(cmd, 80)),
+        (None, false) => format!(" · {reason}"),
+        (None, true) => String::new(),
+    }
+}
+
+/// First non-empty-trimmed line of `s`, capped to `max` chars with an ellipsis.
+fn first_line_capped(s: &str, max: usize) -> String {
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() > max {
+        let head: String = line.chars().take(max).collect();
+        format!("{head}…")
+    } else {
+        line.to_string()
     }
 }
 
@@ -964,7 +1007,55 @@ mod tests {
             }],
         });
         let out = report_to_result(task).unwrap();
-        assert_eq!(out.stop_detail.as_deref(), Some("验收未通过：AC-1"));
+        // Surface the check command + its failure, not just the bare id, so the
+        // user can tell what was run and why it failed.
+        assert_eq!(
+            out.stop_detail.as_deref(),
+            Some("验收未通过：AC-1 · 检查「false」：exit 1")
+        );
+    }
+
+    #[test]
+    fn unverified_detail_prefers_reject_reason_over_evidence() {
+        use leveler_verifier::{
+            AcceptanceEvidence, AcceptanceLedger, AcceptanceStatus, CheckKind, CheckOutcome,
+            CheckStatus, VerificationReport,
+        };
+        let mut task = report(
+            TaskOutcome::CompletedUnverified,
+            StopReason::Completed,
+            &["src/lib.rs"],
+        );
+        task.verification = Some(VerificationReport {
+            checks: vec![CheckOutcome {
+                name: "ok".into(),
+                kind: CheckKind::Test,
+                gating: true,
+                status: CheckStatus::Passed,
+                evidence: String::new(),
+                failure: None,
+                failed_tests: std::collections::BTreeSet::new(),
+            }],
+            scope_ok: true,
+            scope_violations: Vec::new(),
+            baseline_failures: Vec::new(),
+        });
+        task.acceptance = Some(AcceptanceLedger {
+            items: vec![AcceptanceEvidence {
+                id: "AC-2".into(),
+                description: "endpoint returns 200".into(),
+                required: true,
+                status: AcceptanceStatus::Unmet,
+                command: Some("curl -sf localhost:8080/health".into()),
+                evidence: "long stdout\nsecond line".into(),
+                reject_reason: Some("connection refused".into()),
+            }],
+        });
+        let out = report_to_result(task).unwrap();
+        assert_eq!(
+            out.stop_detail.as_deref(),
+            Some("验收未通过：AC-2 · 检查「curl -sf localhost:8080/health」：connection refused")
+        );
     }
 
     #[test]
