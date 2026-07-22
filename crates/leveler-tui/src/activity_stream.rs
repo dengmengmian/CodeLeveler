@@ -1100,7 +1100,7 @@ mod tests {
     #[test]
     fn consecutive_identical_failures_merge_with_retry_count() {
         let args = r#"{"patch":"*** Begin Patch\n*** Update File: README.md\n*** End Patch"}"#;
-        let mut failed = || {
+        let failed = || {
             let mut c = call("apply_patch", args, ToolStatus::Failed);
             c.preview = Some("invalid patch: line 1: bad hunk".into());
             c

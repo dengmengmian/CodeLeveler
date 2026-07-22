@@ -76,6 +76,33 @@ pub(crate) fn detect_branch_label(repo: &Path) -> Option<String> {
     }
 }
 
+pub(crate) fn build_report(
+    report: &leveler_engine::TaskReport,
+    diff: &UiDiff,
+) -> UiCompletionReport {
+    let (passed, total) = report
+        .verification
+        .as_ref()
+        .map(|v| {
+            (
+                v.checks
+                    .iter()
+                    .filter(|c| c.status == CheckStatus::Passed)
+                    .count(),
+                v.checks.len(),
+            )
+        })
+        .unwrap_or((0, 0));
+    UiCompletionReport {
+        files_changed: report.modified_files.len(),
+        added: diff.total_added(),
+        removed: diff.total_removed(),
+        checks_passed: passed,
+        checks_total: total,
+        success: report.outcome.is_success(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,32 +157,5 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
-pub(crate) fn build_report(
-    report: &leveler_engine::TaskReport,
-    diff: &UiDiff,
-) -> UiCompletionReport {
-    let (passed, total) = report
-        .verification
-        .as_ref()
-        .map(|v| {
-            (
-                v.checks
-                    .iter()
-                    .filter(|c| c.status == CheckStatus::Passed)
-                    .count(),
-                v.checks.len(),
-            )
-        })
-        .unwrap_or((0, 0));
-    UiCompletionReport {
-        files_changed: report.modified_files.len(),
-        added: diff.total_added(),
-        removed: diff.total_removed(),
-        checks_passed: passed,
-        checks_total: total,
-        success: report.outcome.is_success(),
     }
 }
