@@ -686,7 +686,14 @@ pub(crate) async fn cmd_tui(
     };
 
     leveler_tui::run(client, Some(web_launcher), boot).await?;
-    Ok(std::process::ExitCode::SUCCESS)
+    // The TUI owns the only runtime, and an in-process `/web` server is spawned
+    // detached on a token it never cancels (it serves "until the process
+    // exits"). Falling through to a normal return would drop the runtime with
+    // that task still live, which hangs the process — the terminal is restored
+    // and the composer draft/history are already persisted inside `run`, but the
+    // shell never comes back. Exit the process directly so a running Web UI can
+    // never keep the CLI alive after the user quits the TUI.
+    std::process::exit(0);
 }
 
 /// The daemon's bound transports. In TCP mode the per-repo Unix socket is
