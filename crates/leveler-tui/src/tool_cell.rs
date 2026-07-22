@@ -650,6 +650,17 @@ pub(crate) fn tool_lines(
         inline_diff_lines(&block.arguments, theme, width, tools_expanded, t, out);
         return;
     }
+    // `replace` is the same edit action with old/new arguments instead of a
+    // patch — synthesize the patch body so it renders the same inline diff.
+    // Failures keep the plain preview path: the error line is more useful
+    // than a diff that never landed.
+    if block.name == "replace"
+        && block.status != ToolStatus::Failed
+        && let Some(patch) = replace_patch_from_arguments(&block.arguments)
+    {
+        inline_diff_lines(&patch, theme, width, tools_expanded, t, out);
+        return;
+    }
 
     // Prefer the structured goal summary over the runtime's internal preview
     // ("Goal resolved.") so expand shows what the model actually wrote.
@@ -736,6 +747,31 @@ pub(crate) fn tool_lines(
             Span::styled(hint, Style::default().fg(theme.dim)),
         ]));
     }
+}
+
+/// Synthesize an apply_patch-style body from `replace` arguments (`path` /
+/// `old` / `new`) so replace edits share [`inline_diff_lines`]. `None` when
+/// the arguments don't parse or carry no text on either side.
+fn replace_patch_from_arguments(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let path = value.get("path")?.as_str()?;
+    let old = value.get("old")?.as_str()?;
+    let new = value.get("new")?.as_str()?;
+    if old.is_empty() && new.is_empty() {
+        return None;
+    }
+    let mut patch = format!("*** Update File: {path}\n");
+    for line in old.lines() {
+        patch.push('-');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    for line in new.lines() {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    Some(patch)
 }
 
 fn inline_diff_lines(
@@ -1124,6 +1160,80 @@ mod tests {
             text.iter()
                 .any(|l| l.contains("+39 行") && l.contains("Ctrl+O")),
             "must hint how to expand: {text:?}"
+        );
+    }
+
+    /// `replace` is an edit tool like `apply_patch`; its cell must render the
+    /// same inline colored diff (file header + −old/+new rows), not just a
+    /// collapsed preview line. The diff is synthesized from the old/new
+    /// arguments since replace carries no patch text.
+    #[test]
+    fn replace_edit_renders_an_inline_diff_like_apply_patch() {
+        let block = ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("r1"),
+            name: "replace".to_string(),
+            arguments: r#"{"path":"src/lib.rs","old":"fn old() {}","new":"fn renamed() {}\nfn extra() {}"}"#
+                .to_string(),
+            status: ToolStatus::Ok,
+            preview: Some("replaced 1 occurrence".to_string()),
+            duration_ms: None,
+            parallel: false,
+        };
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+            &mut out,
+        );
+        let text: Vec<String> = out.iter().map(|l| l.to_string()).collect();
+        assert!(
+            text.iter().any(|l| l.contains("src/lib.rs")),
+            "diff must name the file: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("-fn old() {}")),
+            "old text must render as removed rows: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("+fn renamed() {}"))
+                && text.iter().any(|l| l.contains("+fn extra() {}")),
+            "new text must render as added rows: {text:?}"
+        );
+    }
+
+    /// A failed replace keeps the plain preview path — the error line is more
+    /// useful than a diff that never landed.
+    #[test]
+    fn failed_replace_shows_the_error_not_a_diff() {
+        let block = ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("r2"),
+            name: "replace".to_string(),
+            arguments: r#"{"path":"src/lib.rs","old":"zzz","new":"q"}"#.to_string(),
+            status: ToolStatus::Failed,
+            preview: Some("old text not found in src/lib.rs".to_string()),
+            duration_ms: None,
+            parallel: false,
+        };
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+            &mut out,
+        );
+        let text: Vec<String> = out.iter().map(|l| l.to_string()).collect();
+        assert!(
+            text.iter().any(|l| l.contains("old text not found")),
+            "the failure preview must render: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("+q")),
+            "no diff rows for an edit that never landed: {text:?}"
         );
     }
 
