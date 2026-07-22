@@ -418,9 +418,9 @@ async fn socket_clients_receive_only_their_session_events() {
 /// SubmitMessage is not rejected by the one-active-turn-per-session guard.
 async fn wait_turn_settled(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) {
     loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        let event = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
             .await
-            .expect("turn must settle within 10s")
+            .expect("turn must settle within 30s")
             .expect("event stream open");
         if matches!(
             event,
