@@ -100,6 +100,14 @@ export function restartProject(path: string): Promise<void> {
   });
 }
 
+/** 重命名项目（设置显示别名）；name 传空字符串清除别名、恢复默认名。 */
+export function renameProject(path: string, name: string): Promise<void> {
+  return request<void>('/api/projects/rename', {
+    method: 'POST',
+    body: JSON.stringify({ path, name }),
+  });
+}
+
 export function fetchSnapshot(sessionId: SessionId): Promise<UiSessionSnapshot> {
   return request<UiSessionSnapshot>(
     `/api/sessions/${encodeURIComponent(sessionId)}/snapshot`,

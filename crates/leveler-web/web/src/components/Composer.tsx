@@ -1,6 +1,6 @@
-// 输入舱：消息队列 + 斜杠命令面板 + 运行设置/模型弹层 + 发送/停止。
+// 输入舱：轻量消息队列 + 斜杠命令面板 + 运行设置/模型弹层 + 发送。
 // 控制区分两层：第一层输入内容；第二层执行设置 —— 左侧附件/上下文，
-// 中间「权限 · 模式」合并入口，右侧模型 + 发送；停止仅运行中出现。
+// 中间「权限 · 模式」合并入口，右侧模型 + 发送；停止由顶部全局状态栏负责。
 // 交互：Enter 发送、Shift+Enter 换行、/ 唤起命令、回合进行中发送排队。
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -226,10 +226,31 @@ export function Composer() {
 
         {queue.length > 0 && (
           <div className="queue">
-            {queue.map((q) => (
-              <div className="q-item" key={q.id}>
-                <span className="q-tag">QUEUED</span>
+            {queue.length > 1 && <div className="q-head">消息队列 · {queue.length}</div>}
+            {queue.map((q, i) => (
+              <div className="q-row" key={q.id}>
+                <span className="q-lead">{queue.length === 1 ? '↳ 下一条：' : `${i + 1}`}</span>
                 <span className="q-text">{q.text}</span>
+                {queue.length > 1 && (
+                  <span className="q-ops">
+                    <button
+                      className="q-op"
+                      title="上移"
+                      disabled={i === 0}
+                      onClick={() => bridge.moveQueued(q.id, -1)}
+                    >
+                      ↑
+                    </button>
+                    <button
+                      className="q-op"
+                      title="下移"
+                      disabled={i === queue.length - 1}
+                      onClick={() => bridge.moveQueued(q.id, 1)}
+                    >
+                      ↓
+                    </button>
+                  </span>
+                )}
                 <button className="q-x" onClick={() => bridge.cancelQueued(q.id)} title="取消排队">
                   ✕
                 </button>
@@ -283,7 +304,7 @@ export function Composer() {
               value={text}
               placeholder={
                 turnActive
-                  ? '回合进行中…发送将排队 ( / 唤起命令 )'
+                  ? '回合运行中，可继续输入并加入队列…… ( / 唤起命令 )'
                   : '告诉 Agent 要完成什么，或输入 / 查看命令'
               }
               onChange={(e) => {
@@ -426,12 +447,12 @@ export function Composer() {
               </span>
 
               {turnActive && (
-                <button className="c-chip stop" title="取消当前回合 (Esc)" onClick={() => bridge.cancelTurn()}>
-                  ■ 停止
-                </button>
+                <span className="c-run-hint" title="停止由顶部状态栏负责 (Esc)">
+                  ● 运行中
+                </span>
               )}
               <button className="send" onClick={send}>
-                {turnActive ? '排队 ⏎' : '发送 ⏎'}
+                {turnActive ? '加入队列 ⏎' : '发送 ⏎'}
               </button>
             </div>
           </div>

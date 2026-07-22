@@ -128,6 +128,7 @@ fn build_router_with(state: AppState) -> Router {
             get(list_projects).post(add_project).delete(remove_project),
         )
         .route("/api/projects/restart", post(restart_project))
+        .route("/api/projects/rename", post(rename_project))
         .route("/api/fs/list", get(crate::browse::list_dir))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
@@ -315,6 +316,26 @@ async fn restart_project(
     };
     match multi.manager.restart(&request.path).await {
         // A JSON body (not 202) — the frontend helper parses every response.
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) => project_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameProjectRequest {
+    path: String,
+    /// Display alias; empty restores the path-derived short name.
+    name: String,
+}
+
+async fn rename_project(
+    State(state): State<AppState>,
+    Json(request): Json<RenameProjectRequest>,
+) -> Response {
+    let Some(multi) = &state.multi else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match multi.manager.rename(&request.path, &request.name) {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) => project_error(error),
     }

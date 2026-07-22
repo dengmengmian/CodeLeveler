@@ -63,6 +63,11 @@ export class RuntimeBridge {
         return; // 送达回执，目前无需展示
       case 'project_status':
         this.dispatch({ type: 'project_status', path: frame.path, status: frame.status });
+        // 后台发现（历史项目自动注册）带来的新项目不在已拉取的列表里：
+        // 状态帧到达时补拉一次，让分组立即出现。
+        if (!this.getState().projects.some((p) => p.path === frame.path)) {
+          void this.refreshProjects();
+        }
         return;
       case 'error':
         this.dispatch({ type: 'notice', message: `服务端错误 ${frame.code}: ${frame.message}` });
@@ -303,6 +308,15 @@ export class RuntimeBridge {
     }
   }
 
+  async renameProject(path: string, name: string): Promise<void> {
+    try {
+      await api.renameProject(path, name);
+      await this.refreshProjects();
+    } catch (err) {
+      this.notice(`重命名失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // ── 发消息（含排队）────────────────────────────────────────────────
 
   async sendUserMessage(raw: string): Promise<void> {
@@ -385,6 +399,11 @@ export class RuntimeBridge {
 
   cancelQueued(id: string): void {
     this.dispatch({ type: 'dequeue', id });
+  }
+
+  /** 调整排队消息顺序（纯客户端队列，dir=-1 上移 / 1 下移）。 */
+  moveQueued(id: string, dir: -1 | 1): void {
+    this.dispatch({ type: 'queue_move', id, dir });
   }
 
   // ── 审批 / 澄清（固定 command_id，重试幂等）────────────────────────

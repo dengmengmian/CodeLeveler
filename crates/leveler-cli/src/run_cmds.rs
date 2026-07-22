@@ -889,7 +889,11 @@ pub(crate) async fn cmd_web(
                 registry_path,
                 std::env::current_exe().ok(),
             );
-            tokio::spawn(manager.clone().load_registry());
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background.discover_historical_projects().await;
+            });
             let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
             (server, None, token)
         }
@@ -922,8 +926,14 @@ pub(crate) async fn cmd_web(
                 std::env::current_exe().ok(),
             );
             // Bring persisted projects online in the background — the server
-            // must not wait on daemons that need spawning.
-            tokio::spawn(manager.clone().load_registry());
+            // must not wait on daemons that need spawning. Then register
+            // every repository that has Leveler state (TUI-only projects), so
+            // the sidebar lists all previously used projects.
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background.discover_historical_projects().await;
+            });
             let token = generate_daemon_token();
             let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
             (server, Some(runtime), token)
