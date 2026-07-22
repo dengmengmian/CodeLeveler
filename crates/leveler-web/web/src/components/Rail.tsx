@@ -75,10 +75,15 @@ export function Rail() {
 
 // ── 会话面板 ────────────────────────────────────────────────────────
 
+// 每个项目组默认只展示最新 N 条会话，超出折叠进「加载更多」。
+const SESSION_PREVIEW_COUNT = 5;
+
 function SessionsPanel() {
   const state = useAppState();
   const bridge = useBridge();
   const [closed, setClosed] = useState<ReadonlySet<string>>(new Set());
+  // 会话列表展开为全量的项目路径集合（默认都只显示最新 5 条）
+  const [expandedSessions, setExpandedSessions] = useState<ReadonlySet<string>>(new Set());
   const [picking, setPicking] = useState(false);
   // 正在 inline 重命名的项目路径（null = 无）
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -121,6 +126,15 @@ function SessionsPanel() {
 
   const toggle = (repo: string) => {
     setClosed((prev) => {
+      const next = new Set(prev);
+      if (next.has(repo)) next.delete(repo);
+      else next.add(repo);
+      return next;
+    });
+  };
+
+  const toggleSessionList = (repo: string) => {
+    setExpandedSessions((prev) => {
       const next = new Set(prev);
       if (next.has(repo)) next.delete(repo);
       else next.add(repo);
@@ -217,7 +231,10 @@ function SessionsPanel() {
                   {status === 'offline' ? 'daemon 离线 —— 点 ⟳ 重启后加载会话' : '暂无会话'}
                 </div>
               )}
-              {g.sessions.map((s) => {
+              {(expandedSessions.has(g.repository)
+                ? g.sessions
+                : g.sessions.slice(0, SESSION_PREVIEW_COUNT)
+              ).map((s) => {
                 const dot = statusDot(s.status);
                 return (
                   <button
@@ -235,6 +252,16 @@ function SessionsPanel() {
                   </button>
                 );
               })}
+              {g.sessions.length > SESSION_PREVIEW_COUNT &&
+                (expandedSessions.has(g.repository) ? (
+                  <button className="sess-more" onClick={() => toggleSessionList(g.repository)}>
+                    收起
+                  </button>
+                ) : (
+                  <button className="sess-more" onClick={() => toggleSessionList(g.repository)}>
+                    加载更多 {g.sessions.length - SESSION_PREVIEW_COUNT} 个对话
+                  </button>
+                ))}
             </div>
           </div>
         );
