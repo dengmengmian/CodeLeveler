@@ -104,16 +104,32 @@ impl<'a> SessionRepository<'a> {
         Ok(())
     }
 
-    /// List sessions, most recent first.
+    /// List sessions, most recent first. Archived sessions are excluded —
+    /// archiving is exactly "hide from the default list".
     pub async fn list(&self) -> Result<Vec<SessionRecord>, StorageError> {
         let rows = sqlx::query_as::<_, SessionRow>(
             "SELECT id, repository, goal, status, model, state, created_at, updated_at, \
              collaboration, work_profile \
-             FROM sessions ORDER BY created_at DESC",
+             FROM sessions WHERE archived_at IS NULL ORDER BY created_at DESC",
         )
         .fetch_all(self.db.pool())
         .await?;
         rows.into_iter().map(SessionRow::decode).collect()
+    }
+
+    /// Archive (`Some(now)`) or restore (`None`) a session. Archived sessions
+    /// keep their full transcript; they only leave the default list.
+    pub async fn set_archived(
+        &self,
+        id: &SessionId,
+        archived_at: Option<Timestamp>,
+    ) -> Result<(), StorageError> {
+        sqlx::query("UPDATE sessions SET archived_at = ?2 WHERE id = ?1")
+            .bind(id.as_str())
+            .bind(archived_at.map(|t| t.to_rfc3339()))
+            .execute(self.db.pool())
+            .await?;
+        Ok(())
     }
 
     /// Fetch one session by id.
@@ -336,6 +352,27 @@ mod tests {
         assert!(repo.get(&id).await.unwrap().is_some());
         assert!(repo.delete(&id).await.unwrap());
         assert!(repo.get(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn archived_sessions_leave_the_default_list_and_can_return() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = SessionRecord::new("/repo", "整理", "m", leveler_core::now());
+        repo.create(&record).await.unwrap();
+        let id = SessionId::new(record.id.clone());
+
+        repo.set_archived(&id, Some(leveler_core::now()))
+            .await
+            .unwrap();
+        assert!(repo.list().await.unwrap().is_empty(), "archived is hidden");
+        assert!(
+            repo.get(&id).await.unwrap().is_some(),
+            "archived is not deleted"
+        );
+
+        repo.set_archived(&id, None).await.unwrap();
+        assert_eq!(repo.list().await.unwrap().len(), 1, "restore un-hides");
     }
 
     #[tokio::test]

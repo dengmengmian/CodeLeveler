@@ -638,23 +638,40 @@ impl InProcessRuntimeClient {
         }
     }
 
-    /// List stored sessions, most-recent first, as UI summaries.
+    /// List stored sessions, most-recent first, as UI summaries. Sessions
+    /// whose goal is still the interactive placeholder display the first
+    /// sentence of their first user message instead — this also names the
+    /// history created before placeholder retitling existed.
     async fn list_sessions(&self) -> Vec<UiSessionSummary> {
         let Ok(db) = self.app.open_database().await else {
             return Vec::new();
         };
+        let first_texts = MessageRepository::new(&db)
+            .first_user_texts()
+            .await
+            .unwrap_or_default();
         SessionRepository::new(&db)
             .list()
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| UiSessionSummary {
-                id: SessionId::new(r.id),
-                goal: r.goal,
-                status: r.status.as_str().to_string(),
-                model: r.model,
-                updated_at: r.updated_at,
-                repository: Some(self.app.layout.repo_root.display().to_string()),
+            .map(|r| {
+                let goal = if r.goal == PLACEHOLDER_GOAL || r.goal.trim().is_empty() {
+                    first_texts
+                        .get(&r.id)
+                        .and_then(|text| title_from_first_message(text))
+                        .unwrap_or(r.goal)
+                } else {
+                    r.goal
+                };
+                UiSessionSummary {
+                    id: SessionId::new(r.id),
+                    goal,
+                    status: r.status.as_str().to_string(),
+                    model: r.model,
+                    updated_at: r.updated_at,
+                    repository: Some(self.app.layout.repo_root.display().to_string()),
+                }
             })
             .collect()
     }
@@ -1495,6 +1512,93 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .send(RuntimeEvent::SessionList {
                         sessions: self.list_sessions().await,
                     });
+                Ok(())
+            }
+            ClientCommand::RenameSession { session_id, name } => {
+                let name = name.trim().to_string();
+                let renamed: Result<(), anyhow::Error> = async {
+                    if name.is_empty() {
+                        anyhow::bail!("名称不能为空");
+                    }
+                    let db = self.app.open_database().await?;
+                    SessionRepository::new(&db)
+                        .update_goal(&session_id, &name)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = renamed {
+                    self.notify_error(&session_id, format!("重命名会话失败: {error}"));
+                }
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await,
+                });
+                Ok(())
+            }
+            ClientCommand::ArchiveSession { session_id } => {
+                let archived: Result<(), anyhow::Error> = async {
+                    let db = self.app.open_database().await?;
+                    SessionRepository::new(&db)
+                        .set_archived(&session_id, Some(leveler_core::now()))
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = archived {
+                    self.notify_error(&session_id, format!("归档会话失败: {error}"));
+                }
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await,
+                });
+                Ok(())
+            }
+            ClientCommand::ForkSession { session_id } => {
+                // Copy record + transcript into a fresh session; the original
+                // stays untouched so an alternative direction can be explored.
+                let forked: Result<SessionId, anyhow::Error> = async {
+                    let db = self.app.open_database().await?;
+                    let sessions = SessionRepository::new(&db);
+                    let record = sessions
+                        .get(&session_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("会话不存在"))?;
+                    let title = if record.goal == PLACEHOLDER_GOAL {
+                        record.goal.clone()
+                    } else {
+                        format!("{} (分叉)", record.goal)
+                    };
+                    let fork =
+                        leveler_storage::SessionRecord::new(
+                            record.repository.clone(),
+                            title,
+                            record.model.clone(),
+                            leveler_core::now(),
+                        )
+                        .with_axes(&record.collaboration, &record.work_profile);
+                    sessions.create(&fork).await?;
+                    let fork_id = SessionId::new(fork.id.clone());
+                    let messages = MessageRepository::new(&db);
+                    let transcript = messages.load(&session_id).await?;
+                    messages
+                        .append(&fork_id, &transcript, leveler_core::now())
+                        .await?;
+                    Ok(fork_id)
+                }
+                .await;
+                match forked {
+                    Ok(fork_id) => {
+                        let _ = self.events.send(RuntimeEvent::Notification {
+                            level: NotificationLevel::Info,
+                            message: format!("已分叉会话: {fork_id}"),
+                        });
+                    }
+                    Err(error) => {
+                        self.notify_error(&session_id, format!("分叉会话失败: {error}"));
+                    }
+                }
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await,
+                });
                 Ok(())
             }
             ClientCommand::Btw {

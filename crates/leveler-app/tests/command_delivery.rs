@@ -508,3 +508,81 @@ async fn first_message_retitles_a_placeholder_session() {
     let record = repo.get(&named.session.id).await.unwrap().unwrap();
     assert_eq!(record.goal, "已有正式目标");
 }
+
+/// The session-menu commands: rename overwrites the title, archive hides the
+/// session from the default list (transcript intact), fork clones record +
+/// transcript into a fresh session leaving the original untouched.
+#[tokio::test]
+async fn session_menu_rename_archive_fork_roundtrip() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let db = app.open_database().await.unwrap();
+    let sessions = leveler_storage::SessionRepository::new(&db);
+    let messages = leveler_storage::MessageRepository::new(&db);
+
+    // Seed a transcript so fork has something to copy.
+    messages
+        .append(
+            &session_id,
+            &[
+                r#"{"role":"user","content":[{"type":"text","text":"修复登录"}]}"#.into(),
+                r#"{"role":"assistant","content":[{"type":"text","text":"好的"}]}"#.into(),
+            ],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+    // Rename.
+    client
+        .send(ClientCommand::RenameSession {
+            session_id: session_id.clone(),
+            name: "  登录修复方案  ".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions.get(&session_id).await.unwrap().unwrap().goal,
+        "登录修复方案",
+        "rename trims and overwrites the title"
+    );
+
+    // Fork: a new session appears with the transcript copied.
+    client
+        .send(ClientCommand::ForkSession {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let all = sessions.list().await.unwrap();
+    assert_eq!(all.len(), 2, "fork adds one session: {all:?}");
+    let fork = all
+        .iter()
+        .find(|r| r.id != session_id.as_str())
+        .expect("forked session listed");
+    assert_eq!(fork.goal, "登录修复方案 (分叉)");
+    let fork_id = SessionId::new(fork.id.clone());
+    assert_eq!(
+        messages.load(&fork_id).await.unwrap().len(),
+        2,
+        "fork copies the transcript"
+    );
+    assert_eq!(
+        messages.load(&session_id).await.unwrap().len(),
+        2,
+        "original transcript untouched"
+    );
+
+    // Archive: leaves the default list, transcript intact.
+    client
+        .send(ClientCommand::ArchiveSession {
+            session_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+    let listed = sessions.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "archived fork left the list");
+    assert!(
+        sessions.get(&fork_id).await.unwrap().is_some(),
+        "archive is not delete"
+    );
+}

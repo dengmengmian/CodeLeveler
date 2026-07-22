@@ -84,6 +84,8 @@ function SessionsPanel() {
   const [picking, setPicking] = useState(false);
   // 正在 inline 重命名的项目路径（null = 无）
   const [renaming, setRenaming] = useState<string | null>(null);
+  // 正在 inline 重命名的会话 id（null = 无）
+  const [renamingSession, setRenamingSession] = useState<string | null>(null);
 
   // 会话按 repository 分组（组内按 updated_at 倒序），骨架是注册的项目
   // 列表 —— 没有会话或 daemon 离线的项目也显示；不在项目列表里的会话
@@ -243,8 +245,24 @@ function SessionsPanel() {
                     title={`${dot.label} · ${formatRelative(s.updated_at)}`}
                   >
                     {dot.cls !== 'idle' && <i className={`dot ${dot.cls}`} />}
-                    <span className="t">{s.goal || '未命名会话'}</span>
+                    {renamingSession === s.id ? (
+                      <RenameInput
+                        initial={s.goal}
+                        onSubmit={(value) => {
+                          setRenamingSession(null);
+                          bridge.renameSession(s.id, value);
+                        }}
+                        onCancel={() => setRenamingSession(null)}
+                      />
+                    ) : (
+                      <span className="t">{s.goal || '未命名会话'}</span>
+                    )}
                     <span className="ago">{formatRelative(s.updated_at)}</span>
+                    <SessionMenu
+                      id={s.id}
+                      title={s.goal}
+                      onRename={() => setRenamingSession(s.id)}
+                    />
                   </button>
                 );
               })}
@@ -351,6 +369,106 @@ function ProjectMenu({
               移除工作区
             </span>
           )}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// ── 会话「⋯」菜单：复制 Session ID / 重命名 / 分叉 / 导出 / 归档 ────────
+// 复用 ProjectMenu 的 open + 外部点击/Escape 关闭模式与 .p-* 样式。
+
+function SessionMenu({
+  id,
+  title,
+  onRename,
+}: {
+  id: string;
+  title: string;
+  onRename: () => void;
+}) {
+  const bridge = useBridge();
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  const timer = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('click', onDocClick);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', onDocClick);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const copyId = () => {
+    void bridge.copySessionId(id);
+    setCopied(true);
+    if (timer.current) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      setCopied(false);
+      setOpen(false);
+    }, 900);
+  };
+
+  const archive = () => {
+    setOpen(false);
+    if (window.confirm(`归档会话「${title || id}」？\n归档后从列表隐藏,记录仍保留。`)) {
+      bridge.archiveSession(id);
+    }
+  };
+
+  return (
+    <span className="p-menu" ref={wrapRef} onClick={(e) => e.stopPropagation()}>
+      <span className="p-add" role="button" title="会话操作" onClick={() => setOpen((v) => !v)}>
+        ⋯
+      </span>
+      {open && (
+        <span className="p-pop">
+          <span className="p-item" role="button" onClick={copyId}>
+            {copied ? '已复制' : '复制 Session ID'}
+          </span>
+          <span
+            className="p-item"
+            role="button"
+            onClick={() => {
+              setOpen(false);
+              onRename();
+            }}
+          >
+            重命名
+          </span>
+          <span
+            className="p-item"
+            role="button"
+            onClick={() => {
+              setOpen(false);
+              bridge.forkSession(id);
+            }}
+          >
+            分叉会话
+          </span>
+          <span
+            className="p-item"
+            role="button"
+            onClick={() => {
+              setOpen(false);
+              void bridge.exportSession(id, title);
+            }}
+          >
+            导出会话
+          </span>
+          <span className="p-item danger" role="button" onClick={archive}>
+            归档
+          </span>
         </span>
       )}
     </span>

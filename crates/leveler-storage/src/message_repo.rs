@@ -138,6 +138,46 @@ impl<'a> MessageRepository<'a> {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
+    /// The first user-role message text of every session, keyed by session id
+    /// (display-title source for sessions whose goal is a placeholder).
+    ///
+    /// The one deliberate exception to "payloads are opaque JSON": the query
+    /// peeks at `$.role` so it can pick one row per session inside SQLite
+    /// instead of loading every transcript. Uses SQLite's documented bare-
+    /// column-with-MIN() guarantee to take each session's earliest user row.
+    pub async fn first_user_texts(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, StorageError> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT session_id, payload, MIN(ordinal) FROM session_messages \
+             WHERE json_extract(payload, '$.role') = 'user' \
+             GROUP BY session_id",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut out = std::collections::HashMap::new();
+        for (session_id, payload, _) in rows {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            let text = value
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|parts| {
+                    parts.iter().find_map(|p| {
+                        (p.get("type")?.as_str()? == "text")
+                            .then(|| p.get("text")?.as_str())
+                            .flatten()
+                    })
+                })
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                out.insert(session_id, text.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete all messages at or after `keep` (0-based ordinal), truncating the
     /// transcript back to its first `keep` messages. Used by conversation
     /// rollback / checkpoint restore.
@@ -294,6 +334,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repo.load(&id).await.unwrap(), vec!["summary-only"]);
+    }
+
+    #[tokio::test]
+    async fn first_user_texts_picks_each_sessions_earliest_user_message() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo_s = SessionRepository::new(&db);
+        let a = SessionRecord::new("/r", "interactive session", "m", leveler_core::now());
+        let b = SessionRecord::new("/r", "interactive session", "m", leveler_core::now());
+        repo_s.create(&a).await.unwrap();
+        repo_s.create(&b).await.unwrap();
+        let a_id = SessionId::new(a.id.clone());
+        let b_id = SessionId::new(b.id.clone());
+
+        let repo = MessageRepository::new(&db);
+        repo.append(
+            &a_id,
+            &[
+                r#"{"role":"system","content":[{"type":"text","text":"rules"}]}"#.into(),
+                r#"{"role":"user","content":[{"type":"text","text":"帮我修复登录"}]}"#.into(),
+                r#"{"role":"user","content":[{"type":"text","text":"第二条"}]}"#.into(),
+            ],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        // Session b: first user message is image-first; the text part wins.
+        repo.append(
+            &b_id,
+            &[
+                r#"{"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":"看下这张图"}]}"#.into(),
+            ],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+        let texts = repo.first_user_texts().await.unwrap();
+        assert_eq!(texts.get(a.id.as_str()).map(String::as_str), Some("帮我修复登录"));
+        assert_eq!(texts.get(b.id.as_str()).map(String::as_str), Some("看下这张图"));
     }
 
     #[tokio::test]

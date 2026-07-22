@@ -193,6 +193,9 @@ export type ClientCommand =
   | { type: 'open_session_for'; requester_session_id: SessionId; session_id: SessionId }
   | { type: 'delete_session'; session_id: SessionId }
   | { type: 'delete_session_for'; requester_session_id: SessionId; session_id: SessionId }
+  | { type: 'rename_session'; session_id: SessionId; name: string }
+  | { type: 'archive_session'; session_id: SessionId }
+  | { type: 'fork_session'; session_id: SessionId }
   | { type: 'restore_checkpoint'; session_id: SessionId; checkpoint_id: CheckpointId }
   | { type: 'btw'; session_id: SessionId; question: string }
   | { type: 'quit' };

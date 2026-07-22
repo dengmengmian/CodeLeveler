@@ -323,6 +323,56 @@ export class RuntimeBridge {
     }
   }
 
+  // ── 会话菜单（复制 ID / 重命名 / 分叉 / 导出 / 归档）────────────────
+
+  renameSession(id: SessionId, name: string): void {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    this.deliver({ type: 'rename_session', session_id: id, name: trimmed });
+    // 同连接命令顺序处理:列表请求在改名落库后应答,兜底全局流丢帧
+    this.requestSessionList();
+  }
+
+  archiveSession(id: SessionId): void {
+    this.deliver({ type: 'archive_session', session_id: id });
+    this.requestSessionList();
+    this.notice('会话已归档');
+  }
+
+  forkSession(id: SessionId): void {
+    this.deliver({ type: 'fork_session', session_id: id });
+    this.requestSessionList();
+  }
+
+  async copySessionId(id: SessionId): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(id);
+      this.notice('已复制 Session ID');
+    } catch {
+      this.notice(`Session ID: ${id}`);
+    }
+  }
+
+  /** 导出会话为 Markdown 下载（用 snapshot 数据,不需要新端点）。 */
+  async exportSession(id: SessionId, title: string): Promise<void> {
+    try {
+      const snapshot = await api.fetchSnapshot(id);
+      const lines: string[] = [`# ${title || id}`, ''];
+      for (const m of snapshot.messages ?? []) {
+        lines.push(m.role === 'user' ? '## 用户' : '## 助手', '', m.text, '');
+      }
+      const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(title || id).slice(0, 40).replace(/[\\/:*?"<>|]/g, '_')}.md`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      this.notice(`导出失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // ── 发消息（含排队）────────────────────────────────────────────────
 
   async sendUserMessage(raw: string): Promise<void> {

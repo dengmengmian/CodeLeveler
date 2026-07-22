@@ -254,6 +254,9 @@ button { font-family: inherit; }
 .sess .ago {
   flex: none; font-family: var(--mono); font-size: 10px; color: var(--text-tertiary);
 }
+/* 会话行的 ⋯ 菜单：hover 才显现,复用项目菜单的 .p-* 样式 */
+.sess .p-add { padding: 0 4px; }
+.sess:hover .p-add { opacity: 1; }
 /* 会话列表折叠：默认 5 条，加载更多 / 收起 */
 .sess-more {
   display: block; width: 100%; text-align: left; background: none; border: none;

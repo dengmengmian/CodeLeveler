@@ -114,6 +114,15 @@ pub enum ClientCommand {
         requester_session_id: SessionId,
         session_id: SessionId,
     },
+    /// Rename a stored session (overwrite its goal/title text).
+    RenameSession { session_id: SessionId, name: String },
+    /// Archive a stored session: it keeps its transcript but leaves the
+    /// default session list.
+    ArchiveSession { session_id: SessionId },
+    /// Fork a stored session: create a new session with a copy of the
+    /// transcript, so an alternative direction can be explored without
+    /// touching the original.
+    ForkSession { session_id: SessionId },
     /// Restore the conversation to a checkpoint (spec §68).
     RestoreCheckpoint {
         session_id: SessionId,
@@ -154,6 +163,9 @@ impl ClientCommand {
             | ClientCommand::ClearConversation { session_id }
             | ClientCommand::OpenSession { session_id }
             | ClientCommand::DeleteSession { session_id }
+            | ClientCommand::RenameSession { session_id, .. }
+            | ClientCommand::ArchiveSession { session_id }
+            | ClientCommand::ForkSession { session_id }
             | ClientCommand::RestoreCheckpoint { session_id, .. }
             | ClientCommand::Btw { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
@@ -230,6 +242,29 @@ mod tests {
                 session_id: SessionId::new("s1"),
             },
             "add_clipboard_image",
+        );
+    }
+
+    #[test]
+    fn session_menu_commands_roundtrip() {
+        roundtrip(
+            ClientCommand::RenameSession {
+                session_id: SessionId::new("s1"),
+                name: "登录修复".to_string(),
+            },
+            "rename_session",
+        );
+        roundtrip(
+            ClientCommand::ArchiveSession {
+                session_id: SessionId::new("s1"),
+            },
+            "archive_session",
+        );
+        roundtrip(
+            ClientCommand::ForkSession {
+                session_id: SessionId::new("s1"),
+            },
+            "fork_session",
         );
     }
 
