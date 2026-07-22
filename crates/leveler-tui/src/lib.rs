@@ -19,7 +19,6 @@ pub mod composer;
 mod diff_view;
 mod footer_queue;
 pub mod i18n;
-pub mod inline;
 pub mod markdown;
 pub mod overlay;
 mod plan_cell;

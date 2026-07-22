@@ -10,7 +10,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::command::{ProcessRequest, sandbox_command};
+use crate::command::{ProcessRequest, sandbox_command, should_read_host_caches};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::command::{SandboxPaths, apply_sandbox_environment, prepare_sandbox_paths};
 use crate::snapshot::SnapshotId;
 use crate::windows_sandbox::{FilesystemIntent, assert_intent_spawn_allowed};
 
@@ -23,6 +25,11 @@ pub struct MutationBaseline {
 
 const MAX_CONCURRENT: usize = 4;
 const MAX_LOG_BYTES: usize = 256 * 1024;
+/// Completed task records kept for later `get`/`wait` calls. Pruning happens
+/// when a new task is spawned, so a waiter cannot lose the task that just woke
+/// it. At most `MAX_CONCURRENT` newly terminal records can temporarily sit
+/// above this bound before the next spawn.
+const MAX_RETAINED_TERMINAL_TASKS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundTaskStatus {
@@ -119,6 +126,9 @@ struct TaskInner {
     log_pumps_remaining: u8,
     /// Taken once by wait-end accounting so restore/diff runs at most once.
     mutation_baseline: Option<MutationBaseline>,
+    /// Keeps the private temp tree alive until the child and log pumps finish.
+    /// [`finalize_if_drained`] drops it immediately at that point.
+    sandbox_scratch: Option<tempfile::TempDir>,
 }
 
 /// Process-backed background task registry shared via [`Arc`] on tool context.
@@ -161,6 +171,7 @@ impl BackgroundTaskRegistry {
         mutation_baseline: Option<MutationBaseline>,
     ) -> Result<String, String> {
         let mut st = self.inner.lock().await;
+        prune_terminal_tasks(&mut st);
         let running = st.tasks.values().filter(|t| t.status.is_active()).count();
         if running >= MAX_CONCURRENT {
             return Err(format!(
@@ -180,12 +191,42 @@ impl BackgroundTaskRegistry {
             return Err(err.to_string());
         }
 
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let sandbox_paths = request
+            .write_root
+            .as_ref()
+            .map(|workspace| {
+                prepare_sandbox_paths(
+                    &self.environment,
+                    workspace,
+                    should_read_host_caches(&request),
+                )
+            })
+            .transpose()
+            .map_err(|err| format!("create private sandbox scratch directory: {err}"))?;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let sandbox_paths: Option<tempfile::TempDir> = None;
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let sandbox_scratch_root = sandbox_paths.as_ref().map(SandboxPaths::scratch_path);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let sandbox_scratch_root: Option<&std::path::Path> = None;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let sandbox_cache_write_roots = sandbox_paths
+            .as_ref()
+            .map(SandboxPaths::cache_write_roots)
+            .unwrap_or(&[]);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let sandbox_cache_write_roots: &[std::path::PathBuf] = &[];
+
         let (program, args) = sandbox_command(
             &request.program,
             &request.args,
             request.deny_network,
             request.write_root.as_deref(),
             &request.extra_read_roots,
+            sandbox_scratch_root,
+            sandbox_cache_write_roots,
         );
 
         let mut cmd = Command::new(&program);
@@ -210,6 +251,10 @@ impl BackgroundTaskRegistry {
             if !denied || request.allow_env.iter().any(|v| v == &name_text) {
                 cmd.env(name, value);
             }
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(paths) = sandbox_paths.as_ref() {
+            apply_sandbox_environment(&mut cmd, paths);
         }
 
         let mut child = cmd
@@ -255,6 +300,16 @@ impl BackgroundTaskRegistry {
                 process_done: false,
                 log_pumps_remaining,
                 mutation_baseline,
+                sandbox_scratch: {
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    {
+                        sandbox_paths.map(SandboxPaths::into_scratch)
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                    {
+                        sandbox_paths
+                    }
+                },
             },
         );
         drop(st);
@@ -406,6 +461,26 @@ impl BackgroundTaskRegistry {
     }
 }
 
+/// Evict the oldest completed records while preserving every running/killing
+/// task. Called only before a spawn: completion waiters therefore get a stable
+/// chance to observe their terminal snapshot.
+fn prune_terminal_tasks(state: &mut RegistryState) {
+    let mut terminal: Vec<(Instant, String)> = state
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.status.is_terminal())
+        .map(|(id, task)| (task.finished.unwrap_or(task.started), id.clone()))
+        .collect();
+    let remove_count = terminal.len().saturating_sub(MAX_RETAINED_TERMINAL_TASKS);
+    if remove_count == 0 {
+        return;
+    }
+    terminal.sort_unstable();
+    for (_, id) in terminal.into_iter().take(remove_count) {
+        state.tasks.remove(&id);
+    }
+}
+
 /// Immediate tree kill (drop path / hard kill).
 ///
 /// Unix: `killpg(SIGKILL)` on the recorded process group (spawn used
@@ -491,6 +566,9 @@ fn finalize_if_drained(task: &mut TaskInner) {
         terminal => terminal,
     };
     task.finished = Some(Instant::now());
+    // The process and both output pumps are done, so no child can use TMPDIR.
+    // Release potentially large temp files independently of history retention.
+    task.sandbox_scratch.take();
     task.done.notify_waiters();
 }
 
@@ -539,6 +617,15 @@ mod tests {
     use crate::command::ProcessRequest;
     use crate::windows_sandbox::FilesystemIntent;
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn unix_host_registry() -> BackgroundTaskRegistry {
+        BackgroundTaskRegistry::with_environment(Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )))
+    }
+
     #[tokio::test]
     async fn spawn_wait_echo() {
         let reg = BackgroundTaskRegistry::new();
@@ -571,6 +658,108 @@ mod tests {
         truncate_log(&mut log);
         assert!(log.is_char_boundary(log.len()));
         assert!(log.contains('🙂'));
+    }
+
+    #[test]
+    fn terminal_history_is_bounded_without_evicting_active_tasks() {
+        let now = Instant::now();
+        let mut state = RegistryState::default();
+        for index in 0..(MAX_RETAINED_TERMINAL_TASKS + 3) {
+            let id = format!("terminal-{index:03}");
+            let finished = now - Duration::from_secs((1000 - index) as u64);
+            state.tasks.insert(
+                id.clone(),
+                TaskInner {
+                    id,
+                    program: "true".into(),
+                    args: Vec::new(),
+                    cwd: PathBuf::new(),
+                    status: BackgroundTaskStatus::Exited,
+                    exit_code: Some(0),
+                    log: String::new(),
+                    started: finished,
+                    finished: Some(finished),
+                    child: None,
+                    identity: None,
+                    done: Arc::new(Notify::new()),
+                    process_done: true,
+                    log_pumps_remaining: 0,
+                    mutation_baseline: None,
+                    sandbox_scratch: None,
+                },
+            );
+        }
+        for (id, status) in [
+            ("still-running", BackgroundTaskStatus::Running),
+            ("being-killed", BackgroundTaskStatus::Killing),
+        ] {
+            state.tasks.insert(
+                id.into(),
+                TaskInner {
+                    id: id.into(),
+                    program: "sleep".into(),
+                    args: Vec::new(),
+                    cwd: PathBuf::new(),
+                    status,
+                    exit_code: None,
+                    log: String::new(),
+                    started: now,
+                    finished: None,
+                    child: None,
+                    identity: None,
+                    done: Arc::new(Notify::new()),
+                    process_done: false,
+                    log_pumps_remaining: 0,
+                    mutation_baseline: None,
+                    sandbox_scratch: None,
+                },
+            );
+        }
+
+        prune_terminal_tasks(&mut state);
+
+        assert_eq!(
+            state
+                .tasks
+                .values()
+                .filter(|task| task.status.is_terminal())
+                .count(),
+            MAX_RETAINED_TERMINAL_TASKS
+        );
+        assert!(!state.tasks.contains_key("terminal-000"));
+        assert!(state.tasks.contains_key("terminal-066"));
+        assert!(state.tasks.contains_key("still-running"));
+        assert!(state.tasks.contains_key("being-killed"));
+    }
+
+    #[test]
+    fn finalization_releases_private_scratch_immediately() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let scratch_path = scratch.path().to_path_buf();
+        let mut task = TaskInner {
+            id: "done".into(),
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: PathBuf::new(),
+            status: BackgroundTaskStatus::Running,
+            exit_code: Some(0),
+            log: String::new(),
+            started: Instant::now(),
+            finished: None,
+            child: None,
+            identity: None,
+            done: Arc::new(Notify::new()),
+            process_done: true,
+            log_pumps_remaining: 0,
+            mutation_baseline: None,
+            sandbox_scratch: Some(scratch),
+        };
+
+        finalize_if_drained(&mut task);
+
+        assert_eq!(task.status, BackgroundTaskStatus::Exited);
+        assert!(task.sandbox_scratch.is_none());
+        assert!(!scratch_path.exists());
     }
 
     #[tokio::test]
@@ -767,6 +956,9 @@ mod tests {
         // Smoke: confined ProcessRequest spawns and produces stdout (wrap path
         // does not refuse a normal confined command). OS confinement canary is
         // `background_confined_blocks_write_outside_workspace` below.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let reg = unix_host_registry();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let reg = BackgroundTaskRegistry::new();
         let ws = tempfile::tempdir().expect("ws");
         let mut req =
@@ -818,7 +1010,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
 
-        let reg = BackgroundTaskRegistry::new();
+        let reg = unix_host_registry();
 
         // Write inside workspace: allowed.
         let mut inside = ProcessRequest::new(
@@ -876,6 +1068,52 @@ mod tests {
         assert!(
             !escape.exists(),
             "escape file must not exist after confined background write"
+        );
+
+        // Cache contents are writable, but the trusted leaf itself must not be
+        // unlinked and replaced by a background child.
+        let prepared = prepare_sandbox_paths(&reg.environment, &ws, false).unwrap();
+        let registry_root = prepared.tool_cache_path().join("cargo/registry");
+        drop(prepared);
+        let sentinel_dir = base.join("cache-escape");
+        std::fs::create_dir_all(&sentinel_dir).unwrap();
+        std::fs::write(sentinel_dir.join("sentinel"), "unchanged").unwrap();
+        let script = "target=$(readlink \"$CARGO_HOME/registry\")\nrm -rf \"$target\" || exit 91\nln -s \"$1\" \"$target\"";
+        let mut poison = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                sentinel_dir.display().to_string(),
+            ],
+            ws.clone(),
+        );
+        poison.write_root = Some(ws.clone());
+        poison.filesystem_intent = Some(FilesystemIntent::WorkspaceWrite {
+            write_root: ws.clone(),
+            extra_read_roots: vec![],
+        });
+        let id = reg.spawn(poison, None).await.expect("spawn cache poison");
+        let snap = reg
+            .wait(
+                &id,
+                Some(Duration::from_secs(10)),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("wait cache poison");
+        assert_ne!(snap.exit_code, Some(0), "cache leaf replacement: {snap:?}");
+        assert!(registry_root.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(&registry_root)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(sentinel_dir.join("sentinel")).unwrap(),
+            "unchanged"
         );
 
         let _ = std::fs::remove_dir_all(&base);

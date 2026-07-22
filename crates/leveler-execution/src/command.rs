@@ -10,6 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -126,6 +128,20 @@ impl ProcessRequest {
     }
 }
 
+/// Whether a confined command should expose the host's existing dependency
+/// caches through a read-only overlay. Network-denied requests always do; the
+/// token check also covers explicit `cargo --offline`/`npm --offline`, including
+/// commands carried inside a shell `-c` argument.
+pub(crate) fn should_read_host_caches(request: &ProcessRequest) -> bool {
+    request.deny_network
+        || request.args.iter().any(|arg| {
+            arg == "--offline"
+                || arg
+                    .split_ascii_whitespace()
+                    .any(|token| token == "--offline")
+        })
+}
+
 /// Network policy when building a verify / acceptance [`ProcessRequest`].
 ///
 /// Model acceptance hints always force deny; repo/builtin verify gates inherit
@@ -181,22 +197,44 @@ pub(crate) fn sandbox_command(
     deny_network: bool,
     write_root: Option<&Path>,
     extra_read_roots: &[PathBuf],
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
     if !deny_network && write_root.is_none() {
         return (program.to_string(), args.to_vec());
     }
     #[cfg(target_os = "macos")]
     {
-        macos_sandbox_command(program, args, deny_network, write_root, extra_read_roots)
+        macos_sandbox_command(
+            program,
+            args,
+            deny_network,
+            write_root,
+            extra_read_roots,
+            scratch_root,
+            cache_write_roots,
+        )
     }
     #[cfg(target_os = "linux")]
     {
         let _ = extra_read_roots;
-        linux_sandbox_command(program, args, deny_network, write_root)
+        linux_sandbox_command(
+            program,
+            args,
+            deny_network,
+            write_root,
+            scratch_root,
+            cache_write_roots,
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (write_root, extra_read_roots);
+        let _ = (
+            write_root,
+            extra_read_roots,
+            scratch_root,
+            cache_write_roots,
+        );
         (program.to_string(), args.to_vec())
     }
 }
@@ -214,6 +252,8 @@ fn macos_sandbox_command(
     deny_network: bool,
     write_root: Option<&Path>,
     extra_read_roots: &[PathBuf],
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
     let Some(root) = write_root else {
         // No write confinement (full-access dropping only the network): keep the
@@ -231,7 +271,7 @@ fn macos_sandbox_command(
     // `extra_read_roots` is reserved for future write/read carve-outs; write
     // roots already include toolchain trees.
     let _ = extra_read_roots;
-    let write_roots = writable_roots(root);
+    let write_roots = writable_roots(root, scratch_root, cache_write_roots);
     let protected = git_write_protected_paths(root);
     let mut policy = String::from(SEATBELT_BASE);
     policy.push_str("\n; unrestricted file reads, writes limited to approved roots\n");
@@ -247,6 +287,11 @@ fn macos_sandbox_command(
             "(deny file-write* (subpath (param \"PROTECTED_WRITE_{i}\")))\n"
         ));
     }
+    for i in 0..cache_write_roots.len() {
+        policy.push_str(&format!(
+            "(deny file-write* (literal (param \"CACHE_ROOT_{i}\")))\n"
+        ));
+    }
     if !deny_network {
         policy.push_str("(allow network-outbound)\n(allow network-inbound)\n");
         policy.push_str(SEATBELT_NETWORK);
@@ -258,6 +303,9 @@ fn macos_sandbox_command(
     }
     for (i, r) in protected.iter().enumerate() {
         wrapped.push(format!("-DPROTECTED_WRITE_{i}={}", r.display()));
+    }
+    for (i, r) in cache_write_roots.iter().enumerate() {
+        wrapped.push(format!("-DCACHE_ROOT_{i}={}", r.display()));
     }
     wrapped.push("--".to_string());
     wrapped.push(program.to_string());
@@ -275,25 +323,20 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
     vec![path]
 }
 
-/// Directories the sandboxed process may write to. Canonicalized so symlinked
-/// paths (`/tmp -> /private/tmp`, `$TMPDIR` under `/private/var/folders`) match
-/// what seatbelt checks against.
+/// Directories a confined process may write to: its workspace and one private,
+/// host-created scratch directory plus a Leveler-owned, per-workspace tool
+/// cache. Environment redirection is applied by
+/// [`apply_sandbox_environment`].
 ///
-/// This is the workspace + temp scratch + toolchain cache dirs. The cache dirs
-/// are a deliberate allowance beyond the workspace and temp directories:
-/// without them `go build` (writes `GOCACHE`/`$TMPDIR`) and `cargo`
-/// (writes `~/.cargo`) fail under confinement. Reads are unrestricted
-/// only *writes* outside these roots are blocked.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn writable_roots(root: &Path) -> Vec<PathBuf> {
-    #[cfg(not(test))]
-    let environment = leveler_core::environment().clone();
-    #[cfg(test)]
-    let environment = leveler_core::EnvSnapshot::new(
-        std::env::vars_os(),
-        std::env::current_dir().unwrap_or_default(),
-        std::env::temp_dir(),
-    );
+/// In particular, never add a shared temp directory or a whole user directory
+/// here. Both allow a confined command to tamper with files consumed by other
+/// host processes and turn a cache compatibility allowance into persistence.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn writable_roots(
+    root: &Path,
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut add = |p: PathBuf| {
         if !p.is_dir() {
@@ -305,39 +348,546 @@ fn writable_roots(root: &Path) -> Vec<PathBuf> {
         }
     };
     add(root.to_path_buf());
-    // Temp scratch.
-    for p in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
-        add(PathBuf::from(p));
+    if let Some(scratch_root) = scratch_root {
+        add(scratch_root.to_path_buf());
     }
-    if let Some(tmpdir) = environment.var_os("TMPDIR") {
-        add(PathBuf::from(tmpdir));
-    }
-    // Toolchain caches (outside the repo) so common builds work under
-    // confinement. Honor the env vars first (they may point outside $HOME, e.g.
-    // a custom GOPATH), then fall back to the standard $HOME locations.
-    for var in ["GOPATH", "GOCACHE", "GOMODCACHE", "CARGO_HOME"] {
-        if let Some(val) = environment.var_os(var) {
-            add(PathBuf::from(val));
-        }
-    }
-    if let Some(home) = environment.var_os("HOME") {
-        let home = PathBuf::from(home);
-        for rel in [
-            "Library/Caches",
-            "Library/Application Support",
-            ".cache",
-            ".cargo",
-            ".rustup",
-            "go",
-            ".npm",
-            ".nvm",
-            ".local",
-            ".pyenv",
-        ] {
-            add(home.join(rel));
-        }
+    for cache_root in cache_write_roots {
+        add(cache_root.clone());
     }
     roots
+}
+
+/// Isolated writable paths for a confined command. Temporary files are unique
+/// per command, while build caches persist per workspace under Leveler's own
+/// home so common builds do not repeatedly download dependencies.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) struct SandboxPaths {
+    scratch: tempfile::TempDir,
+    tool_cache: PathBuf,
+    cargo_home: PathBuf,
+    go_mod_cache: PathBuf,
+    npm_cache: PathBuf,
+    cache_write_roots: Vec<PathBuf>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl SandboxPaths {
+    pub(crate) fn scratch_path(&self) -> &Path {
+        self.scratch.path()
+    }
+
+    pub(crate) fn tool_cache_path(&self) -> &Path {
+        &self.tool_cache
+    }
+
+    pub(crate) fn cache_write_roots(&self) -> &[PathBuf] {
+        &self.cache_write_roots
+    }
+
+    pub(crate) fn into_scratch(self) -> tempfile::TempDir {
+        self.scratch
+    }
+}
+
+/// Open/create one real child directory relative to an already-open capability.
+/// Poisoned links/files are removed through the parent handle without following
+/// them. Returning the child handle closes the check/use race for later steps.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ensure_real_private_child(
+    parent: &cap_std::fs::Dir,
+    parent_path: &Path,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<(cap_std::fs::Dir, PathBuf)> {
+    // Another Leveler process may be initializing or repairing the same
+    // per-workspace cache concurrently. Retry a bounded number of times while
+    // always resolving the final entry without following links.
+    for _ in 0..16 {
+        match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                match parent.open_dir(name) {
+                    Ok(child) => return Ok((child, parent_path.join(name))),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(_) => {
+                if let Err(error) = parent.remove_file(name)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(error);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = parent.create_dir(name)
+                    && error.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "private cache entry {} changed repeatedly during initialization",
+            parent_path.join(name).display()
+        ),
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ensure_real_private_chain(
+    base: &cap_std::fs::Dir,
+    base_path: &Path,
+    relative: &Path,
+) -> std::io::Result<PathBuf> {
+    let mut current = base.try_clone()?;
+    let mut current_path = base_path.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private cache path must contain only normal components",
+            ));
+        };
+        (current, current_path) = ensure_real_private_child(&current, &current_path, name)?;
+    }
+    Ok(current_path)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn canonicalize_allow_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no existing ancestor for {}", path.display()),
+            ));
+        };
+        suffix.push(name.to_os_string());
+        existing = existing.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "cache path has no parent")
+        })?;
+    }
+    let mut resolved = existing.canonicalize()?;
+    for name in suffix.into_iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_cache_owner_outside_workspace(
+    candidate: &Path,
+    workspace: &Path,
+) -> std::io::Result<(cap_std::fs::Dir, PathBuf)> {
+    let resolved = canonicalize_allow_missing(candidate)?;
+    if resolved.starts_with(workspace) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "tool-cache owner directory is inside the writable workspace",
+        ));
+    }
+    if std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "tool-cache owner directory must not be a symlink",
+        ));
+    }
+    std::fs::create_dir_all(candidate)?;
+    let candidate = candidate.canonicalize()?;
+    if candidate.starts_with(workspace) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "tool-cache owner resolved inside the writable workspace",
+        ));
+    }
+    let dir = cap_std::fs::Dir::open_ambient_dir(&candidate, cap_std::ambient_authority())?;
+    Ok((dir, candidate))
+}
+
+/// Open a private per-user cache owner under the captured host temp directory.
+/// This is the fallback when no home directory capability was supplied. The
+/// temp base itself must be a real, workspace-external directory; the child is
+/// repaired relative to an open base handle and forced to mode 0700.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_temp_cache_owner_outside_workspace(
+    temp_base: &Path,
+    workspace: &Path,
+) -> std::io::Result<(cap_std::fs::Dir, PathBuf)> {
+    if !temp_base.is_absolute()
+        || temp_base.starts_with(workspace)
+        || std::fs::symlink_metadata(temp_base)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "temporary cache base must be a real directory",
+        ));
+    }
+    let temp_base = temp_base.canonicalize()?;
+    if temp_base.starts_with(workspace) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "temporary cache base is inside the writable workspace",
+        ));
+    }
+    let base = cap_std::fs::Dir::open_ambient_dir(&temp_base, cap_std::ambient_authority())?;
+    let name = format!("codeleveler-private-{}", nix::unistd::geteuid().as_raw());
+    let (owner, owner_path) = ensure_real_private_child(&base, &temp_base, name.as_ref())?;
+    use cap_std::fs::PermissionsExt as _;
+    owner.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))?;
+    Ok((owner, owner_path))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn prepare_sandbox_paths(
+    environment: &leveler_core::EnvSnapshot,
+    workspace: &Path,
+    read_host_caches: bool,
+) -> std::io::Result<SandboxPaths> {
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let mut candidates = Vec::new();
+    if let Some(leveler_home) = leveler_core::leveler_home_dir(environment) {
+        candidates.push(leveler_home);
+    }
+    if let Some(home) = environment.var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".cache/codeleveler-private"));
+    }
+    let (owner, owner_path) = candidates
+        .iter()
+        .find_map(|candidate| open_cache_owner_outside_workspace(candidate, &workspace).ok())
+        .or_else(|| {
+            open_temp_cache_owner_outside_workspace(environment.temp_dir(), &workspace).ok()
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "no stable tool-cache owner outside the writable workspace",
+            )
+        })?;
+    // Scratch creation uses the same stable, workspace-external owner rather
+    // than TMPDIR, which may itself live in or be poisoned by the workspace.
+    let scratch = tempfile::Builder::new()
+        .prefix("codeleveler-sandbox-")
+        .tempdir_in(&owner_path)?;
+    let (cache_base_dir, cache_base) =
+        ensure_real_private_child(&owner, &owner_path, "tool-cache".as_ref())?;
+    let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
+    let workspace_key = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (tool_cache_dir, tool_cache) =
+        ensure_real_private_child(&cache_base_dir, &cache_base, workspace_key.as_ref())?;
+
+    #[cfg(unix)]
+    for directory in [&cache_base, &tool_cache] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    std::fs::create_dir(scratch.path().join("tmp"))?;
+    let mut cache_write_roots = Vec::new();
+    for relative in [
+        "cargo/registry",
+        "cargo/git",
+        "go/build",
+        "go/mod",
+        "go/path",
+        "npm",
+        "yarn",
+        "pnpm",
+        "pip",
+        "uv",
+        "xdg-cache",
+    ] {
+        cache_write_roots.push(ensure_real_private_chain(
+            &tool_cache_dir,
+            &tool_cache,
+            Path::new(relative),
+        )?);
+    }
+    let cargo_home = prepare_cargo_home(
+        environment,
+        &scratch,
+        &cache_base,
+        &tool_cache,
+        &workspace,
+        read_host_caches,
+    )?;
+    let go_mod_cache = if read_host_caches {
+        host_go_mod_cache(environment, &workspace).unwrap_or_else(|| tool_cache.join("go/mod"))
+    } else {
+        tool_cache.join("go/mod")
+    };
+    let npm_cache = prepare_npm_cache(
+        environment,
+        &scratch,
+        &tool_cache,
+        &workspace,
+        read_host_caches,
+    )?;
+    Ok(SandboxPaths {
+        scratch,
+        tool_cache,
+        cargo_home,
+        go_mod_cache,
+        npm_cache,
+        cache_write_roots,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stable_host_directory(path: PathBuf, workspace: &Path) -> Option<PathBuf> {
+    let entry = path.parent()?.canonicalize().ok()?.join(path.file_name()?);
+    if entry.starts_with(workspace) {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    path.canonicalize()
+        .ok()
+        .filter(|path| !path.starts_with(workspace))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn host_cargo_home(
+    environment: &leveler_core::EnvSnapshot,
+    workspace: &Path,
+    private_cache_base: Option<&Path>,
+) -> Option<PathBuf> {
+    environment
+        .var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            environment
+                .var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })
+        .and_then(|path| stable_host_directory(path, workspace))
+        // A caller can configure CARGO_HOME arbitrarily. Never import config or
+        // dependency sources from the same subtree that confined children can
+        // write through Leveler's private cache mounts.
+        .filter(|path| private_cache_base.is_none_or(|cache| !path.starts_with(cache)))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn host_go_mod_cache(environment: &leveler_core::EnvSnapshot, workspace: &Path) -> Option<PathBuf> {
+    environment
+        .var_os("GOMODCACHE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            environment
+                .paths("GOPATH")
+                .into_iter()
+                .next()
+                .map(|path| path.join("pkg/mod"))
+        })
+        .or_else(|| {
+            environment
+                .var_os("HOME")
+                .map(|home| PathBuf::from(home).join("go/pkg/mod"))
+        })
+        .and_then(|path| stable_host_directory(path, workspace))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn host_npm_cache(environment: &leveler_core::EnvSnapshot, workspace: &Path) -> Option<PathBuf> {
+    environment
+        .var_os("npm_config_cache")
+        .map(PathBuf::from)
+        .or_else(|| {
+            environment
+                .var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".npm"))
+        })
+        .and_then(|path| stable_host_directory(path, workspace))
+}
+
+/// Replace one entry relative to a stable directory capability with a symlink.
+/// Removal is no-follow and capability-relative, so a poisoned destination can
+/// never redirect host initialization outside this directory.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn replace_with_readonly_link(
+    directory: &cap_std::fs::Dir,
+    source: &Path,
+    destination: &str,
+) -> std::io::Result<()> {
+    match directory.symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            directory.remove_dir_all(destination)?;
+        }
+        Ok(_) => directory.remove_file(destination)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    directory.symlink_contents(source.canonicalize()?, destination)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result<()> {
+    const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
+    let host = cap_std::fs::Dir::open_ambient_dir(host, cap_std::ambient_authority())?;
+    for name in ["config", "config.toml", "credentials", "credentials.toml"] {
+        use cap_std::fs::OpenOptionsExt as _;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        let source = match host.open_with(name, &options) {
+            Ok(source) => Some(source),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) || error.raw_os_error() == Some(nix::libc::ELOOP) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let mut copied = false;
+        if let Some(source) = source {
+            let metadata = source.metadata()?;
+            if metadata.is_file() {
+                if metadata.len() > MAX_CARGO_CONFIG_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Cargo {name} exceeds 1 MiB safety limit"),
+                    ));
+                }
+                use std::io::Read as _;
+                let mut bytes = Vec::new();
+                source
+                    .take(MAX_CARGO_CONFIG_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_CARGO_CONFIG_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Cargo {name} exceeds 1 MiB safety limit"),
+                    ));
+                }
+                private.write(name, bytes)?;
+                copied = true;
+            }
+        }
+        if !copied && let Ok(metadata) = private.symlink_metadata(name) {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                private.remove_dir_all(name)?;
+            } else {
+                private.remove_file(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_cargo_home(
+    environment: &leveler_core::EnvSnapshot,
+    scratch: &tempfile::TempDir,
+    private_cache_base: &Path,
+    tool_cache: &Path,
+    workspace: &Path,
+    read_host_cache: bool,
+) -> std::io::Result<PathBuf> {
+    let overlay = scratch.path().join("cargo-overlay");
+    let scratch_dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
+    scratch_dir.create_dir("cargo-overlay")?;
+    let overlay_dir = scratch_dir.open_dir("cargo-overlay")?;
+    if let Some(host) = host_cargo_home(environment, workspace, Some(private_cache_base)) {
+        sync_cargo_config(&host, &overlay_dir)?;
+    }
+    for name in ["registry", "git"] {
+        let source = if read_host_cache {
+            host_cargo_home(environment, workspace, Some(private_cache_base))
+                .map(|host| host.join(name))
+        } else {
+            Some(tool_cache.join("cargo").join(name))
+        };
+        let Some(source) = source else { continue };
+        let source = source.canonicalize().ok();
+        if let Some(source) = source.filter(|source| !source.starts_with(workspace)) {
+            replace_with_readonly_link(&overlay_dir, &source, name)?;
+        }
+    }
+    Ok(overlay)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_npm_cache(
+    environment: &leveler_core::EnvSnapshot,
+    scratch: &tempfile::TempDir,
+    tool_cache: &Path,
+    workspace: &Path,
+    read_host_cache: bool,
+) -> std::io::Result<PathBuf> {
+    let persistent = tool_cache.join("npm");
+    let Some(host) = host_npm_cache(environment, workspace) else {
+        return Ok(persistent);
+    };
+    if !read_host_cache {
+        return Ok(persistent);
+    }
+
+    let overlay = scratch.path().join("npm-overlay");
+    let scratch_dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
+    scratch_dir.create_dir("npm-overlay")?;
+    let overlay_dir = scratch_dir.open_dir("npm-overlay")?;
+    overlay_dir.create_dir("_logs")?;
+    let content_cache = host
+        .join("_cacache")
+        .canonicalize()
+        .ok()
+        .filter(|path| !path.starts_with(workspace));
+    if let Some(content_cache) = content_cache {
+        replace_with_readonly_link(&overlay_dir, &content_cache, "_cacache")?;
+    }
+    Ok(overlay)
+}
+
+/// Redirect temp files into per-command scratch and write-heavy tool state into
+/// the Leveler-owned, per-workspace cache. Host HOME and toolchain trees remain
+/// readable, but are no longer writable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn apply_sandbox_environment(cmd: &mut Command, paths: &SandboxPaths) {
+    let private_tmp = paths.scratch_path().join("tmp");
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        cmd.env(name, &private_tmp);
+    }
+    let cache_variables = [
+        ("GOCACHE", "go/build"),
+        ("GOPATH", "go/path"),
+        ("YARN_CACHE_FOLDER", "yarn"),
+        ("PNPM_HOME", "pnpm"),
+        ("PIP_CACHE_DIR", "pip"),
+        ("UV_CACHE_DIR", "uv"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+    ];
+    for (name, relative) in cache_variables {
+        cmd.env(name, paths.tool_cache_path().join(relative));
+    }
+    cmd.env("CARGO_HOME", &paths.cargo_home);
+    cmd.env("GOMODCACHE", &paths.go_mod_cache);
+    cmd.env("npm_config_cache", &paths.npm_cache);
 }
 
 /// True when `arg` looks like an absolute filesystem path the model might use
@@ -466,6 +1016,8 @@ fn linux_sandbox_command(
     args: &[String],
     deny_network: bool,
     write_root: Option<&Path>,
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
     let Some(root) = write_root else {
         // No write confinement (full-access): only optionally drop the network,
@@ -482,7 +1034,7 @@ fn linux_sandbox_command(
         }
         return (program.to_string(), args.to_vec());
     };
-    let roots = writable_roots(root);
+    let roots = writable_roots(root, scratch_root, cache_write_roots);
     let protected = git_write_protected_paths(root);
     (
         "bwrap".to_string(),
@@ -619,12 +1171,42 @@ impl CommandRunner {
         {
             return Err(ProcessError::SandboxPolicy(err.to_string()));
         }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let sandbox_paths = request
+            .write_root
+            .as_ref()
+            .map(|workspace| {
+                prepare_sandbox_paths(
+                    &self.environment,
+                    workspace,
+                    should_read_host_caches(&request),
+                )
+            })
+            .transpose()
+            .map_err(|source| {
+                ProcessError::SandboxPolicy(format!(
+                    "create private sandbox scratch directory: {source}"
+                ))
+            })?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let sandbox_scratch_root = sandbox_paths.as_ref().map(SandboxPaths::scratch_path);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let sandbox_scratch_root: Option<&Path> = None;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let sandbox_cache_write_roots = sandbox_paths
+            .as_ref()
+            .map(SandboxPaths::cache_write_roots)
+            .unwrap_or(&[]);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let sandbox_cache_write_roots: &[PathBuf] = &[];
         let (program, args) = sandbox_command(
             &request.program,
             &request.args,
             request.deny_network,
             request.write_root.as_deref(),
             &request.extra_read_roots,
+            sandbox_scratch_root,
+            sandbox_cache_write_roots,
         );
 
         #[cfg(windows)]
@@ -643,7 +1225,16 @@ impl CommandRunner {
         #[cfg(not(windows))]
         {
             let _ = intent;
-            run_unix_process_group(request, &program, &args, cancellation, &self.environment).await
+            run_unix_process_group(
+                request,
+                &program,
+                &args,
+                cancellation,
+                &self.environment,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                sandbox_paths.as_ref(),
+            )
+            .await
         }
     }
 }
@@ -709,9 +1300,14 @@ async fn run_unix_process_group(
     args: &[String],
     cancellation: CancellationToken,
     environment: &leveler_core::EnvSnapshot,
+    #[cfg(any(target_os = "macos", target_os = "linux"))] sandbox_paths: Option<&SandboxPaths>,
 ) -> Result<ProcessOutput, ProcessError> {
     let mut cmd = Command::new(program);
     apply_common_command_env(&mut cmd, &request, args, environment);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(paths) = sandbox_paths {
+        apply_sandbox_environment(&mut cmd, paths);
+    }
     // Put the child in its own process group so we can terminate the whole
     // subtree (the child and any grandchildren) on timeout or cancellation.
     cmd.process_group(0);
@@ -1011,6 +1607,15 @@ async fn read_capped(pipe: &mut Option<impl AsyncReadExt + Unpin>, cap: usize) -
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn unix_host_runner() -> CommandRunner {
+        CommandRunner::with_environment(std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )))
+    }
+
     #[test]
     fn process_request_for_verify_check_matrix() {
         let root = PathBuf::from("/tmp/ws");
@@ -1244,6 +1849,651 @@ mod tests {
     }
 
     #[test]
+    fn writable_roots_exclude_shared_temp_and_host_tool_directories() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let scratch = tempfile::tempdir().expect("scratch");
+        let tool_cache = tempfile::tempdir().expect("tool cache");
+        let cache_roots = vec![tool_cache.path().to_path_buf()];
+        let roots = writable_roots(workspace.path(), Some(scratch.path()), &cache_roots);
+
+        assert_eq!(
+            roots.len(),
+            3,
+            "only workspace, private scratch, and Leveler tool cache: {roots:?}"
+        );
+        assert!(roots.contains(&workspace.path().canonicalize().unwrap()));
+        assert!(roots.contains(&scratch.path().canonicalize().unwrap()));
+        assert!(roots.contains(&tool_cache.path().canonicalize().unwrap()));
+        for forbidden in [
+            std::env::temp_dir(),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/var/tmp"),
+        ] {
+            let forbidden = forbidden.canonicalize().unwrap_or(forbidden);
+            assert!(
+                !roots.contains(&forbidden),
+                "shared temp root must remain read-only: {forbidden:?}"
+            );
+        }
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            for relative in [".cargo", ".npm", ".local", "Library/Application Support"] {
+                let path = home.join(relative);
+                let path = path.canonicalize().unwrap_or(path);
+                assert!(
+                    !roots.contains(&path),
+                    "host tool/config directory must remain read-only: {path:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn private_paths_separate_ephemeral_temp_and_persistent_build_caches() {
+        let base = tempfile::tempdir().expect("base");
+        let leveler_home = base.path().join("leveler-home");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let environment = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                leveler_home.as_os_str().to_os_string(),
+            )],
+            PathBuf::new(),
+            base.path().to_path_buf(),
+        );
+        let paths = prepare_sandbox_paths(&environment, &workspace, false).expect("private paths");
+        assert!(paths.scratch_path().join("tmp").is_dir());
+        for relative in [
+            "cargo",
+            "go/build",
+            "go/mod",
+            "go/path",
+            "npm",
+            "pip",
+            "xdg-cache",
+        ] {
+            assert!(
+                paths.tool_cache_path().join(relative).is_dir(),
+                "missing private cache directory {relative}"
+            );
+        }
+        assert_eq!(
+            paths.scratch_path().parent(),
+            Some(leveler_home.canonicalize().unwrap().as_path())
+        );
+        assert!(
+            paths
+                .tool_cache_path()
+                .starts_with(leveler_home.canonicalize().unwrap())
+        );
+
+        let second = prepare_sandbox_paths(&environment, &workspace, false).expect("second paths");
+        assert_ne!(paths.scratch_path(), second.scratch_path());
+        assert_eq!(paths.tool_cache_path(), second.tool_cache_path());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn private_paths_fall_back_to_captured_temp_without_home_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let environment = leveler_core::EnvSnapshot::new(
+            std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
+            workspace.clone(),
+            base.path().to_path_buf(),
+        );
+
+        let paths = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        let owner = paths.scratch_path().parent().unwrap();
+        assert_eq!(
+            owner.parent(),
+            Some(base.path().canonicalize().unwrap().as_path())
+        );
+        assert!(
+            owner
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("codeleveler-private-")
+        );
+        assert_eq!(
+            std::fs::metadata(owner).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(paths.tool_cache_path().starts_with(owner));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn private_paths_reject_poisoned_temp_without_home_authority() {
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("workspace");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let poisoned_temp = workspace.join("temp-link");
+        std::os::unix::fs::symlink(&outside, &poisoned_temp).unwrap();
+        let environment = leveler_core::EnvSnapshot::new(
+            std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
+            workspace.clone(),
+            poisoned_temp,
+        );
+
+        let error = prepare_sandbox_paths(&environment, &workspace, false)
+            .err()
+            .expect("poisoned temp must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn cargo_config_fifo_and_symlink_are_never_followed() {
+        let host = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let fifo = host.path().join("config.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available on Unix");
+        assert!(status.success());
+        let outside = host.path().join("outside-credentials");
+        std::fs::write(&outside, "[registry]\ntoken = 'secret'\n").unwrap();
+        std::os::unix::fs::symlink(&outside, host.path().join("credentials.toml")).unwrap();
+
+        let private_dir =
+            cap_std::fs::Dir::open_ambient_dir(private.path(), cap_std::ambient_authority())
+                .unwrap();
+        let started = std::time::Instant::now();
+        sync_cargo_config(host.path(), &private_dir).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "opening a hostile FIFO must not block"
+        );
+        assert!(!private.path().join("config.toml").exists());
+        assert!(!private.path().join("credentials.toml").exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn concurrent_private_cache_repair_is_race_safe() {
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("workspace");
+        let home = base.path().join("home");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), "unchanged").unwrap();
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            [
+                ("HOME".into(), home.clone().into_os_string()),
+                ("LEVELER_HOME".into(), home.join("leveler").into_os_string()),
+            ],
+            base.path().to_path_buf(),
+            home.join("tmp"),
+        ));
+        let initialized = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        let registry = initialized.tool_cache_path().join("cargo/registry");
+        drop(initialized);
+        std::fs::remove_dir(&registry).unwrap();
+        std::os::unix::fs::symlink(&outside, &registry).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let mut threads = Vec::new();
+        for _ in 0..12 {
+            let barrier = barrier.clone();
+            let environment = environment.clone();
+            let workspace = workspace.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_sandbox_paths(&environment, &workspace, false).map(drop)
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        assert!(registry.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(&registry)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "unchanged"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn cache_symlink_poisoning_cannot_escape_host_initialization() {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return;
+        }
+
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("workspace");
+        let safe_home = base.path().join("safe-home");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&safe_home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, "unchanged").unwrap();
+
+        // Both configured state/temp paths are attacker-controlled workspace
+        // links. Cache and scratch selection must ignore them and use HOME.
+        let poisoned_leveler_home = workspace.join("poisoned-leveler-home");
+        let poisoned_tmp = workspace.join("poisoned-tmp");
+        let poisoned_cargo_home = workspace.join("poisoned-cargo-home");
+        std::os::unix::fs::symlink(&outside, &poisoned_leveler_home).unwrap();
+        std::os::unix::fs::symlink(&outside, &poisoned_tmp).unwrap();
+        std::os::unix::fs::symlink(&outside, &poisoned_cargo_home).unwrap();
+        let mut variables: Vec<_> = std::env::vars_os().collect();
+        variables.push(("HOME".into(), safe_home.clone().into_os_string()));
+        variables.push((
+            "LEVELER_HOME".into(),
+            poisoned_leveler_home.into_os_string(),
+        ));
+        variables.push(("CARGO_HOME".into(), poisoned_cargo_home.into_os_string()));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            poisoned_tmp,
+        ));
+
+        let paths = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        let safe_home = safe_home.canonicalize().unwrap();
+        assert!(paths.tool_cache_path().starts_with(&safe_home));
+        assert!(paths.scratch_path().starts_with(&safe_home));
+        let registry_root = paths.tool_cache_path().join("cargo/registry");
+        drop(paths);
+
+        // Simulate a leaf symlink left by an older vulnerable process. The
+        // capability-relative initializer must unlink only the poisoned entry,
+        // recreate a real leaf, and leave the target untouched.
+        std::fs::remove_dir(&registry_root).unwrap();
+        std::os::unix::fs::symlink(&outside, &registry_root).unwrap();
+        let repaired = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        assert!(registry_root.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(&registry_root)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        drop(repaired);
+
+        // A confined command may modify cache contents, but cannot unlink a
+        // trusted leaf mount and replace it with a link to an arbitrary target.
+        let runner = CommandRunner::with_environment(environment);
+        let script = "target=$(readlink \"$CARGO_HOME/registry\")\nrm -rf \"$target\" || exit 91\nln -s \"$1\" \"$target\"";
+        let mut request = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                outside.display().to_string(),
+            ],
+            workspace.clone(),
+        );
+        request.write_root = Some(workspace.clone());
+        let output = runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run cache poisoning attempt");
+        assert!(
+            !output.success(),
+            "cache-root replacement must fail: {output:?}"
+        );
+        assert!(registry_root.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(&registry_root)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // The next trusted initialization is safe even after the attack.
+        let _next = prepare_sandbox_paths(runner.environment.as_ref(), &workspace, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn confined_common_builds_use_private_temp_and_persistent_cache() {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return;
+        }
+
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"sandbox-smoke\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut variables: Vec<_> = std::env::vars_os().collect();
+        variables.push((
+            "LEVELER_HOME".into(),
+            base.path().join("home").into_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let runner = CommandRunner::with_environment(environment);
+
+        let mut private_tmp = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "test -n \"$TMPDIR\" && touch \"$TMPDIR/allowed\"".into(),
+            ],
+            workspace.clone(),
+        );
+        private_tmp.write_root = Some(workspace.clone());
+        let output = runner
+            .run(private_tmp, CancellationToken::new())
+            .await
+            .expect("write private TMPDIR");
+        assert!(
+            output.success(),
+            "private TMPDIR must be writable: {output:?}"
+        );
+
+        let global_tmp_target = base.path().parent().unwrap().join(format!(
+            "codeleveler-global-temp-canary-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&global_tmp_target);
+        let mut shared_tmp = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "touch \"$1\"".into(),
+                "sh".into(),
+                global_tmp_target.display().to_string(),
+            ],
+            workspace.clone(),
+        );
+        shared_tmp.write_root = Some(workspace.clone());
+        let output = runner
+            .run(shared_tmp, CancellationToken::new())
+            .await
+            .expect("try shared temp write");
+        assert!(
+            !output.success() && !global_tmp_target.exists(),
+            "shared temp tree must stay read-only: {output:?}"
+        );
+
+        for _ in 0..2 {
+            let mut request = ProcessRequest::new(
+                "cargo",
+                vec!["check".into(), "--offline".into(), "--quiet".into()],
+                workspace.clone(),
+            );
+            request.write_root = Some(workspace.clone());
+            let output = runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("run confined cargo");
+            assert!(
+                output.success(),
+                "confined cargo check failed: stdout={} stderr={}",
+                output.stdout,
+                output.stderr
+            );
+        }
+
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_ok()
+        {
+            let go_workspace = base.path().join("go-workspace");
+            std::fs::create_dir(&go_workspace).unwrap();
+            std::fs::write(
+                go_workspace.join("go.mod"),
+                "module sandbox-smoke\n\ngo 1.22\n",
+            )
+            .unwrap();
+            std::fs::write(
+                go_workspace.join("main.go"),
+                "package main\nfunc main() {}\n",
+            )
+            .unwrap();
+            let mut request = ProcessRequest::new(
+                "go",
+                vec!["build".into(), "./...".into()],
+                go_workspace.clone(),
+            );
+            request.write_root = Some(go_workspace);
+            let output = runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("run confined go");
+            assert!(output.success(), "confined go build failed: {output:?}");
+        }
+
+        if std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let npm_workspace = base.path().join("npm-workspace");
+            std::fs::create_dir(&npm_workspace).unwrap();
+            std::fs::write(
+                npm_workspace.join("package.json"),
+                r#"{"name":"sandbox-smoke","version":"0.0.0","scripts":{"build":"node -e \"require('fs').writeFileSync('built.txt','ok')\""}}"#,
+            )
+            .unwrap();
+            let mut request = ProcessRequest::new(
+                "npm",
+                vec!["run".into(), "build".into(), "--silent".into()],
+                npm_workspace.clone(),
+            );
+            request.write_root = Some(npm_workspace.clone());
+            let output = runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("run confined npm");
+            assert!(output.success(), "confined npm build failed: {output:?}");
+            assert!(npm_workspace.join("built.txt").is_file());
+        }
+        assert!(base.path().join("home/tool-cache").is_dir());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn confined_offline_cargo_reuses_readonly_host_cache_and_config() {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return;
+        }
+
+        let base = tempfile::tempdir().expect("base");
+        let dependency = base.path().join("dependency");
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname = \"host-cached-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dependency)
+            .status()
+            .unwrap();
+        assert!(git.success());
+        for args in [
+            ["config", "user.email", "test@example.invalid"].as_slice(),
+            ["config", "user.name", "CodeLeveler Test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-qm", "initial"].as_slice(),
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dependency)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        let dependency_url = format!("file://{}", dependency.canonicalize().unwrap().display());
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"offline-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nhost-cached-dep = {{ git = {dependency_url:?} }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() { assert_eq!(host_cached_dep::answer(), 42); }\n",
+        )
+        .unwrap();
+
+        // Warm only the host Cargo cache, then remove both the original git
+        // source and build output. The confined build below can succeed only by
+        // reading the host cache through the read-only overlay.
+        let host_cargo = base.path().join("host-cargo");
+        let warm_target = base.path().join("warm-target");
+        let warm = std::process::Command::new("cargo")
+            .args(["check", "--quiet"])
+            .env("CARGO_HOME", &host_cargo)
+            .env("CARGO_TARGET_DIR", &warm_target)
+            .current_dir(&workspace)
+            .status()
+            .expect("warm host cargo cache");
+        assert!(warm.success());
+        assert!(host_cargo.join("git").is_dir());
+        std::fs::remove_dir_all(&dependency).unwrap();
+        std::fs::remove_dir_all(&warm_target).unwrap();
+
+        let configured_target = workspace.join("configured-target");
+        let config = format!(
+            "[build]\ntarget-dir = {target:?}\n\n[env]\nLEVELER_CARGO_CONFIG_CANARY = \"from-host-config\"\n\n[registries.company]\nindex = \"https://example.invalid/index\"\n",
+            target = configured_target.display().to_string()
+        );
+        std::fs::write(host_cargo.join("config.toml"), &config).unwrap();
+        std::fs::write(
+            workspace.join("src/main.rs"),
+            "const _: &str = env!(\"LEVELER_CARGO_CONFIG_CANARY\");\nfn main() { assert_eq!(host_cached_dep::answer(), 42); }\n",
+        )
+        .unwrap();
+
+        let leveler_home = base.path().join("leveler-home");
+        assert!(!leveler_home.exists(), "private cache starts empty");
+        let mut variables: Vec<_> = std::env::vars_os().collect();
+        variables.push(("CARGO_HOME".into(), host_cargo.clone().into_os_string()));
+        variables.push(("LEVELER_HOME".into(), leveler_home.clone().into_os_string()));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let runner = CommandRunner::with_environment(environment);
+        let mut request = ProcessRequest::new(
+            "cargo",
+            vec!["check".into(), "--offline".into(), "--quiet".into()],
+            workspace.clone(),
+        );
+        request.write_root = Some(workspace.clone());
+        request.deny_network = true;
+        let output = runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run deny-network offline cargo");
+        assert!(
+            output.success(),
+            "offline host-cache build failed: stdout={} stderr={}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            configured_target.is_dir(),
+            "host config.toml target-dir must be applied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host_cargo.join("config.toml")).unwrap(),
+            config
+        );
+
+        let host_write_canary = host_cargo.join("git/host-write-canary");
+        let mut write_host_cache = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "printf tampered > \"$CARGO_HOME/git/host-write-canary\"".into(),
+            ],
+            workspace.clone(),
+        );
+        write_host_cache.write_root = Some(workspace.clone());
+        write_host_cache.deny_network = true;
+        let output = runner
+            .run(write_host_cache, CancellationToken::new())
+            .await
+            .expect("try host cache write through overlay");
+        assert!(
+            !output.success() && !host_write_canary.exists(),
+            "host cache symlink target must remain read-only: {output:?}"
+        );
+
+        let workspace_cache = std::fs::read_dir(leveler_home.join("tool-cache"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            std::fs::read_dir(workspace_cache.join("cargo/git"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "private cache began empty; offline build must not copy or mutate host git cache"
+        );
+    }
+
+    #[test]
     fn absolute_arg_outside_roots_is_detected() {
         // Absolute-path spelling differs by platform.
         #[cfg(not(windows))]
@@ -1283,14 +2533,15 @@ mod tests {
     #[test]
     fn sandbox_passthrough_when_unconfined() {
         // No network deny, no write confinement → run the command as-is.
-        let (p, a) = sandbox_command("cargo", &["test".into()], false, None, &[]);
+        let (p, a) = sandbox_command("cargo", &["test".into()], false, None, &[], None, &[]);
         assert_eq!(p, "cargo");
         assert_eq!(a, vec!["test".to_string()]);
     }
 
     #[test]
     fn sandbox_wraps_when_denying_network() {
-        let (program, args) = sandbox_command("cargo", &["build".into()], true, None, &[]);
+        let (program, args) =
+            sandbox_command("cargo", &["build".into()], true, None, &[], None, &[]);
         #[cfg(target_os = "macos")]
         {
             assert_eq!(program, "/usr/bin/sandbox-exec");
@@ -1316,7 +2567,17 @@ mod tests {
     #[test]
     fn seatbelt_confines_writes_via_params() {
         let root = std::path::Path::new("/tmp");
-        let (program, args) = sandbox_command("touch", &["x".into()], true, Some(root), &[]);
+        let scratch = tempfile::tempdir().expect("scratch");
+        let cache_roots = vec![scratch.path().to_path_buf()];
+        let (program, args) = sandbox_command(
+            "touch",
+            &["x".into()],
+            true,
+            Some(root),
+            &[],
+            Some(scratch.path()),
+            &cache_roots,
+        );
         assert_eq!(program, "/usr/bin/sandbox-exec");
         let policy = &args[1];
         assert!(
@@ -1363,6 +2624,7 @@ mod tests {
         let ws = base.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
+        let runner = unix_host_runner();
 
         // Write inside the workspace: allowed.
         let mut inside = ProcessRequest::new(
@@ -1371,10 +2633,7 @@ mod tests {
             ws.clone(),
         );
         inside.write_root = Some(ws.clone());
-        let out = CommandRunner::new()
-            .run(inside, CancellationToken::new())
-            .await
-            .unwrap();
+        let out = runner.run(inside, CancellationToken::new()).await.unwrap();
         assert!(
             out.success(),
             "write inside workspace should succeed: {out:?}"
@@ -1390,10 +2649,7 @@ mod tests {
             ws.clone(),
         );
         out_req.write_root = Some(ws.clone());
-        let out = CommandRunner::new()
-            .run(out_req, CancellationToken::new())
-            .await
-            .unwrap();
+        let out = runner.run(out_req, CancellationToken::new()).await.unwrap();
         assert!(
             !out.success(),
             "write outside workspace must be blocked: {out:?}"
@@ -1407,7 +2663,7 @@ mod tests {
         let mut read_req =
             ProcessRequest::new("cat", vec![secret.display().to_string()], ws.clone());
         read_req.write_root = Some(ws.clone());
-        let out = CommandRunner::new()
+        let out = runner
             .run(read_req, CancellationToken::new())
             .await
             .unwrap();
@@ -1438,7 +2694,7 @@ mod tests {
             ws.clone(),
         );
         git_write.write_root = Some(ws.clone());
-        let out = CommandRunner::new()
+        let out = runner
             .run(git_write, CancellationToken::new())
             .await
             .unwrap();
@@ -1453,7 +2709,7 @@ mod tests {
             ws.clone(),
         );
         ok_write.write_root = Some(ws.clone());
-        let out = CommandRunner::new()
+        let out = runner
             .run(ok_write, CancellationToken::new())
             .await
             .unwrap();
@@ -1483,6 +2739,7 @@ mod tests {
         ));
         let ws = base.join("ws");
         std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let runner = unix_host_runner();
 
         let marker = ws.join(".git/index.lock");
         let _ = std::fs::remove_file(&marker);
@@ -1493,7 +2750,7 @@ mod tests {
             ws.clone(),
         );
         confined.write_root = Some(ws.clone());
-        let out = CommandRunner::new()
+        let out = runner
             .run(confined, CancellationToken::new())
             .await
             .unwrap();
@@ -1509,10 +2766,7 @@ mod tests {
             vec!["-c".into(), "echo lock > .git/index.lock".into()],
             ws.clone(),
         );
-        let out = CommandRunner::new()
-            .run(free, CancellationToken::new())
-            .await
-            .unwrap();
+        let out = runner.run(free, CancellationToken::new()).await.unwrap();
         assert!(out.success(), "unrestricted must allow .git write: {out:?}");
         assert!(marker.exists(), "index.lock should exist after elevation");
         assert!(
@@ -1542,6 +2796,7 @@ mod tests {
         let ws = base.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
+        let runner = unix_host_runner();
 
         let mut inside = ProcessRequest::new(
             "sh",
@@ -1549,10 +2804,7 @@ mod tests {
             ws.clone(),
         );
         inside.write_root = Some(ws.clone());
-        let output = CommandRunner::new()
-            .run(inside, CancellationToken::new())
-            .await
-            .unwrap();
+        let output = runner.run(inside, CancellationToken::new()).await.unwrap();
         assert!(
             output.success(),
             "write inside workspace should succeed: {output:?}"
@@ -1566,10 +2818,7 @@ mod tests {
             ws.clone(),
         );
         outside.write_root = Some(ws.clone());
-        let output = CommandRunner::new()
-            .run(outside, CancellationToken::new())
-            .await
-            .unwrap();
+        let output = runner.run(outside, CancellationToken::new()).await.unwrap();
         assert!(
             !output.success(),
             "write outside workspace must be blocked: {output:?}"
@@ -1584,7 +2833,7 @@ mod tests {
     async fn sandboxed_non_network_command_still_runs() {
         let mut req = ProcessRequest::new("echo", vec!["hi".into()], std::env::temp_dir());
         req.deny_network = true;
-        let out = CommandRunner::new()
+        let out = unix_host_runner()
             .run(req, CancellationToken::new())
             .await
             .unwrap();

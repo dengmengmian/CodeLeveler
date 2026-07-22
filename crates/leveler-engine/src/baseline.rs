@@ -208,7 +208,16 @@ mod tests {
     }
 
     fn env() -> Arc<EnvSnapshot> {
-        Arc::new(leveler_core::environment().clone())
+        // Library tests do not install the application's global environment
+        // capability, so `leveler_core::environment()` is intentionally empty.
+        // Supply the same explicit host snapshot as the composition root;
+        // otherwise confined verification fails before `/bin/sh` starts and a
+        // passing baseline is misattributed as a pre-existing failure.
+        Arc::new(EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        ))
     }
 
     async fn working_report(repo: &Path, plan: &VerificationPlan) -> VerificationReport {

@@ -133,9 +133,9 @@ export function listFiles(
   sessionId: SessionId,
   prefix = '',
   limit = 2000,
-): Promise<{ files: string[] }> {
+): Promise<{ files: string[]; truncated: boolean }> {
   const params = new URLSearchParams({ prefix, limit: String(limit) });
-  return request<{ files: string[] }>(
+  return request<{ files: string[]; truncated: boolean }>(
     `/api/sessions/${encodeURIComponent(sessionId)}/files?${params}`,
   );
 }
@@ -150,9 +150,9 @@ export function searchFiles(
   sessionId: SessionId,
   q: string,
   limit = 100,
-): Promise<{ matches: SearchMatch[] }> {
+): Promise<{ matches: SearchMatch[]; truncated: boolean }> {
   const params = new URLSearchParams({ q, limit: String(limit) });
-  return request<{ matches: SearchMatch[] }>(
+  return request<{ matches: SearchMatch[]; truncated: boolean }>(
     `/api/sessions/${encodeURIComponent(sessionId)}/search?${params}`,
   );
 }

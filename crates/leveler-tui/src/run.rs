@@ -4,7 +4,7 @@
 //! Rendering uses the **alternate screen** for the full workbench (header,
 //! conversation viewport, composer, overlays). This is intentional: viewport
 //! scroll, drag-select, and fixed chrome are not compatible with native
-//! scrollback. Inline-scrollback helpers remain only for legacy/test paths.
+//! scrollback.
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
@@ -28,7 +28,6 @@ use leveler_client_protocol::{
 };
 
 use crate::action::{Action, Effect, EffectCompletion, WebLauncher};
-use crate::inline::InlineTerminal;
 use crate::reducer::reduce;
 use crate::render::render;
 use crate::screen::Screen;
@@ -195,31 +194,13 @@ pub async fn run(
     let mut selection_tick = tokio::time::interval(SELECTION_TICK);
     selection_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Inline-render state (legacy helpers; paint always uses alternate screen).
-    let mut inline = InlineTerminal::new();
-    let mut committed = 0usize; // transcript items flushed to scrollback
-    // Lines of the currently-streaming assistant item already committed to
-    // scrollback (0 when none is streaming).
-    let mut assistant_lines = 0usize;
     let mut alt: Option<Terminal<CrosstermBackend<Stdout>>> = None;
     let mut pending_runtime_paint = false;
     let mut pending_terminal_actions: VecDeque<Action> = VecDeque::new();
-    // A resize or tool-detail toggle while the alternate screen is up leaves
-    // the main screen stale; force a from-scratch inline repaint on return.
-    let mut reset_inline_on_return = false;
-    let mut painted_expand_epoch = state.expand_epoch;
     // The notification currently on screen and when it appeared, for expiry.
     let mut note_shown: Option<(Notification, Instant)> = None;
 
-    committed = paint(
-        &mut inline,
-        &mut alt,
-        &mut stdout,
-        &mut state,
-        committed,
-        &mut assistant_lines,
-        &mut reset_inline_on_return,
-    )?;
+    paint(&mut alt, &mut stdout, &mut state)?;
 
     while state.running {
         let mut effects: Vec<Effect> = Vec::new();
@@ -235,19 +216,6 @@ pub async fn run(
                 if let Some(Ok(ev)) = maybe {
                     if let CtEvent::Resize(c, r) = ev {
                         state.size = (c, r);
-                        if alt.is_some() {
-                            // The purge below would hit the ALT screen; defer
-                            // the inline repaint until we return to it.
-                            reset_inline_on_return = true;
-                        } else {
-                            // Geometry changed: repaint from scratch. Purge the
-                            // (now mis-wrapped) screen, re-home, and re-emit the
-                            // whole transcript top-anchored on the next paint.
-                            execute!(stdout, Clear(ClearType::Purge), cursor::MoveTo(0, 0))?;
-                            inline.reset();
-                            committed = 0;
-                            assistant_lines = 0;
-                        }
                     }
                     if let Some(action) = map_terminal_event(ev) {
                         let action = maybe_coalesce_text_input(
@@ -357,38 +325,10 @@ pub async fn run(
             paint_now = true;
         }
 
-        // Finalized transcript blocks live in native terminal scrollback. An
-        // explicit Ctrl+O on a historical tool group must rebuild that
-        // scrollback; otherwise only the still-live tail would react.
-        if painted_expand_epoch != state.expand_epoch {
-            painted_expand_epoch = state.expand_epoch;
-            if alt.is_some() {
-                reset_inline_on_return = true;
-            } else {
-                execute!(stdout, Clear(ClearType::Purge), cursor::MoveTo(0, 0))?;
-                inline.reset();
-                committed = 0;
-                assistant_lines = 0;
-            }
-            paint_now = true;
-        }
-
-        // Approach A: user pressed End / Ctrl+End after scrolling history —
-        // rebuild the live edge so the composer is on screen again. Same
-        // purge path as expand/resize; does not change the scroll model.
+        // End / Ctrl+End returns to the conversation's live edge.
         if state.jump_to_bottom {
             state.jump_to_bottom = false;
-            if alt.is_some() {
-                // Full-screen view: return to conversation first next paint
-                // cycle; still mark for a clean inline rebuild.
-                state.active_screen = Screen::Conversation;
-                reset_inline_on_return = true;
-            } else {
-                execute!(stdout, Clear(ClearType::Purge), cursor::MoveTo(0, 0))?;
-                inline.reset();
-                committed = 0;
-                assistant_lines = 0;
-            }
+            state.active_screen = Screen::Conversation;
             paint_now = true;
         }
 
@@ -405,24 +345,15 @@ pub async fn run(
         // (spinner/elapsed). Idle ticks only repaint when the wall clock minute
         // changes (handled above via paint_now).
         if paint_now || (ticked && state.is_busy()) || (!state.is_busy() && pending_runtime_paint) {
-            committed = paint(
-                &mut inline,
-                &mut alt,
-                &mut stdout,
-                &mut state,
-                committed,
-                &mut assistant_lines,
-                &mut reset_inline_on_return,
-            )?;
+            paint(&mut alt, &mut stdout, &mut state)?;
             pending_runtime_paint = false;
         }
     }
 
-    // Leave any open overlay screen and clear the live footer, keeping history.
+    // Leave the alternate screen before restoring terminal state.
     if alt.is_some() {
         let _ = execute!(stdout, LeaveAlternateScreen);
     }
-    let _ = inline.clear_footer(&mut stdout);
 
     // Persist (or clear) the composer draft for next launch (spec §24).
     if let Some(path) = state.draft_path() {
@@ -672,14 +603,10 @@ fn expire_notification(state: &mut AppState, shown: &mut Option<(Notification, I
 /// Conversation uses fixed Header / Conversation / Plan / Input / Footer with
 /// viewport scroll — not native terminal scrollback.
 fn paint(
-    _inline: &mut InlineTerminal,
     alt: &mut Option<Terminal<CrosstermBackend<Stdout>>>,
     stdout: &mut Stdout,
     state: &mut AppState,
-    committed: usize,
-    _assistant_lines: &mut usize,
-    _reset_inline_on_return: &mut bool,
-) -> Result<usize, TuiError> {
+) -> Result<(), TuiError> {
     if alt.is_none() {
         execute!(stdout, EnterAlternateScreen)?;
         let mut t = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -689,7 +616,7 @@ fn paint(
     if let Some(t) = alt {
         t.draw(|f| render(f, state))?;
     }
-    Ok(committed)
+    Ok(())
 }
 
 fn map_terminal_event(event: CtEvent) -> Option<Action> {

@@ -26,6 +26,9 @@ futures-util = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = "4.0.2"
+base64 = { workspace = true }
 
 [dev-dependencies]
 leveler-client-protocol = { workspace = true, features = ["testing"] }

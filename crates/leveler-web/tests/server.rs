@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -429,6 +431,73 @@ async fn file_endpoint_rejects_non_utf8_content() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn file_endpoint_rejects_an_external_symlink_canary() {
+    use std::os::unix::fs::symlink;
+
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "outside-file-canary").unwrap();
+    symlink(outside.path(), repo.path().join("linked.txt")).unwrap();
+    use_repository(&server, repo.path()).await;
+
+    let response = http_get(
+        &server,
+        &format!("/api/sessions/s1/file?token={TOKEN}&path=linked.txt"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(
+        !response
+            .text()
+            .await
+            .unwrap()
+            .contains("outside-file-canary")
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn file_endpoint_rejects_a_windows_junction_parent() {
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside-junction-canary").unwrap();
+    let junction = repo.path().join("linked");
+    let created = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(outside.path())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !created {
+        eprintln!("junction creation is unavailable; skipping the Windows junction case");
+        return;
+    }
+    use_repository(&server, repo.path()).await;
+
+    let response = http_get(
+        &server,
+        &format!("/api/sessions/s1/file?token={TOKEN}&path=linked/secret.txt"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(
+        !response
+            .text()
+            .await
+            .unwrap()
+            .contains("outside-junction-canary")
+    );
+}
+
 #[tokio::test]
 async fn file_endpoint_truncates_large_files_at_a_line_boundary() {
     let server = TestServer::start().await;
@@ -501,6 +570,31 @@ async fn files_endpoint_lists_paths_respecting_gitignore() {
 }
 
 #[tokio::test]
+async fn files_endpoint_clamps_an_excessive_client_limit() {
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    for index in (0..2005).rev() {
+        std::fs::File::create(repo.path().join(format!("file-{index:04}.txt"))).unwrap();
+    }
+    use_repository(&server, repo.path()).await;
+
+    let response = http_get(
+        &server,
+        &format!("/api/sessions/s1/files?token={TOKEN}&limit={}", usize::MAX),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let files = body["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2000);
+    assert_eq!(body["truncated"], true);
+    assert_eq!(files.first().unwrap(), "file-0000.txt");
+    assert_eq!(files.last().unwrap(), "file-1999.txt");
+}
+
+#[tokio::test]
 async fn search_endpoint_matches_case_insensitively() {
     let server = TestServer::start().await;
     let repo = tempfile::tempdir().unwrap();
@@ -543,6 +637,34 @@ async fn search_endpoint_matches_case_insensitively() {
     .unwrap();
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["matches"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn search_endpoint_clamps_an_excessive_client_limit() {
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let content = (0..600)
+        .map(|line| format!("needle {line:03}\n"))
+        .collect::<String>();
+    std::fs::write(repo.path().join("matches.txt"), content).unwrap();
+    use_repository(&server, repo.path()).await;
+
+    let response = http_get(
+        &server,
+        &format!(
+            "/api/sessions/s1/search?token={TOKEN}&q=needle&limit={}",
+            usize::MAX
+        ),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["matches"].as_array().unwrap().len(), 500);
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body["matches"][0]["line"], 1);
+    assert_eq!(body["matches"][499]["line"], 500);
 }
 
 #[tokio::test]
@@ -780,17 +902,197 @@ async fn attachments_store_uploads_and_deliver_commands() {
         "second contents"
     );
 
-    // Each stored file produced one AddAttachment command carrying its path.
+    // Each stored file produced one immutable-data command; the asynchronous
+    // runtime never needs to reopen the workspace path.
     let commands = server.service.mock.commands();
     assert_eq!(commands.len(), 2);
-    for (command, path) in commands.iter().zip(stored) {
-        assert!(
-            matches!(
-                command,
-                ClientCommand::AddAttachment { path: delivered, session_id }
-                    if delivered == path && session_id.as_str() == "s1"
-            ),
-            "expected AddAttachment for {path}, got {command:?}"
+    for (command, (name, expected)) in commands.iter().zip([
+        ("note.txt", b"first contents".as_slice()),
+        ("escape.md", b"second contents".as_slice()),
+    ]) {
+        let ClientCommand::AddAttachmentData {
+            session_id,
+            name: delivered_name,
+            data_base64,
+        } = command
+        else {
+            panic!("expected AddAttachmentData, got {command:?}");
+        };
+        assert_eq!(session_id.as_str(), "s1");
+        assert_eq!(delivered_name, name);
+        assert_eq!(BASE64.decode(data_base64).unwrap(), expected);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attachment_command_is_immutable_after_the_stored_path_is_replaced() {
+    use std::os::unix::fs::symlink;
+
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), b"outside secret").unwrap();
+    use_repository(&server, repo.path()).await;
+    let original = b"trusted upload";
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(original.to_vec()).file_name("race.txt"),
+    );
+    let response = reqwest::Client::new()
+        .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let stored = Path::new(body["stored"][0].as_str().unwrap());
+
+    std::fs::remove_file(stored).unwrap();
+    symlink(outside.path(), stored).unwrap();
+
+    let commands = server.service.mock.commands();
+    let ClientCommand::AddAttachmentData { data_base64, .. } = &commands[0] else {
+        panic!("web upload must deliver immutable attachment data");
+    };
+    assert_eq!(BASE64.decode(data_base64).unwrap(), original);
+    assert_ne!(BASE64.decode(data_base64).unwrap(), b"outside secret");
+}
+
+#[tokio::test]
+async fn attachments_accept_files_above_axums_default_body_limit() {
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    use_repository(&server, repo.path()).await;
+    let contents = vec![0x5a; 3 * 1024 * 1024];
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(contents.clone()).file_name("large.bin"),
+    );
+
+    let response = reqwest::Client::new()
+        .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let stored = body["stored"][0].as_str().unwrap();
+    assert_eq!(
+        std::fs::metadata(stored).unwrap().len(),
+        contents.len() as u64
+    );
+}
+
+#[tokio::test]
+async fn attachments_reject_files_above_twenty_mib() {
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    use_repository(&server, repo.path()).await;
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(vec![0x5a; 20 * 1024 * 1024 + 1])
+            .file_name("too-large.bin"),
+    );
+
+    let response = reqwest::Client::new()
+        .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let uploads = repo.path().join(".leveler/uploads");
+    assert_eq!(std::fs::read_dir(uploads).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn attachments_reject_too_many_files() {
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    use_repository(&server, repo.path()).await;
+    let mut form = reqwest::multipart::Form::new();
+    for index in 0..5 {
+        form = form.part(
+            "file",
+            reqwest::multipart::Part::bytes(vec![index as u8]).file_name(format!("{index}.txt")),
         );
     }
+
+    let response = reqwest::Client::new()
+        .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attachments_reject_symlinked_upload_parents() {
+    use std::os::unix::fs::symlink;
+
+    let server = TestServer::start().await;
+    for link_leveler in [true, false] {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        if link_leveler {
+            symlink(outside.path(), repo.path().join(".leveler")).unwrap();
+        } else {
+            std::fs::create_dir(repo.path().join(".leveler")).unwrap();
+            symlink(outside.path(), repo.path().join(".leveler/uploads")).unwrap();
+        }
+        use_repository(&server, repo.path()).await;
+        let form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(b"must stay inside".to_vec()).file_name("escape.txt"),
+        );
+
+        let response = reqwest::Client::new()
+            .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn attachments_reject_windows_junction_upload_parent() {
+    let server = TestServer::start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".leveler")).unwrap();
+    let junction = repo.path().join(".leveler/uploads");
+    let created = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(outside.path())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !created {
+        eprintln!("junction creation is unavailable; skipping the Windows junction case");
+        return;
+    }
+    use_repository(&server, repo.path()).await;
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(b"must stay inside".to_vec()).file_name("escape.txt"),
+    );
+
+    let response = reqwest::Client::new()
+        .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
 }

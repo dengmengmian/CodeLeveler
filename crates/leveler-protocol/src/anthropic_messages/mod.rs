@@ -176,7 +176,19 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
             while let Some(item) = raw.next().await {
                 match item {
                     Ok(bytes) => {
-                        for sse in decoder.feed(&bytes) {
+                        let events = match decoder.try_feed(&bytes) {
+                            Ok(events) => events,
+                            Err(error) => {
+                                yield Ok(ModelEvent::Error {
+                                    error: ModelError::new(
+                                        ModelErrorKind::Decode,
+                                        format!("malformed SSE stream: {error}"),
+                                    ),
+                                });
+                                return;
+                            }
+                        };
+                        for sse in events {
                             let data = sse.data.trim();
                             if data.is_empty() {
                                 continue;

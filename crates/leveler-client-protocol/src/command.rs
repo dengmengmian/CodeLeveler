@@ -31,6 +31,14 @@ pub enum ClientCommand {
     },
     /// Import a file as an attachment; the runtime processes and stores it.
     AddAttachment { session_id: SessionId, path: String },
+    /// Import an attachment from immutable base64-encoded bytes already read
+    /// by a trusted client. This avoids reopening an ambient path after a
+    /// security-sensitive upload or file-picker validation.
+    AddAttachmentData {
+        session_id: SessionId,
+        name: String,
+        data_base64: String,
+    },
     /// Import an image from the system clipboard (spec §38.1).
     AddClipboardImage { session_id: SessionId },
     /// Cooperatively cancel the running turn (graceful; resumable).
@@ -148,6 +156,7 @@ impl ClientCommand {
             ClientCommand::SubmitMessage { session_id, .. }
             | ClientCommand::RunGoal { session_id, .. }
             | ClientCommand::AddAttachment { session_id, .. }
+            | ClientCommand::AddAttachmentData { session_id, .. }
             | ClientCommand::AddClipboardImage { session_id }
             | ClientCommand::CancelCurrentTurn { session_id }
             | ClientCommand::ForceCancelCurrentTurn { session_id }
@@ -232,6 +241,18 @@ mod tests {
                 path: "/tmp/file.rs".to_string(),
             },
             "add_attachment",
+        );
+    }
+
+    #[test]
+    fn add_attachment_data_roundtrips() {
+        roundtrip(
+            ClientCommand::AddAttachmentData {
+                session_id: SessionId::new("s1"),
+                name: "image.png".to_string(),
+                data_base64: "aW1tdXRhYmxl".to_string(),
+            },
+            "add_attachment_data",
         );
     }
 

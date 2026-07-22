@@ -10,8 +10,9 @@
 //! respect `.gitignore` (via the `ignore` crate) and never descend into
 //! `.git`.
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::io;
+use std::io::Read as StdRead;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -20,8 +21,11 @@ use axum::extract::multipart::Field;
 use axum::extract::{Multipart, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use leveler_client_protocol::{
     ClientCommand, ClientError, CommandEnvelope, CommandId, ProtocolEnvelope, SessionId,
@@ -38,12 +42,26 @@ const FULL_COUNT_CAP: u64 = 16 * 1024 * 1024;
 /// Default and fallback caps for the list/search panels.
 const DEFAULT_LIST_LIMIT: usize = 2000;
 const DEFAULT_SEARCH_LIMIT: usize = 100;
+/// Hard server-side caps. Query parameters may narrow these values but can
+/// never turn one request into an unbounded allocation.
+const MAX_LIST_LIMIT: usize = 2000;
+const MAX_SEARCH_LIMIT: usize = 500;
+/// Hard per-request traversal/I/O budgets. These bound work even when a
+/// repository contains millions of entries or many search-sized files.
+const MAX_REPO_SCAN_ENTRIES: usize = 50_000;
+const MAX_SEARCH_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 /// Files larger than this are skipped by content search.
 const SEARCH_FILE_SIZE_CAP: u64 = 1024 * 1024;
 /// A matched line is reported with at most this many characters.
 const MATCH_TEXT_MAX_CHARS: usize = 200;
 /// Per-file ceiling for one multipart upload.
 const MAX_UPLOAD_BYTES: u64 = 20 * 1024 * 1024;
+/// A request may carry several files, but both their count and their combined
+/// payload are bounded independently from the HTTP body limit.
+const MAX_UPLOAD_FILES: usize = 4;
+const MAX_UPLOAD_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Leave one MiB for multipart boundaries and headers above the payload cap.
+pub(crate) const MAX_MULTIPART_BODY_BYTES: usize = MAX_UPLOAD_TOTAL_BYTES as usize + 1024 * 1024;
 
 /// `GET /api/sessions/{id}/file?path=<repo-relative>` — one text file for the
 /// viewer, capped at 512 KiB and cut at a line boundary when larger.
@@ -52,7 +70,7 @@ pub(crate) async fn read_file(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<FileContentResponse>, EndpointError> {
-    let root = repository_root(&state, &id).await?;
+    let repository = repository(&state, &id).await?;
     // Reject rooted/absolute inputs outright (cross-platform): on Windows an
     // absolute-looking "/etc/hosts" is not `is_absolute()` but does have a root,
     // and `join` would silently reinterpret it against the current drive.
@@ -62,32 +80,19 @@ pub(crate) async fn read_file(
             format!("{} is not repository-relative", query.path),
         ));
     }
-    let target = root
-        .join(&query.path)
-        .canonicalize()
-        .map_err(|error| io_error(&error, &format!("cannot resolve {}", query.path)))?;
-    if !target.starts_with(&root) {
-        return Err(EndpointError::new(
-            StatusCode::FORBIDDEN,
-            format!("{} escapes the repository", query.path),
-        ));
-    }
-    let metadata = tokio::fs::metadata(&target)
-        .await
-        .map_err(|error| io_error(&error, &format!("cannot read {}", query.path)))?;
-    if metadata.is_dir() {
-        return Err(EndpointError::new(
-            StatusCode::BAD_REQUEST,
-            format!("{} is a directory", query.path),
-        ));
-    }
-    if !metadata.is_file() {
-        return Err(EndpointError::new(
-            StatusCode::BAD_REQUEST,
-            format!("{} is not a regular file", query.path),
-        ));
-    }
-    let read = read_text_file(&target, metadata.len(), &query.path).await?;
+    let relative = PathBuf::from(&query.path);
+    let display = query.path.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        let file = open_repository_file(&repository.dir, &relative, &display)?;
+        read_text_file(file, &display)
+    })
+    .await
+    .map_err(|error| {
+        EndpointError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("file read task failed: {error}"),
+        )
+    })??;
     Ok(Json(FileContentResponse {
         path: query.path,
         content: read.content,
@@ -103,18 +108,31 @@ pub(crate) async fn list_files(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<FilesQuery>,
 ) -> Result<Json<FileListResponse>, EndpointError> {
-    let root = repository_root(&state, &id).await?;
-    let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    let repository = repository(&state, &id).await?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .min(MAX_LIST_LIMIT);
     let prefix = query.prefix;
-    let files = tokio::task::spawn_blocking(move || collect_files(&root, prefix.as_deref(), limit))
-        .await
-        .map_err(|error| {
-            EndpointError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("file walk failed: {error}"),
-            )
-        })?;
-    Ok(Json(FileListResponse { files }))
+    let result = tokio::task::spawn_blocking(move || {
+        collect_files(
+            &repository.path,
+            prefix.as_deref(),
+            limit,
+            MAX_REPO_SCAN_ENTRIES,
+        )
+    })
+    .await
+    .map_err(|error| {
+        EndpointError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("file walk failed: {error}"),
+        )
+    })?;
+    Ok(Json(FileListResponse {
+        files: result.items,
+        truncated: result.truncated,
+    }))
 }
 
 /// `GET /api/sessions/{id}/search?q=<needle>&limit=<optional>` —
@@ -124,23 +142,38 @@ pub(crate) async fn search_files(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchMatchesResponse>, EndpointError> {
-    let root = repository_root(&state, &id).await?;
+    let repository = repository(&state, &id).await?;
     let needle = query.q.to_lowercase();
-    let limit = query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .min(MAX_SEARCH_LIMIT);
     if needle.is_empty() || limit == 0 {
         return Ok(Json(SearchMatchesResponse {
             matches: Vec::new(),
+            truncated: false,
         }));
     }
-    let matches = tokio::task::spawn_blocking(move || collect_matches(&root, &needle, limit))
-        .await
-        .map_err(|error| {
-            EndpointError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("search failed: {error}"),
-            )
-        })?;
-    Ok(Json(SearchMatchesResponse { matches }))
+    let result = tokio::task::spawn_blocking(move || {
+        collect_matches(
+            &repository,
+            &needle,
+            limit,
+            MAX_REPO_SCAN_ENTRIES,
+            MAX_SEARCH_SCAN_BYTES,
+        )
+    })
+    .await
+    .map_err(|error| {
+        EndpointError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("search failed: {error}"),
+        )
+    })?;
+    Ok(Json(SearchMatchesResponse {
+        matches: result.items,
+        truncated: result.truncated,
+    }))
 }
 
 /// `GET /api/sessions/{id}/git-status` — the branch plus per-file status and
@@ -150,7 +183,7 @@ pub(crate) async fn git_status(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<GitStatusResponse>, EndpointError> {
-    let root = repository_root(&state, &id).await?;
+    let root = repository(&state, &id).await?.path;
     let empty = || {
         Json(GitStatusResponse {
             branch: None,
@@ -193,13 +226,12 @@ pub(crate) async fn upload_attachments(
     AxumPath(id): AxumPath<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<StoredAttachmentsResponse>), EndpointError> {
-    let root = repository_root(&state, &id).await?;
-    let uploads = root.join(".leveler").join("uploads");
-    tokio::fs::create_dir_all(&uploads)
-        .await
-        .map_err(|error| io_error(&error, "cannot create the uploads directory"))?;
+    let root = repository(&state, &id).await?.path;
+    let uploads = prepare_upload_directory(&root)?;
 
     let mut stored = Vec::new();
+    let mut file_count = 0_usize;
+    let mut total_bytes = 0_u64;
     while let Some(mut field) = multipart
         .next_field()
         .await
@@ -207,6 +239,13 @@ pub(crate) async fn upload_attachments(
     {
         if field.name() != Some("file") {
             continue;
+        }
+        file_count += 1;
+        if file_count > MAX_UPLOAD_FILES {
+            return Err(EndpointError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("a request may contain at most {MAX_UPLOAD_FILES} files"),
+            ));
         }
         let name = field
             .file_name()
@@ -222,17 +261,33 @@ pub(crate) async fn upload_attachments(
                 "uploaded file has no usable file name",
             ));
         };
-        let path = uploads.join(format!("{}-{name}", &new_uuid_string()[..8]));
-        store_field(&mut field, &path, &name).await?;
+        let file_name = format!("{}-{name}", &new_uuid_string()[..8]);
+        let remaining = MAX_UPLOAD_TOTAL_BYTES.saturating_sub(total_bytes);
+        let (written, bytes) =
+            store_field(&mut field, &uploads.dir, &file_name, &name, remaining).await?;
+        total_bytes += written;
+        let path = uploads.absolute.join(&file_name);
+        if let Err(error) = verify_stored_upload(&root, &uploads.absolute, &path) {
+            let _ = uploads.dir.remove_file(&file_name);
+            return Err(error);
+        }
         let absolute = path.to_string_lossy().into_owned();
-        deliver_attachment(&state, SessionId::new(id.clone()), absolute.clone())
-            .await
-            .map_err(|error| {
-                EndpointError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("stored {name} but delivering it to the runtime failed: {error}"),
-                )
-            })?;
+        // Pass the immutable multipart bytes, never the ambient path, to the
+        // asynchronous runtime consumer. A later workspace write may replace
+        // the stored path, but it cannot change the attachment being imported.
+        deliver_attachment_data(
+            &state,
+            SessionId::new(id.clone()),
+            name.clone(),
+            BASE64.encode(bytes),
+        )
+        .await
+        .map_err(|error| {
+            EndpointError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("stored {name} but delivering it to the runtime failed: {error}"),
+            )
+        })?;
         stored.push(absolute);
     }
     if stored.is_empty() {
@@ -249,11 +304,99 @@ pub(crate) async fn upload_attachments(
 
 /// Resolve the session's repository root, canonicalized so later
 /// `starts_with` checks compare like with like (and symlink escapes fail).
-async fn repository_root(state: &AppState, session_id: &str) -> Result<PathBuf, EndpointError> {
+async fn repository(state: &AppState, session_id: &str) -> Result<Repository, EndpointError> {
     let snapshot = state.service.snapshot(&SessionId::new(session_id)).await?;
-    PathBuf::from(&snapshot.repository)
+    let configured = PathBuf::from(&snapshot.repository);
+    // Capture the repository object first. `dir` remains bound to this opened
+    // directory even if its ambient pathname is renamed or replaced later.
+    let dir = cap_std::fs::Dir::open_ambient_dir(&configured, cap_std::ambient_authority())
+        .map_err(|error| io_error(&error, "cannot open the repository"))?;
+    let path = configured
         .canonicalize()
-        .map_err(|error| io_error(&error, "repository unavailable"))
+        .map_err(|error| io_error(&error, "repository unavailable"))?;
+    Ok(Repository { path, dir })
+}
+
+struct Repository {
+    path: PathBuf,
+    dir: cap_std::fs::Dir,
+}
+
+/// Open one repository-relative regular file without following a symbolic
+/// link/reparse point in any component. Every directory descent and the final
+/// file open are relative to stable capability handles, closing the
+/// check-to-open race that ambient canonicalization cannot close.
+fn open_repository_file(
+    root: &cap_std::fs::Dir,
+    relative: &Path,
+    display: &str,
+) -> Result<cap_std::fs::File, EndpointError> {
+    use std::path::Component;
+
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => components.push(name.to_os_string()),
+            _ => {
+                return Err(EndpointError::new(
+                    StatusCode::FORBIDDEN,
+                    format!("{display} is not a plain repository-relative path"),
+                ));
+            }
+        }
+    }
+    let Some((file_name, parents)) = components.split_last() else {
+        return Err(EndpointError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{display} does not name a file"),
+        ));
+    };
+
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| io_error(&error, "cannot clone the repository handle"))?;
+    for parent in parents {
+        directory = directory
+            .open_dir_nofollow(parent)
+            .map_err(|error| secure_open_error(&error, display))?;
+    }
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = directory
+        .open_with(file_name, &options)
+        .map_err(|error| secure_open_error(&error, display))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_error(&error, &format!("cannot inspect {display}")))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse_metadata(&metadata) {
+        return Err(EndpointError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{display} is not a regular file"),
+        ));
+    }
+    Ok(file)
+}
+
+fn secure_open_error(error: &io::Error, display: &str) -> EndpointError {
+    let status = match error.kind() {
+        io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::FORBIDDEN,
+    };
+    EndpointError::new(status, format!("cannot securely open {display}: {error}"))
+}
+
+#[cfg(windows)]
+fn is_reparse_metadata(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_fs_ext::OsMetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_metadata(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
 }
 
 /// The walk shared by listing and search: `.gitignore` (and `.ignore`) rules
@@ -268,11 +411,38 @@ fn repo_walker(root: &Path) -> ignore::Walk {
     builder.build()
 }
 
+struct BoundedResults<T> {
+    items: Vec<T>,
+    truncated: bool,
+}
+
 /// Sorted repository-relative file paths, filtered by `prefix` and capped at
-/// `limit` after sorting so truncation is deterministic.
-fn collect_files(root: &Path, prefix: Option<&str>, limit: usize) -> Vec<String> {
-    let mut files = Vec::new();
-    for entry in repo_walker(root).flatten() {
+/// `limit`. A max-heap retains the lexicographically smallest paths among the
+/// entries actually visited, so memory is O(limit) and the returned vector is
+/// ordered. When the entry budget stops the streaming walk, the set is partial
+/// and may reflect the filesystem's enumeration order.
+fn collect_files(
+    root: &Path,
+    prefix: Option<&str>,
+    limit: usize,
+    max_entries: usize,
+) -> BoundedResults<String> {
+    if limit == 0 {
+        return BoundedResults {
+            items: Vec::new(),
+            truncated: false,
+        };
+    }
+    let mut files = BinaryHeap::with_capacity(limit);
+    let mut truncated = false;
+    for (index, entry) in repo_walker(root).enumerate() {
+        if index >= max_entries {
+            truncated = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
@@ -287,55 +457,128 @@ fn collect_files(root: &Path, prefix: Option<&str>, limit: usize) -> Vec<String>
         if prefix.is_some_and(|prefix| !relative.starts_with(prefix)) {
             continue;
         }
-        files.push(relative);
+        if files.len() < limit {
+            files.push(relative);
+        } else {
+            truncated = true;
+            if files.peek().is_some_and(|largest| relative < *largest) {
+                files.pop();
+                files.push(relative);
+            }
+        }
     }
-    files.sort();
-    files.truncate(limit);
-    files
+    BoundedResults {
+        items: files.into_sorted_vec(),
+        truncated,
+    }
 }
 
 /// Case-insensitive substring matches, sorted by path then line number and
-/// capped at `limit`. Non-UTF-8 and oversized files are skipped.
-fn collect_matches(root: &Path, needle: &str, limit: usize) -> Vec<SearchMatch> {
-    let mut matches = Vec::new();
-    for entry in repo_walker(root).flatten() {
+/// capped at `limit`. Non-UTF-8 and oversized files are skipped. A budget-cut
+/// result is ordered internally but represents only the streamed scan prefix.
+fn collect_matches(
+    repository: &Repository,
+    needle: &str,
+    limit: usize,
+    max_entries: usize,
+    max_bytes: u64,
+) -> BoundedResults<SearchMatch> {
+    collect_matches_with_hook(repository, needle, limit, max_entries, max_bytes, |_| {})
+}
+
+fn collect_matches_with_hook<F>(
+    repository: &Repository,
+    needle: &str,
+    limit: usize,
+    max_entries: usize,
+    max_bytes: u64,
+    mut before_open: F,
+) -> BoundedResults<SearchMatch>
+where
+    F: FnMut(&Path),
+{
+    if limit == 0 {
+        return BoundedResults {
+            items: Vec::new(),
+            truncated: false,
+        };
+    }
+    let mut matches = BinaryHeap::with_capacity(limit);
+    let mut scanned_bytes = 0_u64;
+    let mut truncated = false;
+    for (index, entry) in repo_walker(&repository.path).enumerate() {
+        if index >= max_entries {
+            truncated = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
+        let Ok(relative_path) = entry.path().strip_prefix(&repository.path) else {
+            continue;
+        };
+        let relative_path = relative_path.to_path_buf();
+        let relative = relative_path
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        before_open(&relative_path);
+        let Ok(file) = open_repository_file(&repository.dir, &relative_path, &relative) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
             continue;
         };
         if metadata.len() > SEARCH_FILE_SIZE_CAP {
             continue;
         }
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
+        let Some(reserved_bytes) = scanned_bytes.checked_add(metadata.len()) else {
+            truncated = true;
+            break;
         };
+        if reserved_bytes > max_bytes {
+            truncated = true;
+            break;
+        }
+        // Read through a bounded handle instead of `fs::read`: if the file
+        // grows after metadata, a concurrent writer cannot make this request
+        // exceed its reserved I/O budget.
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        if StdRead::take(file.into_std(), metadata.len())
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        scanned_bytes += bytes.len() as u64;
         let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        let Ok(relative) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let relative = relative
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
         for (index, line) in text.lines().enumerate() {
             if line.to_lowercase().contains(needle) {
-                matches.push(SearchMatch {
+                let candidate = SearchMatch {
                     path: relative.clone(),
                     line: index + 1,
                     text: line.chars().take(MATCH_TEXT_MAX_CHARS).collect(),
-                });
+                };
+                if matches.len() < limit {
+                    matches.push(candidate);
+                } else {
+                    truncated = true;
+                    if matches.peek().is_some_and(|largest| candidate < *largest) {
+                        matches.pop();
+                        matches.push(candidate);
+                    }
+                }
             }
         }
-        if matches.len() >= limit {
-            break;
-        }
     }
-    matches.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
-    matches.truncate(limit);
-    matches
+    BoundedResults {
+        items: matches.into_sorted_vec(),
+        truncated,
+    }
 }
 
 /// Run one git command in `root`; `None` when git cannot even be spawned.
@@ -438,21 +681,161 @@ fn parse_numstat(text: &str) -> HashMap<String, (u64, u64)> {
         .collect()
 }
 
+/// An opened uploads directory plus the canonical path exposed to the
+/// runtime. File creation is performed through `dir`, not by resolving the
+/// ambient path again, so swapping a checked parent for a symlink cannot
+/// redirect writes outside the repository.
+struct UploadDirectory {
+    dir: cap_std::fs::Dir,
+    absolute: PathBuf,
+}
+
+/// Create/open `.leveler/uploads` relative to a capability for the canonical
+/// repository root. Both components must be real directories: symlinks are
+/// rejected even when they happen to point back inside the repository.
+fn prepare_upload_directory(root: &Path) -> Result<UploadDirectory, EndpointError> {
+    let repo = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+        .map_err(|error| io_error(&error, "cannot open the repository"))?;
+    ensure_plain_directory(&repo, root, Path::new(".leveler"), ".leveler")?;
+    ensure_plain_directory(
+        &repo,
+        root,
+        Path::new(".leveler/uploads"),
+        ".leveler/uploads",
+    )?;
+
+    // Open a stable directory handle before rechecking both path components.
+    // Later file creation stays relative to this handle even if an attacker
+    // races an ambient rename or symlink replacement.
+    let dir = repo
+        .open_dir(".leveler/uploads")
+        .map_err(|error| io_error(&error, "cannot open the uploads directory"))?;
+    ensure_plain_directory(&repo, root, Path::new(".leveler"), ".leveler")?;
+    ensure_plain_directory(
+        &repo,
+        root,
+        Path::new(".leveler/uploads"),
+        ".leveler/uploads",
+    )?;
+
+    let absolute = root
+        .join(".leveler/uploads")
+        .canonicalize()
+        .map_err(|error| io_error(&error, "cannot resolve the uploads directory"))?;
+    if !absolute.starts_with(root) {
+        return Err(EndpointError::new(
+            StatusCode::FORBIDDEN,
+            "the uploads directory escapes the repository",
+        ));
+    }
+    Ok(UploadDirectory { dir, absolute })
+}
+
+fn ensure_plain_directory(
+    repo: &cap_std::fs::Dir,
+    root: &Path,
+    path: &Path,
+    display: &str,
+) -> Result<(), EndpointError> {
+    match repo.create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error(&error, &format!("cannot create {display}"))),
+    }
+    let metadata = repo
+        .symlink_metadata(path)
+        .map_err(|error| io_error(&error, &format!("cannot inspect {display}")))?;
+    if metadata.file_type().is_symlink() || is_windows_reparse_point(&root.join(path))? {
+        return Err(EndpointError::new(
+            StatusCode::FORBIDDEN,
+            format!("{display} must not be a symbolic link or reparse point"),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(EndpointError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{display} is not a directory"),
+        ));
+    }
+    Ok(())
+}
+
+/// Windows junctions and mount points are reparse points but are not
+/// consistently surfaced as symbolic links by all metadata APIs. Reject the
+/// whole reparse-point class so a junction cannot redirect uploads.
+#[cfg(windows)]
+fn is_windows_reparse_point(path: &Path) -> Result<bool, EndpointError> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| io_error(&error, "cannot inspect an uploads path component"))?;
+    Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(not(windows))]
+fn is_windows_reparse_point(_path: &Path) -> Result<bool, EndpointError> {
+    Ok(false)
+}
+
+/// Confirm that the ambient path handed to the runtime still identifies the
+/// file just created below the same canonical upload directory. The stable
+/// directory handle protects the write; this final check prevents delivery
+/// of a path redirected by a concurrent parent-directory swap.
+fn verify_stored_upload(root: &Path, uploads: &Path, path: &Path) -> Result<(), EndpointError> {
+    let current_uploads = path
+        .parent()
+        .expect("stored upload always has a parent")
+        .canonicalize()
+        .map_err(|error| io_error(&error, "cannot resolve the uploads directory after writing"))?;
+    let current_file = path
+        .canonicalize()
+        .map_err(|error| io_error(&error, "cannot resolve the stored upload"))?;
+    if current_uploads != uploads
+        || !current_uploads.starts_with(root)
+        || !current_file.starts_with(&current_uploads)
+    {
+        return Err(EndpointError::new(
+            StatusCode::FORBIDDEN,
+            "the stored upload path escaped the repository",
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&current_file)
+        .map_err(|error| io_error(&error, "cannot inspect the stored upload"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(EndpointError::new(
+            StatusCode::FORBIDDEN,
+            "the stored upload is not a regular file",
+        ));
+    }
+    Ok(())
+}
+
 /// Stream one multipart field to `path`, enforcing the per-file cap. The
 /// partial file is removed on any failure so a rejected upload never
 /// lingers in `.leveler/uploads`.
-async fn store_field(field: &mut Field<'_>, path: &Path, name: &str) -> Result<(), EndpointError> {
-    let mut file = tokio::fs::File::create(path)
-        .await
+async fn store_field(
+    field: &mut Field<'_>,
+    uploads: &cap_std::fs::Dir,
+    file_name: &str,
+    name: &str,
+    total_remaining: u64,
+) -> Result<(u64, Vec<u8>), EndpointError> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let file = uploads
+        .open_with(file_name, &options)
         .map_err(|error| io_error(&error, "cannot store the upload"))?;
+    let mut file = tokio::fs::File::from_std(file.into_std());
     let mut written = 0_u64;
+    let mut bytes = Vec::new();
     loop {
         match field.chunk().await {
             Ok(Some(chunk)) => {
                 written += chunk.len() as u64;
                 if written > MAX_UPLOAD_BYTES {
                     drop(file);
-                    let _ = tokio::fs::remove_file(path).await;
+                    let _ = uploads.remove_file(file_name);
                     return Err(EndpointError::new(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         format!(
@@ -461,20 +844,35 @@ async fn store_field(field: &mut Field<'_>, path: &Path, name: &str) -> Result<(
                         ),
                     ));
                 }
+                if written > total_remaining {
+                    drop(file);
+                    let _ = uploads.remove_file(file_name);
+                    return Err(EndpointError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "uploads exceed the {} MiB total request limit",
+                            MAX_UPLOAD_TOTAL_BYTES / 1024 / 1024
+                        ),
+                    ));
+                }
                 if let Err(error) = file.write_all(&chunk).await {
-                    let _ = tokio::fs::remove_file(path).await;
+                    drop(file);
+                    let _ = uploads.remove_file(file_name);
                     return Err(io_error(&error, "cannot write the upload"));
                 }
+                bytes.extend_from_slice(&chunk);
             }
             Ok(None) => {
                 if let Err(error) = file.flush().await {
-                    let _ = tokio::fs::remove_file(path).await;
+                    drop(file);
+                    let _ = uploads.remove_file(file_name);
                     return Err(io_error(&error, "cannot finish the upload"));
                 }
-                return Ok(());
+                return Ok((written, bytes));
             }
             Err(error) => {
-                let _ = tokio::fs::remove_file(path).await;
+                drop(file);
+                let _ = uploads.remove_file(file_name);
                 return Err(EndpointError::new(
                     StatusCode::BAD_REQUEST,
                     error.to_string(),
@@ -484,20 +882,25 @@ async fn store_field(field: &mut Field<'_>, path: &Path, name: &str) -> Result<(
     }
 }
 
-/// Deliver one `AddAttachment` for a stored upload, mirroring the WS path:
-/// the command rides in a `CommandEnvelope` through `deliver_protocol` so
+/// Deliver immutable attachment bytes, mirroring the WS path: the command
+/// rides in a `CommandEnvelope` through `deliver_protocol` so
 /// idempotency/version handling is identical to browser-issued commands.
-async fn deliver_attachment(
+async fn deliver_attachment_data(
     state: &AppState,
     session_id: SessionId,
-    path: String,
+    name: String,
+    data_base64: String,
 ) -> Result<(), ClientError> {
     let envelope = CommandEnvelope {
         command_id: CommandId::generate(),
         session_id: session_id.clone(),
         expected_version: None,
         issued_at: leveler_core::now().to_rfc3339(),
-        command: ClientCommand::AddAttachment { session_id, path },
+        command: ClientCommand::AddAttachmentData {
+            session_id,
+            name,
+            data_base64,
+        },
     };
     state
         .service
@@ -513,39 +916,43 @@ struct FileRead {
     total_lines: usize,
 }
 
-/// Read `path` for the viewer: whole file up to `FULL_COUNT_CAP` (so the
-/// line count is exact even when the content is truncated), otherwise just
-/// the head. Content over 512 KiB is cut at a line boundary; anything that
-/// does not decode as UTF-8 is rejected as 415.
-async fn read_text_file(path: &Path, size: u64, display: &str) -> Result<FileRead, EndpointError> {
-    let truncated = size > MAX_CONTENT_BYTES as u64;
-    let bytes = if size <= FULL_COUNT_CAP {
-        tokio::fs::read(path)
-            .await
-            .map_err(|error| io_error(&error, display))?
+/// Read from an already-opened stable file handle. At most
+/// `FULL_COUNT_CAP + 1` bytes are ever read, even if the file grows after its
+/// handle metadata was sampled. Content over 512 KiB is cut at a line
+/// boundary; anything that does not decode as UTF-8 is rejected as 415.
+fn read_text_file(file: cap_std::fs::File, display: &str) -> Result<FileRead, EndpointError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_error(&error, &format!("cannot inspect {display}")))?;
+    let read_limit = if metadata.len() <= FULL_COUNT_CAP {
+        FULL_COUNT_CAP + 1
     } else {
-        let mut head = Vec::new();
-        tokio::fs::File::open(path)
-            .await
-            .map_err(|error| io_error(&error, display))?
-            .take(MAX_CONTENT_BYTES as u64)
-            .read_to_end(&mut head)
-            .await
-            .map_err(|error| io_error(&error, display))?;
-        head
+        MAX_CONTENT_BYTES as u64 + 1
     };
+    let bytes = read_bounded(file.into_std(), read_limit)
+        .map_err(|error| io_error(&error, &format!("cannot read {display}")))?;
+    let count_len = bytes.len().min(FULL_COUNT_CAP as usize);
+    let counted = &bytes[..count_len];
+    let truncated = metadata.len() > MAX_CONTENT_BYTES as u64 || bytes.len() > MAX_CONTENT_BYTES;
     let head_len = if truncated {
-        line_boundary(&bytes, MAX_CONTENT_BYTES)
+        line_boundary(counted, MAX_CONTENT_BYTES)
     } else {
-        bytes.len()
+        counted.len()
     };
-    let total_lines = count_lines(&bytes);
-    let content = decode_utf8(&bytes[..head_len], truncated)?;
+    let total_lines = count_lines(counted);
+    let content = decode_utf8(&counted[..head_len], truncated)?;
     Ok(FileRead {
         content,
         truncated,
         total_lines,
     })
+}
+
+fn read_bounded(file: std::fs::File, limit: u64) -> io::Result<Vec<u8>> {
+    // Do not reserve the full 16 MiB count window for ordinary small files.
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024) as usize);
+    StdRead::take(file, limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The longest prefix of `bytes` within `max` bytes that ends right after a
@@ -628,16 +1035,18 @@ pub(crate) struct FileContentResponse {
 #[derive(Debug, Serialize)]
 pub(crate) struct FileListResponse {
     files: Vec<String>,
+    truncated: bool,
 }
 
 /// Response of [`search_files`].
 #[derive(Debug, Serialize)]
 pub(crate) struct SearchMatchesResponse {
     matches: Vec<SearchMatch>,
+    truncated: bool,
 }
 
 /// One content-search hit.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SearchMatch {
     path: String,
     line: usize,
@@ -703,6 +1112,156 @@ impl IntoResponse for EndpointError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_repository(path: &Path) -> Repository {
+        let path = path.canonicalize().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority()).unwrap();
+        Repository { path, dir }
+    }
+
+    #[test]
+    fn repository_walker_never_enables_per_directory_sorting() {
+        // ignore/walkdir implements per-directory sorting by first collecting
+        // every child. That defeats our outer entry budget for a single very
+        // wide directory, so guard the production half of this module against
+        // accidentally adding the sorting builder method again.
+        let production = include_str!("repo.rs")
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        let unbounded_sort = ["sort", "_by_file_name"].concat();
+        assert!(!production.contains(&unbounded_sort));
+    }
+
+    #[test]
+    fn file_collection_keeps_a_sorted_bounded_prefix() {
+        let repo = tempfile::tempdir().unwrap();
+        for name in ["z.txt", "d.txt", "a.txt", "c.txt", "b.txt"] {
+            std::fs::write(repo.path().join(name), name).unwrap();
+        }
+        let result = collect_files(repo.path(), None, 3, usize::MAX);
+        assert_eq!(result.items, ["a.txt", "b.txt", "c.txt"]);
+        assert!(result.truncated);
+        assert!(
+            collect_files(repo.path(), None, 0, usize::MAX)
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_collection_keeps_a_sorted_bounded_prefix() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("z.txt"), "hit z\n").unwrap();
+        std::fs::write(repo.path().join("a.txt"), "hit one\nhit two\nhit three\n").unwrap();
+        let repository = test_repository(repo.path());
+        let result = collect_matches(&repository, "hit", 2, usize::MAX, u64::MAX);
+        assert_eq!(result.items.len(), 2);
+        assert!(result.truncated);
+        assert_eq!(result.items[0].path, "a.txt");
+        assert_eq!(result.items[0].line, 1);
+        assert_eq!(result.items[1].path, "a.txt");
+        assert_eq!(result.items[1].line, 2);
+    }
+
+    #[test]
+    fn file_collection_stops_at_the_entry_budget() {
+        let repo = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(repo.path().join(name), name).unwrap();
+        }
+        // The walker yields the repository root before its first child.
+        let result = collect_files(repo.path(), None, 10, 2);
+        assert_eq!(result.items.len(), 1);
+        assert!(["a.txt", "b.txt", "c.txt"].contains(&result.items[0].as_str()));
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn search_collection_stops_at_the_byte_budget() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.txt"), "hit\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "hit\n").unwrap();
+        let repository = test_repository(repo.path());
+        let result = collect_matches(&repository, "hit", 10, usize::MAX, 4);
+        assert_eq!(result.items.len(), 1);
+        assert!(["a.txt", "b.txt"].contains(&result.items[0].path.as_str()));
+        assert!(result.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn viewer_reads_the_open_handle_after_the_path_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "outside canary").unwrap();
+        let victim = repo.path().join("victim.txt");
+        std::fs::write(&victim, "inside content").unwrap();
+        let repository = test_repository(repo.path());
+        let file =
+            open_repository_file(&repository.dir, Path::new("victim.txt"), "victim.txt").unwrap();
+
+        std::fs::remove_file(&victim).unwrap();
+        symlink(outside.path(), &victim).unwrap();
+        let read = read_text_file(file, "victim.txt").unwrap();
+        assert_eq!(read.content, "inside content");
+        assert!(!read.content.contains("outside canary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_rejects_a_file_replaced_by_an_external_symlink_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "outside-search-canary\n").unwrap();
+        let victim = repo.path().join("victim.txt");
+        std::fs::write(&victim, "ordinary repository text\n").unwrap();
+        let repository = test_repository(repo.path());
+        let mut replaced = false;
+        let result = collect_matches_with_hook(
+            &repository,
+            "outside-search-canary",
+            10,
+            usize::MAX,
+            u64::MAX,
+            |relative| {
+                if !replaced && relative == Path::new("victim.txt") {
+                    std::fs::remove_file(&victim).unwrap();
+                    symlink(outside.path(), &victim).unwrap();
+                    replaced = true;
+                }
+            },
+        );
+        assert!(replaced, "the race hook must replace the walked file");
+        assert!(result.items.is_empty());
+    }
+
+    #[test]
+    fn bounded_reader_stops_after_the_cap_when_an_open_file_grows() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("growing.txt");
+        std::fs::write(&path, b"small").unwrap();
+        let open = std::fs::File::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(FULL_COUNT_CAP * 2)
+            .unwrap();
+
+        let bytes = read_bounded(open, FULL_COUNT_CAP + 1).unwrap();
+        assert_eq!(bytes.len() as u64, FULL_COUNT_CAP + 1);
+    }
+
+    #[test]
+    fn client_limits_are_clamped() {
+        assert_eq!(usize::MAX.min(MAX_LIST_LIMIT), MAX_LIST_LIMIT);
+        assert_eq!(usize::MAX.min(MAX_SEARCH_LIMIT), MAX_SEARCH_LIMIT);
+    }
 
     #[test]
     fn porcelain_parses_branch_and_statuses() {

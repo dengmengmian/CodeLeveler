@@ -283,9 +283,20 @@ mod tests {
 
     fn ctx_with_reg(dir: &std::path::Path) -> (ToolContext, Arc<BackgroundTaskRegistry>) {
         let ws = Workspace::new(dir).unwrap();
-        let reg = Arc::new(BackgroundTaskRegistry::new());
-        let ctx =
-            ToolContext::new(ws, PermissionProfile::Assisted).with_background_tasks(reg.clone());
+        // Library tests do not install the application's global environment
+        // capability. Give both the tool context and its background registry
+        // the same explicit snapshot used by the composition root; otherwise
+        // confined background commands fail before spawning.
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        ));
+        let reg = Arc::new(BackgroundTaskRegistry::with_environment(
+            environment.clone(),
+        ));
+        let ctx = ToolContext::with_environment(ws, PermissionProfile::Assisted, environment)
+            .with_background_tasks(reg.clone());
         (ctx, reg)
     }
 

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -121,7 +122,8 @@ fn build_router_with(state: AppState) -> Router {
         )
         .route(
             "/api/sessions/{id}/attachments",
-            post(crate::repo::upload_attachments),
+            post(crate::repo::upload_attachments)
+                .layer(DefaultBodyLimit::max(crate::repo::MAX_MULTIPART_BODY_BYTES)),
         )
         .route(
             "/api/projects",

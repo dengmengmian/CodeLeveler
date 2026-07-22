@@ -13,4 +13,4 @@ pub mod sse;
 
 pub use anthropic_messages::AnthropicMessagesAdapter;
 pub use openai_chat::OpenAiChatAdapter;
-pub use sse::{SseDecoder, SseEvent};
+pub use sse::{SseDecodeError, SseDecoder, SseEvent};

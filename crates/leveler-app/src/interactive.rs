@@ -1200,6 +1200,38 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 });
                 Ok(())
             }
+            ClientCommand::AddAttachmentData {
+                session_id,
+                name,
+                data_base64,
+            } => {
+                let media_root = self.media_root.clone();
+                let events = self.events_for(&session_id);
+                tokio::task::spawn_blocking(move || {
+                    match MediaStore::new(&media_root).import_base64(&data_base64) {
+                        Ok(stored) => {
+                            let _ = events.send(RuntimeEvent::AttachmentAdded {
+                                attachment: AttachmentRef {
+                                    id: AttachmentId::new(leveler_core::new_uuid_string()),
+                                    kind: AttachmentKind::Image,
+                                    name,
+                                    mime_type: stored.mime_type,
+                                    size_bytes: stored.size_bytes,
+                                    sha256: stored.sha256,
+                                    width: Some(stored.width),
+                                    height: Some(stored.height),
+                                },
+                            });
+                        }
+                        Err(error) => {
+                            let _ = events.send(RuntimeEvent::AttachmentProcessingFailed {
+                                error: error.to_string(),
+                            });
+                        }
+                    }
+                });
+                Ok(())
+            }
             ClientCommand::AddClipboardImage { session_id } => {
                 let media_root = self.media_root.clone();
                 let events = self.events_for(&session_id);

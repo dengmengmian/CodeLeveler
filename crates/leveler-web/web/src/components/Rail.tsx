@@ -526,6 +526,7 @@ function FilesPanel() {
   const sessionId = useSessionId();
   const openFile = useOpenFile();
   const [files, setFiles] = useState<string[] | null>(null);
+  const [filesTruncated, setFilesTruncated] = useState(false);
   const [filter, setFilter] = useState('');
   const [error, setError] = useState<string | null>(null);
 
@@ -534,13 +535,18 @@ function FilesPanel() {
     listFiles(sessionId)
       .then((r) => {
         setFiles(r.files);
+        setFilesTruncated(r.truncated);
         setError(null);
       })
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+      .catch((err: unknown) => {
+        setFilesTruncated(false);
+        setError(err instanceof Error ? err.message : String(err));
+      });
   }, [sessionId]);
 
   useEffect(() => {
     setFiles(null);
+    setFilesTruncated(false);
     refresh();
   }, [refresh]);
 
@@ -558,6 +564,7 @@ function FilesPanel() {
       />
       {error && <div className="rail-empty">{error}</div>}
       {!error && files === null && <div className="rail-empty">加载中…</div>}
+      {filesTruncated && <div className="rail-empty">仓库较大，仅显示部分文件。</div>}
       {files !== null && shown.length === 0 && <div className="rail-empty">无匹配文件。</div>}
       {files !== null && shown.length > 0 && (
         <FileTree paths={shown} filtering={filter.trim().length > 0} onOpen={openFile} />
@@ -668,19 +675,27 @@ function SearchPanel() {
   const openFile = useOpenFile();
   const [query, setQuery] = useState('');
   const [matches, setMatches] = useState<SearchMatch[] | null>(null);
+  const [matchesTruncated, setMatchesTruncated] = useState(false);
   const [searching, setSearching] = useState(false);
 
   // 输入防抖 300ms
   useEffect(() => {
     if (!sessionId || !query.trim()) {
       setMatches(null);
+      setMatchesTruncated(false);
       return;
     }
     setSearching(true);
     const timer = setTimeout(() => {
       searchFiles(sessionId, query.trim())
-        .then((r) => setMatches(r.matches))
-        .catch(() => setMatches([]))
+        .then((r) => {
+          setMatches(r.matches);
+          setMatchesTruncated(r.truncated);
+        })
+        .catch(() => {
+          setMatches([]);
+          setMatchesTruncated(false);
+        })
         .finally(() => setSearching(false));
     }, 300);
     return () => clearTimeout(timer);
@@ -700,6 +715,7 @@ function SearchPanel() {
       {!searching && matches !== null && matches.length === 0 && query.trim() && (
         <div className="rail-empty">无命中。</div>
       )}
+      {matchesTruncated && <div className="rail-empty">已达到搜索预算，仅显示部分结果。</div>}
       <div className="rp-list">
         {(matches ?? []).map((m, i) => (
           <button

@@ -952,10 +952,8 @@ fn toggle_current_expand(state: &mut AppState) {
         return;
     }
     if let Some(expanded) = state.transcript.toggle_last_tool_group() {
-        // Mirror into the legacy flag for any path still reading it, and bump
-        // the epoch so native scrollback re-lays out historical groups.
+        // Mirror into the workbench flag used to render the focused group.
         state.tools_expanded = expanded;
-        state.expand_epoch = state.expand_epoch.saturating_add(1);
     }
 }
 

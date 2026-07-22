@@ -272,16 +272,11 @@ pub struct AppState {
     pub queue_scroll: usize,
 
     /// Legacy global expand flag — no longer forces every tool group open.
-    /// Bumped indirectly via [`Self::expand_epoch`] for scrollback rebuilds.
-    /// Kept so Tools-screen tests and older paint paths compile; conversation
-    /// rendering uses per-group `ToolGroupBlock::expanded` only.
+    /// Kept so the workbench can render the currently focused tool group.
     pub tools_expanded: bool,
     /// Whether the live reasoning block is fully expanded (Ctrl+O when
     /// reasoning is the current focus).
     pub reasoning_expanded: bool,
-    /// Monotonic counter bumped when any expand/collapse changes historical
-    /// tool-group height so the event loop can rebuild native scrollback.
-    pub expand_epoch: u64,
     /// Shift+↑/↓ review index into user turns (`None` = live edge).
     /// Composer draft is never cleared while navigating.
     pub turn_nav: Option<usize>,
@@ -400,7 +395,6 @@ impl AppState {
             queue_scroll: 0,
             tools_expanded: false,
             reasoning_expanded: false,
-            expand_epoch: 0,
             turn_nav: None,
             slash_selected: 0,
             slash_popup_dismissed: false,

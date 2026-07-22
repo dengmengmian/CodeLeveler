@@ -9,6 +9,13 @@ use leveler_model::{FinishReason, ModelError, ModelErrorKind, ModelEvent, TokenU
 
 use super::wire::ChatChunk;
 
+/// Maximum tool-argument bytes retained and emitted for one model response.
+const MAX_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum distinct streaming tool-call slots retained for one response.
+const MAX_TOOL_CALLS: usize = 128;
+/// Tool names and provider call IDs should be small protocol metadata.
+const MAX_TOOL_METADATA_BYTES: usize = 8 * 1024;
+
 /// Map an OpenAI finish-reason string to the unified enum.
 pub(super) fn map_finish_reason(reason: &str) -> FinishReason {
     match reason {
@@ -30,15 +37,40 @@ struct ToolCallState {
 }
 
 /// Stateful assembler consuming decoded chunks and emitting unified events.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ChatStreamAssembler {
     tool_calls: BTreeMap<usize, ToolCallState>,
+    tool_argument_bytes: usize,
+    max_tool_argument_bytes: usize,
+    max_tool_calls: usize,
+    tool_arguments_overflowed: bool,
     completed: bool,
+}
+
+impl Default for ChatStreamAssembler {
+    fn default() -> Self {
+        Self {
+            tool_calls: BTreeMap::new(),
+            tool_argument_bytes: 0,
+            max_tool_argument_bytes: MAX_TOOL_ARGUMENT_BYTES,
+            max_tool_calls: MAX_TOOL_CALLS,
+            tool_arguments_overflowed: false,
+            completed: false,
+        }
+    }
 }
 
 impl ChatStreamAssembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_tool_argument_limit(limit: usize) -> Self {
+        Self {
+            max_tool_argument_bytes: limit,
+            ..Self::default()
+        }
     }
 
     /// Process one decoded chunk, returning the events it produced (in order).
@@ -58,15 +90,51 @@ impl ChatStreamAssembler {
 
             for tc in delta.tool_calls {
                 let index = tc.index;
+                if self.tool_arguments_overflowed {
+                    continue;
+                }
+                if !self.tool_calls.contains_key(&index)
+                    && self.tool_calls.len() == self.max_tool_calls
+                {
+                    self.tool_arguments_overflowed = true;
+                    events.push(stream_limit_error(format!(
+                        "streamed tool calls exceeded the {}-call limit",
+                        self.max_tool_calls
+                    )));
+                    continue;
+                }
                 let state = self.tool_calls.entry(index).or_default();
                 if let Some(id) = tc.id.filter(|s| !s.is_empty()) {
+                    if id.len() > MAX_TOOL_METADATA_BYTES {
+                        self.tool_arguments_overflowed = true;
+                        events.push(stream_limit_error(format!(
+                            "streamed tool-call id exceeded the {MAX_TOOL_METADATA_BYTES}-byte limit"
+                        )));
+                        continue;
+                    }
                     state.id = Some(id);
                 }
                 if let Some(func) = tc.function {
                     if let Some(name) = func.name.filter(|s| !s.is_empty()) {
+                        if name.len() > MAX_TOOL_METADATA_BYTES {
+                            self.tool_arguments_overflowed = true;
+                            events.push(stream_limit_error(format!(
+                                "streamed tool name exceeded the {MAX_TOOL_METADATA_BYTES}-byte limit"
+                            )));
+                            continue;
+                        }
                         state.name = Some(name);
                     }
                     if let Some(args) = func.arguments.filter(|s| !s.is_empty()) {
+                        let next_size = self.tool_argument_bytes.checked_add(args.len());
+                        if next_size.is_none_or(|size| size > self.max_tool_argument_bytes) {
+                            self.tool_arguments_overflowed = true;
+                            events.push(stream_limit_error(format!(
+                                "streamed tool arguments exceeded the {}-byte limit",
+                                self.max_tool_argument_bytes
+                            )));
+                            continue;
+                        }
                         if !state.started_emitted {
                             events.push(ModelEvent::ToolCallStarted {
                                 index,
@@ -80,6 +148,7 @@ impl ChatStreamAssembler {
                             delta: args.clone(),
                         });
                         state.arguments.push_str(&args);
+                        self.tool_argument_bytes = next_size.expect("size checked above");
                         continue;
                     }
                 }
@@ -127,6 +196,17 @@ impl ChatStreamAssembler {
         }
         self.completed = true;
         let mut events = Vec::new();
+
+        // Once the response crossed the global argument budget, do not turn any
+        // partially retained data into executable calls. The decode error was
+        // emitted at the offending delta.
+        if self.tool_arguments_overflowed {
+            self.tool_calls.clear();
+            events.push(ModelEvent::MessageCompleted {
+                finish_reason: map_finish_reason(reason),
+            });
+            return events;
+        }
 
         for (index, state) in std::mem::take(&mut self.tool_calls) {
             let Some(name) = state.name else {
@@ -189,6 +269,12 @@ impl ChatStreamAssembler {
     /// Whether a terminal `MessageCompleted` has already been emitted.
     pub fn is_completed(&self) -> bool {
         self.completed
+    }
+}
+
+fn stream_limit_error(message: String) -> ModelEvent {
+    ModelEvent::Error {
+        error: ModelError::new(ModelErrorKind::Decode, message),
     }
 }
 
@@ -258,6 +344,72 @@ mod tests {
             !evs.iter()
                 .any(|e| matches!(e, ModelEvent::ToolCallCompleted { .. }))
         );
+    }
+
+    #[test]
+    fn oversized_tool_arguments_emit_one_error_and_never_complete_a_call() {
+        let mut a = ChatStreamAssembler::with_tool_argument_limit(8);
+        let first = a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": "f", "arguments": "{\"a\":"}}
+            ]}}]
+        })));
+        assert!(!first.iter().any(|e| matches!(e, ModelEvent::Error { .. })));
+
+        let overflow = a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "12345}"}}
+            ]}}]
+        })));
+        assert_eq!(
+            overflow
+                .iter()
+                .filter(|e| matches!(e, ModelEvent::Error { .. }))
+                .count(),
+            1
+        );
+        assert!(!overflow.iter().any(|e| matches!(
+            e,
+            ModelEvent::ToolCallArgumentsDelta { delta, .. } if delta == "12345}"
+        )));
+
+        // Additional fragments do not produce repeated errors or retained data.
+        let ignored = a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "more"}}
+            ]}}]
+        })));
+        assert!(ignored.is_empty());
+
+        let done = a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        })));
+        assert!(
+            !done
+                .iter()
+                .any(|e| matches!(e, ModelEvent::ToolCallCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn distinct_tool_call_slots_are_bounded() {
+        let mut a = ChatStreamAssembler::new();
+        a.max_tool_calls = 1;
+        a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c0", "function": {"name": "f"}}
+            ]}}]
+        })));
+        let overflow = a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 1, "id": "c1", "function": {"name": "f"}}
+            ]}}]
+        })));
+        assert_eq!(a.tool_calls.len(), 1);
+        assert!(overflow.iter().any(|event| matches!(
+            event,
+            ModelEvent::Error { error } if error.kind == ModelErrorKind::Decode
+        )));
     }
 
     #[test]

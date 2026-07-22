@@ -51,16 +51,33 @@ trap 'rm -rf "$tmp"' EXIT
 echo "Downloading ${name}.tar.gz ..."
 curl -fSL "${base}/${name}.tar.gz" -o "$tmp/${name}.tar.gz" || die "download failed"
 
-# Verify sha256 when a checksum file and a hashing tool are both available.
-if curl -fsSL "${base}/${name}.tar.gz.sha256" -o "$tmp/${name}.tar.gz.sha256" 2>/dev/null; then
-  want="$(cut -d' ' -f1 "$tmp/${name}.tar.gz.sha256")"
-  if have shasum; then got="$(shasum -a 256 "$tmp/${name}.tar.gz" | cut -d' ' -f1)"
-  elif have sha256sum; then got="$(sha256sum "$tmp/${name}.tar.gz" | cut -d' ' -f1)"
-  else got=""; fi
-  if [ -n "$got" ] && [ "$want" != "$got" ]; then
-    die "sha256 mismatch (want $want, got $got)"
-  fi
+# Verification is mandatory: never install an executable when its checksum is
+# missing, malformed, or cannot be calculated on this host.
+checksum="$tmp/${name}.tar.gz.sha256"
+curl -fsSL "${base}/${name}.tar.gz.sha256" -o "$checksum" 2>/dev/null \
+  || die "checksum download failed; refusing unverified install"
+want="$(cut -d' ' -f1 "$checksum")"
+case "$want" in
+  ""|*[!0-9a-fA-F]*) die "invalid sha256 checksum file" ;;
+esac
+[ "${#want}" -eq 64 ] || die "invalid sha256 checksum file"
+want="$(printf '%s' "$want" | tr 'A-F' 'a-f')"
+
+if have shasum; then
+  got="$(shasum -a 256 "$tmp/${name}.tar.gz" | cut -d' ' -f1)" \
+    || die "could not calculate sha256"
+elif have sha256sum; then
+  got="$(sha256sum "$tmp/${name}.tar.gz" | cut -d' ' -f1)" \
+    || die "could not calculate sha256"
+else
+  die "shasum or sha256sum is required; refusing unverified install"
 fi
+case "$got" in
+  ""|*[!0-9a-fA-F]*) die "hash tool returned an invalid sha256" ;;
+esac
+[ "${#got}" -eq 64 ] || die "hash tool returned an invalid sha256"
+got="$(printf '%s' "$got" | tr 'A-F' 'a-f')"
+[ "$want" = "$got" ] || die "sha256 mismatch (want $want, got $got)"
 
 tar -xzf "$tmp/${name}.tar.gz" -C "$tmp"
 mkdir -p "$BIN_DIR"

@@ -14,6 +14,13 @@ use super::wire::{
     StreamMessageStart,
 };
 
+/// Maximum tool-argument bytes retained and emitted for one model response.
+const MAX_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum distinct content-block slots retained for one response.
+const MAX_CONTENT_BLOCKS: usize = 128;
+/// Tool names and provider call IDs should be small protocol metadata.
+const MAX_TOOL_METADATA_BYTES: usize = 8 * 1024;
+
 /// Map an Anthropic `stop_reason` to the unified enum.
 pub(super) fn map_stop_reason(reason: &str) -> FinishReason {
     match reason {
@@ -35,13 +42,33 @@ struct BlockState {
 
 /// Stateful assembler consuming decoded Anthropic events and emitting unified
 /// events in order.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AnthropicStreamAssembler {
     blocks: BTreeMap<usize, BlockState>,
+    tool_argument_bytes: usize,
+    max_tool_argument_bytes: usize,
+    max_content_blocks: usize,
+    tool_arguments_overflowed: bool,
     input_tokens: u64,
     output_tokens: u64,
     cache_read: u64,
     completed: bool,
+}
+
+impl Default for AnthropicStreamAssembler {
+    fn default() -> Self {
+        Self {
+            blocks: BTreeMap::new(),
+            tool_argument_bytes: 0,
+            max_tool_argument_bytes: MAX_TOOL_ARGUMENT_BYTES,
+            max_content_blocks: MAX_CONTENT_BLOCKS,
+            tool_arguments_overflowed: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            completed: false,
+        }
+    }
 }
 
 impl AnthropicStreamAssembler {
@@ -49,10 +76,23 @@ impl AnthropicStreamAssembler {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_tool_argument_limit(limit: usize) -> Self {
+        Self {
+            max_tool_argument_bytes: limit,
+            ..Self::default()
+        }
+    }
+
     /// Process one SSE event (its `event:` type and JSON `data`), returning the
     /// unified events it produced. A malformed payload yields a single decode
     /// `Error` event rather than aborting the stream.
     pub fn on_event(&mut self, event: &str, data: &str) -> Vec<ModelEvent> {
+        if self.tool_arguments_overflowed
+            && matches!(event, "content_block_start" | "content_block_delta")
+        {
+            return Vec::new();
+        }
         match event {
             "message_start" => match serde_json::from_str::<StreamMessageStart>(data) {
                 Ok(m) => {
@@ -65,8 +105,26 @@ impl AnthropicStreamAssembler {
                 Err(e) => vec![decode_error(e)],
             },
             "content_block_start" => match serde_json::from_str::<StreamContentBlockStart>(data) {
+                Ok(s)
+                    if !self.blocks.contains_key(&s.index)
+                        && self.blocks.len() == self.max_content_blocks =>
+                {
+                    self.tool_arguments_overflowed = true;
+                    vec![stream_limit_error(format!(
+                        "streamed content blocks exceeded the {}-block limit",
+                        self.max_content_blocks
+                    ))]
+                }
                 Ok(s) => match s.content_block {
                     RespBlock::ToolUse { id, name, .. } => {
+                        if id.len() > MAX_TOOL_METADATA_BYTES
+                            || name.len() > MAX_TOOL_METADATA_BYTES
+                        {
+                            self.tool_arguments_overflowed = true;
+                            return vec![stream_limit_error(format!(
+                                "streamed tool metadata exceeded the {MAX_TOOL_METADATA_BYTES}-byte field limit"
+                            ))];
+                        }
                         self.blocks.insert(
                             s.index,
                             BlockState {
@@ -96,9 +154,21 @@ impl AnthropicStreamAssembler {
                         vec![ModelEvent::ReasoningDelta { delta: thinking }]
                     }
                     BlockDelta::InputJsonDelta { partial_json } => {
+                        if self.tool_arguments_overflowed {
+                            return Vec::new();
+                        }
+                        let next_size = self.tool_argument_bytes.checked_add(partial_json.len());
+                        if next_size.is_none_or(|size| size > self.max_tool_argument_bytes) {
+                            self.tool_arguments_overflowed = true;
+                            return vec![stream_limit_error(format!(
+                                "streamed tool arguments exceeded the {}-byte limit",
+                                self.max_tool_argument_bytes
+                            ))];
+                        }
                         if let Some(b) = self.blocks.get_mut(&d.index) {
                             b.json.push_str(&partial_json);
                         }
+                        self.tool_argument_bytes = next_size.expect("size checked above");
                         if partial_json.is_empty() {
                             Vec::new()
                         } else {
@@ -146,6 +216,17 @@ impl AnthropicStreamAssembler {
                 cached_input_tokens: self.cache_read,
             },
         }];
+
+        // Once the response crossed the global argument budget, do not turn any
+        // partially retained data into executable calls. The decode error was
+        // emitted at the offending delta.
+        if self.tool_arguments_overflowed {
+            self.blocks.clear();
+            events.push(ModelEvent::MessageCompleted {
+                finish_reason: map_stop_reason(reason),
+            });
+            return events;
+        }
 
         for (index, block) in std::mem::take(&mut self.blocks) {
             let Some((id, name)) = block.tool else {
@@ -214,6 +295,12 @@ fn decode_error(e: serde_json::Error) -> ModelEvent {
             ModelErrorKind::Decode,
             format!("malformed stream event: {e}"),
         ),
+    }
+}
+
+fn stream_limit_error(message: String) -> ModelEvent {
+    ModelEvent::Error {
+        error: ModelError::new(ModelErrorKind::Decode, message),
     }
 }
 
@@ -330,6 +417,78 @@ mod tests {
         assert!(
             !evs.iter()
                 .any(|e| matches!(e, ModelEvent::ToolCallCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn oversized_tool_arguments_emit_one_error_and_never_complete_a_call() {
+        let mut a = AnthropicStreamAssembler::with_tool_argument_limit(8);
+        a.on_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"tool_use","id":"t1","name":"f","input":{}}}"#,
+        );
+        let first = a.on_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}"#,
+        );
+        assert!(!first.iter().any(|e| matches!(e, ModelEvent::Error { .. })));
+
+        let overflow = a.on_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"12345}"}}"#,
+        );
+        assert_eq!(
+            overflow
+                .iter()
+                .filter(|e| matches!(e, ModelEvent::Error { .. }))
+                .count(),
+            1
+        );
+        assert!(!overflow.iter().any(|e| matches!(
+            e,
+            ModelEvent::ToolCallArgumentsDelta { delta, .. } if delta == "12345}"
+        )));
+
+        let ignored = a.on_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"more"}}"#,
+        );
+        assert!(ignored.is_empty());
+
+        let done = a.on_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+        );
+        assert!(
+            !done
+                .iter()
+                .any(|e| matches!(e, ModelEvent::ToolCallCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn distinct_content_block_slots_are_bounded() {
+        let mut a = AnthropicStreamAssembler::new();
+        a.max_content_blocks = 1;
+        a.on_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"text","text":""}}"#,
+        );
+        let overflow = a.on_event(
+            "content_block_start",
+            r#"{"index":1,"content_block":{"type":"text","text":""}}"#,
+        );
+        assert_eq!(a.blocks.len(), 1);
+        assert!(overflow.iter().any(|event| matches!(
+            event,
+            ModelEvent::Error { error } if error.kind == ModelErrorKind::Decode
+        )));
+        assert!(
+            a.on_event(
+                "content_block_start",
+                r#"{"index":2,"content_block":{"type":"text","text":""}}"#,
+            )
+            .is_empty()
         );
     }
 

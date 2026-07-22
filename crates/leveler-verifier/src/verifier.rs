@@ -626,7 +626,17 @@ mod tests {
     #[tokio::test]
     async fn acceptance_command_exit_zero_is_met_nonzero_unmet_absent_unverifiable() {
         use crate::acceptance::{AcceptanceCheck, AcceptanceStatus};
-        let v = Verifier::new(std::env::temp_dir());
+        // Library tests intentionally have no installed global environment
+        // capability. Acceptance commands are confined and therefore need the
+        // same explicit host snapshot supplied by the application root.
+        let v = Verifier::with_environment(
+            std::env::temp_dir(),
+            Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )),
+        );
         let checks = vec![
             AcceptanceCheck {
                 id: "AC-1".into(),

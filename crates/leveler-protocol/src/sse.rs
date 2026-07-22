@@ -13,6 +13,13 @@
 //!
 //! The parser never assumes a chunk boundary aligns with anything.
 
+use std::fmt;
+
+/// Maximum bytes in one unterminated SSE line.
+pub const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+/// Maximum joined `data:` payload bytes in one SSE event.
+pub const MAX_SSE_EVENT_DATA_BYTES: usize = 8 * 1024 * 1024;
+
 /// A dispatched SSE event: its `event:` type (if any) and joined `data` payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -20,17 +27,60 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// A size-limit violation while decoding an SSE stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SseDecodeError {
+    LineTooLong { limit: usize },
+    EventDataTooLarge { limit: usize },
+}
+
+impl fmt::Display for SseDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LineTooLong { limit } => {
+                write!(f, "SSE line exceeded the {limit}-byte limit")
+            }
+            Self::EventDataTooLarge { limit } => {
+                write!(f, "SSE event data exceeded the {limit}-byte limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SseDecodeError {}
+
 /// Incremental SSE decoder. Hold one per stream and feed it bytes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseDecoder {
-    /// Bytes received but not yet forming a complete line.
+    /// Bytes received but not yet forming a complete line. Terminators are not stored.
     buffer: Vec<u8>,
+    /// A trailing `\r` is held until the next byte to distinguish `\r` from `\r\n`.
+    pending_cr: bool,
     /// The `event:` value for the event currently being assembled.
     current_event: Option<String>,
-    /// The `data:` lines accumulated for the current event.
-    data_lines: Vec<String>,
+    /// Joined `data:` payload for the current event.
+    data: String,
+    has_data: bool,
+    max_event_data_bytes: usize,
     /// True if any field has been seen since the last dispatch.
     has_fields: bool,
+    /// A failed decoder stays failed so callers cannot accidentally continue it.
+    failed: Option<SseDecodeError>,
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self {
+            buffer: Vec::new(),
+            pending_cr: false,
+            current_event: None,
+            data: String::new(),
+            has_data: false,
+            max_event_data_bytes: MAX_SSE_EVENT_DATA_BYTES,
+            has_fields: false,
+            failed: None,
+        }
+    }
 }
 
 impl SseDecoder {
@@ -38,64 +88,89 @@ impl SseDecoder {
         Self::default()
     }
 
-    /// Feed a raw byte chunk; returns any events completed by this chunk.
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        self.buffer.extend_from_slice(chunk);
-        let mut events = Vec::new();
-
-        // Extract complete lines. We look for `\n`; `\r` is normalized. A lone
-        // trailing `\r` at the very end of the buffer is held back in case the
-        // next chunk starts with `\n` (a split `\r\n`).
-        loop {
-            let Some(nl) = self.buffer.iter().position(|&b| b == b'\n') else {
-                // No newline; but a completed line could still be `\r`-terminated.
-                if let Some(event) = self.try_split_cr() {
-                    if let Some(ev) = event {
-                        events.push(ev);
-                    }
-                    continue;
-                }
-                break;
-            };
-
-            let mut line: Vec<u8> = self.buffer.drain(..=nl).collect();
-            line.pop(); // remove '\n'
-            if line.last() == Some(&b'\r') {
-                line.pop(); // remove '\r' of a '\r\n' pair
-            }
-            if let Some(ev) = self.process_line(&line) {
-                events.push(ev);
-            }
+    #[cfg(test)]
+    fn with_event_data_limit(limit: usize) -> Self {
+        Self {
+            max_event_data_bytes: limit,
+            ..Self::default()
         }
-
-        events
     }
 
-    /// Handle `\r`-only line terminators that appear without a following `\n`.
-    /// Returns `Some(None)` if a line was processed but produced no event,
-    /// `Some(Some(ev))` if it dispatched, and `None` if there is nothing to do.
-    fn try_split_cr(&mut self) -> Option<Option<SseEvent>> {
-        // Find a `\r` that is not the final byte (a final `\r` might be the first
-        // half of a `\r\n` still in flight, so we wait for more input).
-        let pos = self.buffer.iter().position(|&b| b == b'\r')?;
-        if pos == self.buffer.len() - 1 {
-            return None;
+    /// Feed a raw byte chunk, preserving the original infallible API.
+    ///
+    /// Size-limit failures poison and clear the decoder and produce no events.
+    /// New stream consumers should use [`Self::try_feed`] to surface the reason.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        self.try_feed(chunk).unwrap_or_default()
+    }
+
+    /// Feed a raw byte chunk; returns any events completed by this chunk.
+    ///
+    /// Lines and event data are bounded so a peer cannot grow decoder memory
+    /// indefinitely by withholding a terminator or event boundary.
+    pub fn try_feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseDecodeError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
         }
-        let mut line: Vec<u8> = self.buffer.drain(..=pos).collect();
-        line.pop(); // remove '\r'
-        Some(self.process_line(&line))
+
+        let mut events = Vec::new();
+        for &byte in chunk {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if let Some(event) = self.process_buffered_line()? {
+                    events.push(event);
+                }
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+
+            match byte {
+                b'\n' => {
+                    if let Some(event) = self.process_buffered_line()? {
+                        events.push(event);
+                    }
+                }
+                b'\r' => self.pending_cr = true,
+                _ => {
+                    if self.buffer.len() == MAX_SSE_LINE_BYTES {
+                        return self.fail(SseDecodeError::LineTooLong {
+                            limit: MAX_SSE_LINE_BYTES,
+                        });
+                    }
+                    self.buffer.push(byte);
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
+    fn fail<T>(&mut self, error: SseDecodeError) -> Result<T, SseDecodeError> {
+        self.buffer.clear();
+        self.current_event = None;
+        self.data.clear();
+        self.has_data = false;
+        self.has_fields = false;
+        self.failed = Some(error.clone());
+        Err(error)
+    }
+
+    fn process_buffered_line(&mut self) -> Result<Option<SseEvent>, SseDecodeError> {
+        let line = std::mem::take(&mut self.buffer);
+        self.process_line(&line)
     }
 
     /// Process one complete logical line (without its terminator).
-    fn process_line(&mut self, line: &[u8]) -> Option<SseEvent> {
+    fn process_line(&mut self, line: &[u8]) -> Result<Option<SseEvent>, SseDecodeError> {
         // Blank line: dispatch the current event (if any fields were seen).
         if line.is_empty() {
-            return self.dispatch();
+            return Ok(self.dispatch());
         }
 
         // Comment line.
         if line.first() == Some(&b':') {
-            return None;
+            return Ok(None);
         }
 
         let text = String::from_utf8_lossy(line);
@@ -110,12 +185,34 @@ impl SseDecoder {
 
         self.has_fields = true;
         match field {
-            "data" => self.data_lines.push(value.to_string()),
+            "data" => {
+                let separator = usize::from(self.has_data);
+                let Some(next_size) = self
+                    .data
+                    .len()
+                    .checked_add(separator)
+                    .and_then(|n| n.checked_add(value.len()))
+                else {
+                    return self.fail(SseDecodeError::EventDataTooLarge {
+                        limit: self.max_event_data_bytes,
+                    });
+                };
+                if next_size > self.max_event_data_bytes {
+                    return self.fail(SseDecodeError::EventDataTooLarge {
+                        limit: self.max_event_data_bytes,
+                    });
+                }
+                if separator != 0 {
+                    self.data.push('\n');
+                }
+                self.data.push_str(value);
+                self.has_data = true;
+            }
             "event" => self.current_event = Some(value.to_string()),
             // id / retry / unknown fields are irrelevant to LLM streaming.
             _ => {}
         }
-        None
+        Ok(None)
     }
 
     /// Emit the accumulated event and reset. Returns `None` for empty dispatches
@@ -125,8 +222,8 @@ impl SseDecoder {
             return None;
         }
         let event = self.current_event.take();
-        let data = self.data_lines.join("\n");
-        self.data_lines.clear();
+        let data = std::mem::take(&mut self.data);
+        self.has_data = false;
         self.has_fields = false;
         Some(SseEvent { event, data })
     }
@@ -139,7 +236,7 @@ mod tests {
     fn feed_all(decoder: &mut SseDecoder, chunks: &[&[u8]]) -> Vec<SseEvent> {
         let mut out = Vec::new();
         for c in chunks {
-            out.extend(decoder.feed(c));
+            out.extend(decoder.try_feed(c).unwrap());
         }
         out
     }
@@ -155,18 +252,17 @@ mod tests {
     #[test]
     fn joins_multiple_data_lines() {
         let mut d = SseDecoder::new();
-        let events = d.feed(b"data: a\ndata: b\n\n");
+        let events = d.try_feed(b"data: a\ndata: b\n\n").unwrap();
         assert_eq!(events[0].data, "a\nb");
     }
 
     #[test]
     fn tolerates_byte_level_fragmentation() {
         let mut d = SseDecoder::new();
-        // Feed one byte at a time.
         let input = b"data: {\"x\":1}\n\n";
         let mut events = Vec::new();
         for &byte in input {
-            events.extend(d.feed(&[byte]));
+            events.extend(d.try_feed(&[byte]).unwrap());
         }
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "{\"x\":1}");
@@ -175,7 +271,7 @@ mod tests {
     #[test]
     fn handles_crlf_line_endings() {
         let mut d = SseDecoder::new();
-        let events = d.feed(b"data: hi\r\n\r\n");
+        let events = d.try_feed(b"data: hi\r\n\r\n").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hi");
     }
@@ -189,9 +285,19 @@ mod tests {
     }
 
     #[test]
+    fn handles_cr_only_line_endings() {
+        let mut d = SseDecoder::new();
+        let events = d.try_feed(b"data: hi\r\rnext").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "hi");
+    }
+
+    #[test]
     fn ignores_comments_and_blank_leading_lines() {
         let mut d = SseDecoder::new();
-        let events = d.feed(b"\n: this is a comment\ndata: real\n\n");
+        let events = d
+            .try_feed(b"\n: this is a comment\ndata: real\n\n")
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "real");
     }
@@ -199,21 +305,21 @@ mod tests {
     #[test]
     fn preserves_json_with_colons_in_value() {
         let mut d = SseDecoder::new();
-        let events = d.feed(b"data: {\"a\":\"b:c\"}\n\n");
+        let events = d.try_feed(b"data: {\"a\":\"b:c\"}\n\n").unwrap();
         assert_eq!(events[0].data, "{\"a\":\"b:c\"}");
     }
 
     #[test]
     fn captures_event_field() {
         let mut d = SseDecoder::new();
-        let events = d.feed(b"event: done\ndata: {}\n\n");
+        let events = d.try_feed(b"event: done\ndata: {}\n\n").unwrap();
         assert_eq!(events[0].event.as_deref(), Some("done"));
     }
 
     #[test]
     fn multiple_events_in_one_chunk() {
         let mut d = SseDecoder::new();
-        let events = d.feed(b"data: 1\n\ndata: 2\n\ndata: 3\n\n");
+        let events = d.try_feed(b"data: 1\n\ndata: 2\n\ndata: 3\n\n").unwrap();
         let datas: Vec<_> = events.iter().map(|e| e.data.as_str()).collect();
         assert_eq!(datas, ["1", "2", "3"]);
     }
@@ -221,7 +327,47 @@ mod tests {
     #[test]
     fn value_without_colon_is_empty() {
         let mut d = SseDecoder::new();
-        let events = d.feed(b"data\n\n");
+        let events = d.try_feed(b"data\n\n").unwrap();
         assert_eq!(events[0].data, "");
+    }
+
+    #[test]
+    fn rejects_an_unterminated_line_over_the_limit() {
+        let mut d = SseDecoder::new();
+        d.try_feed(&vec![b'x'; MAX_SSE_LINE_BYTES]).unwrap();
+        let err = d.try_feed(b"x").unwrap_err();
+        assert_eq!(
+            err,
+            SseDecodeError::LineTooLong {
+                limit: MAX_SSE_LINE_BYTES
+            }
+        );
+        assert_eq!(d.try_feed(b"data: ignored\n\n").unwrap_err(), err);
+    }
+
+    #[test]
+    fn accepts_a_line_exactly_at_the_limit() {
+        let mut d = SseDecoder::new();
+        let mut line = vec![b'x'; MAX_SSE_LINE_BYTES];
+        line.push(b'\n');
+        d.try_feed(&line).unwrap();
+    }
+
+    #[test]
+    fn rejects_cumulative_event_data_over_the_limit() {
+        let mut d = SseDecoder::with_event_data_limit(7);
+        d.try_feed(b"data: abc\ndata: def\n").unwrap();
+        let err = d.try_feed(b"data: x\n").unwrap_err();
+        assert_eq!(err, SseDecodeError::EventDataTooLarge { limit: 7 });
+    }
+
+    #[test]
+    fn empty_data_lines_are_bounded_by_the_same_payload_buffer() {
+        let mut d = SseDecoder::with_event_data_limit(8);
+        // The first empty value uses zero bytes; each join newline after it uses one.
+        d.try_feed(b"data:\ndata:\ndata:\ndata:\ndata:\ndata:\ndata:\ndata:\ndata:\n")
+            .unwrap();
+        let err = d.try_feed(b"data:\n").unwrap_err();
+        assert_eq!(err, SseDecodeError::EventDataTooLarge { limit: 8 });
     }
 }

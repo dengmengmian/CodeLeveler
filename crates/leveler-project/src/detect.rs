@@ -108,18 +108,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tmpdir() -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("leveler-detect-{}", leveler_test_ordinal()));
-        fs::create_dir_all(&base).unwrap();
-        base
-    }
-
-    // A tiny monotonic-ish suffix without pulling in rand or time (both banned in
-    // some contexts): use an atomic counter.
-    fn leveler_test_ordinal() -> u64 {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        N.fetch_add(1, Ordering::Relaxed)
+    fn tmpdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("leveler-detect-")
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -151,50 +144,45 @@ mod tests {
     #[test]
     fn detects_rust() {
         let dir = tmpdir();
-        fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
-        assert_eq!(detect_languages(&dir), vec![Language::Rust]);
-        fs::remove_dir_all(&dir).ok();
+        fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(detect_languages(dir.path()), vec![Language::Rust]);
     }
 
     #[test]
     fn detects_multiple_in_order() {
         let dir = tmpdir();
-        fs::write(dir.join("Cargo.toml"), "").unwrap();
-        fs::write(dir.join("go.mod"), "").unwrap();
-        fs::write(dir.join("tsconfig.json"), "{}").unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        fs::write(dir.path().join("go.mod"), "").unwrap();
+        fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
         assert_eq!(
-            detect_languages(&dir),
+            detect_languages(dir.path()),
             vec![Language::Rust, Language::Go, Language::TypeScript]
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn package_json_without_tsconfig_is_javascript() {
         let dir = tmpdir();
-        fs::write(dir.join("package.json"), "{}").unwrap();
-        assert_eq!(detect_languages(&dir), vec![Language::JavaScript]);
-        fs::remove_dir_all(&dir).ok();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(detect_languages(dir.path()), vec![Language::JavaScript]);
     }
 
     #[test]
     fn detects_python_java_csharp() {
         let dir = tmpdir();
-        fs::write(dir.join("pyproject.toml"), "").unwrap();
-        fs::write(dir.join("pom.xml"), "").unwrap();
-        fs::write(dir.join("App.csproj"), "").unwrap();
-        let langs = detect_languages(&dir);
+        fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        fs::write(dir.path().join("pom.xml"), "").unwrap();
+        fs::write(dir.path().join("App.csproj"), "").unwrap();
+        let langs = detect_languages(dir.path());
         assert!(langs.contains(&Language::Python));
         assert!(langs.contains(&Language::Java));
         assert!(langs.contains(&Language::CSharp));
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn empty_when_no_markers() {
         let dir = tmpdir();
-        assert!(detect_languages(&dir).is_empty());
-        fs::remove_dir_all(&dir).ok();
+        assert!(detect_languages(dir.path()).is_empty());
     }
 
     #[test]
@@ -213,10 +201,9 @@ mod tests {
     #[test]
     fn dir_has_extension_finds_matching_files() {
         let dir = tmpdir();
-        fs::write(dir.join("App.csproj"), "").unwrap();
-        assert!(dir_has_extension(&dir, "csproj"));
-        assert!(!dir_has_extension(&dir, "sln"));
-        fs::remove_dir_all(&dir).ok();
+        fs::write(dir.path().join("App.csproj"), "").unwrap();
+        assert!(dir_has_extension(dir.path(), "csproj"));
+        assert!(!dir_has_extension(dir.path(), "sln"));
     }
 
     #[test]

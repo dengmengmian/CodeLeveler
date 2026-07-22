@@ -15,14 +15,16 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use image::ImageFormat;
 use image::imageops::FilterType;
+use image::{ImageFormat, ImageReader, Limits};
 use sha2::{Digest, Sha256};
 
 /// Maximum accepted source file size (spec §41).
 pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 /// Maximum decoded pixel count, to defeat decompression bombs (spec §45).
 pub const MAX_PIXELS: u64 = 40_000_000;
+/// Maximum memory the image decoder may allocate while importing one image.
+const MAX_DECODE_ALLOC_BYTES: u64 = MAX_PIXELS * 8;
 /// Longest-edge cap; larger images are downscaled (spec §41).
 pub const MAX_DIMENSION: u32 = 2048;
 
@@ -60,6 +62,15 @@ impl ImageKind {
             _ => None,
         }
     }
+
+    fn image_format(self) -> ImageFormat {
+        match self {
+            Self::Png => ImageFormat::Png,
+            Self::Jpeg => ImageFormat::Jpeg,
+            Self::Webp => ImageFormat::WebP,
+            Self::Gif => ImageFormat::Gif,
+        }
+    }
 }
 
 /// A processed, stored image.
@@ -91,6 +102,19 @@ impl MediaStore {
         self.import_bytes(&bytes)
     }
 
+    /// Import immutable base64-encoded source bytes received over the client
+    /// protocol. Bound the encoded form before allocating the decoded buffer.
+    pub fn import_base64(&self, encoded: &str) -> Result<StoredImage, MediaError> {
+        const MAX_ENCODED_BYTES: usize = (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+        if encoded.len() > MAX_ENCODED_BYTES {
+            return Err(MediaError::TooLarge(MAX_IMAGE_BYTES + 1));
+        }
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|error| MediaError::Decode(format!("invalid base64 attachment: {error}")))?;
+        self.import_bytes(&bytes)
+    }
+
     /// Import an image from raw bytes: validate, decode, bound, strip EXIF,
     /// downscale, hash, and store (deduplicating by hash).
     pub fn import_bytes(&self, bytes: &[u8]) -> Result<StoredImage, MediaError> {
@@ -101,18 +125,31 @@ impl MediaStore {
 
         // Real type from content, not the extension (spec §45).
         let mime = infer::get(bytes).map(|t| t.mime_type().to_string());
-        if mime.as_deref().and_then(ImageKind::from_mime).is_none() {
+        let Some(kind) = mime.as_deref().and_then(ImageKind::from_mime) else {
             return Err(MediaError::Unsupported(
                 mime.unwrap_or_else(|| "unknown".to_string()),
             ));
-        }
+        };
+        let format = kind.image_format();
 
-        let decoded =
-            image::load_from_memory(bytes).map_err(|e| MediaError::Decode(e.to_string()))?;
-        let pixels = decoded.width() as u64 * decoded.height() as u64;
-        if pixels > MAX_PIXELS {
-            return Err(MediaError::TooManyPixels(pixels));
-        }
+        // Read dimensions without materializing the pixel buffer. This must
+        // happen before decode so the pixel cap actually prevents image bombs.
+        let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
+            .into_dimensions()
+            .map_err(|e| MediaError::Decode(e.to_string()))?;
+        validate_pixel_count(width, height)?;
+
+        // Re-open the immutable byte slice for the full decode and enforce both
+        // the dimensions observed above and a bounded decoder allocation budget.
+        let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(width);
+        limits.max_image_height = Some(height);
+        limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+        reader.limits(limits);
+        let decoded = reader
+            .decode()
+            .map_err(|e| MediaError::Decode(e.to_string()))?;
 
         // Downscale if the longest edge exceeds the cap.
         let processed = if decoded.width().max(decoded.height()) > MAX_DIMENSION {
@@ -152,9 +189,19 @@ impl MediaStore {
         height: u32,
         rgba: &[u8],
     ) -> Result<StoredImage, MediaError> {
-        let buffer = image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or_else(|| {
-            MediaError::Decode("clipboard pixel buffer size mismatch".to_string())
-        })?;
+        let pixels = validate_pixel_count(width, height)?;
+        let expected_len = pixels
+            .checked_mul(4)
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| MediaError::Decode("clipboard dimensions overflow".to_string()))?;
+        if rgba.len() != expected_len {
+            return Err(MediaError::Decode(
+                "clipboard pixel buffer size mismatch".to_string(),
+            ));
+        }
+        // Copy only after all dimensions and lengths have been validated.
+        let buffer = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .expect("validated RGBA dimensions and length");
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(buffer)
             .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
@@ -169,6 +216,14 @@ impl MediaStore {
         let bytes = fs::read(&path).map_err(|e| MediaError::Io(e.to_string()))?;
         Ok(("image/png".to_string(), BASE64.encode(bytes)))
     }
+}
+
+fn validate_pixel_count(width: u32, height: u32) -> Result<u64, MediaError> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_PIXELS {
+        return Err(MediaError::TooManyPixels(pixels));
+    }
+    Ok(pixels)
 }
 
 /// Lowercase hex encoding of a byte slice.
@@ -191,6 +246,27 @@ mod tests {
         img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    fn png_with_declared_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut png = png_bytes(1, 1);
+        // PNG signature (8), IHDR length (4), type (4), then width and height.
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
     }
 
     #[test]
@@ -235,6 +311,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_excessive_declared_dimensions_before_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let width = 200_000;
+        let height = 201;
+        let err = store
+            .import_bytes(&png_with_declared_dimensions(width, height))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::TooManyPixels(pixels)
+                if pixels == u64::from(width) * u64::from(height)
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_rgba_dimensions_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let err = store.import_rgba(u32::MAX, u32::MAX, &[]).unwrap_err();
+        assert!(matches!(err, MediaError::TooManyPixels(_)));
+    }
+
+    #[test]
+    fn rejects_rgba_length_mismatch_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let err = store.import_rgba(2, 2, &[0; 15]).unwrap_err();
+        assert!(matches!(err, MediaError::Decode(message) if message.contains("size mismatch")));
+    }
+
+    #[test]
     fn load_base64_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let store = MediaStore::new(dir.path());
@@ -242,5 +350,16 @@ mod tests {
         let (mime, b64) = store.load_base64(&stored.sha256).unwrap();
         assert_eq!(mime, "image/png");
         assert!(!b64.is_empty());
+    }
+
+    #[test]
+    fn import_base64_uses_the_encoded_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = png_bytes(1, 1);
+        let encoded = BASE64.encode(&png);
+        let stored = MediaStore::new(dir.path()).import_base64(&encoded).unwrap();
+        assert_eq!(stored.mime_type, "image/png");
+        assert_eq!(stored.width, 1);
+        assert_eq!(stored.height, 1);
     }
 }

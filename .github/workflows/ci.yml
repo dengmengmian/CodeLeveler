@@ -66,6 +66,10 @@ jobs:
           cargo test -p leveler-execution windows_job_ --all-features -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Installer checksum canaries
+        if: runner.os == 'Linux'
+        run: sh scripts/test_install.sh
+
       - name: Test
         run: cargo test --workspace --all-features --locked
 

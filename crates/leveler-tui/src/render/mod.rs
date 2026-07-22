@@ -107,7 +107,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::panes::pad_line_to_width;
-    use super::text::{composer_text_window, display_window, sanitize_terminal_line};
+    use super::text::sanitize_terminal_line;
     use super::{
         assistant_split, item_render, render, render_list_focused, render_scrolled,
         tool_action_label, tool_summary, truncate_display,
@@ -134,29 +134,6 @@ mod tests {
         // Fits exactly (no ellipsis).
         assert_eq!(truncate_display("abc", 3), "abc");
         assert_eq!(truncate_display("你好", 4), "你好");
-    }
-
-    #[test]
-    fn composer_window_keeps_cursor_visible_on_overflow() {
-        // 10 CJK = 20 cells, room = 8. Cursor at the end (col 20) must be shown.
-        let text = "一二三四五六七八九十";
-        let (piece, hscroll) = composer_text_window(text, 20, 8);
-        assert!(hscroll > 0, "should scroll");
-        assert!(UnicodeWidthStr::width(piece.as_str()) <= 8);
-        assert!(
-            piece.starts_with('…'),
-            "scrolled input should show a left marker: {piece:?}"
-        );
-        // The visible window ends at the last chars, not the first.
-        assert!(piece.contains('十'), "tail visible: {piece:?}");
-        assert!(!piece.contains('一'), "head scrolled off: {piece:?}");
-    }
-
-    #[test]
-    fn composer_window_no_scroll_when_it_fits() {
-        let (piece, hscroll) = composer_text_window("你好", 4, 20);
-        assert_eq!(hscroll, 0);
-        assert_eq!(piece, "你好");
     }
 
     #[test]
@@ -313,16 +290,6 @@ mod tests {
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum();
         assert_eq!(tw, 5);
-    }
-
-    #[test]
-    fn display_window_aligns_on_cells_and_drops_straddling_wide_char() {
-        // Window [1,5) of two CJK (cols 0-1, 2-3): the first char straddles the
-        // left edge → blank; the second is fully inside.
-        let out = display_window("你好", 1, 4);
-        assert!(UnicodeWidthStr::width(out.as_str()) <= 4);
-        assert!(out.starts_with(' '), "straddling char shown blank: {out:?}");
-        assert!(out.contains('好'));
     }
 
     // Replays the run-loop's progressive commit over cumulative streaming
