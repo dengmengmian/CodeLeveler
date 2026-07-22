@@ -668,7 +668,12 @@ mod tests {
         let mut state = RegistryState::default();
         for index in 0..(MAX_RETAINED_TERMINAL_TASKS + 3) {
             let id = format!("terminal-{index:03}");
-            let finished = now - Duration::from_secs((1000 - index) as u64);
+            // Build ascending instants by ADDING to `now` (higher index = more
+            // recent), never subtracting a large Duration from Instant::now():
+            // on Windows Instant is QPC-from-boot, so `now - 1000s` underflows
+            // the monotonic epoch on a low-uptime runner and panics. prune only
+            // needs relative ordering, which addition preserves identically.
+            let finished = now + Duration::from_secs(index as u64);
             state.tasks.insert(
                 id.clone(),
                 TaskInner {

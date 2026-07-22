@@ -321,7 +321,7 @@ pub async fn run(
         }
 
         // Fade a stale notification so old notices don't linger forever.
-        if expire_notification(&mut state, &mut note_shown) {
+        if expire_notification(&mut state, &mut note_shown, Instant::now()) {
             paint_now = true;
         }
 
@@ -562,15 +562,19 @@ fn collect_project_files(repository: &str) -> Vec<String> {
 
 /// Clear `state.notification` once it has been on screen longer than its TTL.
 /// Errors stick until Esc / next action; info is short-lived, warnings longer.
-fn expire_notification(state: &mut AppState, shown: &mut Option<(Notification, Instant)>) -> bool {
+fn expire_notification(
+    state: &mut AppState,
+    shown: &mut Option<(Notification, Instant)>,
+    now: Instant,
+) -> bool {
     match (&state.notification, shown.as_ref()) {
         (Some(current), _) if current.message == "再按一次 Ctrl+C 退出" => {
-            *shown = Some((current.clone(), Instant::now()));
+            *shown = Some((current.clone(), now));
             false
         }
         // Errors are sticky (also written into the transcript).
         (Some(current), _) if current.level == NotificationLevel::Error => {
-            *shown = Some((current.clone(), Instant::now()));
+            *shown = Some((current.clone(), now));
             false
         }
         (Some(current), Some((seen, at))) if current == seen => {
@@ -579,7 +583,8 @@ fn expire_notification(state: &mut AppState, shown: &mut Option<(Notification, I
                 NotificationLevel::Warning => NOTIFICATION_TTL_WARNING,
                 NotificationLevel::Error => return false,
             };
-            if at.elapsed() >= ttl {
+            // saturating: never panic if a caller passes a `now` before `at`.
+            if now.saturating_duration_since(*at) >= ttl {
                 state.notification = None;
                 // The Ctrl+C escalation window closes with its prompt.
                 state.disarm_ctrlc();
@@ -589,7 +594,7 @@ fn expire_notification(state: &mut AppState, shown: &mut Option<(Notification, I
             false
         }
         (Some(current), _) => {
-            *shown = Some((current.clone(), Instant::now()));
+            *shown = Some((current.clone(), now));
             false
         }
         (None, _) => {
@@ -717,13 +722,21 @@ mod tests {
     fn notification_expires_after_ttl() {
         let mut s = state();
         s.notification = Some(note());
+        // Drive time by ADDING to a base, never subtracting a TTL from
+        // Instant::now() (which underflows Instant's monotonic epoch and panics
+        // on low-uptime Windows runners).
+        let base = Instant::now();
         let mut shown = None;
         // First sighting: stamped, not cleared.
-        assert!(!expire_notification(&mut s, &mut shown));
+        assert!(!expire_notification(&mut s, &mut shown, base));
         assert!(s.notification.is_some());
-        // Backdate the stamp past the TTL: cleared and reported.
-        shown = Some((note(), Instant::now() - NOTIFICATION_TTL_INFO));
-        assert!(expire_notification(&mut s, &mut shown));
+        // Advance the clock past the TTL: cleared and reported.
+        shown = Some((note(), base));
+        assert!(expire_notification(
+            &mut s,
+            &mut shown,
+            base + NOTIFICATION_TTL_INFO
+        ));
         assert!(s.notification.is_none());
     }
 
@@ -736,10 +749,10 @@ mod tests {
                 level: NotificationLevel::Warning,
                 message: "old".into(),
             },
-            Instant::now() - NOTIFICATION_TTL_WARNING,
+            Instant::now(),
         ));
         // Different message on screen: re-stamp, do not clear.
-        assert!(!expire_notification(&mut s, &mut shown));
+        assert!(!expire_notification(&mut s, &mut shown, Instant::now()));
         assert!(s.notification.is_some());
     }
 
@@ -751,12 +764,9 @@ mod tests {
             level: NotificationLevel::Info,
             message: "再按一次 Ctrl+C 退出".into(),
         });
-        let mut shown = Some((
-            s.notification.clone().unwrap(),
-            Instant::now() - NOTIFICATION_TTL_INFO,
-        ));
+        let mut shown = Some((s.notification.clone().unwrap(), Instant::now()));
 
-        assert!(!expire_notification(&mut s, &mut shown));
+        assert!(!expire_notification(&mut s, &mut shown, Instant::now()));
         assert!(s.quit_armed);
         assert_eq!(
             s.notification.as_ref().map(|n| n.message.as_str()),
@@ -787,11 +797,8 @@ mod tests {
             level: NotificationLevel::Error,
             message: "boom".into(),
         });
-        let mut shown = Some((
-            s.notification.clone().unwrap(),
-            Instant::now() - NOTIFICATION_TTL_WARNING * 10,
-        ));
-        assert!(!expire_notification(&mut s, &mut shown));
+        let mut shown = Some((s.notification.clone().unwrap(), Instant::now()));
+        assert!(!expire_notification(&mut s, &mut shown, Instant::now()));
         assert_eq!(
             s.notification.as_ref().map(|n| n.message.as_str()),
             Some("boom")
