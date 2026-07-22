@@ -162,9 +162,9 @@ impl Clarifier for ChannelClarifier {
         // However it resolved (answered, cancelled, or timed out), tell every
         // connected client to dismiss the prompt so a second client can't answer
         // a clarification that no longer exists.
-        let _ = self
-            .events
-            .send(RuntimeEvent::ClarificationResolved { id: request.id.clone() });
+        let _ = self.events.send(RuntimeEvent::ClarificationResolved {
+            id: request.id.clone(),
+        });
         answer
     }
 }
@@ -217,9 +217,9 @@ impl Approver for ChannelApprover {
         // However it resolved (answered, cancelled, or timed out), tell every
         // connected client to dismiss the prompt so a second client can't answer
         // an approval that no longer exists.
-        let _ = self
-            .events
-            .send(RuntimeEvent::ApprovalResolved { id: request.id.clone() });
+        let _ = self.events.send(RuntimeEvent::ApprovalResolved {
+            id: request.id.clone(),
+        });
         decision
     }
 }

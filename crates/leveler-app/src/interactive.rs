@@ -93,7 +93,11 @@ const PLACEHOLDER_GOAL: &str = "interactive session";
 /// non-empty line (CJK/latin sentence-final punctuation only — `.` would
 /// mangle paths and version numbers), capped at 40 chars.
 fn title_from_first_message(content: &str) -> Option<String> {
-    let line = content.trim().lines().find(|l| !l.trim().is_empty())?.trim();
+    let line = content
+        .trim()
+        .lines()
+        .find(|l| !l.trim().is_empty())?
+        .trim();
     let sentence = line
         .split(['。', '？', '！', '?', '!', '；', ';'])
         .next()
@@ -1109,7 +1113,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .active
                     .admit(&session_id)
                     .map_err(|error| ClientError::Runtime(error.to_string()))?;
-                self.retitle_placeholder_session(&session_id, &content).await;
+                self.retitle_placeholder_session(&session_id, &content)
+                    .await;
                 self.checkpoint_before_turn(&session_id, &content).await;
                 let _ = self
                     .events_for(&session_id)
@@ -1146,7 +1151,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .active
                     .admit(&session_id)
                     .map_err(|error| ClientError::Runtime(error.to_string()))?;
-                self.retitle_placeholder_session(&session_id, &content).await;
+                self.retitle_placeholder_session(&session_id, &content)
+                    .await;
                 self.checkpoint_before_turn(&session_id, &content).await;
                 let _ = self
                     .events_for(&session_id)
@@ -1567,14 +1573,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     } else {
                         format!("{} (分叉)", record.goal)
                     };
-                    let fork =
-                        leveler_storage::SessionRecord::new(
-                            record.repository.clone(),
-                            title,
-                            record.model.clone(),
-                            leveler_core::now(),
-                        )
-                        .with_axes(&record.collaboration, &record.work_profile);
+                    let fork = leveler_storage::SessionRecord::new(
+                        record.repository.clone(),
+                        title,
+                        record.model.clone(),
+                        leveler_core::now(),
+                    )
+                    .with_axes(&record.collaboration, &record.work_profile);
                     sessions.create(&fork).await?;
                     let fork_id = SessionId::new(fork.id.clone());
                     let messages = MessageRepository::new(&db);

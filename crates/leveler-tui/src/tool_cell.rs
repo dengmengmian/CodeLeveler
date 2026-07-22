@@ -734,7 +734,10 @@ pub(crate) fn tool_lines(
         let long = lines.len() >= LONG_THRESHOLD || more > 0;
         let hint = if long {
             if more > 0 {
-                format!("  {}", t.fold_more_lines_short.replace("{}", &more.to_string()))
+                format!(
+                    "  {}",
+                    t.fold_more_lines_short.replace("{}", &more.to_string())
+                )
             } else {
                 "  (Ctrl+O)".to_string()
             }
@@ -834,7 +837,10 @@ fn inline_diff_lines(
         } else {
             format!("    {}", t.fold_full_diff)
         };
-        out.push(Line::from(Span::styled(hint, Style::default().fg(theme.dim))));
+        out.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme.dim),
+        )));
     }
 }
 
@@ -925,7 +931,10 @@ pub(crate) fn merged_diff_rows(
         } else {
             format!("    {}", t.fold_full_diff)
         };
-        out.push(Line::from(Span::styled(hint, Style::default().fg(theme.dim))));
+        out.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme.dim),
+        )));
     }
 }
 

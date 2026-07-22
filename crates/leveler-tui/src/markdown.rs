@@ -442,7 +442,8 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                         } else {
                             indent.clone()
                         };
-                        let mut spans = vec![Span::styled(lead, Style::default().fg(theme.heading))];
+                        let mut spans =
+                            vec![Span::styled(lead, Style::default().fg(theme.heading))];
                         spans.extend(line.spans);
                         out.push(Line::from(spans));
                     }

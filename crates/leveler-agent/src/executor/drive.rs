@@ -25,8 +25,8 @@ use super::dispatch::{
     newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
 };
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AnswerAudit, Executor, LOOP_GUARD_THRESHOLD,
-    ModelRequestRecord, StopReason, TranscriptSink,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AnswerAudit, Executor,
+    LOOP_GUARD_THRESHOLD, ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
     call_needs_host_escape, collect_scoped_paths_from_call, counts_as_verification_evidence,

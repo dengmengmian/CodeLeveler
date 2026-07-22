@@ -12,8 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_agent::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
-    Clarifier,
-    StopReason,
+    Clarifier, StopReason,
 };
 use leveler_engine::{
     EngineError, EngineEvent, ExecutionKind, TaskOutcome, TaskReport, TaskSpec, mode_str,

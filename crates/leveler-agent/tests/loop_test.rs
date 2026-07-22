@@ -2767,9 +2767,7 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
     );
     assert_eq!(
         outcome.stop_detail.as_deref(),
-        Some(
-            "closeout_reason=goal_unresolved; 目标模式结束但未调用 update_goal(complete/blocked)"
-        ),
+        Some("closeout_reason=goal_unresolved; 目标模式结束但未调用 update_goal(complete/blocked)"),
         "the stall detail must carry the closeout reason for engine continuations"
     );
 
@@ -2824,7 +2822,10 @@ async fn conversational_turn_with_inert_change_answers_on_first_quiet_round() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(outcome.rounds, 2, "the first quiet round must close the turn");
+    assert_eq!(
+        outcome.rounds, 2,
+        "the first quiet round must close the turn"
+    );
     assert_eq!(outcome.final_text, "Cleaned up.");
     assert_eq!(
         requests.lock().unwrap().len(),
@@ -2884,9 +2885,10 @@ async fn evidence_gate_does_not_nudge_inert_changes() {
     assert_eq!(outcome.rounds, 2);
     let requests = requests.lock().unwrap();
     assert!(
-        !requests.iter().flatten().any(|m| m
-            .text_content()
-            .contains(AUDIT_MARKER)),
+        !requests
+            .iter()
+            .flatten()
+            .any(|m| m.text_content().contains(AUDIT_MARKER)),
         "an inert change must not trigger the completion-evidence nudge"
     );
 

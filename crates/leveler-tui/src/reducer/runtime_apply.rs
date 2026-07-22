@@ -42,18 +42,20 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         // matching prompt here so a second answer can't hit an already-resolved
         // approval. Harmless when this client is the one that just answered.
         RuntimeEvent::ApprovalResolved { id } => {
-            dismiss_resolved_interaction(state, |p| {
-                matches!(p, PendingInteraction::Approval(r) if r.id == id)
-            });
+            dismiss_resolved_interaction(
+                state,
+                |p| matches!(p, PendingInteraction::Approval(r) if r.id == id),
+            );
             if matches!(&state.overlay, Some(Overlay::Approval(ov)) if ov.request.id == id) {
                 state.overlay = None;
                 crate::reducer::overlay_keys::advance_overlay(state);
             }
         }
         RuntimeEvent::ClarificationResolved { id } => {
-            dismiss_resolved_interaction(state, |p| {
-                matches!(p, PendingInteraction::Clarification(r) if r.id == id)
-            });
+            dismiss_resolved_interaction(
+                state,
+                |p| matches!(p, PendingInteraction::Clarification(r) if r.id == id),
+            );
             if matches!(&state.overlay, Some(Overlay::Clarification(ov)) if ov.request.id == id) {
                 state.overlay = None;
                 crate::reducer::overlay_keys::advance_overlay(state);

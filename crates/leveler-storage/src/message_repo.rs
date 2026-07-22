@@ -371,8 +371,14 @@ mod tests {
         .unwrap();
 
         let texts = repo.first_user_texts().await.unwrap();
-        assert_eq!(texts.get(a.id.as_str()).map(String::as_str), Some("帮我修复登录"));
-        assert_eq!(texts.get(b.id.as_str()).map(String::as_str), Some("看下这张图"));
+        assert_eq!(
+            texts.get(a.id.as_str()).map(String::as_str),
+            Some("帮我修复登录")
+        );
+        assert_eq!(
+            texts.get(b.id.as_str()).map(String::as_str),
+            Some("看下这张图")
+        );
     }
 
     #[tokio::test]

@@ -227,8 +227,21 @@ pub fn classify_task(task: &str) -> TaskClass {
         return TaskClass::Conversational;
     }
     let implementation = [
-        "fix", "修复", "实现", "implement", "修", "add", "添加", "改", "修改", "write", "编辑",
-        "bug", "重构", "refactor", "优化",
+        "fix",
+        "修复",
+        "实现",
+        "implement",
+        "修",
+        "add",
+        "添加",
+        "改",
+        "修改",
+        "write",
+        "编辑",
+        "bug",
+        "重构",
+        "refactor",
+        "优化",
     ];
     if implementation.iter().any(|w| lower.contains(w)) {
         TaskClass::Implementation
@@ -423,7 +436,10 @@ mod tests {
 
     #[test]
     fn classify_task_grades_modification_requests_implementation() {
-        assert_eq!(classify_task("修复 login 的 panic"), TaskClass::Implementation);
+        assert_eq!(
+            classify_task("修复 login 的 panic"),
+            TaskClass::Implementation
+        );
         for task in [
             "实现用户登录接口",
             "重构 session 模块",

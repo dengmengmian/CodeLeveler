@@ -319,7 +319,7 @@ pub struct UiText {
     pub completion_diff_hint: &'static str,
 
     // Fold hints
-    pub fold_more_lines: &'static str,       // "… 还有 {} 行 · Ctrl+O 展开"
+    pub fold_more_lines: &'static str, // "… 还有 {} 行 · Ctrl+O 展开"
     pub fold_more_lines_short: &'static str, // "(+{} 行 · Ctrl+O)"
     pub fold_full_diff: &'static str,
 

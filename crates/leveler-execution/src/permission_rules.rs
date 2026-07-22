@@ -745,7 +745,11 @@ rules:
         clear_project_rules(dir.path()).unwrap();
         assert!(!project_rules_path(dir.path()).exists());
         // Freshly merged rules no longer contain the cleared project rule.
-        let set = load_merged_rules(dir.path(), &dir.path().join("state/permissions.yaml"), dir.path());
+        let set = load_merged_rules(
+            dir.path(),
+            &dir.path().join("state/permissions.yaml"),
+            dir.path(),
+        );
         assert!(set.is_empty());
     }
 

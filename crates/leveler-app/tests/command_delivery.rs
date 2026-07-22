@@ -484,7 +484,10 @@ async fn first_message_retitles_a_placeholder_session() {
         .unwrap();
     wait_turn_settled(&mut events).await;
     let record = repo.get(&session_id).await.unwrap().unwrap();
-    assert_eq!(record.goal, "帮我修复登录超时的 bug", "no rename on later messages");
+    assert_eq!(
+        record.goal, "帮我修复登录超时的 bug",
+        "no rename on later messages"
+    );
 
     // A session created with a real goal keeps it untouched.
     let named = client

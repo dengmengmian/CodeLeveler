@@ -365,7 +365,11 @@ mod span_tests {
         }
         let (head_end, tail_start) = compaction_span(&msgs, 12, 0).unwrap();
         assert_eq!(head_end, 1);
-        assert_eq!(tail_start, msgs.len() - 12, "tail should be exactly last 12");
+        assert_eq!(
+            tail_start,
+            msgs.len() - 12,
+            "tail should be exactly last 12"
+        );
     }
 
     #[test]

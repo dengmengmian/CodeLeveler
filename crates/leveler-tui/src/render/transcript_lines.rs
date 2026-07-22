@@ -306,9 +306,7 @@ fn turn_end_lines(
         TurnEndStatus::Unverified if no_auto_verify => {
             (t.turn_unverified.to_string(), theme.success)
         }
-        TurnEndStatus::Unverified => {
-            (format!("⚠ {}", t.final_completed_warnings), theme.warning)
-        }
+        TurnEndStatus::Unverified => (format!("⚠ {}", t.final_completed_warnings), theme.warning),
         TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.error),
         // Cancelled is user-initiated, not a failure: stopped glyph, muted.
         TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.muted),
@@ -615,10 +613,7 @@ fn sub_agent_tree_group_lines(
     }
     // A finished-but-not-clean run breaks down how each agent ended.
     if !any_running && !all_ok {
-        let completed = blocks
-            .iter()
-            .filter(|b| b.status == ToolStatus::Ok)
-            .count();
+        let completed = blocks.iter().filter(|b| b.status == ToolStatus::Ok).count();
         let timeout = blocks
             .iter()
             .filter(|b| b.status == ToolStatus::Failed && sub_agent_hit_round_limit(b))
@@ -641,9 +636,7 @@ fn sub_agent_tree_group_lines(
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
             header,
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(stats, Style::default().fg(theme.dim)),
     ]));
@@ -722,10 +715,7 @@ fn sub_agent_tree_child_status(
             (t.agent_status_running.to_string(), theme.accent)
         }
         ToolStatus::Running => (t.sub_agent_waiting.to_string(), theme.muted),
-        ToolStatus::Ok => (
-            format!("✓ {}", t.agent_status_completed),
-            theme.success,
-        ),
+        ToolStatus::Ok => (format!("✓ {}", t.agent_status_completed), theme.success),
         ToolStatus::Failed if sub_agent_hit_round_limit(block) => {
             (format!("✗ {}", t.agent_status_timeout), theme.error)
         }

@@ -43,7 +43,16 @@ pub(crate) fn render_group(
     for unit in plan_units(&group.calls) {
         match unit {
             StreamUnit::Single(call) => {
-                out.extend(unit_lines(call, theme, width, locale, t, group.expanded, 1, None));
+                out.extend(unit_lines(
+                    call,
+                    theme,
+                    width,
+                    locale,
+                    t,
+                    group.expanded,
+                    1,
+                    None,
+                ));
                 if !group.expanded {
                     continue;
                 }
@@ -268,7 +277,15 @@ fn unit_lines(
     let mut out = vec![Line::from(head)];
 
     // Line 2: result summary.
-    out.extend(result_lines_for(call, theme, width, t, expanded, guard_denial, repeat));
+    out.extend(result_lines_for(
+        call,
+        theme,
+        width,
+        t,
+        expanded,
+        guard_denial,
+        repeat,
+    ));
     out
 }
 
@@ -331,7 +348,10 @@ fn result_lines_for(
             let more = preview_line_count(call).saturating_sub(1);
             if more > 0 {
                 spans.push(Span::styled(
-                    format!(" {}", t.fold_more_lines_short.replace("{}", &more.to_string())),
+                    format!(
+                        " {}",
+                        t.fold_more_lines_short.replace("{}", &more.to_string())
+                    ),
                     Style::default().fg(theme.dim),
                 ));
             }
@@ -362,17 +382,27 @@ fn result_lines_for(
     };
     let mut spans = vec![Span::styled("  └ ", Style::default().fg(theme.muted))];
     if let Some(first) = first {
-        let count_w = UnicodeWidthStr::width(pre) + n.to_string().len() + UnicodeWidthStr::width(post);
+        let count_w =
+            UnicodeWidthStr::width(pre) + n.to_string().len() + UnicodeWidthStr::width(post);
         let avail = width.saturating_sub(4 + count_w + 3 + 2).max(8);
         spans.push(Span::styled(
             truncate_display(&first, avail),
             Style::default().fg(theme.muted),
         ));
-        spans.push(Span::styled(" · ".to_string(), Style::default().fg(theme.dim)));
+        spans.push(Span::styled(
+            " · ".to_string(),
+            Style::default().fg(theme.dim),
+        ));
     }
-    spans.push(Span::styled(pre.to_string(), Style::default().fg(theme.muted)));
+    spans.push(Span::styled(
+        pre.to_string(),
+        Style::default().fg(theme.muted),
+    ));
     spans.push(Span::styled(n.to_string(), Style::default().fg(theme.dim)));
-    spans.push(Span::styled(post.to_string(), Style::default().fg(theme.muted)));
+    spans.push(Span::styled(
+        post.to_string(),
+        Style::default().fg(theme.muted),
+    ));
     if call_timed_out(call) {
         spans.push(Span::styled(
             t.result_timeout.to_string(),
@@ -398,7 +428,10 @@ fn first_content_line(call: &ToolCallBlock) -> Option<String> {
 /// Strip a leading `<digits>\t` gutter that read_file adds to every row.
 fn strip_line_gutter(line: &str) -> &str {
     let trimmed = line.trim_start();
-    let digits = trimmed.len() - trimmed.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let digits = trimmed.len()
+        - trimmed
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len();
     if digits > 0 && trimmed[digits..].starts_with('\t') {
         trimmed[digits + 1..].trim_start()
     } else {
@@ -473,7 +506,10 @@ fn edit_unit_lines(
         Span::styled(edits.to_string(), Style::default().fg(theme.dim)),
         Span::styled(post.to_string(), Style::default().fg(theme.muted)),
         Span::styled(" · ".to_string(), Style::default().fg(theme.muted)),
-        Span::styled(format!("+{added} −{removed}"), Style::default().fg(theme.dim)),
+        Span::styled(
+            format!("+{added} −{removed}"),
+            Style::default().fg(theme.dim),
+        ),
     ]));
 
     crate::tool_cell::merged_diff_rows(calls, theme, width, expanded, t, &mut out);
@@ -487,7 +523,12 @@ fn split_placeholder(template: &str) -> (&str, &str) {
 
 /// Output line count for an Ok result row, skipping shell metadata rows.
 fn content_line_count(call: &ToolCallBlock) -> usize {
-    let Some(preview) = call.preview.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
+    let Some(preview) = call
+        .preview
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
         return 0;
     };
     if is_shell_call(call) {
@@ -726,12 +767,11 @@ mod tests {
             ToolStatus::Ok,
         )]);
         let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(lines.iter().any(|l| l.contains("目标收尾")), "{lines:?}");
         assert!(
-            lines.iter().any(|l| l.contains("目标收尾")),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("受阻") && l.contains("缺 API key")),
+            lines
+                .iter()
+                .any(|l| l.contains("受阻") && l.contains("缺 API key")),
             "{lines:?}"
         );
     }
@@ -834,10 +874,7 @@ mod tests {
             ),
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert!(
-            lines.iter().any(|l| l.contains("编辑文件")),
-            "{lines:?}"
-        );
+        assert!(lines.iter().any(|l| l.contains("编辑文件")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("web.go")), "{lines:?}");
     }
 
@@ -937,11 +974,15 @@ mod tests {
             "head carries the command body with a shell prompt: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.contains('{') || l.contains("\"cmd\"")),
+            !lines
+                .iter()
+                .any(|l| l.contains('{') || l.contains("\"cmd\"")),
             "must not leak JSON args: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.contains(&home) || l.contains("Develop/app")),
+            !lines
+                .iter()
+                .any(|l| l.contains(&home) || l.contains("Develop/app")),
             "must not leak absolute cwd: {lines:?}"
         );
     }
@@ -980,8 +1021,7 @@ mod tests {
             "combined hunk stats: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("+new1"))
-                && lines.iter().any(|l| l.contains("-old2")),
+            lines.iter().any(|l| l.contains("+new1")) && lines.iter().any(|l| l.contains("-old2")),
             "both patches' diff rows: {lines:?}"
         );
     }
@@ -1026,7 +1066,9 @@ mod tests {
             "head carries glyph + action + inline file: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("  └ ") && lines[1].contains("1 处修改") && lines[1].contains("+1 −1"),
+            lines[1].starts_with("  └ ")
+                && lines[1].contains("1 处修改")
+                && lines[1].contains("+1 −1"),
             "{lines:?}"
         );
         assert!(

@@ -179,11 +179,9 @@ impl EventBridge {
                     if let Some(id) = self.open_assistant.take() {
                         // Streamed path: the deltas are already on screen —
                         // retract the unfinished block by id.
-                        let _ = self
-                            .events
-                            .send(RuntimeEvent::AssistantAttemptReset {
-                                message_id: Some(id),
-                            });
+                        let _ = self.events.send(RuntimeEvent::AssistantAttemptReset {
+                            message_id: Some(id),
+                        });
                     }
                     let _ = self.events.send(RuntimeEvent::Notification {
                         level: NotificationLevel::Info,
@@ -858,7 +856,10 @@ mod bridge_tests {
             .iter()
             .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
             .count();
-        assert_eq!(completed, 2, "distinct answers must both render: {events:?}");
+        assert_eq!(
+            completed, 2,
+            "distinct answers must both render: {events:?}"
+        );
         assert!(
             !events
                 .iter()
