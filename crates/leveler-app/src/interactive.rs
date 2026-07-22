@@ -85,6 +85,24 @@ const COMPACT_PROMPT: &str = "Summarize the conversation so far into a concise \
     open questions, so work can continue without the full history. Reply with \
     ONLY the summary.";
 
+/// Goal text interactive entry points create sessions with before any real
+/// message exists. Replaced by [`title_from_first_message`] on first submit.
+const PLACEHOLDER_GOAL: &str = "interactive session";
+
+/// Session title from the first message: the first sentence of the first
+/// non-empty line (CJK/latin sentence-final punctuation only — `.` would
+/// mangle paths and version numbers), capped at 40 chars.
+fn title_from_first_message(content: &str) -> Option<String> {
+    let line = content.trim().lines().find(|l| !l.trim().is_empty())?.trim();
+    let sentence = line
+        .split(['。', '？', '！', '?', '!', '；', ';'])
+        .next()
+        .unwrap_or(line)
+        .trim();
+    let title: String = sentence.chars().take(40).collect();
+    (!title.is_empty()).then_some(title)
+}
+
 fn emit_project_rules(events: &broadcast::Sender<RuntimeEvent>, repo: &Path) {
     let sources = leveler_context::load_rules(repo)
         .into_iter()
@@ -601,6 +619,25 @@ impl InProcessRuntimeClient {
         }
     }
 
+    /// Name a placeholder interactive session after its first real message:
+    /// the sidebars (web + TUI resume) show the `goal` column, and a wall of
+    /// "interactive session" rows is unreadable. Only the placeholder is ever
+    /// overwritten — user-named goals stay untouched.
+    async fn retitle_placeholder_session(&self, session_id: &SessionId, content: &str) {
+        let Some(title) = title_from_first_message(content) else {
+            return;
+        };
+        let Ok(db) = self.app.open_database().await else {
+            return;
+        };
+        let repo = SessionRepository::new(&db);
+        if let Ok(Some(record)) = repo.get(session_id).await
+            && (record.goal == PLACEHOLDER_GOAL || record.goal.trim().is_empty())
+        {
+            let _ = repo.update_goal(session_id, &title).await;
+        }
+    }
+
     /// List stored sessions, most-recent first, as UI summaries.
     async fn list_sessions(&self) -> Vec<UiSessionSummary> {
         let Ok(db) = self.app.open_database().await else {
@@ -1055,6 +1092,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .active
                     .admit(&session_id)
                     .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                self.retitle_placeholder_session(&session_id, &content).await;
                 self.checkpoint_before_turn(&session_id, &content).await;
                 let _ = self
                     .events_for(&session_id)
@@ -1091,6 +1129,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .active
                     .admit(&session_id)
                     .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                self.retitle_placeholder_session(&session_id, &content).await;
                 self.checkpoint_before_turn(&session_id, &content).await;
                 let _ = self
                     .events_for(&session_id)
@@ -2106,6 +2145,39 @@ mod checkpoint_ordinal_tests {
         assert_eq!(checkpoint_ordinal(Ok(7)), Some(7));
         // An actually-empty transcript is a legitimate ordinal 0.
         assert_eq!(checkpoint_ordinal(Ok(0)), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::title_from_first_message;
+
+    #[test]
+    fn first_sentence_of_first_line_wins() {
+        assert_eq!(
+            title_from_first_message("帮我修复登录超时的 bug。另外看下日志。").as_deref(),
+            Some("帮我修复登录超时的 bug")
+        );
+        assert_eq!(
+            title_from_first_message("\n\n  fix the login bug! then logs\n").as_deref(),
+            Some("fix the login bug")
+        );
+    }
+
+    #[test]
+    fn dots_in_paths_and_versions_do_not_split() {
+        assert_eq!(
+            title_from_first_message("升级 v1.2 后 src/main.rs 编译不过").as_deref(),
+            Some("升级 v1.2 后 src/main.rs 编译不过")
+        );
+    }
+
+    #[test]
+    fn long_titles_cap_at_40_chars_and_blank_is_none() {
+        let long = "这".repeat(80);
+        assert_eq!(title_from_first_message(&long).unwrap().chars().count(), 40);
+        assert_eq!(title_from_first_message("   \n  "), None);
+        assert_eq!(title_from_first_message("？？？"), None);
     }
 }
 

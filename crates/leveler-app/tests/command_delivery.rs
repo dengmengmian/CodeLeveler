@@ -413,3 +413,98 @@ async fn socket_clients_receive_only_their_session_events() {
     shutdown.cancel();
     task.await.unwrap().unwrap();
 }
+
+/// Wait for the spawned background turn to reach a terminal event so the next
+/// SubmitMessage is not rejected by the one-active-turn-per-session guard.
+async fn wait_turn_settled(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) {
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("turn must settle within 10s")
+            .expect("event stream open");
+        if matches!(
+            event,
+            RuntimeEvent::TurnCompleted
+                | RuntimeEvent::TurnAnswered
+                | RuntimeEvent::TurnTruncated { .. }
+                | RuntimeEvent::TurnIncomplete { .. }
+                | RuntimeEvent::TurnCompletedUnverified { .. }
+                | RuntimeEvent::TurnFailed { .. }
+                | RuntimeEvent::TurnCancelled
+        ) {
+            return;
+        }
+    }
+}
+
+/// The first real message names a placeholder interactive session: the goal
+/// column (what the web/TUI sidebars show) becomes the message's first
+/// sentence. Later messages never rename, and a session created with a real
+/// goal keeps it.
+#[tokio::test]
+async fn first_message_retitles_a_placeholder_session() {
+    let (_tmp, app, client, _existing) = build_client().await;
+    let bootstrap = client
+        .create_session(CreateSessionRequest {
+            goal: "interactive session".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let session_id = bootstrap.session.id.clone();
+    let mut events = client.subscribe_session(&session_id);
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "帮我修复登录超时的 bug。另外顺便看下日志轮转。".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_turn_settled(&mut events).await;
+
+    let db = app.open_database().await.unwrap();
+    let repo = leveler_storage::SessionRepository::new(&db);
+    let record = repo.get(&session_id).await.unwrap().unwrap();
+    assert_eq!(
+        record.goal, "帮我修复登录超时的 bug",
+        "placeholder goal must become the first sentence of the first message"
+    );
+
+    // A second message must not rename the session again.
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "再帮我看看别的问题。".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_turn_settled(&mut events).await;
+    let record = repo.get(&session_id).await.unwrap().unwrap();
+    assert_eq!(record.goal, "帮我修复登录超时的 bug", "no rename on later messages");
+
+    // A session created with a real goal keeps it untouched.
+    let named = client
+        .create_session(CreateSessionRequest {
+            goal: "已有正式目标".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let mut named_events = client.subscribe_session(&named.session.id);
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: named.session.id.clone(),
+            content: "随便聊聊。".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_turn_settled(&mut named_events).await;
+    let record = repo.get(&named.session.id).await.unwrap().unwrap();
+    assert_eq!(record.goal, "已有正式目标");
+}
