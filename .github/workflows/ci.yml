@@ -71,7 +71,10 @@ jobs:
         run: sh scripts/test_install.sh
 
       - name: Test
-        run: cargo test --workspace --all-features --locked
+        # --no-fail-fast: run every test binary and report ALL failures in one
+        # run instead of stopping at the first failing crate (so a Windows-only
+        # failure in a late crate is not hidden behind an earlier one).
+        run: cargo test --workspace --all-features --locked --no-fail-fast
 
   supply-chain:
     name: deny · audit

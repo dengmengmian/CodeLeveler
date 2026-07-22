@@ -361,6 +361,22 @@ fn open_repository_file(
             .map_err(|error| secure_open_error(&error, display))?;
     }
 
+    // A directory is a portable 400, not a 403. Unix opens a directory
+    // read-only and then fails the is_file() check below, but Windows errors on
+    // the open itself with a non-NotFound kind that secure_open_error would map
+    // to FORBIDDEN. Classify the entry type first (nofollow) so "path is a
+    // directory" answers 400 on every platform; non-dir entries fall through to
+    // the race-safe open + handle-stat that closes the check-to-open window.
+    if directory
+        .symlink_metadata(file_name)
+        .is_ok_and(|meta| meta.is_dir())
+    {
+        return Err(EndpointError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{display} is a directory, not a file"),
+        ));
+    }
+
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let file = directory
