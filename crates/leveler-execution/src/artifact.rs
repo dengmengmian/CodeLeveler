@@ -61,13 +61,18 @@ mod tests {
     use super::*;
 
     fn tmp() -> PathBuf {
+        // A per-process atomic counter — NOT a timestamp. Windows' coarse timer
+        // resolution (~15ms) let parallel tests collide on the same nanos → same
+        // dir, and one test's remove_dir_all raced another's write (Windows
+        // forbids deleting a dir with live handles). The counter is unique per
+        // call regardless of clock resolution; process id disambiguates across
+        // processes.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
             "leveler-artifact-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
