@@ -72,6 +72,11 @@ struct Entry {
     /// to kill it. `None` when the daemon was attached, not spawned — someone
     /// else's process is never killed from here.
     kill: Option<oneshot::Sender<()>>,
+    /// Listed by historical discovery, not opened by the user. Discovered
+    /// entries are ephemeral: excluded from the persisted registry (discovery
+    /// re-runs every start) and promoted to persistent when the user opens
+    /// them explicitly.
+    discovered: bool,
 }
 
 /// Shared with monitor tasks so they never own the manager itself.
@@ -163,7 +168,8 @@ impl ProjectManager {
 
     /// Open a project: validate, register, bring its daemon online, persist.
     /// Idempotent — re-adding the primary or an already-registered project
-    /// answers with its current state.
+    /// answers with its current state. Opening a merely-discovered project
+    /// promotes it to a persistent, online one.
     pub async fn add(&self, path: &str) -> Result<ProjectInfo, ProjectError> {
         let repo = PathBuf::from(path);
         if !repo.is_dir() {
@@ -174,20 +180,33 @@ impl ProjectManager {
             return Ok(self.info_for(&repo, ProjectStatus::Online));
         }
         {
-            let entries = self.state.entries.lock().unwrap();
-            if let Some(entry) = entries.get(&repo) {
-                let status = entry.status;
-                drop(entries);
-                return Ok(self.info_for(&repo, status));
+            let mut entries = self.state.entries.lock().unwrap();
+            if let Some(entry) = entries.get_mut(&repo) {
+                if !entry.discovered {
+                    let status = entry.status;
+                    drop(entries);
+                    return Ok(self.info_for(&repo, status));
+                }
+                // Explicit open of a discovered project: it becomes a real
+                // registry member and goes through bring_online below (an
+                // Online discovered entry keeps its attached daemon).
+                entry.discovered = false;
+                if entry.status == ProjectStatus::Online {
+                    drop(entries);
+                    self.persist();
+                    return Ok(self.info_for(&repo, ProjectStatus::Online));
+                }
+            } else {
+                entries.insert(
+                    repo.clone(),
+                    Entry {
+                        status: ProjectStatus::Starting,
+                        kill: None,
+                        discovered: false,
+                    },
+                );
             }
         }
-        self.state.entries.lock().unwrap().insert(
-            repo.clone(),
-            Entry {
-                status: ProjectStatus::Starting,
-                kill: None,
-            },
-        );
         self.state.set_status(&repo, ProjectStatus::Starting);
         self.persist();
         match self.bring_online(&repo).await {
@@ -297,22 +316,57 @@ impl ProjectManager {
     }
 
     /// Discover repositories that have Leveler state under the Leveler home
-    /// (derived from the registry path's parent) and register each one. Runs
-    /// after [`load_registry`](Self::load_registry) at server start; `add` is
-    /// idempotent, so already-registered projects are untouched. This is what
-    /// lets the sidebar list projects the user only ever drove from the TUI.
-    pub async fn discover_historical_projects(&self) {
+    /// (derived from the registry path's parent) and list each one. Runs
+    /// after [`load_registry`](Self::load_registry) at server start; this is
+    /// what lets the sidebar list projects the user only ever drove from the
+    /// TUI. Discovered projects are probe-or-offline and never persisted:
+    /// attaching to a live daemon is cheap, but spawning one per historical
+    /// repo would be a process storm — the user opening the project (or the
+    /// restart button) is the spawn path.
+    ///
+    /// `ephemeral_root` (the OS temp dir in production) filters out throwaway
+    /// checkouts: eval and fixture repos live under temp and would otherwise
+    /// bury the real projects in noise. Explicitly opening such a path still
+    /// works — only discovery skips it.
+    pub async fn discover_historical_projects(&self, ephemeral_root: &Path) {
         let Some(home) = self.registry_path.parent() else {
             return;
         };
-        for repo in leveler_project::layout::known_repositories(home) {
-            let Some(repo_str) = repo.to_str() else {
-                continue;
-            };
-            if let Err(error) = self.add(repo_str).await {
-                tracing::warn!(%error, repo = %repo.display(), "failed to bring a discovered project online");
-            }
+        for repo in historical_repositories(home, ephemeral_root).await {
+            self.register_discovered(repo).await;
         }
+    }
+
+    /// List one discovered repository: probe its daemon socket and attach when
+    /// live, else show it offline. Never spawns, never persists; repositories
+    /// that no longer exist (deleted checkouts, temp eval dirs) are skipped.
+    async fn register_discovered(&self, repo: PathBuf) {
+        if !repo.is_dir() {
+            return;
+        }
+        let repo = repo.canonicalize().unwrap_or(repo);
+        if repo == self.router.primary_repo()
+            || self.state.entries.lock().unwrap().contains_key(&repo)
+        {
+            return;
+        }
+        self.state.entries.lock().unwrap().insert(
+            repo.clone(),
+            Entry {
+                status: ProjectStatus::Starting,
+                kill: None,
+                discovered: true,
+            },
+        );
+        let socket = (self.socket_for)(&repo);
+        let status = match LocalSocketRuntimeClient::connect(&socket).await {
+            Ok(client) => {
+                self.router.add_daemon(repo.clone(), Arc::new(client)).await;
+                ProjectStatus::Online
+            }
+            Err(_) => ProjectStatus::Offline,
+        };
+        self.state.set_status(&repo, status);
     }
 
     /// Probe the repo's daemon socket; attach when live, else spawn a fresh
@@ -407,9 +461,19 @@ impl ProjectManager {
     /// the running state is unaffected.
     fn persist(&self) {
         let registry = Registry {
+            // Only user-opened projects: discovered entries are re-listed by
+            // every start's discovery pass, and persisting them would make
+            // the next start spawn a daemon per historical repo.
             projects: {
-                let mut paths: Vec<PathBuf> =
-                    self.state.entries.lock().unwrap().keys().cloned().collect();
+                let mut paths: Vec<PathBuf> = self
+                    .state
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, entry)| !entry.discovered)
+                    .map(|(path, _)| path.clone())
+                    .collect();
                 paths.sort();
                 paths
             },
@@ -425,6 +489,44 @@ impl ProjectManager {
             tracing::warn!(%error, path = %self.registry_path.display(), "failed to persist the project registry");
         }
     }
+}
+
+/// Every repository with Leveler state under `<home>/projects/*`: the
+/// `.repository-root` ownership marker where present, else the repository
+/// recorded in the dir's `sessions.db` (state dirs created before the marker
+/// existed — exactly the TUI-only history the sidebar must still list).
+/// Repositories under `ephemeral_root` are dropped as throwaway checkouts;
+/// vanished repositories are the caller's filter.
+async fn historical_repositories(home: &Path, ephemeral_root: &Path) -> Vec<PathBuf> {
+    let ephemeral = ephemeral_root
+        .canonicalize()
+        .unwrap_or_else(|_| ephemeral_root.to_path_buf());
+    let mut repos = leveler_project::layout::known_repositories(home);
+    if let Ok(entries) = std::fs::read_dir(home.join("projects")) {
+        for entry in entries.filter_map(Result::ok) {
+            let dir = entry.path();
+            if dir
+                .join(leveler_project::layout::REPOSITORY_OWNER_FILE)
+                .exists()
+            {
+                continue; // already covered by the marker pass
+            }
+            if let Some(repo) = leveler_storage::peek_repository(&dir.join("sessions.db")).await {
+                let repo = PathBuf::from(repo);
+                if !repos.contains(&repo) {
+                    repos.push(repo);
+                }
+            }
+        }
+    }
+    repos.retain(|repo| {
+        // Canonicalize so the macOS `/var` → `/private/var` symlink cannot
+        // dodge the prefix check.
+        let canonical = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        !canonical.starts_with(&ephemeral)
+    });
+    repos.sort();
+    repos
 }
 
 /// Wait for the daemon's readiness file and return the socket path it reports.
@@ -768,11 +870,143 @@ mod tests {
         .unwrap();
 
         let (manager, router) = manager_in(dir.path(), socket);
-        manager.discover_historical_projects().await;
+        manager
+            .discover_historical_projects(&dir.path().join("tempzone"))
+            .await;
         assert!(router.handles(&canonical_repo));
         let list = manager.list();
         assert_eq!(list.len(), 2);
         assert_eq!(list[1].path, canonical_repo.display().to_string());
         assert_eq!(list[1].status, ProjectStatus::Online);
+    }
+
+    /// State dirs created before the ownership marker existed carry no
+    /// `.repository-root` — but their `sessions.db` records the repository.
+    /// Discovery must list those too (they are exactly the TUI-only history
+    /// the sidebar was missing), while never persisting discovered projects
+    /// into the registry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_falls_back_to_sessions_db_and_stays_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let _shutdown = serve_stub_daemon(&socket).await;
+        let repo = dir.path().join("legacy-project");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = repo.canonicalize().unwrap();
+        // Legacy state dir: sessions.db only, no marker.
+        let state_dir = dir.path().join("projects").join("-legacy-slug");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        {
+            let db = leveler_storage::Database::connect(&state_dir.join("sessions.db"))
+                .await
+                .unwrap();
+            leveler_storage::SessionRepository::new(&db)
+                .create(&leveler_storage::SessionRecord::new(
+                    canonical_repo.display().to_string(),
+                    "goal",
+                    "model",
+                    leveler_core::now(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let (manager, router) = manager_in(dir.path(), socket);
+        manager
+            .discover_historical_projects(&dir.path().join("tempzone"))
+            .await;
+        assert!(router.handles(&canonical_repo), "db-recorded repo attaches");
+        let list = manager.list();
+        assert_eq!(list.len(), 2, "{list:?}");
+        assert_eq!(list[1].path, canonical_repo.display().to_string());
+        assert_eq!(list[1].status, ProjectStatus::Online);
+        // Discovery is ephemeral: no registry write.
+        assert!(
+            !dir.path().join("web-projects.json").exists(),
+            "discovery must not persist the registry"
+        );
+    }
+
+    /// Deleted checkouts and temp eval dirs leave state behind; discovery must
+    /// skip repositories that no longer exist instead of listing dead rows.
+    #[tokio::test]
+    async fn discovery_skips_vanished_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("projects").join("-gone-slug");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join(".repository-root"),
+            dir.path().join("deleted-checkout").display().to_string(),
+        )
+        .unwrap();
+
+        let (manager, _router) = manager_in(dir.path(), dir.path().join("dead.sock"));
+        manager
+            .discover_historical_projects(&dir.path().join("tempzone"))
+            .await;
+        assert_eq!(manager.list().len(), 1, "vanished repo must not be listed");
+    }
+
+    /// Repos under the ephemeral root (the OS temp dir in production) are
+    /// throwaway eval/fixture checkouts — they must not bury the real
+    /// projects. Explicit `add` still accepts such a path.
+    #[tokio::test]
+    async fn discovery_skips_repositories_under_the_ephemeral_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ephemeral = dir.path().join("tempzone");
+        let repo = ephemeral.join("leveler-eval-rust-h1-12345");
+        std::fs::create_dir_all(&repo).unwrap();
+        let state_dir = dir.path().join("projects").join("-eval-slug");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join(".repository-root"),
+            repo.canonicalize().unwrap().display().to_string(),
+        )
+        .unwrap();
+
+        let (manager, _router) = manager_in(dir.path(), dir.path().join("dead.sock"));
+        manager.discover_historical_projects(&ephemeral).await;
+        assert_eq!(
+            manager.list().len(),
+            1,
+            "temp checkout must not be discovered"
+        );
+        // …but the user can still open it deliberately.
+        let _ = manager.add(repo.to_str().unwrap()).await;
+        assert_eq!(manager.list().len(), 2);
+    }
+
+    /// A discovered (offline, ephemeral) project becomes a real registry
+    /// member the moment the user opens it explicitly — even when bringing it
+    /// online fails, so the restart button has something to retry.
+    #[tokio::test]
+    async fn opening_a_discovered_project_promotes_it_to_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("promoted-project");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = repo.canonicalize().unwrap();
+        let state_dir = dir.path().join("projects").join("-promoted-slug");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join(".repository-root"),
+            canonical_repo.display().to_string(),
+        )
+        .unwrap();
+
+        let (manager, _router) = manager_in(dir.path(), dir.path().join("dead.sock"));
+        manager
+            .discover_historical_projects(&dir.path().join("tempzone"))
+            .await;
+        assert_eq!(manager.list()[1].status, ProjectStatus::Offline);
+        assert!(!dir.path().join("web-projects.json").exists());
+
+        // Explicit open: no daemon and no spawner, so it errors — but the
+        // project is now persisted for the retry path.
+        let _ = manager.add(canonical_repo.to_str().unwrap()).await;
+        let registry: Registry =
+            serde_json::from_slice(&std::fs::read(dir.path().join("web-projects.json")).unwrap())
+                .unwrap();
+        assert_eq!(registry.projects, vec![canonical_repo]);
     }
 }

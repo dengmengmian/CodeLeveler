@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-const REPOSITORY_OWNER_FILE: &str = ".repository-root";
+/// Ownership marker inside a `<home>/projects/<slug>/` state dir: holds the
+/// absolute path of the repository the dir belongs to.
+pub const REPOSITORY_OWNER_FILE: &str = ".repository-root";
 
 /// Resolved paths for a CodeLeveler run rooted at a repository.
 #[derive(Debug, Clone)]

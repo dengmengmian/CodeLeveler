@@ -637,15 +637,33 @@ pub(crate) async fn cmd_tui(
     // `/web` inside the TUI binds the browser Web UI over this same in-process
     // runtime. The service is the `InProcessRuntimeClient` itself (it implements
     // `LocalRuntimeService`); the launcher mints a fresh token and serves on an
-    // ephemeral loopback port, returning the token-carrying URL.
+    // ephemeral loopback port, returning the token-carrying URL. Aggregation
+    // mode, same as `leveler web`: without it every `/api/projects` endpoint
+    // 404s ("打开项目失败: Not Found") and the sidebar can only ever show the
+    // current repository.
     let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
+    let web_repo_root = app.layout.repo_root.clone();
     let web_launcher: leveler_tui::WebLauncher = Arc::new(move || {
         let service = web_service.clone();
+        let repo_root = web_repo_root.clone();
         Box::pin(async move {
             let token = generate_daemon_token();
             let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
-            let server = leveler_web::bind(service, addr, token.clone())
+            let router = leveler_web::RouterService::new(service, repo_root);
+            let manager = leveler_web::ProjectManager::new(
+                router.clone(),
+                web_projects_registry_path(),
+                std::env::current_exe().ok(),
+            );
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
+            });
+            let server = leveler_web::bind_multi(router, manager, addr, token.clone())
                 .await
                 .map_err(|e| e.to_string())?;
             let url = format!("http://{}/?token={token}", server.local_addr());
@@ -899,7 +917,9 @@ pub(crate) async fn cmd_web(
             let background = manager.clone();
             tokio::spawn(async move {
                 background.clone().load_registry().await;
-                background.discover_historical_projects().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
             });
             let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
             (server, None, token)
@@ -939,7 +959,9 @@ pub(crate) async fn cmd_web(
             let background = manager.clone();
             tokio::spawn(async move {
                 background.clone().load_registry().await;
-                background.discover_historical_projects().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
             });
             let token = generate_daemon_token();
             let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
