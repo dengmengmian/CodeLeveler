@@ -1,7 +1,7 @@
 //! Event rendering for the CLI: engine/orchestrator events and agent events in
 //! text or JSONL form.
 
-use leveler_agent::{AgentEvent, AgentVerificationStatus};
+use leveler_agent::{AdvisoryKind, AgentEvent, AgentVerificationStatus};
 use leveler_orchestrator::OrchestratorEvent;
 
 use crate::cli::OutputFormat;
@@ -326,6 +326,27 @@ fn render_event_text(event: AgentEvent) {
                 );
             }
         }
+        AgentEvent::AdvisoryStarted { kind } => {
+            // Closeout model round trips after the visible answer; name the
+            // wait instead of showing a bare "waiting for model".
+            let label = match kind {
+                AdvisoryKind::CompletenessAudit => "completeness audit",
+                AdvisoryKind::ContextCompaction => "compacting context",
+                AdvisoryKind::CloseoutNudge(reason) => match reason {
+                    leveler_agent::closeout::CloseoutReason::GoalUnresolved => {
+                        "nudge: goal unresolved"
+                    }
+                    leveler_agent::closeout::CloseoutReason::MissingEvidence => {
+                        "nudge: missing evidence"
+                    }
+                    leveler_agent::closeout::CloseoutReason::EmptyAnswer => "nudge: empty answer",
+                    leveler_agent::closeout::CloseoutReason::AnswerIncomplete => {
+                        "nudge: answer incomplete"
+                    }
+                },
+            };
+            println!("  {} {label}", console::style("⋯").yellow());
+        }
         AgentEvent::Finished(_) => {}
     }
 }
@@ -450,6 +471,9 @@ fn render_event_jsonl(event: AgentEvent) {
             "closing": ledger.closing,
             "no_progress_streak": ledger.no_progress_streak,
             "closeout_deny_rounds": ledger.closeout_deny_rounds,
+        }),
+        AgentEvent::AdvisoryStarted { kind } => serde_json::json!({
+            "type": "advisory_started", "kind": kind.as_key(),
         }),
     };
     emit_jsonl(value);

@@ -1,5 +1,6 @@
 //! The state-driven single-agent tool loop.
 
+pub mod closeout;
 mod dispatch;
 mod drive;
 mod handlers;
@@ -185,9 +186,10 @@ pub enum AgentEvent {
     Finished(String),
 }
 
-/// Which advisory (tool-free, non-user-visible) model call the harness is making
-/// during closeout. Carried by [`AgentEvent::AdvisoryStarted`] so a UI can label
-/// the wait instead of showing a bare "waiting for model".
+/// Which extra harness-initiated model round trip is starting during closeout.
+/// Carried by [`AgentEvent::AdvisoryStarted`] so a UI can label the wait
+/// instead of showing a bare "waiting for model". Audits and compaction are
+/// tool-free advisory calls; a closeout nudge re-prompts the full loop once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvisoryKind {
     /// Post-answer completeness audit (`answer_audit`): a separate model call
@@ -195,6 +197,10 @@ pub enum AdvisoryKind {
     CompletenessAudit,
     /// Context compaction: summarizing older transcript to fit the window.
     ContextCompaction,
+    /// The unified closeout injected a nudge (executor/closeout.rs) and the
+    /// model is being re-prompted. Without this the user sees the "final"
+    /// answer, then an unexplained extra model round.
+    CloseoutNudge(closeout::CloseoutReason),
 }
 
 impl AdvisoryKind {
@@ -203,7 +209,53 @@ impl AdvisoryKind {
         match self {
             AdvisoryKind::CompletenessAudit => "completeness_audit",
             AdvisoryKind::ContextCompaction => "context_compaction",
+            AdvisoryKind::CloseoutNudge(reason) => match reason {
+                closeout::CloseoutReason::GoalUnresolved => "nudge_goal_unresolved",
+                closeout::CloseoutReason::MissingEvidence => "nudge_missing_evidence",
+                closeout::CloseoutReason::EmptyAnswer => "nudge_empty_answer",
+                closeout::CloseoutReason::AnswerIncomplete => "nudge_answer_incomplete",
+            },
         }
+    }
+
+    /// Inverse of [`Self::as_key`] (engine → app event replay).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "completeness_audit" => Some(AdvisoryKind::CompletenessAudit),
+            "context_compaction" => Some(AdvisoryKind::ContextCompaction),
+            _ => {
+                let reason = closeout::CloseoutReason::from_key(key.strip_prefix("nudge_")?)?;
+                Some(AdvisoryKind::CloseoutNudge(reason))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod advisory_kind_tests {
+    use super::AdvisoryKind;
+    use super::closeout::CloseoutReason;
+
+    #[test]
+    fn advisory_kind_keys_round_trip() {
+        let all = [
+            AdvisoryKind::CompletenessAudit,
+            AdvisoryKind::ContextCompaction,
+            AdvisoryKind::CloseoutNudge(CloseoutReason::GoalUnresolved),
+            AdvisoryKind::CloseoutNudge(CloseoutReason::MissingEvidence),
+            AdvisoryKind::CloseoutNudge(CloseoutReason::EmptyAnswer),
+            AdvisoryKind::CloseoutNudge(CloseoutReason::AnswerIncomplete),
+        ];
+        for kind in all {
+            assert_eq!(
+                AdvisoryKind::from_key(kind.as_key()),
+                Some(kind),
+                "key {} must round-trip",
+                kind.as_key()
+            );
+        }
+        assert_eq!(AdvisoryKind::from_key("nudge_bogus"), None);
+        assert_eq!(AdvisoryKind::from_key("bogus"), None);
     }
 }
 

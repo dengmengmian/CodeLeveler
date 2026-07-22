@@ -86,12 +86,35 @@ fn verification_failure_summary(report: &VerificationReport) -> String {
     let failed_gates = report.failed_gates();
     let failed: Vec<String> = failed_gates
         .iter()
-        .map(|check| check.name.clone())
+        .map(|check| failed_gate_label(check))
         .collect();
     if failed.is_empty() {
         "verification did not pass".to_string()
     } else {
         format!("failed gate(s): {}", failed.join(", "))
+    }
+}
+
+/// Terminal-marker label for one failed gate: the check name plus the parsed
+/// failing test ids (capped at two, with the remainder as a count) so the
+/// marker carries evidence instead of contradicting the agent's own summary
+/// unexplained. Falls back to the bare name when no test ids were parsed
+/// (build/fmt failures, unparsable output).
+fn failed_gate_label(check: &leveler_verifier::CheckOutcome) -> String {
+    if check.failed_tests.is_empty() {
+        return check.name.clone();
+    }
+    let shown: Vec<&str> = check
+        .failed_tests
+        .iter()
+        .take(2)
+        .map(String::as_str)
+        .collect();
+    let rest = check.failed_tests.len() - shown.len();
+    if rest == 0 {
+        format!("{} ({})", check.name, shown.join(", "))
+    } else {
+        format!("{} ({}, +{} more)", check.name, shown.join(", "), rest)
     }
 }
 
@@ -160,10 +183,8 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
         },
         EngineEvent::Compacted { from, to } => AgentEvent::Compacted { from, to },
         EngineEvent::AdvisoryStarted { kind } => AgentEvent::AdvisoryStarted {
-            kind: match kind.as_str() {
-                "context_compaction" => AdvisoryKind::ContextCompaction,
-                _ => AdvisoryKind::CompletenessAudit,
-            },
+            // Unknown keys (older/newer logs) degrade to the audit label.
+            kind: AdvisoryKind::from_key(&kind).unwrap_or(AdvisoryKind::CompletenessAudit),
         },
         EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
         EngineEvent::GoalIntercepted { kind, detail } => {
@@ -974,6 +995,106 @@ mod tests {
         assert_eq!(
             out.stop_detail.as_deref(),
             Some("gating checks did not run: tsc (tool missing)")
+        );
+    }
+
+    #[test]
+    fn zero_gating_checks_report_surfaces_the_token_not_the_raw_reason() {
+        // When the project configured no gating checks, the terminal detail
+        // must be the stable REASON_NO_AUTOMATIC_VERIFICATION token — not the
+        // verifier's raw English reason ("no gating verification checks were
+        // configured"), which used to leak into the UI as a ⚠ warning.
+        let mut task = report(
+            TaskOutcome::CompletedUnverified,
+            StopReason::Completed,
+            &["src/lib.rs"],
+        );
+        task.verification = Some(leveler_verifier::VerificationReport {
+            checks: Vec::new(),
+            scope_ok: true,
+            scope_violations: Vec::new(),
+            baseline_failures: Vec::new(),
+        });
+
+        let out = report_to_result(task).unwrap();
+
+        assert_eq!(out.stop_reason, StopReason::CompletedUnverified);
+        assert_eq!(
+            out.stop_detail.as_deref(),
+            Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION)
+        );
+        assert_ne!(
+            out.stop_detail.as_deref(),
+            Some("no gating verification checks were configured")
+        );
+    }
+
+    #[test]
+    fn incomplete_marker_names_the_failing_tests() {
+        // The terminal marker must carry the parsed failing test ids, not just
+        // the check name — "failed gate(s): cargo test" right after the agent
+        // said "all green" reads as a contradiction with zero evidence.
+        use leveler_verifier::{CheckKind, CheckOutcome, CheckStatus, VerificationReport};
+        let mut task = report(TaskOutcome::Failed, StopReason::Completed, &["src/lib.rs"]);
+        task.verification = Some(VerificationReport {
+            checks: vec![CheckOutcome {
+                name: "cargo test".into(),
+                kind: CheckKind::Test,
+                gating: true,
+                status: CheckStatus::Failed,
+                evidence: String::new(),
+                failure: None,
+                failed_tests: ["permission_grants::always_allow_grants_survive_reassembly"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            }],
+            scope_ok: true,
+            scope_violations: Vec::new(),
+            baseline_failures: Vec::new(),
+        });
+
+        let out = report_to_result(task).unwrap();
+
+        assert_eq!(out.stop_reason, StopReason::Incomplete);
+        assert_eq!(
+            out.stop_detail.as_deref(),
+            Some(
+                "failed gate(s): cargo test \
+                 (permission_grants::always_allow_grants_survive_reassembly)"
+            )
+        );
+    }
+
+    #[test]
+    fn incomplete_marker_caps_the_test_list_and_keeps_the_count() {
+        // Many failing tests must not flood the one-line marker: show the
+        // first two ids and the size of the remainder.
+        use leveler_verifier::{CheckKind, CheckOutcome, CheckStatus, VerificationReport};
+        let mut task = report(TaskOutcome::Failed, StopReason::Completed, &["src/lib.rs"]);
+        task.verification = Some(VerificationReport {
+            checks: vec![CheckOutcome {
+                name: "cargo test".into(),
+                kind: CheckKind::Test,
+                gating: true,
+                status: CheckStatus::Failed,
+                evidence: String::new(),
+                failure: None,
+                failed_tests: ["a::one", "b::two", "c::three", "d::four"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            }],
+            scope_ok: true,
+            scope_violations: Vec::new(),
+            baseline_failures: Vec::new(),
+        });
+
+        let out = report_to_result(task).unwrap();
+
+        assert_eq!(
+            out.stop_detail.as_deref(),
+            Some("failed gate(s): cargo test (a::one, b::two, +2 more)")
         );
     }
 

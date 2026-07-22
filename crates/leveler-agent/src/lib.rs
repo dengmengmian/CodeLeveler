@@ -25,6 +25,7 @@ pub use executor::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
     ClarificationRequest, Clarifier, ContinuationPolicy, Executor, ModelRequestRecord, NoopSink,
     StepLimits, StopReason, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink,
+    closeout,
 };
 pub use leveler_lifecycle::{
     CollaborationMode, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,

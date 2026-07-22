@@ -22,6 +22,7 @@
 
 mod axes;
 mod contract;
+mod impact;
 mod ledger;
 mod objective;
 mod plan;
@@ -30,6 +31,7 @@ mod readiness;
 
 pub use axes::{CollaborationMode, DepthUseMetrics, ToolSurface, WorkProfile};
 pub use contract::TaskContract;
+pub use impact::{ChangeImpact, is_build_relevant};
 pub use ledger::{
     CompleteStepReceipt, EvidenceLedger, InterceptRecord, MutationRecord, VerifyRecord,
 };
@@ -37,8 +39,8 @@ pub use objective::{ObjectiveAnchor, ObjectiveSource};
 pub use plan::{PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 pub use readiness::{
-    GateConfig, ProcessEvidence, ReadinessFailure, check, check_goal_complete,
-    task_looks_like_implementation,
+    GateConfig, ProcessEvidence, ReadinessFailure, TaskClass, check, check_goal_complete,
+    classify_task, task_looks_like_implementation,
 };
 
 use std::str::FromStr;

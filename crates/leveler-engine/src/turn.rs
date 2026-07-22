@@ -167,10 +167,21 @@ impl TurnRunner<'_> {
         // The executor block OWNS the emitter (observer closure + recorders); when it
         // ends, every sender is dropped and the pump drains to close.
         let is_goal_profile = matches!(profile, TurnProfile::Goal { .. });
+        // P3: the raw request text feeds task-class gate grading in the
+        // factory. Resume turns carry no new request, so they stay
+        // unclassified and keep the default (fully gated) assembly.
+        let task_text: Option<String> = match &input {
+            TurnInput::Goal { goal, .. } => Some(goal.clone()),
+            TurnInput::Content { content, .. } => {
+                let text = content_text(content);
+                (!text.is_empty()).then_some(text)
+            }
+            TurnInput::Resume(_) => None,
+        };
         let exec = async {
             let mut executor: Executor = self
                 .factory
-                .build(profile)
+                .build(profile, task_text.as_deref())
                 .await?
                 .with_approver(Arc::new(RecordingApprover {
                     inner: self.approver.clone(),
@@ -241,14 +252,7 @@ impl TurnRunner<'_> {
                         .await
                 }
                 TurnInput::Content { prior, content } => {
-                    let text = content
-                        .iter()
-                        .filter_map(|p| match p {
-                            leveler_model::ContentPart::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let text = content_text(&content);
                     let objective = if is_goal_profile {
                         leveler_lifecycle::ObjectiveAnchor::from_session_goal(text)
                     } else {
@@ -343,6 +347,19 @@ impl TurnRunner<'_> {
 
         Ok(TurnRecordedOutcome { turn_id, outcome })
     }
+}
+
+/// Join the text parts of a multimodal user message (objective anchors and
+/// P3 task classification both read the request through this one view).
+fn content_text(content: &[leveler_model::ContentPart]) -> String {
+    content
+        .iter()
+        .filter_map(|p| match p {
+            leveler_model::ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether a fresh Content/Goal turn should inherit Plan/Ledger/Progress.

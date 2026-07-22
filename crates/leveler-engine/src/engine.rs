@@ -1072,10 +1072,25 @@ impl TaskEngine {
                 )
                 .await?;
             }
-            // Full objective restatement — not a vague “Continue…” only.
+            // Full objective restatement — not a vague “Continue…” only. When
+            // the previous drive recorded WHY its closeout stalled, name that
+            // gap so the continuation addresses it instead of repeating the
+            // same summary into the same wall.
+            let closeout_note = outcome
+                .stop_detail
+                .as_deref()
+                .and_then(leveler_agent::closeout::reason_from_stalled_detail)
+                .map(|reason| {
+                    format!(
+                        "\n\nThe previous turn's closeout stalled on: {}. Close that specific \
+                         gap first instead of re-stating what was already done.",
+                        reason.as_key()
+                    )
+                })
+                .unwrap_or_default();
             let continue_text = format!(
                 "Continue working toward the active goal. The previous turn ended without \
-                 proving completion.\n\n\
+                 proving completion.{closeout_note}\n\n\
                  <objective>\n{}\n</objective>\n\n\
                  Inspect the current workspace, make concrete progress, and call update_goal \
                  only when the full objective is complete or genuinely blocked. Do not \

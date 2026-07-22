@@ -12,11 +12,14 @@ use leveler_agent::{
     ContinuationPolicy, Executor, StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy,
     WorkProfile,
 };
+use leveler_lifecycle::{TaskClass, classify_task};
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_tools::{ToolContext, ToolRegistry};
 
 use crate::EngineError;
-use crate::policy_resolver::{ExecutionOverrides, ExecutionRole, resolve_execution_policy};
+use crate::policy_resolver::{
+    ExecutionOverrides, ExecutionRole, ResolvedExecutionPolicy, resolve_execution_policy,
+};
 
 /// What kind of turn the executor will drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +53,34 @@ pub fn profile_step_limits(profile: &TurnProfile) -> StepLimits {
     }
 }
 
+/// P3 task-class grading of the two closeout gates: completion evidence and
+/// the answer audit.
+///
+/// - `Conversational` turns get neither gate — on a command/question turn they
+///   only produce redundant verification prompts.
+/// - `Implementation` (or unclassifiable) turns keep the resolved policy and
+///   the Delivery work-profile audit unchanged.
+/// - An **explicit** eval-only override (`ExecutionOverrides::completion_evidence`)
+///   still wins over grading: safety rails are lowered only deliberately, and
+///   an ablation that pins the rail must not be silently re-graded. Grading
+///   applies only when the override leaves the rail unset.
+fn grade_gates(
+    task_class: Option<TaskClass>,
+    overrides: Option<&ExecutionOverrides>,
+    work_profile: WorkProfile,
+    resolved: &ResolvedExecutionPolicy,
+) -> (bool, bool) {
+    let conversational = matches!(task_class, Some(TaskClass::Conversational));
+    let evidence_override = overrides.and_then(|o| o.completion_evidence);
+    let completion_evidence = if conversational && evidence_override.is_none() {
+        false
+    } else {
+        resolved.completion_evidence
+    };
+    let answer_audit = matches!(work_profile, WorkProfile::Delivery) && !conversational;
+    (completion_evidence, answer_audit)
+}
+
 /// Builds executors for engine turns. Owns the shared runtime/registry/tool
 /// context/model; profile read failures are hard errors (no silently ungated
 /// executors). `overrides` is the eval-only ablation seam — production
@@ -76,7 +107,15 @@ pub struct ExecutorFactory {
 }
 
 impl ExecutorFactory {
-    pub async fn build(&self, profile: TurnProfile) -> Result<Executor, EngineError> {
+    /// `task` is the turn's raw request text when the caller has it (fresh
+    /// Goal/Content turns; `None` for resumes). It feeds P3 task-class
+    /// grading: conversational turns skip the completion-evidence gate and the
+    /// answer audit.
+    pub async fn build(
+        &self,
+        profile: TurnProfile,
+        task: Option<&str>,
+    ) -> Result<Executor, EngineError> {
         let model_profile = self
             .runtime
             .profile(&self.model)
@@ -87,6 +126,21 @@ impl ExecutorFactory {
             ExecutionRole::Main,
             &profile,
             self.overrides.as_ref(),
+        );
+        let task_class = task.map(classify_task);
+        let (completion_evidence, answer_audit) = grade_gates(
+            task_class,
+            self.overrides.as_ref(),
+            self.work_profile,
+            &resolved,
+        );
+        // P3 留痕: the classification and the gates it produced, for offline
+        // accuracy analysis of the keyword classifier.
+        tracing::info!(
+            task_class = ?task_class,
+            completion_evidence,
+            answer_audit,
+            "task classification graded gate assembly"
         );
         let child_policy = |role| {
             let policy =
@@ -136,7 +190,7 @@ impl ExecutorFactory {
             resolved.max_search_calls_per_step,
             resolved.max_parallel_tools,
         )
-        .with_structure(resolved.explicit_plan, resolved.completion_evidence)
+        .with_structure(resolved.explicit_plan, completion_evidence)
         .with_sub_agent_policies(child_policies)
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
@@ -145,15 +199,15 @@ impl ExecutorFactory {
             .with_work_profile(self.work_profile)
             .with_memory_index(self.memory_index.clone());
 
-        // K29: answer_audit off by default; Delivery may enable as optional tax.
-        let delivery_audit = matches!(self.work_profile, WorkProfile::Delivery);
+        // K29: answer_audit off by default; Delivery may enable as optional
+        // tax — but not for conversational turns (graded in `grade_gates`).
         executor = match profile {
             TurnProfile::Goal { .. } => executor
                 .with_goal_mode(true)
-                .with_answer_audit(delivery_audit),
+                .with_answer_audit(answer_audit),
             TurnProfile::Chat { .. } => executor
                 .with_goal_mode(false)
-                .with_answer_audit(delivery_audit),
+                .with_answer_audit(answer_audit),
             TurnProfile::Node {
                 write_allowlist, ..
             } => executor
@@ -215,5 +269,78 @@ mod tests {
             limits.max_duration,
             Some(std::time::Duration::from_secs(900))
         );
+    }
+
+    fn resolved_policy(completion_evidence: bool) -> ResolvedExecutionPolicy {
+        ResolvedExecutionPolicy {
+            max_output_tokens: 8192,
+            context_budget: 65536,
+            max_parallel_tools: 4,
+            max_search_calls_per_step: 0,
+            max_files_per_step: 8,
+            explicit_plan: true,
+            step_summary_every: 0,
+            completion_evidence,
+            repeated_read_guard: true,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn conversational_turn_disables_evidence_gate_and_answer_audit() {
+        // The incident shape: a command-style task under the Delivery profile
+        // must not assemble either closeout gate.
+        let (evidence, audit) = grade_gates(
+            Some(TaskClass::Conversational),
+            None,
+            WorkProfile::Delivery,
+            &resolved_policy(true),
+        );
+        assert!(!evidence);
+        assert!(!audit);
+    }
+
+    #[test]
+    fn implementation_turn_keeps_resolved_gates() {
+        let (evidence, audit) = grade_gates(
+            Some(TaskClass::Implementation),
+            None,
+            WorkProfile::Delivery,
+            &resolved_policy(true),
+        );
+        assert!(evidence);
+        assert!(audit);
+
+        // Unknown task text (resume) keeps the pre-P3 behavior too.
+        let (evidence, audit) =
+            grade_gates(None, None, WorkProfile::Delivery, &resolved_policy(true));
+        assert!(evidence);
+        assert!(audit);
+
+        // Non-Delivery profiles never had the audit.
+        let (_, audit) = grade_gates(
+            Some(TaskClass::Implementation),
+            None,
+            WorkProfile::Balanced,
+            &resolved_policy(true),
+        );
+        assert!(!audit);
+    }
+
+    #[test]
+    fn explicit_override_wins_over_conversational_grading() {
+        // Eval seam pins the rail on: grading must not switch it back off.
+        let overrides = ExecutionOverrides {
+            completion_evidence: Some(true),
+            ..ExecutionOverrides::default()
+        };
+        let (evidence, audit) = grade_gates(
+            Some(TaskClass::Conversational),
+            Some(&overrides),
+            WorkProfile::Delivery,
+            &resolved_policy(true),
+        );
+        assert!(evidence, "explicit override beats task-class grading");
+        assert!(!audit, "answer audit has no override seam");
     }
 }

@@ -81,6 +81,53 @@ pub(crate) struct EventBridge {
     /// The in-flight assistant message id, open while deltas stream (spec §16).
     open_assistant: Option<MessageId>,
     verification_checks: Vec<UiCheck>,
+    /// Recently completed assistant texts this turn, for the near-duplicate
+    /// fold (a nudged model repeating its "task complete" summary). Display
+    /// layer only — the persisted transcript keeps every message.
+    recent_assistant_texts: std::collections::VecDeque<String>,
+}
+
+/// How many completed texts the fold compares against. Nudge rounds can carry
+/// a short tool-status text between two copies of the summary, so comparing
+/// only the immediately previous message would miss the repeat.
+const FOLD_LOOKBACK: usize = 4;
+
+/// Minimum normalized length before the fold may apply: short acknowledgements
+/// repeat legitimately and must stay visible.
+const FOLD_MIN_CHARS: usize = 24;
+
+/// Fraction of the new text's trigrams that must already exist in an earlier
+/// text for the new one to count as "nothing new". A re-stated summary with a
+/// trivial suffix lands ≈0.87; an answer with a genuinely new paragraph drops
+/// below ≈0.7 — 0.85 separates the two with margin on the keep side.
+const FOLD_CONTAINMENT: f64 = 0.85;
+
+/// True when `new` adds (nearly) nothing over `prev`: compare character
+/// trigrams of the normalized texts and require [`FOLD_CONTAINMENT`] of the
+/// new text's trigrams to be already present. Containment (not symmetric
+/// similarity) so a shorter re-statement of a long summary still folds.
+fn is_near_duplicate(prev: &str, new: &str) -> bool {
+    fn normalized(text: &str) -> Vec<char> {
+        text.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    fn trigrams(chars: &[char]) -> std::collections::HashSet<[char; 3]> {
+        chars.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
+    }
+    let p = normalized(prev);
+    let n = normalized(new);
+    if p.len() < FOLD_MIN_CHARS || n.len() < FOLD_MIN_CHARS {
+        return false;
+    }
+    let new_grams = trigrams(&n);
+    if new_grams.is_empty() {
+        return false;
+    }
+    let prev_grams = trigrams(&p);
+    let overlap = new_grams.iter().filter(|g| prev_grams.contains(*g)).count();
+    overlap as f64 / new_grams.len() as f64 >= FOLD_CONTAINMENT
 }
 
 impl EventBridge {
@@ -90,6 +137,7 @@ impl EventBridge {
             tool_starts: HashMap::new(),
             open_assistant: None,
             verification_checks: Vec::new(),
+            recent_assistant_texts: std::collections::VecDeque::new(),
         }
     }
 
@@ -120,6 +168,35 @@ impl EventBridge {
                 let _ = self.events.send(RuntimeEvent::ReasoningDelta { delta });
             }
             AgentEvent::AssistantText(text) => {
+                // Near-duplicate fold: a nudged model that re-states an earlier
+                // summary is collapsed into one notice instead of rendering the
+                // repeat. Display only — the transcript sink keeps the message.
+                let duplicate = self
+                    .recent_assistant_texts
+                    .iter()
+                    .any(|prev| is_near_duplicate(prev, &text));
+                if duplicate {
+                    if let Some(id) = self.open_assistant.take() {
+                        // Streamed path: the deltas are already on screen —
+                        // retract the unfinished block by id.
+                        let _ = self
+                            .events
+                            .send(RuntimeEvent::AssistantAttemptReset {
+                                message_id: Some(id),
+                            });
+                    }
+                    let _ = self.events.send(RuntimeEvent::Notification {
+                        level: NotificationLevel::Info,
+                        message: "重复的总结已折叠(内容与先前一致)".to_string(),
+                    });
+                    return;
+                }
+                if !text.trim().is_empty() {
+                    self.recent_assistant_texts.push_back(text.clone());
+                    if self.recent_assistant_texts.len() > FOLD_LOOKBACK {
+                        self.recent_assistant_texts.pop_front();
+                    }
+                }
                 // Streamed path: close the open message. Non-streamed fallback:
                 // synthesize the whole message as one delta.
                 if let Some(id) = self.open_assistant.take() {
@@ -245,9 +322,16 @@ impl EventBridge {
                 // Closeout round trips that happen after the visible answer.
                 // Label them so the status line does not read "等待模型" with no
                 // hint of why the wait continues.
+                use leveler_agent::closeout::CloseoutReason;
                 let label = match kind {
                     leveler_agent::AdvisoryKind::CompletenessAudit => "完成度审计中…",
                     leveler_agent::AdvisoryKind::ContextCompaction => "压缩上下文中…",
+                    leveler_agent::AdvisoryKind::CloseoutNudge(reason) => match reason {
+                        CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
+                        CloseoutReason::MissingEvidence => "催办:改动缺验证证据,再询一轮",
+                        CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
+                        CloseoutReason::AnswerIncomplete => "催办:回答有遗漏,补齐中",
+                    },
                 };
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
                     label: label.to_string(),
@@ -516,6 +600,18 @@ mod bridge_tests {
         for (kind, needle) in [
             (leveler_agent::AdvisoryKind::CompletenessAudit, "审计"),
             (leveler_agent::AdvisoryKind::ContextCompaction, "压缩"),
+            (
+                leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::MissingEvidence,
+                ),
+                "催办",
+            ),
+            (
+                leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::GoalUnresolved,
+                ),
+                "update_goal",
+            ),
         ] {
             let (tx, mut rx) = broadcast::channel(16);
             let mut bridge = EventBridge::new(tx);
@@ -691,6 +787,128 @@ mod bridge_tests {
             event,
             RuntimeEvent::AssistantAttemptReset { message_id: Some(id) } if id == &stale_id
         )));
+    }
+
+    /// Display-layer fold: a later assistant message that near-duplicates an
+    /// earlier one this turn (the repeated "task complete" summary after a
+    /// closeout nudge) is retracted and replaced by ONE folded notice. The
+    /// persisted transcript is untouched — this only stops the live UI spam.
+    #[test]
+    fn near_duplicate_final_summary_is_folded() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let summary = "任务已完成:统一 closeout 决策点,合并三个 nudge 机制,四种催办原因都有 \
+                       UI 事件与 transcript 持久化,工作区测试全部通过。";
+
+        // Streamed round one passes through untouched.
+        bridge.forward(AgentEvent::AssistantDelta(summary.into()));
+        bridge.forward(AgentEvent::AssistantText(summary.into()));
+        // Nudged round two repeats the same summary with a trivial suffix.
+        let repeat = format!("{summary}(以上为最终结论)");
+        bridge.forward(AgentEvent::AssistantDelta(repeat.clone()));
+        bridge.forward(AgentEvent::AssistantText(repeat));
+
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed, 1,
+            "the duplicate must not complete as a second message: {events:?}"
+        );
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::AssistantMessageStarted { message_id } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2, "both rounds stream a block: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantAttemptReset { message_id: Some(id) } if id == &started[1]
+            )),
+            "the duplicate's streamed block must be retracted by id: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Notification { message, .. } if message.contains("折叠")
+            )),
+            "the fold must leave one visible notice: {events:?}"
+        );
+    }
+
+    /// A genuinely different second answer must never be folded.
+    #[test]
+    fn different_second_answer_is_not_folded() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(AgentEvent::AssistantText(
+            "第一部分结论:closeout 决策点已统一,三个 nudge 机制合并为共享预算。".into(),
+        ));
+        bridge.forward(AgentEvent::AssistantText(
+            "补充遗漏的分支:event_bridge 的重复检测只作用于展示层,持久化与 resume 上下文都保持原样。"
+                .into(),
+        ));
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(completed, 2, "distinct answers must both render: {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::Notification { message, .. } if message.contains("折叠"))),
+            "no fold notice for distinct answers: {events:?}"
+        );
+    }
+
+    /// Short acknowledgements repeat legitimately ("好的" twice) — the length
+    /// guard keeps them out of the fold.
+    #[test]
+    fn short_repeats_are_not_folded() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(AgentEvent::AssistantText("好的,收到。".into()));
+        bridge.forward(AgentEvent::AssistantText("好的,收到。".into()));
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(completed, 2, "short repeats stay visible: {events:?}");
+    }
+
+    /// The non-streamed fallback (no deltas) must fold BEFORE synthesizing the
+    /// message, so the duplicate never reaches the client at all.
+    #[test]
+    fn non_streamed_duplicate_is_folded_without_synthesis() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let summary = "验证完成:所有工作区测试通过,改动范围与方案一致,没有引入新的配置开关,\
+                       持久化层保持不变。";
+        bridge.forward(AgentEvent::AssistantText(summary.into()));
+        bridge.forward(AgentEvent::AssistantText(summary.into()));
+        let events = drain(&mut rx);
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageStarted { .. }))
+            .count();
+        assert_eq!(
+            started, 1,
+            "the duplicate must not even start a second message: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Notification { message, .. } if message.contains("折叠")
+            )),
+            "the fold must leave one visible notice: {events:?}"
+        );
     }
 
     #[test]
