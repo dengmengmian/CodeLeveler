@@ -61,10 +61,10 @@ pub fn item_render(
         // Welcome card retired — workbench Header + Input replace it.
         TranscriptItem::Welcome(_) => {}
         TranscriptItem::User(text) => {
-            // A continuous accent left-bar + bold text marks a user turn clearly
+            // A continuous heading left-bar + bold text marks a user turn clearly
             // apart from the assistant's "●" bullet + normal-weight prose.
             let bar = Style::default()
-                .fg(theme.accent)
+                .fg(theme.heading)
                 .add_modifier(Modifier::BOLD);
             let body = Style::default()
                 .fg(theme.user_message)
@@ -96,7 +96,7 @@ pub fn item_render(
             ));
         }
         TranscriptItem::SubAgent(block) => sub_agent_lines(block, theme, wrap_width, &mut out, t),
-        TranscriptItem::Completion(report) => completion_lines(report, theme, &mut out),
+        TranscriptItem::Completion(report) => completion_lines(report, theme, &mut out, t),
         TranscriptItem::Error(text) => {
             push_prefixed(
                 &mut out,
@@ -288,40 +288,50 @@ fn turn_end_lines(
         && detail_token == Some(leveler_client_protocol::REASON_NO_CODE_CHANGES);
     let no_auto_verify = block.status == TurnEndStatus::Unverified
         && detail_token == Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION);
-    // Soft unverified (no gate / no edits) is a calm finish, not a warning.
-    let (mut label, color) = match block.status {
-        TurnEndStatus::Completed => (t.turn_completed.to_string(), theme.success),
-        TurnEndStatus::Answered => (t.turn_answered.to_string(), theme.success),
-        TurnEndStatus::Truncated => (t.turn_truncated.to_string(), theme.warning),
-        TurnEndStatus::Incomplete => (t.turn_incomplete.to_string(), theme.warning),
+    // The marker reads as `symbol + status word` (colored by outcome) followed
+    // by muted stats. Soft unverified (no gate / no edits) is a calm finish,
+    // not a warning, so it keeps its own low-key wording.
+    let (label, color) = match block.status {
+        TurnEndStatus::Completed | TurnEndStatus::Answered => {
+            (format!("✓ {}", t.turn_end_completed), theme.success)
+        }
+        TurnEndStatus::Truncated => (format!("⚠ {}", t.final_completed_warnings), theme.warning),
+        // Incomplete = the run stopped mid-task on its own (budget / loop
+        // guard); "blocked" names that honestly — the appended detail says how
+        // to unblock ("说「继续」…").
+        TurnEndStatus::Incomplete => (format!("⚠ {}", t.final_blocked), theme.warning),
         TurnEndStatus::Unverified if no_code_changes => {
             (t.turn_no_code_changes.to_string(), theme.success)
         }
         TurnEndStatus::Unverified if no_auto_verify => {
             (t.turn_unverified.to_string(), theme.success)
         }
-        TurnEndStatus::Unverified => (t.turn_unverified.to_string(), theme.muted),
-        TurnEndStatus::Failed => (t.turn_failed.to_string(), theme.error),
-        TurnEndStatus::Cancelled => (t.turn_cancelled.to_string(), theme.warning),
+        TurnEndStatus::Unverified => {
+            (format!("⚠ {}", t.final_completed_warnings), theme.warning)
+        }
+        TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.error),
+        // Cancelled is user-initiated, not a failure: stopped glyph, muted.
+        TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.muted),
     };
+    let mut stats = String::new();
     if matches!(
         block.status,
         TurnEndStatus::Completed | TurnEndStatus::Answered | TurnEndStatus::Unverified
     ) {
         if block.tool_calls > 0 {
-            label.push_str(
+            stats.push_str(
                 &t.tool_calls_n
                     .replacen("{}", &block.tool_calls.to_string(), 1),
             );
         }
         if block.elapsed_secs > 0 {
-            label.push_str(&format!(
+            stats.push_str(&format!(
                 " · {}",
                 crate::status_line::fmt_elapsed(block.elapsed_secs)
             ));
         }
         if let Some(summary) = &block.summary {
-            label.push_str(&format!(" · {summary}"));
+            stats.push_str(&format!(" · {summary}"));
         }
     }
     // Soft machine tokens are already folded into the label — do not re-append.
@@ -330,12 +340,15 @@ fn turn_end_lines(
     if let Some(detail) = &block.detail {
         let d = localized_turn_detail(detail, t);
         if !folded && !d.is_empty() {
-            label.push_str(" · ");
-            label.push_str(d);
+            stats.push_str(" · ");
+            stats.push_str(d);
         }
     }
     let lead = "── ";
-    let used = UnicodeWidthStr::width(lead) + UnicodeWidthStr::width(label.as_str()) + 1;
+    let used = UnicodeWidthStr::width(lead)
+        + UnicodeWidthStr::width(label.as_str())
+        + UnicodeWidthStr::width(stats.as_str())
+        + 1;
     let tail = "─".repeat(width.saturating_sub(used));
     out.push(Line::from(vec![
         Span::styled(lead, Style::default().fg(theme.border)),
@@ -343,6 +356,7 @@ fn turn_end_lines(
             label,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(stats, Style::default().fg(theme.muted)),
         Span::styled(format!(" {tail}"), Style::default().fg(theme.border)),
     ]));
     // Very long residual reasons wrap onto a second dim line.
@@ -488,7 +502,7 @@ fn sub_agent_lines(
     t: &crate::i18n::UiText,
 ) {
     let (glyph, color) = match block.status {
-        ToolStatus::Running => ("↗", theme.accent),
+        ToolStatus::Running => ("◌", theme.accent),
         ToolStatus::Ok => ("✓", theme.success),
         ToolStatus::Failed => ("✗", theme.error),
     };
@@ -532,6 +546,193 @@ fn sub_agent_lines(
     }
 }
 
+/// Render a run of consecutive sub-agent blocks as one inline tree: an
+/// aggregate header (◌ running / ✓ all done / ⚠ ended with failures) plus one
+/// `├─/└─` child per agent. A lone agent keeps the classic single-block
+/// rendering. Only data the blocks actually carry is shown (token usage);
+/// per-agent tool counts / wall time are not tracked, so they are not faked.
+pub fn sub_agent_tree_lines(
+    blocks: &[&crate::transcript::SubAgentBlock],
+    theme: &Theme,
+    wrap_width: usize,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    match blocks {
+        [] => {}
+        [single] => sub_agent_lines(single, theme, wrap_width, &mut out, t),
+        many => sub_agent_tree_group_lines(many, theme, &mut out, t),
+    }
+    out
+}
+
+/// The multi-agent tree (two or more consecutive blocks).
+fn sub_agent_tree_group_lines(
+    blocks: &[&crate::transcript::SubAgentBlock],
+    theme: &Theme,
+    out: &mut Vec<Line<'static>>,
+    t: &crate::i18n::UiText,
+) {
+    let n = blocks.len();
+    let any_running = blocks.iter().any(|b| b.status == ToolStatus::Running);
+    let all_ok = blocks.iter().all(|b| b.status == ToolStatus::Ok);
+
+    let count = n.to_string();
+    let (glyph, color, header) = if any_running {
+        (
+            "◌",
+            theme.accent,
+            t.agents_running_header.replacen("{}", &count, 1),
+        )
+    } else if all_ok {
+        (
+            "✓",
+            theme.success,
+            t.agents_done_header.replacen("{}", &count, 1),
+        )
+    } else {
+        (
+            "⚠",
+            theme.warning,
+            t.agents_ended_header.replacen("{}", &count, 1),
+        )
+    };
+
+    // Aggregate the token usage the runtime actually reports.
+    let sum_in = blocks
+        .iter()
+        .fold(0u64, |acc, b| acc + u64::from(b.progress.input_tokens));
+    let sum_out = blocks
+        .iter()
+        .fold(0u64, |acc, b| acc + u64::from(b.progress.output_tokens));
+    let mut stats = String::new();
+    if sum_in > 0 || sum_out > 0 {
+        stats.push_str(&format!(
+            " · ↑ {} · ↓ {}",
+            crate::status_line::fmt_tokens_compact(u32::try_from(sum_in).unwrap_or(u32::MAX)),
+            crate::status_line::fmt_tokens_compact(u32::try_from(sum_out).unwrap_or(u32::MAX))
+        ));
+    }
+    // A finished-but-not-clean run breaks down how each agent ended.
+    if !any_running && !all_ok {
+        let completed = blocks
+            .iter()
+            .filter(|b| b.status == ToolStatus::Ok)
+            .count();
+        let timeout = blocks
+            .iter()
+            .filter(|b| b.status == ToolStatus::Failed && sub_agent_hit_round_limit(b))
+            .count();
+        let failed = n - completed - timeout;
+        let mut parts: Vec<String> = Vec::new();
+        if completed > 0 {
+            parts.push(format!("{completed} {}", t.agent_status_completed));
+        }
+        if timeout > 0 {
+            parts.push(format!("{timeout} {}", t.agent_status_timeout));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} {}", t.sub_agent_incomplete));
+        }
+        stats.push_str(" · ");
+        stats.push_str(&parts.join(" · "));
+    }
+    out.push(Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            header,
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(stats, Style::default().fg(theme.dim)),
+    ]));
+
+    // Children: nickname first, then the localized role name. Stats/status in
+    // a right column aligned on the widest name.
+    let names: Vec<String> = blocks
+        .iter()
+        .map(|b| {
+            if b.nickname.trim().is_empty() {
+                sub_agent_display_name(b, t)
+            } else {
+                b.nickname.clone()
+            }
+        })
+        .collect();
+    let name_w = names
+        .iter()
+        .map(|name| UnicodeWidthStr::width(name.as_str()))
+        .max()
+        .unwrap_or(0);
+    for (i, (block, name)) in blocks.iter().zip(&names).enumerate() {
+        let branch = if i + 1 == blocks.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        let mut spans = vec![
+            Span::styled(format!("  {branch} "), Style::default().fg(theme.border)),
+            Span::styled(name.clone(), Style::default().fg(theme.text)),
+        ];
+        // Only an imperfect run spells out each child's outcome; a fully
+        // successful batch shows usage stats instead of repeating "completed".
+        let (right, right_color) = if all_ok {
+            (sub_agent_tree_child_usage(block), theme.dim)
+        } else {
+            sub_agent_tree_child_status(block, theme, t)
+        };
+        if !right.is_empty() {
+            let pad = name_w.saturating_sub(UnicodeWidthStr::width(name.as_str())) + 2;
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(right, Style::default().fg(right_color)));
+        }
+        out.push(Line::from(spans));
+    }
+}
+
+/// Whether a failed sub-agent hit its round limit (the "timeout" outcome).
+fn sub_agent_hit_round_limit(block: &crate::transcript::SubAgentBlock) -> bool {
+    block.detail.starts_with("Reached the ")
+        && block.detail.contains("-round limit before finishing.")
+}
+
+/// Compact usage stats for one fully-succeeded tree child (`↑ 87.8k · ↓ 45.8k`).
+fn sub_agent_tree_child_usage(block: &crate::transcript::SubAgentBlock) -> String {
+    let usage = &block.progress;
+    if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        return String::new();
+    }
+    format!(
+        "↑ {} · ↓ {}",
+        crate::status_line::fmt_tokens_compact(usage.input_tokens),
+        crate::status_line::fmt_tokens_compact(usage.output_tokens)
+    )
+}
+
+/// Status word for one tree child in a non-all-success batch. Running agents
+/// keep the waiting/running distinction; finished ones carry a ✓/✗ glyph.
+fn sub_agent_tree_child_status(
+    block: &crate::transcript::SubAgentBlock,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> (String, ratatui::style::Color) {
+    match block.status {
+        ToolStatus::Running if block.progress.active => {
+            (t.agent_status_running.to_string(), theme.accent)
+        }
+        ToolStatus::Running => (t.sub_agent_waiting.to_string(), theme.muted),
+        ToolStatus::Ok => (
+            format!("✓ {}", t.agent_status_completed),
+            theme.success,
+        ),
+        ToolStatus::Failed if sub_agent_hit_round_limit(block) => {
+            (format!("✗ {}", t.agent_status_timeout), theme.error)
+        }
+        ToolStatus::Failed => (format!("✗ {}", t.sub_agent_incomplete), theme.error),
+    }
+}
+
 /// Prefix a block of lines with a colored bullet on the first line and a
 /// two-column hanging indent on the remaining lines.
 fn bulleted(lines: Vec<Line<'static>>, bullet: &str, bullet_style: Style) -> Vec<Line<'static>> {
@@ -556,42 +757,53 @@ fn bulleted(lines: Vec<Line<'static>>, bullet: &str, bullet_style: Style) -> Vec
 /// Consecutive tool calls form one visual group — a gap between each would
 /// stretch a burst of quick reads across half a screen of whitespace.
 pub fn items_need_gap(prev: &TranscriptItem, next: &TranscriptItem) -> bool {
-    // Consecutive sub-agents form one visual batch. Tool calls are already
-    // represented by a single ToolGroup transcript item.
+    // Consecutive sub-agents form one visual batch (the workbench renders the
+    // whole run as one tree via `sub_agent_tree_lines`; this rule covers the
+    // per-item footer path). Tool calls are already a single ToolGroup item.
     let both_agents =
         matches!(prev, TranscriptItem::SubAgent(_)) && matches!(next, TranscriptItem::SubAgent(_));
     !both_agents
 }
 
 /// The completion report block (spec §23).
-fn completion_lines(report: &UiCompletionReport, theme: &Theme, out: &mut Vec<Line<'static>>) {
+fn completion_lines(
+    report: &UiCompletionReport,
+    theme: &Theme,
+    out: &mut Vec<Line<'static>>,
+    t: &crate::i18n::UiText,
+) {
     let (glyph, color) = if report.success {
         ("✓", theme.success)
     } else {
         ("✗", theme.warning)
     };
     out.push(Line::from(Span::styled(
-        format!("{glyph} 任务已完成"),
+        format!("{glyph} {}", t.turn_end_completed),
         Style::default().fg(color),
     )));
     out.push(Line::from(Span::styled(
         format!(
-            "  修改 {} 个文件  +{} / -{}",
-            report.files_changed, report.added, report.removed
+            "  {}  +{} / -{}",
+            t.completion_files_changed
+                .replacen("{}", &report.files_changed.to_string(), 1),
+            report.added,
+            report.removed
         ),
         Style::default().fg(theme.muted),
     )));
     if report.checks_total > 0 {
         out.push(Line::from(Span::styled(
             format!(
-                "  验证 {}/{} 通过",
-                report.checks_passed, report.checks_total
+                "  {}",
+                t.completion_verified
+                    .replacen("{}", &report.checks_passed.to_string(), 1)
+                    .replacen("{}", &report.checks_total.to_string(), 1)
             ),
             Style::default().fg(theme.muted),
         )));
     }
     out.push(Line::from(Span::styled(
-        "  /diff 查看改动",
+        format!("  {}", t.completion_diff_hint),
         Style::default().fg(theme.muted),
     )));
 }
@@ -723,5 +935,170 @@ mod tests {
             !text.contains("no applicable automatic verification"),
             "{text}"
         );
+    }
+
+    fn turn_end_text(status: TurnEndStatus, detail: Option<&str>) -> String {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let item = TranscriptItem::TurnEnd(TurnEndBlock {
+            status,
+            tool_calls: 0,
+            elapsed_secs: 0,
+            summary: None,
+            detail: detail.map(str::to_string),
+        });
+        item_render(&item, &theme, 120, false, t)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn turn_end_marker_distinguishes_all_terminal_states() {
+        let completed = turn_end_text(TurnEndStatus::Completed, None);
+        assert!(completed.contains("✓ 任务已完成"), "{completed}");
+        let answered = turn_end_text(TurnEndStatus::Answered, None);
+        assert!(answered.contains("✓ 任务已完成"), "{answered}");
+        let truncated = turn_end_text(TurnEndStatus::Truncated, Some("context limit"));
+        assert!(truncated.contains("⚠ 已完成，但有警告"), "{truncated}");
+        let incomplete = turn_end_text(TurnEndStatus::Incomplete, Some("预算已耗尽"));
+        assert!(incomplete.contains("⚠ 被阻塞"), "{incomplete}");
+        let unverified = turn_end_text(TurnEndStatus::Unverified, Some("verify failed"));
+        assert!(unverified.contains("⚠ 已完成，但有警告"), "{unverified}");
+        let failed = turn_end_text(TurnEndStatus::Failed, Some("boom"));
+        assert!(failed.contains("✗ 失败"), "{failed}");
+        let cancelled = turn_end_text(TurnEndStatus::Cancelled, None);
+        assert!(cancelled.contains("⊘ 已取消"), "{cancelled}");
+    }
+
+    #[test]
+    fn turn_end_marker_colors_only_symbol_and_word_not_stats() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let item = TranscriptItem::TurnEnd(TurnEndBlock {
+            status: TurnEndStatus::Failed,
+            tool_calls: 2,
+            elapsed_secs: 5,
+            summary: None,
+            detail: Some("boom".into()),
+        });
+        let lines = item_render(&item, &theme, 80, false, t);
+        assert_eq!(lines.len(), 1);
+        // lead border / label / stats / tail: stats must not take the status color.
+        let stats = &lines[0].spans[2];
+        assert!(stats.content.contains("boom"), "{stats:?}");
+        assert_eq!(stats.style.fg, Some(theme.muted), "{stats:?}");
+        assert_eq!(lines[0].spans[1].style.fg, Some(theme.error));
+    }
+
+    fn sub_agent(id: &str, nickname: &str, status: ToolStatus) -> crate::transcript::SubAgentBlock {
+        crate::transcript::SubAgentBlock {
+            id: id.into(),
+            nickname: nickname.into(),
+            role: "explorer".into(),
+            status,
+            detail: if status == ToolStatus::Failed {
+                "Reached the 6-round limit before finishing.".into()
+            } else {
+                "done".into()
+            },
+            progress: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sub_agent_tree_aggregates_running_agents() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
+        a.progress.active = true;
+        a.progress.input_tokens = 1_200;
+        a.progress.output_tokens = 80;
+        let mut b = sub_agent("agent-2", "Newton", ToolStatus::Running);
+        b.progress.input_tokens = 2_400;
+        b.progress.output_tokens = 160;
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("◌ 2 个 agents 正在运行"), "{text}");
+        assert!(text.contains("↑ 3.6k · ↓ 240"), "{text}");
+        assert!(text.contains("├─ Euclid"), "{text}");
+        assert!(text.contains("└─ Newton"), "{text}");
+        assert!(text.contains("进行中"), "{text}");
+        assert!(text.contains("等待执行"), "{text}");
+    }
+
+    #[test]
+    fn sub_agent_tree_all_done_shows_stats_not_status_words() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+        a.progress.input_tokens = 87_800;
+        let b = sub_agent("agent-2", "Newton", ToolStatus::Ok);
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("✓ 2 个 agents 完成"), "{text}");
+        assert!(text.contains("├─ Euclid"), "{text}");
+        assert!(text.contains("↑ 87k"), "{text}");
+        assert!(!text.contains("└─ Newton  已完成"), "{text}");
+    }
+
+    #[test]
+    fn sub_agent_tree_with_failure_breaks_down_outcomes() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+        let b = sub_agent("agent-2", "Newton", ToolStatus::Failed);
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("⚠ 2 个 agents 结束"), "{text}");
+        assert!(text.contains("1 已完成 · 1 超时"), "{text}");
+        assert!(text.contains("├─ Euclid"), "{text}");
+        assert!(text.contains("✓ 已完成"), "{text}");
+        assert!(text.contains("✗ 超时"), "{text}");
+    }
+
+    #[test]
+    fn single_sub_agent_keeps_classic_rendering() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
+        let lines = sub_agent_tree_lines(&[&a], &theme, 100, t);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("◌ 探索 Agent 1"), "{text}");
+        assert!(!text.contains("├─"), "{text}");
+    }
+
+    #[test]
+    fn completion_report_is_localized() {
+        let theme = Theme::default();
+        let report = UiCompletionReport {
+            files_changed: 3,
+            added: 86,
+            removed: 31,
+            checks_passed: 4,
+            checks_total: 5,
+            success: true,
+        };
+        let item = TranscriptItem::Completion(report);
+        let zh = item_render(&item, &theme, 120, false, Locale::Zh.text())
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(zh.contains("✓ 任务已完成"), "{zh}");
+        assert!(zh.contains("修改 3 个文件  +86 / -31"), "{zh}");
+        assert!(zh.contains("验证 4/5 通过"), "{zh}");
+        assert!(zh.contains("/diff 查看改动"), "{zh}");
+
+        let en = item_render(&item, &theme, 120, false, Locale::En.text())
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(en.contains("✓ Task completed"), "{en}");
+        assert!(en.contains("3 files changed"), "{en}");
+        assert!(en.contains("verification 4/5 passed"), "{en}");
+        assert!(en.contains("/diff to view changes"), "{en}");
     }
 }

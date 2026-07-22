@@ -545,9 +545,25 @@ fn dispatch_effects(
                     )));
                 }
             },
+            Effect::OpenWebUrl(url) => open_in_browser(&url),
             Effect::Quit => state.running = false,
         }
     }
+}
+
+/// Open `url` in the platform default browser (best-effort, non-blocking).
+/// Shared by the `/web` first launch (CLI launcher closure) and re-invocation
+/// (the [`Effect::OpenWebUrl`] path) so both behave identically.
+pub fn open_in_browser(url: &str) {
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        // `start` needs an empty title argument before the URL.
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    let _ = std::process::Command::new(program).args(args).spawn();
 }
 
 fn collect_project_files(repository: &str) -> Vec<String> {

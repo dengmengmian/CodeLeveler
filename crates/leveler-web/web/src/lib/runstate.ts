@@ -77,15 +77,7 @@ export function deriveRunState(s: SessionView): RunView | null {
       return { state, primary: label, detail: toolTarget(runningTool.arguments), terminal: false };
     }
 
-    if (s.plan && s.plan.steps.some((st) => st.status === 'running')) {
-      const step = s.plan.steps.find((st) => st.status === 'running');
-      return {
-        state: 'planning',
-        primary: '正在执行计划',
-        detail: step ? truncate(step.description) : null,
-        terminal: false,
-      };
-    }
+    // 计划步骤不在中间区域重复展示（右侧面板负责完整执行计划）。
 
     // agent_activity 的 label 本身是人类可读的阶段描述，优先直接展示。
     if (s.activity) {

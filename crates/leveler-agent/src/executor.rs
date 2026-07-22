@@ -1,5 +1,6 @@
 //! The state-driven single-agent tool loop.
 
+pub mod closeout;
 mod dispatch;
 mod drive;
 mod handlers;
@@ -175,8 +176,87 @@ pub enum AgentEvent {
     EvidenceLedgerUpdated { ledger: EvidenceLedger },
     /// Cross-round progress / closeout ledger (resume + engine continue).
     ProgressUpdated { ledger: ProgressLedger },
+    /// The harness started an advisory (tool-free) model call during closeout —
+    /// a completeness audit or a compaction summary. These are extra model round
+    /// trips that happen AFTER the visible answer, so without this a UI shows a
+    /// bare "waiting for model" for many seconds with no idea why. Emitting the
+    /// kind lets the status line name the wait ("completeness audit…").
+    AdvisoryStarted { kind: AdvisoryKind },
     /// The loop finished with a final answer.
     Finished(String),
+}
+
+/// Which extra harness-initiated model round trip is starting during closeout.
+/// Carried by [`AgentEvent::AdvisoryStarted`] so a UI can label the wait
+/// instead of showing a bare "waiting for model". Audits and compaction are
+/// tool-free advisory calls; a closeout nudge re-prompts the full loop once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryKind {
+    /// Post-answer completeness audit (`answer_audit`): a separate model call
+    /// that checks the answer covered everything the request asked for.
+    CompletenessAudit,
+    /// Context compaction: summarizing older transcript to fit the window.
+    ContextCompaction,
+    /// The unified closeout injected a nudge (executor/closeout.rs) and the
+    /// model is being re-prompted. Without this the user sees the "final"
+    /// answer, then an unexplained extra model round.
+    CloseoutNudge(closeout::CloseoutReason),
+}
+
+impl AdvisoryKind {
+    /// Stable key for crossing the (serialized) engine event boundary.
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            AdvisoryKind::CompletenessAudit => "completeness_audit",
+            AdvisoryKind::ContextCompaction => "context_compaction",
+            AdvisoryKind::CloseoutNudge(reason) => match reason {
+                closeout::CloseoutReason::GoalUnresolved => "nudge_goal_unresolved",
+                closeout::CloseoutReason::MissingEvidence => "nudge_missing_evidence",
+                closeout::CloseoutReason::EmptyAnswer => "nudge_empty_answer",
+                closeout::CloseoutReason::AnswerIncomplete => "nudge_answer_incomplete",
+            },
+        }
+    }
+
+    /// Inverse of [`Self::as_key`] (engine → app event replay).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "completeness_audit" => Some(AdvisoryKind::CompletenessAudit),
+            "context_compaction" => Some(AdvisoryKind::ContextCompaction),
+            _ => {
+                let reason = closeout::CloseoutReason::from_key(key.strip_prefix("nudge_")?)?;
+                Some(AdvisoryKind::CloseoutNudge(reason))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod advisory_kind_tests {
+    use super::AdvisoryKind;
+    use super::closeout::CloseoutReason;
+
+    #[test]
+    fn advisory_kind_keys_round_trip() {
+        let all = [
+            AdvisoryKind::CompletenessAudit,
+            AdvisoryKind::ContextCompaction,
+            AdvisoryKind::CloseoutNudge(CloseoutReason::GoalUnresolved),
+            AdvisoryKind::CloseoutNudge(CloseoutReason::MissingEvidence),
+            AdvisoryKind::CloseoutNudge(CloseoutReason::EmptyAnswer),
+            AdvisoryKind::CloseoutNudge(CloseoutReason::AnswerIncomplete),
+        ];
+        for kind in all {
+            assert_eq!(
+                AdvisoryKind::from_key(kind.as_key()),
+                Some(kind),
+                "key {} must round-trip",
+                kind.as_key()
+            );
+        }
+        assert_eq!(AdvisoryKind::from_key("nudge_bogus"), None);
+        assert_eq!(AdvisoryKind::from_key("bogus"), None);
+    }
 }
 
 // PlanStep lives in leveler-lifecycle; re-exported from crate root.
@@ -1458,7 +1538,7 @@ mod compaction_tests {
             msgs.push(tool_result("... file contents ..."));
         }
 
-        let out = compact_messages(&msgs, 4, None, None);
+        let out = compact_messages(&msgs, 4, 0, None, None);
         assert!(out.len() < msgs.len(), "should shrink");
         assert!(
             out.iter()
@@ -1470,7 +1550,7 @@ mod compaction_tests {
     #[test]
     fn keeps_anchors_and_recent_and_reduces_length() {
         let msgs = long_transcript();
-        let out = compact_messages(&msgs, 4, None, Some("fix the bug"));
+        let out = compact_messages(&msgs, 4, 0, None, Some("fix the bug"));
 
         assert!(
             out.len() < msgs.len(),
@@ -1519,6 +1599,7 @@ mod compaction_tests {
         let out = compact_messages(
             &msgs,
             4,
+            0,
             None,
             Some("update docs/ARCHITECTURE.md for the runtime"),
         );
@@ -1541,7 +1622,7 @@ mod compaction_tests {
     fn tail_never_starts_on_an_orphan_tool_result() {
         let msgs = long_transcript();
         // keep_recent=3 would land the tail on a Tool result; it must back up.
-        let out = compact_messages(&msgs, 3, None, None);
+        let out = compact_messages(&msgs, 3, 0, None, None);
         // system + first user + breadcrumb → index of first tail message.
         let first_after_breadcrumb = out
             .iter()
@@ -1563,7 +1644,7 @@ mod compaction_tests {
             assistant_call("read_file", "a.rs"),
             tool_result("x"),
         ];
-        assert_eq!(compact_messages(&msgs, 4, None, None), msgs);
+        assert_eq!(compact_messages(&msgs, 4, 0, None, None), msgs);
     }
 
     #[test]
@@ -1574,7 +1655,7 @@ mod compaction_tests {
             assistant_call("read_file", "a.rs"),
             tool_result("x"),
         ];
-        let out = compact_messages(&msgs, 4, None, Some("new objective only"));
+        let out = compact_messages(&msgs, 4, 0, None, Some("new objective only"));
         assert!(
             out.iter()
                 .any(|m| m.text_content().contains(ACTIVE_OBJECTIVE_MARKER)

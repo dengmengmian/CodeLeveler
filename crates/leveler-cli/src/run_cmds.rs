@@ -637,15 +637,33 @@ pub(crate) async fn cmd_tui(
     // `/web` inside the TUI binds the browser Web UI over this same in-process
     // runtime. The service is the `InProcessRuntimeClient` itself (it implements
     // `LocalRuntimeService`); the launcher mints a fresh token and serves on an
-    // ephemeral loopback port, returning the token-carrying URL.
+    // ephemeral loopback port, returning the token-carrying URL. Aggregation
+    // mode, same as `leveler web`: without it every `/api/projects` endpoint
+    // 404s ("打开项目失败: Not Found") and the sidebar can only ever show the
+    // current repository.
     let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
+    let web_repo_root = app.layout.repo_root.clone();
     let web_launcher: leveler_tui::WebLauncher = Arc::new(move || {
         let service = web_service.clone();
+        let repo_root = web_repo_root.clone();
         Box::pin(async move {
             let token = generate_daemon_token();
             let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
-            let server = leveler_web::bind(service, addr, token.clone())
+            let router = leveler_web::RouterService::new(service, repo_root);
+            let manager = leveler_web::ProjectManager::new(
+                router.clone(),
+                web_projects_registry_path(),
+                std::env::current_exe().ok(),
+            );
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
+            });
+            let server = leveler_web::bind_multi(router, manager, addr, token.clone())
                 .await
                 .map_err(|e| e.to_string())?;
             let url = format!("http://{}/?token={token}", server.local_addr());
@@ -655,7 +673,7 @@ pub(crate) async fn cmd_tui(
             });
             // The token URL is only printed to the transient notification line;
             // open it in the default browser so it is not missed.
-            open_in_browser(&url);
+            leveler_tui::open_in_browser(&url);
             Ok(url)
         })
     });
@@ -686,7 +704,14 @@ pub(crate) async fn cmd_tui(
     };
 
     leveler_tui::run(client, Some(web_launcher), boot).await?;
-    Ok(std::process::ExitCode::SUCCESS)
+    // The TUI owns the only runtime, and an in-process `/web` server is spawned
+    // detached on a token it never cancels (it serves "until the process
+    // exits"). Falling through to a normal return would drop the runtime with
+    // that task still live, which hangs the process — the terminal is restored
+    // and the composer draft/history are already persisted inside `run`, but the
+    // shell never comes back. Exit the process directly so a running Web UI can
+    // never keep the CLI alive after the user quits the TUI.
+    std::process::exit(0);
 }
 
 /// The daemon's bound transports. In TCP mode the per-repo Unix socket is
@@ -740,18 +765,6 @@ fn generate_daemon_token() -> String {
 
 /// Open `url` in the OS default browser, best-effort (any failure is ignored —
 /// the URL is still shown in the TUI notification as a fallback).
-fn open_in_browser(url: &str) {
-    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else if cfg!(target_os = "windows") {
-        // `start` needs an empty title argument before the URL.
-        ("cmd", vec!["/C", "start", "", url])
-    } else {
-        ("xdg-open", vec![url])
-    };
-    let _ = std::process::Command::new(program).args(args).spawn();
-}
-
 /// Environment variable carrying the daemon bearer token. Secrets never go on
 /// argv (`ps` exposes it); the spawning WebUI passes the token this way.
 pub(crate) const DAEMON_TOKEN_ENV: &str = "LEVELER_DAEMON_TOKEN";
@@ -889,7 +902,13 @@ pub(crate) async fn cmd_web(
                 registry_path,
                 std::env::current_exe().ok(),
             );
-            tokio::spawn(manager.clone().load_registry());
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
+            });
             let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
             (server, None, token)
         }
@@ -922,8 +941,16 @@ pub(crate) async fn cmd_web(
                 std::env::current_exe().ok(),
             );
             // Bring persisted projects online in the background — the server
-            // must not wait on daemons that need spawning.
-            tokio::spawn(manager.clone().load_registry());
+            // must not wait on daemons that need spawning. Then register
+            // every repository that has Leveler state (TUI-only projects), so
+            // the sidebar lists all previously used projects.
+            let background = manager.clone();
+            tokio::spawn(async move {
+                background.clone().load_registry().await;
+                background
+                    .discover_historical_projects(&std::env::temp_dir())
+                    .await;
+            });
             let token = generate_daemon_token();
             let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
             (server, Some(runtime), token)

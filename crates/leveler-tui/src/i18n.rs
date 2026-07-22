@@ -303,6 +303,63 @@ pub struct UiText {
     pub btw_answering: &'static str,
     /// Footer/card hint: how to close a finished 旁问 card.
     pub btw_dismiss: &'static str,
+
+    // Final status (turn closeout)
+    pub final_completed: &'static str,
+    pub final_completed_warnings: &'static str,
+    pub final_waiting_confirmation: &'static str,
+    pub final_blocked: &'static str,
+    pub final_failed: &'static str,
+    pub final_cancelled: &'static str,
+
+    // Turn end / completion report
+    pub turn_end_completed: &'static str,
+    pub completion_files_changed: &'static str, // "修改 {} 个文件"
+    pub completion_verified: &'static str,      // "验证 {}/{} 通过"
+    pub completion_diff_hint: &'static str,
+
+    // Fold hints
+    pub fold_more_lines: &'static str,       // "… 还有 {} 行 · Ctrl+O 展开"
+    pub fold_more_lines_short: &'static str, // "(+{} 行 · Ctrl+O)"
+    pub fold_full_diff: &'static str,
+
+    // Tool detail labels
+    pub tool_label_args: &'static str,
+    pub tool_label_patch: &'static str,
+    pub tool_label_replace: &'static str,
+    pub tool_word_blocked: &'static str,
+    pub tool_word_done: &'static str,
+
+    // Tools screen
+    pub tools_none: &'static str,
+    pub tools_col_tool: &'static str,
+    pub tools_col_status: &'static str,
+    pub tools_status_running: &'static str,
+    pub tools_status_ok: &'static str,
+    pub tools_status_attention: &'static str,
+    pub tools_col_duration: &'static str,
+    pub tools_output: &'static str,
+
+    // Parallel batch header
+    pub parallel_header: &'static str, // "并行执行 {} 个工具"
+
+    // Sub-agent tree
+    pub agents_running_header: &'static str, // "{} 个 agents 正在运行"
+    pub agents_done_header: &'static str,    // "{} 个 agents 完成"
+    pub agents_ended_header: &'static str,   // "{} 个 agents 结束"
+    pub agent_status_running: &'static str,
+    pub agent_status_completed: &'static str,
+    pub agent_status_timeout: &'static str,
+
+    // Tool result
+    pub result_timeout: &'static str,
+
+    // Edit merge summary
+    pub edit_merge_summary: &'static str, // "{} 处修改"
+
+    // Tools screen footer hint
+    pub tools_footer_hint_full: &'static str,
+    pub tools_footer_hint_compact: &'static str,
 }
 
 #[derive(Debug)]
@@ -556,6 +613,43 @@ static ZH: UiText = UiText {
     btw_failed: "临时提问失败",
     btw_answering: "回答中…",
     btw_dismiss: "关闭",
+    final_completed: "已完成",
+    final_completed_warnings: "已完成，但有警告",
+    final_waiting_confirmation: "等待确认",
+    final_blocked: "被阻塞",
+    final_failed: "失败",
+    final_cancelled: "已取消",
+    turn_end_completed: "任务已完成",
+    completion_files_changed: "修改 {} 个文件",
+    completion_verified: "验证 {}/{} 通过",
+    completion_diff_hint: "/diff 查看改动",
+    fold_more_lines: "… 还有 {} 行 · Ctrl+O 展开",
+    fold_more_lines_short: "(+{} 行 · Ctrl+O)",
+    fold_full_diff: "… Ctrl+O 查看完整 Diff",
+    tool_label_args: "参数",
+    tool_label_patch: "补丁",
+    tool_label_replace: "文本替换",
+    tool_word_blocked: "受阻",
+    tool_word_done: "完成",
+    tools_none: "无工具调用",
+    tools_col_tool: "工具",
+    tools_col_status: "状态",
+    tools_status_running: "运行中",
+    tools_status_ok: "成功",
+    tools_status_attention: "需调整",
+    tools_col_duration: "耗时",
+    tools_output: "输出",
+    parallel_header: "并行执行 {} 个工具",
+    agents_running_header: "{} 个 agents 正在运行",
+    agents_done_header: "{} 个 agents 完成",
+    agents_ended_header: "{} 个 agents 结束",
+    agent_status_running: "进行中",
+    agent_status_completed: "已完成",
+    agent_status_timeout: "超时",
+    result_timeout: " · timeout",
+    edit_merge_summary: "{} 处修改",
+    tools_footer_hint_full: "Tab 过滤 · ↑↓ 选择 · PgUp/PgDn 滚动 · Esc 返回",
+    tools_footer_hint_compact: "Tab 过滤 · ↑↓ 选择 · Esc 返回",
 };
 
 static EN: UiText = UiText {
@@ -762,6 +856,43 @@ static EN: UiText = UiText {
     btw_failed: "btw failed",
     btw_answering: "Answering…",
     btw_dismiss: "dismiss",
+    final_completed: "Completed",
+    final_completed_warnings: "Completed with warnings",
+    final_waiting_confirmation: "Waiting for confirmation",
+    final_blocked: "Blocked",
+    final_failed: "Failed",
+    final_cancelled: "Cancelled",
+    turn_end_completed: "Task completed",
+    completion_files_changed: "{} files changed",
+    completion_verified: "verification {}/{} passed",
+    completion_diff_hint: "/diff to view changes",
+    fold_more_lines: "… {} more lines · Ctrl+O to expand",
+    fold_more_lines_short: "(+{} lines · Ctrl+O)",
+    fold_full_diff: "… Ctrl+O for full diff",
+    tool_label_args: "Arguments",
+    tool_label_patch: "Patch",
+    tool_label_replace: "Text replacement",
+    tool_word_blocked: "Blocked",
+    tool_word_done: "Done",
+    tools_none: "No tool calls",
+    tools_col_tool: "Tool",
+    tools_col_status: "Status",
+    tools_status_running: "Running",
+    tools_status_ok: "OK",
+    tools_status_attention: "Needs attention",
+    tools_col_duration: "Duration",
+    tools_output: "Output",
+    parallel_header: "{} tools in parallel",
+    agents_running_header: "{} agents running",
+    agents_done_header: "{} agents completed",
+    agents_ended_header: "{} agents finished",
+    agent_status_running: "running",
+    agent_status_completed: "completed",
+    agent_status_timeout: "timeout",
+    result_timeout: " · timeout",
+    edit_merge_summary: "{} changes",
+    tools_footer_hint_full: "Tab filter · ↑↓ select · PgUp/PgDn scroll · Esc back",
+    tools_footer_hint_compact: "Tab filter · ↑↓ select · Esc back",
 };
 
 #[cfg(test)]

@@ -14,9 +14,9 @@ use crate::transcript::{ToolCallBlock, ToolStatus};
 
 fn tool_glyph(status: ToolStatus) -> &'static str {
     match status {
-        ToolStatus::Running => "●",
+        ToolStatus::Running => "◌",
         ToolStatus::Ok => "✓",
-        ToolStatus::Failed => "!",
+        ToolStatus::Failed => "✗",
     }
 }
 
@@ -24,20 +24,39 @@ fn tool_style(theme: &Theme, status: ToolStatus) -> Style {
     match status {
         ToolStatus::Running => Style::default().fg(theme.accent),
         ToolStatus::Ok => Style::default().fg(theme.success),
-        ToolStatus::Failed => Style::default().fg(theme.warning),
+        ToolStatus::Failed => Style::default().fg(theme.error),
     }
 }
 
-fn tools_footer_hint(width: usize) -> String {
-    const FULL: &str = "Tab 过滤 · ↑↓ 选择 · PgUp/PgDn 滚动 · Esc 返回";
-    const COMPACT: &str = "Tab 过滤 · ↑↓ 选择 · Esc 返回";
+/// Tools whose guard rejection is a neutral skip (closeout, loop-guard,
+/// skip-complete), not a real failure — shown with ⚠ instead of ✗.
+pub(crate) fn is_guard_denied_name(name: &str) -> bool {
+    matches!(
+        name,
+        "update_plan" | "update_goal" | "list_files" | "git_status" | "grep" | "repository_search"
+    )
+}
 
-    if FULL.width() <= width {
-        FULL.to_string()
-    } else if COMPACT.width() <= width {
-        COMPACT.to_string()
+/// Localized user-facing note for a guard denial. The runtime's guard text is
+/// internal English guidance for the model and must never reach the user.
+pub(crate) fn guard_denial_note<'a>(name: &str, t: &'a crate::i18n::UiText) -> &'a str {
+    if name == "update_plan" {
+        t.plan_update_rejected
     } else {
-        truncate_display(COMPACT, width)
+        t.observe_denied
+    }
+}
+
+fn tools_footer_hint(width: usize, t: &crate::i18n::UiText) -> String {
+    let full = t.tools_footer_hint_full;
+    let compact = t.tools_footer_hint_compact;
+
+    if full.width() <= width {
+        full.to_string()
+    } else if compact.width() <= width {
+        compact.to_string()
+    } else {
+        truncate_display(compact, width)
     }
 }
 
@@ -51,9 +70,14 @@ fn format_arg_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn tool_argument_lines(arguments: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+fn tool_argument_lines(
+    arguments: &str,
+    theme: &Theme,
+    width: usize,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        "参数",
+        t.tool_label_args,
         Style::default().fg(theme.muted),
     ))];
     let inner = width.saturating_sub(2).max(1);
@@ -139,10 +163,10 @@ fn patch_touched_files(patch: &str) -> Vec<String> {
     files
 }
 
-fn patch_summary_from_text(patch: &str) -> String {
+fn patch_summary_from_text(patch: &str, t: &crate::i18n::UiText) -> String {
     let files = patch_touched_files(patch);
     if files.is_empty() {
-        "补丁".to_string()
+        t.tool_label_patch.to_string()
     } else {
         files.join(", ")
     }
@@ -186,21 +210,27 @@ fn first_path_value(value: &serde_json::Value, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// Public for workbench activity stream rendering.
-pub(crate) fn tool_summary_pub(name: &str, arguments: &str) -> String {
-    tool_summary(name, arguments)
+/// Localized one-line target summary, public for Conversation rendering.
+pub(crate) fn tool_summary_pub(name: &str, arguments: &str, t: &crate::i18n::UiText) -> String {
+    tool_summary_for(name, arguments, t)
 }
 
+/// Legacy 2-arg form (Chinese fallback copy) for callers that do not thread
+/// [`crate::i18n::UiText`] — e.g. the reducer's busy-activity string.
 pub(crate) fn tool_summary(name: &str, arguments: &str) -> String {
+    tool_summary_for(name, arguments, crate::i18n::Locale::Zh.text())
+}
+
+pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiText) -> String {
     let v: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(_) if name == "apply_patch" => {
             return truncate_display(
-                &patch_summary_from_text(&patch_text_from_arguments(arguments)),
+                &patch_summary_from_text(&patch_text_from_arguments(arguments), t),
                 64,
             );
         }
-        Err(_) if name == "replace" => return "文本替换".to_string(),
+        Err(_) if name == "replace" => return t.tool_label_replace.to_string(),
         // Never dump raw JSON / partial tool args into Conversation activity.
         Err(_) if looks_like_json_object(arguments) => return String::new(),
         Err(_) => return truncate_display(&command_line_summary(arguments), 56),
@@ -237,7 +267,7 @@ pub(crate) fn tool_summary(name: &str, arguments: &str) -> String {
         }
         "apply_patch" => {
             let patch = patch_text_from_arguments(arguments);
-            patch_summary_from_text(&patch)
+            patch_summary_from_text(&patch, t)
         }
         "replace" => {
             let path = first_path_value(
@@ -245,7 +275,7 @@ pub(crate) fn tool_summary(name: &str, arguments: &str) -> String {
                 &["path", "file", "file_path", "filepath", "target_file"],
             );
             if path.is_empty() {
-                "文本替换".to_string()
+                t.tool_label_replace.to_string()
             } else {
                 path
             }
@@ -253,7 +283,7 @@ pub(crate) fn tool_summary(name: &str, arguments: &str) -> String {
         "find_symbol" | "read_symbol" | "find_references" => s("symbol"),
         "repository_search" => s("query"),
         "update_plan" => s("explanation"),
-        "update_goal" => update_goal_summary_text(&v),
+        "update_goal" => update_goal_summary_text(&v, t),
         "task" => {
             let description = s("description");
             if description.is_empty() {
@@ -288,7 +318,7 @@ pub(crate) fn tool_summary(name: &str, arguments: &str) -> String {
 /// Full `update_goal` closeout line (no width truncate) for expand / body.
 ///
 /// Strips inline markdown so activity lines never leak `**` / backticks.
-fn update_goal_summary_text(v: &serde_json::Value) -> String {
+fn update_goal_summary_text(v: &serde_json::Value, t: &crate::i18n::UiText) -> String {
     let summary = v
         .get("summary")
         .and_then(|x| x.as_str())
@@ -296,19 +326,25 @@ fn update_goal_summary_text(v: &serde_json::Value) -> String {
         .replace("**", "")
         .replace('`', "");
     let prefix = match v.get("status").and_then(|x| x.as_str()).unwrap_or("") {
-        "blocked" => "受阻",
-        _ => "完成",
+        "blocked" => t.tool_word_blocked,
+        _ => t.tool_word_done,
     };
     if summary.is_empty() {
         prefix.to_string()
     } else {
-        format!("{prefix}：{summary}")
+        // Fullwidth colon pairs with CJK copy, ASCII colon with English.
+        let sep = if t.unsupported_task_action.starts_with("Delegation") {
+            ": "
+        } else {
+            "："
+        };
+        format!("{prefix}{sep}{summary}")
     }
 }
 
-fn update_goal_summary_from_arguments(arguments: &str) -> String {
+fn update_goal_summary_from_arguments(arguments: &str, t: &crate::i18n::UiText) -> String {
     match serde_json::from_str::<serde_json::Value>(arguments) {
-        Ok(v) => update_goal_summary_text(&v),
+        Ok(v) => update_goal_summary_text(&v, t),
         Err(_) => String::new(),
     }
 }
@@ -513,12 +549,13 @@ pub(crate) fn compact_tool_heading(
     arguments: &str,
     locale: crate::i18n::Locale,
 ) -> String {
+    let t = locale.text();
     crate::tool_taxonomy::compact_tool_line(
         tool_glyph(status),
         name,
         arguments,
         locale,
-        tool_summary,
+        |name, arguments| tool_summary_for(name, arguments, t),
     )
 }
 
@@ -551,23 +588,14 @@ pub(crate) fn tool_lines(
     // skip-complete) is NOT a tool failure — the agent is correctly
     // constraining itself. The model gets English guidance; the user should
     // see a neutral "skipped", not a red error with internal English text.
-    let guard_denial = block.status == ToolStatus::Failed
-        && matches!(
-            block.name.as_str(),
-            "update_plan"
-                | "update_goal"
-                | "list_files"
-                | "git_status"
-                | "grep"
-                | "repository_search"
-        );
+    let guard_denial = block.status == ToolStatus::Failed && is_guard_denied_name(&block.name);
     let glyph = if guard_denial {
-        "⊘"
+        "⚠"
     } else {
         tool_glyph(block.status)
     };
     let glyph_style = if guard_denial {
-        Style::default().fg(theme.muted)
+        Style::default().fg(theme.warning)
     } else {
         tool_style(theme, block.status)
     };
@@ -586,14 +614,12 @@ pub(crate) fn tool_lines(
     };
 
     // Compact default row: glyph + presentation + one-line summary.
+    // Only the glyph carries a status color; the action name is theme.tool.
     let mut head = vec![
         Span::styled(format!("{glyph} "), glyph_style),
-        Span::styled(
-            action.clone(),
-            Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(action.clone(), Style::default().fg(theme.tool)),
     ];
-    let target = tool_summary(&block.name, &block.arguments);
+    let target = tool_summary_for(&block.name, &block.arguments, t);
     if !target.is_empty() && target != "{}" {
         let used = 2 + UnicodeWidthStr::width(action.as_str()) + 1;
         head.push(Span::raw("  "));
@@ -606,14 +632,14 @@ pub(crate) fn tool_lines(
         ToolStatus::Running => {
             head.push(Span::styled(
                 " …".to_string(),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.dim),
             ));
         }
         _ => {
             if let Some(ms) = block.duration_ms.filter(|ms| *ms >= 1000) {
                 head.push(Span::styled(
                     format!(" · {:.1}s", ms as f64 / 1000.0),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.dim),
                 ));
             }
         }
@@ -621,14 +647,25 @@ pub(crate) fn tool_lines(
     out.push(Line::from(head));
 
     if block.name == "apply_patch" && block.status != ToolStatus::Failed {
-        inline_diff_lines(&block.arguments, theme, width, tools_expanded, out);
+        inline_diff_lines(&block.arguments, theme, width, tools_expanded, t, out);
+        return;
+    }
+    // `replace` is the same edit action with old/new arguments instead of a
+    // patch — synthesize the patch body so it renders the same inline diff.
+    // Failures keep the plain preview path: the error line is more useful
+    // than a diff that never landed.
+    if block.name == "replace"
+        && block.status != ToolStatus::Failed
+        && let Some(patch) = replace_patch_from_arguments(&block.arguments)
+    {
+        inline_diff_lines(&patch, theme, width, tools_expanded, t, out);
         return;
     }
 
     // Prefer the structured goal summary over the runtime's internal preview
     // ("Goal resolved.") so expand shows what the model actually wrote.
     let goal_body = if block.name == "update_goal" {
-        update_goal_summary_from_arguments(&block.arguments)
+        update_goal_summary_from_arguments(&block.arguments, t)
     } else {
         String::new()
     };
@@ -644,11 +681,7 @@ pub(crate) fn tool_lines(
         // Guard denials carry internal English guidance for the model
         // (skip-complete, closeout, loop-guard). Users just need to know the
         // action was turned down, not the raw guard text.
-        if block.name == "update_plan" {
-            t.plan_update_rejected
-        } else {
-            t.observe_denied
-        }
+        guard_denial_note(&block.name, t)
     } else if block.name == "task"
         && (raw_preview.contains("unknown tool") || raw_preview.contains("spawn_agent"))
     {
@@ -676,16 +709,20 @@ pub(crate) fn tool_lines(
     if expand {
         let shown = lines.len().min(MAX_EXPANDED_PREVIEW);
         for (i, line) in lines.iter().take(shown).enumerate() {
-            let lead = if i == 0 { "  ⎿ " } else { "    " };
+            let lead = if i == 0 { "  └ " } else { "    " };
             out.push(Line::from(vec![
-                Span::styled(lead, Style::default().fg(theme.border)),
+                Span::styled(lead, Style::default().fg(theme.dim)),
                 Span::styled(line.clone(), Style::default().fg(theme.muted)),
             ]));
         }
         if lines.len() > shown {
             out.push(Line::from(Span::styled(
-                format!("    … 还有 {} 行 · Ctrl+O", lines.len() - shown),
-                Style::default().fg(theme.muted),
+                format!(
+                    "    {}",
+                    t.fold_more_lines
+                        .replace("{}", &(lines.len() - shown).to_string())
+                ),
+                Style::default().fg(theme.dim),
             )));
         }
     } else {
@@ -697,7 +734,7 @@ pub(crate) fn tool_lines(
         let long = lines.len() >= LONG_THRESHOLD || more > 0;
         let hint = if long {
             if more > 0 {
-                format!("  (+{more} 行 · Ctrl+O)")
+                format!("  {}", t.fold_more_lines_short.replace("{}", &more.to_string()))
             } else {
                 "  (Ctrl+O)".to_string()
             }
@@ -705,11 +742,36 @@ pub(crate) fn tool_lines(
             String::new()
         };
         out.push(Line::from(vec![
-            Span::styled("  ⎿ ", Style::default().fg(theme.border)),
+            Span::styled("  └ ", Style::default().fg(theme.dim)),
             Span::styled(one, Style::default().fg(theme.muted)),
-            Span::styled(hint, Style::default().fg(theme.border)),
+            Span::styled(hint, Style::default().fg(theme.dim)),
         ]));
     }
+}
+
+/// Synthesize an apply_patch-style body from `replace` arguments (`path` /
+/// `old` / `new`) so replace edits share [`inline_diff_lines`]. `None` when
+/// the arguments don't parse or carry no text on either side.
+fn replace_patch_from_arguments(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let path = value.get("path")?.as_str()?;
+    let old = value.get("old")?.as_str()?;
+    let new = value.get("new")?.as_str()?;
+    if old.is_empty() && new.is_empty() {
+        return None;
+    }
+    let mut patch = format!("*** Update File: {path}\n");
+    for line in old.lines() {
+        patch.push('-');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    for line in new.lines() {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    Some(patch)
 }
 
 fn inline_diff_lines(
@@ -717,6 +779,7 @@ fn inline_diff_lines(
     theme: &Theme,
     width: usize,
     tools_expanded: bool,
+    t: &crate::i18n::UiText,
     out: &mut Vec<Line<'static>>,
 ) {
     const DIFF_FOLD_ROWS: usize = 12;
@@ -737,9 +800,9 @@ fn inline_diff_lines(
     let inner = width.saturating_sub(4).max(8);
     for (i, raw) in rows.iter().take(shown).enumerate() {
         let style = if let Some(file) = raw.strip_prefix("*** Update File: ") {
-            let lead = if i == 0 { "  ⎿ " } else { "    " };
+            let lead = if i == 0 { "  └ " } else { "    " };
             out.push(Line::from(vec![
-                Span::styled(lead, Style::default().fg(theme.border)),
+                Span::styled(lead, Style::default().fg(theme.dim)),
                 Span::styled(
                     truncate_display(file, inner),
                     Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
@@ -755,25 +818,114 @@ fn inline_diff_lines(
         } else {
             Style::default().fg(theme.muted)
         };
-        let lead = if i == 0 { "  ⎿ " } else { "    " };
+        let lead = if i == 0 { "  └ " } else { "    " };
         out.push(Line::from(vec![
-            Span::styled(lead, Style::default().fg(theme.border)),
+            Span::styled(lead, Style::default().fg(theme.dim)),
             Span::styled(truncate_display(raw, inner), style),
         ]));
     }
     if rows.len() > shown {
         let hint = if tools_expanded {
             format!(
-                "    … 还有 {} 行 · Ctrl+D 查看完整 diff",
-                rows.len() - shown
+                "    {}",
+                t.fold_more_lines
+                    .replace("{}", &(rows.len() - shown).to_string())
             )
         } else {
-            format!("    … 还有 {} 行 · Ctrl+O 展开", rows.len() - shown)
+            format!("    {}", t.fold_full_diff)
         };
-        out.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme.muted),
-        )));
+        out.push(Line::from(Span::styled(hint, Style::default().fg(theme.dim))));
+    }
+}
+
+/// Merge identity for consecutive same-file edits: the patch's touched files.
+pub(crate) fn patch_files_key(arguments: &str) -> String {
+    patch_touched_files(&patch_text_from_arguments(arguments)).join("\u{1}")
+}
+
+/// Hunk count and +/- line totals over one patch argument string.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PatchStats {
+    pub hunks: usize,
+    pub added: usize,
+    pub removed: usize,
+}
+
+pub(crate) fn patch_stats(arguments: &str) -> PatchStats {
+    let patch = patch_text_from_arguments(arguments);
+    let mut stats = PatchStats::default();
+    for line in patch.lines() {
+        let line = line.trim_start();
+        if line.starts_with("@@") {
+            stats.hunks += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            stats.added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            stats.removed += 1;
+        }
+    }
+    stats
+}
+
+/// Combined inline diff rows for one or more same-file patches (merged edit
+/// node in the activity stream). File-marker rows are skipped — the unit's
+/// argument line already shows the file. Capped, with a fold hint.
+pub(crate) fn merged_diff_rows(
+    calls: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    expanded: bool,
+    t: &crate::i18n::UiText,
+    out: &mut Vec<Line<'static>>,
+) {
+    const DIFF_FOLD_ROWS: usize = 12;
+    let mut rows: Vec<String> = Vec::new();
+    for call in calls {
+        let patch = patch_text_from_arguments(&call.arguments);
+        for line in patch.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("***") || trimmed == "@@" {
+                continue;
+            }
+            if trimmed.starts_with("@@") {
+                rows.push(trimmed.to_string());
+            } else {
+                rows.push(line.to_string());
+            }
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+    let cap = if expanded { 40 } else { DIFF_FOLD_ROWS };
+    let shown = rows.len().min(cap);
+    let inner = width.saturating_sub(4).max(8);
+    for raw in rows.iter().take(shown) {
+        let style = if raw.starts_with("@@") {
+            Style::default().fg(theme.dim)
+        } else if raw.starts_with('+') {
+            Style::default().fg(theme.diff_add)
+        } else if raw.starts_with('-') {
+            Style::default().fg(theme.diff_remove)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        out.push(Line::from(vec![
+            Span::styled("    ", Style::default()),
+            Span::styled(truncate_display(raw, inner), style),
+        ]));
+    }
+    if rows.len() > shown {
+        let hint = if expanded {
+            format!(
+                "    {}",
+                t.fold_more_lines
+                    .replace("{}", &(rows.len() - shown).to_string())
+            )
+        } else {
+            format!("    {}", t.fold_full_diff)
+        };
+        out.push(Line::from(Span::styled(hint, Style::default().fg(theme.dim))));
     }
 }
 
@@ -813,22 +965,26 @@ mod m1_tests {
             r#"{"program":"cargo","args":["test","-p","leveler-tui"]}"#,
             Locale::En,
         );
-        assert!(run.starts_with('●'), "{run}");
-        assert!(run.contains("Run"), "{run}");
+        assert!(run.starts_with('◌'), "{run}");
+        assert!(run.contains("Run command"), "{run}");
         assert!(run.contains("cargo test"), "{run}");
     }
 
     #[test]
     fn presentation_labels_match_taxonomy() {
-        assert_eq!(tool_action_label("read_file"), "读取");
-        assert_eq!(tool_action_label_for("run_command", Locale::En), "Run");
-        assert_eq!(tool_action_label_for("run_command", Locale::Zh), "执行");
-        assert_eq!(tool_action_label_for("apply_patch", Locale::Zh), "编辑");
+        assert_eq!(tool_action_label("read_file"), "读取文件");
+        assert_eq!(
+            tool_action_label_for("run_command", Locale::En),
+            "Run command"
+        );
+        assert_eq!(tool_action_label_for("run_command", Locale::Zh), "执行命令");
+        assert_eq!(tool_action_label_for("apply_patch", Locale::Zh), "编辑文件");
     }
 }
 
 pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
+    let t = state.t();
     let filter = state.tools_screen.filter;
     let calls: Vec<&ToolCallBlock> = state
         .transcript
@@ -847,7 +1003,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
     let mut rows: Vec<Line> = Vec::new();
     if calls.is_empty() {
         rows.push(Line::from(Span::styled(
-            "无工具调用",
+            t.tools_none,
             Style::default().fg(theme.muted),
         )));
     }
@@ -858,7 +1014,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
             .duration_ms
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_default();
-        let target = tool_summary(&block.name, &block.arguments);
+        let target = tool_summary_for(&block.name, &block.arguments, t);
         let label = if target.is_empty() || target == "{}" {
             block.name.clone()
         } else {
@@ -877,14 +1033,14 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
                 tool_style(theme, block.status),
             ),
             Span::raw(truncate_display(&label, label_width)),
-            Span::styled(format!("  {dur}"), Style::default().fg(theme.muted)),
+            Span::styled(format!("  {dur}"), Style::default().fg(theme.dim)),
         ]));
     }
     let list_block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(theme.border))
         .title(Span::styled(
-            format!(" 工具 · {} ", filter.label()),
+            format!(" {} · {} ", t.tools_col_tool, filter.label()),
             Style::default().fg(theme.muted),
         ));
     let list_inner = list_block.inner(list_area);
@@ -894,33 +1050,43 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
     let mut detail: Vec<Line> = Vec::new();
     if let Some(block) = calls.get(selected) {
         detail.push(Line::from(vec![
-            Span::styled("工具  ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}  ", t.tools_col_tool),
+                Style::default().fg(theme.muted),
+            ),
             Span::raw(block.name.clone()),
         ]));
         detail.extend(tool_argument_lines(
             &block.arguments,
             theme,
             detail_area.width.saturating_sub(1).max(1) as usize,
+            t,
         ));
         let status = match block.status {
-            ToolStatus::Running => "运行中",
-            ToolStatus::Ok => "成功",
-            ToolStatus::Failed => "需调整",
+            ToolStatus::Running => t.tools_status_running,
+            ToolStatus::Ok => t.tools_status_ok,
+            ToolStatus::Failed => t.tools_status_attention,
         };
         detail.push(Line::from(vec![
-            Span::styled("状态  ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}  ", t.tools_col_status),
+                Style::default().fg(theme.muted),
+            ),
             Span::styled(status, tool_style(theme, block.status)),
         ]));
         if let Some(ms) = block.duration_ms {
             detail.push(Line::from(vec![
-                Span::styled("耗时  ", Style::default().fg(theme.muted)),
-                Span::raw(format!("{ms}ms")),
+                Span::styled(
+                    format!("{}  ", t.tools_col_duration),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::styled(format!("{ms}ms"), Style::default().fg(theme.dim)),
             ]));
         }
         if let Some(preview) = &block.preview {
             detail.push(Line::from(""));
             detail.push(Line::from(Span::styled(
-                "输出",
+                t.tools_output,
                 Style::default().fg(theme.muted),
             )));
             for line in wrap(preview, detail_area.width.saturating_sub(1).max(1) as usize) {
@@ -929,7 +1095,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
         }
     }
     detail.push(Line::from(""));
-    let footer = tools_footer_hint(detail_area.width.saturating_sub(1).max(1) as usize);
+    let footer = tools_footer_hint(detail_area.width.saturating_sub(1).max(1) as usize, t);
     detail.push(Line::from(Span::styled(
         footer,
         Style::default().fg(theme.muted),
@@ -943,15 +1109,19 @@ mod tests {
 
     #[test]
     fn tools_footer_hint_fits_available_width() {
+        let t = crate::i18n::Locale::Zh.text();
         for width in [8, 16, 24, 32, 48, 80] {
-            let hint = tools_footer_hint(width);
+            let hint = tools_footer_hint(width, t);
             assert!(
                 hint.width() <= width,
                 "footer `{hint}` should fit in {width} columns"
             );
         }
 
-        assert!(tools_footer_hint(32).contains("Esc 返回"));
+        assert!(tools_footer_hint(32, t).contains("Esc 返回"));
+
+        let en = crate::i18n::Locale::En.text();
+        assert!(tools_footer_hint(80, en).contains("Esc back"));
     }
 
     fn failed_block(preview: &str) -> ToolCallBlock {
@@ -990,6 +1160,80 @@ mod tests {
             text.iter()
                 .any(|l| l.contains("+39 行") && l.contains("Ctrl+O")),
             "must hint how to expand: {text:?}"
+        );
+    }
+
+    /// `replace` is an edit tool like `apply_patch`; its cell must render the
+    /// same inline colored diff (file header + −old/+new rows), not just a
+    /// collapsed preview line. The diff is synthesized from the old/new
+    /// arguments since replace carries no patch text.
+    #[test]
+    fn replace_edit_renders_an_inline_diff_like_apply_patch() {
+        let block = ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("r1"),
+            name: "replace".to_string(),
+            arguments: r#"{"path":"src/lib.rs","old":"fn old() {}","new":"fn renamed() {}\nfn extra() {}"}"#
+                .to_string(),
+            status: ToolStatus::Ok,
+            preview: Some("replaced 1 occurrence".to_string()),
+            duration_ms: None,
+            parallel: false,
+        };
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+            &mut out,
+        );
+        let text: Vec<String> = out.iter().map(|l| l.to_string()).collect();
+        assert!(
+            text.iter().any(|l| l.contains("src/lib.rs")),
+            "diff must name the file: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("-fn old() {}")),
+            "old text must render as removed rows: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("+fn renamed() {}"))
+                && text.iter().any(|l| l.contains("+fn extra() {}")),
+            "new text must render as added rows: {text:?}"
+        );
+    }
+
+    /// A failed replace keeps the plain preview path — the error line is more
+    /// useful than a diff that never landed.
+    #[test]
+    fn failed_replace_shows_the_error_not_a_diff() {
+        let block = ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("r2"),
+            name: "replace".to_string(),
+            arguments: r#"{"path":"src/lib.rs","old":"zzz","new":"q"}"#.to_string(),
+            status: ToolStatus::Failed,
+            preview: Some("old text not found in src/lib.rs".to_string()),
+            duration_ms: None,
+            parallel: false,
+        };
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+            &mut out,
+        );
+        let text: Vec<String> = out.iter().map(|l| l.to_string()).collect();
+        assert!(
+            text.iter().any(|l| l.contains("old text not found")),
+            "the failure preview must render: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("+q")),
+            "no diff rows for an edit that never landed: {text:?}"
         );
     }
 
@@ -1037,7 +1281,7 @@ mod tests {
     #[test]
     fn closeout_denied_list_files_reads_as_a_neutral_skip_not_a_red_error() {
         // After the plan completes, a repeat list_files is turned down with an
-        // English nudge. The user must see a neutral "skipped" (⊘, not ✗) with
+        // English nudge. The user must see a neutral "skipped" (⚠, not ✗) with
         // a localized note — never the internal English guard text.
         let block = ToolCallBlock {
             id: leveler_client_protocol::ToolCallId::new("l1"),
@@ -1075,8 +1319,12 @@ mod tests {
             "a localized 'skipped' note must show instead: {text}"
         );
         assert!(
-            text.contains('⊘'),
-            "a guard denial reads as a neutral skip glyph, not the failure marker: {text}"
+            text.contains('⚠'),
+            "a guard denial reads as a warning glyph, not the failure marker: {text}"
+        );
+        assert!(
+            !text.contains('✗'),
+            "a guard denial must not use the failure glyph: {text}"
         );
     }
 
@@ -1115,6 +1363,7 @@ mod tests {
             r#"{"end_line":1,"path":"package.json","start_line":1}"#,
             &theme,
             80,
+            crate::i18n::Locale::Zh.text(),
         );
         let rendered: Vec<String> = lines.into_iter().map(|line| line.to_string()).collect();
 

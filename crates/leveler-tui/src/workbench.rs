@@ -17,7 +17,7 @@ use crate::footer_queue::{queue_panel_height, queue_panel_lines};
 use crate::i18n::UiText;
 use crate::render::{
     COMPOSER_MAX_ROWS, btw_card_lines, composer_box_lines, composer_visible_rows, item_render,
-    items_need_gap, render_attachments, render_slash_popup,
+    items_need_gap, render_attachments, render_slash_popup, sub_agent_tree_lines,
 };
 use crate::screen::Screen;
 use crate::state::AppState;
@@ -489,9 +489,12 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
     }
 
     let items = state.transcript.items();
-    for (idx, item) in items.iter().enumerate() {
+    let mut idx = 0;
+    while idx < items.len() {
+        let item = &items[idx];
         // Welcome card is retired; /btw is a floating overlay, not scroll content.
         if matches!(item, TranscriptItem::Welcome(_) | TranscriptItem::Btw(_)) {
+            idx += 1;
             continue;
         }
         if idx > 0 && items_need_gap(&items[idx - 1], item) {
@@ -501,10 +504,10 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
         // `▌` user prompt, `●` agent prose, status glyphs for tool activity.
         match item {
             TranscriptItem::User(text) => {
-                // A solid accent bar + bold body marks the user's turn clearly
+                // A solid heading bar + bold body marks the user's turn clearly
                 // apart from the assistant's `●` bullet and normal-weight prose.
                 let bar = Style::default()
-                    .fg(theme.accent)
+                    .fg(theme.heading)
                     .add_modifier(Modifier::BOLD);
                 let body = Style::default()
                     .fg(theme.user_message)
@@ -531,10 +534,22 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
                     t,
                 ));
             }
+            TranscriptItem::SubAgent(first) => {
+                // A run of consecutive sub-agent blocks renders as one tree
+                // (aggregate header + ├─/└─ children). Any other item breaks
+                // the run — batches split by tool calls stay separate.
+                let mut blocks = vec![first];
+                while let Some(TranscriptItem::SubAgent(next)) = items.get(idx + 1) {
+                    blocks.push(next);
+                    idx += 1;
+                }
+                out.extend(sub_agent_tree_lines(&blocks, theme, width, t));
+            }
             _ => {
                 out.extend(item_render(item, theme, width, state.tools_expanded, t));
             }
         }
+        idx += 1;
     }
 
     // Live reasoning as activity while in flight.
@@ -1099,6 +1114,57 @@ mod tests {
         assert!(
             plan_panel_should_show(&failed),
             "failed plan stays visible so the failure is scannable"
+        );
+    }
+
+    #[test]
+    fn consecutive_sub_agents_render_as_one_tree_in_conversation() {
+        let mut s = test_state();
+        s.transcript.push_sub_agent_started(
+            "agent-1".into(),
+            "Euclid".into(),
+            "explorer".into(),
+            "task A".into(),
+        );
+        s.transcript.push_sub_agent_started(
+            "agent-2".into(),
+            "Newton".into(),
+            "explorer".into(),
+            "task B".into(),
+        );
+        let lines = build_conversation_lines(&s, 100);
+        let text = lines.iter().map(rule_plain).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("2 个 agents 正在运行"), "{text}");
+        assert!(text.contains("├─ Euclid"), "{text}");
+        assert!(text.contains("└─ Newton"), "{text}");
+    }
+
+    #[test]
+    fn final_answer_is_separated_from_the_last_tool_group() {
+        let mut s = test_state();
+        let call = leveler_client_protocol::ToolCallId::new("t1");
+        s.transcript.push_tool_started(
+            call.clone(),
+            "read_file".into(),
+            r#"{"path":"README.md"}"#.into(),
+            false,
+        );
+        s.transcript.complete_tool(&call, true, "ok".into(), 1);
+        let id = leveler_client_protocol::MessageId::new("m1");
+        s.transcript.begin_assistant(id.clone());
+        s.transcript.append_assistant(&id, "最终回答");
+        s.transcript.finish_assistant(&id);
+
+        let lines = build_conversation_lines(&s, 80);
+        let plain: Vec<String> = lines.iter().map(rule_plain).collect();
+        let answer = plain
+            .iter()
+            .position(|l| l.contains("● 最终回答"))
+            .unwrap_or_else(|| panic!("answer missing: {plain:?}"));
+        assert!(answer >= 1, "tool group must precede the answer: {plain:?}");
+        assert!(
+            plain[answer - 1].trim().is_empty(),
+            "a blank line must separate the final answer from the tool group: {plain:?}"
         );
     }
 }

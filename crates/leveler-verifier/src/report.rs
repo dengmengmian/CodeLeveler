@@ -103,6 +103,14 @@ impl VerificationReport {
             && self.baseline_failures.iter().any(|n| n == &check.name)
     }
 
+    /// Whether the project configured any gating verification check at all. When
+    /// false there is simply nothing to verify against — a calm "not auto-verified"
+    /// finish, NOT a warning about this task. Callers use it to route the terminal
+    /// state to the soft `no_automatic_verification` copy instead of a warning.
+    pub fn has_gating_checks(&self) -> bool {
+        self.checks.iter().any(|c| c.gating)
+    }
+
     /// The three-way verdict: whether completion is actually evidence-backed.
     ///
     /// `Verified` requires `scope_ok`, at least one applicable (gating) check,
@@ -118,12 +126,12 @@ impl VerificationReport {
             return Verdict::Failed;
         }
 
-        let applicable: Vec<&CheckOutcome> = self.checks.iter().filter(|c| c.gating).collect();
-        if applicable.is_empty() {
+        if !self.has_gating_checks() {
             return Verdict::Unverified(
                 "no gating verification checks were configured".to_string(),
             );
         }
+        let applicable: Vec<&CheckOutcome> = self.checks.iter().filter(|c| c.gating).collect();
         if applicable.iter().all(|c| c.status == CheckStatus::Passed) {
             return Verdict::Verified;
         }
@@ -247,6 +255,24 @@ mod tests {
             scope_violations: vec![],
             baseline_failures: vec![],
         }
+    }
+
+    #[test]
+    fn has_gating_checks_reflects_configured_gates_only() {
+        // No checks at all, or only non-gating checks → nothing to verify against.
+        assert!(!report(vec![]).has_gating_checks());
+        assert!(!report(vec![check("fmt", false, CheckStatus::Passed)]).has_gating_checks());
+        // At least one gating check → there is something to verify.
+        assert!(report(vec![check("build", true, CheckStatus::Passed)]).has_gating_checks());
+    }
+
+    #[test]
+    fn no_configured_gates_is_unverified_not_failed() {
+        // "Nothing configured" must be Unverified (a calm not-verified finish),
+        // never Failed — the caller routes it to the soft "not auto-verified" copy.
+        let r = report(vec![check("fmt", false, CheckStatus::Failed)]);
+        assert!(!r.has_gating_checks());
+        assert!(matches!(r.verdict(), Verdict::Unverified(_)));
     }
 
     #[test]

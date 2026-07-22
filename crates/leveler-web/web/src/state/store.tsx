@@ -172,6 +172,7 @@ export type Action =
   | { type: 'seed_composer'; text: string | null }
   | { type: 'enqueue'; item: QueuedMessage }
   | { type: 'dequeue'; id: string }
+  | { type: 'queue_move'; id: string; dir: -1 | 1 }
   | { type: 'set_permission'; mode: PermissionProfile }
   | { type: 'set_model'; model: ModelRef }
   | { type: 'set_agent_mode'; mode: AgentMode }
@@ -477,6 +478,14 @@ export function reducer(state: AppState, action: Action): void {
     case 'dequeue':
       state.queue = state.queue.filter((q) => q.id !== action.id);
       return;
+    case 'queue_move': {
+      const i = state.queue.findIndex((q) => q.id === action.id);
+      const j = i + action.dir;
+      if (i < 0 || j < 0 || j >= state.queue.length) return;
+      const [item] = state.queue.splice(i, 1);
+      state.queue.splice(j, 0, item);
+      return;
+    }
     case 'set_permission':
       if (state.current) state.current.permission = action.mode;
       return;

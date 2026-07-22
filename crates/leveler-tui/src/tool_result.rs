@@ -28,12 +28,12 @@ pub(crate) fn result_lines(
         ToolStatus::Failed => ("✗", theme.error, t.tool_status_failed),
         ToolStatus::Running => unreachable!("running calls use Tool Activity"),
     };
-    let mut summary = format!("{status} · {}", tool_target(call, locale));
+    let mut summary = format!("{status} · {}", tool_target(call, locale, t));
     if let Some(exit) = parsed.exit.as_deref() {
         summary.push_str(&format!(" · exit {exit}"));
     }
     if parsed.timed_out {
-        summary.push_str(" · timeout");
+        summary.push_str(t.result_timeout);
     }
     if let Some(ms) = call.duration_ms.filter(|ms| *ms >= 100) {
         summary.push_str(&format!(" · {:.1}s", ms as f64 / 1000.0));
@@ -75,14 +75,14 @@ pub(crate) fn result_lines(
     ]));
 
     if expanded {
-        append_details(&parsed, theme, width, &mut out);
+        append_details(&parsed, theme, width, t, &mut out);
     }
     out
 }
 
-fn tool_target(call: &ToolCallBlock, locale: Locale) -> String {
+fn tool_target(call: &ToolCallBlock, locale: Locale, t: &UiText) -> String {
     let action = crate::tool_cell::tool_action_label_for(&call.name, locale);
-    let target = crate::tool_cell::tool_summary_pub(&call.name, &call.arguments)
+    let target = crate::tool_cell::tool_summary_pub(&call.name, &call.arguments, t)
         .replace("**", "")
         .replace('`', "");
     if target.is_empty() || target == "{}" {
@@ -147,6 +147,7 @@ fn append_details(
     parsed: &ParsedOutput,
     theme: &Theme,
     width: usize,
+    t: &UiText,
     out: &mut Vec<Line<'static>>,
 ) {
     const MAX_DETAIL_LINES: usize = 24;
@@ -179,8 +180,12 @@ fn append_details(
     }
     if parsed.content_lines > shown {
         out.push(Line::from(Span::styled(
-            format!("      … {} more lines", parsed.content_lines - shown),
-            Style::default().fg(theme.border),
+            format!(
+                "      … {}",
+                t.tool_output_lines
+                    .replace("{}", &(parsed.content_lines - shown).to_string())
+            ),
+            Style::default().fg(theme.dim),
         )));
     }
 }

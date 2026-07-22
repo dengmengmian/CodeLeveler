@@ -6,8 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{load_scoped_rules, render_instructions};
 use leveler_lifecycle::{
-    CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig, ObjectiveAnchor, PlanState,
-    ProgressCaps, TaskContract, TurnPhase, check, task_looks_like_implementation,
+    ChangeImpact, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,
+    ObjectiveAnchor, PlanState, ProgressCaps, TaskContract, TurnPhase, check, is_build_relevant,
+    task_looks_like_implementation,
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelRequest, Role, ToolCall, ToolChoice,
@@ -15,12 +16,16 @@ use leveler_model::{
 };
 use leveler_tools::ToolContext;
 
+use super::closeout::{
+    CLOSEOUT_NUDGE_BUDGET, CloseoutAction, CloseoutBudget, CloseoutInput, CloseoutReason, decide,
+    stalled_detail,
+};
 use super::dispatch::{
     collect_modified, compact_json, deny_call, extract_image, extract_plan, is_plan_explore_tool,
     newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
 };
 use super::{
-    AgentError, AgentEvent, AgentOutcome, AnswerAudit, Executor, LOOP_GUARD_THRESHOLD,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AnswerAudit, Executor, LOOP_GUARD_THRESHOLD,
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
@@ -36,7 +41,8 @@ use crate::injected_tools::{
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
 use crate::nudges::{
-    STEP_SUMMARY_NUDGE, completion_audit_nudge, first_user_text, goal_resolve_nudge,
+    STEP_SUMMARY_NUDGE, answer_repair_nudge, completion_audit_nudge, first_user_text,
+    goal_resolve_nudge,
 };
 use crate::sub_agent::{AgentRole, MAX_SUB_AGENT_DEPTH, agent_nickname};
 
@@ -143,7 +149,12 @@ impl Executor {
             }
             led
         };
-        let mut evidence_nudges = 0u32;
+        // Unified closeout nudge budget shared by every quiet-round mechanism
+        // (goal resolution, completion evidence, empty answer, audit repair) —
+        // the old per-mechanism caps (3 + 2 + 2 + 1) are deliberately gone.
+        let mut closeout_budget = CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET);
+        // Re-arm guard for the evidence nudge: it fires again only after real
+        // progress (any successful tool call), never on idle repeats.
         let mut progress_since_evidence_nudge = true;
         // No-progress loop guard: "name\0args" -> (last result content, identical
         // repeat count). Blocks a call that keeps producing the same output.
@@ -161,26 +172,9 @@ impl Executor {
         // the same answer a bounded number of times; truncated tool calls are
         // never safe to execute and fail immediately below.
         let mut length_continuations = 0u32;
-        // One-shot "actually answer" nudge for a non-goal turn ending empty.
-        let mut empty_answer_nudged = false;
         let mut continued_text = String::new();
         const MAX_LENGTH_CONTINUATIONS: u32 = 2;
         let mut had_tool_calls = false;
-        let mut answer_audit_repairs = 0u32;
-        const MAX_ANSWER_AUDIT_REPAIRS: u32 = 2;
-        // Hard cap on completion-evidence nudges. `verification_ran` only flips
-        // true when a verification command PASSES, so if verification cannot pass
-        // (e.g. a broken local sandbox — `sandbox-exec` exit 71 — fails every
-        // test), the gate would nudge forever: each retry counts as "progress",
-        // re-arming the nudge. This cap bounds that loop; after it, the turn
-        // closes honestly unverified instead of spinning.
-        const MAX_EVIDENCE_NUDGES: u32 = 2;
-        // Goal mode: how many times the model went quiet without calling
-        // update_goal. Each time we re-prompt it to audit and resolve explicitly;
-        // after a small cap we accept completion, so a model that never learns to
-        // call update_goal still terminates as stalled instead of running forever.
-        let mut goal_quiet_nudges = 0u32;
-        const MAX_GOAL_QUIET_NUDGES: u32 = 3;
         // Absolute per-turn round ceiling — the unconditional circuit breaker.
         // The progress watchdogs are heuristic (they only fire on "no progress"),
         // so a busy loop that keeps issuing novel-looking reads/searches while a
@@ -710,122 +704,120 @@ impl Executor {
             }
 
             if calls.is_empty() {
-                // Goal mode: going quiet does NOT end the run.
-                // Re-prompt the model to audit against the current workspace and
-                // resolve explicitly via update_goal. Past the nudge cap the run
-                // stops as `Stalled` — never as a success — so a model that never
-                // learns to call update_goal terminates without the harness
-                // declaring completion on its behalf.
+                // Unified closeout (executor/closeout.rs): a quiet round
+                // produces AT MOST one nudge — chosen by priority
+                // (EmptyAnswer > GoalUnresolved > MissingEvidence >
+                // AnswerIncomplete) — and every mechanism draws from the same
+                // per-turn budget. Past the budget a goal-mode quiet ends as
+                // `Stalled` — never as a success, so a model that never learns
+                // to call update_goal terminates without the harness declaring
+                // completion on its behalf; a non-goal turn ends `Answered`.
                 //
                 // No-progress is counted once when this drive ends as Stalled
-                // (below), not on every quiet nudge — so one drive can still use
-                // its nudge budget, while Engine continue is capped across turns.
-                if self.goal_mode && goal_quiet_nudges < MAX_GOAL_QUIET_NUDGES && has_next_round {
-                    goal_quiet_nudges += 1;
-                    metrics.extra_model_calls += 1;
-                    sink.append(&[assistant]).await?;
-                    messages.push(Message {
-                        role: Role::User,
-                        content: vec![ContentPart::Text {
-                            text: goal_resolve_nudge(&original_task),
-                        }],
-                    });
-                    continue;
-                }
-                // Non-goal turn ending with an empty answer: nudge once for
-                // the actual answer. `Answered("")` is indistinguishable from
-                // a silent failure for the caller. (Goal mode is covered by
-                // the quiet-nudge/Stalled path above.)
-                if !self.goal_mode
-                    && last_text.trim().is_empty()
-                    && !empty_answer_nudged
-                    && has_next_round
-                    && !cancellation.is_cancelled()
-                {
-                    empty_answer_nudged = true;
-                    metrics.extra_model_calls += 1;
-                    sink.append(&[assistant]).await?;
-                    messages.push(Message::text(
-                        Role::User,
-                        "Your last message was empty. Reply with the actual answer to the \
-                         request — do not send an empty message.",
-                    ));
-                    continue;
-                }
-                // Completion-evidence gate (spec §17): refuse the first
-                // completion that has no verification behind it, once, so the
-                // model runs the build/tests instead of declaring success blind.
-                if self.require_completion_evidence
-                    && !modified_files.is_empty()
-                    && !verification_ran
-                    && evidence_nudges < MAX_EVIDENCE_NUDGES
-                    && (evidence_nudges == 0 || progress_since_evidence_nudge)
+                // (below), not on every quiet nudge — so one drive can still
+                // use its nudge budget, while Engine continue is capped across
+                // turns.
+                let impact = ChangeImpact {
+                    has_mutation: !modified_files.is_empty(),
+                    verified_after_last_mutation: verification_ran,
+                    build_relevant: modified_files.is_empty()
+                        || modified_files.iter().any(|f| is_build_relevant(f)),
+                    modified_files: modified_files.clone(),
+                };
+                let has_final_text = !last_text.trim().is_empty();
+                let closeout_input = |audit_incomplete: bool| CloseoutInput {
+                    goal_mode: self.goal_mode,
+                    has_final_text,
+                    require_completion_evidence: self.require_completion_evidence,
+                    impact: &impact,
+                    progress_since_evidence_nudge,
+                    audit_incomplete,
+                    cancelled: cancellation.is_cancelled(),
+                    can_continue: has_next_round,
+                    budget_remaining: closeout_budget.remaining(),
+                };
+                let mut action = decide(&closeout_input(false));
+                // The completeness audit only gets a say when nothing stronger
+                // fires: goal/empty/evidence nudges outrank it, and with the
+                // budget spent its verdict could not trigger a repair anyway.
+                // The audit model call itself is a read-only judgment and
+                // stays advisory — only its repair nudge draws on the budget.
+                let mut audit_missing: Vec<String> = Vec::new();
+                if action == CloseoutAction::Finish
+                    && self.answer_audit
+                    && had_tool_calls
+                    && !self.goal_mode
+                    && has_final_text
+                    && closeout_budget.remaining() > 0
                     && has_next_round
                 {
-                    evidence_nudges += 1;
-                    progress_since_evidence_nudge = false;
-                    messages.push(Message {
-                        role: Role::User,
-                        content: vec![ContentPart::Text {
-                            text: completion_audit_nudge(&original_task),
-                        }],
-                    });
-                    continue;
-                }
-                // Every tool-backed turn is audited against what was actually
-                // asked, edits or not. The verification gates answer a different
-                // question — "does the code still build and pass?" — and a turn
-                // can be green on both while quietly skipping a deliverable it
-                // was handed (asked for five things, did four, reported done).
-                // Whether a file changed says nothing about whether the request
-                // was finished, so it must not decide who gets checked.
-                //
-                // The audit stays advisory: it may request bounded repairs, but
-                // model self-review is not objective evidence that a finished
-                // answer failed.
-                if self.answer_audit && had_tool_calls && !self.goal_mode {
                     metrics.answer_audit_invocations += 1;
                     metrics.extra_model_calls += 1;
+                    // Name this extra closeout round trip so the UI does not show
+                    // a bare "waiting for model" while the audit runs.
+                    observer(AgentEvent::AdvisoryStarted {
+                        kind: AdvisoryKind::CompletenessAudit,
+                    });
                     match self.audit_answer(&messages, &cancellation).await? {
                         AnswerAudit::Complete => {}
-                        AnswerAudit::Missing(missing)
-                            if answer_audit_repairs < MAX_ANSWER_AUDIT_REPAIRS
-                                && has_next_round =>
-                        {
-                            answer_audit_repairs += 1;
-                            sink.append(&[assistant]).await?;
-                            continued_text = last_text.clone();
-                            let missing = if missing.is_empty() {
-                                "- The audit found the answer incomplete but did not name the missing branch. Re-check the original request and tool evidence.".to_string()
+                        AnswerAudit::Missing(missing) => {
+                            action = decide(&closeout_input(true));
+                            if action == CloseoutAction::NudgeOnce(CloseoutReason::AnswerIncomplete)
+                            {
+                                audit_missing = missing;
                             } else {
-                                missing
-                                    .into_iter()
-                                    .map(|item| format!("- {item}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            };
-                            messages.push(Message::text(
-                                Role::User,
-                                format!(
-                                    "A separate completeness audit found these omissions:\n{missing}\nContinue the answer from where it stopped. Cover those omissions precisely, do not repeat completed sections, and provide a clear closing conclusion."
-                                ),
-                            ));
-                            continue;
+                                tracing::warn!(
+                                    missing = ?missing,
+                                    "answer completeness audit reports omissions but the closeout budget is spent"
+                                );
+                            }
                         }
-                        AnswerAudit::Missing(missing) => tracing::warn!(
-                            missing = ?missing,
-                            "answer completeness audit still reports omissions after bounded repairs"
-                        ),
                         AnswerAudit::Unavailable(reason) => {
                             tracing::warn!(%reason, "answer completeness audit unavailable");
                         }
                     }
                 }
+                if let CloseoutAction::NudgeOnce(reason) = action {
+                    closeout_budget.consume();
+                    metrics.extra_model_calls += 1;
+                    // Surface the injection: without this the user sees a
+                    // "final" answer and then an unexplained extra model round.
+                    observer(AgentEvent::AdvisoryStarted {
+                        kind: AdvisoryKind::CloseoutNudge(reason),
+                    });
+                    let nudge = match reason {
+                        CloseoutReason::GoalUnresolved => {
+                            Message::text(Role::User, goal_resolve_nudge(&original_task))
+                        }
+                        CloseoutReason::MissingEvidence => {
+                            progress_since_evidence_nudge = false;
+                            Message::text(Role::User, completion_audit_nudge(&original_task))
+                        }
+                        CloseoutReason::EmptyAnswer => Message::text(
+                            Role::User,
+                            "Your last message was empty. Reply with the actual answer to the \
+                             request — do not send an empty message.",
+                        ),
+                        CloseoutReason::AnswerIncomplete => {
+                            continued_text = last_text.clone();
+                            Message::text(Role::User, answer_repair_nudge(&audit_missing))
+                        }
+                    };
+                    // Persist BOTH the quiet-round assistant text and the nudge:
+                    // an engine continuation reloads the transcript from the
+                    // sink, and any gap here makes the resumed model see a
+                    // different conversation than the one it actually had.
+                    sink.append(&[assistant, nudge.clone()]).await?;
+                    messages.push(nudge);
+                    continue;
+                }
                 sink.append(&[assistant]).await?;
                 observer(AgentEvent::Finished(last_text.clone()));
                 // In goal mode reaching this point means the model went quiet
                 // through every nudge without ever calling update_goal — that
-                // is a stall, not a proven completion.
+                // is a stall, not a proven completion. The detail carries the
+                // closeout reason so an engine continuation knows what the
+                // previous turn stalled on.
                 let (stop_reason, stop_detail) = if self.goal_mode {
                     // One no-progress tick per stalled drive so Engine
                     // continue_active_goal cannot open unbounded turns.
@@ -836,9 +828,16 @@ impl Executor {
                     observer(AgentEvent::ProgressUpdated {
                         ledger: progress.clone(),
                     });
+                    let reason = match action {
+                        CloseoutAction::Stall(reason) => reason,
+                        _ => CloseoutReason::GoalUnresolved,
+                    };
                     (
                         StopReason::Stalled,
-                        Some("目标模式结束但未调用 update_goal(complete/blocked)".to_string()),
+                        Some(stalled_detail(
+                            reason,
+                            "目标模式结束但未调用 update_goal(complete/blocked)",
+                        )),
                     )
                 } else {
                     (StopReason::Answered, None)
@@ -2348,12 +2347,28 @@ impl Executor {
                 && has_next_round
             {
                 let before = messages.len();
+                // Cap the retained working set at half the context budget so a
+                // huge recent tool output can't keep the fold over the window;
+                // the other half leaves room for the head, summary, and next
+                // response. (context_budget > 0 is guaranteed by the guard above.)
+                let keep_recent_tokens = self.context_budget as u64 / 2;
+                // Name this extra round trip so the UI shows "compacting…" instead
+                // of a bare "waiting for model" during the summary call.
+                observer(AgentEvent::AdvisoryStarted {
+                    kind: AdvisoryKind::ContextCompaction,
+                });
                 let summary = self
-                    .summarize_for_compaction(&messages, COMPACT_KEEP_RECENT, &cancellation)
+                    .summarize_for_compaction(
+                        &messages,
+                        COMPACT_KEEP_RECENT,
+                        keep_recent_tokens,
+                        &cancellation,
+                    )
                     .await;
                 messages = compact_messages(
                     &messages,
                     COMPACT_KEEP_RECENT,
+                    keep_recent_tokens,
                     summary.as_deref(),
                     Some(objective.text()),
                 );

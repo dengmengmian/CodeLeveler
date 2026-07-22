@@ -675,6 +675,94 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// End-to-end regression for the “没有提交的都回退掉” incident: a command-style
+/// revert request, assembled the way the factory builds a conversational task
+/// (evidence gate off, answer audit off, goal mode on). The old harness chained
+/// three independent nudge mechanisms, so the turn produced repeated “任务完成”
+/// summaries, redundant `git status` verification rounds, and finally a Stalled
+/// stop that triggered an engine continuation. The whole turn must now be:
+/// revert command → ONE summary → one goal nudge → update_goal(complete).
+#[tokio::test]
+async fn revert_request_ends_with_one_summary_and_no_stall() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-revertend-{}",
+        std::process::id() as u64 * 157 + 91
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        // The revert itself (echo stands in for `git checkout -- .`).
+        assistant_tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": "echo", "args": ["reverted"]}),
+        ),
+        // The one and only summary; quiet → exactly one goal-resolve nudge.
+        assistant_text("已回退所有未提交的改动。"),
+        // The nudge's conversational fast path: resolve with update_goal only.
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "未提交改动已全部回退。"}),
+        ),
+    ]));
+
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let outcome = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .run(
+        "没有提交的都回退掉",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // No Stalled → no engine continuation turn.
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    // 总结块 == 1: exactly one user-visible summary.
+    let summaries = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::AssistantText(t) if !t.trim().is_empty()))
+        .count();
+    assert_eq!(summaries, 1, "exactly one summary block: {events:?}");
+    // 无冗余验证轮: revert + summary + resolve — nothing extra.
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "no redundant verification rounds"
+    );
+    let commands = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "run_command"))
+        .count();
+    assert_eq!(commands, 1, "only the revert command itself runs");
+    // The single intervention is visible, not silent.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::AdvisoryStarted {
+                kind: leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::GoalUnresolved
+                )
+            }
+        )),
+        "the goal nudge must surface as an advisory event: {events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn goal_mode_update_goal_emits_completed_tool_event() {
     let dir = std::env::temp_dir().join(format!(
@@ -2639,8 +2727,9 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The model goes quiet every round and never calls update_goal: three
-    // nudges, then a fourth quiet round. That is a stall, not a completion.
+    // The model goes quiet every round and never calls update_goal: two
+    // nudges (the shared closeout budget), then a third quiet round. That is
+    // a stall, not a completion.
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text("I think it's done."),
         assistant_text("Still done."),
@@ -2671,6 +2760,134 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
         outcome.stop_reason,
         StopReason::Stalled,
         "quiet-nudge exhaustion must not be reported as a successful completion"
+    );
+    assert_eq!(
+        outcome.rounds, 3,
+        "the shared closeout budget allows two nudges, then the third quiet round stalls"
+    );
+    assert_eq!(
+        outcome.stop_detail.as_deref(),
+        Some(
+            "closeout_reason=goal_unresolved; 目标模式结束但未调用 update_goal(complete/blocked)"
+        ),
+        "the stall detail must carry the closeout reason for engine continuations"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Conversational non-goal turn (the Step-2 assembly: evidence gate and
+/// answer audit off) that only made an inert change: the FIRST quiet round
+/// closes as `Answered` — no closeout nudge may re-invoke the model for a
+/// second summary.
+#[tokio::test]
+async fn conversational_turn_with_inert_change_answers_on_first_quiet_round() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-closeout-conv-{}",
+        std::process::id() as u64 * 61 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("README.md"), "# Notes\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let (runtime, requests) = RequestRecordingRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: README.md\n # Notes\n+draft\n*** End Patch"
+            }),
+        ),
+        assistant_text("Cleaned up."),
+    ]);
+
+    let executor = Executor::new(
+        Arc::new(runtime),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    // Conversational tasks assemble with the evidence gate off (Step 2).
+    .with_structure(false, false);
+
+    let outcome = executor
+        .run(
+            "clean up the notes",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(outcome.rounds, 2, "the first quiet round must close the turn");
+    assert_eq!(outcome.final_text, "Cleaned up.");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "no closeout nudge may re-invoke the model"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Even with the completion-evidence gate assembled (Implementation profile),
+/// an inert change (docs only) demands no verification — the same answer the
+/// readiness gate gives — so the first quiet round closes as `Answered`.
+#[tokio::test]
+async fn evidence_gate_does_not_nudge_inert_changes() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-closeout-inert-{}",
+        std::process::id() as u64 * 67 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("README.md"), "# Notes\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let (runtime, requests) = RequestRecordingRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: README.md\n # Notes\n+draft\n*** End Patch"
+            }),
+        ),
+        assistant_text("Updated the docs."),
+    ]);
+
+    let executor = Executor::new(
+        Arc::new(runtime),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_structure(false, true);
+
+    let outcome = executor
+        .run(
+            "update the readme",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(outcome.rounds, 2);
+    let requests = requests.lock().unwrap();
+    assert!(
+        !requests.iter().flatten().any(|m| m
+            .text_content()
+            .contains(AUDIT_MARKER)),
+        "an inert change must not trigger the completion-evidence nudge"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -5597,6 +5814,95 @@ async fn empty_answer_gets_one_nudge_before_answered() {
         outcome.final_text, "the real answer",
         "an empty answer must be nudged once, not silently accepted"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A closeout nudge must be observable and durable: surfaced as an
+/// `AdvisoryStarted { CloseoutNudge }` event so the UI can label the extra
+/// model round, and persisted to the transcript sink (premature summary +
+/// injected nudge, in order) so an engine continuation reloads exactly the
+/// context the model saw. Before this, the MissingEvidence branch persisted
+/// neither message, so a resumed turn lost both.
+#[tokio::test]
+async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-nudgepersist-{}",
+        std::process::id() as u64 * 151 + 83
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+            }),
+        ),
+        assistant_text("Done."), // quiet + unverified build-relevant edit → nudge
+        assistant_text("Final answer."), // re-arm guard blocks a 2nd nudge → finish
+    ]));
+
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink(transcript.clone());
+    let mut events: Vec<AgentEvent> = Vec::new();
+
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_structure(false, true)
+    .run(
+        "Add an `added` function to lib.rs",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.final_text, "Final answer.");
+
+    // 1. The nudge surfaces as a labeled advisory event.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::AdvisoryStarted {
+                kind: leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::MissingEvidence
+                )
+            }
+        )),
+        "the evidence nudge must emit AdvisoryStarted(CloseoutNudge(MissingEvidence))"
+    );
+
+    // 2. The transcript holds the premature summary AND the injected nudge, in
+    // order, so continuation reload sees what the model saw.
+    let messages = transcript.lock().unwrap();
+    let done_idx = messages
+        .iter()
+        .position(|m| m.role == Role::Assistant && m.text_content().contains("Done."));
+    let nudge_idx = messages.iter().position(|m| {
+        m.role == Role::User && m.text_content().contains("Treat completion as unproven")
+    });
+    assert!(
+        done_idx.is_some(),
+        "the premature 'Done.' summary must be persisted for resume"
+    );
+    assert!(
+        nudge_idx.is_some(),
+        "the injected evidence nudge must be persisted for resume"
+    );
+    assert!(
+        done_idx < nudge_idx,
+        "summary must precede the nudge: {done_idx:?} vs {nudge_idx:?}"
+    );
+    drop(messages);
     std::fs::remove_dir_all(&dir).ok();
 }
 

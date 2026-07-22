@@ -3,7 +3,7 @@
 // 搜索（内容搜索）/ Git（工作区改动）。数据走 REST，按当前会话定位仓库；
 // 底部 daemon 连接状态。
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
 import { BrandMark } from './BrandMark';
@@ -34,12 +34,9 @@ export function Rail() {
 
   return (
     <aside className="rail">
-      <div className="brand">
+      <div className="brand" title="CodeLeveler web · v0.1">
         <BrandMark />
-        <div>
-          <div className="name">CodeLeveler</div>
-          <div className="ver">web · v0.1</div>
-        </div>
+        <div className="name">CodeLeveler</div>
       </div>
 
       <button className="rail-new" onClick={() => bridge.newDraft()}>
@@ -75,26 +72,54 @@ export function Rail() {
 
 // ── 会话面板 ────────────────────────────────────────────────────────
 
+// 每个项目组默认只展示最新 N 条会话，超出折叠进「加载更多」。
+const SESSION_PREVIEW_COUNT = 5;
+
 function SessionsPanel() {
   const state = useAppState();
   const bridge = useBridge();
   const [closed, setClosed] = useState<ReadonlySet<string>>(new Set());
+  // 会话列表展开为全量的项目路径集合（默认都只显示最新 5 条）
+  const [expandedSessions, setExpandedSessions] = useState<ReadonlySet<string>>(new Set());
   const [picking, setPicking] = useState(false);
+  // 正在 inline 重命名的项目路径（null = 无）
+  const [renaming, setRenaming] = useState<string | null>(null);
 
-  // 按 repository 分组；保持首见顺序，组内按 updated_at 倒序（新的在前）
+  // 会话按 repository 分组（组内按 updated_at 倒序），骨架是注册的项目
+  // 列表 —— 没有会话或 daemon 离线的项目也显示；不在项目列表里的会话
+  // 分组（单项目模式回退）追加在最后。
   const groups = useMemo<ProjectGroup[]>(() => {
-    const map = new Map<string, UiSessionSummary[]>();
+    const byRepo = new Map<string, UiSessionSummary[]>();
     for (const s of state.sessions) {
       const repo = s.repository ?? state.repository ?? '';
-      const list = map.get(repo);
+      const list = byRepo.get(repo);
       if (list) list.push(s);
-      else map.set(repo, [s]);
+      else byRepo.set(repo, [s]);
     }
-    return [...map.entries()].map(([repository, sessions]) => ({
-      repository,
-      sessions: [...sessions].sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
-    }));
-  }, [state.sessions, state.repository]);
+    for (const list of byRepo.values()) {
+      list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    }
+    const out: ProjectGroup[] = [];
+    const seen = new Set<string>();
+    for (const p of state.projects) {
+      seen.add(p.path);
+      out.push({ repository: p.path, sessions: byRepo.get(p.path) ?? [] });
+    }
+    for (const [repo, sessions] of byRepo) {
+      if (!seen.has(repo)) out.push({ repository: repo, sessions });
+    }
+    // 有会话的组按最近活动倒序（沿用旧的首见顺序体验）；无会话的组保持
+    // projects 顺序排在最后（sessions 已按 updated_at 倒序，首条即最新）。
+    out.sort((a, b) => {
+      const ta = a.sessions[0]?.updated_at;
+      const tb = b.sessions[0]?.updated_at;
+      if (ta && tb) return tb.localeCompare(ta);
+      if (ta) return -1;
+      if (tb) return 1;
+      return 0;
+    });
+    return out;
+  }, [state.sessions, state.projects, state.repository]);
 
   const toggle = (repo: string) => {
     setClosed((prev) => {
@@ -105,8 +130,24 @@ function SessionsPanel() {
     });
   };
 
-  const projectStatus = (repo: string) =>
-    state.projects.find((p) => p.path === repo)?.status ?? null;
+  const toggleSessionList = (repo: string) => {
+    setExpandedSessions((prev) => {
+      const next = new Set(prev);
+      if (next.has(repo)) next.delete(repo);
+      else next.add(repo);
+      return next;
+    });
+  };
+
+  const projectOf = (repo: string) => state.projects.find((p) => p.path === repo);
+
+  const submitRename = (repo: string, current: string, raw: string) => {
+    setRenaming(null);
+    const value = raw.trim();
+    if (value === current) return;
+    // 空串交给后端：清除别名、恢复路径末段的默认名
+    void bridge.renameProject(repo, value);
+  };
 
   return (
     <div className="sessions">
@@ -125,7 +166,9 @@ function SessionsPanel() {
         </div>
       )}
       {groups.map((g) => {
-        const status = projectStatus(g.repository);
+        const proj = projectOf(g.repository);
+        const status = proj?.status ?? null;
+        const name = proj?.name ?? repoShortName(g.repository);
         return (
           <div className={`proj${closed.has(g.repository) ? ' closed' : ''}`} key={g.repository || '_'}>
             <button className="proj-head" onClick={() => toggle(g.repository)}>
@@ -133,7 +176,15 @@ function SessionsPanel() {
               <span className="pmeta">
                 <span className="pname">
                   {status && <i className={`pdot ${status}`} />}
-                  {repoShortName(g.repository)}
+                  {renaming === g.repository ? (
+                    <RenameInput
+                      initial={name}
+                      onSubmit={(value) => submitRename(g.repository, name, value)}
+                      onCancel={() => setRenaming(null)}
+                    />
+                  ) : (
+                    name
+                  )}
                 </span>
                 <span className="ppath">{g.repository || '当前仓库'}</span>
               </span>
@@ -163,31 +214,180 @@ function SessionsPanel() {
                   ＋
                 </span>
               )}
+              <ProjectMenu
+                repo={g.repository}
+                name={name}
+                canManage={!!proj}
+                isPrimary={state.projects[0]?.path === g.repository}
+                onRename={() => setRenaming(g.repository)}
+              />
             </button>
             <div className="proj-sessions">
-              {g.sessions.map((s) => {
+              {g.sessions.length === 0 && (
+                <div className="sess-empty">
+                  {status === 'offline' ? 'daemon 离线 —— 点 ⟳ 重启后加载会话' : '暂无会话'}
+                </div>
+              )}
+              {(expandedSessions.has(g.repository)
+                ? g.sessions
+                : g.sessions.slice(0, SESSION_PREVIEW_COUNT)
+              ).map((s) => {
                 const dot = statusDot(s.status);
                 return (
+                  // 单行紧凑式：标题 + 右侧相对时间;状态点只在「运行中/等待
+                  // 输入」时出现,完成态不再各占一行刷 COMPLETED 噪声。
                   <button
                     key={s.id}
                     className={`sess${state.current?.id === s.id ? ' active' : ''}`}
                     onClick={() => bridge.selectSession(s.id)}
+                    title={`${dot.label} · ${formatRelative(s.updated_at)}`}
                   >
-                    <div className="t">{s.goal || '未命名会话'}</div>
-                    <div className="m">
-                      <i className={`dot ${dot.cls}`} />
-                      <span>{dot.label}</span>
-                      <span>·</span>
-                      <span>{formatRelative(s.updated_at)}</span>
-                    </div>
+                    {dot.cls !== 'idle' && <i className={`dot ${dot.cls}`} />}
+                    <span className="t">{s.goal || '未命名会话'}</span>
+                    <span className="ago">{formatRelative(s.updated_at)}</span>
                   </button>
                 );
               })}
+              {g.sessions.length > SESSION_PREVIEW_COUNT &&
+                (expandedSessions.has(g.repository) ? (
+                  <button className="sess-more" onClick={() => toggleSessionList(g.repository)}>
+                    收起
+                  </button>
+                ) : (
+                  <button className="sess-more" onClick={() => toggleSessionList(g.repository)}>
+                    加载更多 {g.sessions.length - SESSION_PREVIEW_COUNT} 个对话
+                  </button>
+                ))}
             </div>
           </div>
         );
       })}
     </div>
+  );
+}
+
+// ── 项目「⋯」菜单：复制路径 / 重命名 / 移除工作区 ──────────────────────
+// 仿 ThemeMenu 模式：open 状态 + 外部点击 / Escape 关闭。proj-head 本身是
+// <button>，内部沿用 .p-add 的 span[role=button] 惯例避免嵌套按钮。
+
+function ProjectMenu({
+  repo,
+  name,
+  canManage,
+  isPrimary,
+  onRename,
+}: {
+  repo: string;
+  name: string;
+  /** 是否在项目列表里（聚合模式）；否则只提供复制路径 */
+  canManage: boolean;
+  /** primary 项目不可移除 */
+  isPrimary: boolean;
+  onRename: () => void;
+}) {
+  const bridge = useBridge();
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  const timer = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('click', onDocClick);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', onDocClick);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const copyPath = () => {
+    void navigator.clipboard.writeText(repo);
+    setCopied(true);
+    if (timer.current) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      setCopied(false);
+      setOpen(false);
+    }, 900);
+  };
+
+  const remove = () => {
+    setOpen(false);
+    if (window.confirm(`移除工作区「${name}」？\n只会从列表中移除，不会删除磁盘上的文件。`)) {
+      void bridge.removeProject(repo);
+    }
+  };
+
+  return (
+    <span className="p-menu" ref={wrapRef} onClick={(e) => e.stopPropagation()}>
+      <span className="p-add" role="button" title="项目操作" onClick={() => setOpen((v) => !v)}>
+        ⋯
+      </span>
+      {open && (
+        <span className="p-pop">
+          <span className="p-item" role="button" onClick={copyPath}>
+            {copied ? '已复制' : '复制路径'}
+          </span>
+          {canManage && (
+            <span
+              className="p-item"
+              role="button"
+              onClick={() => {
+                setOpen(false);
+                onRename();
+              }}
+            >
+              重命名
+            </span>
+          )}
+          {canManage && !isPrimary && (
+            <span className="p-item danger" role="button" onClick={remove}>
+              移除工作区
+            </span>
+          )}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** inline 重命名输入框：Enter / 失焦提交，Escape 取消。 */
+function RenameInput({
+  initial,
+  onSubmit,
+  onCancel,
+}: {
+  initial: string;
+  onSubmit: (value: string) => void;
+  onCancel: () => void;
+}) {
+  // Escape 取消后 input 卸载，失焦回调不得再提交
+  const cancelled = useRef(false);
+  return (
+    <input
+      className="p-rename"
+      defaultValue={initial}
+      autoFocus
+      onFocus={(e) => e.currentTarget.select()}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') e.currentTarget.blur();
+        if (e.key === 'Escape') {
+          cancelled.current = true;
+          onCancel();
+        }
+      }}
+      onBlur={(e) => {
+        if (!cancelled.current) onSubmit(e.target.value);
+      }}
+    />
   );
 }
 

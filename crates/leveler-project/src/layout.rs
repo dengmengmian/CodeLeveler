@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-const REPOSITORY_OWNER_FILE: &str = ".repository-root";
+/// Ownership marker inside a `<home>/projects/<slug>/` state dir: holds the
+/// absolute path of the repository the dir belongs to.
+pub const REPOSITORY_OWNER_FILE: &str = ".repository-root";
 
 /// Resolved paths for a CodeLeveler run rooted at a repository.
 #[derive(Debug, Clone)]
@@ -88,6 +90,13 @@ impl Layout {
     pub fn memory_dir(&self) -> PathBuf {
         self.state_dir.join("memory")
     }
+
+    /// ApproveAlways permission-rules file (`<state_dir>/permissions.yaml`,
+    /// next to `sessions.db`) — machine-written per-user state, kept out of
+    /// the repo.
+    pub fn permissions_path(&self) -> PathBuf {
+        self.state_dir.join("permissions.yaml")
+    }
 }
 
 /// The global CodeLeveler home: `$LEVELER_HOME`, else `$HOME/.leveler` (or
@@ -116,6 +125,18 @@ fn resolve_leveler_home(
         _ => None,
     })
     .unwrap_or_else(|| temp_dir.join(format!("leveler-{}", std::process::id())))
+}
+
+/// Advisory write-lock path for a workspace file: `<home>/locks/<hash>.lock`.
+///
+/// Lock files live under the global home — never next to the target — so
+/// workspaces don't accumulate `.<name>.leveler-lock` residue. Keyed by a
+/// stable hash of the absolute target path, so independent CodeLeveler
+/// processes editing the same file agree on the same lock.
+pub fn target_lock_path(environment: &leveler_core::EnvSnapshot, target_abs: &Path) -> PathBuf {
+    leveler_home(environment)
+        .join("locks")
+        .join(format!("{}.lock", path_hash(&target_abs.to_string_lossy())))
 }
 
 /// The runtime-state dir for a repo under `home`: `<home>/projects/<encoded>`.
@@ -239,6 +260,32 @@ fn write_owner_marker_if_directory_exists(state_dir: &Path, repo_root: &Path) {
     }
 }
 
+/// Every repository that has Leveler state under `home`: each
+/// `<home>/projects/*/` directory carrying a `.repository-root` marker stores
+/// the owning repository's path in that marker. Sorted for deterministic
+/// output; unreadable or marker-less directories are skipped. The repository
+/// itself may no longer exist — existence is the caller's decision.
+pub fn known_repositories(home: &Path) -> Vec<PathBuf> {
+    let mut repos: Vec<PathBuf> = match std::fs::read_dir(home.join("projects")) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let owner =
+                    std::fs::read_to_string(entry.path().join(REPOSITORY_OWNER_FILE)).ok()?;
+                let owner = owner.trim();
+                if owner.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(owner))
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    repos.sort();
+    repos
+}
+
 /// Collect YAML files (`*.yaml` / `*.yml`) directly inside `dir`, sorted by name
 /// for deterministic loading. Returns an empty vec if the directory is absent.
 pub fn yaml_files(dir: &Path) -> Vec<PathBuf> {
@@ -287,6 +334,26 @@ mod tests {
         assert!(
             db.to_string_lossy().contains("projects"),
             "namespaced under projects/: {db:?}"
+        );
+    }
+
+    #[test]
+    fn target_lock_path_lives_under_home_locks_never_in_the_workspace() {
+        let environment = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                std::ffi::OsString::from("/home/x/.leveler"),
+            )],
+            PathBuf::from("/"),
+            PathBuf::from("/tmp"),
+        );
+        let lock = target_lock_path(&environment, Path::new("/repo/src/lib.rs"));
+        assert_eq!(
+            lock,
+            PathBuf::from(format!(
+                "/home/x/.leveler/locks/{}.lock",
+                path_hash("/repo/src/lib.rs")
+            ))
         );
     }
 
@@ -593,6 +660,37 @@ mod tests {
         let layout = Layout::resolve(PathBuf::from("/repo"), Some(PathBuf::from("/custom")));
         assert_eq!(layout.config_dir, PathBuf::from("/custom"));
         assert_eq!(layout.providers_dir(), PathBuf::from("/custom/providers"));
+    }
+
+    #[test]
+    fn known_repositories_reads_owner_markers() {
+        let base = std::env::temp_dir().join(format!(
+            "leveler-known-repos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = base.join("home").join("projects");
+        // One properly marked state dir.
+        let marked = projects.join("-tmp-app-0123456789abcdef");
+        fs::create_dir_all(&marked).unwrap();
+        fs::write(marked.join(REPOSITORY_OWNER_FILE), b"/tmp/app\n").unwrap();
+        // A marker-less dir and an empty marker are skipped.
+        fs::create_dir_all(projects.join("unmarked")).unwrap();
+        let empty = projects.join("empty-marker");
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(empty.join(REPOSITORY_OWNER_FILE), b"  \n").unwrap();
+
+        let repos = known_repositories(&base.join("home"));
+        assert_eq!(repos, vec![PathBuf::from("/tmp/app")]);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn known_repositories_returns_empty_without_projects_dir() {
+        assert!(known_repositories(Path::new("/does/not/exist")).is_empty());
     }
 
     #[test]

@@ -182,7 +182,9 @@ fn start_web(state: &mut AppState) -> Vec<Effect> {
             level: NotificationLevel::Info,
             message: format!("Web UI 已在运行：{url}"),
         });
-        return Vec::new();
+        // The tab that opened on first launch may be long closed — re-open the
+        // browser every time instead of stranding the user with a URL to copy.
+        return vec![Effect::OpenWebUrl(url.clone())];
     }
     if state.web_starting {
         return Vec::new();
@@ -914,8 +916,15 @@ mod export_tests {
         assert!(!s.web_starting);
         assert_eq!(s.web_url.as_deref(), Some("http://127.0.0.1:9/?token=abc"));
 
-        // Now /web only re-surfaces the running URL — no new StartWeb effect.
-        assert!(handle_slash(&mut s, "web").is_empty());
+        // Now /web re-surfaces the running URL AND re-opens the browser —
+        // "already running" must not strand the user with a bare URL to copy.
+        assert_eq!(
+            handle_slash(&mut s, "web"),
+            vec![Effect::OpenWebUrl(
+                "http://127.0.0.1:9/?token=abc".to_string()
+            )],
+            "re-invoking /web must re-open the browser, not just print the URL"
+        );
         assert!(
             matches!(&s.notification, Some(n) if n.message.contains("已在运行")),
             "should report the already-running URL"

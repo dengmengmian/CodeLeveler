@@ -216,6 +216,7 @@ impl Executor {
         &self,
         messages: &[Message],
         keep_recent: usize,
+        keep_recent_tokens: u64,
         cancellation: &CancellationToken,
     ) -> Option<String> {
         crate::compaction::summarize_with_model(
@@ -224,6 +225,7 @@ impl Executor {
             self.reasoning_effort,
             messages,
             keep_recent,
+            keep_recent_tokens,
             cancellation,
         )
         .await

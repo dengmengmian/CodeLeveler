@@ -189,6 +189,13 @@ pub enum EngineEvent {
         from: usize,
         to: usize,
     },
+    /// The harness started an advisory (tool-free) model call during closeout —
+    /// a completeness audit or a compaction summary. Transient UI hint only, so a
+    /// status line can name the wait instead of a bare "waiting for model". `kind`
+    /// is a stable key (`completeness_audit` / `context_compaction`).
+    AdvisoryStarted {
+        kind: String,
+    },
     /// The model replaced its structured plan (update_plan tool). Full list,
     /// not a delta; step text derives from the task/model output.
     PlanUpdated {
@@ -434,7 +441,9 @@ impl EngineEvent {
             | EngineEvent::RequirementReady { .. }
             | EngineEvent::PlanReady { .. }
             | EngineEvent::ReviewFinding { .. }
-            | EngineEvent::ReviewFailed { .. } => LocalOnly,
+            | EngineEvent::ReviewFailed { .. }
+            // Transient local UI hint (no source/model content), never projected.
+            | EngineEvent::AdvisoryStarted { .. } => LocalOnly,
         }
     }
 
@@ -562,7 +571,8 @@ impl EngineEvent {
             | EngineEvent::RequirementReady { .. }
             | EngineEvent::PlanReady { .. }
             | EngineEvent::ReviewFinding { .. }
-            | EngineEvent::ReviewFailed { .. } => return None,
+            | EngineEvent::ReviewFailed { .. }
+            | EngineEvent::AdvisoryStarted { .. } => return None,
         })
     }
 }
@@ -751,6 +761,9 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 cached_input_tokens,
             },
             A::Compacted { from, to } => EngineEvent::Compacted { from, to },
+            A::AdvisoryStarted { kind } => EngineEvent::AdvisoryStarted {
+                kind: kind.as_key().to_string(),
+            },
             A::PlanUpdated { steps } => EngineEvent::PlanUpdated { steps },
             A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
             A::EvidenceLedgerUpdated { ledger } => EngineEvent::EvidenceLedgerUpdated { ledger },

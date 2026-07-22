@@ -13,6 +13,7 @@ leveler-core = { workspace = true }
 leveler-client-protocol = { workspace = true }
 leveler-local-transport = { workspace = true }
 leveler-project = { workspace = true }
+leveler-storage = { workspace = true }
 axum = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }

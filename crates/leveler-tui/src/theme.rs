@@ -64,7 +64,11 @@ pub struct Theme {
     pub monochrome: bool,
     pub text: Color,
     pub muted: Color,
+    /// De-emphasized text: fold hints, auxiliary info (weaker than `muted`).
+    pub dim: Color,
     pub accent: Color,
+    /// Headings and the user-message bar (distinct from `accent` links/tools).
+    pub heading: Color,
     pub success: Color,
     pub warning: Color,
     pub error: Color,
@@ -74,6 +78,10 @@ pub struct Theme {
     pub tool: Color,
     pub diff_add: Color,
     pub diff_remove: Color,
+    /// Inline `code` spans.
+    pub code: Color,
+    /// Shell prompt marker (`$`) in command blocks.
+    pub shell_prompt: Color,
     pub attachment: Color,
     /// Soft background for fenced code blocks (Reset = transparent / none).
     pub code_bg: Color,
@@ -85,20 +93,24 @@ impl Theme {
         Self {
             id: ThemeId::Ion,
             monochrome: false,
-            text: Color::Reset,
-            muted: Color::Rgb(0x9A, 0xA3, 0xA7),
-            accent: Color::Rgb(0x22, 0xD3, 0xEE),
-            success: Color::Rgb(0x7D, 0xC8, 0x5F),
-            warning: Color::Rgb(0xF5, 0x9E, 0x42),
-            error: Color::Rgb(0xF2, 0x5F, 0x7A),
-            border: Color::Rgb(0x62, 0x6B, 0x70),
-            // Reset (terminal fg) so user text stays readable on both dark and
-            // light terminals; the accent bar + bold carry the turn distinction.
-            user_message: Color::Reset,
-            assistant_message: Color::Reset,
-            tool: Color::Rgb(0x67, 0xE8, 0xF9),
-            diff_add: Color::Rgb(0x7D, 0xC8, 0x5F),
-            diff_remove: Color::Rgb(0xF2, 0x5F, 0x7A),
+            text: Color::Rgb(0xD6, 0xD9, 0xDC),
+            muted: Color::Rgb(0x90, 0x97, 0x9F),
+            dim: Color::Rgb(0x69, 0x70, 0x78),
+            accent: Color::Rgb(0x56, 0xB6, 0xE9),
+            heading: Color::Rgb(0x45, 0xC7, 0xD9),
+            success: Color::Rgb(0x73, 0xC9, 0x91),
+            warning: Color::Rgb(0xD7, 0xBA, 0x7D),
+            error: Color::Rgb(0xF0, 0x6A, 0x7A),
+            border: Color::Rgb(0x4A, 0x51, 0x58),
+            // Match `text` so user and assistant turns share one readable fg on
+            // dark terminals; the heading bar + bold carry the turn distinction.
+            user_message: Color::Rgb(0xD6, 0xD9, 0xDC),
+            assistant_message: Color::Rgb(0xD6, 0xD9, 0xDC),
+            tool: Color::Rgb(0x56, 0xB6, 0xE9),
+            diff_add: Color::Rgb(0x73, 0xC9, 0x91),
+            diff_remove: Color::Rgb(0xF0, 0x6A, 0x7A),
+            code: Color::Rgb(0xC8, 0xCD, 0xD2),
+            shell_prompt: Color::Rgb(0xC5, 0x86, 0xC0),
             attachment: Color::Rgb(0xA7, 0x8B, 0xFA),
             code_bg: Color::Rgb(0x1A, 0x1F, 0x24),
         }
@@ -114,18 +126,23 @@ impl Theme {
         Self {
             id: ThemeId::Night,
             monochrome: false,
-            text: Color::Rgb(0xC0, 0xCA, 0xF5),
-            muted: Color::Rgb(0x56, 0x5F, 0x89),
-            accent: Color::Rgb(0xBB, 0x9A, 0xF7),
-            success: Color::Rgb(0x9E, 0xCE, 0x6A),
-            warning: Color::Rgb(0xE0, 0xAF, 0x68),
-            error: Color::Rgb(0xF7, 0x76, 0x8E),
-            border: Color::Rgb(0x3B, 0x42, 0x61),
+            text: Color::Rgb(0xD6, 0xD9, 0xDC),
+            muted: Color::Rgb(0x90, 0x97, 0x9F),
+            dim: Color::Rgb(0x69, 0x70, 0x78),
+            accent: Color::Rgb(0x56, 0xB6, 0xE9),
+            heading: Color::Rgb(0x45, 0xC7, 0xD9),
+            success: Color::Rgb(0x73, 0xC9, 0x91),
+            warning: Color::Rgb(0xD7, 0xBA, 0x7D),
+            error: Color::Rgb(0xF0, 0x6A, 0x7A),
+            border: Color::Rgb(0x4A, 0x51, 0x58),
+            // Night keeps its blue-tinted turn colors (existing semantics).
             user_message: Color::Rgb(0xC0, 0xCA, 0xF5),
             assistant_message: Color::Rgb(0xA9, 0xB1, 0xD6),
-            tool: Color::Rgb(0x7D, 0xCF, 0xFF),
-            diff_add: Color::Rgb(0x9E, 0xCE, 0x6A),
-            diff_remove: Color::Rgb(0xF7, 0x76, 0x8E),
+            tool: Color::Rgb(0x56, 0xB6, 0xE9),
+            diff_add: Color::Rgb(0x73, 0xC9, 0x91),
+            diff_remove: Color::Rgb(0xF0, 0x6A, 0x7A),
+            code: Color::Rgb(0xC8, 0xCD, 0xD2),
+            shell_prompt: Color::Rgb(0xC5, 0x86, 0xC0),
             attachment: Color::Rgb(0xFF, 0x9E, 0x64),
             code_bg: Color::Rgb(0x16, 0x16, 0x1E),
         }
@@ -137,17 +154,21 @@ impl Theme {
             id: ThemeId::Day,
             monochrome: false,
             text: Color::Rgb(0x1F, 0x23, 0x28),
-            muted: Color::Rgb(0x6E, 0x77, 0x81),
-            accent: Color::Rgb(0x05, 0x5D, 0x9C),
+            muted: Color::Rgb(0x57, 0x60, 0x6A),
+            dim: Color::Rgb(0x8C, 0x95, 0x9F),
+            accent: Color::Rgb(0x09, 0x69, 0xDA),
+            heading: Color::Rgb(0x0E, 0x74, 0x90),
             success: Color::Rgb(0x1A, 0x7F, 0x37),
             warning: Color::Rgb(0x9A, 0x67, 0x00),
             error: Color::Rgb(0xCF, 0x22, 0x2E),
             border: Color::Rgb(0xD0, 0xD7, 0xDE),
             user_message: Color::Rgb(0x24, 0x29, 0x2F),
             assistant_message: Color::Rgb(0x1F, 0x23, 0x28),
-            tool: Color::Rgb(0x05, 0x63, 0xA1),
+            tool: Color::Rgb(0x09, 0x69, 0xDA),
             diff_add: Color::Rgb(0x1A, 0x7F, 0x37),
             diff_remove: Color::Rgb(0xCF, 0x22, 0x2E),
+            code: Color::Rgb(0x33, 0x39, 0x3F),
+            shell_prompt: Color::Rgb(0x82, 0x50, 0xDF),
             attachment: Color::Rgb(0x82, 0x50, 0xDF),
             code_bg: Color::Rgb(0xF6, 0xF8, 0xFA),
         }
@@ -170,7 +191,9 @@ impl Theme {
             monochrome: true,
             text: Color::Reset,
             muted: Color::Reset,
+            dim: Color::Reset,
             accent: Color::Reset,
+            heading: Color::Reset,
             success: Color::Reset,
             warning: Color::Reset,
             error: Color::Reset,
@@ -180,6 +203,8 @@ impl Theme {
             tool: Color::Reset,
             diff_add: Color::Reset,
             diff_remove: Color::Reset,
+            code: Color::Reset,
+            shell_prompt: Color::Reset,
             attachment: Color::Reset,
             code_bg: Color::Reset,
         }
@@ -239,22 +264,27 @@ mod tests {
             let t = Theme::named(id);
             assert!(!t.is_monochrome(), "{id}");
             assert_ne!(t.accent, Color::Reset, "{id} accent should be colored");
+            assert_ne!(t.heading, Color::Reset, "{id} heading should be colored");
+            assert_ne!(t.dim, Color::Reset, "{id} dim should be colored");
+            assert_ne!(t.code, Color::Reset, "{id} code should be colored");
+            assert_ne!(
+                t.shell_prompt,
+                Color::Reset,
+                "{id} shell_prompt should be colored"
+            );
             assert_eq!(t.id, id);
         }
     }
 
     #[test]
-    fn ion_user_message_follows_terminal_fg() {
-        // ion keeps text/assistant at Reset so they adapt to the terminal bg.
-        // user_message must do the same — a hardcoded light color turned gray on
-        // white terminals. Distinction comes from the accent bar + bold, not hue.
+    fn ion_message_turns_follow_text_color() {
+        // ion uses an explicit light-on-dark fg; user and assistant turns share
+        // it. Distinction comes from the heading bar + bold, not hue. Light
+        // terminals are served by day(), not by Reset adaptation.
         let t = Theme::ion();
-        assert_eq!(t.text, Color::Reset);
-        assert_eq!(
-            t.user_message,
-            Color::Reset,
-            "ion user_message must adapt to terminal fg, not a fixed light color"
-        );
+        assert_eq!(t.user_message, t.text);
+        assert_eq!(t.assistant_message, t.text);
+        assert_ne!(t.text, Color::Reset, "ion text is an explicit palette fg");
     }
 
     #[test]
@@ -264,6 +294,10 @@ mod tests {
             assert!(t.is_monochrome(), "{id}");
             assert_eq!(t.accent, Color::Reset);
             assert_eq!(t.diff_add, Color::Reset);
+            assert_eq!(t.heading, Color::Reset);
+            assert_eq!(t.dim, Color::Reset);
+            assert_eq!(t.code, Color::Reset);
+            assert_eq!(t.shell_prompt, Color::Reset);
             assert_eq!(t.id, id, "preference id retained under NO_COLOR");
         }
     }

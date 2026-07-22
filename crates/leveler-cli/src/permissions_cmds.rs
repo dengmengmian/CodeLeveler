@@ -2,14 +2,17 @@
 //!
 //! Rules live in:
 //! - global: `$LEVELER_HOME/permissions.yaml` (default `~/.leveler/permissions.yaml`)
-//! - project: `<repo>/.leveler/permissions.yaml` (written by ApproveAlways)
+//! - project: `~/.leveler/projects/<hash>/permissions.yaml` (written by
+//!   ApproveAlways, next to `sessions.db`)
+//! - repo: `<repo>/.leveler/permissions.yaml` (user-authored / legacy
+//!   ApproveAlways target, still honored)
 //!
-//! `list` shows both; `clear` only removes the project file.
+//! `list` shows all three; `clear` removes the project file and the repo file.
 
 use std::path::{Path, PathBuf};
 
 use leveler_execution::{
-    PermissionRule, RuleEffect, clear_project_rules, load_rules_file, project_rules_path,
+    PermissionRule, RuleEffect, clear_rules_file, load_rules_file, project_rules_path,
 };
 use leveler_project::Layout;
 
@@ -24,31 +27,32 @@ pub(crate) fn cmd_permissions(
         PermissionsCommand::List => {
             let global_home = leveler_home();
             let global_path = global_home.join("permissions.yaml");
-            let project_path = project_rules_path(&layout.repo_root);
 
             println!("{}", Line::heading("Permission rules"));
             println!();
             print_source("global", &global_path);
-            print_source("project", &project_path);
+            print_source("project", &layout.permissions_path());
+            print_source("repo", &project_rules_path(&layout.repo_root));
             Ok(std::process::ExitCode::SUCCESS)
         }
         PermissionsCommand::Clear => {
-            let path = project_rules_path(&layout.repo_root);
-            let existed = path.is_file();
-            clear_project_rules(&layout.repo_root).map_err(anyhow::Error::msg)?;
-            if existed {
-                println!(
-                    "{}",
-                    Line::ok(&format!("cleared project rules ({})", path.display()))
-                );
-            } else {
-                println!(
-                    "{}",
-                    Line::warn(&format!(
-                        "no project rules file to clear ({})",
-                        path.display()
-                    ))
-                );
+            let mut cleared = false;
+            for path in [
+                layout.permissions_path(),
+                project_rules_path(&layout.repo_root),
+            ] {
+                let existed = path.is_file();
+                clear_rules_file(&path).map_err(anyhow::Error::msg)?;
+                if existed {
+                    cleared = true;
+                    println!(
+                        "{}",
+                        Line::ok(&format!("cleared project rules ({})", path.display()))
+                    );
+                }
+            }
+            if !cleared {
+                println!("{}", Line::warn("no project rules file to clear"));
             }
             Ok(std::process::ExitCode::SUCCESS)
         }

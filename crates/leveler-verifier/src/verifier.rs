@@ -97,6 +97,8 @@ impl Verifier {
 
         // Narrow whole-repo commands to the changed packages (spec §29.5).
         let args = scope_args(&command.args, modified_files);
+        // Complete failure sets for baseline attribution (see with_no_fail_fast).
+        let args = with_no_fail_fast(command, args);
         // Repo / builtin verify: write confinement on, network inherits session
         // (not force-deny — K12 so cargo/go/npm cold caches still work).
         let mut request = process_request_for_verify_check(
@@ -319,6 +321,25 @@ fn scope_args(args: &[String], modified_files: &[String]) -> Vec<String> {
     out
 }
 
+/// `cargo test` stops at the first failing test binary by default, truncating
+/// the failed-test set that baseline attribution diffs (test_results.rs): a
+/// pre-existing failure hidden behind the truncation point can never be proven
+/// pre-existing, and the working run's truncation can hide a genuinely new
+/// failure behind an attributed one. Force the full suite for `cargo test`
+/// checks; the flag goes before a `--` harness-args separator so it stays a
+/// cargo flag. Other toolchains and non-Test checks are untouched.
+fn with_no_fail_fast(command: &VerificationCommand, mut args: Vec<String>) -> Vec<String> {
+    let is_cargo_test = command.kind == CheckKind::Test
+        && program_stem(&command.program) == "cargo"
+        && args.first().is_some_and(|a| a == "test");
+    if !is_cargo_test || args.iter().any(|a| a == "--no-fail-fast") {
+        return args;
+    }
+    let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    args.insert(at, "--no-fail-fast".to_string());
+    args
+}
+
 /// Parse a failed check's output into test-level failure ids, dispatching on
 /// the toolchain. Only Test checks carry test granularity; build/fmt/lint and
 /// toolchains without a parser (Node, …) yield an empty set and fall back to
@@ -327,16 +348,21 @@ fn parse_failed_tests(command: &VerificationCommand, output: &str) -> BTreeSet<S
     if command.kind != CheckKind::Test {
         return BTreeSet::new();
     }
-    // `program` may be a bare name or an absolute path; match on the stem.
-    let program = std::path::Path::new(&command.program)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command.program.as_str());
+    let program = program_stem(&command.program);
     match program {
         "cargo" => parse_rust_failures(output),
         "go" => parse_go_failures(output),
         _ => BTreeSet::new(),
     }
+}
+
+/// `program` may be a bare name or an absolute path; toolchain dispatch matches
+/// on the stem.
+fn program_stem(program: &str) -> &str {
+    std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
 }
 
 fn combine(stdout: &str, stderr: &str) -> String {
@@ -464,6 +490,63 @@ mod tests {
     fn scope_leaves_non_glob_commands_untouched() {
         let args = sv(&["check", "--workspace"]);
         assert_eq!(scope_args(&args, &["src/lib.rs".into()]), args);
+    }
+
+    fn test_check(program: &str, args: &[&str]) -> VerificationCommand {
+        VerificationCommand {
+            name: format!("{program} test"),
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            kind: CheckKind::Test,
+            gating: true,
+            timeout_seconds: 30,
+        }
+    }
+
+    #[test]
+    fn cargo_test_gains_no_fail_fast() {
+        // Fail-fast truncates the failed-test set baseline attribution diffs;
+        // the executed command must always carry --no-fail-fast.
+        let c = test_check("cargo", &["test", "--workspace", "--quiet"]);
+        assert_eq!(
+            with_no_fail_fast(&c, c.args.clone()),
+            sv(&["test", "--workspace", "--quiet", "--no-fail-fast"])
+        );
+    }
+
+    #[test]
+    fn no_fail_fast_goes_before_the_harness_separator() {
+        // After `--` the args belong to the test harness, which rejects the
+        // flag — it must stay on cargo's side.
+        let c = test_check("cargo", &["test", "--", "--nocapture"]);
+        assert_eq!(
+            with_no_fail_fast(&c, c.args.clone()),
+            sv(&["test", "--no-fail-fast", "--", "--nocapture"])
+        );
+    }
+
+    #[test]
+    fn no_fail_fast_is_not_duplicated() {
+        let c = test_check("cargo", &["test", "--no-fail-fast"]);
+        assert_eq!(with_no_fail_fast(&c, c.args.clone()), c.args);
+    }
+
+    #[test]
+    fn other_toolchains_and_non_test_checks_are_untouched() {
+        let go = test_check("go", &["test", "./..."]);
+        assert_eq!(with_no_fail_fast(&go, go.args.clone()), go.args);
+
+        // `cargo check` is a Build check — no test flags.
+        let build = cmd("cargo check", "cargo", &["check", "--workspace"], true);
+        assert_eq!(with_no_fail_fast(&build, build.args.clone()), build.args);
+
+        // A cargo Test check whose subcommand is not `test` (e.g. nextest)
+        // takes different flags — leave it alone.
+        let nextest = test_check("cargo", &["nextest", "run"]);
+        assert_eq!(
+            with_no_fail_fast(&nextest, nextest.args.clone()),
+            nextest.args
+        );
     }
 
     #[test]

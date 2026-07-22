@@ -17,7 +17,7 @@ mod terminal_repo;
 mod turn_repo;
 
 pub use command_receipt_repo::{Admission, CommandReceiptRepository};
-pub use database::{Database, StorageError};
+pub use database::{Database, StorageError, peek_repository};
 pub use event_repo::{EVENT_SCHEMA_VERSION, EventRecord, EventRepository};
 pub use event_store::{EventStore, MemoryEventStore};
 pub use message_repo::MessageRepository;

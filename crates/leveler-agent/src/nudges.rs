@@ -53,7 +53,11 @@ pub(crate) fn goal_resolve_nudge(objective: &str) -> String {
          call update_goal(blocked).\n\
          C) **Follow-up in the same session** — use the conversation history; do \
          not claim you have \"no prior context\" and re-discover the project from \
-         scratch unless the user started a truly new topic."
+         scratch unless the user started a truly new topic.\n\n\
+         In every case: resolve by calling update_goal directly, and if you must \
+         say anything user-visible first, output only NEW information that differs \
+         from what you already said — do NOT repeat conclusions you have already \
+         given."
     )
 }
 
@@ -76,7 +80,31 @@ pub(crate) fn completion_audit_nudge(original_task: &str) -> String {
          - Do not redefine the task into a smaller or easier one; the original \
          requirement is the bar.\n\n\
          If every requirement is verifiably satisfied, give your final answer. \
-         If anything is missing or unverified, keep working now."
+         If anything is missing or unverified, keep working now.\n\n\
+         When you do answer, output only what is NEW since your last message — \
+         do NOT repeat conclusions you have already stated."
+    )
+}
+
+/// The repair prompt injected when the answer-completeness audit names
+/// branches the answer skipped: continue from where the answer stopped with
+/// the missing pieces only — never a second copy of what was already said.
+pub(crate) fn answer_repair_nudge(missing: &[String]) -> String {
+    let missing = if missing.is_empty() {
+        "- The audit found the answer incomplete but did not name the missing branch. Re-check the original request and tool evidence.".to_string()
+    } else {
+        missing
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "A separate completeness audit found these omissions:\n{missing}\n\
+         Continue the answer from where it stopped. Cover those omissions \
+         precisely, do not repeat completed sections, and provide a clear \
+         closing conclusion. Output only the NEW, incremental content that was \
+         missing — do NOT restate conclusions already given above."
     )
 }
 

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::contract::TaskContract;
+use crate::impact::ChangeImpact;
 use crate::ledger::EvidenceLedger;
 use crate::plan::PlanState;
 
@@ -111,9 +112,16 @@ pub fn check(
             return Err(ReadinessFailure::UnprovenNoMutation);
         }
         if last_mut > 0 && !ledger.has_fresh_successful_verify() {
-            return Err(ReadinessFailure::MissingVerification {
-                last_mutation_seq: last_mut,
-            });
+            // Inert changes (docs, scripts, deleted non-build files) cannot
+            // affect the build, so they never require a fresh verify — the
+            // same `is_build_relevant` heuristic the verifier uses to scope
+            // its gates, via the shared ChangeImpact view.
+            let impact = ChangeImpact::from_ledger(ledger);
+            if impact.build_relevant {
+                return Err(ReadinessFailure::MissingVerification {
+                    last_mutation_seq: last_mut,
+                });
+            }
         }
         // Explicit plan steps that finished need complete_step receipts with fresh evidence.
         if plan.is_model_explicit() && !plan.steps.is_empty() {
@@ -191,27 +199,47 @@ fn normalize_acceptance(cmd: &str) -> String {
     EvidenceLedger::normalize_command_fingerprint(&parts[0], &parts[1..])
 }
 
+/// How a request is classified for gate assembly (P3): whether it is
+/// implementation work that merits the completion-evidence gate and answer
+/// audit, or a conversational/command-style turn where those gates only add
+/// redundant verification prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskClass {
+    Conversational,
+    Implementation,
+}
+
+/// Appendix C — task classification heuristic (v1). Read-only/question words
+/// and command-style git-operation verbs (回退/清理/删除/还原 — the kind of
+/// request that runs one command and is done) classify as
+/// [`TaskClass::Conversational`]; modification verbs as
+/// [`TaskClass::Implementation`]. Anything unrecognized defaults to
+/// `Conversational`: a misclassification only skips an optional verification
+/// prompt, never relaxes a gate on real implementation work that announces
+/// itself with a modification verb.
+pub fn classify_task(task: &str) -> TaskClass {
+    let lower = task.to_lowercase();
+    let conversational = [
+        "解释", "explain", "what is", "在哪", "how does", "why is", "回退", "清理", "删除", "还原",
+        "撤销", "revert",
+    ];
+    if conversational.iter().any(|w| lower.contains(w)) {
+        return TaskClass::Conversational;
+    }
+    let implementation = [
+        "fix", "修复", "实现", "implement", "修", "add", "添加", "改", "修改", "write", "编辑",
+        "bug", "重构", "refactor", "优化",
+    ];
+    if implementation.iter().any(|w| lower.contains(w)) {
+        TaskClass::Implementation
+    } else {
+        TaskClass::Conversational
+    }
+}
+
 /// Appendix C — implementation-class request heuristic (v1).
 pub fn task_looks_like_implementation(task: &str) -> bool {
-    let lower = task.to_lowercase();
-    let readonly = ["解释", "explain", "what is", "在哪", "how does", "why is"];
-    if readonly.iter().any(|w| lower.contains(w)) {
-        return false;
-    }
-    let hits = [
-        "fix",
-        "实现",
-        "implement",
-        "修",
-        "add",
-        "添加",
-        "改",
-        "修改",
-        "write",
-        "编辑",
-        "bug",
-    ];
-    hits.iter().any(|w| lower.contains(w))
+    classify_task(task) == TaskClass::Implementation
 }
 
 #[cfg(test)]
@@ -300,6 +328,45 @@ mod tests {
     }
 
     #[test]
+    fn delivery_blocks_stale_verify_after_build_relevant_mutation() {
+        // Regression: a build-relevant mutation without a fresh verify is
+        // still refused, even when inert files were touched alongside it.
+        let cfg = GateConfig::for_work_profile(WorkProfile::Delivery);
+        let mut led = EvidenceLedger::default();
+        led.record_mutation("c1", "apply_patch", vec!["src/lib.rs".into()]);
+        led.record_verify("v1", "cargo\u{1f}test", 0);
+        led.record_mutation(
+            "c2",
+            "replace",
+            vec!["README.md".into(), "crates/x/src/main.rs".into()],
+        );
+        assert!(matches!(
+            check(&PlanState::default(), &led, None, &cfg, false, true),
+            Err(ReadinessFailure::MissingVerification { .. })
+        ));
+    }
+
+    #[test]
+    fn delivery_ignores_stale_verify_for_inert_changes() {
+        // Docs-only mutations cannot affect the build: no fresh verify is
+        // required, so the gate must not bounce update_goal(complete) back
+        // with MissingVerification.
+        let cfg = GateConfig::for_work_profile(WorkProfile::Delivery);
+        let mut led = EvidenceLedger::default();
+        led.record_mutation("c1", "apply_patch", vec!["README.md".into()]);
+        led.record_verify("v1", "cargo\u{1f}test", 0);
+        led.record_mutation(
+            "c2",
+            "replace",
+            vec!["docs/guide.md".into(), "scripts/audit.sh".into()],
+        );
+        assert!(
+            check(&PlanState::default(), &led, None, &cfg, false, true).is_ok(),
+            "inert changes must not trigger MissingVerification"
+        );
+    }
+
+    #[test]
     fn acceptance_commands_must_appear_in_ledger() {
         let cfg = GateConfig::for_work_profile(WorkProfile::Delivery);
         let mut led = EvidenceLedger::default();
@@ -326,5 +393,54 @@ mod tests {
     fn implementation_heuristic() {
         assert!(task_looks_like_implementation("fix the login bug"));
         assert!(!task_looks_like_implementation("explain how auth works"));
+    }
+
+    #[test]
+    fn classify_task_grades_command_and_question_turns_conversational() {
+        // The incident trigger: a git-operation command must not assemble the
+        // evidence gate / answer audit.
+        assert_eq!(
+            classify_task("没有提交的都回退掉"),
+            TaskClass::Conversational
+        );
+        assert_eq!(
+            classify_task("这个函数是干什么的"),
+            TaskClass::Conversational
+        );
+        for task in [
+            "把工作区清理一下",
+            "删除未跟踪的文件",
+            "还原刚才的改动",
+            "revert the last commit",
+        ] {
+            assert_eq!(
+                classify_task(task),
+                TaskClass::Conversational,
+                "{task} must be conversational"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_task_grades_modification_requests_implementation() {
+        assert_eq!(classify_task("修复 login 的 panic"), TaskClass::Implementation);
+        for task in [
+            "实现用户登录接口",
+            "重构 session 模块",
+            "优化这段代码的查询性能",
+            "refactor the session module",
+        ] {
+            assert_eq!(
+                classify_task(task),
+                TaskClass::Implementation,
+                "{task} must be implementation"
+            );
+        }
+        // Command verbs win over modification words: the request is a git
+        // operation, not code modification.
+        assert_eq!(
+            classify_task("把刚才的修改回退掉"),
+            TaskClass::Conversational
+        );
     }
 }

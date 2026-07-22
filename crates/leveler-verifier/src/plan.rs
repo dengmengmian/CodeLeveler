@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use leveler_lifecycle::is_build_relevant;
 use leveler_project::Language;
 
 /// The category of a verification command.
@@ -166,17 +167,11 @@ impl VerificationPlan {
     /// scripts, lock files, or other non-compiled inputs.
     ///
     /// Conservative by construction — the gates stand unless EVERY modified file
-    /// is provably inert:
-    /// - Anything inside a compiled/consumed source tree (`src/`, `tests/`,
-    ///   `benches/`, `examples/`) keeps the gates: a fixture there could be an
-    ///   `include_str!` input.
-    /// - Any known source / manifest / build-driver file (by name or extension,
-    ///   across the ecosystems we gate) keeps them.
-    /// - Empty `modified_files` (unknown blast radius) keeps them.
-    ///
-    /// Known blind spot: a repo whose tests read a tracked top-level `*.sh` or
-    /// `include_str!` a `.md` living outside a source dir would have that
-    /// dependency treated as inert. Fixtures under `src/`/`tests/` are covered.
+    /// is provably inert. The heuristic itself lives in
+    /// [`leveler_lifecycle::is_build_relevant`] (shared with the readiness gate,
+    /// so both layers judge "does this change need verification" identically);
+    /// see its docs for the full trade-off. Empty `modified_files` (unknown
+    /// blast radius) keeps the gates.
     pub fn scope_gates_to_changes(&mut self, modified_files: &[String]) {
         if modified_files.is_empty() || modified_files.iter().any(|f| is_build_relevant(f)) {
             return;
@@ -189,59 +184,6 @@ impl VerificationPlan {
                 cmd.gating = false;
             }
         }
-    }
-}
-
-/// Whether a modified path could affect a build or test outcome. Conservative:
-/// unknown files outside a source tree are treated as inert (return `false`);
-/// see [`VerificationPlan::scope_gates_to_changes`] for the trade-off.
-fn is_build_relevant(path: &str) -> bool {
-    let norm = path.trim_start_matches("./");
-
-    // Inside a compiled/consumed source tree → may be an include!/fixture input.
-    for seg in ["src", "tests", "test", "benches", "examples"] {
-        if norm == seg || norm.starts_with(&format!("{seg}/")) || norm.contains(&format!("/{seg}/"))
-        {
-            return true;
-        }
-    }
-
-    let base = norm.rsplit('/').next().unwrap_or(norm);
-
-    // Manifests and build drivers across the ecosystems whose default gates we
-    // emit (Rust/Go/Python/Node) plus common native ones.
-    const NAMES: &[&str] = &[
-        "Cargo.toml",
-        "Cargo.lock",
-        "build.rs",
-        "go.mod",
-        "go.sum",
-        "package.json",
-        "tsconfig.json",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "Makefile",
-        "makefile",
-        "CMakeLists.txt",
-        "Dockerfile",
-    ];
-    if NAMES.contains(&base) {
-        return true;
-    }
-    if base.starts_with("requirements") && base.ends_with(".txt") {
-        return true;
-    }
-
-    // Source and build-config extensions. Docs (.md/.txt/.rst), shell scripts,
-    // and lock/metadata files deliberately fall through to inert.
-    const EXTS: &[&str] = &[
-        "rs", "go", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "c", "cc", "cpp", "cxx", "h",
-        "hpp", "java", "rb", "cs", "vue", "svelte", "toml", "json",
-    ];
-    match base.rsplit_once('.') {
-        Some((_, ext)) => EXTS.contains(&ext.to_ascii_lowercase().as_str()),
-        None => false,
     }
 }
 

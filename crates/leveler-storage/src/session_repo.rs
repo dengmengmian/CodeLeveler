@@ -179,6 +179,18 @@ impl<'a> SessionRepository<'a> {
         Ok(())
     }
 
+    /// Overwrite the goal/title text. Used to name a placeholder interactive
+    /// session after its first real message; does not bump `updated_at` (the
+    /// message's own turn does that).
+    pub async fn update_goal(&self, id: &SessionId, goal: &str) -> Result<(), StorageError> {
+        sqlx::query("UPDATE sessions SET goal = ?2 WHERE id = ?1")
+            .bind(id.as_str())
+            .bind(goal)
+            .execute(self.db.pool())
+            .await?;
+        Ok(())
+    }
+
     /// Persist the model selected for subsequent turns in this session.
     pub async fn update_model(
         &self,
@@ -324,6 +336,23 @@ mod tests {
         assert!(repo.get(&id).await.unwrap().is_some());
         assert!(repo.delete(&id).await.unwrap());
         assert!(repo.get(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_goal_overwrites_title_without_touching_updated_at() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = SessionRecord::new("/repo", "interactive session", "m", leveler_core::now());
+        repo.create(&record).await.unwrap();
+        let id = SessionId::new(record.id.clone());
+
+        repo.update_goal(&id, "帮我修复登录超时").await.unwrap();
+        let got = repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.goal, "帮我修复登录超时");
+        assert_eq!(
+            got.updated_at, record.updated_at,
+            "retitle must not reorder the session list"
+        );
     }
 
     #[tokio::test]
