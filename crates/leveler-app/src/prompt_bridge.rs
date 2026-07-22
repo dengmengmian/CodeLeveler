@@ -159,6 +159,12 @@ impl Clarifier for ChannelClarifier {
             _ = tokio::time::sleep(control_response_timeout()) => String::new(),
         };
         self.pending.lock().unwrap().remove(&request.id);
+        // However it resolved (answered, cancelled, or timed out), tell every
+        // connected client to dismiss the prompt so a second client can't answer
+        // a clarification that no longer exists.
+        let _ = self
+            .events
+            .send(RuntimeEvent::ClarificationResolved { id: request.id.clone() });
         answer
     }
 }
@@ -208,6 +214,12 @@ impl Approver for ChannelApprover {
             _ = tokio::time::sleep(control_response_timeout()) => ApprovalDecision::Deny,
         };
         self.pending.lock().unwrap().remove(&request.id);
+        // However it resolved (answered, cancelled, or timed out), tell every
+        // connected client to dismiss the prompt so a second client can't answer
+        // an approval that no longer exists.
+        let _ = self
+            .events
+            .send(RuntimeEvent::ApprovalResolved { id: request.id.clone() });
         decision
     }
 }

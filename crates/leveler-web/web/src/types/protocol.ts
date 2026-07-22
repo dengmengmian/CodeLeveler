@@ -210,7 +210,9 @@ export type RuntimeEvent =
   | { type: 'session_opened'; session: UiSessionSnapshot }
   | { type: 'session_updated'; session: UiSessionSnapshot }
   | { type: 'approval_requested'; request: UiApprovalRequest }
+  | { type: 'approval_resolved'; id: ApprovalId }
   | { type: 'clarification_requested'; request: UiClarificationRequest }
+  | { type: 'clarification_resolved'; id: ClarificationId }
   | { type: 'attachment_added'; attachment: AttachmentRef }
   | { type: 'attachment_processing_failed'; error: string }
   | { type: 'user_message_added'; message: UiMessage }

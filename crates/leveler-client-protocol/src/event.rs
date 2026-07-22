@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::ToolCallId;
+use leveler_core::{ApprovalId, ClarificationId, ToolCallId};
 
 use super::approval::{UiApprovalRequest, UiClarificationRequest};
 use super::media::AttachmentRef;
@@ -44,8 +44,14 @@ pub enum RuntimeEvent {
     SessionUpdated { session: UiSessionSnapshot },
     /// The runtime needs the user to approve a risky action .
     ApprovalRequested { request: UiApprovalRequest },
+    /// A pending approval was resolved (by any connected client, or by a
+    /// timeout/cancel). Clients dismiss the matching prompt so a second client
+    /// never answers an approval that no longer exists.
+    ApprovalResolved { id: ApprovalId },
     /// The agent is asking the user a clarifying question (spec §35).
     ClarificationRequested { request: UiClarificationRequest },
+    /// A pending clarification was resolved (by any client, timeout, or cancel).
+    ClarificationResolved { id: ClarificationId },
     /// An imported attachment was processed and stored (spec §39).
     AttachmentAdded { attachment: AttachmentRef },
     /// Importing an attachment failed.

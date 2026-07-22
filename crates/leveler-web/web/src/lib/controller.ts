@@ -153,8 +153,14 @@ export class RuntimeBridge {
       case 'approval_requested':
         this.dispatch({ type: 'approval_requested', request: ev.request });
         break;
+      case 'approval_resolved':
+        this.dispatch({ type: 'approval_resolved', requestId: ev.id });
+        break;
       case 'clarification_requested':
         this.dispatch({ type: 'clarification_requested', request: ev.request });
+        break;
+      case 'clarification_resolved':
+        this.dispatch({ type: 'clarification_resolved', requestId: ev.id });
         break;
       case 'plan_updated':
         this.dispatch({ type: 'plan', plan: ev.plan });
