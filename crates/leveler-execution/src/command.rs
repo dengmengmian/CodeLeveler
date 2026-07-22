@@ -132,6 +132,10 @@ impl ProcessRequest {
 /// caches through a read-only overlay. Network-denied requests always do; the
 /// token check also covers explicit `cargo --offline`/`npm --offline`, including
 /// commands carried inside a shell `-c` argument.
+///
+/// Only the macOS/Linux sandbox paths consult this; Windows has no host-cache
+/// overlay, so the function is gated to avoid a dead-code warning there.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn should_read_host_caches(request: &ProcessRequest) -> bool {
     request.deny_network
         || request.args.iter().any(|arg| {

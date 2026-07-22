@@ -10,9 +10,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::command::{ProcessRequest, sandbox_command, should_read_host_caches};
+use crate::command::{ProcessRequest, sandbox_command};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::command::{SandboxPaths, apply_sandbox_environment, prepare_sandbox_paths};
+use crate::command::{
+    SandboxPaths, apply_sandbox_environment, prepare_sandbox_paths, should_read_host_caches,
+};
 use crate::snapshot::SnapshotId;
 use crate::windows_sandbox::{FilesystemIntent, assert_intent_spawn_allowed};
 
