@@ -673,7 +673,7 @@ pub(crate) async fn cmd_tui(
             });
             // The token URL is only printed to the transient notification line;
             // open it in the default browser so it is not missed.
-            open_in_browser(&url);
+            leveler_tui::open_in_browser(&url);
             Ok(url)
         })
     });
@@ -765,18 +765,6 @@ fn generate_daemon_token() -> String {
 
 /// Open `url` in the OS default browser, best-effort (any failure is ignored —
 /// the URL is still shown in the TUI notification as a fallback).
-fn open_in_browser(url: &str) {
-    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else if cfg!(target_os = "windows") {
-        // `start` needs an empty title argument before the URL.
-        ("cmd", vec!["/C", "start", "", url])
-    } else {
-        ("xdg-open", vec![url])
-    };
-    let _ = std::process::Command::new(program).args(args).spawn();
-}
-
 /// Environment variable carrying the daemon bearer token. Secrets never go on
 /// argv (`ps` exposes it); the spawning WebUI passes the token this way.
 pub(crate) const DAEMON_TOKEN_ENV: &str = "LEVELER_DAEMON_TOKEN";

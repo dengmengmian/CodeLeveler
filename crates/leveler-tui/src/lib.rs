@@ -43,7 +43,7 @@ mod run;
 
 pub use action::WebLauncher;
 pub use i18n::Locale;
-pub use run::{TuiError, run};
+pub use run::{TuiError, open_in_browser, run};
 pub use state::Boot;
 pub use theme::{Theme, ThemeId};
 pub use theme_config::{load_theme_id, save_theme_id};
