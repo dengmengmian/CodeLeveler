@@ -9,14 +9,13 @@ use leveler_model::ToolCall;
 use leveler_lifecycle::ProgressLedger;
 
 use super::{
-    AgentError, AgentEvent, ClarificationRequest, Executor,
-    StepLimits, StopReason, SubAgentProgressSink,
+    AgentError, AgentEvent, ClarificationRequest, Executor, StepLimits, StopReason,
+    SubAgentProgressSink,
 };
 use crate::authorization::action_fingerprint;
 use crate::sub_agent::AgentRole;
 
 impl Executor {
-
     /// Answer a `request_user_input` / `ask_user` tool call via the clarifier.
     pub(crate) async fn handle_ask_user(
         &self,
@@ -179,40 +178,38 @@ impl Executor {
         let partial_obs = partial.clone();
         let activity_id = id.clone();
         let activity_tx = progress.clone();
-        let mut capture = move |event: AgentEvent| {
-            match &event {
-                AgentEvent::ProgressUpdated { ledger } => {
-                    if let Ok(mut guard) = partial_obs.lock() {
-                        *guard = ledger.clone();
-                    }
+        let mut capture = move |event: AgentEvent| match &event {
+            AgentEvent::ProgressUpdated { ledger } => {
+                if let Ok(mut guard) = partial_obs.lock() {
+                    *guard = ledger.clone();
                 }
-                AgentEvent::ToolCall {
-                    name, arguments, ..
-                } => {
-                    let _ = activity_tx.send(AgentEvent::SubAgentActivity {
-                        id: activity_id.clone(),
-                        phase: "tool_started".to_string(),
-                        tool: name.clone(),
-                        preview: cap_activity_preview(arguments),
-                        is_error: false,
-                    });
-                }
-                AgentEvent::ToolResult {
-                    name,
-                    is_error,
-                    preview,
-                    ..
-                } => {
-                    let _ = activity_tx.send(AgentEvent::SubAgentActivity {
-                        id: activity_id.clone(),
-                        phase: "tool_finished".to_string(),
-                        tool: name.clone(),
-                        preview: cap_activity_preview(preview),
-                        is_error: *is_error,
-                    });
-                }
-                _ => {}
             }
+            AgentEvent::ToolCall {
+                name, arguments, ..
+            } => {
+                let _ = activity_tx.send(AgentEvent::SubAgentActivity {
+                    id: activity_id.clone(),
+                    phase: "tool_started".to_string(),
+                    tool: name.clone(),
+                    preview: cap_activity_preview(arguments),
+                    is_error: false,
+                });
+            }
+            AgentEvent::ToolResult {
+                name,
+                is_error,
+                preview,
+                ..
+            } => {
+                let _ = activity_tx.send(AgentEvent::SubAgentActivity {
+                    id: activity_id.clone(),
+                    phase: "tool_finished".to_string(),
+                    tool: name.clone(),
+                    preview: cap_activity_preview(preview),
+                    is_error: *is_error,
+                });
+            }
+            _ => {}
         };
         let mut sink = SubAgentProgressSink::new(id, progress);
         // Box the recursive future (agent → spawn_agent → agent) so its size is

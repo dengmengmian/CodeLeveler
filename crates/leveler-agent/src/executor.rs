@@ -31,7 +31,7 @@ use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOT
 
 /// Secondary summarization/audit requests improve quality but must never make
 /// an otherwise finished turn look hung for minutes.
-
+///
 /// Query-conditioned memory recall (tail injection). Each turn we retrieve the
 /// top-scoring memories for the current request and inject their bodies as a
 /// system block right before the (always-new) user message. This keeps the

@@ -954,7 +954,6 @@ async fn worker_sub_agent_serializes_parallel_safe_tools() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-
 /// Blocker 1: exhausted parent residual (`Some(0)`) must hard-block child
 /// commands — never reopen unlimited via `0 == unlimited` confusion.
 #[tokio::test]
@@ -1678,25 +1677,26 @@ async fn concurrent_spawns_emit_attributed_tool_activity() {
             _ => None,
         })
         .collect();
-    assert_eq!(started_ids.len(), 2, "need two concurrent children: {events:?}");
+    assert_eq!(
+        started_ids.len(),
+        2,
+        "need two concurrent children: {events:?}"
+    );
 
     let activities: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
             AgentEvent::SubAgentActivity {
-                id,
-                phase,
-                tool,
-                ..
+                id, phase, tool, ..
             } => Some((id.clone(), phase.clone(), tool.clone())),
             _ => None,
         })
         .collect();
     for id in &started_ids {
         assert!(
-            activities
-                .iter()
-                .any(|(aid, phase, tool)| aid == id && phase == "tool_started" && tool == "list_files"),
+            activities.iter().any(|(aid, phase, tool)| aid == id
+                && phase == "tool_started"
+                && tool == "list_files"),
             "child {id} must report list_files start: {activities:?}"
         );
         assert!(

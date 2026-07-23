@@ -234,9 +234,6 @@ mod tests {
         );
     }
 
-
-
-
     #[test]
     fn exhausted_budget_stalls_goal_and_finishes_non_goal() {
         let impact = quiet_impact();
@@ -269,7 +266,6 @@ mod tests {
             CloseoutAction::Stall(CloseoutReason::GoalUnresolved)
         );
     }
-
 
     #[test]
     fn stalled_detail_round_trips_the_reason() {

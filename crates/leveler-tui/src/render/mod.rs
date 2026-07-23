@@ -1397,7 +1397,9 @@ mod tests {
             "file heading missing: {joined}"
         );
         assert!(
-            (joined.contains("- old") || joined.contains("-old") || joined.lines().any(|l| l.contains('-') && l.contains("old")))
+            (joined.contains("- old")
+                || joined.contains("-old")
+                || joined.lines().any(|l| l.contains('-') && l.contains("old")))
                 && (joined.contains("+ new")
                     || joined.contains("+new")
                     || joined.lines().any(|l| l.contains('+') && l.contains("new"))),
@@ -1418,10 +1420,7 @@ mod tests {
 
         let folded = tool_render(&item, false);
         let text = folded.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(
-            !text.contains("line 30"),
-            "folded diff is capped: {text}"
-        );
+        assert!(!text.contains("line 30"), "folded diff is capped: {text}");
         assert!(
             text.contains("Ctrl+O") && text.contains("…"),
             "must hint how to see the full diff: {text}"
@@ -1429,10 +1428,7 @@ mod tests {
 
         let expanded = tool_render(&item, true);
         let text = expanded.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(
-            text.contains("line 30"),
-            "Ctrl+O expands the diff: {text}"
-        );
+        assert!(text.contains("line 30"), "Ctrl+O expands the diff: {text}");
     }
 
     #[test]

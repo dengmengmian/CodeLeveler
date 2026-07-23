@@ -17,9 +17,7 @@ use leveler_model::{ModelRef, ModelRuntime};
 use leveler_tools::{ToolContext, ToolRegistry};
 
 use crate::EngineError;
-use crate::policy_resolver::{
-    ExecutionOverrides, ExecutionRole, resolve_execution_policy,
-};
+use crate::policy_resolver::{ExecutionOverrides, ExecutionRole, resolve_execution_policy};
 
 /// What kind of turn the executor will drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,10 +50,6 @@ pub fn profile_step_limits(profile: &TurnProfile) -> StepLimits {
         TurnProfile::Node { limits, .. } => *limits,
     }
 }
-
-/// P3 task-class grading of the two closeout gates: completion evidence and
-/// the answer audit.
-///
 
 /// Builds executors for engine turns. Owns the shared runtime/registry/tool
 /// context/model; profile read failures are hard errors (no silently ungated
@@ -232,8 +226,4 @@ mod tests {
             Some(std::time::Duration::from_secs(900))
         );
     }
-
-
-
-
 }

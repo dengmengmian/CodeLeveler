@@ -795,9 +795,15 @@ fn inline_diff_lines(
 /// One body row of a patch, ready for gutter rendering.
 #[derive(Debug, Clone)]
 enum EditDiffRow {
-    FileHeader { path: String },
-    Meta { text: String },
-    Hunk { label: String },
+    FileHeader {
+        path: String,
+    },
+    Meta {
+        text: String,
+    },
+    Hunk {
+        label: String,
+    },
     Code {
         /// New-file line number when known (from `@@ +N`).
         line_no: Option<u32>,
@@ -864,7 +870,10 @@ fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
             });
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix('+').filter(|_| !trimmed.starts_with("+++")) {
+        if let Some(rest) = trimmed
+            .strip_prefix('+')
+            .filter(|_| !trimmed.starts_with("+++"))
+        {
             let ln = new_ln;
             if let Some(n) = new_ln.as_mut() {
                 *n = n.saturating_add(1);
@@ -876,7 +885,10 @@ fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
             });
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix('-').filter(|_| !trimmed.starts_with("---")) {
+        if let Some(rest) = trimmed
+            .strip_prefix('-')
+            .filter(|_| !trimmed.starts_with("---"))
+        {
             // Removals do not advance the new-file line counter.
             rows.push(EditDiffRow::Code {
                 line_no: new_ln,
@@ -919,12 +931,18 @@ fn push_edit_diff_body(
     let cap = if tools_expanded { 48 } else { DIFF_FOLD_ROWS };
     let shown = rows.len().min(cap);
     // Gutter: "  1234 │ " ≈ up to 4 digits when numbered.
-    let has_numbers = rows.iter().any(|r| matches!(r, EditDiffRow::Code { line_no: Some(_), .. }));
+    let has_numbers = rows.iter().any(|r| {
+        matches!(
+            r,
+            EditDiffRow::Code {
+                line_no: Some(_),
+                ..
+            }
+        )
+    });
     let gutter_w = if has_numbers { 6 } else { 2 };
     let mark_w = 2; // "+ " / "- " / "  "
-    let inner = width
-        .saturating_sub(4 + gutter_w + mark_w)
-        .max(12);
+    let inner = width.saturating_sub(4 + gutter_w + mark_w).max(12);
 
     for (i, row) in rows.iter().take(shown).enumerate() {
         let lead = if i == 0 { "  └ " } else { "    " };
@@ -934,9 +952,7 @@ fn push_edit_diff_body(
                     Span::styled(lead, Style::default().fg(theme.dim)),
                     Span::styled(
                         truncate_display(path, width.saturating_sub(4).max(8)),
-                        Style::default()
-                            .fg(theme.text)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                     ),
                 ]));
             }
@@ -1046,9 +1062,8 @@ pub(crate) fn merged_diff_rows(
     let mut combined = String::new();
     for call in calls {
         let patch = if call.name == "replace" {
-            replace_patch_from_arguments(&call.arguments).unwrap_or_else(|| {
-                patch_text_from_arguments(&call.arguments)
-            })
+            replace_patch_from_arguments(&call.arguments)
+                .unwrap_or_else(|| patch_text_from_arguments(&call.arguments))
         } else {
             patch_text_from_arguments(&call.arguments)
         };
@@ -1151,10 +1166,7 @@ mod m1_tests {
             text.contains("461") || text.contains("462") || text.contains("464"),
             "line numbers from @@: {text}"
         );
-        assert!(
-            text.contains("allow_delegation"),
-            "added code body: {text}"
-        );
+        assert!(text.contains("allow_delegation"), "added code body: {text}");
         // Clean gutter: content should not be shown only as raw "+allow..." without separation.
         assert!(
             text.contains("+ ") || text.lines().any(|l| l.contains('+') && l.contains("allow")),
@@ -1193,8 +1205,14 @@ mod m1_tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("foo.rs") || text.contains("src/foo.rs"), "{text}");
-        assert!(text.contains("todo!()") || text.contains("fn a()"), "{text}");
+        assert!(
+            text.contains("foo.rs") || text.contains("src/foo.rs"),
+            "{text}"
+        );
+        assert!(
+            text.contains("todo!()") || text.contains("fn a()"),
+            "{text}"
+        );
     }
 }
 

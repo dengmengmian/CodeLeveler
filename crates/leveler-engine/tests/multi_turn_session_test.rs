@@ -655,7 +655,15 @@ async fn chat_anchors_a_baseline_for_pre_existing_failures() {
     for args in [
         vec!["init", "-q"],
         vec!["add", "-A"],
-        vec!["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"],
+        vec![
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "base",
+        ],
     ] {
         std::process::Command::new("git")
             .arg("-C")

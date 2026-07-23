@@ -1294,7 +1294,6 @@ impl TaskEngine {
         })
     }
 
-
     /// The plan strategy (B5): understand → localize → plan, then every graph
     /// node runs as a fully-persisted engine turn, then verify + bounded
     /// repair and the advisory review panel.

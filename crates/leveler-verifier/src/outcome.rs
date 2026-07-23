@@ -130,7 +130,6 @@ mod tests {
         }
     }
 
-
     fn expected(needs: bool, has: bool) -> ExpectedEvidence {
         ExpectedEvidence {
             needs_mutation: needs,

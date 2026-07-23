@@ -25,8 +25,8 @@ use super::dispatch::{
     newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
 };
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor,
-    LOOP_GUARD_THRESHOLD, ModelRequestRecord, StopReason, TranscriptSink,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor, LOOP_GUARD_THRESHOLD,
+    ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
     call_needs_host_escape, collect_scoped_paths_from_call, counts_as_verification_evidence,
@@ -40,10 +40,7 @@ use crate::injected_tools::{
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::{
-    STEP_SUMMARY_NUDGE, first_user_text,
-    goal_resolve_nudge,
-};
+use crate::nudges::{STEP_SUMMARY_NUDGE, first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
     AgentRole, MAX_SUB_AGENT_DEPTH, agent_nickname, multi_agent_steer_hint,
     task_suggests_delegation,
@@ -1421,11 +1418,9 @@ impl Executor {
                         snapshot,
                     });
                 }
-                if !is_error {
-                    if !is_pure_observe_call(&call.name, &call.arguments) {
-                        non_observe_success_this_round =
-                            non_observe_success_this_round.saturating_add(1);
-                    }
+                if !is_error && !is_pure_observe_call(&call.name, &call.arguments) {
+                    non_observe_success_this_round =
+                        non_observe_success_this_round.saturating_add(1);
                 }
                 // Track command execution for the stagnation guard: a command
                 // that keeps failing (test/build/script) is the stuck signal.
@@ -1601,18 +1596,16 @@ impl Executor {
                             modified_files.push(f.clone());
                         }
                     }
-                    if !is_error {
-                        if !job_files.is_empty() {
-                            verification_ran = false;
-                            note_tool_side_effects(
-                                &mut ledger,
-                                job.call.id.as_str(),
-                                job.call.name.as_str(),
-                                job_files.clone(),
-                                &plan_state,
-                                observer,
-                            );
-                        }
+                    if !is_error && !job_files.is_empty() {
+                        verification_ran = false;
+                        note_tool_side_effects(
+                            &mut ledger,
+                            job.call.id.as_str(),
+                            job.call.name.as_str(),
+                            job_files.clone(),
+                            &plan_state,
+                            observer,
+                        );
                     }
                     if let Some(part) = extract_image(&metadata) {
                         pending_images.push(part);
@@ -1801,8 +1794,6 @@ impl Executor {
                                 ok: result.ok,
                                 summary: preview(&result.text),
                             });
-                            if result.ok {
-                            }
                             // Roll sub-agent spend into the parent task epoch.
                             // Parent same-batch spend was pinned before absorb.
                             progress.absorb_child_spend(&result.progress);

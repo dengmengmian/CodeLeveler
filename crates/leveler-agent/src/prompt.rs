@@ -112,7 +112,6 @@ impl PromptBuilder {
         self
     }
 
-
     pub(crate) fn turn_context(mut self, context: TurnContext) -> Self {
         self.turn_context = Some(context);
         self
@@ -395,9 +394,7 @@ mod tests {
         assert!(!base.contains("Before calling any tool"));
         assert!(!base.contains("do NOT declare the task complete"));
 
-        let prompt = PromptBuilder::new()
-            .require_explicit_plan(true)
-            .build();
+        let prompt = PromptBuilder::new().require_explicit_plan(true).build();
 
         assert!(prompt.contains("Before calling any tool"));
         assert!(prompt.contains("do NOT declare the task complete"));
@@ -951,12 +948,8 @@ mod tests {
     fn core_system_prefix_is_byte_stable_across_assemblies() {
         // Cache-stable prefix: same builder options must yield identical system text
         // when turn context is absent (task contracts never land in this path).
-        let a = PromptBuilder::new()
-            .require_explicit_plan(true)
-            .build();
-        let b = PromptBuilder::new()
-            .require_explicit_plan(true)
-            .build();
+        let a = PromptBuilder::new().require_explicit_plan(true).build();
+        let b = PromptBuilder::new().require_explicit_plan(true).build();
         assert_eq!(a, b);
         assert!(!a.contains("Request:"));
         assert!(!a.contains("Constraints:"));

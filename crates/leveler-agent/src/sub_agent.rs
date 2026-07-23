@@ -37,7 +37,13 @@ pub fn task_suggests_delegation(task: &str) -> bool {
         return true;
     }
     // English multi-facet review phrasing (architecture + security + …).
-    let facets = ["architecture", "security", "stability", "tools", "performance"];
+    let facets = [
+        "architecture",
+        "security",
+        "stability",
+        "tools",
+        "performance",
+    ];
     let facet_hits = facets.iter().filter(|f| t.contains(*f)).count();
     if facet_hits >= 2 && (t.contains("review") || t.contains("investigate") || t.contains("audit"))
     {

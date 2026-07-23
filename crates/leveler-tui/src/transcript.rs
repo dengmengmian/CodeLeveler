@@ -636,10 +636,10 @@ impl TranscriptState {
 
     /// Record the latest real tool/step for a running sub-agent.
     pub fn update_sub_agent_activity(&mut self, id: &str, step: String) {
-        if let Some(block) = self.sub_agent_mut(id) {
-            if block.status == ToolStatus::Running {
-                block.recent_step = Some(step);
-            }
+        if let Some(block) = self.sub_agent_mut(id)
+            && block.status == ToolStatus::Running
+        {
+            block.recent_step = Some(step);
         }
     }
 

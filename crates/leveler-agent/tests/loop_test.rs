@@ -1194,7 +1194,6 @@ async fn completion_evidence_gate_allows_plain_text_without_workspace_change() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-
 /// A runtime that reports a huge token count every round (to force compaction)
 /// and records whether any request it received carried the compaction
 /// breadcrumb — proof the `drive` loop actually folded the transcript.
@@ -2103,9 +2102,6 @@ impl ModelRuntime for RequestRecordingRuntime {
 
 const AUDIT_MARKER: &str = "Treat completion as unproven";
 
-
-
-
 #[tokio::test]
 async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
     // Architectural backstop: a turn that keeps issuing tool calls forever (a
@@ -2173,8 +2169,6 @@ async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
-
-
 
 /// One assistant message that requests several tool calls at once.
 fn assistant_tool_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> ModelResponse {
@@ -2588,7 +2582,6 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
-
 
 #[tokio::test]
 async fn cargo_command_is_completion_evidence() {
@@ -3203,7 +3196,6 @@ async fn natural_stop_is_an_answer_end_not_proof_that_the_task_completed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-
 #[tokio::test]
 async fn unavailable_completeness_audit_does_not_downgrade_a_finished_answer() {
     let dir = std::env::temp_dir().join(format!(
@@ -3239,7 +3231,6 @@ async fn unavailable_completeness_audit_does_not_downgrade_a_finished_answer() {
     assert!(outcome.final_text.contains("fully explained"));
     std::fs::remove_dir_all(&dir).ok();
 }
-
 
 /// The summary a scripted model returns when asked to compact the transcript.
 const COMPACT_SUMMARY_MARKER: &str =
@@ -3646,7 +3637,6 @@ async fn auto_approve_grants_a_network_permission_without_asking_a_human() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
-
 
 #[tokio::test]
 async fn answer_audit_is_off_by_default() {
@@ -5322,9 +5312,9 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
     let done_idx = messages
         .iter()
         .position(|m| m.role == Role::Assistant && m.text_content().contains("Done."));
-    let nudge_idx = messages.iter().position(|m| {
-        m.role == Role::User && m.text_content().contains("update_goal")
-    });
+    let nudge_idx = messages
+        .iter()
+        .position(|m| m.role == Role::User && m.text_content().contains("update_goal"));
     assert!(
         done_idx.is_some(),
         "the premature 'Done.' summary must be persisted for resume"

@@ -540,8 +540,6 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
     assert!(report.outcome.is_success());
 }
 
-
-
 #[tokio::test]
 async fn top_level_goal_runs_until_terminal_past_the_old_model_round_budget() {
     let h = harness(vec![
