@@ -28,6 +28,29 @@ pub(crate) fn refuse_shell_script(cmd: &str) -> Option<String> {
             ));
         }
     }
+    #[cfg(windows)]
+    {
+        if has_windows_background_start(cmd) {
+            return Some(crate::recoverable::permission_refused(
+                "refused Windows process detaching in a foreground shell tool \
+                 (`start …`, `Start-Process`). Detached processes cannot be \
+                 reaped by this tool and orphan on timeout.",
+                "use `run_command` with `background=true` for servers/watchers, \
+                 then a separate tool call for health checks.",
+            ));
+        }
+    }
+    if let Some(token) = sensitive_shell_token(cmd) {
+        return Some(crate::recoverable::permission_refused(
+            &format!(
+                "refused a command touching a credential-bearing file (`{token}`). \
+                 .env*, key/cert files, .ssh/.aws paths, credentials.json and \
+                 similar are blocked from tool access at every layer."
+            ),
+            "if the task truly needs that value, ask the user to supply it or \
+             wire it via configuration instead of reading the secret file.",
+        ));
+    }
     if let Some(detail) = comment_swallows_trailing_command(cmd) {
         return Some(crate::recoverable::permission_refused(
             &format!(
@@ -121,7 +144,6 @@ fn has_unix_job_control_background(cmd: &str) -> bool {
     false
 }
 
-#[cfg(not(windows))]
 fn shell_token_present(haystack_lower: &str, token: &str) -> bool {
     let mut rest = haystack_lower;
     while let Some(idx) = rest.find(token) {
@@ -137,6 +159,121 @@ fn shell_token_present(haystack_lower: &str, token: &str) -> bool {
         rest = &rest[idx + 1..];
     }
     false
+}
+
+/// Best-effort refusal of commands that touch credential-bearing files
+/// (`cat .env`, `openssl rsa -in server.pem`, `~/.ssh/id_rsa`, …), so the
+/// command layer enforces the same product semantics as the workspace layer
+/// (`read_file(".env")` is already Denied). Token-based and quote-aware — a
+/// quoted prose string mentioning `.env` is not a path. This is a guard rail
+/// for the honest-model path, not a security boundary: the OS-level secret
+/// scrubbing and env_clear remain the hard line.
+fn sensitive_shell_token(cmd: &str) -> Option<String> {
+    let mut chars = cmd.chars();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut token = String::new();
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if in_double {
+            if c == '\\' {
+                chars.next();
+                continue;
+            }
+            if c == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            // Comment tail never executes; the `#`-swallow guard owns that case.
+            '#' => break,
+            c if c.is_whitespace() => {
+                if let Some(hit) = take_sensitive(&mut token) {
+                    return Some(hit);
+                }
+            }
+            _ => token.push(c),
+        }
+    }
+    take_sensitive(&mut token)
+}
+
+/// Drain `token`; return it if it points at a sensitive path.
+fn take_sensitive(token: &mut String) -> Option<String> {
+    let t = std::mem::take(token);
+    let trimmed = t.trim_matches(|c: char| matches!(c, '(' | ')' | '<' | '>' | '|' | ';' | '&'));
+    if !trimmed.is_empty() && arg_touches_sensitive_path(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Whether one shell token / argv argument points at a credential-bearing
+/// path. Shares the workspace layer's file-name rule set; `.git` is
+/// deliberately not matched here (git tooling passes `.git` paths
+/// legitimately — its protection stays at the workspace layer).
+fn arg_touches_sensitive_path(arg: &str) -> bool {
+    // `--file=.env` style flags: also check the value after the last `=`.
+    let value = arg.rsplit('=').next().unwrap_or(arg);
+    for cand in [arg, value] {
+        let path = std::path::Path::new(cand);
+        for comp in path.components() {
+            if let std::path::Component::Normal(os) = comp
+                && matches!(os.to_string_lossy().as_ref(), ".ssh" | ".aws")
+            {
+                return true;
+            }
+        }
+        if let Some(file) = path.file_name().map(|f| f.to_string_lossy())
+            && leveler_execution::is_sensitive_file_name(&file)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Per-argument variant for structured `run_command` argv: each arg is one
+/// path candidate (never token-split, so a prose `-m` message stays allowed —
+/// a multi-word string has no separator, hence no sensitive file name).
+pub(crate) fn refuse_sensitive_args(args: &[String]) -> Option<String> {
+    let hit = args.iter().map(|a| a.trim()).find(|a| {
+        !a.is_empty() && !a.contains(char::is_whitespace) && arg_touches_sensitive_path(a)
+    })?;
+    Some(crate::recoverable::permission_refused(
+        &format!(
+            "refused a command argument pointing at a credential-bearing file \
+             (`{hit}`). .env*, key/cert files, .ssh/.aws paths, \
+             credentials.json and similar are blocked from tool access at \
+             every layer."
+        ),
+        "if the task truly needs that value, ask the user to supply it or \
+         wire it via configuration instead of reading the secret file.",
+    ))
+}
+
+/// Windows background/hang anti-patterns: cmd's `start` (segment-initial) and
+/// PowerShell `Start-Process` detach processes the foreground tool cannot
+/// reap — the Windows counterpart of Unix `&`/`nohup`. Not matched: `npm
+/// start` and other uses where `start` is an argument, not the command.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn has_windows_background_start(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    if shell_token_present(&lower, "start-process") {
+        return true;
+    }
+    lower
+        .split(['&', '|', ';', '\n'])
+        .filter_map(|seg| seg.split_whitespace().next())
+        .any(|first| matches!(first, "start" | "start.exe"))
 }
 
 fn comment_swallows_trailing_command(cmd: &str) -> Option<String> {
@@ -292,6 +429,54 @@ mod tests {
         assert!(err.contains("background=true"), "{err}");
         #[cfg(windows)]
         assert!(err.contains("comment"), "{err}");
+    }
+
+    #[test]
+    fn refuses_sensitive_files_in_shell_strings() {
+        for cmd in [
+            "cat .env",
+            "cat config/.env.production",
+            "openssl rsa -in server.pem",
+            "cat ~/.ssh/id_rsa",
+            "cat credentials.json",
+            "head .npmrc",
+            "grep token < .netrc",
+        ] {
+            assert!(refuse_shell_script(cmd).is_some(), "{cmd} must be refused");
+        }
+        // No false positives on ordinary work, quoted prose, or comments.
+        for cmd in [
+            "cargo test -q",
+            "git commit -m \"document .env handling\"",
+            "echo done # .env note",
+            "ls src && cargo build --release",
+        ] {
+            assert!(refuse_shell_script(cmd).is_none(), "{cmd} must be allowed");
+        }
+    }
+
+    #[test]
+    fn refuses_sensitive_argv_paths_but_not_prose_args() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(refuse_sensitive_args(&s(&[".env"])).is_some());
+        assert!(refuse_sensitive_args(&s(&["rsa", "-in", "server.key"])).is_some());
+        assert!(refuse_sensitive_args(&s(&["--file=.env"])).is_some());
+        assert!(refuse_sensitive_args(&s(&["/home/u/.aws/config", "x"])).is_some());
+        // A prose arg mentioning .env is a message, not a path to it.
+        assert!(refuse_sensitive_args(&s(&["commit", "-m", "document .env handling"])).is_none());
+        assert!(refuse_sensitive_args(&s(&["build", "--release"])).is_none());
+    }
+
+    #[test]
+    fn detects_windows_background_start_but_not_npm_start() {
+        assert!(has_windows_background_start("start notepad.exe"));
+        assert!(has_windows_background_start("cd x && start /B server.exe"));
+        assert!(has_windows_background_start(
+            "Start-Process python -ArgumentList app.py"
+        ));
+        assert!(!has_windows_background_start("npm start"));
+        assert!(!has_windows_background_start("npm run start && echo ok"));
+        assert!(!has_windows_background_start("cargo build --release"));
     }
 
     #[test]

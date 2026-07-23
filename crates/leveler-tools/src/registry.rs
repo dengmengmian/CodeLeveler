@@ -31,16 +31,42 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
-    /// A registry containing only the read-only (Safe-risk) tools — search,
-    /// read, symbol lookup, git status/diff, plan. Used to build an `explorer`
-    /// sub-agent that physically cannot modify the workspace: the write tools
-    /// aren't present, so a forbidden edit fails as "unknown tool" rather than
+    /// A registry containing only pure read-only tools — search, read, symbol
+    /// lookup, git status/diff, plan. Used to build an `explorer` sub-agent
+    /// that physically cannot modify the workspace: the write tools aren't
+    /// present, so a forbidden edit fails as "unknown tool" rather than
     /// relying on the model to obey a prompt.
+    ///
+    /// An explicit allowlist, NOT derived from `risk() == Safe`: the Safe label
+    /// admits side effects that break the subset's guarantee (create_checkpoint
+    /// resets the rollback baseline; wait_task can restore a workspace
+    /// snapshot). A newly added Safe tool stays out until listed here.
     pub fn read_only_subset(&self) -> ToolRegistry {
         use leveler_execution::RiskLevel;
+        const READ_ONLY_TOOLS: &[&str] = &[
+            "blast_radius",
+            "diagnostics",
+            "expand_tools",
+            "find_files",
+            "find_references",
+            "find_symbol",
+            "get_task",
+            "git_diff",
+            "git_status",
+            "grep",
+            "list_files",
+            "load_skill",
+            "memory",
+            "read_file",
+            "read_symbol",
+            "update_plan",
+            "view_image",
+        ];
         let mut subset = ToolRegistry::new();
         for tool in self.tools.values() {
-            if tool.risk() == RiskLevel::Safe {
+            // Belt and braces: allowlisted AND still Safe-risk, so a future
+            // risk bump on a listed tool drops it out automatically.
+            if READ_ONLY_TOOLS.contains(&tool.name()) && tool.risk() == RiskLevel::Safe {
                 subset.register(tool.clone());
             }
         }
@@ -326,6 +352,29 @@ mod tests {
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"forget".to_string()));
         assert_eq!(names.len(), 31);
+    }
+
+    #[test]
+    fn read_only_subset_is_an_explicit_allowlist_without_side_effect_tools() {
+        let subset = full_registry().read_only_subset();
+        // Pure lookups stay in.
+        for name in ["read_file", "grep", "list_files", "git_status", "git_diff"] {
+            assert!(subset.get(name).is_some(), "{name} must be in the subset");
+        }
+        // Safe-labeled tools with side effects must NOT ride in on the label:
+        // create_checkpoint resets the rollback baseline; wait_task can restore
+        // a workspace snapshot.
+        for name in ["create_checkpoint", "wait_task"] {
+            assert!(
+                subset.get(name).is_none(),
+                "{name} must not be in the subset"
+            );
+        }
+        // Belt and braces: everything included is still Safe-risk.
+        for def in subset.definitions() {
+            let tool = subset.get(&def.name).unwrap();
+            assert_eq!(tool.risk(), RiskLevel::Safe, "{}", def.name);
+        }
     }
 
     #[test]

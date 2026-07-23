@@ -63,4 +63,4 @@ pub use windows_sandbox::{
     doctor_sandbox_line, probe_sandbox_capabilities, process_tree_backend_available,
     validate_acl_root,
 };
-pub use workspace::{PathAccess, Workspace, WorkspaceError};
+pub use workspace::{PathAccess, Workspace, WorkspaceError, is_sensitive_file_name};

@@ -276,19 +276,44 @@ impl Workspace {
             }
         }
 
-        if let Some(file) = normalized.file_name().map(|f| f.to_string_lossy()) {
-            let is_env = file == ".env" || file.starts_with(".env.");
-            let is_key = matches!(
-                normalized.extension().and_then(|e| e.to_str()),
-                Some("pem") | Some("key")
-            );
-            if is_env || is_key {
-                return Err(denied(original));
-            }
+        if let Some(file) = normalized.file_name().map(|f| f.to_string_lossy())
+            && is_sensitive_file_name(&file)
+        {
+            return Err(denied(original));
         }
 
         Ok(())
     }
+}
+
+/// File names that commonly hold credentials, denied at the workspace layer
+/// (`read_file`, `apply_patch`, …) and best-effort refused by the shell guard
+/// so both layers enforce one rule set: `.env*`, key/cert material by
+/// extension, SSH private keys by conventional name, and well-known credential
+/// stores. Public halves (`id_rsa.pub`) stay allowed.
+pub fn is_sensitive_file_name(name: &str) -> bool {
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    if matches!(
+        Path::new(name).extension().and_then(|e| e.to_str()),
+        Some("pem") | Some("key")
+    ) {
+        return true;
+    }
+    matches!(
+        name,
+        "credentials.json"
+            | ".netrc"
+            | "_netrc"
+            | ".npmrc"
+            | ".pgpass"
+            | ".htpasswd"
+            | "id_rsa"
+            | "id_dsa"
+            | "id_ecdsa"
+            | "id_ed25519"
+    )
 }
 
 /// Normalize `.` and `..` components lexically, without touching the filesystem.
@@ -403,6 +428,31 @@ mod tests {
             ws.resolve(".git/config").unwrap_err(),
             WorkspaceError::Denied(_)
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn denies_credential_files_beyond_env_and_keys() {
+        let (ws, dir) = workspace();
+        for name in [
+            "credentials.json",
+            "id_rsa",
+            "id_ed25519",
+            ".netrc",
+            ".npmrc",
+            ".pgpass",
+            ".htpasswd",
+            "config/credentials.json",
+        ] {
+            assert!(
+                matches!(ws.resolve(name), Err(WorkspaceError::Denied(_))),
+                "{name} must be denied"
+            );
+        }
+        // Public halves and ordinary files stay readable.
+        for name in ["id_rsa.pub", "src/main.rs", "package.json"] {
+            assert!(ws.resolve(name).is_ok(), "{name} must stay allowed");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

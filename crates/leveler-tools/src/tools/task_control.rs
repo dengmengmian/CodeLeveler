@@ -97,7 +97,11 @@ impl Tool for WaitTaskTool {
     }
 
     fn risk(&self) -> RiskLevel {
-        RiskLevel::Safe
+        // Not Safe: under a command_write_allowlist this tool can restore the
+        // whole workspace to a snapshot (see account_background_mutations) —
+        // Safe would auto-replay it on crash recovery and admit it into
+        // read-only tool subsets.
+        RiskLevel::WorkspaceWrite
     }
 
     async fn execute(
@@ -265,6 +269,16 @@ mod tests {
     use leveler_execution::{BackgroundTaskRegistry, PermissionProfile, Workspace};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn wait_task_is_workspace_write_risk() {
+        // wait_task can roll the whole workspace back to a snapshot when a
+        // background task violates its write allowlist — that is a mutation,
+        // not a Safe read (and Safe implies auto-replay on crash recovery).
+        assert_eq!(WaitTaskTool.risk(), RiskLevel::WorkspaceWrite);
+        // get_task stays a pure status read.
+        assert_eq!(GetTaskTool.risk(), RiskLevel::Safe);
+    }
 
     async fn sh_in(dir: &std::path::Path, script: &str) {
         let out = tokio::process::Command::new("sh")

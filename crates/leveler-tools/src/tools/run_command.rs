@@ -95,6 +95,12 @@ impl Tool for RunCommandTool {
             ));
         };
         let args = normalize_args(program, input.args);
+        // Same product semantics as the workspace layer: read_file(".env") is
+        // Denied, so `cat .env` via argv must not be the workaround. Applies to
+        // background commands too.
+        if let Some(reason) = super::shell_guard::refuse_sensitive_args(&args) {
+            return Ok(ToolOutput::error(reason));
+        }
         if input.background.unwrap_or(false) {
             return execute_background(program, args, input.cwd.as_deref(), context).await;
         }
