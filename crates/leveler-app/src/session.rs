@@ -226,7 +226,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
         EngineEvent::Compacted { from, to } => AgentEvent::Compacted { from, to },
         EngineEvent::AdvisoryStarted { kind } => AgentEvent::AdvisoryStarted {
             // Unknown keys (older/newer logs) degrade to the audit label.
-            kind: AdvisoryKind::from_key(&kind).unwrap_or(AdvisoryKind::CompletenessAudit),
+            kind: AdvisoryKind::from_key(&kind).unwrap_or(AdvisoryKind::ContextCompaction),
         },
         EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
         EngineEvent::GoalIntercepted { kind, detail } => {

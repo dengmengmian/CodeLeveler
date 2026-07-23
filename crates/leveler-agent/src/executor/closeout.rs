@@ -34,12 +34,8 @@ pub enum CloseoutAction {
 pub enum CloseoutReason {
     /// Goal mode: the model went quiet without calling `update_goal`.
     GoalUnresolved,
-    /// A build-relevant mutation has no fresh passing verification behind it.
-    MissingEvidence,
     /// The model ended with an empty answer.
     EmptyAnswer,
-    /// The completeness audit named branches the answer skipped.
-    AnswerIncomplete,
 }
 
 impl CloseoutReason {
@@ -48,18 +44,14 @@ impl CloseoutReason {
     pub fn as_key(&self) -> &'static str {
         match self {
             Self::GoalUnresolved => "goal_unresolved",
-            Self::MissingEvidence => "missing_evidence",
             Self::EmptyAnswer => "empty_answer",
-            Self::AnswerIncomplete => "answer_incomplete",
         }
     }
 
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "goal_unresolved" => Some(Self::GoalUnresolved),
-            "missing_evidence" => Some(Self::MissingEvidence),
             "empty_answer" => Some(Self::EmptyAnswer),
-            "answer_incomplete" => Some(Self::AnswerIncomplete),
             _ => None,
         }
     }
@@ -113,16 +105,8 @@ pub struct CloseoutInput<'a> {
     pub goal_mode: bool,
     /// The model produced non-empty final text this turn.
     pub has_final_text: bool,
-    /// The completion-evidence gate is assembled for this turn.
-    pub require_completion_evidence: bool,
     /// What the turn touched and whether it is evidence-backed yet.
     pub impact: &'a ChangeImpact,
-    /// Real progress happened since the last evidence nudge (re-arm guard, so
-    /// a model that idles after being nudged is not nudged again for free).
-    pub progress_since_evidence_nudge: bool,
-    /// This round's completeness-audit verdict (false when the audit did not
-    /// run, passed, or was unavailable).
-    pub audit_incomplete: bool,
     /// The turn is being cancelled — an empty answer is not worth a nudge.
     pub cancelled: bool,
     /// The continuation policy allows at least one more model round.
@@ -132,23 +116,14 @@ pub struct CloseoutInput<'a> {
 }
 
 /// Decide the fate of one quiet round. At most one nudge per round, chosen by
-/// priority: EmptyAnswer > GoalUnresolved > MissingEvidence > AnswerIncomplete
+/// priority: EmptyAnswer > GoalUnresolved
 /// (an empty answer means the model said nothing at all, so it outranks even
-/// the goal-mode prompt; the audit is advisory and always comes last).
+/// the goal-mode prompt).
 pub fn decide(input: &CloseoutInput) -> CloseoutAction {
     let candidate = if !input.has_final_text && !input.cancelled {
         Some(CloseoutReason::EmptyAnswer)
     } else if input.goal_mode {
         Some(CloseoutReason::GoalUnresolved)
-    } else if input.require_completion_evidence
-        && input.impact.has_mutation
-        && input.impact.build_relevant
-        && !input.impact.verified_after_last_mutation
-        && input.progress_since_evidence_nudge
-    {
-        Some(CloseoutReason::MissingEvidence)
-    } else if input.audit_incomplete {
-        Some(CloseoutReason::AnswerIncomplete)
     } else {
         None
     };
@@ -199,10 +174,7 @@ mod tests {
         CloseoutInput {
             goal_mode: false,
             has_final_text: true,
-            require_completion_evidence: false,
             impact,
-            progress_since_evidence_nudge: true,
-            audit_incomplete: false,
             cancelled: false,
             can_continue: true,
             budget_remaining: CLOSEOUT_NUDGE_BUDGET,
@@ -217,12 +189,11 @@ mod tests {
 
     #[test]
     fn empty_answer_outranks_everything() {
-        // Even in goal mode with missing evidence, an empty answer means the
-        // model said nothing — that nudge comes first.
+        // Even in goal mode, an empty answer means the model said nothing —
+        // that nudge outranks everything else.
         let impact = relevant_unverified_impact();
         let mut i = input(&impact);
         i.goal_mode = true;
-        i.require_completion_evidence = true;
         i.has_final_text = false;
         assert_eq!(
             decide(&i),
@@ -252,84 +223,19 @@ mod tests {
 
     #[test]
     fn conversational_goal_turn_only_has_goal_nudge() {
-        // Step 2 leaves the evidence gate and audit off for conversational
-        // tasks, so GoalUnresolved is the only possible nudge in goal mode.
+        // GoalUnresolved is the only nudge a goal turn with a real answer can
+        // draw.
         let impact = inert_impact();
         let mut i = input(&impact);
         i.goal_mode = true;
-        i.require_completion_evidence = false;
-        i.audit_incomplete = true; // would not be assembled; must be ignored
         assert_eq!(
             decide(&i),
             CloseoutAction::NudgeOnce(CloseoutReason::GoalUnresolved)
         );
     }
 
-    #[test]
-    fn missing_evidence_needs_relevant_unverified_mutation() {
-        let impact = relevant_unverified_impact();
-        let mut i = input(&impact);
-        i.require_completion_evidence = true;
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::MissingEvidence)
-        );
 
-        // Gate off → no nudge.
-        i.require_completion_evidence = false;
-        assert_eq!(decide(&i), CloseoutAction::Finish);
 
-        // Inert change (docs only) → no evidence demanded, same answer as the
-        // readiness gate gives.
-        let inert = inert_impact();
-        let mut i = input(&inert);
-        i.require_completion_evidence = true;
-        assert_eq!(decide(&i), CloseoutAction::Finish);
-
-        // Fresh verification after the last mutation → satisfied.
-        let mut verified = relevant_unverified_impact();
-        verified.verified_after_last_mutation = true;
-        let mut i = input(&verified);
-        i.require_completion_evidence = true;
-        assert_eq!(decide(&i), CloseoutAction::Finish);
-    }
-
-    #[test]
-    fn evidence_nudge_rearms_only_after_progress() {
-        let impact = relevant_unverified_impact();
-        let mut i = input(&impact);
-        i.require_completion_evidence = true;
-        i.progress_since_evidence_nudge = false;
-        // Blocked by the re-arm guard: no candidate (and no audit verdict)
-        // means Finish, even with budget left.
-        assert_eq!(decide(&i), CloseoutAction::Finish);
-        // …but a pending audit verdict still gets its say behind the guard.
-        i.audit_incomplete = true;
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::AnswerIncomplete)
-        );
-    }
-
-    #[test]
-    fn priority_goal_over_evidence_over_audit() {
-        let impact = relevant_unverified_impact();
-        let mut i = input(&impact);
-        i.require_completion_evidence = true;
-        i.audit_incomplete = true;
-        // Non-goal: evidence beats audit.
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::MissingEvidence)
-        );
-        // Goal: goal beats both (audit is not even assembled in goal mode,
-        // but the priority holds regardless).
-        i.goal_mode = true;
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::GoalUnresolved)
-        );
-    }
 
     #[test]
     fn exhausted_budget_stalls_goal_and_finishes_non_goal() {
@@ -343,14 +249,12 @@ mod tests {
             CloseoutAction::Stall(CloseoutReason::GoalUnresolved)
         );
 
-        i.goal_mode = false;
-        i.require_completion_evidence = true;
         let impact = relevant_unverified_impact();
-        let mut i = CloseoutInput {
+        let i = CloseoutInput {
             budget_remaining: 0,
+            goal_mode: false,
             ..input(&impact)
         };
-        i.require_completion_evidence = true;
         assert_eq!(decide(&i), CloseoutAction::Finish);
     }
 
@@ -366,53 +270,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn budget_is_shared_across_mechanisms() {
-        let mut budget = CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET);
-        let impact = relevant_unverified_impact();
-
-        // Nudge 1: missing evidence.
-        let mut i = input(&impact);
-        i.require_completion_evidence = true;
-        i.budget_remaining = budget.remaining();
-        assert!(matches!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::MissingEvidence)
-        ));
-        budget.consume();
-
-        // Nudge 2: an audit repair draws from the SAME budget.
-        let impact = quiet_impact();
-        let mut i = input(&impact);
-        i.audit_incomplete = true;
-        i.budget_remaining = budget.remaining();
-        assert!(matches!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::AnswerIncomplete)
-        ));
-        budget.consume();
-
-        // Nudge 3 would be goal resolution — budget is spent, so a goal turn
-        // stalls instead of nudging a third mechanism.
-        let mut i = input(&impact);
-        i.goal_mode = true;
-        i.budget_remaining = budget.remaining();
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::Stall(CloseoutReason::GoalUnresolved)
-        );
-    }
 
     #[test]
     fn stalled_detail_round_trips_the_reason() {
         let detail = stalled_detail(
-            CloseoutReason::MissingEvidence,
+            CloseoutReason::GoalUnresolved,
             "目标模式结束但未调用 update_goal(complete/blocked)",
         );
-        assert!(detail.starts_with("closeout_reason=missing_evidence; "));
+        assert!(detail.starts_with("closeout_reason=goal_unresolved; "));
         assert_eq!(
             reason_from_stalled_detail(&detail),
-            Some(CloseoutReason::MissingEvidence)
+            Some(CloseoutReason::GoalUnresolved)
         );
         assert_eq!(reason_from_stalled_detail("no marker here"), None);
     }

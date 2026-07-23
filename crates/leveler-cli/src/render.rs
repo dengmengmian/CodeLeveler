@@ -330,20 +330,13 @@ fn render_event_text(event: AgentEvent) {
             // Closeout model round trips after the visible answer; name the
             // wait instead of showing a bare "waiting for model".
             let label = match kind {
-                AdvisoryKind::CompletenessAudit => "completeness audit",
                 AdvisoryKind::ContextCompaction => "compacting context",
                 AdvisoryKind::GoalContinuation => "continuing active goal",
                 AdvisoryKind::CloseoutNudge(reason) => match reason {
                     leveler_agent::closeout::CloseoutReason::GoalUnresolved => {
                         "nudge: goal unresolved"
                     }
-                    leveler_agent::closeout::CloseoutReason::MissingEvidence => {
-                        "nudge: missing evidence"
-                    }
                     leveler_agent::closeout::CloseoutReason::EmptyAnswer => "nudge: empty answer",
-                    leveler_agent::closeout::CloseoutReason::AnswerIncomplete => {
-                        "nudge: answer incomplete"
-                    }
                 },
             };
             println!("  {} {label}", console::style("⋯").yellow());

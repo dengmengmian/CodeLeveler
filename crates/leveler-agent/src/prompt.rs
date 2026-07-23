@@ -14,7 +14,6 @@ const BASE_PROMPT: &str = include_str!("../prompts/base.md");
 #[derive(Debug, Clone)]
 pub(crate) struct PromptBuilder {
     require_explicit_plan: bool,
-    require_completion_evidence: bool,
     turn_context: Option<TurnContext>,
     base_instructions: Option<String>,
     commit_co_author: bool,
@@ -26,7 +25,6 @@ impl Default for PromptBuilder {
     fn default() -> Self {
         Self {
             require_explicit_plan: false,
-            require_completion_evidence: false,
             turn_context: None,
             base_instructions: None,
             commit_co_author: true,
@@ -114,10 +112,6 @@ impl PromptBuilder {
         self
     }
 
-    pub(crate) fn require_completion_evidence(mut self, enabled: bool) -> Self {
-        self.require_completion_evidence = enabled;
-        self
-    }
 
     pub(crate) fn turn_context(mut self, context: TurnContext) -> Self {
         self.turn_context = Some(context);
@@ -194,8 +188,10 @@ impl PromptBuilder {
                  then follow and revise that plan via update_plan. If a single \
                  action covers the request, skip update_plan and just do the task.",
             );
-        }
-        if self.require_completion_evidence {
+            // Zero-cost guidance, unlike the removed MissingEvidence nudge: it
+            // costs no extra round, and a model that verifies inside the turn
+            // can still fix what it finds. The engine's gating checks remain
+            // the actual verdict either way.
             prompt.push_str(
                 "\n\nFor tasks where you edit files, do NOT declare the task complete \
                  until you have run the build or tests with run_command and seen \
@@ -401,7 +397,6 @@ mod tests {
 
         let prompt = PromptBuilder::new()
             .require_explicit_plan(true)
-            .require_completion_evidence(true)
             .build();
 
         assert!(prompt.contains("Before calling any tool"));
@@ -958,11 +953,9 @@ mod tests {
         // when turn context is absent (task contracts never land in this path).
         let a = PromptBuilder::new()
             .require_explicit_plan(true)
-            .require_completion_evidence(true)
             .build();
         let b = PromptBuilder::new()
             .require_explicit_plan(true)
-            .require_completion_evidence(true)
             .build();
         assert_eq!(a, b);
         assert!(!a.contains("Request:"));

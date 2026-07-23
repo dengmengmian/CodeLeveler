@@ -6,7 +6,6 @@ use leveler_model::{Message, Role};
 pub(crate) const STEP_SUMMARY_NUDGE: &str = "Briefly summarize what you have done so far and \
      what remains, then continue with the next concrete action.";
 
-pub(crate) const COMPLETION_AUDIT_MARKER: &str = "Treat completion as unproven";
 
 pub(crate) fn first_user_text(messages: &[Message]) -> String {
     messages
@@ -61,52 +60,7 @@ pub(crate) fn goal_resolve_nudge(objective: &str) -> String {
     )
 }
 
-pub(crate) fn completion_audit_nudge(original_task: &str) -> String {
-    let task = original_task.trim();
-    let restated = if task.is_empty() {
-        String::new()
-    } else {
-        format!("\n\nOriginal task:\n<task>\n{task}\n</task>")
-    };
-    format!(
-        "{COMPLETION_AUDIT_MARKER}: audit it against the current state of the \
-         workspace, not your memory of earlier steps.{restated}\n\n\
-         - For every explicit requirement of the task, identify the evidence that \
-         would prove it is done (file contents, command output, test results) and \
-         check that evidence now with tools.\n\
-         - If the build or tests have not run since your last change, run them \
-         with run_command and see them pass; verification older than your last \
-         edit does not count.\n\
-         - Do not redefine the task into a smaller or easier one; the original \
-         requirement is the bar.\n\n\
-         If every requirement is verifiably satisfied, give your final answer. \
-         If anything is missing or unverified, keep working now.\n\n\
-         When you do answer, output only what is NEW since your last message — \
-         do NOT repeat conclusions you have already stated."
-    )
-}
 
-/// The repair prompt injected when the answer-completeness audit names
-/// branches the answer skipped: continue from where the answer stopped with
-/// the missing pieces only — never a second copy of what was already said.
-pub(crate) fn answer_repair_nudge(missing: &[String]) -> String {
-    let missing = if missing.is_empty() {
-        "- The audit found the answer incomplete but did not name the missing branch. Re-check the original request and tool evidence.".to_string()
-    } else {
-        missing
-            .iter()
-            .map(|item| format!("- {item}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    format!(
-        "A separate completeness audit found these omissions:\n{missing}\n\
-         Continue the answer from where it stopped. Cover those omissions \
-         precisely, do not repeat completed sections, and provide a clear \
-         closing conclusion. Output only the NEW, incremental content that was \
-         missing — do NOT restate conclusions already given above."
-    )
-}
 
 #[cfg(test)]
 mod tests {

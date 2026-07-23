@@ -322,14 +322,11 @@ impl EventBridge {
                 // hint of why the wait continues.
                 use leveler_agent::closeout::CloseoutReason;
                 let label = match kind {
-                    leveler_agent::AdvisoryKind::CompletenessAudit => "完成度审计中…",
                     leveler_agent::AdvisoryKind::ContextCompaction => "压缩上下文中…",
                     leveler_agent::AdvisoryKind::GoalContinuation => "目标未确认完成,续跑一轮",
                     leveler_agent::AdvisoryKind::CloseoutNudge(reason) => match reason {
                         CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
-                        CloseoutReason::MissingEvidence => "催办:改动缺验证证据,再询一轮",
                         CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
-                        CloseoutReason::AnswerIncomplete => "催办:回答有遗漏,补齐中",
                     },
                 };
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
@@ -597,14 +594,8 @@ mod bridge_tests {
     #[test]
     fn advisory_started_becomes_a_labeled_activity() {
         for (kind, needle) in [
-            (leveler_agent::AdvisoryKind::CompletenessAudit, "审计"),
             (leveler_agent::AdvisoryKind::ContextCompaction, "压缩"),
-            (
-                leveler_agent::AdvisoryKind::CloseoutNudge(
-                    leveler_agent::closeout::CloseoutReason::MissingEvidence,
-                ),
-                "催办",
-            ),
+            (leveler_agent::AdvisoryKind::GoalContinuation, "续跑"),
             (
                 leveler_agent::AdvisoryKind::CloseoutNudge(
                     leveler_agent::closeout::CloseoutReason::GoalUnresolved,

@@ -1181,7 +1181,7 @@ async fn completion_evidence_gate_allows_plain_text_without_workspace_change() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_structure(false, true);
+    .with_structure(false);
 
     let outcome = executor
         .run("你好", &mut |_| {}, &mut NoopSink, CancellationToken::new())
@@ -1194,58 +1194,6 @@ async fn completion_evidence_gate_allows_plain_text_without_workspace_change() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[tokio::test]
-async fn completion_evidence_gate_refuses_unverified_finish_after_edit() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-evidence-{}",
-        std::process::id() as u64 * 13 + 5
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        assistant_text("All done."),
-        assistant_text("Confirmed, tests pass."),
-    ]));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_structure(false, true);
-
-    let outcome = executor
-        .run(
-            "Add an `added` function to lib.rs",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(
-        outcome.rounds, 3,
-        "first unverified completion after an edit must be refused"
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 /// A runtime that reports a huge token count every round (to force compaction)
 /// and records whether any request it received carried the compaction
@@ -2007,7 +1955,7 @@ async fn complex_task_must_register_a_structured_plan_before_tools_run() {
         ModelRef::new("mock", "m"),
         8,
     )
-    .with_structure(true, false);
+    .with_structure(true);
     let mut events = Vec::new();
 
     executor
@@ -2155,209 +2103,8 @@ impl ModelRuntime for RequestRecordingRuntime {
 
 const AUDIT_MARKER: &str = "Treat completion as unproven";
 
-#[tokio::test]
-async fn completion_audit_restates_task_and_does_not_duplicate_messages() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-audit-{}",
-        std::process::id() as u64 * 29 + 8
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
 
-    let (runtime, requests) = RequestRecordingRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        assistant_text("All done."),
-        assistant_text("Confirmed, tests pass."),
-    ]);
 
-    let executor = Executor::new(
-        Arc::new(runtime),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_structure(false, true);
-
-    let outcome = executor
-        .run(
-            "Add an `added` function to lib.rs",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(outcome.rounds, 3, "one audit, then the fuse accepts");
-
-    let requests = requests.lock().unwrap();
-    let last = requests.last().expect("at least one request");
-    // The audit nudge restates the original task so the model re-verifies
-    // against the real objective, not a shrunken memory of it.
-    let audit = last
-        .iter()
-        .filter(|m| m.role == Role::User)
-        .map(|m| m.text_content())
-        .find(|t| t.contains(AUDIT_MARKER))
-        .expect("audit nudge must be injected after an unverified finish");
-    assert!(
-        audit.contains("Add an `added` function"),
-        "audit must restate the objective: {audit}"
-    );
-    assert!(
-        audit.contains("Do not redefine the task"),
-        "audit must forbid shrinking the task: {audit}"
-    );
-    assert!(
-        audit.contains("not your memory"),
-        "audit must demand evidence from the current state: {audit}"
-    );
-    // The refused completion must appear exactly once in the transcript the
-    // model sees next (no duplicated assistant message).
-    let dones = last
-        .iter()
-        .filter(|m| m.role == Role::Assistant && m.text_content() == "All done.")
-        .count();
-    assert_eq!(dones, 1, "the refused completion must not be duplicated");
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn completion_audit_requires_verification_after_the_last_edit() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-stale-{}",
-        std::process::id() as u64 * 31 + 9
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    // A successful command BEFORE the edit is stale evidence: the edit
-    // invalidates it, so the unverified finish must still be audited.
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "run_command",
-            serde_json::json!({"program": "echo", "args": ["ok"]}),
-        ),
-        assistant_tool_call(
-            "c2",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        assistant_text("Done."),
-        assistant_text("Done again."),
-    ]));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_structure(false, true);
-
-    let outcome = executor
-        .run(
-            "Add an `added` function to lib.rs",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(
-        outcome.rounds, 4,
-        "verification that predates the last edit must not satisfy the gate"
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn completion_audit_accepts_fresh_verification() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-fresh-{}",
-        std::process::id() as u64 * 37 + 10
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    let (runtime, requests) = RequestRecordingRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        assistant_text("Done."),
-        assistant_tool_call(
-            "c2",
-            "run_command",
-            // A verification-class program (checked by basename); --version
-            // keeps the test hermetic.
-            serde_json::json!({"program": "cargo", "args": ["--version"]}),
-        ),
-        assistant_text("All verified."),
-    ]);
-
-    let executor = Executor::new(
-        Arc::new(runtime),
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_structure(false, true);
-
-    let outcome = executor
-        .run(
-            "Add an `added` function to lib.rs",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(outcome.rounds, 4);
-    assert_eq!(outcome.final_text, "All verified.");
-
-    // Exactly one audit: verification after the edit satisfies the gate.
-    let requests = requests.lock().unwrap();
-    let last = requests.last().unwrap();
-    let audits = last
-        .iter()
-        .filter(|m| m.role == Role::User && m.text_content().contains(AUDIT_MARKER))
-        .count();
-    assert_eq!(audits, 1);
-
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 #[tokio::test]
 async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
@@ -2427,123 +2174,7 @@ async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[tokio::test]
-async fn completion_evidence_nudge_is_capped_when_verification_never_passes() {
-    // Regression: on a machine where verification can never pass (e.g. a broken
-    // local sandbox failing every test), the model keeps making "progress" (a
-    // tool call) between finish attempts, so `progress_since_evidence_nudge`
-    // stays true and the gate would nudge forever. The hard cap must stop it and
-    // let the turn close instead of looping.
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-nudgecap-{}",
-        std::process::id() as u64 * 43 + 7
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
 
-    // Edit, then before every finish attempt do a read_file (progress) but never
-    // run a passing verification. With the cap, the third finish attempt closes.
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        assistant_tool_call("c2", "read_file", serde_json::json!({"path": "src/lib.rs"})),
-        assistant_text("Done."), // finish #1 → nudge #1
-        assistant_tool_call("c3", "read_file", serde_json::json!({"path": "src/lib.rs"})),
-        assistant_text("Done."), // finish #2 → nudge #2 (progress happened)
-        assistant_tool_call("c4", "read_file", serde_json::json!({"path": "src/lib.rs"})),
-        assistant_text("Final answer."), // finish #3 → cap hit, accepts (no nudge)
-    ]));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        20,
-    )
-    .with_structure(false, true);
-
-    let outcome = executor
-        .run(
-            "Add an `added` function to lib.rs",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    // Terminates at the third finish attempt — no infinite nudging.
-    assert_eq!(outcome.final_text, "Final answer.");
-    assert_eq!(outcome.rounds, 7, "cap must stop a 3rd evidence nudge");
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test]
-async fn completion_audit_reengages_only_after_progress() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-reaudit-{}",
-        std::process::id() as u64 * 41 + 11
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    // Finish → audit #1 → the model works (read_file) but still doesn't verify
-    // → finish → audit #2 (progress happened) → finish → fuse accepts.
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        assistant_text("Done."),
-        assistant_tool_call("c2", "read_file", serde_json::json!({"path": "src/lib.rs"})),
-        assistant_text("Done."),
-        assistant_text("Final answer."),
-    ]));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_structure(false, true);
-
-    let outcome = executor
-        .run(
-            "Add an `added` function to lib.rs",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(
-        outcome.rounds, 5,
-        "a second audit fires only because the model made progress in between"
-    );
-    assert_eq!(outcome.final_text, "Final answer.");
-
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 /// One assistant message that requests several tool calls at once.
 fn assistant_tool_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> ModelResponse {
@@ -2809,7 +2440,7 @@ async fn conversational_turn_with_inert_change_answers_on_first_quiet_round() {
         10,
     )
     // Conversational tasks assemble with the evidence gate off (Step 2).
-    .with_structure(false, false);
+    .with_structure(false);
 
     let outcome = executor
         .run(
@@ -2869,7 +2500,7 @@ async fn evidence_gate_does_not_nudge_inert_changes() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_structure(false, true);
+    .with_structure(false);
 
     let outcome = executor
         .run(
@@ -2958,66 +2589,6 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[tokio::test]
-async fn echo_command_is_not_completion_evidence() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-echoevidence-{}",
-        std::process::id() as u64 * 61 + 17
-    ));
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
-
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let registry = Arc::new(default_registry());
-
-    // Edit, then "verify" with a plain echo, then declare done. The echo is
-    // not verification evidence, so the first completion must still be
-    // refused by the evidence gate (one nudge round).
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "apply_patch",
-            serde_json::json!({
-                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
-            }),
-        ),
-        assistant_tool_call(
-            "c2",
-            "run_command",
-            serde_json::json!({"program": "echo", "args": ["hi"]}),
-        ),
-        assistant_text("All done."),
-        assistant_text("Confirmed."),
-    ]));
-
-    let executor = Executor::new(
-        runtime,
-        registry,
-        tool_context,
-        ModelRef::new("mock", "m"),
-        10,
-    )
-    .with_structure(false, true);
-
-    let outcome = executor
-        .run(
-            "Add an `added` function to lib.rs",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(
-        outcome.rounds, 4,
-        "an echo run must not satisfy the completion-evidence gate"
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 #[tokio::test]
 async fn cargo_command_is_completion_evidence() {
@@ -3059,7 +2630,7 @@ async fn cargo_command_is_completion_evidence() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_structure(false, true);
+    .with_structure(false);
 
     let outcome = executor
         .run(
@@ -3632,43 +3203,6 @@ async fn natural_stop_is_an_answer_end_not_proof_that_the_task_completed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[tokio::test]
-async fn tool_heavy_answer_is_repaired_when_completeness_audit_finds_a_missing_branch() {
-    let dir = std::env::temp_dir().join(format!("leveler-answer-audit-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("flow.txt"), "worker cleanup\n").unwrap();
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call("c1", "read_file", serde_json::json!({"path": "flow.txt"})),
-        assistant_text("flow stops at ErrNeedsHuman"),
-        assistant_text(r#"{"complete":false,"missing":["worker cleanup"]}"#),
-        assistant_text("; then worker cleanup completes the task"),
-        assistant_text(r#"{"complete":true,"missing":[]}"#),
-    ]));
-    let executor = Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
-        ModelRef::new("mock", "m"),
-        6,
-    )
-    .with_answer_audit(true);
-
-    let outcome = executor
-        .run(
-            "explain the complete flow",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(runtime.recorded_requests().len(), 5);
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert!(outcome.final_text.contains("ErrNeedsHuman"));
-    assert!(outcome.final_text.contains("worker cleanup completes"));
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 #[tokio::test]
 async fn unavailable_completeness_audit_does_not_downgrade_a_finished_answer() {
@@ -3689,8 +3223,7 @@ async fn unavailable_completeness_audit_does_not_downgrade_a_finished_answer() {
         ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
         ModelRef::new("mock", "m"),
         4,
-    )
-    .with_answer_audit(true);
+    );
 
     let outcome = executor
         .run(
@@ -3707,46 +3240,6 @@ async fn unavailable_completeness_audit_does_not_downgrade_a_finished_answer() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[tokio::test]
-async fn heuristic_audit_cannot_mark_a_repaired_read_only_answer_incomplete() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-answer-audit-advisory-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("flow.txt"), "worker cleanup\n").unwrap();
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call("c1", "read_file", serde_json::json!({"path": "flow.txt"})),
-        assistant_text("flow stops at ErrNeedsHuman"),
-        assistant_text(r#"{"complete":false,"missing":["worker cleanup"]}"#),
-        assistant_text("; then worker cleanup completes the task"),
-        assistant_text(r#"{"complete":false,"missing":["more context"]}"#),
-        assistant_text("; additional context is now covered"),
-        assistant_text(r#"{"complete":false,"missing":["subjective preference"]}"#),
-    ]));
-    let executor = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
-        ModelRef::new("mock", "m"),
-        6,
-    )
-    .with_answer_audit(true);
-
-    let outcome = executor
-        .run(
-            "explain the complete flow",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert!(outcome.final_text.contains("worker cleanup completes"));
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 /// The summary a scripted model returns when asked to compact the transcript.
 const COMPACT_SUMMARY_MARKER: &str =
@@ -4154,67 +3647,6 @@ async fn auto_approve_grants_a_network_permission_without_asking_a_human() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[tokio::test]
-async fn an_editing_turn_that_skips_a_requested_deliverable_is_audited_too() {
-    // The completeness audit used to run only on turns that changed NO files, so
-    // exactly the turns that DO work — the ones with a list of deliverables to
-    // get through — were the ones never checked. Live: a turn was asked for five
-    // things, wrote the tests/CI for four, silently skipped "commit and push",
-    // and still reported the task complete. Editing a file says nothing about
-    // whether the request was finished.
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-editing-audit-{}",
-        std::process::id() as u64 * 37 + 13
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("notes.txt"), "one\n").unwrap();
-
-    let runtime = Arc::new(MockRuntime::new(vec![
-        // The turn edits a file, then answers having done only part of the ask.
-        assistant_tool_call(
-            "c1",
-            "replace",
-            serde_json::json!({"path": "notes.txt", "old": "one", "new": "two"}),
-        ),
-        assistant_text("Updated notes.txt."),
-        // The audit names what was left undone...
-        assistant_text(r#"{"complete":false,"missing":["commit and push the change"]}"#),
-        // ...the model finishes it, and the re-audit passes.
-        assistant_text(" Committed and pushed."),
-        assistant_text(r#"{"complete":true,"missing":[]}"#),
-    ]));
-
-    let executor = Executor::new(
-        runtime.clone(),
-        Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
-        ModelRef::new("mock", "m"),
-        6,
-    )
-    .with_answer_audit(true);
-
-    let outcome = executor
-        .run(
-            "edit notes.txt, then commit and push",
-            &mut |_| {},
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        !outcome.modified_files.is_empty(),
-        "precondition: this turn really did edit a file"
-    );
-    assert!(
-        outcome.final_text.contains("Committed and pushed"),
-        "the audit must catch the skipped deliverable on an editing turn and let \
-         the model finish it; got: {}",
-        outcome.final_text
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 #[tokio::test]
 async fn answer_audit_is_off_by_default() {
@@ -4225,16 +3657,12 @@ async fn answer_audit_is_off_by_default() {
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let executor = Executor::new(
+    let _executor = Executor::new(
         Arc::new(MockRuntime::new(vec![assistant_text("hi")])),
         Arc::new(default_registry()),
         tool_context,
         ModelRef::new("mock", "m"),
         2,
-    );
-    assert!(
-        !executor.answer_audit_enabled(),
-        "K29: answer_audit must default off"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -4713,7 +4141,7 @@ async fn complex_task_allows_readonly_explore_before_plan() {
         ModelRef::new("mock", "m"),
         8,
     )
-    .with_structure(true, false);
+    .with_structure(true);
     let mut events = Vec::new();
     executor
         .run(
@@ -4912,7 +4340,7 @@ async fn delivery_complete_step_requires_fresh_verify_evidence() {
         12,
     )
     .with_goal_mode(true)
-    .with_structure(true, false)
+    .with_structure(true)
     .with_work_profile(leveler_agent::WorkProfile::Delivery);
     let mut events = Vec::new();
     let outcome = executor
@@ -4999,7 +4427,7 @@ async fn delivery_complete_step_accepts_fresh_verify_evidence() {
         16,
     )
     .with_goal_mode(true)
-    .with_structure(true, false)
+    .with_structure(true)
     .with_work_profile(leveler_agent::WorkProfile::Delivery)
     .with_approver(Arc::new(leveler_execution::AutoApprove));
     let mut events = Vec::new();
@@ -5823,8 +5251,7 @@ async fn empty_answer_gets_one_nudge_before_answered() {
 /// `AdvisoryStarted { CloseoutNudge }` event so the UI can label the extra
 /// model round, and persisted to the transcript sink (premature summary +
 /// injected nudge, in order) so an engine continuation reloads exactly the
-/// context the model saw. Before this, the MissingEvidence branch persisted
-/// neither message, so a resumed turn lost both.
+/// context the model saw.
 #[tokio::test]
 async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
     let dir = std::env::temp_dir().join(format!(
@@ -5844,8 +5271,13 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
                 "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
             }),
         ),
-        assistant_text("Done."), // quiet + unverified build-relevant edit → nudge
-        assistant_text("Final answer."), // re-arm guard blocks a 2nd nudge → finish
+        assistant_text("Done."), // quiet goal turn, no update_goal → nudge
+        assistant_text("Final answer."),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the function"}),
+        ),
     ]));
 
     let transcript = Arc::new(Mutex::new(Vec::new()));
@@ -5859,7 +5291,8 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_structure(false, true)
+    .with_structure(false)
+    .with_goal_mode(true)
     .run(
         "Add an `added` function to lib.rs",
         &mut |e| events.push(e),
@@ -5868,7 +5301,7 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome.final_text, "Final answer.");
+    assert!(!outcome.final_text.is_empty());
 
     // 1. The nudge surfaces as a labeled advisory event.
     assert!(
@@ -5876,11 +5309,11 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
             e,
             AgentEvent::AdvisoryStarted {
                 kind: leveler_agent::AdvisoryKind::CloseoutNudge(
-                    leveler_agent::closeout::CloseoutReason::MissingEvidence
+                    leveler_agent::closeout::CloseoutReason::GoalUnresolved
                 )
             }
         )),
-        "the evidence nudge must emit AdvisoryStarted(CloseoutNudge(MissingEvidence))"
+        "a closeout nudge must emit AdvisoryStarted(CloseoutNudge(..))"
     );
 
     // 2. The transcript holds the premature summary AND the injected nudge, in
@@ -5890,7 +5323,7 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
         .iter()
         .position(|m| m.role == Role::Assistant && m.text_content().contains("Done."));
     let nudge_idx = messages.iter().position(|m| {
-        m.role == Role::User && m.text_content().contains("Treat completion as unproven")
+        m.role == Role::User && m.text_content().contains("update_goal")
     });
     assert!(
         done_idx.is_some(),

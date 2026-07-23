@@ -25,7 +25,7 @@ use super::dispatch::{
     newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
 };
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AnswerAudit, Executor,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor,
     LOOP_GUARD_THRESHOLD, ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
@@ -41,7 +41,7 @@ use crate::injected_tools::{
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
 use crate::nudges::{
-    STEP_SUMMARY_NUDGE, answer_repair_nudge, completion_audit_nudge, first_user_text,
+    STEP_SUMMARY_NUDGE, first_user_text,
     goal_resolve_nudge,
 };
 use crate::sub_agent::{AgentRole, MAX_SUB_AGENT_DEPTH, agent_nickname};
@@ -155,7 +155,6 @@ impl Executor {
         let mut closeout_budget = CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET);
         // Re-arm guard for the evidence nudge: it fires again only after real
         // progress (any successful tool call), never on idle repeats.
-        let mut progress_since_evidence_nudge = true;
         // No-progress loop guard: "name\0args" -> (last result content, identical
         // repeat count). Blocks a call that keeps producing the same output.
         let mut call_history: std::collections::HashMap<String, (String, u32)> =
@@ -174,7 +173,6 @@ impl Executor {
         let mut length_continuations = 0u32;
         let mut continued_text = String::new();
         const MAX_LENGTH_CONTINUATIONS: u32 = 2;
-        let mut had_tool_calls = false;
         // Absolute per-turn round ceiling — the unconditional circuit breaker.
         // The progress watchdogs are heuristic (they only fire on "no progress"),
         // so a busy loop that keeps issuing novel-looking reads/searches while a
@@ -655,7 +653,6 @@ impl Executor {
                 }
                 FinishReason::Stop | FinishReason::ToolCalls => {}
             }
-            had_tool_calls |= !calls.is_empty();
 
             if !text.trim().is_empty() {
                 if continued_text.is_empty() {
@@ -706,7 +703,7 @@ impl Executor {
             if calls.is_empty() {
                 // Unified closeout (executor/closeout.rs): a quiet round
                 // produces AT MOST one nudge — chosen by priority
-                // (EmptyAnswer > GoalUnresolved > MissingEvidence >
+                // (EmptyAnswer > GoalUnresolved >
                 // AnswerIncomplete) — and every mechanism draws from the same
                 // per-turn budget. Past the budget a goal-mode quiet ends as
                 // `Stalled` — never as a success, so a model that never learns
@@ -725,18 +722,14 @@ impl Executor {
                     modified_files: modified_files.clone(),
                 };
                 let has_final_text = !last_text.trim().is_empty();
-                let closeout_input = |audit_incomplete: bool| CloseoutInput {
+                let action = decide(&CloseoutInput {
                     goal_mode: self.goal_mode,
                     has_final_text,
-                    require_completion_evidence: self.require_completion_evidence,
                     impact: &impact,
-                    progress_since_evidence_nudge,
-                    audit_incomplete,
                     cancelled: cancellation.is_cancelled(),
                     can_continue: has_next_round,
                     budget_remaining: closeout_budget.remaining(),
-                };
-                let mut action = decide(&closeout_input(false));
+                });
                 // Whether the harness accepted the quiet round or bought itself
                 // another model call is the difference between "the model is
                 // slow" and "we added a round" — indistinguishable on screen.
@@ -751,46 +744,6 @@ impl Executor {
                     budget_remaining = closeout_budget.remaining(),
                     "closeout decided"
                 );
-                // The completeness audit only gets a say when nothing stronger
-                // fires: goal/empty/evidence nudges outrank it, and with the
-                // budget spent its verdict could not trigger a repair anyway.
-                // The audit model call itself is a read-only judgment and
-                // stays advisory — only its repair nudge draws on the budget.
-                let mut audit_missing: Vec<String> = Vec::new();
-                if action == CloseoutAction::Finish
-                    && self.answer_audit
-                    && had_tool_calls
-                    && !self.goal_mode
-                    && has_final_text
-                    && closeout_budget.remaining() > 0
-                    && has_next_round
-                {
-                    metrics.answer_audit_invocations += 1;
-                    metrics.extra_model_calls += 1;
-                    // Name this extra closeout round trip so the UI does not show
-                    // a bare "waiting for model" while the audit runs.
-                    observer(AgentEvent::AdvisoryStarted {
-                        kind: AdvisoryKind::CompletenessAudit,
-                    });
-                    match self.audit_answer(&messages, &cancellation).await? {
-                        AnswerAudit::Complete => {}
-                        AnswerAudit::Missing(missing) => {
-                            action = decide(&closeout_input(true));
-                            if action == CloseoutAction::NudgeOnce(CloseoutReason::AnswerIncomplete)
-                            {
-                                audit_missing = missing;
-                            } else {
-                                tracing::warn!(
-                                    missing = ?missing,
-                                    "answer completeness audit reports omissions but the closeout budget is spent"
-                                );
-                            }
-                        }
-                        AnswerAudit::Unavailable(reason) => {
-                            tracing::warn!(%reason, "answer completeness audit unavailable");
-                        }
-                    }
-                }
                 if let CloseoutAction::NudgeOnce(reason) = action {
                     closeout_budget.consume();
                     metrics.extra_model_calls += 1;
@@ -803,19 +756,11 @@ impl Executor {
                         CloseoutReason::GoalUnresolved => {
                             Message::text(Role::User, goal_resolve_nudge(&original_task))
                         }
-                        CloseoutReason::MissingEvidence => {
-                            progress_since_evidence_nudge = false;
-                            Message::text(Role::User, completion_audit_nudge(&original_task))
-                        }
                         CloseoutReason::EmptyAnswer => Message::text(
                             Role::User,
                             "Your last message was empty. Reply with the actual answer to the \
                              request — do not send an empty message.",
                         ),
-                        CloseoutReason::AnswerIncomplete => {
-                            continued_text = last_text.clone();
-                            Message::text(Role::User, answer_repair_nudge(&audit_missing))
-                        }
                     };
                     // Persist BOTH the quiet-round assistant text and the nudge:
                     // an engine continuation reloads the transcript from the
@@ -1462,7 +1407,6 @@ impl Executor {
                     });
                 }
                 if !is_error {
-                    progress_since_evidence_nudge = true;
                     if !is_pure_observe_call(&call.name, &call.arguments) {
                         non_observe_success_this_round =
                             non_observe_success_this_round.saturating_add(1);
@@ -1643,7 +1587,6 @@ impl Executor {
                         }
                     }
                     if !is_error {
-                        progress_since_evidence_nudge = true;
                         if !job_files.is_empty() {
                             verification_ran = false;
                             note_tool_side_effects(
@@ -1844,7 +1787,6 @@ impl Executor {
                                 summary: preview(&result.text),
                             });
                             if result.ok {
-                                progress_since_evidence_nudge = true;
                             }
                             // Roll sub-agent spend into the parent task epoch.
                             // Parent same-batch spend was pinned before absorb.

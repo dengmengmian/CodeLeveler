@@ -4,89 +4,18 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::{ApprovalId, ClarificationId};
 use leveler_execution::{ApprovalDecision, ApprovalRequest, RiskLevel};
-use leveler_model::{FinishReason, Message, ModelRequest, Role, ToolCall, ToolChoice};
+use leveler_model::ToolCall;
 
 use leveler_lifecycle::ProgressLedger;
 
 use super::{
-    ADVISORY_REQUEST_TIMEOUT, AgentError, AgentEvent, AnswerAudit, ClarificationRequest, Executor,
+    AgentError, AgentEvent, ClarificationRequest, Executor,
     StepLimits, StopReason, SubAgentProgressSink,
 };
 use crate::authorization::action_fingerprint;
 use crate::sub_agent::AgentRole;
 
 impl Executor {
-    pub(crate) async fn audit_answer(
-        &self,
-        messages: &[Message],
-        cancellation: &CancellationToken,
-    ) -> Result<AnswerAudit, AgentError> {
-        let mut audit_messages = messages.to_vec();
-        audit_messages.push(Message::text(
-            Role::User,
-            "Audit the latest assistant answer against the original user request and all tool evidence above. Go through the request item by item, including anything it asked you to DO (run, edit, commit, push, verify), and check each one against the tool evidence: an action counts only if a tool call above actually performed it — describing it, planning it, or promising it does not. Also check that every discovered branch, terminal state, and caveat is covered. Reply with ONLY strict JSON: {\"complete\":true,\"missing\":[]} or {\"complete\":false,\"missing\":[\"specific missing item\"]}. Do not continue the answer in this audit response.",
-        ));
-        let mut request = ModelRequest::new(self.model.clone(), audit_messages);
-        request.tool_choice = ToolChoice::None;
-        request.max_output_tokens = Some(512);
-        request.reasoning_effort = self.reasoning_effort;
-
-        let response = match tokio::time::timeout(
-            ADVISORY_REQUEST_TIMEOUT,
-            self.runtime.generate(request, cancellation.child_token()),
-        )
-        .await
-        {
-            Err(_) => {
-                return Ok(AnswerAudit::Unavailable(
-                    "completeness audit timed out after 30s".to_string(),
-                ));
-            }
-            Ok(Ok(response)) => response,
-            Ok(Err(error))
-                if cancellation.is_cancelled()
-                    || error.kind == leveler_model::ModelErrorKind::Cancelled =>
-            {
-                return Err(AgentError::Cancelled);
-            }
-            Ok(Err(error)) => return Ok(AnswerAudit::Unavailable(error.to_string())),
-        };
-        if response.finish_reason != FinishReason::Stop {
-            return Ok(AnswerAudit::Unavailable(format!(
-                "completeness audit ended with {:?}",
-                response.finish_reason
-            )));
-        }
-
-        let raw = response.message.text_content();
-        let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
-            Ok(value) => value,
-            Err(error) => {
-                return Ok(AnswerAudit::Unavailable(format!(
-                    "invalid completeness audit JSON: {error}"
-                )));
-            }
-        };
-        match value.get("complete").and_then(serde_json::Value::as_bool) {
-            Some(true) => Ok(AnswerAudit::Complete),
-            Some(false) => {
-                let missing = value
-                    .get("missing")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect();
-                Ok(AnswerAudit::Missing(missing))
-            }
-            None => Ok(AnswerAudit::Unavailable(
-                "completeness audit omitted boolean `complete`".to_string(),
-            )),
-        }
-    }
 
     /// Answer a `request_user_input` / `ask_user` tool call via the clarifier.
     pub(crate) async fn handle_ask_user(

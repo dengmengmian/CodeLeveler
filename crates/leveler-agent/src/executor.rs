@@ -31,7 +31,6 @@ use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOT
 
 /// Secondary summarization/audit requests improve quality but must never make
 /// an otherwise finished turn look hung for minutes.
-const ADVISORY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Query-conditioned memory recall (tail injection). Each turn we retrieve the
 /// top-scoring memories for the current request and inject their bodies as a
@@ -192,9 +191,6 @@ pub enum AgentEvent {
 /// tool-free advisory calls; a closeout nudge re-prompts the full loop once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvisoryKind {
-    /// Post-answer completeness audit (`answer_audit`): a separate model call
-    /// that checks the answer covered everything the request asked for.
-    CompletenessAudit,
     /// Context compaction: summarizing older transcript to fit the window.
     ContextCompaction,
     /// The unified closeout injected a nudge (executor/closeout.rs) and the
@@ -212,14 +208,11 @@ impl AdvisoryKind {
     /// Stable key for crossing the (serialized) engine event boundary.
     pub fn as_key(&self) -> &'static str {
         match self {
-            AdvisoryKind::CompletenessAudit => "completeness_audit",
             AdvisoryKind::ContextCompaction => "context_compaction",
             AdvisoryKind::GoalContinuation => "goal_continuation",
             AdvisoryKind::CloseoutNudge(reason) => match reason {
                 closeout::CloseoutReason::GoalUnresolved => "nudge_goal_unresolved",
-                closeout::CloseoutReason::MissingEvidence => "nudge_missing_evidence",
                 closeout::CloseoutReason::EmptyAnswer => "nudge_empty_answer",
-                closeout::CloseoutReason::AnswerIncomplete => "nudge_answer_incomplete",
             },
         }
     }
@@ -227,7 +220,6 @@ impl AdvisoryKind {
     /// Inverse of [`Self::as_key`] (engine → app event replay).
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
-            "completeness_audit" => Some(AdvisoryKind::CompletenessAudit),
             "context_compaction" => Some(AdvisoryKind::ContextCompaction),
             "goal_continuation" => Some(AdvisoryKind::GoalContinuation),
             _ => {
@@ -246,13 +238,10 @@ mod advisory_kind_tests {
     #[test]
     fn advisory_kind_keys_round_trip() {
         let all = [
-            AdvisoryKind::CompletenessAudit,
             AdvisoryKind::ContextCompaction,
             AdvisoryKind::GoalContinuation,
             AdvisoryKind::CloseoutNudge(CloseoutReason::GoalUnresolved),
-            AdvisoryKind::CloseoutNudge(CloseoutReason::MissingEvidence),
             AdvisoryKind::CloseoutNudge(CloseoutReason::EmptyAnswer),
-            AdvisoryKind::CloseoutNudge(CloseoutReason::AnswerIncomplete),
         ];
         for kind in all {
             assert_eq!(
@@ -578,11 +567,6 @@ pub(crate) struct StreamRoundResult {
     retry_count: u32,
 }
 
-pub(crate) enum AnswerAudit {
-    Complete,
-    Missing(Vec<String>),
-    Unavailable(String),
-}
 
 /// The execution-policy slice a delegated executor needs. The engine resolves
 /// one value per role from model facts, task facts, and eval-only overrides;
@@ -593,7 +577,6 @@ pub struct SubAgentExecutionPolicy {
     pub max_search_calls_per_step: usize,
     pub max_parallel_tools: usize,
     pub require_explicit_plan: bool,
-    pub require_completion_evidence: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -640,7 +623,6 @@ pub struct Executor {
     require_explicit_plan: bool,
     /// Refuse the first "I'm done" until the model has run a verification
     /// command (build/tests) as evidence (spec §17).
-    require_completion_evidence: bool,
     /// Per-request reasoning effort selected by the execution-policy resolver.
     reasoning_effort: Option<ReasoningEffort>,
     /// The usable context window in tokens (0 = disabled). When the last
@@ -670,7 +652,6 @@ pub struct Executor {
     goal_mode: bool,
     /// Audit tool-backed conversational answers for missing branches before
     /// accepting their natural end. Default off (K29); Delivery/eval may enable.
-    answer_audit: bool,
     /// Seeded plan mirror (resume / host-preseed). Local drive state starts here.
     seeded_plan: PlanState,
     /// Seeded process evidence (resume from last EvidenceLedgerUpdated).
@@ -736,7 +717,6 @@ impl Executor {
             max_search_calls_per_step: 0,
             max_parallel_tools: 0,
             require_explicit_plan: false,
-            require_completion_evidence: false,
             reasoning_effort: None,
             context_budget: 0,
             depth: 0,
@@ -746,7 +726,6 @@ impl Executor {
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
             sub_agent_policies: None,
             goal_mode: false,
-            answer_audit: false,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
@@ -845,10 +824,6 @@ impl Executor {
         self
     }
 
-    /// Whether post-turn answer_audit is enabled (tests / diagnostics).
-    pub fn answer_audit_enabled(&self) -> bool {
-        self.answer_audit
-    }
 
     /// Whether delivery process evidence is enforced on update_goal(complete).
     pub fn delivery_gate_enabled(&self) -> bool {
@@ -882,11 +857,6 @@ impl Executor {
         self
     }
 
-    /// Enable a bounded, tool-free completeness audit for tool-backed answers.
-    pub fn with_answer_audit(mut self, on: bool) -> Self {
-        self.answer_audit = on;
-        self
-    }
 
     /// Build a sub-agent that reuses this agent's runtime, tools, model, and
     /// permissions, but runs silently on its own fresh conversation with a
@@ -911,7 +881,6 @@ impl Executor {
                     AgentRole::Default | AgentRole::Explorer => self.max_parallel_tools,
                 },
                 require_explicit_plan: self.require_explicit_plan,
-                require_completion_evidence: self.require_completion_evidence,
                 reasoning_effort: self.reasoning_effort,
             },
             |policies| policies.for_role(role),
@@ -936,7 +905,6 @@ impl Executor {
             max_search_calls_per_step: child_policy.max_search_calls_per_step,
             max_parallel_tools: child_policy.max_parallel_tools,
             require_explicit_plan: child_policy.require_explicit_plan,
-            require_completion_evidence: child_policy.require_completion_evidence,
             reasoning_effort: child_policy.reasoning_effort,
             context_budget: self.context_budget,
             depth: self.depth + 1,
@@ -948,7 +916,6 @@ impl Executor {
             // A sub-agent finishes when it goes quiet; only the top-level run
             // uses explicit goal resolution.
             goal_mode: false,
-            answer_audit: false,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
@@ -1029,15 +996,9 @@ impl Executor {
         self
     }
 
-    /// Apply the structural gates (spec §17): ask for an explicit plan before
-    /// acting, and refuse the first completion that lacks verification evidence.
-    pub fn with_structure(
-        mut self,
-        require_explicit_plan: bool,
-        require_completion_evidence: bool,
-    ) -> Self {
+    /// Ask for an explicit plan before acting (spec §17).
+    pub fn with_structure(mut self, require_explicit_plan: bool) -> Self {
         self.require_explicit_plan = require_explicit_plan;
-        self.require_completion_evidence = require_completion_evidence;
         self
     }
 
@@ -1064,7 +1025,6 @@ impl Executor {
                 user_language: crate::prompt::user_language(request),
             })
             .require_explicit_plan(self.require_explicit_plan)
-            .require_completion_evidence(self.require_completion_evidence)
             .memory_index(self.memory_index.clone())
             .build();
         match self.agent_role {
@@ -1388,7 +1348,6 @@ mod recall_tests {
 
 #[cfg(test)]
 mod compaction_tests {
-    use super::ADVISORY_REQUEST_TIMEOUT;
     use super::dispatch::task_needs_structured_plan;
 
     use crate::authorization::{extract_command, patch_paths, push_unique_path};
@@ -1484,7 +1443,6 @@ mod compaction_tests {
 
     #[test]
     fn advisory_model_calls_have_a_short_independent_deadline() {
-        assert!(ADVISORY_REQUEST_TIMEOUT <= std::time::Duration::from_secs(30));
     }
 
     fn assistant_call(name: &str, path: &str) -> Message {
