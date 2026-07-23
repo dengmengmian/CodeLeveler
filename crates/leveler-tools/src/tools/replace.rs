@@ -676,10 +676,13 @@ fn windows_capability_replace(
     use std::io::{Read, Write};
 
     let mut target = context.parent.open(&context.target_name)?;
-    // Use the underlying `std::fs::File` metadata so the returned
-    // `Permissions` type matches the rest of the crate (and the Unix path).
-    // `cap_std::fs::Permissions` is a distinct type and fails to compile here.
-    let permissions = target.as_file().metadata()?.permissions();
+    // `cap_std::fs::Permissions` is not `std::fs::Permissions`. On Windows we
+    // only need the readonly bit for checkpoint restore / temp mode copy, so
+    // map that into a real `std::fs::Permissions` value.
+    let permissions = {
+        let readonly = target.metadata()?.permissions().readonly();
+        windows_std_permissions_matching(readonly)?
+    };
     let mut current = String::new();
     target.read_to_string(&mut current)?;
     if current != expected {
@@ -705,6 +708,22 @@ fn windows_capability_replace(
     }
     temp.replace(&context.target_name)?;
     Ok(Some(permissions))
+}
+
+/// Build a `std::fs::Permissions` with the given readonly flag (Windows has no
+/// mode bits). Uses a short-lived probe file so we never invent an invalid
+/// permissions object.
+#[cfg(windows)]
+fn windows_std_permissions_matching(readonly: bool) -> std::io::Result<std::fs::Permissions> {
+    let path = std::env::temp_dir().join(format!(
+        ".leveler-perm-probe-{}.tmp",
+        leveler_core::new_uuid_string()
+    ));
+    std::fs::write(&path, b"")?;
+    let mut permissions = std::fs::metadata(&path)?.permissions();
+    permissions.set_readonly(readonly);
+    let _ = std::fs::remove_file(&path);
+    Ok(permissions)
 }
 
 /// Commit relative to directory descriptors opened with `NOFOLLOW`. Holding
