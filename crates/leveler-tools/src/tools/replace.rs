@@ -676,7 +676,10 @@ fn windows_capability_replace(
     use std::io::{Read, Write};
 
     let mut target = context.parent.open(&context.target_name)?;
-    let permissions = target.metadata()?.permissions();
+    // Use the underlying `std::fs::File` metadata so the returned
+    // `Permissions` type matches the rest of the crate (and the Unix path).
+    // `cap_std::fs::Permissions` is a distinct type and fails to compile here.
+    let permissions = target.as_file().metadata()?.permissions();
     let mut current = String::new();
     target.read_to_string(&mut current)?;
     if current != expected {
