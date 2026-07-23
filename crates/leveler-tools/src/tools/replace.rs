@@ -676,13 +676,11 @@ fn windows_capability_replace(
     use std::io::{Read, Write};
 
     let mut target = context.parent.open(&context.target_name)?;
-    // `cap_std::fs::Permissions` is not `std::fs::Permissions`. On Windows we
-    // only need the readonly bit for checkpoint restore / temp mode copy, so
-    // map that into a real `std::fs::Permissions` value.
-    let permissions = {
-        let readonly = target.metadata()?.permissions().readonly();
-        windows_std_permissions_matching(readonly)?
-    };
+    // Keep cap-std permissions for the temp write path (TempFile::as_file uses
+    // cap_std::fs::Permissions). Map only the readonly bit to std for the
+    // checkpoint return type used by the rest of the crate.
+    let cap_permissions = target.metadata()?.permissions();
+    let std_permissions = windows_std_permissions_matching(cap_permissions.readonly())?;
     let mut current = String::new();
     target.read_to_string(&mut current)?;
     if current != expected {
@@ -693,7 +691,7 @@ fn windows_capability_replace(
     let mut temp = cap_tempfile::TempFile::new(&context.parent)?;
     temp.write_all(replacement.as_bytes())?;
     temp.flush()?;
-    temp.as_file().set_permissions(permissions.clone())?;
+    temp.as_file().set_permissions(cap_permissions)?;
     temp.as_file().sync_all()?;
 
     // Re-read at the commit boundary. This is cooperative CAS for normal
@@ -707,7 +705,7 @@ fn windows_capability_replace(
         return Ok(None);
     }
     temp.replace(&context.target_name)?;
-    Ok(Some(permissions))
+    Ok(Some(std_permissions))
 }
 
 /// Build a `std::fs::Permissions` with the given readonly flag (Windows has no
