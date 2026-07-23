@@ -271,6 +271,19 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             ok,
             summary,
         },
+        EngineEvent::SubAgentActivity {
+            id,
+            phase,
+            tool,
+            preview,
+            is_error,
+        } => AgentEvent::SubAgentActivity {
+            id,
+            phase,
+            tool,
+            preview,
+            is_error,
+        },
         EngineEvent::RunFinished { text } => AgentEvent::Finished(text),
         EngineEvent::VerificationStarted => AgentEvent::VerificationStarted,
         EngineEvent::VerificationCheck {

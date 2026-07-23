@@ -239,6 +239,14 @@ pub enum EngineEvent {
         ok: bool,
         summary: String,
     },
+    /// TRANSIENT: live tool/step for one sub-agent (attributed by `id`).
+    SubAgentActivity {
+        id: String,
+        phase: String,
+        tool: String,
+        preview: String,
+        is_error: bool,
+    },
     /// TRANSIENT: the executor's final-text marker; the turn runner replaces
     /// it with [`EngineEvent::TurnFinished`].
     RunFinished {
@@ -357,6 +365,7 @@ impl EngineEvent {
                 | EngineEvent::ReasoningDelta { .. }
                 | EngineEvent::TokenUsage { .. }
                 | EngineEvent::SubAgentProgress { .. }
+                | EngineEvent::SubAgentActivity { .. }
                 | EngineEvent::RunFinished { .. }
         )
     }
@@ -432,6 +441,7 @@ impl EngineEvent {
             | EngineEvent::ContextSnapshot { .. }
             | EngineEvent::SubAgentStarted { .. }
             | EngineEvent::SubAgentProgress { .. }
+            | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }
             | EngineEvent::RunFinished { .. }
             | EngineEvent::PlanUpdated { .. }
@@ -562,6 +572,7 @@ impl EngineEvent {
             | EngineEvent::ContextSnapshot { .. }
             | EngineEvent::SubAgentStarted { .. }
             | EngineEvent::SubAgentProgress { .. }
+            | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }
             | EngineEvent::RunFinished { .. }
             | EngineEvent::PlanUpdated { .. }
@@ -818,6 +829,19 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 nickname,
                 ok,
                 summary,
+            },
+            A::SubAgentActivity {
+                id,
+                phase,
+                tool,
+                preview,
+                is_error,
+            } => EngineEvent::SubAgentActivity {
+                id,
+                phase,
+                tool,
+                preview,
+                is_error,
             },
             A::Finished(text) => EngineEvent::RunFinished { text },
         }

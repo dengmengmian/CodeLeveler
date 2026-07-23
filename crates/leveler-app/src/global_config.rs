@@ -77,6 +77,23 @@ pub struct GlobalConfig {
     /// the model (spawned over stdio).
     #[serde(default)]
     mcp_servers: Vec<GlobalMcpServer>,
+    /// Multi-agent product settings.
+    #[serde(default)]
+    agents: GlobalAgents,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalAgents {
+    /// Advertise `spawn_agent` (default true).
+    #[serde(default = "default_true")]
+    delegation: bool,
+}
+
+impl Default for GlobalAgents {
+    fn default() -> Self {
+        Self { delegation: true }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -212,6 +229,8 @@ pub struct GlobalBundle {
     pub theme: Option<String>,
     pub vcs_co_author: bool,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Multi-agent: advertise `spawn_agent` when true (default).
+    pub agents_delegation: bool,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -424,6 +443,7 @@ impl GlobalConfig {
             theme: self.ui.theme,
             vcs_co_author: self.vcs.co_author,
             mcp_servers,
+            agents_delegation: self.agents.delegation,
         }
     }
 }

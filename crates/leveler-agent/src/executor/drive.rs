@@ -44,7 +44,10 @@ use crate::nudges::{
     STEP_SUMMARY_NUDGE, first_user_text,
     goal_resolve_nudge,
 };
-use crate::sub_agent::{AgentRole, MAX_SUB_AGENT_DEPTH, agent_nickname};
+use crate::sub_agent::{
+    AgentRole, MAX_SUB_AGENT_DEPTH, agent_nickname, multi_agent_steer_hint,
+    task_suggests_delegation,
+};
 
 struct CancelOnDrop(CancellationToken);
 
@@ -69,8 +72,9 @@ impl Executor {
         tools.push(request_user_input_tool_definition());
         tools.push(ask_user_tool_definition());
         tools.push(request_permissions_tool_definition());
-        // A sub-agent shouldn't spawn its own sub-agents.
-        if self.depth < MAX_SUB_AGENT_DEPTH {
+        // A sub-agent shouldn't spawn its own sub-agents; product kill-switch
+        // can also hide spawn_agent entirely.
+        if self.allow_delegation && self.depth < MAX_SUB_AGENT_DEPTH {
             tools.push(spawn_agent_tool_definition());
         }
         // Goal mode: the model resolves the objective explicitly.
@@ -116,6 +120,17 @@ impl Executor {
                 .any(|m| m.role == Role::User && m.text_content().contains("## Task contract"))
         {
             messages.push(Message::text(Role::User, contract_injection));
+        }
+        // Product steer: when delegation is on and the task looks multi-part /
+        // parallel, remind the model once that concurrent spawn_agent is OK.
+        if self.allow_delegation
+            && self.depth == 0
+            && task_suggests_delegation(&original_task)
+            && !messages.iter().any(|m| {
+                m.role == Role::User && m.text_content().contains("## Multi-agent delegation")
+            })
+        {
+            messages.push(Message::text(Role::User, multi_agent_steer_hint()));
         }
         let mut session_approved: HashSet<String> = HashSet::new();
         if let Some(dir) = &self.grants_state_dir {

@@ -163,6 +163,16 @@ pub enum RuntimeEvent {
         output_tokens: u32,
         cached_input_tokens: u32,
     },
+    /// Live tool/step for one spawned sub-agent (attributed by `id`). Transient;
+    /// older clients ignore unknown types via [`parse_runtime_event`].
+    SubAgentActivity {
+        id: String,
+        /// `tool_started` or `tool_finished`.
+        phase: String,
+        tool: String,
+        preview: String,
+        is_error: bool,
+    },
     /// A transient notification for the status line.
     Notification {
         level: NotificationLevel,
@@ -673,6 +683,20 @@ mod tests {
         assert!(
             event.is_ok(),
             "sub-agent usage must not reuse global TokenUsage"
+        );
+    }
+
+    #[test]
+    fn sub_agent_activity_roundtrips() {
+        roundtrip(
+            RuntimeEvent::SubAgentActivity {
+                id: "agent-1".into(),
+                phase: "tool_started".into(),
+                tool: "list_files".into(),
+                preview: r#"{"path":"."}"#.into(),
+                is_error: false,
+            },
+            "sub_agent_activity",
         );
     }
 

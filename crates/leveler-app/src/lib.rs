@@ -87,6 +87,8 @@ pub struct LoadedConfig {
     pub vcs_co_author: bool,
     /// External MCP servers to expose to the model.
     pub mcp_servers: Vec<leveler_tools::mcp::McpServerConfig>,
+    /// Global multi-agent kill-switch default (project config can override).
+    pub agents_delegation: bool,
 }
 
 impl Default for LoadedConfig {
@@ -98,6 +100,7 @@ impl Default for LoadedConfig {
             lang: None,
             vcs_co_author: true,
             mcp_servers: Vec::new(),
+            agents_delegation: true,
         }
     }
 }
@@ -170,6 +173,7 @@ impl Application {
             lang: global.lang,
             vcs_co_author: global.vcs_co_author,
             mcp_servers: global.mcp_servers,
+            agents_delegation: global.agents_delegation,
         })
     }
 
@@ -457,6 +461,9 @@ impl Application {
                 permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,
                 grants_state_dir: Some(self.layout.state_dir.clone()),
+                // Project config wins over global when set; both default true.
+                allow_delegation: self.project_config().agents.delegation
+                    && self.config.agents_delegation,
             },
             approver,
             clarifier,

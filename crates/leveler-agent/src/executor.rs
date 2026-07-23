@@ -167,6 +167,18 @@ pub enum AgentEvent {
         ok: bool,
         summary: String,
     },
+    /// Live step for one spawned sub-agent (tool start/finish). Transient UI
+    /// signal — not full child transcript. Attributed by `id` so concurrent
+    /// children stay distinguishable.
+    SubAgentActivity {
+        id: String,
+        /// `tool_started` or `tool_finished`.
+        phase: String,
+        tool: String,
+        /// Short capped preview (args or result head); never full output.
+        preview: String,
+        is_error: bool,
+    },
     /// Host process gate refused `update_goal(complete)` (or similar).
     /// Persisted so resume/UI can show intercept history (not only ToolResult).
     GoalIntercepted { kind: String, detail: String },
@@ -640,6 +652,8 @@ pub struct Executor {
     max_concurrent_agents: usize,
     /// Max sub-agents spawned across the whole top-level run.
     max_total_agents: usize,
+    /// When false, `spawn_agent` is not advertised (delegation kill-switch).
+    allow_delegation: bool,
     /// Role-specific policies resolved by the engine for delegated executors.
     /// Direct library users fall back to the parent's settings, with writes
     /// serialized, so the safety invariant does not depend on the app layer.
@@ -723,6 +737,7 @@ impl Executor {
             write_allowlist: None,
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
+            allow_delegation: true,
             sub_agent_policies: None,
             goal_mode: false,
             seeded_plan: PlanState::default(),
@@ -909,6 +924,8 @@ impl Executor {
             write_allowlist,
             max_concurrent_agents: self.max_concurrent_agents,
             max_total_agents: self.max_total_agents,
+            // Children never advertise spawn_agent (depth already blocks it).
+            allow_delegation: false,
             sub_agent_policies: self.sub_agent_policies,
             // A sub-agent finishes when it goes quiet; only the top-level run
             // uses explicit goal resolution.
@@ -940,6 +957,12 @@ impl Executor {
     pub fn with_agents(mut self, max_concurrent: usize, max_total: usize) -> Self {
         self.max_concurrent_agents = max_concurrent.max(1);
         self.max_total_agents = max_total;
+        self
+    }
+
+    /// Product kill-switch: when false, `spawn_agent` is not in the tool list.
+    pub fn with_delegation(mut self, allow: bool) -> Self {
+        self.allow_delegation = allow;
         self
     }
 

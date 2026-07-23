@@ -328,6 +328,24 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             output_tokens,
             cached_input_tokens,
         ),
+        RuntimeEvent::SubAgentActivity {
+            id,
+            phase,
+            tool,
+            is_error,
+            ..
+        } => {
+            let step = if phase == "tool_finished" {
+                if is_error {
+                    format!("{tool} ✗")
+                } else {
+                    format!("{tool} ✓")
+                }
+            } else {
+                tool
+            };
+            state.transcript.update_sub_agent_activity(&id, step);
+        }
         RuntimeEvent::MemoryList {
             memory_dir,
             active,

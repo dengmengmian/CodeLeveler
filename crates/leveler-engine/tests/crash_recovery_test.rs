@@ -169,6 +169,7 @@ async fn harness(
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             grants_state_dir: None,
+            allow_delegation: true,
         },
         approver,
         clarifier: Arc::new(AutoClarify),

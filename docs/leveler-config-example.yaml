@@ -52,3 +52,8 @@ ignore:
 # readonly_roots:
 #   - ../adjacent-project
 #   - /Users/you/src/other-project
+
+# Multi-agent: advertise spawn_agent (default true). Set false to hide the tool.
+# See docs/multi-agent.md / docs/multi-agent.zh-CN.md.
+# agents:
+#   delegation: false

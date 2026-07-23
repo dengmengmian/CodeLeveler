@@ -80,6 +80,8 @@ pub struct ExecutorFactory {
     pub hook_runner: leveler_execution::HookRunner,
     /// SEC-2 durable grants directory under project state.
     pub grants_state_dir: Option<std::path::PathBuf>,
+    /// When false, top-level executors do not advertise `spawn_agent`.
+    pub allow_delegation: bool,
 }
 
 impl ExecutorFactory {
@@ -157,6 +159,7 @@ impl ExecutorFactory {
         )
         .with_structure(resolved.explicit_plan)
         .with_sub_agent_policies(child_policies)
+        .with_delegation(self.allow_delegation)
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
 

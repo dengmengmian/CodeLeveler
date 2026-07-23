@@ -153,10 +153,11 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
         description: "Run a focused sub-agent on a self-contained subtask and get \
             back its final result. It shares your model and workspace but starts a \
             FRESH conversation, so put everything it needs in `task`. Emit SEVERAL \
-            spawn_agent calls in one turn to run them in parallel. Prefer this only \
-            when the user or task explicitly calls for delegation/parallel work, or \
-            when a subtask is bounded and independent; do NOT use it for the whole \
-            task or trivial steps you can do directly. \
+            spawn_agent calls in one turn to run them in parallel — do this when the \
+            user asks for parallel/multi-agent work, or the task has independent \
+            facets (e.g. architecture + stability + tools review, disjoint files). \
+            Do NOT use it for the whole task as one blob, or for trivial one-step \
+            work you can do directly. \
             role='explorer' gives a read-only agent for investigation/Q&A; \
             role='worker' writes code and MUST be given `files` it exclusively owns \
             (assign disjoint files to parallel workers so they never edit the same \

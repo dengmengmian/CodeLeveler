@@ -609,6 +609,7 @@ mod tests {
             status: ToolStatus::Ok,
             detail: "done".into(),
             progress: Default::default(),
+            recent_step: None,
         });
         let text: String = item_render(
             &item,
@@ -639,6 +640,7 @@ mod tests {
                 "Reached the 6-round limit before finishing.\n\nLatest note: inspecting providers"
                     .into(),
             progress: Default::default(),
+            recent_step: None,
         });
         let text: String = item_render(
             &item,
@@ -673,6 +675,7 @@ mod tests {
                 active: true,
                 ..Default::default()
             },
+            recent_step: None,
         });
         let text = item_render(
             &item,

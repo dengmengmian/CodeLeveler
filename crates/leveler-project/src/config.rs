@@ -51,6 +51,24 @@ impl VerifySpec {
     }
 }
 
+/// Multi-agent product settings under `agents:` in project config.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AgentsConfig {
+    /// When false, `spawn_agent` is not advertised. Default true when omitted.
+    #[serde(default = "default_true")]
+    pub delegation: bool,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self { delegation: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// The parsed `.leveler/config.yaml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ProjectConfig {
@@ -66,6 +84,9 @@ pub struct ProjectConfig {
     /// Optional token/cost/time ceilings. Absence means run until terminal.
     #[serde(default)]
     pub limits: RunLimitsConfig,
+    /// Multi-agent delegation settings.
+    #[serde(default)]
+    pub agents: AgentsConfig,
     /// Extra ignore globs.
     #[serde(default)]
     pub ignore: Vec<String>,
@@ -149,6 +170,16 @@ ignore:
         let cfg: ProjectConfig = serde_yaml::from_str("{}").unwrap();
         assert!(cfg.verify.is_empty());
         assert!(cfg.model.is_none());
+        assert!(
+            cfg.agents.delegation,
+            "delegation defaults on when agents: is omitted"
+        );
+    }
+
+    #[test]
+    fn agents_delegation_can_be_disabled() {
+        let cfg: ProjectConfig = serde_yaml::from_str("agents:\n  delegation: false\n").unwrap();
+        assert!(!cfg.agents.delegation);
     }
 
     #[test]

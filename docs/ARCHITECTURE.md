@@ -113,6 +113,12 @@ budget, cancellation, permission decision, and completion rules.
 arguments are schema-validated before execution. Write and command tools are
 serialized where necessary to prevent conflicting mutations.
 
+**Multi-agent.** The parent executor may advertise `spawn_agent` (depth 0,
+delegation enabled). Several calls in one model turn run concurrently (default
+caps: 4 concurrent, 6 total per top-level run; depth 1). Child tool start/finish
+is re-emitted as attributed activity for clients; full child transcripts stay
+out of the parent message list. See `docs/multi-agent.md`.
+
 `leveler-execution` enforces the workspace boundary, sensitive-path rules,
 approval policy, checkpoints, process-tree cancellation, and available OS-level
 isolation. Filesystem decisions use host-resolved paths and trusted execution

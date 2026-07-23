@@ -420,6 +420,21 @@ impl EventBridge {
                     detail: summary,
                 });
             }
+            AgentEvent::SubAgentActivity {
+                id,
+                phase,
+                tool,
+                preview,
+                is_error,
+            } => {
+                let _ = self.events.send(RuntimeEvent::SubAgentActivity {
+                    id,
+                    phase,
+                    tool,
+                    preview,
+                    is_error,
+                });
+            }
             AgentEvent::Finished(_) => {
                 // Close a still-open streamed message at turn end. Without this, a
                 // round that streamed only whitespace (no closing AssistantText,

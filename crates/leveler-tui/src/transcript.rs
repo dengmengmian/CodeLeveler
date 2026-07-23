@@ -119,6 +119,8 @@ pub struct SubAgentBlock {
     /// The task while running; a short result summary once done.
     pub detail: String,
     pub progress: SubAgentProgress,
+    /// Latest tool/step from the runtime (real event; not invented stats).
+    pub recent_step: Option<String>,
 }
 
 /// Ephemeral side question (`/btw`) — rendered in the UI but never loaded
@@ -582,6 +584,7 @@ impl TranscriptState {
             status: ToolStatus::Running,
             detail: task,
             progress: SubAgentProgress::default(),
+            recent_step: None,
         }));
     }
 
@@ -609,6 +612,7 @@ impl TranscriptState {
             status,
             detail: summary,
             progress: SubAgentProgress::default(),
+            recent_step: None,
         }));
     }
 
@@ -627,6 +631,15 @@ impl TranscriptState {
                 output_tokens,
                 cached_input_tokens,
             };
+        }
+    }
+
+    /// Record the latest real tool/step for a running sub-agent.
+    pub fn update_sub_agent_activity(&mut self, id: &str, step: String) {
+        if let Some(block) = self.sub_agent_mut(id) {
+            if block.status == ToolStatus::Running {
+                block.recent_step = Some(step);
+            }
         }
     }
 

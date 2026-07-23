@@ -517,6 +517,12 @@ fn sub_agent_lines(
         format!(" · {}", sub_agent_status(block, t)),
         Style::default().fg(theme.muted),
     ));
+    if let Some(step) = block.recent_step.as_deref().filter(|s| !s.is_empty()) {
+        head_spans.push(Span::styled(
+            format!(" · {step}"),
+            Style::default().fg(theme.accent),
+        ));
+    }
     let usage = sub_agent_usage(block, t);
     if !usage.is_empty() {
         head_spans.push(Span::styled(
@@ -670,7 +676,14 @@ fn sub_agent_tree_group_lines(
         ];
         // Only an imperfect run spells out each child's outcome; a fully
         // successful batch shows usage stats instead of repeating "completed".
-        let (right, right_color) = if all_ok {
+        // While running, prefer the real recent tool/step when present.
+        let (right, right_color) = if block.status == ToolStatus::Running {
+            if let Some(step) = block.recent_step.as_deref().filter(|s| !s.is_empty()) {
+                (step.to_string(), theme.accent)
+            } else {
+                sub_agent_tree_child_status(block, theme, t)
+            }
+        } else if all_ok {
             (sub_agent_tree_child_usage(block), theme.dim)
         } else {
             sub_agent_tree_child_status(block, theme, t)
@@ -994,7 +1007,24 @@ mod tests {
                 "done".into()
             },
             progress: Default::default(),
+            recent_step: None,
         }
+    }
+
+    #[test]
+    fn sub_agent_tree_shows_recent_tool_step_while_running() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
+        a.progress.active = true;
+        a.recent_step = Some("list_files".into());
+        let mut b = sub_agent("agent-2", "Newton", ToolStatus::Running);
+        b.progress.active = true;
+        b.recent_step = Some("grep ✓".into());
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("list_files"), "{text}");
+        assert!(text.contains("grep ✓"), "{text}");
     }
 
     #[test]

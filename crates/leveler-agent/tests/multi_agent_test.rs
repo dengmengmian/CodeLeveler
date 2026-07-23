@@ -1492,3 +1492,294 @@ async fn child_duration_does_not_inflate_parent_wall_clock() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Concurrent children that each run a real tool must emit attributed activity
+/// (agent id + tool name) so clients can show current/recent steps.
+///
+/// Responses are routed by task text so concurrent children do not steal each
+/// other's scripted turns from a shared FIFO.
+#[tokio::test]
+async fn concurrent_spawns_emit_attributed_tool_activity() {
+    let dir = tmp("activity", 21);
+    std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "beta\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    /// Parent first, then per-task child scripts: tool then text.
+    struct TaskRoutedRuntime {
+        parent_done: std::sync::atomic::AtomicBool,
+        /// task marker → remaining responses for that child.
+        by_task: Mutex<std::collections::HashMap<&'static str, VecDeque<ModelResponse>>>,
+        parent_final: Mutex<Option<ModelResponse>>,
+    }
+
+    impl TaskRoutedRuntime {
+        fn new() -> Self {
+            let mut by_task = std::collections::HashMap::new();
+            by_task.insert(
+                "TASK_ALPHA",
+                VecDeque::from(vec![
+                    assistant_with(
+                        vec![tool_call_part(
+                            "cA",
+                            "list_files",
+                            serde_json::json!({"path": "."}),
+                        )],
+                        FinishReason::ToolCalls,
+                    ),
+                    assistant_text("A listed."),
+                ]),
+            );
+            by_task.insert(
+                "TASK_BETA",
+                VecDeque::from(vec![
+                    assistant_with(
+                        vec![tool_call_part(
+                            "cB",
+                            "list_files",
+                            serde_json::json!({"path": "."}),
+                        )],
+                        FinishReason::ToolCalls,
+                    ),
+                    assistant_text("B listed."),
+                ]),
+            );
+            Self {
+                parent_done: std::sync::atomic::AtomicBool::new(false),
+                by_task: Mutex::new(by_task),
+                parent_final: Mutex::new(Some(assistant_text("Both listed."))),
+            }
+        }
+
+        fn response_for(&self, request: &ModelRequest) -> ModelResponse {
+            let blob: String = request
+                .messages
+                .iter()
+                .map(|m| m.text_content())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if blob.contains("TASK_ALPHA") {
+                return self
+                    .by_task
+                    .lock()
+                    .unwrap()
+                    .get_mut("TASK_ALPHA")
+                    .and_then(|q| q.pop_front())
+                    .expect("TASK_ALPHA responses exhausted");
+            }
+            if blob.contains("TASK_BETA") {
+                return self
+                    .by_task
+                    .lock()
+                    .unwrap()
+                    .get_mut("TASK_BETA")
+                    .and_then(|q| q.pop_front())
+                    .expect("TASK_BETA responses exhausted");
+            }
+            // Parent conversation (no child task markers).
+            if !self
+                .parent_done
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return assistant_with(
+                    vec![
+                        spawn_call(
+                            "s1",
+                            serde_json::json!({
+                                "task": "TASK_ALPHA list workspace",
+                                "role": "explorer"
+                            }),
+                        ),
+                        spawn_call(
+                            "s2",
+                            serde_json::json!({
+                                "task": "TASK_BETA list workspace",
+                                "role": "explorer"
+                            }),
+                        ),
+                    ],
+                    FinishReason::ToolCalls,
+                );
+            }
+            self.parent_final
+                .lock()
+                .unwrap()
+                .take()
+                .expect("parent final already used")
+        }
+    }
+
+    #[async_trait]
+    impl ModelRuntime for TaskRoutedRuntime {
+        async fn generate(
+            &self,
+            _request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            unimplemented!()
+        }
+
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            use leveler_model::ModelEvent;
+            let response = self.response_for(&request);
+            let mut events: Vec<Result<ModelEvent, ModelError>> =
+                vec![Ok(ModelEvent::MessageStarted {
+                    request_id: response.request_id.clone(),
+                })];
+            for part in &response.message.content {
+                match part {
+                    ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                        delta: text.clone(),
+                    })),
+                    ContentPart::ToolCall { call } => {
+                        events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
+                    }
+                    _ => {}
+                }
+            }
+            events.push(Ok(ModelEvent::MessageCompleted {
+                finish_reason: response.finish_reason,
+            }));
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+            unimplemented!()
+        }
+    }
+
+    let mut events = Vec::new();
+    Executor::new(
+        Arc::new(TaskRoutedRuntime::new()),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .run(
+        "parallel list",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let started_ids: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::SubAgentStarted { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started_ids.len(), 2, "need two concurrent children: {events:?}");
+
+    let activities: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::SubAgentActivity {
+                id,
+                phase,
+                tool,
+                ..
+            } => Some((id.clone(), phase.clone(), tool.clone())),
+            _ => None,
+        })
+        .collect();
+    for id in &started_ids {
+        assert!(
+            activities
+                .iter()
+                .any(|(aid, phase, tool)| aid == id && phase == "tool_started" && tool == "list_files"),
+            "child {id} must report list_files start: {activities:?}"
+        );
+        assert!(
+            activities.iter().any(|(aid, phase, tool)| {
+                aid == id && phase == "tool_finished" && tool == "list_files"
+            }),
+            "child {id} must report list_files finish: {activities:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// With `with_delegation(false)`, the model must not see `spawn_agent`.
+#[tokio::test]
+async fn delegation_off_hides_spawn_agent_from_tool_list() {
+    let dir = tmp("nodeleg", 22);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let tool_names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = tool_names.clone();
+
+    struct CaptureToolsRuntime {
+        names: Arc<Mutex<Vec<String>>>,
+        inner: SleepyRuntime,
+    }
+
+    #[async_trait]
+    impl ModelRuntime for CaptureToolsRuntime {
+        async fn generate(
+            &self,
+            _request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            unimplemented!()
+        }
+
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            let names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
+            *self.names.lock().unwrap() = names;
+            self.inner.stream(request, cancellation).await
+        }
+
+        async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
+            self.inner.profile(m).await
+        }
+    }
+
+    let runtime = Arc::new(CaptureToolsRuntime {
+        names: capture,
+        inner: SleepyRuntime::new(vec![assistant_text("ok")], Duration::from_millis(0)),
+    });
+
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        5,
+    )
+    .with_delegation(false)
+    .run(
+        "hello",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let names = tool_names.lock().unwrap().clone();
+    assert!(
+        !names.iter().any(|n| n == "spawn_agent"),
+        "spawn_agent must be absent when delegation is off: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "read_file" || n == "list_files"),
+        "core tools should still be present: {names:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

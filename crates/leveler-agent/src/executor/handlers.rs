@@ -173,14 +173,45 @@ impl Executor {
         // of the parent remainder (Some(0) hard-blocks that dimension).
         child.step_limits = residual_limits;
         // Capture ProgressUpdated even when the child is cancelled mid-run so
-        // partial spend still rolls up to the parent.
+        // partial spend still rolls up to the parent. Also re-emit tool
+        // start/finish as attributed SubAgentActivity for the UI.
         let partial = std::sync::Arc::new(std::sync::Mutex::new(ProgressLedger::default()));
         let partial_obs = partial.clone();
+        let activity_id = id.clone();
+        let activity_tx = progress.clone();
         let mut capture = move |event: AgentEvent| {
-            if let AgentEvent::ProgressUpdated { ledger } = event
-                && let Ok(mut guard) = partial_obs.lock()
-            {
-                *guard = ledger;
+            match &event {
+                AgentEvent::ProgressUpdated { ledger } => {
+                    if let Ok(mut guard) = partial_obs.lock() {
+                        *guard = ledger.clone();
+                    }
+                }
+                AgentEvent::ToolCall {
+                    name, arguments, ..
+                } => {
+                    let _ = activity_tx.send(AgentEvent::SubAgentActivity {
+                        id: activity_id.clone(),
+                        phase: "tool_started".to_string(),
+                        tool: name.clone(),
+                        preview: cap_activity_preview(arguments),
+                        is_error: false,
+                    });
+                }
+                AgentEvent::ToolResult {
+                    name,
+                    is_error,
+                    preview,
+                    ..
+                } => {
+                    let _ = activity_tx.send(AgentEvent::SubAgentActivity {
+                        id: activity_id.clone(),
+                        phase: "tool_finished".to_string(),
+                        tool: name.clone(),
+                        preview: cap_activity_preview(preview),
+                        is_error: *is_error,
+                    });
+                }
+                _ => {}
             }
         };
         let mut sink = SubAgentProgressSink::new(id, progress);
@@ -236,6 +267,20 @@ pub(crate) struct SubAgentRunResult {
     pub ok: bool,
     pub progress: ProgressLedger,
     pub modified_files: Vec<String>,
+}
+
+/// Cap UI previews so concurrent sub-agent activity cannot flood the event bus.
+fn cap_activity_preview(s: &str) -> String {
+    const MAX: usize = 160;
+    let s = s.trim();
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Parent wall-clock budget context for refreshing a child's residual duration

@@ -89,6 +89,11 @@ SSE 解码接受任意分片。Tool-call 参数拼完整后再做 JSON 解析；
 `leveler-tools` 定义内置与 MCP 工具的 schema 与分发。参数先 schema 校验再执行。
 写操作与命令类工具在必要时串行，避免冲突修改。
 
+**多 Agent。** 父 executor 可在 depth 0 且启用委派时广告 `spawn_agent`。同一模型
+轮次内多次调用会并发（默认上限：并发 4、单次 top-level 共 6 次；深度 1）。子
+agent 的工具起止会以带 id 归属的 activity 事件上浮给客户端；完整子对话不会写入
+父消息列表。详见 `docs/multi-agent.zh-CN.md`。
+
 `leveler-execution` 强制工作区边界、敏感路径规则、审批策略、检查点、进程树取消，
 以及可用的 OS 级隔离。文件系统决策使用宿主解析后的路径与可信执行意图；
 模型输入不能选择更高权限后端。
