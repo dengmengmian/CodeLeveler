@@ -1257,7 +1257,12 @@ mod tests {
             std::fs::rename(root.path().join("src"), root.path().join("src-old")).is_err(),
             "an open parent capability must deny the rename needed for a junction swap"
         );
-        assert!(windows_capability_replace(context, "old\n", "new\n").unwrap());
+        assert!(
+            windows_capability_replace(context, "old\n", "new\n")
+                .unwrap()
+                .is_some(),
+            "CAS replace should commit when expected content matches"
+        );
         assert_eq!(
             std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap(),
             "new\n"
