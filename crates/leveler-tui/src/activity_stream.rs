@@ -176,20 +176,36 @@ fn plan_units(calls: &[ToolCallBlock]) -> Vec<StreamUnit<'_>> {
     out
 }
 
-/// A non-failed patch with a real file target can merge with its neighbors.
+/// A non-failed edit with a real file target can merge with its neighbors.
 fn mergeable_edit(call: &ToolCallBlock) -> bool {
-    call.name == "apply_patch"
-        && call.status != ToolStatus::Failed
-        && !crate::tool_cell::patch_files_key(&call.arguments).is_empty()
+    if call.status == ToolStatus::Failed {
+        return false;
+    }
+    match call.name.as_str() {
+        "apply_patch" => !crate::tool_cell::patch_files_key(&call.arguments).is_empty(),
+        "replace" => {
+            // Same-file consecutive replaces merge like patches.
+            serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .and_then(|v| v.get("path")?.as_str().map(str::to_string))
+                .is_some_and(|p| !p.is_empty())
+        }
+        _ => false,
+    }
 }
 
 /// Merge identity: same touched files, same status. Different files or a
 /// status change (running → ok) never merge.
 fn edit_merge_key(call: &ToolCallBlock) -> (String, ToolStatus) {
-    (
-        crate::tool_cell::patch_files_key(&call.arguments),
-        call.status,
-    )
+    let key = if call.name == "replace" {
+        serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|v| v.get("path")?.as_str().map(|p| p.to_string()))
+            .unwrap_or_default()
+    } else {
+        crate::tool_cell::patch_files_key(&call.arguments)
+    };
+    (key, call.status)
 }
 
 fn is_shell_call(call: &ToolCallBlock) -> bool {
@@ -454,6 +470,7 @@ fn edit_unit_lines(
         return Vec::new();
     };
     let (glyph, glyph_color) = status_glyph(first.status, theme);
+    // Prefer apply_patch presentation even when the merge mixes replace calls.
     let action = tool_action_label_for("apply_patch", locale);
     let tail = match first.status {
         ToolStatus::Running => " …".to_string(),
@@ -471,7 +488,14 @@ fn edit_unit_lines(
         Span::styled(action.clone(), Style::default().fg(theme.tool)),
     ];
     // The touched file(s) ride inline on the head row.
-    let files = crate::tool_cell::patch_files_key(&first.arguments).replace('\u{1}', ", ");
+    let files = {
+        let key = edit_merge_key(first).0;
+        if key.is_empty() {
+            crate::tool_cell::patch_files_key(&first.arguments).replace('\u{1}', ", ")
+        } else {
+            key.replace('\u{1}', ", ")
+        }
+    };
     if !files.is_empty() {
         let used = 2 + UnicodeWidthStr::width(action.as_str()) + 2;
         let avail = width
@@ -493,7 +517,13 @@ fn edit_unit_lines(
     let mut added = 0usize;
     let mut removed = 0usize;
     for call in calls {
-        let stats = crate::tool_cell::patch_stats(&call.arguments);
+        let stats = if call.name == "replace" {
+            crate::tool_cell::replace_patch_from_arguments(&call.arguments)
+                .map(|p| crate::tool_cell::patch_stats_from_text(&p))
+                .unwrap_or_default()
+        } else {
+            crate::tool_cell::patch_stats(&call.arguments)
+        };
         hunks += stats.hunks;
         added += stats.added;
         removed += stats.removed;
@@ -1021,7 +1051,8 @@ mod tests {
             "combined hunk stats: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("+new1")) && lines.iter().any(|l| l.contains("-old2")),
+            lines.iter().any(|l| l.contains("new1") && l.contains('+'))
+                && lines.iter().any(|l| l.contains("old2") && l.contains('-')),
             "both patches' diff rows: {lines:?}"
         );
     }
@@ -1072,7 +1103,8 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("+new")) && lines.iter().any(|l| l.contains("-old")),
+            lines.iter().any(|l| l.contains("new") && l.contains('+'))
+                && lines.iter().any(|l| l.contains("old") && l.contains('-')),
             "diff rows visible by default: {lines:?}"
         );
     }

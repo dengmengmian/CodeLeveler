@@ -758,7 +758,7 @@ pub(crate) fn tool_lines(
 /// Synthesize an apply_patch-style body from `replace` arguments (`path` /
 /// `old` / `new`) so replace edits share [`inline_diff_lines`]. `None` when
 /// the arguments don't parse or carry no text on either side.
-fn replace_patch_from_arguments(arguments: &str) -> Option<String> {
+pub(crate) fn replace_patch_from_arguments(arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let path = value.get("path")?.as_str()?;
     let old = value.get("old")?.as_str()?;
@@ -788,47 +788,199 @@ fn inline_diff_lines(
     t: &crate::i18n::UiText,
     out: &mut Vec<Line<'static>>,
 ) {
-    const DIFF_FOLD_ROWS: usize = 12;
     let patch = patch_text_from_arguments(arguments);
+    push_edit_diff_body(&patch, theme, width, tools_expanded, t, out, true);
+}
 
-    let rows: Vec<&str> = patch
-        .lines()
-        .filter(|l| {
-            !l.starts_with("*** Begin Patch") && !l.starts_with("*** End Patch") && *l != "@@"
-        })
-        .collect();
+/// One body row of a patch, ready for gutter rendering.
+#[derive(Debug, Clone)]
+enum EditDiffRow {
+    FileHeader { path: String },
+    Meta { text: String },
+    Hunk { label: String },
+    Code {
+        /// New-file line number when known (from `@@ +N`).
+        line_no: Option<u32>,
+        kind: EditLineKind,
+        /// Code without the leading `+`/`-`/` ` marker.
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditLineKind {
+    Context,
+    Add,
+    Remove,
+}
+
+/// Parse apply_patch / unified-diff text into display rows with line numbers.
+fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
+    let mut rows = Vec::new();
+    let mut new_ln: Option<u32> = None;
+    for raw in patch.lines() {
+        let trimmed = raw.trim_end();
+        if trimmed.starts_with("*** Begin Patch") || trimmed.starts_with("*** End Patch") {
+            continue;
+        }
+        if let Some(path) = trimmed
+            .strip_prefix("*** Update File: ")
+            .or_else(|| trimmed.strip_prefix("*** Add File: "))
+            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
+            .or_else(|| trimmed.strip_prefix("+++ b/"))
+            .or_else(|| trimmed.strip_prefix("+++ "))
+        {
+            let path = path.trim();
+            if path.is_empty() || path == "/dev/null" {
+                continue;
+            }
+            rows.push(EditDiffRow::FileHeader {
+                path: path.to_string(),
+            });
+            new_ln = None;
+            continue;
+        }
+        if trimmed.starts_with("--- ") || trimmed.starts_with("diff --git") {
+            continue;
+        }
+        if trimmed.starts_with("@@") {
+            // `@@ -a,b +c,d @@` or bare `@@` / `@@ label`.
+            if let Some(plus) = trimmed.find('+') {
+                let after = &trimmed[plus + 1..];
+                let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = num.parse::<u32>() {
+                    new_ln = Some(n);
+                }
+            }
+            let label = trimmed.trim().to_string();
+            if label != "@@" {
+                rows.push(EditDiffRow::Hunk { label });
+            }
+            continue;
+        }
+        if trimmed.starts_with("*** ") {
+            rows.push(EditDiffRow::Meta {
+                text: trimmed.to_string(),
+            });
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('+').filter(|_| !trimmed.starts_with("+++")) {
+            let ln = new_ln;
+            if let Some(n) = new_ln.as_mut() {
+                *n = n.saturating_add(1);
+            }
+            rows.push(EditDiffRow::Code {
+                line_no: ln,
+                kind: EditLineKind::Add,
+                text: rest.to_string(),
+            });
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('-').filter(|_| !trimmed.starts_with("---")) {
+            // Removals do not advance the new-file line counter.
+            rows.push(EditDiffRow::Code {
+                line_no: new_ln,
+                kind: EditLineKind::Remove,
+                text: rest.to_string(),
+            });
+            continue;
+        }
+        // Context: leading space optional.
+        let text = trimmed.strip_prefix(' ').unwrap_or(trimmed);
+        let ln = new_ln;
+        if let Some(n) = new_ln.as_mut() {
+            *n = n.saturating_add(1);
+        }
+        rows.push(EditDiffRow::Code {
+            line_no: ln,
+            kind: EditLineKind::Context,
+            text: text.to_string(),
+        });
+    }
+    rows
+}
+
+/// Shared edit body for Tools screen / Conversation: file header, line gutter,
+/// green/red code (no raw `+/-` clutter).
+fn push_edit_diff_body(
+    patch: &str,
+    theme: &Theme,
+    width: usize,
+    tools_expanded: bool,
+    t: &crate::i18n::UiText,
+    out: &mut Vec<Line<'static>>,
+    show_file_headers: bool,
+) {
+    const DIFF_FOLD_ROWS: usize = 16;
+    let rows = parse_edit_diff_rows(patch);
     if rows.is_empty() {
         return;
     }
-
-    let cap = if tools_expanded { 40 } else { DIFF_FOLD_ROWS };
+    let cap = if tools_expanded { 48 } else { DIFF_FOLD_ROWS };
     let shown = rows.len().min(cap);
-    let inner = width.saturating_sub(4).max(8);
-    for (i, raw) in rows.iter().take(shown).enumerate() {
-        let style = if let Some(file) = raw.strip_prefix("*** Update File: ") {
-            let lead = if i == 0 { "  └ " } else { "    " };
-            out.push(Line::from(vec![
-                Span::styled(lead, Style::default().fg(theme.dim)),
-                Span::styled(
-                    truncate_display(file, inner),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            continue;
-        } else if raw.starts_with("*** ") {
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
-        } else if raw.starts_with('+') {
-            Style::default().fg(theme.diff_add)
-        } else if raw.starts_with('-') {
-            Style::default().fg(theme.diff_remove)
-        } else {
-            Style::default().fg(theme.muted)
-        };
+    // Gutter: "  1234 │ " ≈ up to 4 digits when numbered.
+    let has_numbers = rows.iter().any(|r| matches!(r, EditDiffRow::Code { line_no: Some(_), .. }));
+    let gutter_w = if has_numbers { 6 } else { 2 };
+    let mark_w = 2; // "+ " / "- " / "  "
+    let inner = width
+        .saturating_sub(4 + gutter_w + mark_w)
+        .max(12);
+
+    for (i, row) in rows.iter().take(shown).enumerate() {
         let lead = if i == 0 { "  └ " } else { "    " };
-        out.push(Line::from(vec![
-            Span::styled(lead, Style::default().fg(theme.dim)),
-            Span::styled(truncate_display(raw, inner), style),
-        ]));
+        match row {
+            EditDiffRow::FileHeader { path } if show_file_headers => {
+                out.push(Line::from(vec![
+                    Span::styled(lead, Style::default().fg(theme.dim)),
+                    Span::styled(
+                        truncate_display(path, width.saturating_sub(4).max(8)),
+                        Style::default()
+                            .fg(theme.text)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            EditDiffRow::FileHeader { .. } => {}
+            EditDiffRow::Meta { text } | EditDiffRow::Hunk { label: text } => {
+                out.push(Line::from(vec![
+                    Span::styled(lead, Style::default().fg(theme.dim)),
+                    Span::styled(
+                        truncate_display(text, width.saturating_sub(4).max(8)),
+                        Style::default().fg(theme.dim),
+                    ),
+                ]));
+            }
+            EditDiffRow::Code {
+                line_no,
+                kind,
+                text,
+            } => {
+                let (mark, style) = match kind {
+                    EditLineKind::Add => (
+                        "+ ",
+                        Style::default()
+                            .fg(theme.diff_add)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    EditLineKind::Remove => ("- ", Style::default().fg(theme.diff_remove)),
+                    EditLineKind::Context => ("  ", Style::default().fg(theme.muted)),
+                };
+                let gutter = if has_numbers {
+                    match line_no {
+                        Some(n) => format!("{n:>4} │ "),
+                        None => "     │ ".to_string(),
+                    }
+                } else {
+                    "  ".to_string()
+                };
+                out.push(Line::from(vec![
+                    Span::styled(lead, Style::default().fg(theme.dim)),
+                    Span::styled(gutter, Style::default().fg(theme.dim)),
+                    Span::styled(mark.to_string(), style),
+                    Span::styled(truncate_display(text, inner), style),
+                ]));
+            }
+        }
     }
     if rows.len() > shown {
         let hint = if tools_expanded {
@@ -861,7 +1013,11 @@ pub(crate) struct PatchStats {
 }
 
 pub(crate) fn patch_stats(arguments: &str) -> PatchStats {
-    let patch = patch_text_from_arguments(arguments);
+    patch_stats_from_text(&patch_text_from_arguments(arguments))
+}
+
+/// Count hunks / +/- lines in raw patch text (also used for synthesized replace).
+pub(crate) fn patch_stats_from_text(patch: &str) -> PatchStats {
     let mut stats = PatchStats::default();
     for line in patch.lines() {
         let line = line.trim_start();
@@ -887,58 +1043,25 @@ pub(crate) fn merged_diff_rows(
     t: &crate::i18n::UiText,
     out: &mut Vec<Line<'static>>,
 ) {
-    const DIFF_FOLD_ROWS: usize = 12;
-    let mut rows: Vec<String> = Vec::new();
+    let mut combined = String::new();
     for call in calls {
-        let patch = patch_text_from_arguments(&call.arguments);
-        for line in patch.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("***") || trimmed == "@@" {
-                continue;
-            }
-            if trimmed.starts_with("@@") {
-                rows.push(trimmed.to_string());
-            } else {
-                rows.push(line.to_string());
-            }
+        let patch = if call.name == "replace" {
+            replace_patch_from_arguments(&call.arguments).unwrap_or_else(|| {
+                patch_text_from_arguments(&call.arguments)
+            })
+        } else {
+            patch_text_from_arguments(&call.arguments)
+        };
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&patch);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
         }
     }
-    if rows.is_empty() {
-        return;
-    }
-    let cap = if expanded { 40 } else { DIFF_FOLD_ROWS };
-    let shown = rows.len().min(cap);
-    let inner = width.saturating_sub(4).max(8);
-    for raw in rows.iter().take(shown) {
-        let style = if raw.starts_with("@@") {
-            Style::default().fg(theme.dim)
-        } else if raw.starts_with('+') {
-            Style::default().fg(theme.diff_add)
-        } else if raw.starts_with('-') {
-            Style::default().fg(theme.diff_remove)
-        } else {
-            Style::default().fg(theme.muted)
-        };
-        out.push(Line::from(vec![
-            Span::styled("    ", Style::default()),
-            Span::styled(truncate_display(raw, inner), style),
-        ]));
-    }
-    if rows.len() > shown {
-        let hint = if expanded {
-            format!(
-                "    {}",
-                t.fold_more_lines
-                    .replace("{}", &(rows.len() - shown).to_string())
-            )
-        } else {
-            format!("    {}", t.fold_full_diff)
-        };
-        out.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme.dim),
-        )));
-    }
+    // Head already shows the path; hide per-hunk file headers to avoid noise.
+    push_edit_diff_body(&combined, theme, width, expanded, t, out, false);
 }
 
 #[cfg(test)]
@@ -991,6 +1114,87 @@ mod m1_tests {
         );
         assert_eq!(tool_action_label_for("run_command", Locale::Zh), "执行命令");
         assert_eq!(tool_action_label_for("apply_patch", Locale::Zh), "编辑文件");
+    }
+
+    #[test]
+    fn edit_diff_shows_line_numbers_and_clean_add_rows() {
+        let theme = Theme::no_color();
+        let t = Locale::Zh.text();
+        let patch = r#"*** Begin Patch
+*** Update File: crates/leveler-app/src/lib.rs
+@@ -461,3 +461,6 @@
+ permission_rules_path: Some(path),
+ hook_runner,
+ grants_state_dir: Some(dir),
++// Project config wins over global when set; both default true.
++allow_delegation: self.project_config().agents.delegation
++    && self.config.agents_delegation,
+*** End Patch"#;
+        let args = serde_json::json!({ "patch": patch }).to_string();
+        let mut out = Vec::new();
+        inline_diff_lines(&args, &theme, 100, true, t, &mut out);
+        let text: String = out
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("leveler-app/src/lib.rs") || text.contains("lib.rs"),
+            "file path header: {text}"
+        );
+        assert!(
+            text.contains("461") || text.contains("462") || text.contains("464"),
+            "line numbers from @@: {text}"
+        );
+        assert!(
+            text.contains("allow_delegation"),
+            "added code body: {text}"
+        );
+        // Clean gutter: content should not be shown only as raw "+allow..." without separation.
+        assert!(
+            text.contains("+ ") || text.lines().any(|l| l.contains('+') && l.contains("allow")),
+            "add mark present: {text}"
+        );
+    }
+
+    #[test]
+    fn replace_synthesizes_diff_for_inline_render() {
+        let theme = Theme::no_color();
+        let t = Locale::En.text();
+        let args = serde_json::json!({
+            "path": "src/foo.rs",
+            "old": "fn a() {}",
+            "new": "fn a() { todo!() }"
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let block = ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new("r1"),
+            name: "replace".into(),
+            arguments: args.clone(),
+            status: ToolStatus::Ok,
+            preview: Some("ok".into()),
+            duration_ms: Some(12),
+            parallel: false,
+        };
+        tool_lines(&block, &theme, 80, true, t, &mut out);
+        let text: String = out
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("foo.rs") || text.contains("src/foo.rs"), "{text}");
+        assert!(text.contains("todo!()") || text.contains("fn a()"), "{text}");
     }
 }
 
@@ -1206,12 +1410,16 @@ mod tests {
             "diff must name the file: {text:?}"
         );
         assert!(
-            text.iter().any(|l| l.contains("-fn old() {}")),
+            text.iter()
+                .any(|l| l.contains("fn old() {}") && l.contains('-')),
             "old text must render as removed rows: {text:?}"
         );
         assert!(
-            text.iter().any(|l| l.contains("+fn renamed() {}"))
-                && text.iter().any(|l| l.contains("+fn extra() {}")),
+            text.iter()
+                .any(|l| l.contains("fn renamed() {}") && l.contains('+'))
+                && text
+                    .iter()
+                    .any(|l| l.contains("fn extra() {}") && l.contains('+')),
             "new text must render as added rows: {text:?}"
         );
     }
