@@ -391,6 +391,29 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
+        // Anchor the baseline for THIS turn before it edits anything, exactly as
+        // `run` does. Without it `reconcile_with_baseline` has nothing to compare
+        // against, so failures the repository already carried are charged to this
+        // turn: measured on a repo with one pre-existing red test, a 3-round edit
+        // became a 45-round run in which the repair turn started rewriting
+        // unrelated files trying to make someone else's failure go away.
+        // Interactive chat is the path where a dirty, already-red worktree is the
+        // normal case, so it needs this more than `run` does.
+        let owned_spec;
+        let spec = if spec.base_commit.is_none() {
+            match crate::baseline::capture_head(&spec.repository).await {
+                Some(head) => {
+                    owned_spec = TaskSpec {
+                        base_commit: Some(head),
+                        ..spec.clone()
+                    };
+                    &owned_spec
+                }
+                None => spec,
+            }
+        } else {
+            spec
+        };
         let payloads = leveler_storage::MessageRepository::new(&self.db)
             .load(session_id)
             .await?;

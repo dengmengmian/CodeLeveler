@@ -70,6 +70,15 @@ pub(crate) async fn reconcile_with_baseline(
     if failed.is_empty() {
         return;
     }
+    // Baseline attribution decides whether a red gate is charged to this turn or
+    // to the repository it started from — i.e. whether a repair turn fires at
+    // all. It ran completely silently, so a run that spent tens of rounds
+    // repairing someone else's failure looked identical to one doing real work.
+    tracing::info!(
+        base_commit,
+        failed_gates = ?failed,
+        "reconciling failed gates against baseline"
+    );
     let subset = VerificationPlan {
         commands: full_plan
             .commands
@@ -92,6 +101,21 @@ pub(crate) async fn reconcile_with_baseline(
     .await
     {
         report.attribute_baseline(&base);
+        tracing::info!(
+            pre_existing = ?report.baseline_failures,
+            still_gating = ?report
+                .failed_gates()
+                .iter()
+                .map(|c| c.name.as_str())
+                .filter(|n| !report.baseline_failures.iter().any(|b| b == n))
+                .collect::<Vec<_>>(),
+            "baseline attribution done"
+        );
+    } else {
+        tracing::warn!(
+            base_commit,
+            "baseline report unavailable; every failure will be charged to this turn"
+        );
     }
 }
 

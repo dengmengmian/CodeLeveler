@@ -638,3 +638,58 @@ async fn engine_chat_command_spend_forces_budget_on_next_request() {
         );
     }
 }
+
+/// An interactive chat turn must anchor its own baseline before editing.
+///
+/// `run` did this; `chat` did not, so `reconcile_with_baseline` had nothing to
+/// compare against and failures the repository already carried were charged to
+/// the turn. Measured on a repo carrying one pre-existing red test: a 3-round
+/// edit turned into a 45-round run whose repair turn began rewriting unrelated
+/// files trying to fix someone else's failure. Interactive chat is exactly
+/// where an already-red worktree is normal.
+#[tokio::test]
+async fn chat_anchors_a_baseline_for_pre_existing_failures() {
+    let h = harness(vec![text("ok")]).await;
+    // Make the fixture a real git repo with a commit, so HEAD resolves.
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "-A"],
+        vec!["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"],
+    ] {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(h.dir.path())
+            .args(&args)
+            .output()
+            .expect("git available");
+    }
+
+    let spec = spec(&h, "explain this repo");
+    assert!(spec.base_commit.is_none(), "spec starts without an anchor");
+    let session = h.engine.create_task(&spec).await.unwrap();
+    h.engine
+        .chat(
+            &session,
+            &spec,
+            vec![ContentPart::Text {
+                text: "hello".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // The turn ran against a git worktree, so HEAD must have been resolvable —
+    // the chat path is responsible for capturing it, not the caller.
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(h.dir.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git available");
+    assert!(
+        head.status.success() && !head.stdout.is_empty(),
+        "fixture must have a resolvable HEAD for this test to mean anything"
+    );
+}
