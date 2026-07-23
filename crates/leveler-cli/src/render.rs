@@ -299,6 +299,25 @@ fn render_event_text(event: AgentEvent) {
             };
             println!("{mark} sub-agent {nickname}: {summary}");
         }
+        AgentEvent::SubAgentActivity {
+            id,
+            phase,
+            tool,
+            preview,
+            is_error,
+        } => {
+            let mark = if is_error {
+                console::style("·").red()
+            } else {
+                console::style("·").magenta()
+            };
+            let preview = if preview.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", console::style(&preview).dim())
+            };
+            println!("{mark} sub-agent {id} {phase} {tool}{preview}");
+        }
         AgentEvent::GoalIntercepted { kind, detail } => {
             println!(
                 "  {} gate refused {kind}: {}",
@@ -449,6 +468,20 @@ fn render_event_jsonl(event: AgentEvent) {
         } => serde_json::json!({
             "type": "sub_agent_finished",
             "id": id, "nickname": nickname, "ok": ok, "summary": summary,
+        }),
+        AgentEvent::SubAgentActivity {
+            id,
+            phase,
+            tool,
+            preview,
+            is_error,
+        } => serde_json::json!({
+            "type": "sub_agent_activity",
+            "id": id,
+            "phase": phase,
+            "tool": tool,
+            "preview": preview,
+            "is_error": is_error,
         }),
         AgentEvent::GoalIntercepted { kind, detail } => serde_json::json!({
             "type": "goal_intercepted", "kind": kind, "detail": detail,
