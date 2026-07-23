@@ -455,21 +455,21 @@ async fn impl_with_mutations_and_green_gates_is_verified() {
         "impl path requires observed mutation"
     );
     assert!(report.verification.is_some());
-    let ledger = report
-        .acceptance
-        .expect("Direct emits acceptance when Verified");
-    assert!(
-        ledger.has_proven_required_met(),
-        "impl Verified requires Met required AC"
-    );
+    // Direct no longer spends a model call inventing acceptance criteria; the
+    // project's gating checks are the verdict.
+    assert!(report.acceptance.is_none());
     assert!(report.outcome.is_success());
 }
 
-/// rust-h3 class: green gates + mutation + empty/unproven AC → not Verified.
-/// Content-only edits cannot false-Verified via mutation-derived path checks
-/// (file still exists → no MUT-DEL synthesis).
+/// Green gates + real mutation is Verified even when the model never produced
+/// usable acceptance criteria.
+///
+/// The gate ran the project's own checks against the edited tree — that is the
+/// evidence. Requiring a *proven* criterion on top of it meant a model that
+/// merely failed to restate its goal turned a correct, fully green turn into
+/// "有改动但缺少系统级验收背书".
 #[tokio::test]
-async fn impl_green_gates_with_unproven_acceptance_is_completed_unverified() {
+async fn impl_green_gates_are_verified_without_proven_acceptance() {
     // No understand response → fallback optional AC → no proven required Met.
     let h = harness(patch_then_resolve()).await;
     let s = spec(&h, gate("ok", "true"));
@@ -481,16 +481,10 @@ async fn impl_green_gates_with_unproven_acceptance_is_completed_unverified() {
         .unwrap();
     assert_eq!(
         report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "implementation-class without proven required AC must not Verified"
+        TaskOutcome::Verified,
+        "a passing gate on real changes is the completion evidence"
     );
-    assert!(!report.outcome.is_success());
-    if let Some(ledger) = &report.acceptance {
-        assert!(
-            !ledger.has_proven_required_met(),
-            "edit-only mutation must not synthesize proven AC: {ledger:?}"
-        );
-    }
+    assert!(report.outcome.is_success());
 }
 
 /// Delete a workspace file; understand fails (no response) → mutation-derived
@@ -541,87 +535,11 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
         "modified_files should track delete: {:?}",
         report.modified_files
     );
-    let ledger = report
-        .acceptance
-        .as_ref()
-        .expect("acceptance ledger when health Verified");
-    assert!(
-        ledger.has_proven_required_met(),
-        "mutation-derived required Met expected: {ledger:?}"
-    );
-    assert!(
-        ledger
-            .items
-            .iter()
-            .any(|i| i.id.starts_with("MUT-DEL-") && i.required),
-        "expected MUT-DEL item: {ledger:?}"
-    );
+    assert!(report.acceptance.is_none());
     assert!(report.outcome.is_success());
 }
 
-/// Direct extracts acceptance via understand and evaluates it: required Unmet
-/// downgrades Verified → CompletedUnverified (same finalize as Orchestrate).
-#[tokio::test]
-async fn direct_required_unmet_acceptance_blocks_verified() {
-    let mut responses = patch_then_resolve();
-    // After goal completes + gates pass, conclude_direct calls understand.
-    let hint = grep_hint("NEVER_MARKER", "src/lib.rs");
-    responses.push(text(&format!(
-        r#"{{"goal":"add a function","task_type":"feature","constraints":[],
-        "acceptance_criteria":[{{"id":"AC-1","description":"must contain NEVER_MARKER",
-        "verification_hint":"{hint}","required":true}}],
-        "out_of_scope":[],"risk":"low","uncertainties":[]}}"#
-    )));
-    let h = harness(responses).await;
-    let s = spec(&h, gate("ok", "true"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
 
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "required Unmet acceptance must block Verified on Direct"
-    );
-    let ledger = report
-        .acceptance
-        .as_ref()
-        .expect("Direct must emit acceptance ledger when health is Verified");
-    assert!(!ledger.all_required_met());
-}
-
-/// Direct with required Met acceptance + green gates stays Verified.
-#[tokio::test]
-async fn direct_required_met_acceptance_allows_verified() {
-    let mut responses = patch_then_resolve();
-    let hint = grep_hint("pub fn added", "src/lib.rs");
-    responses.push(text(&format!(
-        r#"{{"goal":"add a function","task_type":"feature","constraints":[],
-        "acceptance_criteria":[{{"id":"AC-1","description":"added() exists",
-        "verification_hint":"{hint}","required":true}}],
-        "out_of_scope":[],"risk":"low","uncertainties":[]}}"#
-    )));
-    let h = harness(responses).await;
-    let s = spec(&h, gate("ok", "true"));
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "ledger: {:?}",
-        report.acceptance
-    );
-    let ledger = report.acceptance.expect("ledger present");
-    assert!(ledger.all_required_met());
-}
 
 #[tokio::test]
 async fn top_level_goal_runs_until_terminal_past_the_old_model_round_budget() {
@@ -1077,5 +995,29 @@ async fn goal_continuation_announces_itself_before_re_prompting() {
             EngineEvent::AdvisoryStarted { kind } if kind == "goal_continuation"
         )),
         "a goal continuation turn must announce itself: {seen:?}"
+    );
+}
+
+/// Direct must not spend an extra model call inventing acceptance criteria.
+///
+/// The scripted runtime here supplies exactly the turn's responses and nothing
+/// more, so any additional `understand` round would exhaust the queue and fail
+/// the run. This is the regression guard for the removed
+/// `direct_extract_and_evaluate_acceptance` step.
+#[tokio::test]
+async fn direct_spends_no_extra_model_call_on_acceptance() {
+    let h = harness(patch_then_resolve()).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Verified);
+    assert!(
+        report.acceptance.is_none(),
+        "Direct no longer produces an acceptance ledger"
     );
 }

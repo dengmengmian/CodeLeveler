@@ -737,6 +737,20 @@ impl Executor {
                     budget_remaining: closeout_budget.remaining(),
                 };
                 let mut action = decide(&closeout_input(false));
+                // Whether the harness accepted the quiet round or bought itself
+                // another model call is the difference between "the model is
+                // slow" and "we added a round" — indistinguishable on screen.
+                tracing::info!(
+                    round,
+                    ?action,
+                    goal_mode = self.goal_mode,
+                    has_final_text,
+                    has_mutation = impact.has_mutation,
+                    build_relevant = impact.build_relevant,
+                    verified = impact.verified_after_last_mutation,
+                    budget_remaining = closeout_budget.remaining(),
+                    "closeout decided"
+                );
                 // The completeness audit only gets a say when nothing stronger
                 // fires: goal/empty/evidence nudges outrank it, and with the
                 // budget spent its verdict could not trigger a repair anyway.

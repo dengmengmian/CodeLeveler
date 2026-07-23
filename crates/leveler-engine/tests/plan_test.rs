@@ -569,13 +569,15 @@ async fn interrupted_orchestrated_run_resumes_mid_graph() {
     assert_eq!(outcome, Some(TaskOutcome::Verified));
 }
 
-/// Golden (K11 + proven-AC): understand JSON failure → fallback optional AC.
-/// For implementation-class (Edit + mutation) that is **not** proven required
-/// Met → CompletedUnverified. Empty required hints are demoted so mutation-
-/// derived deletes can prove; content edits still cannot Verified without a
-/// real executable required command.
+/// Golden (K11): understand JSON failure → fallback optional AC, and empty
+/// required hints are demoted rather than left permanently Unverifiable.
+///
+/// The ledger-shaping behaviour asserted here is unchanged. What changed is the
+/// verdict: an unproven ledger no longer downgrades a green gate, so both paths
+/// now finish Verified. A model that cannot restate its own goal as criteria
+/// has said nothing about whether the code is correct — the gate has.
 #[tokio::test]
-async fn fallback_optional_ac_allows_verified_required_unverifiable_blocks() {
+async fn fallback_and_demoted_acceptance_do_not_block_a_green_gate() {
     let gate = VerificationPlan {
         commands: vec![passing_gate("ok")],
     };
@@ -607,8 +609,8 @@ async fn fallback_optional_ac_allows_verified_required_unverifiable_blocks() {
         .unwrap();
     assert_eq!(
         report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "impl-class + fallback-only AC must not Verified"
+        TaskOutcome::Verified,
+        "fallback-only AC must not downgrade a passing gate"
     );
     let ledger = report
         .acceptance
@@ -650,8 +652,8 @@ async fn fallback_optional_ac_allows_verified_required_unverifiable_blocks() {
         .unwrap();
     assert_eq!(
         report.outcome,
-        TaskOutcome::CompletedUnverified,
-        "empty required AC on content edit must not Verified"
+        TaskOutcome::Verified,
+        "a demoted empty required AC must not downgrade a passing gate"
     );
     let ledger = report
         .acceptance

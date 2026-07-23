@@ -71,6 +71,16 @@ impl Executor {
                     if e.retryable && attempt < MAX_ATTEMPTS && !cancellation.is_cancelled() =>
                 {
                     let wait = jittered(retry_backoff_delay(&e, attempt));
+                    // A silent retry re-sends the whole (often huge) request and
+                    // looks identical to a hang from the outside. Name it.
+                    tracing::warn!(
+                        attempt,
+                        kind = ?e.kind,
+                        wait_ms = wait.as_millis() as u64,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error = %e,
+                        "model round retrying"
+                    );
                     // Cancellable: a user Ctrl+C during a long rate-limit wait
                     // must not hang until the timer fires.
                     tokio::select! {
@@ -99,6 +109,19 @@ impl Executor {
         let mut usage = TokenUsage::default();
         let mut finish_reason = None;
 
+        // A model round is the one thing a stuck turn is almost always waiting
+        // on, and until now it left no trace at all: a turn could sit for a
+        // minute with an unchanging spinner and `RUST_LOG=debug` would show
+        // nothing. Timing each phase separately is what makes the wait
+        // attributable — connect vs. first byte vs. streaming.
+        let round_started = std::time::Instant::now();
+        let message_count = request.messages.len();
+        tracing::info!(
+            request_id = %request_id,
+            messages = message_count,
+            "model round started"
+        );
+
         let mut stream = match self
             .runtime
             .stream(request, cancellation.child_token())
@@ -121,8 +144,33 @@ impl Executor {
         // TUI context gauge stays stuck at "— / window". After completion we
         // only accept UsageUpdated / terminal errors until the stream ends.
         let mut completed = false;
+        let connect_ms = round_started.elapsed().as_millis() as u64;
+        let mut first_event_ms: Option<u64> = None;
 
+        // `MessageStarted` is synthesized locally by the protocol layer, so the
+        // first event says nothing about the provider. What matters for a frozen
+        // screen is the longest stretch with NO event at all — that is exactly
+        // how long the UI had nothing to redraw.
+        let mut event_count = 0u32;
+        let mut last_event = std::time::Instant::now();
+        let mut max_event_gap_ms = 0u64;
         while let Some(event) = stream.next().await {
+            let gap = last_event.elapsed().as_millis() as u64;
+            if gap > max_event_gap_ms {
+                max_event_gap_ms = gap;
+            }
+            last_event = std::time::Instant::now();
+            event_count += 1;
+            if first_event_ms.is_none() {
+                let ms = round_started.elapsed().as_millis() as u64;
+                first_event_ms = Some(ms);
+                tracing::info!(
+                    request_id = %request_id,
+                    connect_ms,
+                    first_event_ms = ms,
+                    "model round first byte"
+                );
+            }
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
@@ -171,11 +219,36 @@ impl Executor {
         }
 
         let finish_reason = finish_reason.ok_or_else(|| {
+            tracing::warn!(
+                request_id = %request_id,
+                connect_ms,
+                first_event_ms,
+                total_ms = round_started.elapsed().as_millis() as u64,
+                text_len = text.len(),
+                calls = calls.len(),
+                "model round ended with no terminal event (retryable)"
+            );
             AgentError::Model(ModelError::new(
                 leveler_model::ModelErrorKind::StreamInterrupted,
                 "model stream ended without a terminal completion event",
             ))
         })?;
+
+        tracing::info!(
+            request_id = %request_id,
+            connect_ms,
+            first_event_ms,
+            total_ms = round_started.elapsed().as_millis() as u64,
+            events = event_count,
+            max_event_gap_ms,
+            ?finish_reason,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            cached_input_tokens = usage.cached_input_tokens,
+            text_len = text.len(),
+            calls = calls.len(),
+            "model round finished"
+        );
 
         // Guarantee one final usage signal for the UI even when the provider
         // only reported tokens once mid-stream (or only after completion).

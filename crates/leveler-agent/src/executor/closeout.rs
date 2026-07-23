@@ -138,17 +138,7 @@ pub struct CloseoutInput<'a> {
 pub fn decide(input: &CloseoutInput) -> CloseoutAction {
     let candidate = if !input.has_final_text && !input.cancelled {
         Some(CloseoutReason::EmptyAnswer)
-    } else if input.goal_mode && (!input.impact.has_mutation || input.impact.build_relevant) {
-        // One carve-out: a goal turn whose only changes are inert (docs, config
-        // text — the same `build_relevant` line the evidence gate uses) and that
-        // produced a real answer is done. `update_goal` is bookkeeping, not
-        // evidence of unfinished work; nudging such a turn only makes the model
-        // repeat its summary, and once the budget is spent the Stalled result
-        // drags the engine into a continuation turn — an invisible extra turn
-        // after a visible answer.
-        //
-        // A turn that changed NOTHING keeps nudging: that is the long-running
-        // goal still thinking out loud, not a finished one.
+    } else if input.goal_mode {
         Some(CloseoutReason::GoalUnresolved)
     } else if input.require_completion_evidence
         && input.impact.has_mutation
@@ -250,50 +240,8 @@ mod tests {
     }
 
     #[test]
-    fn goal_mode_inert_change_with_an_answer_finishes() {
-        // Docs-only edits take the same path as the evidence gate: inert work
-        // plus a real answer is a finished turn. Re-prompting it only makes the
-        // model repeat its summary and then drags the engine into an invisible
-        // continuation turn.
-        let inert = inert_impact();
-        let mut i = input(&inert);
-        i.goal_mode = true;
-        assert_eq!(decide(&i), CloseoutAction::Finish);
-    }
-
-    #[test]
-    fn goal_mode_with_no_change_at_all_still_nudges() {
-        // A goal turn that touched nothing is the long-running goal thinking
-        // out loud — it must keep its nudge and its engine continuation. The
-        // inert carve-out above must not swallow this case.
-        let quiet = quiet_impact();
-        let mut i = input(&quiet);
-        i.goal_mode = true;
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::GoalUnresolved)
-        );
-    }
-
-    #[test]
-    fn goal_mode_empty_answer_still_nudges_even_when_inert() {
-        // The relaxation is keyed on a real answer. Nothing said at all is
-        // still worth one nudge (and EmptyAnswer outranks GoalUnresolved).
-        let impact = inert_impact();
-        let mut i = input(&impact);
-        i.goal_mode = true;
-        i.has_final_text = false;
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::EmptyAnswer)
-        );
-    }
-
-    #[test]
-    fn goal_mode_build_relevant_change_still_nudges() {
-        // Touching code without resolving the goal is the case GoalUnresolved
-        // exists for — the relaxation must not swallow it.
-        let impact = relevant_unverified_impact();
+    fn goal_mode_quiet_is_goal_unresolved() {
+        let impact = quiet_impact();
         let mut i = input(&impact);
         i.goal_mode = true;
         assert_eq!(
@@ -303,17 +251,18 @@ mod tests {
     }
 
     #[test]
-    fn conversational_goal_turn_finishes_on_a_real_answer() {
+    fn conversational_goal_turn_only_has_goal_nudge() {
         // Step 2 leaves the evidence gate and audit off for conversational
-        // tasks; with the goal nudge now keyed on build-relevant work, a
-        // conversational goal turn that answered has no nudge left at all.
+        // tasks, so GoalUnresolved is the only possible nudge in goal mode.
         let impact = inert_impact();
         let mut i = input(&impact);
         i.goal_mode = true;
         i.require_completion_evidence = false;
-        // The audit never runs in goal mode (drive gates it on `!goal_mode`),
-        // so `audit_incomplete` stays false here by construction.
-        assert_eq!(decide(&i), CloseoutAction::Finish);
+        i.audit_incomplete = true; // would not be assembled; must be ignored
+        assert_eq!(
+            decide(&i),
+            CloseoutAction::NudgeOnce(CloseoutReason::GoalUnresolved)
+        );
     }
 
     #[test]

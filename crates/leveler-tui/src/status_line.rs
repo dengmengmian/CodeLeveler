@@ -55,8 +55,14 @@ fn estimate_tokens(text: &str) -> u32 {
     (cjk as f32 / 1.6 + other as f32 / 4.0).ceil() as u32
 }
 
+/// Live output of the round currently streaming — visible answer text AND the
+/// hidden reasoning.
+///
+/// Reasoning has to count. A measured round on a thinking model ran 95s and
+/// produced 6738 output tokens of which only 45 characters were answer text:
+/// ignoring reasoning here is what made a hard-working turn look frozen.
 fn streaming_output_estimate(state: &AppState) -> Option<u32> {
-    let text = state
+    let visible = state
         .transcript
         .items()
         .iter()
@@ -64,8 +70,12 @@ fn streaming_output_estimate(state: &AppState) -> Option<u32> {
         .find_map(|it| match it {
             TranscriptItem::Assistant(b) if !b.done => Some(b.text.as_str()),
             _ => None,
-        })?;
-    (!text.is_empty()).then(|| estimate_tokens(text))
+        })
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    let thinking = estimate_tokens(&state.reasoning);
+    let total = visible.saturating_add(thinking);
+    (total > 0).then_some(total)
 }
 
 /// Permission mode label and color role (localized chrome, e.g. status screens).
@@ -383,13 +393,18 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
                 format!("{frame} {turn_mode}{label}"),
                 fmt_elapsed(state.elapsed_secs),
             ];
+            // Totals are only reported when a round ENDS, so on their own they
+            // freeze for the whole of the next round. Show them, then always
+            // append the live estimate for the round in flight — that is the
+            // only number that moves while the model is thinking.
             if state.token_input > 0 || state.token_output > 0 {
                 parts.push(format!(
                     "↑{} ↓{}",
                     fmt_tokens(state.token_input),
                     fmt_tokens(state.token_output)
                 ));
-            } else if let Some(est) = streaming_output_estimate(state) {
+            }
+            if let Some(est) = streaming_output_estimate(state) {
                 parts.push(format!("↓~{}", fmt_tokens(est)));
             }
             let waiting = state.input_queues.waiting_len();
@@ -785,5 +800,27 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("m · auto") || text.contains("auto"), "{text}");
+    }
+
+    /// A reasoning model can spend 90+ seconds and thousands of tokens on a
+    /// single round while emitting almost no visible text (measured: 95s,
+    /// 6738 output tokens, 45 characters of answer). During that round the
+    /// status line kept showing the PREVIOUS round's totals, so every number
+    /// on screen was frozen and the turn looked hung. Live rounds must show
+    /// live progress.
+    #[test]
+    fn streaming_reasoning_shows_live_progress_not_stale_totals() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        // Previous round reported usage; without the fix this alone wins.
+        state.token_input = 51_360;
+        state.token_output = 633;
+        // Current round is streaming reasoning and nothing else yet.
+        state.reasoning = "思考".repeat(400);
+        let status = status_line_content(&state, 160).to_string();
+        assert!(
+            status.contains('~'),
+            "a live round must show a live estimate, not only frozen totals: {status}"
+        );
     }
 }

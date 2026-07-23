@@ -1241,24 +1241,12 @@ impl TaskEngine {
         // needs_mutation is heuristic/delivery only — never derived from
         // modified_files (self-referential). has_mutation is separate.
         //
-        // Acceptance (K2): when health would be Verified, Direct also extracts
-        // AC via understand and evaluates them — same finalize formula as
-        // Orchestrate. Skip the model call when health is already not Verified
-        // (no upgrade path; saves a round on Failed/Unverified).
-        let acceptance = if report.verdict() == Verdict::Verified {
-            Some(
-                self.direct_extract_and_evaluate_acceptance(
-                    log,
-                    spec,
-                    &outcome.modified_files,
-                    observer,
-                    &cancellation,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+        // The project's own gating checks already ran against the edited tree
+        // and that is the verdict. Direct used to spend one more full model call
+        // here asking the model to restate its goal as acceptance criteria and
+        // then evaluate them — criteria that could only ever downgrade a green
+        // gate, and that measurably did so for reasons that had nothing to do
+        // with the code (see `leveler_verifier::outcome` docs). The call is gone.
         let expected = ExpectedEvidence {
             needs_mutation: direct_needs_mutation(
                 &spec.goal,
@@ -1269,14 +1257,10 @@ impl TaskEngine {
             ),
             has_mutation: !outcome.modified_files.is_empty(),
         };
-        let task_outcome = map_completion_verdict(finalize_task_outcome(
-            &report,
-            acceptance.as_ref(),
-            expected,
-        ));
+        let task_outcome = map_completion_verdict(finalize_task_outcome(&report, expected));
         Ok(TaskReport {
             verification: Some(report),
-            acceptance,
+            acceptance: None,
             ..TaskReport::new(
                 task_outcome,
                 outcome.final_text,
@@ -1287,48 +1271,6 @@ impl TaskEngine {
         })
     }
 
-    /// Direct-path acceptance: one `understand` call to pull criteria from the
-    /// goal, then the shared command-backed ledger (with mutation-derived gap
-    /// fill for deletes). On understand failure use
-    /// [`Requirement::fallback`] (optional AC, K11) so a weak model cannot
-    /// hard-break an otherwise healthy Direct run.
-    async fn direct_extract_and_evaluate_acceptance(
-        &self,
-        log: &EventLog<'_>,
-        spec: &TaskSpec,
-        modified_files: &[String],
-        observer: &mut dyn FnMut(EngineEvent),
-        cancellation: &CancellationToken,
-    ) -> Result<leveler_verifier::AcceptanceLedger, EngineError> {
-        let planner = self.planner();
-        let requirement = match planner.understand(&spec.goal, cancellation).await {
-            Ok(req) => req,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "direct acceptance: understand failed; using optional fallback AC"
-                );
-                leveler_orchestrator::Requirement::fallback(&spec.goal)
-            }
-        };
-        log.append(
-            None,
-            EngineEvent::RequirementReady {
-                requirement: requirement.clone(),
-            },
-            observer,
-        )
-        .await?;
-        self.evaluate_acceptance(
-            log,
-            spec,
-            &requirement,
-            modified_files,
-            observer,
-            cancellation,
-        )
-        .await
-    }
 
     /// The plan strategy (B5): understand → localize → plan, then every graph
     /// node runs as a fully-persisted engine turn, then verify + bounded
@@ -1863,8 +1805,10 @@ impl TaskEngine {
             ),
             has_mutation: !modified_files.is_empty(),
         };
-        let outcome =
-            map_completion_verdict(finalize_task_outcome(&report, Some(&acceptance), expected));
+        // Orchestrate keeps building the ledger — it is genuinely useful to show
+        // per-criterion evidence for a planned run — but like Direct it does not
+        // let those criteria override the project's gating checks.
+        let outcome = map_completion_verdict(finalize_task_outcome(&report, expected));
         Ok(TaskReport {
             verification: Some(report),
             review: Some(review.findings),
