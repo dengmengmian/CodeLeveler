@@ -76,8 +76,14 @@ impl Tool for ListFilesTool {
         walk(&base, &base, 0, max_depth, &mut entries);
         // Case-insensitive so `apple`, `Banana`, `Zebra` read in natural order
         // rather than ASCII order (all uppercase before all lowercase); ties
-        // fall back to the exact ordering for determinism.
-        entries.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+        // fall back to the exact ordering for determinism. Decorate once so the
+        // comparator does not allocate lowercase copies O(n log n) times.
+        let mut keyed: Vec<_> = entries
+            .into_iter()
+            .map(|entry| (entry.to_lowercase(), entry))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut entries: Vec<_> = keyed.into_iter().map(|(_, entry)| entry).collect();
         let truncated = entries.len() > MAX_ENTRIES;
         entries.truncate(MAX_ENTRIES);
 
@@ -181,8 +187,8 @@ mod tests {
 
     #[tokio::test]
     async fn entries_sort_case_insensitively() {
-        let dir = std::env::temp_dir()
-            .join(format!("leveler-ls-sort-{}", super::super::test_ordinal()));
+        let dir =
+            std::env::temp_dir().join(format!("leveler-ls-sort-{}", super::super::test_ordinal()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["Zebra.txt", "apple.txt", "Banana.txt"] {
             std::fs::write(dir.join(name), "").unwrap();

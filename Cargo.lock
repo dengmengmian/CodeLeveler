@@ -2181,6 +2181,7 @@ dependencies = [
  "futures",
  "leveler-client-protocol",
  "leveler-core",
+ "leveler-model",
  "leveler-skills",
  "leveler-tools",
  "pulldown-cmark",

@@ -5,8 +5,32 @@
 //! shaped the model's patch and the write that applies it.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
+
+/// Incremental fingerprint for streamed file reads.
+#[derive(Debug, Clone, Copy)]
+pub struct ContentFingerprint(u64);
+
+impl Default for ContentFingerprint {
+    fn default() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+}
+
+impl ContentFingerprint {
+    /// Add the next byte chunk.
+    pub fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    /// Final stable 64-bit value.
+    pub fn finish(self) -> u64 {
+        self.0
+    }
+}
 
 /// Tracks repeated reads of the same (file, range, content version).
 pub struct RepeatedReadGuard {
@@ -34,6 +58,11 @@ impl RepeatedReadGuard {
     /// command, user edit, or sub-agent write are never mistaken for looping.
     pub fn record(&self, key: &str, content: &[u8]) -> u32 {
         let fingerprint = FileStateTracker::fingerprint(content);
+        self.record_fingerprint(key, fingerprint)
+    }
+
+    /// Record a fingerprint produced while streaming the file.
+    pub fn record_fingerprint(&self, key: &str, fingerprint: u64) -> u32 {
         let mut reads = self.reads.lock().unwrap();
         let entry = reads.entry(key.to_string()).or_insert((fingerprint, 0));
         if entry.0 != fingerprint {
@@ -48,6 +77,11 @@ impl RepeatedReadGuard {
     /// edit can always recover.
     pub fn tripped(&self, key: &str, content: &[u8]) -> bool {
         self.record(key, content) > self.threshold
+    }
+
+    /// [`Self::tripped`] for a precomputed streamed fingerprint.
+    pub fn tripped_fingerprint(&self, key: &str, fingerprint: u64) -> bool {
+        self.record_fingerprint(key, fingerprint) > self.threshold
     }
 }
 
@@ -67,19 +101,26 @@ pub struct FileStateTracker {
 }
 
 impl FileStateTracker {
-    fn fingerprint(content: &[u8]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        hasher.finish()
+    /// Fingerprint an in-memory byte slice using the same incremental algorithm
+    /// as [`ContentFingerprint`].
+    pub fn fingerprint(content: &[u8]) -> u64 {
+        let mut fingerprint = ContentFingerprint::default();
+        fingerprint.update(content);
+        fingerprint.finish()
     }
 
     /// Record the contents of `path` as the agent now knows them. Call after a
     /// read, and after a write, so the agent's own edits do not look stale.
     pub fn record(&self, path: &str, content: &[u8]) {
+        self.record_fingerprint(path, Self::fingerprint(content));
+    }
+
+    /// Record a fingerprint produced while streaming the file.
+    pub fn record_fingerprint(&self, path: &str, fingerprint: u64) {
         self.seen
             .lock()
             .unwrap()
-            .insert(path.to_string(), Self::fingerprint(content));
+            .insert(path.to_string(), fingerprint);
     }
 
     /// Drop any fingerprint for `path`. Call when the file is deleted, so a file
@@ -146,6 +187,19 @@ mod tests {
         t.record("a.rs", b"one");
         t.record("a.rs", b"two");
         assert!(!t.is_stale("a.rs", b"two"));
+    }
+
+    #[test]
+    fn precomputed_fingerprints_match_byte_based_tracking() {
+        let bytes = b"streamed content\n";
+        let fingerprint = FileStateTracker::fingerprint(bytes);
+        let tracker = FileStateTracker::default();
+        tracker.record_fingerprint("a.rs", fingerprint);
+        assert!(!tracker.is_stale("a.rs", bytes));
+
+        let reads = RepeatedReadGuard::new(1);
+        assert!(!reads.tripped_fingerprint("a:1-2", fingerprint));
+        assert!(reads.tripped_fingerprint("a:1-2", fingerprint));
     }
 
     #[test]

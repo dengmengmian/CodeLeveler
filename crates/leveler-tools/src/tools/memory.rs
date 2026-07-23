@@ -23,35 +23,6 @@ fn open_store(context: &ToolContext) -> Result<MemoryStore, ToolError> {
     MemoryStore::open(root).map_err(|e| ToolError::Io(e.to_string()))
 }
 
-/// Give `entry` an id that won't silently clobber a *different* memory.
-///
-/// The id is `slugify(title)`, so two unrelated facts with the same (or
-/// slug-colliding) title map to one file and the second `fs::write` would
-/// overwrite the first. Keep the id when it's free or already holds this exact
-/// fact (idempotent re-remember); otherwise suffix it (`-2`, `-3`, …) so both
-/// survive.
-fn deduplicate_id(store: &MemoryStore, entry: &leveler_memory::MemoryEntry) -> String {
-    match store.read_active(&entry.id) {
-        // Free, or the identical fact is already stored: keep the id.
-        Err(_) => entry.id.clone(),
-        Ok(existing)
-            if existing.title == entry.title && existing.body.trim() == entry.body.trim() =>
-        {
-            entry.id.clone()
-        }
-        Ok(_) => {
-            let mut n = 2;
-            loop {
-                let candidate = format!("{}-{n}", entry.id);
-                if store.read_active(&candidate).is_err() {
-                    return candidate;
-                }
-                n += 1;
-            }
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MemoryArgs {
     /// Action: search | list | read
@@ -206,10 +177,9 @@ impl Tool for RememberTool {
             return Ok(ToolOutput::error("title and body are required"));
         }
         let store = open_store(&context)?;
-        let mut entry = new_entry(&args.title, &args.body, args.tags);
-        entry.id = deduplicate_id(&store, &entry);
+        let entry = new_entry(&args.title, &args.body, args.tags);
         let saved = store
-            .remember(entry)
+            .remember_deduplicated(entry)
             .map_err(|e| ToolError::Io(e.to_string()))?;
         Ok(ToolOutput::ok(format!(
             "Remembered [{}]: {}",
@@ -334,10 +304,9 @@ impl Tool for ConsolidateMemoryTool {
         }
         let store = open_store(&context)?;
         let mut written = Vec::new();
-        for mut e in candidates {
-            e.id = deduplicate_id(&store, &e);
+        for e in candidates {
             let saved = store
-                .remember(e)
+                .remember_deduplicated(e)
                 .map_err(|err| ToolError::Io(err.to_string()))?;
             written.push(saved.id);
         }
@@ -431,7 +400,10 @@ mod tests {
         );
         // Idempotent re-remember of the SAME fact must not spawn a duplicate.
         let again = remember("Staging deploys from the release branch.").await;
-        assert_eq!(again.content, first.content, "identical fact must reuse its id");
+        assert_eq!(
+            again.content, first.content,
+            "identical fact must reuse its id"
+        );
     }
 
     #[tokio::test]

@@ -62,10 +62,11 @@ Example (add a function after an existing one):
 +}
 *** End Patch
 
-The patch applies atomically: if any hunk cannot be located, nothing is written.
-So after a call succeeds, do NOT re-read the file to check the edit landed — a
-hunk that failed to match fails the whole call loudly. Re-reading only burns
-context."#;
+Every hunk is planned before the first write. Commits use compare-and-swap; if a
+later commit conflicts, earlier commits are rolled back without overwriting the
+conflicting writer (and a rollback conflict is surfaced loudly). So after a
+call succeeds, do NOT re-read the file to check the edit landed — a hunk that
+failed to match fails the whole call loudly. Re-reading only burns context."#;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
@@ -86,7 +87,134 @@ enum Op {
     /// Create a new file (`Add File`, or an `Update … Move to:` destination):
     /// no prior version to match against.
     Create { path: PathBuf, content: String },
-    Remove { path: PathBuf },
+    Remove {
+        path: PathBuf,
+        expected: String,
+        permissions: std::fs::Permissions,
+    },
+}
+
+enum Applied {
+    Replaced {
+        path: PathBuf,
+        before: String,
+        after: String,
+    },
+    Created {
+        path: PathBuf,
+        content: String,
+    },
+    Removed {
+        path: PathBuf,
+        content: String,
+        permissions: std::fs::Permissions,
+    },
+}
+
+enum CommitFailure {
+    Model(String),
+    Infrastructure(ToolError),
+}
+
+async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailure> {
+    match op {
+        Op::Replace {
+            path,
+            expected,
+            content,
+        } => match super::replace::commit_replace(context, &path, &expected, &content).await {
+            Ok(super::replace::Commit::Written) => Ok(Applied::Replaced {
+                path,
+                before: expected,
+                after: content,
+            }),
+            Ok(super::replace::Commit::Stale) => Err(CommitFailure::Model(format!(
+                "{} changed on disk between planning and writing this patch — another process or \
+                 command edited it. Re-read it and rebuild the patch against what is there now.",
+                path.display()
+            ))),
+            Ok(super::replace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
+            Err(error) => Err(CommitFailure::Infrastructure(error)),
+        },
+        Op::Create { path, content } => {
+            match super::replace::commit_create(context, &path, &content).await {
+                Ok(super::replace::Commit::Written) => Ok(Applied::Created { path, content }),
+                Ok(super::replace::Commit::Stale) => Err(CommitFailure::Model(format!(
+                    "{} was created by another writer while this patch was being committed",
+                    path.display()
+                ))),
+                Ok(super::replace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
+                Err(error) => Err(CommitFailure::Infrastructure(error)),
+            }
+        }
+        Op::Remove {
+            path,
+            expected,
+            permissions,
+        } => match super::replace::commit_remove(context, &path, &expected).await {
+            Ok(super::replace::Commit::Written) => Ok(Applied::Removed {
+                path,
+                content: expected,
+                permissions,
+            }),
+            Ok(super::replace::Commit::Stale) => Err(CommitFailure::Model(format!(
+                "{} changed on disk between planning and deleting it — another process or \
+                     command edited it. Re-read it and rebuild the patch against what is there now.",
+                path.display()
+            ))),
+            Ok(super::replace::Commit::Rejected(message)) => Err(CommitFailure::Model(message)),
+            Err(error) => Err(CommitFailure::Infrastructure(error)),
+        },
+    }
+}
+
+async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<(), ToolError> {
+    for operation in applied.iter().rev() {
+        let (path, outcome) = match operation {
+            Applied::Replaced {
+                path,
+                before,
+                after,
+            } => (
+                path,
+                super::replace::commit_replace(context, path, after, before).await?,
+            ),
+            Applied::Created { path, content } => (
+                path,
+                super::replace::commit_remove(context, path, content).await?,
+            ),
+            Applied::Removed {
+                path,
+                content,
+                permissions,
+            } => (
+                path,
+                super::replace::commit_create_with_permissions(
+                    context,
+                    path,
+                    content,
+                    Some(permissions.clone()),
+                )
+                .await?,
+            ),
+        };
+        match outcome {
+            super::replace::Commit::Written => {}
+            super::replace::Commit::Stale => {
+                return Err(ToolError::Io(format!(
+                    "rollback refused to overwrite a concurrent change at {}",
+                    path.display()
+                )));
+            }
+            super::replace::Commit::Rejected(message) => {
+                return Err(ToolError::Io(format!(
+                    "rollback rejected {}: {message}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct ApplyPatchTool;
@@ -134,6 +262,15 @@ impl Tool for ApplyPatchTool {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
                     };
+                    match tokio::fs::symlink_metadata(&resolved).await {
+                        Ok(_) => {
+                            return Ok(ToolOutput::error(format!(
+                                "cannot add existing file: {path}"
+                            )));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(ToolError::Io(format!("stat {path}: {e}"))),
+                    }
                     ops.push(Op::Create {
                         path: resolved,
                         content,
@@ -146,12 +283,24 @@ impl Tool for ApplyPatchTool {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
                     };
-                    if !resolved.exists() {
-                        return Ok(ToolOutput::error(format!(
-                            "cannot delete missing file: {path}"
-                        )));
-                    }
-                    ops.push(Op::Remove { path: resolved });
+                    let expected = match tokio::fs::read_to_string(&resolved).await {
+                        Ok(content) => content,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(ToolOutput::error(format!(
+                                "cannot delete missing file: {path}"
+                            )));
+                        }
+                        Err(e) => return Err(ToolError::Io(format!("read {path}: {e}"))),
+                    };
+                    let permissions = tokio::fs::symlink_metadata(&resolved)
+                        .await
+                        .map_err(|e| ToolError::Io(format!("stat {path}: {e}")))?
+                        .permissions();
+                    ops.push(Op::Remove {
+                        path: resolved,
+                        expected,
+                        permissions,
+                    });
                     summary.push(format!("D {path}"));
                     modified.push(path);
                 }
@@ -173,6 +322,10 @@ impl Tool for ApplyPatchTool {
                         }
                         Err(e) => return Err(ToolError::Io(format!("read {path}: {e}"))),
                     };
+                    let existing_permissions = tokio::fs::symlink_metadata(&resolved)
+                        .await
+                        .map_err(|e| ToolError::Io(format!("stat {path}: {e}")))?
+                        .permissions();
 
                     // The patch was written against contents the model read. If
                     // the file moved on since, applying it would discard whatever
@@ -201,12 +354,31 @@ impl Tool for ApplyPatchTool {
                                 Ok(p) => p,
                                 Err(e) => return Ok(ToolOutput::error(e.to_string())),
                             };
-                            ops.push(Op::Remove { path: resolved });
+                            match tokio::fs::symlink_metadata(&dest_resolved).await {
+                                Ok(_) => {
+                                    return Ok(ToolOutput::error(format!(
+                                        "cannot move to existing file: {dest}"
+                                    )));
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => {
+                                    return Err(ToolError::Io(format!("stat {dest}: {e}")));
+                                }
+                            }
+                            // Create the destination first. If the source CAS
+                            // later fails, rollback can safely remove only the
+                            // exact destination bytes this patch created.
                             ops.push(Op::Create {
                                 path: dest_resolved,
                                 content: updated,
                             });
+                            ops.push(Op::Remove {
+                                path: resolved,
+                                expected: existing,
+                                permissions: existing_permissions,
+                            });
                             summary.push(format!("M {path} -> {dest}"));
+                            modified.push(path);
                             modified.push(dest);
                         }
                         None => {
@@ -265,42 +437,25 @@ impl Tool for ApplyPatchTool {
         // Update refuses if the file moved on disk since the plan phase read it,
         // so a concurrent writer is never silently clobbered. Each file is
         // checkpointed just before it is first modified (spec §28).
+        let mut applied = Vec::new();
         for op in ops {
-            match op {
-                Op::Replace {
-                    path,
-                    expected,
-                    content,
-                } => match super::replace::commit_replace(&context, &path, &expected, &content)
-                    .await?
-                {
-                    super::replace::Commit::Written => {}
-                    super::replace::Commit::Stale => {
-                        return Ok(ToolOutput::error(format!(
-                            "{} changed on disk between planning and writing this patch — \
-                             another process or command edited it. Re-read it and rebuild the \
-                             patch against what is there now.",
-                            path.display()
+            match commit_op(&context, op).await {
+                Ok(operation) => applied.push(operation),
+                Err(failure) => {
+                    if let Err(rollback_error) = rollback_applied(&context, &applied).await {
+                        let original = match failure {
+                            CommitFailure::Model(message) => message,
+                            CommitFailure::Infrastructure(error) => error.to_string(),
+                        };
+                        return Err(ToolError::Io(format!(
+                            "patch commit failed ({original}); rollback also failed: \
+                             {rollback_error}"
                         )));
                     }
-                    super::replace::Commit::Rejected(message) => {
-                        return Ok(ToolOutput::error(message));
-                    }
-                },
-                Op::Create { path, content } => {
-                    match super::replace::commit_create(&context, &path, &content).await? {
-                        super::replace::Commit::Written => {}
-                        super::replace::Commit::Rejected(message) => {
-                            return Ok(ToolOutput::error(message));
-                        }
-                        super::replace::Commit::Stale => unreachable!("create does not CAS"),
-                    }
-                }
-                Op::Remove { path } => {
-                    context.checkpoint.record(&path);
-                    tokio::fs::remove_file(&path)
-                        .await
-                        .map_err(|e| ToolError::Io(format!("remove {}: {e}", path.display())))?;
+                    return match failure {
+                        CommitFailure::Model(message) => Ok(ToolOutput::error(message)),
+                        CommitFailure::Infrastructure(error) => Err(error),
+                    };
                 }
             }
         }
@@ -314,7 +469,8 @@ impl Tool for ApplyPatchTool {
                     Ok(bytes) => {
                         context.file_state.record(rel, &bytes);
                         // Auto-format the edited file (best-effort; re-fingerprints).
-                        super::format::format_after_edit(&context, rel, &resolved, &cancellation).await;
+                        super::format::format_after_edit(&context, rel, &resolved, &cancellation)
+                            .await;
                     }
                     Err(_) => context.file_state.forget(rel),
                 },
@@ -536,6 +692,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_refuses_to_overwrite_an_existing_file() {
+        let (context, dir) = ctx();
+        let existing = dir.join("src/existing.rs");
+        std::fs::write(&existing, "keep me\n").unwrap();
+        let patch = "*** Begin Patch\n*** Add File: src/existing.rs\n+replacement\n*** End Patch";
+
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_error, "Add File must reject an existing target");
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "keep me\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn move_reports_both_source_and_destination_as_modified() {
+        let (context, dir) = ctx();
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n*** Move to: src/moved.rs\n fn a() {}\n fn b() {}\n*** End Patch";
+
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error, "{}", out.content);
+        let modified = out
+            .metadata
+            .get("modified_files")
+            .and_then(serde_json::Value::as_array)
+            .expect("modified_files metadata");
+        assert!(
+            modified.iter().any(|path| path == "src/lib.rs"),
+            "move source must be reported: {modified:?}"
+        );
+        assert!(
+            modified.iter().any(|path| path == "src/moved.rs"),
+            "move destination must be reported: {modified:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn move_refuses_an_existing_destination_without_deleting_the_source() {
+        let (context, dir) = ctx();
+        let destination = dir.join("src/moved.rs");
+        std::fs::write(&destination, "destination\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n*** Move to: src/moved.rs\n fn a() {}\n fn b() {}\n*** End Patch";
+
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_error, "move must reject an existing destination");
+        assert!(
+            dir.join("src/lib.rs").exists(),
+            "a rejected move must keep its source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination).unwrap(),
+            "destination\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn updates_a_file() {
         let (context, dir) = ctx();
         let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n fn a() {}\n-fn b() {}\n+fn b() { todo!() }\n*** End Patch";
@@ -600,6 +836,72 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
             before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_delete_rolls_back_earlier_commits_without_clobbering_external_changes() {
+        use fs2::FileExt;
+
+        let (context, dir) = ctx();
+        let second = dir.join("src/second.rs");
+        std::fs::write(&second, "second-original\n").unwrap();
+
+        // Hold the second target's cooperative lock so the patch commits its
+        // first delete and then pauses before comparing/removing the second.
+        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &second);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let patch = "*** Begin Patch\n*** Delete File: src/lib.rs\n*** Delete File: src/second.rs\n*** End Patch";
+        let task = tokio::spawn({
+            let context = context.clone();
+            async move {
+                ApplyPatchTool
+                    .execute(
+                        serde_json::json!({ "patch": patch }),
+                        context,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while dir.join("src/lib.rs").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first operation should commit before the second lock");
+
+        std::fs::write(&second, "external-change\n").unwrap();
+        FileExt::unlock(&lock).unwrap();
+        drop(lock);
+
+        let out = task.await.unwrap();
+        assert!(
+            out.is_error,
+            "the stale second delete must reject the patch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+            "fn a() {}\nfn b() {}\n",
+            "an earlier committed operation must be rolled back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "external-change\n",
+            "rollback must not overwrite the concurrent writer"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

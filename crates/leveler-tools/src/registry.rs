@@ -105,6 +105,9 @@ impl ToolRegistry {
 /// chars. Per-model budgets (`ModelLimits::max_tool_output_bytes`) may lower
 /// it via [`ToolContext::tool_output_budget`].
 pub const MAX_TOOL_OUTPUT: usize = 48 * 1024;
+/// Smallest configured result budget. Below this, even a useful truncation
+/// marker and one diagnostic line cannot be preserved.
+pub const MIN_TOOL_OUTPUT: usize = 1024;
 
 /// [`cap_output_with`] at the default budget.
 ///
@@ -121,17 +124,37 @@ pub fn cap_output_with(s: &str, budget: usize) -> String {
     if s.len() <= budget {
         return s.to_string();
     }
-    // Keep ½ head + ¼ tail (¾ of the budget), leaving ample room for the marker
-    // so the result is always strictly smaller than both the input and the cap.
-    let head = floor_boundary(s, budget / 2);
-    let tail = ceil_boundary(s, s.len() - budget / 4);
-    format!(
-        "{}\n… [{} bytes (~{} tokens) elided to fit the context] …\n{}",
-        &s[..head],
+    if budget == 0 {
+        return String::new();
+    }
+    let largest_marker = format!(
+        "… [{} bytes (~{} tokens) elided to fit the context] …",
+        s.len(),
+        approx_tokens(s.len())
+    );
+    let framing = largest_marker.len() + 2;
+    if framing >= budget {
+        return s[..floor_boundary(s, budget)].to_string();
+    }
+
+    let keep = budget - framing;
+    let head_budget = keep * 2 / 3;
+    let tail_budget = keep - head_budget;
+    let head = floor_boundary(s, head_budget);
+    let tail = ceil_boundary(s, s.len() - tail_budget);
+    let marker = format!(
+        "… [{} bytes (~{} tokens) elided to fit the context] …",
         tail - head,
-        approx_tokens(tail - head),
-        &s[tail..]
-    )
+        approx_tokens(tail - head)
+    );
+    let output = format!("{}\n{marker}\n{}", &s[..head], &s[tail..]);
+    if output.len() <= budget {
+        output
+    } else {
+        // UTF-8 boundary rounding and a changing digit count should only save
+        // space, but keep the hard invariant even if the marker format evolves.
+        s[..floor_boundary(s, budget)].to_string()
+    }
 }
 
 /// ~4 bytes/token heuristic — enough for "is it worth re-reading" decisions.
@@ -192,8 +215,7 @@ pub fn default_registry() -> ToolRegistry {
 pub fn full_registry() -> ToolRegistry {
     use crate::tools;
     let mut registry = core_registry();
-    registry.register(Arc::new(tools::RepositorySearchTool));
-    registry.register(Arc::new(tools::GlobTool));
+    registry.register(Arc::new(tools::FindFilesTool));
     registry.register(Arc::new(tools::FindSymbolTool));
     registry.register(Arc::new(tools::ReadSymbolTool));
     registry.register(Arc::new(tools::FindReferencesTool));
@@ -240,8 +262,7 @@ pub fn expand_tool_category(registry: &mut ToolRegistry, category: &str) {
     use crate::tools;
     match category {
         "search" => {
-            registry.register(Arc::new(tools::RepositorySearchTool));
-            registry.register(Arc::new(tools::GlobTool));
+            registry.register(Arc::new(tools::FindFilesTool));
         }
         "lsp" => {
             registry.register(Arc::new(tools::FindSymbolTool));
@@ -285,8 +306,9 @@ mod tests {
         assert!(names.contains(&"replace".to_string()));
         assert!(names.contains(&"run_command".to_string()));
         assert!(names.contains(&"shell_command".to_string()));
-        assert!(names.contains(&"repository_search".to_string()));
-        assert!(names.contains(&"glob".to_string()));
+        assert!(names.contains(&"find_files".to_string()));
+        assert!(!names.contains(&"repository_search".to_string()));
+        assert!(!names.contains(&"glob".to_string()));
         assert!(names.contains(&"find_symbol".to_string()));
         assert!(names.contains(&"read_symbol".to_string()));
         assert!(names.contains(&"find_references".to_string()));
@@ -303,7 +325,7 @@ mod tests {
         assert!(names.contains(&"memory".to_string()));
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"forget".to_string()));
-        assert_eq!(names.len(), 32);
+        assert_eq!(names.len(), 31);
     }
 
     #[test]
@@ -316,7 +338,9 @@ mod tests {
         let mut expanded = core_registry();
         expand_tool_category(&mut expanded, "search");
         let names: Vec<_> = expanded.definitions().into_iter().map(|d| d.name).collect();
-        assert!(names.contains(&"repository_search".to_string()));
+        assert!(names.contains(&"find_files".to_string()));
+        assert!(!names.contains(&"repository_search".to_string()));
+        assert!(!names.contains(&"glob".to_string()));
     }
 
     #[test]
@@ -341,6 +365,19 @@ mod tests {
         let out = cap_output(&big);
         assert!(out.len() < big.len());
         assert!(out.contains("elided"));
+    }
+
+    #[test]
+    fn cap_output_never_exceeds_even_a_tiny_budget() {
+        let input = "头部".repeat(100);
+        for budget in 0..128 {
+            let out = cap_output_with(&input, budget);
+            assert!(
+                out.len() <= budget,
+                "budget={budget}, output={} bytes: {out:?}",
+                out.len()
+            );
+        }
     }
 
     #[tokio::test]

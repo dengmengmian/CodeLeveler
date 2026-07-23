@@ -341,3 +341,65 @@ async fn rate_limit_retry_honors_retry_after_header() {
          elapsed: {elapsed:?}"
     );
 }
+
+/// `[DONE]` is the OpenAI SSE protocol's explicit end-of-stream marker. A
+/// gateway that streams the whole answer and then sends `[DONE]` WITHOUT ever
+/// putting `finish_reason` in a chunk has delivered a complete response — the
+/// decoder must accept it.
+///
+/// Treating `[DONE]` as noise instead makes the decoder keep waiting on a
+/// stream the server considers finished: the answer is fully on screen while
+/// the status line still reads "waiting for model", until the idle read timeout
+/// fires and the whole (large) request is retried as StreamInterrupted.
+#[tokio::test]
+async fn done_sentinel_completes_a_stream_that_never_sent_finish_reason() {
+    let server = MockServer::start_one(MockResponse::sse(&[
+        r#"{"choices":[{"delta":{"content":"the whole answer"}}]}"#,
+    ]))
+    .await;
+    let reg = registry(&server);
+
+    let stream = reg
+        .stream(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(stream).await;
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            ModelEvent::Error { error }
+                if error.kind == leveler_model::ModelErrorKind::StreamInterrupted
+        )),
+        "[DONE] means the server finished; this must not read as an interruption: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ModelEvent::MessageCompleted { .. })),
+        "the stream must terminate with a completion event: {events:?}"
+    );
+}
+
+/// The counterpart to the case above: `[DONE]` with no content at all is NOT a
+/// usable response, so it must keep reporting an interruption (retryable).
+#[tokio::test]
+async fn done_sentinel_with_no_content_is_still_an_interruption() {
+    let server = MockServer::start_one(MockResponse::sse(&[])).await;
+    let reg = registry(&server);
+
+    let stream = reg
+        .stream(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(stream).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ModelEvent::Error { error }
+                if error.kind == leveler_model::ModelErrorKind::StreamInterrupted
+        )),
+        "an empty [DONE]-only stream has no answer to accept: {events:?}"
+    );
+}

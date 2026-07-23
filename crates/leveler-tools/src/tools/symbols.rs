@@ -9,6 +9,56 @@ use leveler_project::Language;
 
 use crate::tool::ToolContext;
 
+pub(crate) fn remove_if_same<T>(
+    sessions: &mut std::collections::HashMap<String, std::sync::Arc<T>>,
+    key: &str,
+    expected: &std::sync::Arc<T>,
+) {
+    if sessions
+        .get(key)
+        .is_some_and(|current| std::sync::Arc::ptr_eq(current, expected))
+    {
+        sessions.remove(key);
+    }
+}
+
+pub(crate) async fn get_or_start_lsp(
+    context: &ToolContext,
+    key: &str,
+    program: &str,
+    args: &[String],
+    root: &Path,
+) -> Result<std::sync::Arc<leveler_lsp::LspClient>, String> {
+    if let Some(client) = context.lsp_sessions.lock().await.get(key).cloned() {
+        return Ok(client);
+    }
+    let start_lock = {
+        let mut locks = context.lsp_start_locks.lock().await;
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _starting = start_lock.lock().await;
+    if let Some(client) = context.lsp_sessions.lock().await.get(key).cloned() {
+        return Ok(client);
+    }
+
+    // Only this language's startup lock is held across process launch. Other
+    // languages and already-running sessions remain available concurrently.
+    let client = std::sync::Arc::new(
+        leveler_lsp::LspClient::start(program, args, root)
+            .await
+            .map_err(|error| error.to_string())?,
+    );
+    context
+        .lsp_sessions
+        .lock()
+        .await
+        .insert(key.to_string(), client.clone());
+    Ok(client)
+}
+
 /// Locate a symbol's definitions via a language server, returning the language
 /// whose server answered and the matching locations. `None` if no server is
 /// available or the symbol is not found.
@@ -29,17 +79,9 @@ pub(crate) async fn lsp_locate(
         // Clone the session's Arc out under the lock, then release it before the
         // request/retry loop — holding the global lock across `sleep` would
         // serialize every LSP tool and stall them for seconds.
-        let client = {
-            let mut sessions = context.lsp_sessions.lock().await;
-            if !sessions.contains_key(&key) {
-                match leveler_lsp::LspClient::start(&spec.program, &spec.args, root).await {
-                    Ok(client) => {
-                        sessions.insert(key.clone(), std::sync::Arc::new(client));
-                    }
-                    Err(_) => continue,
-                }
-            }
-            sessions.get(&key)?.clone()
+        let client = match get_or_start_lsp(context, &key, &spec.program, &spec.args, root).await {
+            Ok(client) => client,
+            Err(_) => continue,
         };
 
         // The server may still be indexing on first use; retry briefly.
@@ -64,7 +106,8 @@ pub(crate) async fn lsp_locate(
         if server_died {
             // Re-acquire only to evict, and only if it's still the same dead
             // client (a concurrent call may have already restarted it).
-            context.lsp_sessions.lock().await.remove(&key);
+            let mut sessions = context.lsp_sessions.lock().await;
+            remove_if_same(&mut sessions, &key, &client);
         }
         let matches: Vec<_> = located
             .into_iter()
@@ -148,6 +191,23 @@ pub(crate) fn column_of(line_text: &str, name: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_never_removes_a_concurrently_restarted_session() {
+        let stale = std::sync::Arc::new(1_u8);
+        let restarted = std::sync::Arc::new(2_u8);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert("rust".to_string(), restarted.clone());
+
+        remove_if_same(&mut sessions, "rust", &stale);
+
+        assert!(std::sync::Arc::ptr_eq(
+            sessions.get("rust").unwrap(),
+            &restarted
+        ));
+        remove_if_same(&mut sessions, "rust", &restarted);
+        assert!(!sessions.contains_key("rust"));
+    }
 
     #[test]
     fn extract_block_marks_an_unclosed_clip() {

@@ -130,7 +130,11 @@ pub fn resolve_execution_policy(
         max_tool_output_bytes: o
             .max_tool_output_bytes
             .or(profile.limits.max_tool_output_bytes)
-            .unwrap_or(leveler_tools::registry::MAX_TOOL_OUTPUT),
+            .unwrap_or(leveler_tools::registry::MAX_TOOL_OUTPUT)
+            .clamp(
+                leveler_tools::registry::MIN_TOOL_OUTPUT,
+                leveler_tools::registry::MAX_TOOL_OUTPUT,
+            ),
     }
 }
 
@@ -209,7 +213,35 @@ mod tests {
             ..ExecutionOverrides::default()
         };
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o));
-        assert_eq!(r.max_tool_output_bytes, 8 * 1024, "eval seam wins over profile");
+        assert_eq!(
+            r.max_tool_output_bytes,
+            8 * 1024,
+            "eval seam wins over profile"
+        );
+    }
+
+    #[test]
+    fn tool_output_budget_is_clamped_to_safe_global_bounds() {
+        let p = profile();
+        let huge = ExecutionOverrides {
+            max_tool_output_bytes: Some(leveler_tools::registry::MAX_TOOL_OUTPUT * 10),
+            ..ExecutionOverrides::default()
+        };
+        assert_eq!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&huge))
+                .max_tool_output_bytes,
+            leveler_tools::registry::MAX_TOOL_OUTPUT
+        );
+
+        let zero = ExecutionOverrides {
+            max_tool_output_bytes: Some(0),
+            ..ExecutionOverrides::default()
+        };
+        assert_eq!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&zero))
+                .max_tool_output_bytes,
+            leveler_tools::registry::MIN_TOOL_OUTPUT
+        );
     }
 
     #[test]

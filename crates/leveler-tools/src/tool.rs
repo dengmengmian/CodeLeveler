@@ -48,6 +48,10 @@ pub struct ToolContext {
     /// tool calls so servers index the workspace once (spec §26 LSP platform).
     pub lsp_sessions:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<leveler_lsp::LspClient>>>>,
+    /// Per-language startup locks. Starting a server may take seconds; these
+    /// prevent duplicate starts without holding the global sessions mutex.
+    pub lsp_start_locks:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Where oversized command output is spilled (content-addressed) instead of
     /// being silently truncated. `None` disables spilling (output is truncated
     /// with a marker, the pre-artifact behavior).
@@ -100,6 +104,7 @@ impl ToolContext {
             command_modified_files_remaining: None,
             command_previously_modified: Arc::new(Vec::new()),
             lsp_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            lsp_start_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             artifact_store: None,
             memory_root: None,
             read_only: false,

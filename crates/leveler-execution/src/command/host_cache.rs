@@ -76,10 +76,17 @@ fn ensure_real_private_child(
                 }
             }
             Ok(_) => {
-                if let Err(error) = parent.remove_file(name)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(error);
+                if let Err(error) = parent.remove_file(name) {
+                    match parent.symlink_metadata(name) {
+                        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                            continue;
+                        }
+                        Err(current) if current.kind() == std::io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        _ if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        _ => return Err(error),
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

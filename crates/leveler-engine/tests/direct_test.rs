@@ -1034,3 +1034,48 @@ async fn resume_refuses_a_kind_mismatch() {
         .expect_err("kind mismatch must be refused");
     assert!(err.to_string().contains("is `direct`"), "{err}");
 }
+
+/// The engine's goal continuation (`continue_active_goal`) opens a whole new
+/// turn AFTER the user already saw a final answer. Without an advisory event a
+/// UI can only show a bare "waiting for model" for the entire continuation —
+/// which reads as a hang. Every continuation round must name itself.
+#[tokio::test]
+async fn goal_continuation_announces_itself_before_re_prompting() {
+    // Code change + a real answer, but `update_goal` never called: the closeout
+    // spends its nudge budget on GoalUnresolved and stalls, which is exactly
+    // what drives the engine into a continuation turn.
+    let mut responses = vec![tool_call(
+        "c1",
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+        }),
+    )];
+    for _ in 0..8 {
+        responses.push(text("已经改完了。"));
+    }
+    let h = harness(responses).await;
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    // Response exhaustion may end the run in an error; the advisory must have
+    // been emitted before the continuation turn asked the model anything.
+    let _ = h
+        .engine
+        .run(
+            &session,
+            &spec,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            EngineEvent::AdvisoryStarted { kind } if kind == "goal_continuation"
+        )),
+        "a goal continuation turn must announce itself: {seen:?}"
+    );
+}

@@ -33,7 +33,7 @@ fn tool_style(theme: &Theme, status: ToolStatus) -> Style {
 pub(crate) fn is_guard_denied_name(name: &str) -> bool {
     matches!(
         name,
-        "update_plan" | "update_goal" | "list_files" | "git_status" | "grep" | "repository_search"
+        "update_plan" | "update_goal" | "list_files" | "git_status" | "grep" | "find_files"
     )
 }
 
@@ -281,7 +281,10 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
             }
         }
         "find_symbol" | "read_symbol" | "find_references" => s("symbol"),
-        "repository_search" => s("query"),
+        "find_files" => leveler_model::builtin_tool_metadata(name)
+            .and_then(|metadata| metadata.primary_argument)
+            .map(s)
+            .unwrap_or_default(),
         "update_plan" => s("explanation"),
         "update_goal" => update_goal_summary_text(&v, t),
         "task" => {
@@ -565,7 +568,7 @@ fn noisy_success_tool(name: &str) -> bool {
         "read_file"
             | "list_files"
             | "grep"
-            | "repository_search"
+            | "find_files"
             | "find_symbol"
             | "read_symbol"
             | "find_references"

@@ -17,6 +17,7 @@ use leveler_execution::RiskLevel;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_BYTES: usize = 512 * 1024;
 const HARD_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
@@ -151,12 +152,16 @@ pub(crate) async fn resolve_and_validate(url: &str) -> Result<SafeTarget, String
         });
     }
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let hostport = format!("{host}:{port}");
-    let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
-        hostport.to_socket_addrs().map(|it| it.collect::<Vec<_>>())
-    })
+    let dns_host = host.clone();
+    let addrs = resolve_with_timeout(
+        async move {
+            tokio::net::lookup_host((dns_host.as_str(), port))
+                .await
+                .map(|addresses| addresses.collect::<Vec<_>>())
+        },
+        DNS_TIMEOUT,
+    )
     .await
-    .map_err(|e| format!("dns task failed: {e}"))?
     .map_err(|e| format!("dns resolve failed for `{host}`: {e}"))?;
     if addrs.is_empty() {
         return Err(format!("dns resolve returned no addresses for `{host}`"));
@@ -169,7 +174,15 @@ pub(crate) async fn resolve_and_validate(url: &str) -> Result<SafeTarget, String
     Ok(SafeTarget { host, addrs })
 }
 
-use std::net::ToSocketAddrs;
+async fn resolve_with_timeout<F>(future: F, timeout: Duration) -> Result<Vec<SocketAddr>, String>
+where
+    F: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| format!("timed out after {}s", timeout.as_secs_f64()))?
+        .map_err(|error| error.to_string())
+}
 
 /// True for loopback, private, link-local, and cloud metadata ranges.
 pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
@@ -178,6 +191,7 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
+                || v4.is_multicast()
                 || v4.is_broadcast()
                 || v4.is_unspecified()
                 || v4.octets()[0] == 0
@@ -191,6 +205,7 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_unspecified()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || v6.is_multicast()
                 // IPv4-mapped: re-check embedded v4
                 || v6
                     .to_ipv4_mapped()
@@ -260,20 +275,20 @@ async fn read_body_capped(
     max_bytes: usize,
 ) -> Result<(String, bool), String> {
     let mut collected: Vec<u8> = Vec::new();
-    let mut truncated = false;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("read body: {e}"))?
-    {
-        let remaining = max_bytes.saturating_sub(collected.len());
-        if chunk.len() >= remaining {
+    let limit = max_bytes.saturating_add(1);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read body: {e}"))? {
+        let remaining = limit.saturating_sub(collected.len());
+        if chunk.len() > remaining {
             collected.extend_from_slice(&chunk[..remaining]);
-            truncated = true;
             break;
         }
         collected.extend_from_slice(&chunk);
+        if collected.len() == limit {
+            break;
+        }
     }
+    let truncated = collected.len() > max_bytes;
+    collected.truncate(max_bytes);
     // Lossy UTF-8; binary surfaces as replacement chars rather than panicking.
     Ok((String::from_utf8_lossy(&collected).into_owned(), truncated))
 }
@@ -302,6 +317,46 @@ mod tests {
         assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
             0xfc00, 0, 0, 0, 0, 0, 0, 1
         ))));
+    }
+
+    #[test]
+    fn blocks_multicast_destinations() {
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
+        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::new(
+            0xff02, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[tokio::test]
+    async fn exact_size_body_is_not_reported_as_truncated() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345")
+                .await
+                .unwrap();
+        });
+        let response = reqwest::get(format!("http://{addr}")).await.unwrap();
+        let (body, truncated) = read_body_capped(response, 5).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(body, "12345");
+        assert!(!truncated, "an exact-boundary response was not cut short");
+    }
+
+    #[tokio::test]
+    async fn dns_resolution_has_an_explicit_deadline() {
+        let pending = std::future::pending::<std::io::Result<Vec<SocketAddr>>>();
+        let error = resolve_with_timeout(pending, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[test]

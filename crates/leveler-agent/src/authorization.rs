@@ -8,10 +8,7 @@ use sha2::{Digest, Sha256};
 /// Whether a tool is a read-only search/lookup (subject to the per-step search
 /// budget). These gather context but never change the workspace.
 pub(crate) fn is_search_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "grep" | "repository_search" | "find_symbol" | "read_symbol" | "find_references"
-    )
+    leveler_model::is_search_tool(name)
 }
 
 /// Whether a `run_command` call runs a verification-class program (build /
@@ -302,21 +299,10 @@ pub(crate) fn is_pure_observe_call(name: &str, arguments: &serde_json::Value) ->
 /// Returns an owned key so path/pattern can distinguish different observes
 /// (same tool, different target is not thrash).
 pub(crate) fn observe_class(name: &str, arguments: &serde_json::Value) -> Option<String> {
+    if let Some(key) = leveler_model::builtin_observe_key(name, arguments) {
+        return Some(key);
+    }
     match name {
-        "list_files" => {
-            let path = arguments
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            Some(format!("observe:list_files:{path}"))
-        }
-        "grep" | "repository_search" => {
-            let pattern = arguments
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            Some(format!("observe:search:{pattern}"))
-        }
         "git_status" => Some("observe:git_status".into()),
         "run_command" => {
             let program = arguments

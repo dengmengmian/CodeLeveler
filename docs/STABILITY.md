@@ -89,7 +89,7 @@ major version. Adding a key is always allowed.
 
 ## 3. Rust API
 
-Leveler publishes 21 crates but is consumed as a binary. Only the traits a
+Leveler publishes 27 crates but is consumed as a binary. Only the traits a
 third party would *implement* need a stability promise; the rest are internal
 seams that should stay free to change.
 

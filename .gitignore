@@ -17,7 +17,6 @@ Cargo.lock.orig
 .claude/
 .codex/
 .omc/
-AGENTS.md
 CLAUDE.md
 
 # Generated evaluation output

@@ -633,20 +633,21 @@ fn truncate_or_spill(s: &str, store: Option<&leveler_execution::ArtifactStore>) 
     let head = crate::registry::floor_boundary(s, MAX_OUTPUT / 2);
     let tail = crate::registry::ceil_boundary(s, s.len() - MAX_OUTPUT / 4);
     let elided_tokens = crate::registry::approx_tokens(tail - head);
-    let marker = match store.and_then(|store| store.write_text(s).ok()) {
-        Some(art) => format!(
-            "… [{} of {} bytes (~{elided_tokens} tokens) elided; full output: {}] …",
-            tail - head,
-            s.len(),
-            art.path.display()
-        ),
-        None => format!(
-            "… [{} of {} bytes (~{elided_tokens} tokens) elided] …",
-            tail - head,
-            s.len()
-        ),
-    };
-    format!("{}\n{}\n{}", &s[..head], marker, &s[tail..])
+    let artifact = store.and_then(|store| store.write_text(s).ok());
+    let marker = format!(
+        "… [{} of {} bytes (~{elided_tokens} tokens) elided] …",
+        tail - head,
+        s.len()
+    );
+    let mut shown = format!("{}\n{}\n{}", &s[..head], marker, &s[tail..]);
+    if let Some(artifact) = artifact {
+        // Keep the recovery reference at the very end. The registry applies a
+        // second, model-specific head/tail cap after this tool returns; a link
+        // embedded in the middle marker would be elided and make the stored
+        // full output unreachable.
+        shown.push_str(&format!("\n[full output: {}]\n", artifact.path.display()));
+    }
+    shown
 }
 
 /// Default command timeout, and the ceiling we clamp any request to.
@@ -685,9 +686,15 @@ mod tests {
 
     #[test]
     fn resolve_timeout_defaults_zero_and_clamps_huge() {
-        assert_eq!(resolve_timeout(None), Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            resolve_timeout(None),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
         // Zero would expire instantly — fall back to the default instead.
-        assert_eq!(resolve_timeout(Some(0)), Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            resolve_timeout(Some(0)),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
         assert_eq!(resolve_timeout(Some(45)), Duration::from_secs(45));
         assert_eq!(
             resolve_timeout(Some(u64::MAX)),
@@ -758,7 +765,7 @@ mod tests {
         let store = leveler_execution::ArtifactStore::new(&root);
         let shown = truncate_or_spill(&big, Some(&store));
         assert!(shown.starts_with("HEAD"), "keeps the head");
-        assert!(shown.trim_end().ends_with("TAIL"), "keeps the tail");
+        assert!(shown.contains("TAIL"), "keeps the tail");
         assert!(
             shown.contains(&format!("full output: {}", root.display())),
             "must reference the artifact path: {shown}"
@@ -793,6 +800,25 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), big);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn central_output_cap_does_not_erase_the_artifact_recovery_link() {
+        let big = format!("HEAD{}TAIL", "x".repeat(MAX_OUTPUT + 5000));
+        let root = std::env::temp_dir().join(format!(
+            "leveler-double-cap-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let store = leveler_execution::ArtifactStore::new(&root);
+        let shown = truncate_or_spill(&big, Some(&store));
+        let capped = crate::registry::cap_output_with(&shown, 4 * 1024);
+
+        assert!(
+            capped.contains(&format!("full output: {}", root.display())),
+            "the central cap must preserve the only way to recover full output: {capped}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

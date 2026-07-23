@@ -5,9 +5,10 @@
 //! so an interrupted or bad run can be rolled back exactly to its starting tree.
 
 use std::collections::HashMap;
+use std::fs::Permissions;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Originals larger than this spill to a temp file instead of staying
 /// resident: a session that touches a build artifact or data file must not pin
@@ -18,9 +19,15 @@ const MAX_IN_MEMORY_ORIGINAL: usize = 4 * 1024 * 1024;
 enum Original {
     /// The file did not exist before the first write.
     Absent,
-    InMemory(Vec<u8>),
+    InMemory {
+        bytes: Vec<u8>,
+        permissions: Permissions,
+    },
     /// Large original spilled to a session temp file (removed on reset/drop).
-    Spilled(PathBuf),
+    Spilled {
+        file: tempfile::NamedTempFile,
+        permissions: Permissions,
+    },
 }
 
 /// Records the pre-modification state of touched files.
@@ -37,23 +44,34 @@ impl Checkpoint {
     /// Capture the current state of `path` the first time it is touched. Reading
     /// happens synchronously; subsequent touches of the same path are ignored so
     /// the earliest (true original) state is preserved.
-    pub fn record(&self, path: &Path) {
+    pub fn record(&self, path: &Path) -> std::io::Result<()> {
         let mut map = self.originals.lock().unwrap();
         if map.contains_key(path) {
-            return;
+            return Ok(());
         }
         // Size-gate BEFORE reading: a large original is spilled via a streaming
         // copy so recording a multi-GB artifact never loads it into memory.
-        let original = match std::fs::metadata(path) {
-            Err(_) => Original::Absent,
-            Ok(meta) if meta.len() as usize <= MAX_IN_MEMORY_ORIGINAL => {
-                match std::fs::read(path).ok() {
-                    None => Original::Absent,
-                    Some(bytes) => Original::InMemory(bytes),
-                }
+        let original = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Original::Absent,
+            Err(error) => return Err(error),
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "checkpoint target is not a regular file: {}",
+                        path.display()
+                    ),
+                ));
             }
-            Ok(_) => match spill_copy(path) {
-                Ok(spill_path) => Original::Spilled(spill_path),
+            Ok(meta) if meta.len() as usize <= MAX_IN_MEMORY_ORIGINAL => Original::InMemory {
+                bytes: std::fs::read(path)?,
+                permissions: meta.permissions(),
+            },
+            Ok(meta) => match spill_copy(path) {
+                Ok(file) => Original::Spilled {
+                    file,
+                    permissions: meta.permissions(),
+                },
                 // Rollback safety beats memory: fall back to reading it
                 // resident rather than silently losing the ability to restore.
                 Err(e) => {
@@ -62,21 +80,41 @@ impl Checkpoint {
                         error = %e,
                         "could not spill large checkpoint original; reading it into memory"
                     );
-                    match std::fs::read(path).ok() {
-                        None => Original::Absent,
-                        Some(bytes) => Original::InMemory(bytes),
+                    Original::InMemory {
+                        bytes: std::fs::read(path)?,
+                        permissions: meta.permissions(),
                     }
                 }
             },
         };
         map.insert(path.to_path_buf(), original);
+        Ok(())
+    }
+
+    /// Record bytes already read from a locked file descriptor. Commit paths
+    /// use this after their compare step so a failed stale write cannot poison
+    /// the checkpoint with unrelated on-disk state.
+    pub fn record_captured(&self, path: &Path, bytes: Vec<u8>, permissions: Permissions) {
+        self.originals
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_insert(Original::InMemory { bytes, permissions });
+    }
+
+    /// Record that a create target was absent at its successful commit point.
+    pub fn record_absent(&self, path: &Path) {
+        self.originals
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_insert(Original::Absent);
     }
 
     /// Clear all captured state, making the current tree the new restore point
     /// (an explicit `create_checkpoint`).
     pub fn reset(&self) {
         let mut map = self.originals.lock().unwrap();
-        remove_spill_files(&map);
         map.clear();
     }
 
@@ -92,8 +130,8 @@ impl Checkpoint {
             .unwrap()
             .values()
             .map(|v| match v {
-                Original::InMemory(bytes) => bytes.len(),
-                Original::Absent | Original::Spilled(_) => 0,
+                Original::InMemory { bytes, .. } => bytes.len(),
+                Original::Absent | Original::Spilled { .. } => 0,
             })
             .sum()
     }
@@ -108,17 +146,21 @@ impl Checkpoint {
         let map = self.originals.lock().unwrap();
         for (path, original) in map.iter() {
             match original {
-                Original::InMemory(bytes) => {
+                Original::InMemory { bytes, permissions } => {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    replace_atomically(path, |tmp| std::fs::write(tmp, bytes))?;
+                    replace_atomically(path, permissions, |tmp| tmp.write_all(bytes))?;
                 }
-                Original::Spilled(spill_path) => {
+                Original::Spilled { file, permissions } => {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    replace_atomically(path, |tmp| std::fs::copy(spill_path, tmp).map(|_| ()))?;
+                    replace_atomically(path, permissions, |tmp| {
+                        let mut source = file.reopen()?;
+                        source.rewind()?;
+                        std::io::copy(&mut source, tmp).map(|_| ())
+                    })?;
                 }
                 Original::Absent => match std::fs::remove_file(path) {
                     Ok(()) => {}
@@ -131,52 +173,34 @@ impl Checkpoint {
     }
 }
 
-impl Drop for Checkpoint {
-    fn drop(&mut self) {
-        if let Ok(map) = self.originals.lock() {
-            remove_spill_files(&map);
-        }
-    }
-}
-
 /// Stream a large original into a unique session temp file without loading it
 /// into memory.
-fn spill_copy(src: &Path) -> std::io::Result<PathBuf> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "leveler-checkpoint-{}-{}.orig",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::copy(src, &path)?;
-    Ok(path)
+fn spill_copy(src: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut source = std::fs::File::open(src)?;
+    let mut spill = tempfile::Builder::new()
+        .prefix("leveler-checkpoint-")
+        .suffix(".orig")
+        .tempfile()?;
+    std::io::copy(&mut source, spill.as_file_mut())?;
+    spill.as_file_mut().flush()?;
+    Ok(spill)
 }
 
 /// Replace `path` by staging into a same-directory temp file and renaming, so
 /// an interrupted restore never leaves a truncated target.
 fn replace_atomically(
     path: &Path,
-    stage: impl FnOnce(&Path) -> std::io::Result<()>,
+    permissions: &Permissions,
+    stage: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(".{file_name}.leveler-restore-tmp"));
-    stage(&tmp)?;
-    let renamed = std::fs::rename(&tmp, path);
-    if renamed.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    renamed
-}
-
-fn remove_spill_files(map: &HashMap<PathBuf, Original>) {
-    for original in map.values() {
-        if let Original::Spilled(spill_path) = original {
-            std::fs::remove_file(spill_path).ok();
-        }
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".leveler-restore-")
+        .tempfile_in(parent)?;
+    stage(tmp.as_file_mut())?;
+    tmp.as_file().set_permissions(permissions.clone())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map(|_| ()).map_err(|error| error.error)
 }
 
 #[cfg(test)]
@@ -200,10 +224,45 @@ mod tests {
         let file = dir.join("a.txt");
         std::fs::write(&file, "original").unwrap();
         let cp = Checkpoint::new();
-        cp.record(&file);
+        cp.record(&file).unwrap();
         std::fs::write(&file, "modified").unwrap();
         cp.restore().unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_original_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let file = dir.join("script.sh");
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let cp = Checkpoint::new();
+        cp.record(&file).unwrap();
+
+        std::fs::write(&file, "changed\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        cp.restore().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn record_rejects_non_regular_files_instead_of_treating_them_as_absent() {
+        let dir = tmp();
+        let cp = Checkpoint::new();
+        assert!(
+            cp.record(&dir).is_err(),
+            "a directory/read error must not become an Absent checkpoint"
+        );
+        assert_eq!(cp.touched_count(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -212,7 +271,7 @@ mod tests {
         let dir = tmp();
         let file = dir.join("new.txt");
         let cp = Checkpoint::new();
-        cp.record(&file); // does not exist yet
+        cp.record(&file).unwrap(); // does not exist yet
         std::fs::write(&file, "created").unwrap();
         cp.restore().unwrap();
         assert!(!file.exists());
@@ -230,7 +289,7 @@ mod tests {
         std::fs::write(&file, &original).unwrap();
 
         let cp = Checkpoint::new();
-        cp.record(&file);
+        cp.record(&file).unwrap();
         assert!(
             cp.in_memory_bytes() < 5 * 1024 * 1024,
             "a 6MB original must not be held in memory ({} bytes resident)",
@@ -260,15 +319,18 @@ mod tests {
         std::fs::write(&nested, "nested-original").unwrap();
 
         let cp = Checkpoint::new();
-        cp.record(&plain);
-        cp.record(&nested);
+        cp.record(&plain).unwrap();
+        cp.record(&nested).unwrap();
         std::fs::write(&plain, "plain-modified").unwrap();
         std::fs::write(&nested, "nested-modified").unwrap();
 
         // Block the nested restore: its parent dir becomes a plain file.
         std::fs::remove_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub"), "blocker").unwrap();
-        assert!(cp.restore().is_err(), "blocked restore must surface the error");
+        assert!(
+            cp.restore().is_err(),
+            "blocked restore must surface the error"
+        );
 
         // Unblock and retry: BOTH files must come back to their originals.
         std::fs::remove_file(dir.join("sub")).unwrap();
@@ -307,9 +369,9 @@ mod tests {
         let file = dir.join("a.txt");
         std::fs::write(&file, "v1").unwrap();
         let cp = Checkpoint::new();
-        cp.record(&file);
+        cp.record(&file).unwrap();
         std::fs::write(&file, "v2").unwrap();
-        cp.record(&file); // ignored
+        cp.record(&file).unwrap(); // ignored
         cp.restore().unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
         std::fs::remove_dir_all(&dir).ok();

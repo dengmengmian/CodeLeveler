@@ -84,11 +84,10 @@ pub enum Recovery {
 /// a process requires confirmation. Unknown tools default to the safe (for the
 /// user) side: confirmation.
 pub fn recovery_for_tool(tool_name: &str) -> Recovery {
-    match tool_name {
-        "read_file" | "list_files" | "grep" | "repository_search" | "find_symbol"
-        | "read_symbol" | "find_references" | "git_status" | "git_diff" | "view_image"
-        | "web_search" | "web_fetch" => Recovery::SafeReplay,
-        _ => Recovery::RequiresConfirmation,
+    if leveler_model::is_safe_replay_tool(tool_name) {
+        Recovery::SafeReplay
+    } else {
+        Recovery::RequiresConfirmation
     }
 }
 

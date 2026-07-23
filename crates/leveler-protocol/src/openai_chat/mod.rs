@@ -213,8 +213,22 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                                };
                                for sse in events {
                                    let data = sse.data.trim();
-                                   if data.is_empty() || data == "[DONE]" {
+                                   if data.is_empty() {
                                        continue;
+                                   }
+                                   if data == "[DONE]" {
+                                       for ev in assembler.on_done() {
+                                           yield Ok(ev);
+                                       }
+                                       if !assembler.is_completed() {
+                                           yield Ok(ModelEvent::Error {
+                                               error: ModelError::new(
+                                                   ModelErrorKind::StreamInterrupted,
+                                                   "stream ended before completion",
+                                               ),
+                                           });
+                                       }
+                                       return;
                                    }
                                    match serde_json::from_str::<wire::ChatChunk>(data) {
                                        Ok(chunk) => {

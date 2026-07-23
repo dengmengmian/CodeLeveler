@@ -44,6 +44,7 @@ pub struct ChatStreamAssembler {
     max_tool_argument_bytes: usize,
     max_tool_calls: usize,
     tool_arguments_overflowed: bool,
+    has_output: bool,
     completed: bool,
 }
 
@@ -55,6 +56,7 @@ impl Default for ChatStreamAssembler {
             max_tool_argument_bytes: MAX_TOOL_ARGUMENT_BYTES,
             max_tool_calls: MAX_TOOL_CALLS,
             tool_arguments_overflowed: false,
+            has_output: false,
             completed: false,
         }
     }
@@ -82,13 +84,16 @@ impl ChatStreamAssembler {
             let delta = choice.delta;
 
             if let Some(text) = delta.content.filter(|t| !t.is_empty()) {
+                self.has_output = true;
                 events.push(ModelEvent::TextDelta { delta: text });
             }
             if let Some(reasoning) = delta.reasoning_content.filter(|t| !t.is_empty()) {
+                self.has_output = true;
                 events.push(ModelEvent::ReasoningDelta { delta: reasoning });
             }
 
             for tc in delta.tool_calls {
+                self.has_output = true;
                 let index = tc.index;
                 if self.tool_arguments_overflowed {
                     continue;
@@ -185,6 +190,23 @@ impl ChatStreamAssembler {
         }
 
         events
+    }
+
+    /// Finalize a stream ended by OpenAI's explicit `[DONE]` sentinel.
+    ///
+    /// A sentinel after substantive output is a successful protocol-level
+    /// completion even when no chunk carried `finish_reason`. An empty stream
+    /// stays incomplete so the caller can surface `StreamInterrupted`.
+    pub fn on_done(&mut self) -> Vec<ModelEvent> {
+        if !self.has_output || self.completed {
+            return Vec::new();
+        }
+        let reason = if self.tool_calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        self.finalize(reason)
     }
 
     /// Emit completed tool calls (parsing their joined arguments) followed by

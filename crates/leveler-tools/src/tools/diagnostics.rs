@@ -86,28 +86,21 @@ impl Tool for DiagnosticsTool {
         // out and drop the lock before `wait_for_diagnostics` (up to WAIT
         // seconds) so a diagnostics call doesn't block every other LSP tool.
         let key = language.as_str().to_string();
-        let client = {
-            let mut sessions = context.lsp_sessions.lock().await;
-            if !sessions.contains_key(&key) {
-                match leveler_lsp::LspClient::start(&spec.program, &spec.args, &root).await {
-                    Ok(client) => {
-                        sessions.insert(key.clone(), std::sync::Arc::new(client));
-                    }
-                    Err(e) => {
-                        return Ok(ToolOutput::ok(format!(
-                            "(could not start {} language server: {e})\n",
-                            spec.program
-                        )));
-                    }
-                }
-            }
-            match sessions.get(&key) {
-                Some(client) => client.clone(),
-                None => {
-                    return Ok(ToolOutput::ok(
-                        "(language server unavailable)\n".to_string(),
-                    ));
-                }
+        let client = match super::symbols::get_or_start_lsp(
+            &context,
+            &key,
+            &spec.program,
+            &spec.args,
+            &root,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                return Ok(ToolOutput::ok(format!(
+                    "(could not start {} language server: {error})\n",
+                    spec.program
+                )));
             }
         };
         let _ = client.open(&abs, &spec.language_id).await;

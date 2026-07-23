@@ -13,7 +13,7 @@ pub mod rules;
 pub mod symbols;
 
 pub use context::{ContextCompiler, ContextPackage, estimate_text_tokens};
-pub use guard::{FileStateTracker, RepeatedReadGuard};
+pub use guard::{ContentFingerprint, FileStateTracker, RepeatedReadGuard};
 pub use repo_map::RepositoryMap;
 pub use rules::{
     ProjectInstruction, load_rules, load_rules_for_paths, load_scoped_rules, render_instructions,

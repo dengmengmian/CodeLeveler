@@ -103,7 +103,7 @@ mod tests {
             .execute(serde_json::json!({}), ctx.clone(), CancellationToken::new())
             .await
             .unwrap();
-        ctx.checkpoint.record(&dir.join("a.txt"));
+        ctx.checkpoint.record(&dir.join("a.txt")).unwrap();
         std::fs::write(dir.join("a.txt"), "edited").unwrap();
 
         let out = RestoreCheckpointTool

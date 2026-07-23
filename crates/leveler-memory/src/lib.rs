@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -68,20 +69,67 @@ impl MemoryStore {
 
     /// Write or replace an active entry (caller handles approval).
     pub fn remember(&self, entry: MemoryEntry) -> Result<MemoryEntry, MemoryError> {
-        if entry.id.trim().is_empty() || entry.title.trim().is_empty() {
-            return Err(MemoryError::Invalid(
-                "id and title are required".to_string(),
-            ));
-        }
-        if entry.id.contains('/') || entry.id.contains('\\') || entry.id.contains("..") {
-            return Err(MemoryError::Invalid("id must be a plain slug".to_string()));
-        }
+        validate_entry(&entry)?;
         let path = self.active_path(&entry.id);
-        // Remove from archive if re-remembering.
-        let _ = fs::remove_file(self.archive_path(&entry.id));
         let json = serde_json::to_string_pretty(&entry)?;
-        fs::write(path, json)?;
+        write_atomically(&path, json.as_bytes())?;
+        // Remove from archive only after the active copy is durable.
+        let _ = fs::remove_file(self.archive_path(&entry.id));
         Ok(entry)
+    }
+
+    /// Atomically choose a non-conflicting slug and store a complete entry.
+    ///
+    /// The no-overwrite hard link is the reservation: concurrent writers can
+    /// never both claim the same id, and readers never observe a partial JSON
+    /// file. An unreadable existing entry is an error, not evidence that the id
+    /// is available.
+    pub fn remember_deduplicated(
+        &self,
+        mut entry: MemoryEntry,
+    ) -> Result<MemoryEntry, MemoryError> {
+        validate_entry(&entry)?;
+        let base = entry.id.clone();
+        let mut suffix = 1usize;
+        loop {
+            entry.id = if suffix == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{suffix}")
+            };
+            let path = self.active_path(&entry.id);
+            let json = serde_json::to_string_pretty(&entry)?;
+            let mut temp = tempfile::Builder::new()
+                .prefix(".memory-")
+                .tempfile_in(self.root.join("active"))?;
+            temp.write_all(json.as_bytes())?;
+            temp.as_file().sync_all()?;
+
+            match fs::hard_link(temp.path(), &path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(self.archive_path(&entry.id));
+                    return Ok(entry);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match self.read_active(&entry.id) {
+                        Ok(existing)
+                            if existing.title == entry.title
+                                && existing.body.trim() == entry.body.trim() =>
+                        {
+                            return Ok(existing);
+                        }
+                        Ok(_) => {
+                            suffix = suffix.checked_add(1).ok_or_else(|| {
+                                MemoryError::Invalid("too many colliding memory ids".to_string())
+                            })?;
+                        }
+                        Err(MemoryError::NotFound(_)) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(MemoryError::Io(error)),
+            }
+        }
     }
 
     pub fn read_active(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
@@ -212,6 +260,32 @@ impl MemoryStore {
             .map(|(i, s)| (entries[i].clone(), s))
             .collect())
     }
+}
+
+fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
+    if entry.id.trim().is_empty() || entry.title.trim().is_empty() {
+        return Err(MemoryError::Invalid(
+            "id and title are required".to_string(),
+        ));
+    }
+    if entry.id.contains('/') || entry.id.contains('\\') || entry.id.contains("..") {
+        return Err(MemoryError::Invalid("id must be a plain slug".to_string()));
+    }
+    Ok(())
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| MemoryError::Invalid("memory path has no parent".to_string()))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".memory-")
+        .tempfile_in(parent)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map(|_| ())
+        .map_err(|error| MemoryError::Io(error.error))
 }
 
 /// Build a new entry with a slug id from title.
@@ -378,6 +452,45 @@ mod tests {
         store.forget(&entry.id).unwrap();
         assert!(store.search("workspace", 5).unwrap().is_empty());
         assert!(store.archive_path(&entry.id).exists());
+    }
+
+    #[test]
+    fn concurrent_deduplicated_remembers_never_clobber_each_other() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let mut threads = Vec::new();
+        for index in 0..8 {
+            let store = store.clone();
+            let gate = gate.clone();
+            threads.push(std::thread::spawn(move || {
+                let entry = new_entry("Deploy notes", &format!("fact {index}"), vec![]);
+                gate.wait();
+                store.remember_deduplicated(entry).unwrap()
+            }));
+        }
+        gate.wait();
+        let saved: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let ids: std::collections::HashSet<_> =
+            saved.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(store.list_active().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn deduplication_does_not_treat_a_corrupt_entry_as_a_free_id() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        std::fs::write(store.active_path("deploy-notes"), "{not-json").unwrap();
+
+        let error = store
+            .remember_deduplicated(new_entry("Deploy notes", "fact", vec![]))
+            .unwrap_err();
+        assert!(matches!(error, MemoryError::Serde(_)), "{error}");
+        assert!(!store.active_path("deploy-notes-2").exists());
     }
 
     #[test]

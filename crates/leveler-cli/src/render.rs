@@ -332,6 +332,7 @@ fn render_event_text(event: AgentEvent) {
             let label = match kind {
                 AdvisoryKind::CompletenessAudit => "completeness audit",
                 AdvisoryKind::ContextCompaction => "compacting context",
+                AdvisoryKind::GoalContinuation => "continuing active goal",
                 AdvisoryKind::CloseoutNudge(reason) => match reason {
                     leveler_agent::closeout::CloseoutReason::GoalUnresolved => {
                         "nudge: goal unresolved"

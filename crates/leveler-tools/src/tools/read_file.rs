@@ -59,7 +59,7 @@ impl Tool for ReadFileTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let path = context.workspace.resolve_read(&input.path)?;
@@ -99,8 +99,8 @@ impl Tool for ReadFileTool {
             input.start_line.unwrap_or(0),
             input.end_line.unwrap_or(0)
         );
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ToolOutput::error(crate::recoverable::missing_file(
                     &input.path,
@@ -108,65 +108,120 @@ impl Tool for ReadFileTool {
             }
             Err(e) => return Err(ToolError::Io(format!("read {}: {e}", input.path))),
         };
-        let repeated = context.read_guard.tripped(&range_key, &bytes);
 
-        // Reject binary content: a NUL byte in the first chunk is a strong signal.
-        let scan = &bytes[..bytes.len().min(8192)];
-        if scan.contains(&0) {
+        let start = input.start_line.unwrap_or(1).max(1);
+        let end = input.end_line.unwrap_or(usize::MAX);
+        let mut out = String::new();
+        let mut reader = tokio::io::BufReader::new(file);
+        let mut line = Vec::new();
+        let mut fingerprint = leveler_context::ContentFingerprint::default();
+        let mut scanned_for_binary = 0usize;
+        let mut binary = false;
+        let mut total_lines = 0usize;
+        let mut first_shown = None;
+        let mut last_shown = 0usize;
+        let mut clipped = false;
+        let mut clipped_inside_line = false;
+
+        // Stream the complete file once: this keeps narrow ranges O(line size)
+        // in memory while still producing the full-file fingerprint needed by
+        // stale-write protection and the total line count used in paging copy.
+        loop {
+            use tokio::io::AsyncBufReadExt;
+            line.clear();
+            let read = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Ok(ToolOutput::error("read_file cancelled"));
+                }
+                read = reader.read_until(b'\n', &mut line) => read,
+            }
+            .map_err(|e| ToolError::Io(format!("read {}: {e}", input.path)))?;
+            if read == 0 {
+                break;
+            }
+            fingerprint.update(&line);
+            if scanned_for_binary < 8192 {
+                let scan_len = (8192 - scanned_for_binary).min(line.len());
+                binary |= line[..scan_len].contains(&0);
+                scanned_for_binary += scan_len;
+            }
+            total_lines += 1;
+            let lineno = total_lines;
+            if clipped || lineno < start || lineno > end {
+                continue;
+            }
+
+            let prefix = format!("{lineno:>6}\t");
+            if out.len() + prefix.len() + 1 > MAX_BYTES {
+                clipped = true;
+                continue;
+            }
+            let mut content_end = line.as_slice();
+            if content_end.ends_with(b"\n") {
+                content_end = &content_end[..content_end.len() - 1];
+            }
+            if content_end.ends_with(b"\r") {
+                content_end = &content_end[..content_end.len() - 1];
+            }
+            let rendered = String::from_utf8_lossy(content_end);
+            let remaining = MAX_BYTES - out.len() - prefix.len() - 1;
+            if rendered.len() > remaining && !out.is_empty() {
+                clipped = true;
+                continue;
+            }
+            let shown = crate::registry::floor_boundary(&rendered, rendered.len().min(remaining));
+            first_shown.get_or_insert(lineno);
+            last_shown = lineno;
+            out.push_str(&prefix);
+            out.push_str(&rendered[..shown]);
+            out.push('\n');
+            if shown < rendered.len() {
+                clipped = true;
+                clipped_inside_line = true;
+            }
+        }
+
+        if binary {
             return Ok(ToolOutput::error(format!(
                 "refusing to read binary file: {}",
                 input.path
             )));
         }
 
-        // Remember the file as the model now sees it, so a later apply_patch can
-        // tell whether something else rewrote it in between.
-        context.file_state.record(&input.path, &bytes);
+        let fingerprint = fingerprint.finish();
+        let repeated = context
+            .read_guard
+            .tripped_fingerprint(&range_key, fingerprint);
+        context
+            .file_state
+            .record_fingerprint(&input.path, fingerprint);
 
-        let text = String::from_utf8_lossy(&bytes);
-
-        let start = input.start_line.unwrap_or(1).max(1);
-        let end = input.end_line.unwrap_or(usize::MAX);
-        let total_lines = text.lines().count();
-
-        let mut out = String::new();
         if repeated {
-            out.push_str(
+            out.insert_str(
+                0,
                 "[note: this unchanged range was read multiple times; returning it again so recovery is not blocked]\n",
             );
         }
-        // The byte cap limits the *output*, not which part of the file is
-        // reachable: line filtering runs over the whole file, so a range past
-        // the cap still returns its lines.
-        let mut first_shown = None;
-        let mut last_shown = 0usize;
-        let mut clipped = false;
-        for (i, line) in text.lines().enumerate() {
-            let lineno = i + 1;
-            if lineno < start {
-                continue;
-            }
-            if lineno > end {
-                break;
-            }
-            if out.len() >= MAX_BYTES {
-                clipped = true;
-                break;
-            }
-            first_shown.get_or_insert(lineno);
-            last_shown = lineno;
-            out.push_str(&format!("{lineno:>6}\t{line}\n"));
-        }
         if clipped {
-            out.push_str(&format!(
-                "… [truncated: lines {}–{} of {total_lines} lines shown ({} bytes \
-                 / ~{} tokens total); continue with start_line={}]\n",
-                first_shown.unwrap_or(start),
-                last_shown,
-                bytes.len(),
-                crate::registry::approx_tokens(bytes.len()),
-                last_shown + 1
-            ));
+            if clipped_inside_line {
+                out.push_str(&format!(
+                    "… [truncated within line {last_shown} of {total_lines}; the file is {} \
+                     bytes / ~{} tokens — use grep or run_command to inspect that long line]\n",
+                    meta.len(),
+                    crate::registry::approx_tokens(meta.len() as usize),
+                ));
+            } else {
+                out.push_str(&format!(
+                    "… [truncated: lines {}–{} of {total_lines} lines shown ({} bytes \
+                     / ~{} tokens total); continue with start_line={}]\n",
+                    first_shown.unwrap_or(start),
+                    last_shown,
+                    meta.len(),
+                    crate::registry::approx_tokens(meta.len() as usize),
+                    last_shown + 1
+                ));
+            }
         }
         if first_shown.is_none() && !clipped {
             out.push_str(&format!(
@@ -287,6 +342,27 @@ mod tests {
             "marker must tell the model how to continue: {}",
             &out.content[out.content.len().saturating_sub(300)..]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn one_very_long_line_is_clipped_before_formatting() {
+        let (ctx, dir) = ctx_with("long.txt", &"x".repeat(MAX_BYTES * 2)).await;
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "long.txt"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.len() <= MAX_BYTES + 512,
+            "a single line must not allocate/return the whole file: {} bytes",
+            out.content.len()
+        );
+        assert!(out.content.contains("truncated"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

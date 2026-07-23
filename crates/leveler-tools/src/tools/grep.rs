@@ -28,9 +28,12 @@ fn clip_line(line: &str) -> String {
 /// Whether a pattern uses regex metacharacters — used only to warn that the
 /// no-ripgrep fallback matched it as a literal substring, not a regex.
 fn looks_like_regex(pattern: &str) -> bool {
-    pattern
-        .chars()
-        .any(|c| matches!(c, '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'))
+    pattern.chars().any(|c| {
+        matches!(
+            c,
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
+        )
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -266,10 +269,8 @@ mod tests {
     fn builtin_grep_marks_capped_results() {
         // The fallback must not silently stop at max: exactly-max output with
         // no marker is indistinguishable from a complete result.
-        let dir = std::env::temp_dir().join(format!(
-            "leveler-grep-cap-{}",
-            super::super::test_ordinal()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("leveler-grep-cap-{}", super::super::test_ordinal()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.rs"), "hit\nhit\nhit\n").unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
@@ -298,7 +299,11 @@ mod tests {
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
         let out = builtin_grep(&ctx, "needle", &dir, 10).unwrap();
-        assert!(out.content.contains("needle"), "still matches: {}", out.content);
+        assert!(
+            out.content.contains("needle"),
+            "still matches: {}",
+            out.content
+        );
         assert!(
             out.content.contains("line truncated"),
             "long line must be clipped: {}",
@@ -317,10 +322,8 @@ mod tests {
     fn builtin_fallback_flags_that_a_regex_was_matched_literally() {
         // Without ripgrep the fallback is a substring scan; a regex pattern is
         // matched literally, which silently mis-searches. Say so.
-        let dir = std::env::temp_dir().join(format!(
-            "leveler-grep-lit-{}",
-            super::super::test_ordinal()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("leveler-grep-lit-{}", super::super::test_ordinal()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.rs"), "fn foo() {}\n").unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();

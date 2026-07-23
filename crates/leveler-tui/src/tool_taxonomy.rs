@@ -82,18 +82,10 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         visibility: ActivityVisibility::Normal,
     },
     ToolTaxonomyEntry {
-        name: "repository_search",
+        name: "find_files",
         kind: ToolKind::Search,
-        presentation_en: "Search code",
-        presentation_zh: "搜索代码",
-        read_only_default: true,
-        visibility: ActivityVisibility::Normal,
-    },
-    ToolTaxonomyEntry {
-        name: "glob",
-        kind: ToolKind::Search,
-        presentation_en: "Search code",
-        presentation_zh: "搜索代码",
+        presentation_en: "Find files",
+        presentation_zh: "查找文件",
         read_only_default: true,
         visibility: ActivityVisibility::Normal,
     },
@@ -421,7 +413,7 @@ pub fn is_exploration_tool(name: &str) -> bool {
     ) || name == "read_file"
         || name == "list_files"
         || name == "grep"
-        || name == "repository_search"
+        || name == "find_files"
 }
 
 fn is_silent_shell_probe(name: &str, arguments: &str) -> bool {

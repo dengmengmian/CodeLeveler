@@ -282,10 +282,7 @@ mod tests {
         // A function named `helper` in a.rs and another in b.rs both reference the
         // target. They are distinct impacts — keying dedup on the bare name would
         // silently drop one and under-report the blast radius.
-        let graph = HashMap::from([(
-            "target",
-            vec![r("a.rs", "helper"), r("b.rs", "helper")],
-        )]);
+        let graph = HashMap::from([("target", vec![r("a.rs", "helper"), r("b.rs", "helper")])]);
         let by_depth = compute_blast_radius("target", 2, &MockResolver(graph)).await;
         assert_eq!(by_depth.len(), 1);
         assert_eq!(

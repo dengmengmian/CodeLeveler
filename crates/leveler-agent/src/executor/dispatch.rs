@@ -317,7 +317,7 @@ pub(crate) fn is_plan_explore_tool(name: &str) -> bool {
         "read_file"
             | "list_files"
             | "grep"
-            | "repository_search"
+            | "find_files"
             | "find_symbol"
             | "read_symbol"
             | "find_references"

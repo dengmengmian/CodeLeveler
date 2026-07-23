@@ -324,6 +324,7 @@ impl EventBridge {
                 let label = match kind {
                     leveler_agent::AdvisoryKind::CompletenessAudit => "完成度审计中…",
                     leveler_agent::AdvisoryKind::ContextCompaction => "压缩上下文中…",
+                    leveler_agent::AdvisoryKind::GoalContinuation => "目标未确认完成,续跑一轮",
                     leveler_agent::AdvisoryKind::CloseoutNudge(reason) => match reason {
                         CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
                         CloseoutReason::MissingEvidence => "催办:改动缺验证证据,再询一轮",

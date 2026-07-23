@@ -201,6 +201,11 @@ pub enum AdvisoryKind {
     /// model is being re-prompted. Without this the user sees the "final"
     /// answer, then an unexplained extra model round.
     CloseoutNudge(closeout::CloseoutReason),
+    /// The engine opened another goal turn after a stalled one
+    /// (`continue_active_goal`). This is a whole turn, not one round, and it
+    /// starts after the user already read a final answer — unlabelled it is
+    /// indistinguishable from a hang.
+    GoalContinuation,
 }
 
 impl AdvisoryKind {
@@ -209,6 +214,7 @@ impl AdvisoryKind {
         match self {
             AdvisoryKind::CompletenessAudit => "completeness_audit",
             AdvisoryKind::ContextCompaction => "context_compaction",
+            AdvisoryKind::GoalContinuation => "goal_continuation",
             AdvisoryKind::CloseoutNudge(reason) => match reason {
                 closeout::CloseoutReason::GoalUnresolved => "nudge_goal_unresolved",
                 closeout::CloseoutReason::MissingEvidence => "nudge_missing_evidence",
@@ -223,6 +229,7 @@ impl AdvisoryKind {
         match key {
             "completeness_audit" => Some(AdvisoryKind::CompletenessAudit),
             "context_compaction" => Some(AdvisoryKind::ContextCompaction),
+            "goal_continuation" => Some(AdvisoryKind::GoalContinuation),
             _ => {
                 let reason = closeout::CloseoutReason::from_key(key.strip_prefix("nudge_")?)?;
                 Some(AdvisoryKind::CloseoutNudge(reason))
@@ -241,6 +248,7 @@ mod advisory_kind_tests {
         let all = [
             AdvisoryKind::CompletenessAudit,
             AdvisoryKind::ContextCompaction,
+            AdvisoryKind::GoalContinuation,
             AdvisoryKind::CloseoutNudge(CloseoutReason::GoalUnresolved),
             AdvisoryKind::CloseoutNudge(CloseoutReason::MissingEvidence),
             AdvisoryKind::CloseoutNudge(CloseoutReason::EmptyAnswer),

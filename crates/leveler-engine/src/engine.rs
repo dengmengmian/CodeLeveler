@@ -1041,6 +1041,15 @@ impl TaskEngine {
                 );
                 break;
             }
+            // Announce BEFORE the transcript load / compaction / model call.
+            // Everything below is invisible work that happens after the user
+            // already read a final answer; without this the status line shows
+            // a bare "waiting for model" for the whole continuation.
+            observer(EngineEvent::AdvisoryStarted {
+                kind: leveler_agent::AdvisoryKind::GoalContinuation
+                    .as_key()
+                    .to_string(),
+            });
             let payloads = leveler_storage::MessageRepository::new(&self.db)
                 .load(&runner.session_id)
                 .await?;

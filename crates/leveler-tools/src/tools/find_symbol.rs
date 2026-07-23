@@ -107,18 +107,13 @@ async fn lsp_lookup(context: &ToolContext, root: &std::path::Path, symbol: &str)
         let key = language.as_str().to_string();
         // Clone the session Arc out under the lock, then drop it before the
         // request/retry loop so LSP tools don't serialize on the global lock.
-        let client = {
-            let mut sessions = context.lsp_sessions.lock().await;
-            if !sessions.contains_key(&key) {
-                match leveler_lsp::LspClient::start(&spec.program, &spec.args, root).await {
-                    Ok(client) => {
-                        sessions.insert(key.clone(), std::sync::Arc::new(client));
-                    }
-                    Err(_) => continue,
-                }
-            }
-            sessions.get(&key)?.clone()
-        };
+        let client =
+            match super::symbols::get_or_start_lsp(context, &key, &spec.program, &spec.args, root)
+                .await
+            {
+                Ok(client) => client,
+                Err(_) => continue,
+            };
 
         // The server may still be indexing on first use; retry briefly.
         let mut located = Vec::new();
@@ -139,7 +134,8 @@ async fn lsp_lookup(context: &ToolContext, root: &std::path::Path, symbol: &str)
             }
         }
         if server_died {
-            context.lsp_sessions.lock().await.remove(&key);
+            let mut sessions = context.lsp_sessions.lock().await;
+            super::symbols::remove_if_same(&mut sessions, &key, &client);
         }
 
         let matches: Vec<_> = located

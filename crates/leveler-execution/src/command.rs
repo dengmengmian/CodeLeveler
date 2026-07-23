@@ -1116,8 +1116,8 @@ async fn read_capped(
         // indefinitely, and there is no more of the child's own output to get.
         let read = tokio::select! {
             biased;
-            read = p.read(&mut buf) => read,
             _ = drain.cancelled() => break,
+            read = p.read(&mut buf) => read,
         };
         match read {
             Ok(0) | Err(_) => break,
@@ -1230,8 +1230,89 @@ mod tests {
         .await
         .expect("runner must return promptly, not hang on the detached grandchild's pipe")
         .expect("process ran");
-        assert!(out.stdout.contains("hi"), "buffered output must survive: {out:?}");
-        assert!(!out.timed_out, "the shell exited normally; not a timeout: {out:?}");
+        assert!(
+            out.stdout.contains("hi"),
+            "buffered output must survive: {out:?}"
+        );
+        assert!(
+            !out.timed_out,
+            "the shell exited normally; not a timeout: {out:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn drain_deadline_is_not_starved_by_a_continuously_writable_pipe() {
+        // The fallback killer makes this test self-cleaning even against the
+        // broken implementation: the writer stops after two seconds. A correct
+        // runner honors PIPE_DRAIN_GRACE and returns well before that.
+        let mut req = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "(while :; do echo x; done) & writer=$!; \
+                 (sleep 2; kill \"$writer\") >/dev/null 2>&1 &"
+                    .into(),
+            ],
+            std::env::temp_dir(),
+        );
+        req.timeout = Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let out = unix_host_runner()
+            .run(req, CancellationToken::new())
+            .await
+            .expect("process ran");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a ready read branch must not starve the drain deadline"
+        );
+        assert!(out.stdout.contains('x'));
+    }
+
+    #[tokio::test]
+    async fn an_already_fired_drain_deadline_wins_over_an_always_ready_reader() {
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct AlwaysReady {
+            remaining_reads: usize,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for AlwaysReady {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.remaining_reads == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                self.remaining_reads -= 1;
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                buf.put_slice(b"x");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut pipe = Some(AlwaysReady {
+            remaining_reads: 10_000,
+            reads: reads.clone(),
+        });
+        let drain = CancellationToken::new();
+        drain.cancel();
+        let _ = read_capped(&mut pipe, 1024, drain).await;
+
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            0,
+            "the fired deadline must be checked before a perpetually ready pipe"
+        );
     }
 
     #[tokio::test]
@@ -1740,7 +1821,9 @@ mod tests {
         .unwrap();
         std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
 
-        let mut variables: Vec<_> = std::env::vars_os().collect();
+        let mut variables: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| name != "CARGO_TARGET_DIR")
+            .collect();
         variables.push((
             "LEVELER_HOME".into(),
             base.path().join("home").into_os_string(),
@@ -1967,7 +2050,9 @@ mod tests {
 
         let leveler_home = base.path().join("leveler-home");
         assert!(!leveler_home.exists(), "private cache starts empty");
-        let mut variables: Vec<_> = std::env::vars_os().collect();
+        let mut variables: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| name != "CARGO_TARGET_DIR")
+            .collect();
         variables.push(("CARGO_HOME".into(), host_cargo.clone().into_os_string()));
         variables.push(("LEVELER_HOME".into(), leveler_home.clone().into_os_string()));
         let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(

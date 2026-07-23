@@ -396,8 +396,7 @@ mod tests {
         // carries a UTF-8 BOM. Matching must strip the BOM (or the first-line
         // hunk never locates), and the BOM must be restored on write.
         let original = "\u{FEFF}alpha\nbeta\n";
-        let out =
-            apply_update(original, &[chunk(&["alpha", "beta"], &["alpha", "BETA"])]).unwrap();
+        let out = apply_update(original, &[chunk(&["alpha", "beta"], &["alpha", "BETA"])]).unwrap();
         assert_eq!(out, "\u{FEFF}alpha\nBETA\n");
     }
 

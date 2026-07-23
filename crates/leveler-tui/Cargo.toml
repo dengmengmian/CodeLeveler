@@ -11,6 +11,7 @@ description = "CodeLeveler interactive terminal UI (Ratatui/Crossterm): AppState
 [dependencies]
 leveler-core = { workspace = true }
 leveler-client-protocol = { workspace = true }
+leveler-model = { workspace = true }
 leveler-skills = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
