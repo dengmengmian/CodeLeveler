@@ -42,20 +42,30 @@ impl Checkpoint {
         if map.contains_key(path) {
             return;
         }
-        let original = match std::fs::read(path).ok() {
-            None => Original::Absent,
-            Some(bytes) if bytes.len() <= MAX_IN_MEMORY_ORIGINAL => Original::InMemory(bytes),
-            Some(bytes) => match spill(&bytes) {
+        // Size-gate BEFORE reading: a large original is spilled via a streaming
+        // copy so recording a multi-GB artifact never loads it into memory.
+        let original = match std::fs::metadata(path) {
+            Err(_) => Original::Absent,
+            Ok(meta) if meta.len() as usize <= MAX_IN_MEMORY_ORIGINAL => {
+                match std::fs::read(path).ok() {
+                    None => Original::Absent,
+                    Some(bytes) => Original::InMemory(bytes),
+                }
+            }
+            Ok(_) => match spill_copy(path) {
                 Ok(spill_path) => Original::Spilled(spill_path),
-                // Rollback safety beats memory: keep it resident rather than
-                // silently losing the ability to restore.
+                // Rollback safety beats memory: fall back to reading it
+                // resident rather than silently losing the ability to restore.
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "could not spill large checkpoint original; keeping in memory"
+                        "could not spill large checkpoint original; reading it into memory"
                     );
-                    Original::InMemory(bytes)
+                    match std::fs::read(path).ok() {
+                        None => Original::Absent,
+                        Some(bytes) => Original::InMemory(bytes),
+                    }
                 }
             },
         };
@@ -102,13 +112,13 @@ impl Checkpoint {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(path, bytes)?;
+                    replace_atomically(path, |tmp| std::fs::write(tmp, bytes))?;
                 }
                 Original::Spilled(spill_path) => {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::copy(spill_path, path)?;
+                    replace_atomically(path, |tmp| std::fs::copy(spill_path, tmp).map(|_| ()))?;
                 }
                 Original::Absent => match std::fs::remove_file(path) {
                     Ok(()) => {}
@@ -129,16 +139,36 @@ impl Drop for Checkpoint {
     }
 }
 
-/// Write a large original into a unique session temp file.
-fn spill(bytes: &[u8]) -> std::io::Result<PathBuf> {
+/// Stream a large original into a unique session temp file without loading it
+/// into memory.
+fn spill_copy(src: &Path) -> std::io::Result<PathBuf> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "leveler-checkpoint-{}-{}.orig",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&path, bytes)?;
+    std::fs::copy(src, &path)?;
     Ok(path)
+}
+
+/// Replace `path` by staging into a same-directory temp file and renaming, so
+/// an interrupted restore never leaves a truncated target.
+fn replace_atomically(
+    path: &Path,
+    stage: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".{file_name}.leveler-restore-tmp"));
+    stage(&tmp)?;
+    let renamed = std::fs::rename(&tmp, path);
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
 }
 
 fn remove_spill_files(map: &HashMap<PathBuf, Original>) {
@@ -215,6 +245,60 @@ mod tests {
             "spilled originals must still restore byte-for-byte"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_restore_is_retryable_and_leaves_no_temp_residue() {
+        // One unrestorable file must not poison the checkpoint: the captured
+        // originals survive the error, a retry completes the rollback, and no
+        // staging temp files are left behind.
+        let dir = tmp();
+        let plain = dir.join("plain.txt");
+        let nested = dir.join("sub").join("nested.txt");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&plain, "plain-original").unwrap();
+        std::fs::write(&nested, "nested-original").unwrap();
+
+        let cp = Checkpoint::new();
+        cp.record(&plain);
+        cp.record(&nested);
+        std::fs::write(&plain, "plain-modified").unwrap();
+        std::fs::write(&nested, "nested-modified").unwrap();
+
+        // Block the nested restore: its parent dir becomes a plain file.
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub"), "blocker").unwrap();
+        assert!(cp.restore().is_err(), "blocked restore must surface the error");
+
+        // Unblock and retry: BOTH files must come back to their originals.
+        std::fs::remove_file(dir.join("sub")).unwrap();
+        cp.restore().unwrap();
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "plain-original");
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "nested-original");
+
+        // No staging residue anywhere in the tree.
+        for entry in walkdir(&dir) {
+            assert!(
+                !entry.to_string_lossy().contains("restore-tmp"),
+                "staging temp must not survive: {entry:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn walkdir(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(read) = std::fs::read_dir(dir) {
+            for e in read.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walkdir(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     #[test]

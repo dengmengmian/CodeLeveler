@@ -233,7 +233,8 @@ pub(crate) async fn execute_program(
         }
     }
     let mut request = ProcessRequest::new(program.to_string(), args, cwd);
-    request.timeout = Duration::from_secs(timeout_seconds.unwrap_or(120));
+    let timeout = resolve_timeout(timeout_seconds);
+    request.timeout = timeout;
     request.deny_network = context.deny_network;
     request.deny_env = context.deny_env.as_ref().clone();
     // OS confinement when not full-access / turn-unrestricted:
@@ -359,7 +360,9 @@ pub(crate) async fn execute_program(
 
     let mut body = String::new();
     if output.timed_out {
-        body.push_str("[timed out]\n");
+        // Name the limit that fired: the model can't tell a too-tight timeout
+        // from a genuinely hung command without it.
+        body.push_str(&format!("[timed out after {}s]\n", timeout.as_secs()));
     }
     body.push_str(&format!(
         "exit: {}\n",
@@ -425,7 +428,6 @@ fn sandbox_denial_hint(sandboxed: bool, success: bool, body: &str) -> Option<&'s
     }
 }
 
-/// Legacy marker truncation, kept for unit tests of the no-store path shape.
 #[cfg(test)]
 mod hang_guard_tests {
     use super::*;
@@ -618,40 +620,49 @@ mod grant_tests {
     }
 }
 
-#[cfg(test)]
-fn truncate(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT {
-        return s.to_string();
-    }
-    let mut end = MAX_OUTPUT;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n… [truncated]\n", &s[..end])
-}
-
-/// Show at most `MAX_OUTPUT` bytes. When the output is larger and an artifact
+/// Show at most `MAX_OUTPUT` bytes, keeping head AND tail (build/test errors
+/// land at the end) with an elision marker between, mirroring
+/// [`crate::registry::cap_output`]. When the output is larger and an artifact
 /// store is available, spill the FULL output to a content-addressed file and
-/// reference it, so nothing is silently lost — the model (or user) can read
-/// the full output back. Without a store, fall back to marker truncation.
+/// reference it in the marker, so nothing is silently lost — the model (or
+/// user) can read the full output back.
 fn truncate_or_spill(s: &str, store: Option<&leveler_execution::ArtifactStore>) -> String {
     if s.len() <= MAX_OUTPUT {
         return s.to_string();
     }
-    let mut end = MAX_OUTPUT;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    match store.and_then(|store| store.write_text(s).ok()) {
+    let head = crate::registry::floor_boundary(s, MAX_OUTPUT / 2);
+    let tail = crate::registry::ceil_boundary(s, s.len() - MAX_OUTPUT / 4);
+    let elided_tokens = crate::registry::approx_tokens(tail - head);
+    let marker = match store.and_then(|store| store.write_text(s).ok()) {
         Some(art) => format!(
-            "{}\n… [truncated to {} of {} bytes; full output: {}]\n",
-            &s[..end],
-            MAX_OUTPUT,
-            art.size_bytes,
+            "… [{} of {} bytes (~{elided_tokens} tokens) elided; full output: {}] …",
+            tail - head,
+            s.len(),
             art.path.display()
         ),
-        None => format!("{}\n… [truncated]\n", &s[..end]),
-    }
+        None => format!(
+            "… [{} of {} bytes (~{elided_tokens} tokens) elided] …",
+            tail - head,
+            s.len()
+        ),
+    };
+    format!("{}\n{}\n{}", &s[..head], marker, &s[tail..])
+}
+
+/// Default command timeout, and the ceiling we clamp any request to.
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 3600;
+
+/// Resolve the effective timeout. A missing or zero value uses the default
+/// (zero would otherwise mean "expire immediately"); anything above the ceiling
+/// is clamped so a stray huge value can't wedge the agent forever — use
+/// `background=true` for genuinely long-lived processes.
+fn resolve_timeout(timeout_seconds: Option<u64>) -> Duration {
+    let secs = timeout_seconds
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .min(MAX_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 fn normalize_args(program: &str, mut args: Vec<String>) -> Vec<String> {
@@ -671,6 +682,18 @@ fn normalize_args(program: &str, mut args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_timeout_defaults_zero_and_clamps_huge() {
+        assert_eq!(resolve_timeout(None), Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        // Zero would expire instantly — fall back to the default instead.
+        assert_eq!(resolve_timeout(Some(0)), Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(resolve_timeout(Some(45)), Duration::from_secs(45));
+        assert_eq!(
+            resolve_timeout(Some(u64::MAX)),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+    }
 
     #[test]
     fn sandbox_denial_gets_a_hint_only_when_relevant() {
@@ -713,6 +736,37 @@ mod tests {
     }
 
     #[test]
+    fn truncate_or_spill_keeps_head_and_tail() {
+        // Errors land at the end of build/test output; truncation must keep the
+        // tail, not just the head.
+        let big = format!("HEAD{}TAIL", "z".repeat(MAX_OUTPUT));
+        let shown = truncate_or_spill(&big, None);
+        assert!(shown.len() < big.len(), "must shrink");
+        assert!(shown.starts_with("HEAD"), "keeps the head");
+        assert!(shown.trim_end().ends_with("TAIL"), "keeps the tail");
+        assert!(shown.contains("elided"), "marks the elision");
+    }
+
+    #[test]
+    fn truncate_or_spill_with_store_keeps_tail_and_references_artifact() {
+        let big = format!("HEAD{}TAIL", "z".repeat(MAX_OUTPUT));
+        let root = std::env::temp_dir().join(format!(
+            "leveler-spill-tail-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let store = leveler_execution::ArtifactStore::new(&root);
+        let shown = truncate_or_spill(&big, Some(&store));
+        assert!(shown.starts_with("HEAD"), "keeps the head");
+        assert!(shown.trim_end().ends_with("TAIL"), "keeps the tail");
+        assert!(
+            shown.contains(&format!("full output: {}", root.display())),
+            "must reference the artifact path: {shown}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn truncate_or_spill_writes_full_output_and_references_it() {
         let big = "x".repeat(MAX_OUTPUT + 5000);
         let root = std::env::temp_dir().join(format!(
@@ -726,8 +780,7 @@ mod tests {
         assert!(shown.len() < big.len(), "the shown output must be capped");
         assert!(
             shown.contains(&format!("full output: {}", root.display())),
-            "must reference the artifact path: {}",
-            &shown[shown.len().saturating_sub(120)..]
+            "must reference the artifact path: {shown}"
         );
         assert!(shown.contains(&format!("of {} bytes", big.len())));
         // The referenced file holds the FULL, untruncated output.
@@ -736,7 +789,9 @@ mod tests {
             .split("full output: ")
             .nth(1)
             .unwrap()
-            .trim_end_matches(']');
+            .split(']')
+            .next()
+            .unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), big);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -745,7 +800,7 @@ mod tests {
     fn truncate_or_spill_without_a_store_falls_back_to_marker() {
         let big = "y".repeat(MAX_OUTPUT + 100);
         let shown = truncate_or_spill(&big, None);
-        assert!(shown.contains("… [truncated]"));
+        assert!(shown.contains("elided"));
         assert!(!shown.contains("full output:"));
     }
 
@@ -831,20 +886,6 @@ mod tests {
         );
         assert!(!out.is_error);
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn truncate_leaves_short_output_untouched() {
-        assert_eq!(truncate("hello"), "hello");
-    }
-
-    #[test]
-    fn truncate_clips_and_marks_long_output() {
-        let big = "x".repeat(MAX_OUTPUT + 10);
-        let out = truncate(&big);
-        assert!(out.ends_with("\n… [truncated]\n"));
-        // The prefix is clamped to MAX_OUTPUT bytes, so the total stays bounded.
-        assert!(out.len() <= MAX_OUTPUT + "\n… [truncated]\n".len());
     }
 
     // Invokes bare Unix `pwd`; Git's pwd.exe fails to initialize under the

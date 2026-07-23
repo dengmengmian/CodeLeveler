@@ -75,7 +75,17 @@ struct Input {
 
 /// A resolved filesystem operation, computed before anything is written.
 enum Op {
-    Write { path: PathBuf, content: String },
+    /// Update an existing file in place: commit compares the on-disk bytes
+    /// against `expected` (what the plan phase read) before swapping in
+    /// `content`, so a concurrent writer can't be silently clobbered.
+    Replace {
+        path: PathBuf,
+        expected: String,
+        content: String,
+    },
+    /// Create a new file (`Add File`, or an `Update … Move to:` destination):
+    /// no prior version to match against.
+    Create { path: PathBuf, content: String },
     Remove { path: PathBuf },
 }
 
@@ -103,7 +113,7 @@ impl Tool for ApplyPatchTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
@@ -124,7 +134,7 @@ impl Tool for ApplyPatchTool {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
                     };
-                    ops.push(Op::Write {
+                    ops.push(Op::Create {
                         path: resolved,
                         content,
                     });
@@ -192,7 +202,7 @@ impl Tool for ApplyPatchTool {
                                 Err(e) => return Ok(ToolOutput::error(e.to_string())),
                             };
                             ops.push(Op::Remove { path: resolved });
-                            ops.push(Op::Write {
+                            ops.push(Op::Create {
                                 path: dest_resolved,
                                 content: updated,
                             });
@@ -200,8 +210,9 @@ impl Tool for ApplyPatchTool {
                             modified.push(dest);
                         }
                         None => {
-                            ops.push(Op::Write {
+                            ops.push(Op::Replace {
                                 path: resolved,
+                                expected: existing,
                                 content: updated,
                             });
                             summary.push(format!("M {path}"));
@@ -249,30 +260,41 @@ impl Tool for ApplyPatchTool {
             }
         }
 
-        // Commit phase — now that everything resolved, write to disk. Each file
-        // is checkpointed just before it is first modified (spec §28).
+        // Commit phase — now that everything resolved, write to disk through the
+        // shared lock + compare-and-swap engine (same as `replace`): an in-place
+        // Update refuses if the file moved on disk since the plan phase read it,
+        // so a concurrent writer is never silently clobbered. Each file is
+        // checkpointed just before it is first modified (spec §28).
         for op in ops {
             match op {
-                Op::Write { path, content } => {
-                    context.checkpoint.record(&path);
-                    if let Some(parent) = path.parent() {
-                        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                            ToolError::Io(format!("mkdir {}: {e}", parent.display()))
-                        })?;
+                Op::Replace {
+                    path,
+                    expected,
+                    content,
+                } => match super::replace::commit_replace(&context, &path, &expected, &content)
+                    .await?
+                {
+                    super::replace::Commit::Written => {}
+                    super::replace::Commit::Stale => {
+                        return Ok(ToolOutput::error(format!(
+                            "{} changed on disk between planning and writing this patch — \
+                             another process or command edited it. Re-read it and rebuild the \
+                             patch against what is there now.",
+                            path.display()
+                        )));
                     }
-                    // Atomic write: stage into a sibling temp file, then rename
-                    // over the target so a crash mid-write never leaves a
-                    // half-written (corrupt) source file (atomcode semantics).
-                    let tmp = path.with_extension(format!(
-                        "{}.leveler-tmp",
-                        path.extension().and_then(|e| e.to_str()).unwrap_or("")
-                    ));
-                    tokio::fs::write(&tmp, content)
-                        .await
-                        .map_err(|e| ToolError::Io(format!("write {}: {e}", tmp.display())))?;
-                    tokio::fs::rename(&tmp, &path).await.map_err(|e| {
-                        ToolError::Io(format!("rename into {}: {e}", path.display()))
-                    })?;
+                    super::replace::Commit::Rejected(message) => {
+                        return Ok(ToolOutput::error(message));
+                    }
+                },
+                Op::Create { path, content } => {
+                    match super::replace::commit_create(&context, &path, &content).await? {
+                        super::replace::Commit::Written => {}
+                        super::replace::Commit::Rejected(message) => {
+                            return Ok(ToolOutput::error(message));
+                        }
+                        super::replace::Commit::Stale => unreachable!("create does not CAS"),
+                    }
                 }
                 Op::Remove { path } => {
                     context.checkpoint.record(&path);
@@ -292,7 +314,7 @@ impl Tool for ApplyPatchTool {
                     Ok(bytes) => {
                         context.file_state.record(rel, &bytes);
                         // Auto-format the edited file (best-effort; re-fingerprints).
-                        super::format::format_after_edit(&context, rel, &resolved).await;
+                        super::format::format_after_edit(&context, rel, &resolved, &cancellation).await;
                     }
                     Err(_) => context.file_state.forget(rel),
                 },
@@ -427,6 +449,69 @@ mod tests {
                 .unwrap();
             assert!(!out.is_error, "{}", out.content);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two independent contexts patch the same file, from the same read
+    /// version, at the same time. Without a cross-process lock + compare-and-swap
+    /// at commit, both writes "succeed" and the second silently clobbers the
+    /// first. Mirrors `replace`'s concurrency guarantee: exactly one must be
+    /// rejected as stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_patches_cannot_both_commit_from_the_same_version() {
+        let (first, dir) = ctx();
+        let second = ToolContext::new(
+            leveler_execution::Workspace::new(&dir).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+        );
+        // Both contexts read the file, so neither trips the in-process staleness
+        // guard — the only thing that can reject a writer is the commit-time CAS.
+        for c in [&first, &second] {
+            crate::tools::read_file::ReadFileTool
+                .execute(
+                    serde_json::json!({ "path": "src/lib.rs" }),
+                    c.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let launch = |context: ToolContext,
+                      body: &'static str,
+                      gate: std::sync::Arc<tokio::sync::Barrier>| async move {
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: src/lib.rs\n fn a() {{}}\n-fn b() {{}}\n+fn b() {{ {body} }}\n*** End Patch"
+            );
+            gate.wait().await;
+            ApplyPatchTool
+                .execute(
+                    serde_json::json!({ "patch": patch }),
+                    context,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        };
+        let a = tokio::spawn(launch(first, "A()", gate.clone()));
+        let b = tokio::spawn(launch(second, "B()", gate.clone()));
+        gate.wait().await;
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_ne!(
+            a.is_error, b.is_error,
+            "exactly one stale writer must be rejected; got a.err={} b.err={}\n{}\n{}",
+            a.is_error, b.is_error, a.content, b.content
+        );
+        let final_text = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+        assert!(
+            matches!(
+                final_text.as_str(),
+                "fn a() {}\nfn b() { A() }\n" | "fn a() {}\nfn b() { B() }\n"
+            ),
+            "one writer's content must survive intact, not a torn mix: {final_text:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

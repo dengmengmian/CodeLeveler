@@ -58,17 +58,23 @@ impl Tool for ViewImageTool {
             ));
         };
         let path = context.workspace.resolve_read(&input.path)?;
+        // Check the size before reading, so a huge file is rejected instead of
+        // pulled fully into memory first.
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.len() > MAX_BYTES as u64 => {
+                return Ok(ToolOutput::error(format!(
+                    "图片过大({} KB),上限 {} KB。",
+                    meta.len() / 1024,
+                    MAX_BYTES / 1024
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
+        }
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
         };
-        if bytes.len() > MAX_BYTES {
-            return Ok(ToolOutput::error(format!(
-                "图片过大({} KB),上限 {} KB。",
-                bytes.len() / 1024,
-                MAX_BYTES / 1024
-            )));
-        }
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Ok(ToolOutput::ok(format!(
             "已加载图片 {} ({} KB)。",

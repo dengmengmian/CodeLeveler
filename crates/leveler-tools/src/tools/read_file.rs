@@ -9,8 +9,10 @@ use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-/// Maximum bytes read before truncating (large files go to artifacts later).
+/// Maximum bytes of file content returned per call; ranges page through the rest.
 const MAX_BYTES: usize = 256 * 1024;
+/// Maximum file size read into memory; larger files are refused with guidance.
+const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
@@ -76,6 +78,16 @@ impl Tool for ReadFileTool {
                 &input.path,
             )));
         }
+        if meta.len() > MAX_FILE_BYTES {
+            return Ok(ToolOutput::error(format!(
+                "file too large to read: `{}` is {} bytes (limit {} MB). Use `grep` \
+                 to locate the relevant part, or `run_command` with sed/head/tail \
+                 to slice it.",
+                input.path,
+                meta.len(),
+                MAX_FILE_BYTES / (1024 * 1024)
+            )));
+        }
 
         // Detect wasteful repeated reads of the same unchanged range (spec §28).
         // This is deliberately a nudge, not a denial: edit tools can require a
@@ -111,12 +123,11 @@ impl Tool for ReadFileTool {
         // tell whether something else rewrote it in between.
         context.file_state.record(&input.path, &bytes);
 
-        let truncated = bytes.len() > MAX_BYTES;
-        let slice = &bytes[..bytes.len().min(MAX_BYTES)];
-        let text = String::from_utf8_lossy(slice);
+        let text = String::from_utf8_lossy(&bytes);
 
         let start = input.start_line.unwrap_or(1).max(1);
         let end = input.end_line.unwrap_or(usize::MAX);
+        let total_lines = text.lines().count();
 
         let mut out = String::new();
         if repeated {
@@ -124,6 +135,12 @@ impl Tool for ReadFileTool {
                 "[note: this unchanged range was read multiple times; returning it again so recovery is not blocked]\n",
             );
         }
+        // The byte cap limits the *output*, not which part of the file is
+        // reachable: line filtering runs over the whole file, so a range past
+        // the cap still returns its lines.
+        let mut first_shown = None;
+        let mut last_shown = 0usize;
+        let mut clipped = false;
         for (i, line) in text.lines().enumerate() {
             let lineno = i + 1;
             if lineno < start {
@@ -132,13 +149,29 @@ impl Tool for ReadFileTool {
             if lineno > end {
                 break;
             }
+            if out.len() >= MAX_BYTES {
+                clipped = true;
+                break;
+            }
+            first_shown.get_or_insert(lineno);
+            last_shown = lineno;
             out.push_str(&format!("{lineno:>6}\t{line}\n"));
         }
-        if truncated {
-            out.push_str("… [truncated: file exceeds read limit]\n");
+        if clipped {
+            out.push_str(&format!(
+                "… [truncated: lines {}–{} of {total_lines} lines shown ({} bytes \
+                 / ~{} tokens total); continue with start_line={}]\n",
+                first_shown.unwrap_or(start),
+                last_shown,
+                bytes.len(),
+                crate::registry::approx_tokens(bytes.len()),
+                last_shown + 1
+            ));
         }
-        if out.is_empty() {
-            out.push_str("(no lines in the requested range)\n");
+        if first_shown.is_none() && !clipped {
+            out.push_str(&format!(
+                "(no lines in the requested range; the file has {total_lines} lines)\n"
+            ));
         }
 
         Ok(ToolOutput::ok(out))
@@ -192,6 +225,91 @@ mod tests {
         assert!(out.content.contains("l3"));
         assert!(!out.content.contains("l1"));
         assert!(!out.content.contains("l4"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn range_past_the_byte_cap_still_returns_lines() {
+        // Lock the bug: a line range that starts past MAX_BYTES must still
+        // return content — the byte cap limits the *output*, not which part
+        // of the file is reachable.
+        let per_line = 58;
+        let n = MAX_BYTES / per_line + 200;
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("l{i:06}-{}\n", "x".repeat(per_line - 9)));
+        }
+        let (ctx, dir) = ctx_with("big.txt", &content).await;
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "big.txt", "start_line": n - 5, "end_line": n}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains(&format!("l{:06}", n - 3)),
+            "tail range must be readable: {}",
+            &out.content[..out.content.len().min(300)]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn truncation_marker_reports_total_lines_and_paging() {
+        // A truncated read must tell the model how big the file is and how to
+        // page through it, not a bare "[truncated]".
+        let per_line = 58;
+        let n = MAX_BYTES / per_line + 200;
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("l{i:06}-{}\n", "x".repeat(per_line - 9)));
+        }
+        let (ctx, dir) = ctx_with("big.txt", &content).await;
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "big.txt"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content.contains(&format!("of {n} lines")),
+            "marker must state the total line count: {}",
+            &out.content[out.content.len().saturating_sub(300)..]
+        );
+        assert!(
+            out.content.contains("start_line="),
+            "marker must tell the model how to continue: {}",
+            &out.content[out.content.len().saturating_sub(300)..]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn oversized_file_is_a_recoverable_error() {
+        // Files past the in-memory limit are refused with guidance instead of
+        // being read whole (memory) or silently clipped.
+        let content = "y".repeat(MAX_FILE_BYTES as usize + 1);
+        let (ctx, dir) = ctx_with("huge.bin.log", &content).await;
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "huge.bin.log"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "oversized file must be a model-facing error");
+        assert!(
+            out.content.contains("grep") || out.content.contains("run_command"),
+            "must steer to a tool that can slice it: {}",
+            out.content
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

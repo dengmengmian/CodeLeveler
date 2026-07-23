@@ -7,7 +7,19 @@ use super::seek::seek_sequence;
 /// Chunks must apply in file order; on any hunk that cannot be located this
 /// returns an error and makes no partial change (the caller commits nothing).
 pub fn apply_update(original: &str, chunks: &[UpdateChunk]) -> Result<String, String> {
-    let mut file = split_lines(original);
+    // Preserve the file's byte conventions: strip a leading BOM and fold CRLF to
+    // LF for matching (the model's hunks are LF), then restore both on write —
+    // otherwise a CRLF file comes back with mixed endings and a BOM file's
+    // first-line context never matches.
+    let had_bom = original.starts_with('\u{FEFF}');
+    let stripped = original.strip_prefix('\u{FEFF}').unwrap_or(original);
+    let uses_crlf = detect_crlf(stripped);
+    let normalized = if uses_crlf {
+        stripped.replace("\r\n", "\n")
+    } else {
+        stripped.to_string()
+    };
+    let mut file = split_lines(&normalized);
 
     // Resolve every hunk to a (start, len, replacement) op before mutating.
     let mut ops: Vec<(usize, usize, Vec<String>)> = Vec::new();
@@ -92,7 +104,22 @@ pub fn apply_update(original: &str, chunks: &[UpdateChunk]) -> Result<String, St
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
+    // Restore the original line ending and BOM.
+    if uses_crlf {
+        out = out.replace('\n', "\r\n");
+    }
+    if had_bom {
+        out.insert(0, '\u{FEFF}');
+    }
     Ok(out)
+}
+
+/// Whether the file predominantly uses CRLF line endings, so a rewrite should
+/// too. Counts `\r\n` against LF-only line endings; ties break toward LF.
+fn detect_crlf(s: &str) -> bool {
+    let crlf = s.matches("\r\n").count();
+    let lf_only = s.matches('\n').count() - crlf;
+    crlf > lf_only
 }
 
 /// If a hunk's `old_lines` ends in a blank line that prevents a match, retry
@@ -351,6 +378,27 @@ mod tests {
         // must be dropped as well or a stray empty line is inserted.
         let out = apply_update("a\nb\nc\n", &[chunk(&["b", ""], &["B", ""])]).unwrap();
         assert_eq!(out, "a\nB\nc\n");
+    }
+
+    #[test]
+    fn crlf_file_keeps_crlf_and_does_not_mix_endings() {
+        // A CRLF file must stay CRLF: the old code kept `\r` on untouched lines
+        // and joined with bare `\n`, producing a mixed-ending (corrupt) file.
+        let original = "line1\r\nline2\r\nline3\r\n";
+        let out = apply_update(original, &[chunk(&["line2"], &["LINE2"])]).unwrap();
+        assert_eq!(out, "line1\r\nLINE2\r\nline3\r\n");
+        assert!(!out.contains("\n\r"), "no mixed endings: {out:?}");
+    }
+
+    #[test]
+    fn bom_first_line_context_matches_and_bom_is_preserved() {
+        // The model's context line is plain `alpha`; the file's first line
+        // carries a UTF-8 BOM. Matching must strip the BOM (or the first-line
+        // hunk never locates), and the BOM must be restored on write.
+        let original = "\u{FEFF}alpha\nbeta\n";
+        let out =
+            apply_update(original, &[chunk(&["alpha", "beta"], &["alpha", "BETA"])]).unwrap();
+        assert_eq!(out, "\u{FEFF}alpha\nBETA\n");
     }
 
     #[test]

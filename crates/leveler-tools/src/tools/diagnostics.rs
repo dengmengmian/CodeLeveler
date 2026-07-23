@@ -82,29 +82,47 @@ impl Tool for DiagnosticsTool {
             )));
         };
 
-        // Ensure a session, mirroring the code-intelligence tools.
-        let mut sessions = context.lsp_sessions.lock().await;
+        // Ensure a session, mirroring the code-intelligence tools. Clone the Arc
+        // out and drop the lock before `wait_for_diagnostics` (up to WAIT
+        // seconds) so a diagnostics call doesn't block every other LSP tool.
         let key = language.as_str().to_string();
-        if !sessions.contains_key(&key) {
-            match leveler_lsp::LspClient::start(&spec.program, &spec.args, &root).await {
-                Ok(client) => {
-                    sessions.insert(key.clone(), client);
-                }
-                Err(e) => {
-                    return Ok(ToolOutput::ok(format!(
-                        "(could not start {} language server: {e})\n",
-                        spec.program
-                    )));
+        let client = {
+            let mut sessions = context.lsp_sessions.lock().await;
+            if !sessions.contains_key(&key) {
+                match leveler_lsp::LspClient::start(&spec.program, &spec.args, &root).await {
+                    Ok(client) => {
+                        sessions.insert(key.clone(), std::sync::Arc::new(client));
+                    }
+                    Err(e) => {
+                        return Ok(ToolOutput::ok(format!(
+                            "(could not start {} language server: {e})\n",
+                            spec.program
+                        )));
+                    }
                 }
             }
-        }
-        let Some(client) = sessions.get(&key) else {
-            return Ok(ToolOutput::ok(
-                "(language server unavailable)\n".to_string(),
-            ));
+            match sessions.get(&key) {
+                Some(client) => client.clone(),
+                None => {
+                    return Ok(ToolOutput::ok(
+                        "(language server unavailable)\n".to_string(),
+                    ));
+                }
+            }
         };
         let _ = client.open(&abs, &spec.language_id).await;
         let diags = client.wait_for_diagnostics(&abs, WAIT).await;
+
+        // Distinguish "analyzed and clean" from "the server never reported":
+        // an empty result with no publish is a timeout, not a clean bill.
+        if diags.is_empty() && !client.diagnostics_reported(&abs).await {
+            return Ok(ToolOutput::ok(format!(
+                "(no diagnostics received for `{}` within {}s — the language server may \
+                 still be analyzing; re-run to confirm before trusting a clean result)\n",
+                input.path,
+                WAIT.as_secs()
+            )));
+        }
 
         Ok(ToolOutput::ok(format_diagnostics(&input.path, &diags)))
     }

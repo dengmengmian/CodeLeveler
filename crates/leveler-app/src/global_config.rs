@@ -30,6 +30,7 @@
 //! max_output_tokens = 16384   # optional; default 8192
 //! # parallel_tool_calls = false # optional: force this model serial
 //! # max_parallel_tool_calls = 1 # optional known hard limit
+//! # max_tool_output_bytes = 16384 # optional per-tool-result cap; default 48 KiB
 //!
 //! [[mcp_servers]]             # optional; external MCP tool servers
 //! name = "fs"
@@ -182,6 +183,10 @@ struct GlobalModel {
     /// calls are supported; non-parallel models default to one.
     #[serde(default)]
     max_parallel_tool_calls: Option<usize>,
+    /// Per-tool-result byte budget fed to the executor's central output cap.
+    /// Omitted → 48 KiB. Lower it for weak models with small reliable contexts.
+    #[serde(default)]
+    max_tool_output_bytes: Option<usize>,
     /// Whether the provider accepts a caller-chosen `temperature`. Kimi For
     /// Coding rejects every value but its own default (HTTP 400), so set this
     /// false there. Defaults to true.
@@ -375,6 +380,7 @@ impl GlobalConfig {
                             max_parallel_tool_calls: m
                                 .max_parallel_tool_calls
                                 .unwrap_or(usize::from(!m.parallel_tool_calls)),
+                            max_tool_output_bytes: m.max_tool_output_bytes,
                         },
                         reasoning: ReasoningConfig {
                             style: m.reasoning_style,

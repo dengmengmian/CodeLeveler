@@ -1850,7 +1850,10 @@ impl Executor {
                                     call_id,
                                     // Sub-agent results bypass the registry, so apply
                                     // the central cap here.
-                                    content: leveler_tools::registry::cap_output(&content),
+                                    content: leveler_tools::registry::cap_output_with(
+                                        &content,
+                                        self.tool_context.tool_output_budget,
+                                    ),
                                     is_error: !result.ok,
                                 },
                             });

@@ -25,20 +25,26 @@ pub(crate) async fn lsp_locate(
             continue;
         };
 
-        let mut sessions = context.lsp_sessions.lock().await;
         let key = language.as_str().to_string();
-        if !sessions.contains_key(&key) {
-            match leveler_lsp::LspClient::start(&spec.program, &spec.args, root).await {
-                Ok(client) => {
-                    sessions.insert(key.clone(), client);
+        // Clone the session's Arc out under the lock, then release it before the
+        // request/retry loop — holding the global lock across `sleep` would
+        // serialize every LSP tool and stall them for seconds.
+        let client = {
+            let mut sessions = context.lsp_sessions.lock().await;
+            if !sessions.contains_key(&key) {
+                match leveler_lsp::LspClient::start(&spec.program, &spec.args, root).await {
+                    Ok(client) => {
+                        sessions.insert(key.clone(), std::sync::Arc::new(client));
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
-        }
-        let client = sessions.get(&key)?;
+            sessions.get(&key)?.clone()
+        };
 
         // The server may still be indexing on first use; retry briefly.
         let mut located = Vec::new();
+        let mut server_died = false;
         for _ in 0..6 {
             match client.workspace_symbols(symbol).await {
                 Ok(found) if !found.is_empty() => {
@@ -46,8 +52,19 @@ pub(crate) async fn lsp_locate(
                     break;
                 }
                 Ok(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-                Err(_) => break,
+                // The server crashed or timed out. Evict the dead client so the
+                // NEXT call restarts it — otherwise a single crash/timeout pins a
+                // corpse in the map and this language degrades to scan forever.
+                Err(_) => {
+                    server_died = true;
+                    break;
+                }
             }
+        }
+        if server_died {
+            // Re-acquire only to evict, and only if it's still the same dead
+            // client (a concurrent call may have already restarted it).
+            context.lsp_sessions.lock().await.remove(&key);
         }
         let matches: Vec<_> = located
             .into_iter()
@@ -106,7 +123,18 @@ pub(crate) fn extract_block(text: &str, line: usize, max_lines: usize) -> String
         // Indentation-based languages: return a bounded window.
         end = (line + 20).min(lines.len() - 1);
     }
-    lines[line..=end].join("\n")
+    let mut block = lines[line..=end].join("\n");
+    if !found_end && seen_open {
+        // The braces never closed within the window: the symbol body continues
+        // past the clip. Without a marker the model may treat the clip point as
+        // the end of the definition.
+        block.push_str(&format!(
+            "\n… [symbol body clipped after {max_lines} lines; use read_file \
+             with start_line={} for the rest]",
+            end + 2
+        ));
+    }
+    block
 }
 
 /// The 0-based character offset of `name` on `line_text`, if present.
@@ -120,6 +148,24 @@ pub(crate) fn column_of(line_text: &str, name: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_block_marks_an_unclosed_clip() {
+        // A body longer than max_lines is clipped mid-function; without a
+        // marker the model may treat the clip point as the end of the symbol.
+        let text = format!("fn big() {{\n{}}}\n", "    call();\n".repeat(300));
+        let block = extract_block(&text, 0, 200);
+        assert!(
+            block.contains("clipped"),
+            "mid-body clip must be marked: …{}",
+            &block[block.len().saturating_sub(120)..]
+        );
+        assert!(
+            block.contains("read_file"),
+            "marker should point at the recovery tool: …{}",
+            &block[block.len().saturating_sub(120)..]
+        );
+    }
 
     #[test]
     fn extract_block_captures_a_braced_definition() {

@@ -5,6 +5,13 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// Host environment as it stood when the composition root captured it.
+///
+/// Library crates read this instead of `std::env` so that a value cannot
+/// change under them mid-run and so tests can supply an exact environment.
+/// A snapshot never re-reads the process environment: a variable exported
+/// after capture is invisible here, which is what keeps spawned children from
+/// inheriting credentials that appeared late.
 #[derive(Debug, Clone, Default)]
 pub struct EnvSnapshot {
     values: BTreeMap<OsString, OsString>,
@@ -13,6 +20,8 @@ pub struct EnvSnapshot {
 }
 
 impl EnvSnapshot {
+    /// Capture `values` as the complete environment, with the working and
+    /// temporary directories stated explicitly rather than probed.
     pub fn new(
         values: impl IntoIterator<Item = (OsString, OsString)>,
         current_dir: PathBuf,
@@ -25,23 +34,36 @@ impl EnvSnapshot {
         }
     }
 
+    /// Look up a variable by exact name. Case-sensitive on every platform;
+    /// see [`Self::var_os_case_insensitive`] for Windows-style lookup.
     pub fn var_os(&self, key: impl AsRef<OsStr>) -> Option<OsString> {
         self.values.get(key.as_ref()).cloned()
     }
 
+    /// [`Self::var_os`] restricted to values that are valid UTF-8. A variable
+    /// holding non-UTF-8 bytes reads as absent rather than lossily converted.
     pub fn var(&self, key: impl AsRef<OsStr>) -> Option<String> {
         self.var_os(key).and_then(|v| v.into_string().ok())
     }
 
+    /// Every captured variable, ordered by name.
     pub fn vars_os(&self) -> impl Iterator<Item = (&OsString, &OsString)> {
         self.values.iter()
     }
+
+    /// The working directory at capture time — not the process's current one.
     pub fn current_dir(&self) -> &Path {
         &self.current_dir
     }
+
+    /// The temporary directory at capture time. Sandbox setup treats this as
+    /// untrusted: it may itself sit inside the workspace.
     pub fn temp_dir(&self) -> &Path {
         &self.temp_dir
     }
+
+    /// Split a `PATH`-style variable on the platform separator. Absent or
+    /// empty yields an empty vector.
     pub fn paths(&self, key: impl AsRef<OsStr>) -> Vec<PathBuf> {
         self.var_os(key)
             .map(|v| std::env::split_paths(&v).collect())
@@ -59,6 +81,8 @@ impl EnvSnapshot {
         })
     }
 
+    /// [`Self::paths`] using the case-insensitive lookup of
+    /// [`Self::var_os_case_insensitive`].
     pub fn paths_case_insensitive(&self, key: &str) -> Vec<PathBuf> {
         self.var_os_case_insensitive(key)
             .map(|value| std::env::split_paths(&value).collect())
@@ -68,6 +92,14 @@ impl EnvSnapshot {
 
 static ENVIRONMENT: OnceLock<EnvSnapshot> = OnceLock::new();
 
+/// Install the process-wide snapshot. The composition root calls this once,
+/// before any library code reads [`environment`].
+///
+/// # Errors
+///
+/// Returns the rejected `snapshot` unchanged if one was already installed —
+/// the first install wins, so a second caller cannot swap the environment out
+/// from under code already running against it.
 pub fn install_environment(snapshot: EnvSnapshot) -> Result<(), EnvSnapshot> {
     ENVIRONMENT.set(snapshot)
 }

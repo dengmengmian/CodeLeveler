@@ -30,7 +30,12 @@ fn format_command(path: &Path) -> Option<(&'static str, Vec<String>)> {
 /// every failure. Re-fingerprinting is essential: the formatter rewrites the
 /// file the tool just recorded, so without it the next patch would see the
 /// formatter's change as an outside edit and refuse.
-pub(crate) async fn format_after_edit(context: &ToolContext, rel_path: &str, resolved: &Path) {
+pub(crate) async fn format_after_edit(
+    context: &ToolContext,
+    rel_path: &str,
+    resolved: &Path,
+    cancellation: &CancellationToken,
+) {
     if !context.auto_format {
         return;
     }
@@ -43,8 +48,9 @@ pub(crate) async fn format_after_edit(context: &ToolContext, rel_path: &str, res
     if context.mode == PermissionProfile::Assisted {
         req.write_root = Some(context.workspace.root().to_path_buf());
     }
-    // Best-effort: never let a formatter error or absence fail the edit.
-    let _ = context.runner.run(req, CancellationToken::new()).await;
+    // Best-effort: never let a formatter error or absence fail the edit. Honor
+    // the turn's cancellation so a canceled turn doesn't wait out the formatter.
+    let _ = context.runner.run(req, cancellation.child_token()).await;
     if let Ok(bytes) = tokio::fs::read(resolved).await {
         context.file_state.record(rel_path, &bytes);
     }
@@ -110,7 +116,7 @@ mod tests {
             .with_auto_format(true);
         let resolved = dir.join("m.go");
 
-        format_after_edit(&ctx, "m.go", &resolved).await;
+        format_after_edit(&ctx, "m.go", &resolved, &CancellationToken::new()).await;
 
         let out = std::fs::read_to_string(&resolved).unwrap();
         assert!(

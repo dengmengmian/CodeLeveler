@@ -97,14 +97,18 @@ trait ImpactResolver: Send + Sync {
     async fn referrers(&self, symbol: &str) -> Vec<Referrer>;
 }
 
-/// BFS from `seed` up to `max_depth` hops. A symbol is expanded at most once, so
-/// cycles terminate and a referrer seen at an earlier hop is not re-counted.
+/// BFS from `seed` up to `max_depth` hops. A referrer is counted once per
+/// `(file, symbol)` — a same-named function in another file is a distinct
+/// impact, not a duplicate — while each enclosing symbol *name* is expanded at
+/// most once (the resolver locates by name, so re-expanding a name only repeats
+/// work). Cycles terminate because the expansion set only grows.
 async fn compute_blast_radius(
     seed: &str,
     max_depth: usize,
     resolver: &dyn ImpactResolver,
 ) -> Vec<(usize, Vec<Referrer>)> {
-    let mut visited: HashSet<String> = HashSet::from([seed.to_string()]);
+    let mut counted: HashSet<Referrer> = HashSet::new();
+    let mut expanded: HashSet<String> = HashSet::from([seed.to_string()]);
     let mut frontier = vec![seed.to_string()];
     let mut by_depth = Vec::new();
 
@@ -113,10 +117,10 @@ async fn compute_blast_radius(
         let mut next = Vec::new();
         for sym in &frontier {
             for r in resolver.referrers(sym).await {
-                // Dedup by enclosing symbol: a caller counts once, and expands
-                // once, no matter how many call sites it holds.
-                if visited.insert(r.symbol.clone()) {
-                    next.push(r.symbol.clone());
+                if counted.insert(r.clone()) {
+                    if expanded.insert(r.symbol.clone()) {
+                        next.push(r.symbol.clone());
+                    }
                     found.push(r);
                 }
             }
@@ -190,9 +194,14 @@ impl ImpactResolver for LspResolver<'_> {
         let Some(spec) = leveler_lsp::server_for(language) else {
             return Vec::new();
         };
-        let sessions = self.context.lsp_sessions.lock().await;
-        let Some(client) = sessions.get(language.as_str()) else {
-            return Vec::new();
+        // Clone the session Arc out and drop the lock before the LSP requests so
+        // this BFS doesn't hold the global sessions mutex across many round-trips.
+        let client = {
+            let sessions = self.context.lsp_sessions.lock().await;
+            let Some(client) = sessions.get(language.as_str()) else {
+                return Vec::new();
+            };
+            client.clone()
         };
 
         let def_path = Path::new(&def.path);
@@ -266,6 +275,24 @@ mod tests {
         assert_eq!(by_depth[0].1.len(), 2); // a, b
         assert_eq!(by_depth[1].0, 2);
         assert_eq!(by_depth[1].1, vec![r("c.rs", "c")]); // only c; a is a repeat
+    }
+
+    #[tokio::test]
+    async fn same_name_symbol_in_two_files_counts_as_two_impacts() {
+        // A function named `helper` in a.rs and another in b.rs both reference the
+        // target. They are distinct impacts — keying dedup on the bare name would
+        // silently drop one and under-report the blast radius.
+        let graph = HashMap::from([(
+            "target",
+            vec![r("a.rs", "helper"), r("b.rs", "helper")],
+        )]);
+        let by_depth = compute_blast_radius("target", 2, &MockResolver(graph)).await;
+        assert_eq!(by_depth.len(), 1);
+        assert_eq!(
+            by_depth[0].1.len(),
+            2,
+            "both files' `helper` must count: {by_depth:?}"
+        );
     }
 
     #[tokio::test]

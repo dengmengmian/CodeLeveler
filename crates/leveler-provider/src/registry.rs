@@ -371,6 +371,7 @@ mod limits_tests {
             max_output_tokens: 8192,
             max_tool_schema_bytes: 32768,
             max_parallel_tool_calls: 1,
+            max_tool_output_bytes: None,
         }
     }
 

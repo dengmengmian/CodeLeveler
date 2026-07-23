@@ -166,10 +166,13 @@ impl ExecutorFactory {
             }
             TurnProfile::Node { continuation, .. } => *continuation,
         };
+        // Per-model tool-result budget rides the turn's tool context.
+        let mut tool_context = self.tool_context.clone();
+        tool_context.tool_output_budget = resolved.max_tool_output_bytes;
         let mut executor = Executor::new(
             self.runtime.clone(),
             self.registry.clone(),
-            self.tool_context.clone(),
+            tool_context,
             self.model.clone(),
             0,
         )
@@ -283,6 +286,7 @@ mod tests {
             completion_evidence,
             repeated_read_guard: true,
             reasoning_effort: None,
+            max_tool_output_bytes: 48 * 1024,
         }
     }
 

@@ -104,6 +104,7 @@ pub struct MemoryEventStore {
 }
 
 impl MemoryEventStore {
+    /// An empty store. Events live only as long as the value itself.
     pub fn new() -> Self {
         Self::default()
     }

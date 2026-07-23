@@ -44,9 +44,10 @@ impl Tool for RepositorySearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Find files whose path matches a query (case-insensitive substring), \
-         optionally filtered by extension. Use this to locate files by name; use \
-         `grep` to search file contents."
+        "Find files by a case-insensitive substring of their path, optionally \
+         filtered by extension — forgiving when you're unsure of the exact name \
+         or casing. If you know the precise name shape, `glob` (case-sensitive \
+         patterns) is more targeted; use `grep` to search file contents."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -85,7 +86,7 @@ impl Tool for RepositorySearchTool {
             .collect();
         matches.sort();
         matches.dedup();
-        let truncated = matches.len() > max;
+        let total = matches.len();
         matches.truncate(max);
 
         if matches.is_empty() {
@@ -93,15 +94,19 @@ impl Tool for RepositorySearchTool {
         }
         let mut body = matches.join("\n");
         body.push('\n');
-        if truncated {
-            body.push_str("… [truncated]\n");
+        if total > max {
+            body.push_str(&format!(
+                "… [showing {max} of {total} matches; raise max_results or \
+                 narrow the query]\n"
+            ));
         }
         Ok(ToolOutput::ok(body))
     }
 }
 
 impl RepositorySearchTool {
-    /// Prefer tracked files via `git ls-files`; fall back to a filesystem walk.
+    /// List tracked **and** untracked-but-not-ignored files via git (so a
+    /// just-created file is found), falling back to a filesystem walk.
     async fn list_files(
         &self,
         context: &ToolContext,
@@ -109,7 +114,12 @@ impl RepositorySearchTool {
     ) -> Vec<String> {
         let mut request = ProcessRequest::new(
             "git",
-            vec!["ls-files".into()],
+            vec![
+                "ls-files".into(),
+                "--cached".into(),
+                "--others".into(),
+                "--exclude-standard".into(),
+            ],
             context.workspace.root().to_path_buf(),
         );
         request.timeout = Duration::from_secs(30);
@@ -179,6 +189,39 @@ mod tests {
             .unwrap();
         assert!(out.content.contains("order_service.rs"));
         assert!(!out.content.contains("user.rs"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn capped_results_report_the_total() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-repsearch-cap-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("order_{i}.rs")), "").unwrap();
+        }
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = RepositorySearchTool
+            .execute(
+                serde_json::json!({ "query": "order", "max_results": 2 }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("2 of 3"),
+            "marker must report shown/total: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("max_results"),
+            "marker must name the knob: {}",
+            out.content
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

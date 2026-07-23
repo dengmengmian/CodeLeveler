@@ -12,10 +12,16 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 /// Storage-layer errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// The query itself failed — connection, constraint, or syntax.
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    /// A migration could not be applied at startup.
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    /// A row was read but could not be decoded: an unknown enum string, an
+    /// unparseable timestamp, or a payload version newer than this build
+    /// understands. Signals corruption or a downgrade, never a transient fault,
+    /// so retrying will not help.
     #[error("invalid persisted data: {0}")]
     InvalidData(String),
 }

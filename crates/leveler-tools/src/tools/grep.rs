@@ -11,6 +11,27 @@ use leveler_execution::{ProcessRequest, RiskLevel};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const DEFAULT_MAX: usize = 100;
+/// Per-line character cap: a match on a minified/generated one-line file must
+/// not flood the model's context with a multi-KB line.
+const MAX_LINE_LEN: usize = 500;
+
+/// Clip a single output line to [`MAX_LINE_LEN`] characters, pointing at
+/// `read_file` for the rest. Counts by `char` so multibyte content isn't split.
+fn clip_line(line: &str) -> String {
+    if line.chars().count() <= MAX_LINE_LEN {
+        return line.to_string();
+    }
+    let clipped: String = line.chars().take(MAX_LINE_LEN).collect();
+    format!("{clipped}… [line truncated at {MAX_LINE_LEN} chars; use read_file for the full line]")
+}
+
+/// Whether a pattern uses regex metacharacters — used only to warn that the
+/// no-ripgrep fallback matched it as a literal substring, not a regex.
+fn looks_like_regex(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .any(|c| matches!(c, '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'))
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
@@ -105,9 +126,14 @@ fn relativize(text: &str, root: &std::path::Path) -> String {
 }
 
 fn truncate_lines(text: &str, max: usize) -> String {
-    let mut out: Vec<&str> = text.lines().take(max).collect();
-    if text.lines().count() > max {
-        out.push("… [truncated]");
+    let total = text.lines().count();
+    let mut out: Vec<String> = text.lines().take(max).map(clip_line).collect();
+    if total > max {
+        // `--max-count` is per-file, so `total` is itself a lower bound.
+        out.push(format!(
+            "… [showing first {max} of {total} matched lines; raise max_results \
+             or narrow the pattern/path/glob]"
+        ));
     }
     let mut s = out.join("\n");
     s.push('\n');
@@ -134,18 +160,37 @@ fn builtin_grep(
                     .strip_prefix(context.workspace.root())
                     .unwrap_or(&file)
                     .display();
-                matches.push(format!("{rel}:{}:{}", i + 1, line));
+                matches.push(clip_line(&format!("{rel}:{}:{}", i + 1, line)));
                 if matches.len() >= max {
                     break 'outer;
                 }
             }
         }
     }
-    if matches.is_empty() {
-        Ok(ToolOutput::ok("(no matches)\n"))
+    // Without ripgrep this is a substring scan; a regex-shaped pattern was
+    // matched literally, which silently mis-searches. Tell the model so it can
+    // trust (or discount) the result.
+    let literal_note = if looks_like_regex(pattern) {
+        format!(
+            "[note] ripgrep unavailable — `{pattern}` was matched as a literal substring, \
+             not a regex.\n"
+        )
     } else {
-        let mut s = matches.join("\n");
+        String::new()
+    };
+    if matches.is_empty() {
+        Ok(ToolOutput::ok(format!("{literal_note}(no matches)\n")))
+    } else {
+        let capped = matches.len() >= max;
+        let mut s = literal_note;
+        s.push_str(&matches.join("\n"));
         s.push('\n');
+        if capped {
+            s.push_str(&format!(
+                "… [results capped at {max}; raise max_results or narrow the \
+                 pattern/path]\n"
+            ));
+        }
         Ok(ToolOutput::ok(s))
     }
 }
@@ -212,7 +257,81 @@ mod tests {
         assert!(out.contains("line1"));
         assert!(out.contains("line2"));
         assert!(!out.contains("line3"));
-        assert!(out.contains("… [truncated]"));
+        // The marker must say how much was dropped and how to recover.
+        assert!(out.contains("of 3"), "must report the total: {out}");
+        assert!(out.contains("max_results"), "must name the knob: {out}");
+    }
+
+    #[test]
+    fn builtin_grep_marks_capped_results() {
+        // The fallback must not silently stop at max: exactly-max output with
+        // no marker is indistinguishable from a complete result.
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-grep-cap-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "hit\nhit\nhit\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = builtin_grep(&ctx, "hit", &dir, 2).unwrap();
+        assert_eq!(out.content.matches("hit").count(), 2, "{}", out.content);
+        assert!(
+            out.content.contains("max_results"),
+            "capped fallback results must carry a marker: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grep_clips_very_long_matched_lines() {
+        // A match on a minified/one-line file must not flood the context with a
+        // multi-KB line; clip it and point at read_file for the whole thing.
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-grep-longline-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let long = "x".repeat(2000);
+        std::fs::write(dir.join("min.js"), format!("needle {long}\n")).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = builtin_grep(&ctx, "needle", &dir, 10).unwrap();
+        assert!(out.content.contains("needle"), "still matches: {}", out.content);
+        assert!(
+            out.content.contains("line truncated"),
+            "long line must be clipped: {}",
+            out.content
+        );
+        let match_line = out.content.lines().next().unwrap();
+        assert!(
+            match_line.chars().count() < MAX_LINE_LEN + 100,
+            "clipped line must be bounded: {} chars",
+            match_line.chars().count()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn builtin_fallback_flags_that_a_regex_was_matched_literally() {
+        // Without ripgrep the fallback is a substring scan; a regex pattern is
+        // matched literally, which silently mis-searches. Say so.
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-grep-lit-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn foo() {}\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = builtin_grep(&ctx, "fn.*foo", &dir, 10).unwrap();
+        assert!(
+            out.content.contains("literal substring"),
+            "a regex-shaped pattern in the fallback must be flagged as literal: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -7,13 +7,29 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Every entry needs an expiry date and a reachability check reproducible from
+# this file. Re-run the quoted `cargo tree` command when an entry expires: an
+# empty result means the crate is lockfile-only, a non-empty one means the
+# advisory now applies to a linked dependency and must be re-evaluated.
 ignore = [
-    # Expires 2026-10-01. Unreachable optional sqlx-mysql lockfile dependency;
-    # this workspace enables sqlite only. See audit.toml for the graph check.
+    # rsa — Marvin attack (timing sidechannel). Expires 2026-10-01.
+    # Lockfile-only: pulled in by the optional sqlx-mysql backend, and this
+    # workspace enables sqlite alone. Never linked, on any target:
+    #   $ cargo tree --target all -i rsa
+    #   warning: nothing to print.
     "RUSTSEC-2023-0071",
-    # No safe direct upgrade is currently available. These are unmaintained
-    # transitive dependencies of syntect and ratatui, not vulnerability reports.
+    # bincode 1.x — `informational = "unmaintained"`, not a vulnerability.
+    # Expires 2027-01-01. Reached at runtime, but only through syntect's
+    # syntax-definition loading in the TUI; no safe direct upgrade exists
+    # (syntect 5.x pins bincode 1.x).
+    #   $ cargo tree --target all -i bincode
+    #   bincode v1.3.3 └── syntect v5.3.0 └── leveler-tui └── leveler-cli
     "RUSTSEC-2025-0141",
+    # paste — `informational = "unmaintained"`, not a vulnerability.
+    # Expires 2027-01-01. Build-time only (proc-macro), so it contributes no
+    # runtime code to any shipped binary. Comes in via ratatui.
+    #   $ cargo tree --target all -i paste
+    #   paste v1.0.15 (proc-macro) └── ratatui v0.29.0 └── leveler-tui └── leveler-cli
     "RUSTSEC-2024-0436",
 ]
 

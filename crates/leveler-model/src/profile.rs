@@ -35,6 +35,11 @@ pub struct ModelLimits {
     pub max_output_tokens: u32,
     pub max_tool_schema_bytes: usize,
     pub max_parallel_tool_calls: usize,
+    /// Per-model byte budget for a single tool result (the executor's central
+    /// cap). Omitted → the global default (48 KiB). Configure lower for weak
+    /// models with small reliable contexts.
+    #[serde(default)]
+    pub max_tool_output_bytes: Option<usize>,
 }
 
 /// How the provider expects a reasoning request to be spelled on the wire.
@@ -265,6 +270,7 @@ mod tests {
                 max_output_tokens: 4096,
                 max_tool_schema_bytes: 32_768,
                 max_parallel_tool_calls: 16,
+                max_tool_output_bytes: None,
             },
             reasoning: ReasoningConfig {
                 style: ReasoningStyle::ThinkingFlag,

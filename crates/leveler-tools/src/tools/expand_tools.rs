@@ -70,7 +70,11 @@ impl Tool for ExpandToolsTool {
         for cat in &args.categories {
             let key = cat.trim().to_ascii_lowercase();
             if KNOWN.contains(&key.as_str()) {
-                accepted.push(key);
+                // Dedup: a repeated category must not appear twice in the result
+                // or the registered-categories metadata.
+                if !accepted.contains(&key) {
+                    accepted.push(key);
+                }
             } else {
                 unknown.push(cat.clone());
             }
@@ -117,6 +121,24 @@ mod tests {
         assert_eq!(
             out.metadata.get("expand_categories").unwrap(),
             &serde_json::json!(["search"])
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_categories_are_deduplicated() {
+        let out = ExpandToolsTool
+            .execute(
+                serde_json::json!({ "categories": ["search", "search", "lsp"] }),
+                ctx(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.metadata.get("expand_categories").unwrap(),
+            &serde_json::json!(["search", "lsp"]),
+            "duplicate categories must collapse: {}",
+            out.content
         );
     }
 }

@@ -39,6 +39,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct AnthropicMessagesAdapter;
 
 impl AnthropicMessagesAdapter {
+    /// The adapter carries no state; every instance is interchangeable.
     pub fn new() -> Self {
         Self
     }

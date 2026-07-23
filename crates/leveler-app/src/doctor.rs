@@ -320,6 +320,7 @@ mod tests {
                     max_output_tokens: 1_024,
                     max_tool_schema_bytes: 8_192,
                     max_parallel_tool_calls: 1,
+                    max_tool_output_bytes: None,
                 },
                 reasoning: Default::default(),
                 compatibility: Default::default(),

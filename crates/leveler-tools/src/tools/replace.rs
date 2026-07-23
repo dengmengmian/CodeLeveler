@@ -57,7 +57,7 @@ impl Tool for ReplaceTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
@@ -130,145 +130,23 @@ impl Tool for ReplaceTool {
             existing.replacen(&input.old, &input.new, 1)
         };
 
-        // Serialize CodeLeveler writers for this target. The lock is advisory,
-        // cross-platform, and held across the final compare + rename, making
-        // the CAS real for concurrent replace invocations (including separate
-        // CodeLeveler processes). It lives under the global leveler home, keyed
-        // by the resolved path — never inside the workspace, which must not
-        // accumulate lock files.
-        context.checkpoint.record(&resolved);
-        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &resolved);
-        let lock = tokio::task::spawn_blocking({
-            let lock_path = lock_path.clone();
-            move || TargetLock::acquire(lock_path)
-        })
-        .await
-        .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
-        .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
-
-        if let Err(e) = context.workspace.revalidate_write_path(&resolved) {
-            drop(lock);
-            return Ok(ToolOutput::error(e.to_string()));
-        }
-        #[cfg(not(windows))]
-        let unique = format!(
-            ".{}.{}.leveler-tmp",
-            resolved
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"),
-            std::process::id() as u64
-                ^ std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
-        );
-        #[cfg(unix)]
-        {
-            let root = context.workspace.root().to_path_buf();
-            let root_fd = context.workspace.root_fd();
-            let relative = resolved
-                .strip_prefix(&root)
-                .map_err(|_| {
-                    ToolError::Io(format!(
-                        "{} is no longer below workspace",
-                        resolved.display()
-                    ))
-                })?
-                .to_path_buf();
-            let expected = existing.clone();
-            let replacement = new_content.clone();
-            let committed = tokio::task::spawn_blocking(move || {
-                descriptor_relative_replace(&root_fd, &relative, &unique, &expected, &replacement)
-            })
-            .await
-            .map_err(|e| ToolError::Io(format!("join descriptor write: {e}")))?
-            .map_err(|e| ToolError::Io(format!("descriptor-relative replace: {e}")))?;
-            if !committed {
+        match commit_replace(&context, &resolved, &existing, &new_content).await? {
+            Commit::Written => {}
+            Commit::Stale => {
                 return Ok(ToolOutput::error(format!(
                     "{} changed since you read it — re-read it and redo the replace against current contents.",
                     input.path
                 )));
             }
+            Commit::Rejected(message) => return Ok(ToolOutput::error(message)),
         }
-        #[cfg(windows)]
-        {
-            let root = context.workspace.root().to_path_buf();
-            let root_dir = context.workspace.root_dir();
-            let relative = resolved
-                .strip_prefix(&root)
-                .map_err(|_| ToolError::Io("target left workspace".into()))?
-                .to_path_buf();
-            let expected = existing.clone();
-            let replacement = new_content.clone();
-            let committed = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
-                let commit = open_windows_replace_context(&root_dir, &relative)?;
-                windows_capability_replace(commit, &expected, &replacement)
-            })
-            .await
-            .map_err(|e| ToolError::Io(format!("join capability write: {e}")))?
-            .map_err(|e| ToolError::Io(format!("capability-relative replace: {e}")))?;
-            if !committed {
-                return Ok(ToolOutput::error(format!(
-                    "{} changed since you read it — re-read it and redo the replace against current contents.",
-                    input.path
-                )));
-            }
-        }
-        #[cfg(all(not(unix), not(windows)))]
-        {
-            let parent = resolved
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let tmp = parent.join(unique);
-            // create_new: fail if the name somehow collides instead of overwriting.
-            {
-                use tokio::io::AsyncWriteExt;
-                let mut f = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)
-                    .await
-                    .map_err(|e| ToolError::Io(format!("create temp {}: {e}", tmp.display())))?;
-                f.write_all(new_content.as_bytes())
-                    .await
-                    .map_err(|e| ToolError::Io(format!("write {}: {e}", tmp.display())))?;
-                f.flush()
-                    .await
-                    .map_err(|e| ToolError::Io(format!("flush {}: {e}", tmp.display())))?;
-            }
-            // Re-verify the target still matches the content we planned against.
-            match tokio::fs::read_to_string(&resolved).await {
-                Ok(current) if current == existing => {}
-                Ok(_) => {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Ok(ToolOutput::error(format!(
-                        "{} changed since you read it — re-read it and redo the replace against \
-                     current contents.",
-                        input.path
-                    )));
-                }
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(ToolError::Io(format!("re-read {}: {e}", input.path)));
-                }
-            }
-            if let Err(e) = tokio::fs::rename(&tmp, &resolved).await {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(ToolError::Io(format!(
-                    "rename into {}: {e}",
-                    resolved.display()
-                )));
-            }
-        }
-        drop(lock);
 
         // Re-fingerprint so our own edit isn't seen as an outside change next time.
         context
             .file_state
             .record(&input.path, new_content.as_bytes());
         // Auto-format the edited file (best-effort; re-fingerprints internally).
-        super::format::format_after_edit(&context, &input.path, &resolved).await;
+        super::format::format_after_edit(&context, &input.path, &resolved, &cancellation).await;
 
         // Report the write: the executor folds `modified_files` into the turn's
         // change set, and the engine gates verification on it. Without this an
@@ -280,6 +158,200 @@ impl Tool for ReplaceTool {
         ))
         .with_metadata(serde_json::json!({ "modified_files": [input.path] })))
     }
+}
+
+/// Outcome of a locked commit. `Stale` and `Rejected` wrote nothing; the caller
+/// turns each into the right model-facing message (CAS staleness vs. a path that
+/// left the workspace), so both `replace` and `apply_patch` phrase it identically.
+pub(crate) enum Commit {
+    Written,
+    Stale,
+    Rejected(String),
+}
+
+/// Lock the target, verify it still equals `expected`, and atomically replace it
+/// with `replacement`. Returns `Stale` (writing nothing) if the on-disk content
+/// diverged since `expected` was read.
+///
+/// This is the one commit path shared by `replace` and `apply_patch`: an
+/// advisory cross-process lock (under the leveler home, never in the workspace)
+/// held across the compare + rename, an unguessable temp name, and — on unix and
+/// Windows — a capability/descriptor-relative write that a concurrent
+/// junction/symlink swap cannot redirect outside the workspace.
+pub(crate) async fn commit_replace(
+    context: &ToolContext,
+    resolved: &std::path::Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<Commit, ToolError> {
+    context.checkpoint.record(resolved);
+    let lock_path = leveler_project::layout::target_lock_path(&context.environment, resolved);
+    let lock = tokio::task::spawn_blocking({
+        let lock_path = lock_path.clone();
+        move || TargetLock::acquire(lock_path)
+    })
+    .await
+    .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
+    .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
+
+    if let Err(e) = context.workspace.revalidate_write_path(resolved) {
+        drop(lock);
+        return Ok(Commit::Rejected(e.to_string()));
+    }
+    #[cfg(not(windows))]
+    let unique = unique_temp_name(resolved);
+    let committed: bool;
+    #[cfg(unix)]
+    {
+        let root = context.workspace.root().to_path_buf();
+        let root_fd = context.workspace.root_fd();
+        let relative = resolved
+            .strip_prefix(&root)
+            .map_err(|_| ToolError::Io(format!("{} is no longer below workspace", resolved.display())))?
+            .to_path_buf();
+        let expected = expected.to_string();
+        let replacement = replacement.to_string();
+        committed = tokio::task::spawn_blocking(move || {
+            descriptor_relative_replace(&root_fd, &relative, &unique, &expected, &replacement)
+        })
+        .await
+        .map_err(|e| ToolError::Io(format!("join descriptor write: {e}")))?
+        .map_err(|e| ToolError::Io(format!("descriptor-relative replace: {e}")))?;
+    }
+    #[cfg(windows)]
+    {
+        let root = context.workspace.root().to_path_buf();
+        let root_dir = context.workspace.root_dir();
+        let relative = resolved
+            .strip_prefix(&root)
+            .map_err(|_| ToolError::Io("target left workspace".into()))?
+            .to_path_buf();
+        let expected = expected.to_string();
+        let replacement = replacement.to_string();
+        committed = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+            let commit = open_windows_replace_context(&root_dir, &relative)?;
+            windows_capability_replace(commit, &expected, &replacement)
+        })
+        .await
+        .map_err(|e| ToolError::Io(format!("join capability write: {e}")))?
+        .map_err(|e| ToolError::Io(format!("capability-relative replace: {e}")))?;
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let parent = resolved.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let tmp = parent.join(&unique);
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .await
+                .map_err(|e| ToolError::Io(format!("create temp {}: {e}", tmp.display())))?;
+            f.write_all(replacement.as_bytes())
+                .await
+                .map_err(|e| ToolError::Io(format!("write {}: {e}", tmp.display())))?;
+            f.flush()
+                .await
+                .map_err(|e| ToolError::Io(format!("flush {}: {e}", tmp.display())))?;
+        }
+        match tokio::fs::read_to_string(resolved).await {
+            Ok(current) if current == expected => committed = true,
+            Ok(_) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                committed = false;
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                drop(lock);
+                return Err(ToolError::Io(format!("re-read {}: {e}", resolved.display())));
+            }
+        }
+        if committed
+            && let Err(e) = tokio::fs::rename(&tmp, resolved).await
+        {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            drop(lock);
+            return Err(ToolError::Io(format!("rename into {}: {e}", resolved.display())));
+        }
+    }
+    drop(lock);
+    Ok(if committed { Commit::Written } else { Commit::Stale })
+}
+
+/// Atomically create/overwrite `resolved` with `content` under the target lock,
+/// via an unguessable temp name + rename (no compare — for a patch's Add/Move
+/// destination, where there is no prior version to match). Creates parent dirs.
+pub(crate) async fn commit_create(
+    context: &ToolContext,
+    resolved: &std::path::Path,
+    content: &str,
+) -> Result<Commit, ToolError> {
+    context.checkpoint.record(resolved);
+    if let Some(parent) = resolved.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ToolError::Io(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    let lock_path = leveler_project::layout::target_lock_path(&context.environment, resolved);
+    let lock = tokio::task::spawn_blocking({
+        let lock_path = lock_path.clone();
+        move || TargetLock::acquire(lock_path)
+    })
+    .await
+    .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
+    .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
+
+    if let Err(e) = context.workspace.revalidate_write_path(resolved) {
+        drop(lock);
+        return Ok(Commit::Rejected(e.to_string()));
+    }
+    let parent = resolved.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = parent.join(unique_temp_name(resolved));
+    let write = async {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+            .map_err(|e| ToolError::Io(format!("create temp {}: {e}", tmp.display())))?;
+        f.write_all(content.as_bytes())
+            .await
+            .map_err(|e| ToolError::Io(format!("write {}: {e}", tmp.display())))?;
+        f.flush()
+            .await
+            .map_err(|e| ToolError::Io(format!("flush {}: {e}", tmp.display())))?;
+        tokio::fs::rename(&tmp, resolved)
+            .await
+            .map_err(|e| ToolError::Io(format!("rename into {}: {e}", resolved.display())))
+    };
+    let result = write.await;
+    drop(lock);
+    match result {
+        Ok(()) => Ok(Commit::Written),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(e)
+        }
+    }
+}
+
+/// An unguessable sibling temp name (`.<file>.<pid^nanos>.leveler-tmp`) so two
+/// concurrent writers to the same target never collide on the staging file.
+fn unique_temp_name(resolved: &std::path::Path) -> String {
+    format!(
+        ".{}.{}.leveler-tmp",
+        resolved
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file"),
+        std::process::id() as u64
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+    )
 }
 
 /// Windows commit context rooted in directory handles which deny delete

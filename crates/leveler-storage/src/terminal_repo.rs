@@ -6,15 +6,27 @@ use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 use crate::event_repo::EVENT_SCHEMA_VERSION;
 use crate::{Database, EventRecord, StorageError};
 
+/// Writes that must land together: appending the terminal event and marking
+/// the aggregate finished. Each method runs both in one transaction, so a crash
+/// can never leave a session marked complete without its event, or vice versa.
 pub struct TerminalRepository<'a> {
     db: &'a Database,
 }
 
 impl<'a> TerminalRepository<'a> {
+    /// Borrow `db` for the lifetime of this repository handle.
     pub fn new(db: &'a Database) -> Self {
         Self { db }
     }
 
+    /// Append the session's terminal event and record `outcome` on the session
+    /// row, atomically. Returns the appended event with its assigned sequence.
+    ///
+    /// # Errors
+    ///
+    /// Rolls back and returns [`StorageError::InvalidData`] if `session_id`
+    /// matches no row — a terminal transition for an unknown session is a bug,
+    /// not a no-op.
     pub async fn finish_task(
         &self,
         session_id: &SessionId,
@@ -50,6 +62,13 @@ impl<'a> TerminalRepository<'a> {
         Ok(event)
     }
 
+    /// Append the turn's terminal event and set the turn's status and
+    /// `finished_at`, atomically. Returns the appended event.
+    ///
+    /// # Errors
+    ///
+    /// Rolls back and returns [`StorageError::InvalidData`] if `turn_id`
+    /// matches no row.
     pub async fn finish_turn(
         &self,
         session_id: &SessionId,

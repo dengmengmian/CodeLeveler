@@ -24,11 +24,18 @@ async fn run_git(
     request.timeout = Duration::from_secs(30);
     let output = context.runner.run(request, cancellation).await?;
     if output.success() {
-        let body = if output.stdout.trim().is_empty() {
+        let mut body = if output.stdout.trim().is_empty() {
             "(clean)\n".to_string()
         } else {
             output.stdout
         };
+        // The runner caps output; a silently-cut diff reads as complete. Say so.
+        if output.truncated {
+            body.push_str(
+                "\n[note] output was truncated (too large); narrow with a `path`, \
+                 or read specific files, for the full diff.\n",
+            );
+        }
         Ok(ToolOutput::ok(body))
     } else {
         Ok(ToolOutput::error(format!(

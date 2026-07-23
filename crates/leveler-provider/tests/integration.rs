@@ -55,6 +55,7 @@ fn model_config() -> ModelConfigFile {
                 max_output_tokens: 1024,
                 max_tool_schema_bytes: 8192,
                 max_parallel_tool_calls: 1,
+                max_tool_output_bytes: None,
             },
             reasoning: Default::default(),
             compatibility: Default::default(),

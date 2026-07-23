@@ -5,6 +5,7 @@
 //! Migrations are embedded at compile time so no `DATABASE_URL` is required to
 //! build (spec §6.7 offline note).
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 mod command_receipt_repo;
 mod database;

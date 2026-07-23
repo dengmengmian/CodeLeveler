@@ -93,9 +93,16 @@ impl Tool for FindReferencesTool {
                 input.symbol
             )));
         }
+        let capped = hits.len() >= MAX_HITS;
         let mut body = format!("References to `{}` (via scan):\n", input.symbol);
         for h in &hits {
             body.push_str(&format!("- {h}\n"));
+        }
+        if capped {
+            body.push_str(&format!(
+                "… [references capped at {MAX_HITS}; narrow with `grep` on a \
+                 subdirectory]\n"
+            ));
         }
         Ok(ToolOutput::ok(body))
     }
@@ -119,8 +126,12 @@ async fn lsp_references(
         .to_string();
     let character = column_of(&line_text, symbol);
 
-    let sessions = context.lsp_sessions.lock().await;
-    let client = sessions.get(language.as_str())?;
+    // Clone the session Arc out, then drop the lock before the LSP requests so
+    // concurrent LSP tools don't serialize on the global sessions mutex.
+    let client = {
+        let sessions = context.lsp_sessions.lock().await;
+        sessions.get(language.as_str())?.clone()
+    };
     // References need the document open.
     let _ = client.open(def_path, &spec.language_id).await;
     let refs = client
@@ -133,6 +144,13 @@ async fn lsp_references(
     let mut body = format!("References to `{symbol}` (via {}):\n", spec.program);
     for r in refs.iter().take(MAX_HITS) {
         body.push_str(&format!("- {}:{}\n", relativize(&r.path, root), r.line + 1));
+    }
+    if refs.len() > MAX_HITS {
+        body.push_str(&format!(
+            "… [showing {MAX_HITS} of {} references; narrow with `grep` on a \
+             subdirectory]\n",
+            refs.len()
+        ));
     }
     Some(body)
 }
@@ -203,6 +221,33 @@ mod tests {
         assert!(out.content.contains("References to `target`"));
         assert!(out.content.contains("lib.rs:1"));
         assert!(out.content.contains("lib.rs:2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fallback_scan_marks_capped_results() {
+        // More references than MAX_HITS must produce a marker, not a silently
+        // complete-looking list.
+        let dir =
+            std::env::temp_dir().join(format!("leveler-refs-cap-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "target();\n".repeat(MAX_HITS + 5);
+        std::fs::write(dir.join("lib.rs"), body).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = FindReferencesTool
+            .execute(
+                serde_json::json!({"symbol": "target"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains(&format!("capped at {MAX_HITS}")),
+            "capped scan must carry a marker: {}",
+            &out.content[out.content.len().saturating_sub(200)..]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

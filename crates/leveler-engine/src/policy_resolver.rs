@@ -50,6 +50,7 @@ pub struct ExecutionOverrides {
     pub completion_evidence: Option<bool>,
     pub repeated_read_guard: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub max_tool_output_bytes: Option<usize>,
 }
 
 /// The fully resolved execution configuration for one executor. For the
@@ -66,6 +67,8 @@ pub struct ResolvedExecutionPolicy {
     pub completion_evidence: bool,
     pub repeated_read_guard: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Byte budget for a single tool result (the central output cap).
+    pub max_tool_output_bytes: usize,
 }
 
 /// min over concurrency caps where `0` means "no opinion / unlimited".
@@ -122,6 +125,12 @@ pub fn resolve_execution_policy(
         completion_evidence: o.completion_evidence.unwrap_or(true),
         repeated_read_guard: o.repeated_read_guard.unwrap_or(true),
         reasoning_effort: o.reasoning_effort.or(profile.reasoning.effort),
+        // Explicit configuration only (no auto-tuning in v1): eval seam, then
+        // the model profile, then the global default cap.
+        max_tool_output_bytes: o
+            .max_tool_output_bytes
+            .or(profile.limits.max_tool_output_bytes)
+            .unwrap_or(leveler_tools::registry::MAX_TOOL_OUTPUT),
     }
 }
 
@@ -181,6 +190,26 @@ mod tests {
         assert!(new.completion_evidence);
         assert_eq!(new.max_files_per_step, 8, "task budget, was policy field");
         assert!(new.repeated_read_guard, "safety rail is always on");
+        assert_eq!(
+            new.max_tool_output_bytes,
+            48 * 1024,
+            "no profile/override opinion → today's central cap, zero drift"
+        );
+    }
+
+    #[test]
+    fn tool_output_budget_prefers_override_then_profile_then_default() {
+        let mut p = profile();
+        p.limits.max_tool_output_bytes = Some(16 * 1024);
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(r.max_tool_output_bytes, 16 * 1024, "profile value wins");
+
+        let o = ExecutionOverrides {
+            max_tool_output_bytes: Some(8 * 1024),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o));
+        assert_eq!(r.max_tool_output_bytes, 8 * 1024, "eval seam wins over profile");
     }
 
     #[test]

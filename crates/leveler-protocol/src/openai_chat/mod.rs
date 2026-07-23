@@ -27,6 +27,7 @@ use leveler_model::EncodedRequest;
 pub struct OpenAiChatAdapter;
 
 impl OpenAiChatAdapter {
+    /// The adapter carries no state; every instance is interchangeable.
     pub fn new() -> Self {
         Self
     }

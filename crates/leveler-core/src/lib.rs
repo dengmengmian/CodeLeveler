@@ -5,6 +5,7 @@
 //! traits. Per the product spec (§8.3) business types must **not** accumulate
 //! here — they belong to the crate that owns that concern.
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 pub mod budget;
 pub mod environment;

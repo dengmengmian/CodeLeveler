@@ -4,30 +4,61 @@ use leveler_core::{SessionId, Timestamp};
 
 use crate::{Database, StorageError};
 
+/// One completed model call, recorded for diagnostics rather than replay: this
+/// row holds no prompt or response text, only the shape of the exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequestRecord {
+    /// Caller-supplied primary key. The repository does not generate it and
+    /// does not check it for collisions — a duplicate fails at the database.
     pub id: String,
+    /// Owning session. Not stored on read-back from [`ModelRequestRepository::load_for_session`];
+    /// it is filled in from the queried session instead.
     pub session_id: SessionId,
+    /// Provider key as configured (e.g. `deepseek`), not the vendor's own name.
     pub provider: String,
+    /// Provider-side model id actually sent on the wire, which may differ from
+    /// the local alias the user typed.
     pub model: String,
+    /// Prompt tokens reported by the provider. Persisted as a signed 64-bit
+    /// integer, so a value above `i64::MAX` is clamped on write.
     pub input_tokens: u64,
+    /// Completion tokens, clamped on write like [`Self::input_tokens`].
     pub output_tokens: u64,
+    /// Provider's stop reason (`stop`, `length`, `tool_calls`, …). `None` when
+    /// the call never reached a normal end — see [`Self::error_kind`].
     pub finish_reason: Option<String>,
+    /// Failure classification when the call did not complete. Mutually
+    /// exclusive with [`Self::finish_reason`] in practice, though nothing
+    /// enforces that here.
     pub error_kind: Option<String>,
+    /// Wall-clock duration of the call. `None` when it was never measured
+    /// (for example a request that failed before being sent).
     pub latency_ms: Option<u64>,
+    /// Retries *before* this outcome; `0` means it succeeded first try.
     pub retry_count: u32,
+    /// When the call finished. Stored as RFC 3339 text and re-parsed on read,
+    /// so an unparseable value surfaces as [`StorageError::InvalidData`].
     pub created_at: Timestamp,
 }
 
+/// Read/write access to the `model_requests` table, borrowed from a [`Database`].
 pub struct ModelRequestRepository<'a> {
     db: &'a Database,
 }
 
 impl<'a> ModelRequestRepository<'a> {
+    /// Borrow `db` for the lifetime of this repository handle.
     pub fn new(db: &'a Database) -> Self {
         Self { db }
     }
 
+    /// Append one record. Token counts and latency are clamped into the signed
+    /// range SQLite stores; no other normalization happens.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the row cannot be written — including a duplicate
+    /// [`ModelRequestRecord::id`], which the database rejects.
     pub async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError> {
         sqlx::query(
             "INSERT INTO model_requests \
@@ -55,6 +86,13 @@ impl<'a> ModelRequestRepository<'a> {
         Ok(())
     }
 
+    /// Every record for `session_id`, oldest first (ties broken by insertion
+    /// order, so calls made within the same second keep their sequence).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidData`] if a stored timestamp does not
+    /// parse; the whole load fails rather than skipping the bad row.
     pub async fn load_for_session(
         &self,
         session_id: &SessionId,

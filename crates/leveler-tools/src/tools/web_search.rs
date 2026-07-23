@@ -159,7 +159,15 @@ async fn run_search(
 async fn parse_ok(resp: reqwest::Response) -> Result<serde_json::Value, String> {
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
+        // The provider's error body carries the actionable detail (quota
+        // exhausted, invalid key, bad param); a bare status hides it.
+        let body = resp.text().await.unwrap_or_default();
+        let detail: String = body.trim().chars().take(300).collect();
+        return Err(if detail.is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else {
+            format!("HTTP {}: {detail}", status.as_u16())
+        });
     }
     resp.json::<serde_json::Value>()
         .await

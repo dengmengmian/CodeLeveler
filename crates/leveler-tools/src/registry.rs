@@ -91,41 +91,55 @@ impl ToolRegistry {
         let input = tool.normalize_input(input);
         validate_schema(name, &tool.input_schema(), &input)?;
 
+        let budget = context.tool_output_budget;
         let mut output = tool.execute(input, context, cancellation).await?;
         // Central guard: no single tool result may flood the context window,
         // whatever the tool's own limits are (some search tools have none). Keep
         // the head and the tail — errors and test failures often land at the end.
-        output.content = cap_output(&output.content);
+        output.content = cap_output_with(&output.content, budget);
         Ok(output)
     }
 }
 
-/// Hard ceiling on any single tool result (~12k tokens). Bytes, not chars.
-const MAX_TOOL_OUTPUT: usize = 48 * 1024;
+/// Default hard ceiling on any single tool result (~12k tokens). Bytes, not
+/// chars. Per-model budgets (`ModelLimits::max_tool_output_bytes`) may lower
+/// it via [`ToolContext::tool_output_budget`].
+pub const MAX_TOOL_OUTPUT: usize = 48 * 1024;
 
-/// Truncate `s` to [`MAX_TOOL_OUTPUT`] bytes, keeping the head (⅔) and tail (⅓)
-/// with an elision marker between. Slices only on UTF-8 boundaries.
+/// [`cap_output_with`] at the default budget.
 ///
 /// Public because this is the ONE tool-result cap: `execute` applies it to
 /// every registry tool, and the executor reuses it for content that bypasses
 /// the registry (sub-agent results).
 pub fn cap_output(s: &str) -> String {
-    if s.len() <= MAX_TOOL_OUTPUT {
+    cap_output_with(s, MAX_TOOL_OUTPUT)
+}
+
+/// Truncate `s` to `budget` bytes, keeping the head (½ budget) and tail
+/// (¼ budget) with an elision marker between. Slices only on UTF-8 boundaries.
+pub fn cap_output_with(s: &str, budget: usize) -> String {
+    if s.len() <= budget {
         return s.to_string();
     }
     // Keep ½ head + ¼ tail (¾ of the budget), leaving ample room for the marker
     // so the result is always strictly smaller than both the input and the cap.
-    let head = floor_boundary(s, MAX_TOOL_OUTPUT / 2);
-    let tail = ceil_boundary(s, s.len() - MAX_TOOL_OUTPUT / 4);
+    let head = floor_boundary(s, budget / 2);
+    let tail = ceil_boundary(s, s.len() - budget / 4);
     format!(
-        "{}\n… [{} bytes elided to fit the context] …\n{}",
+        "{}\n… [{} bytes (~{} tokens) elided to fit the context] …\n{}",
         &s[..head],
         tail - head,
+        approx_tokens(tail - head),
         &s[tail..]
     )
 }
 
-fn floor_boundary(s: &str, mut i: usize) -> usize {
+/// ~4 bytes/token heuristic — enough for "is it worth re-reading" decisions.
+pub(crate) fn approx_tokens(bytes: usize) -> usize {
+    bytes.div_ceil(4)
+}
+
+pub(crate) fn floor_boundary(s: &str, mut i: usize) -> usize {
     if i >= s.len() {
         return s.len();
     }
@@ -135,7 +149,7 @@ fn floor_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-fn ceil_boundary(s: &str, mut i: usize) -> usize {
+pub(crate) fn ceil_boundary(s: &str, mut i: usize) -> usize {
     while i < s.len() && !s.is_char_boundary(i) {
         i += 1;
     }
@@ -327,6 +341,34 @@ mod tests {
         let out = cap_output(&big);
         assert!(out.len() < big.len());
         assert!(out.contains("elided"));
+    }
+
+    #[tokio::test]
+    async fn per_context_budget_caps_tool_output() {
+        // A model-specific budget on the context must shrink the central cap.
+        let dir = std::env::temp_dir().join(format!("leveler-reg-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.txt"), "x".repeat(16 * 1024)).unwrap();
+        let reg = default_registry();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        ctx.tool_output_budget = 4 * 1024;
+        let out = reg
+            .execute(
+                "read_file",
+                serde_json::json!({"path": "big.txt"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.len() < 5 * 1024,
+            "output must respect the per-context budget, got {} bytes",
+            out.content.len()
+        );
+        assert!(out.content.contains("elided"), "must mark the elision");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

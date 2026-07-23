@@ -74,14 +74,21 @@ impl Tool for ListFilesTool {
 
         let mut entries = Vec::new();
         walk(&base, &base, 0, max_depth, &mut entries);
-        entries.sort();
+        // Case-insensitive so `apple`, `Banana`, `Zebra` read in natural order
+        // rather than ASCII order (all uppercase before all lowercase); ties
+        // fall back to the exact ordering for determinism.
+        entries.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
         let truncated = entries.len() > MAX_ENTRIES;
         entries.truncate(MAX_ENTRIES);
 
         let mut out = entries.join("\n");
         out.push('\n');
         if truncated {
-            out.push_str("… [truncated]\n");
+            // The walk stops early, so the real total is unknown.
+            out.push_str(&format!(
+                "… [listing capped at {MAX_ENTRIES} entries; pass a subdirectory \
+                 `path` or a smaller `max_depth` to narrow]\n"
+            ));
         }
         Ok(ToolOutput::ok(out))
     }
@@ -140,6 +147,62 @@ mod tests {
         assert!(out.content.contains("src/main.rs"));
         assert!(out.content.contains("Cargo.toml"));
         assert!(!out.content.contains("target"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn capped_listing_names_the_limit_and_recovery() {
+        // The walk stops early, so the real total is unknown — the marker must
+        // name the cap and tell the model how to narrow.
+        let dir =
+            std::env::temp_dir().join(format!("leveler-ls-cap-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..(MAX_ENTRIES + 50) {
+            std::fs::write(dir.join(format!("f{i:05}.txt")), "").unwrap();
+        }
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = ListFilesTool
+            .execute(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains(&format!("capped at {MAX_ENTRIES}")),
+            "marker must name the cap: {}",
+            &out.content[out.content.len().saturating_sub(200)..]
+        );
+        assert!(
+            out.content.contains("path"),
+            "marker must point at the narrowing knob: {}",
+            &out.content[out.content.len().saturating_sub(200)..]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn entries_sort_case_insensitively() {
+        let dir = std::env::temp_dir()
+            .join(format!("leveler-ls-sort-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["Zebra.txt", "apple.txt", "Banana.txt"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = ListFilesTool
+            .execute(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        let order: Vec<&str> = out
+            .content
+            .lines()
+            .filter(|l| l.ends_with(".txt"))
+            .collect();
+        assert_eq!(
+            order,
+            vec!["apple.txt", "Banana.txt", "Zebra.txt"],
+            "listing must be case-insensitive, not ASCII (upper-before-lower)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -23,6 +23,35 @@ fn open_store(context: &ToolContext) -> Result<MemoryStore, ToolError> {
     MemoryStore::open(root).map_err(|e| ToolError::Io(e.to_string()))
 }
 
+/// Give `entry` an id that won't silently clobber a *different* memory.
+///
+/// The id is `slugify(title)`, so two unrelated facts with the same (or
+/// slug-colliding) title map to one file and the second `fs::write` would
+/// overwrite the first. Keep the id when it's free or already holds this exact
+/// fact (idempotent re-remember); otherwise suffix it (`-2`, `-3`, …) so both
+/// survive.
+fn deduplicate_id(store: &MemoryStore, entry: &leveler_memory::MemoryEntry) -> String {
+    match store.read_active(&entry.id) {
+        // Free, or the identical fact is already stored: keep the id.
+        Err(_) => entry.id.clone(),
+        Ok(existing)
+            if existing.title == entry.title && existing.body.trim() == entry.body.trim() =>
+        {
+            entry.id.clone()
+        }
+        Ok(_) => {
+            let mut n = 2;
+            loop {
+                let candidate = format!("{}-{n}", entry.id);
+                if store.read_active(&candidate).is_err() {
+                    return candidate;
+                }
+                n += 1;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MemoryArgs {
     /// Action: search | list | read
@@ -177,7 +206,8 @@ impl Tool for RememberTool {
             return Ok(ToolOutput::error("title and body are required"));
         }
         let store = open_store(&context)?;
-        let entry = new_entry(&args.title, &args.body, args.tags);
+        let mut entry = new_entry(&args.title, &args.body, args.tags);
+        entry.id = deduplicate_id(&store, &entry);
         let saved = store
             .remember(entry)
             .map_err(|e| ToolError::Io(e.to_string()))?;
@@ -304,7 +334,8 @@ impl Tool for ConsolidateMemoryTool {
         }
         let store = open_store(&context)?;
         let mut written = Vec::new();
-        for e in candidates {
+        for mut e in candidates {
+            e.id = deduplicate_id(&store, &e);
             let saved = store
                 .remember(e)
                 .map_err(|err| ToolError::Io(err.to_string()))?;
@@ -352,6 +383,55 @@ mod tests {
             .await
             .unwrap();
         assert!(listed.content.contains("Prefer workspace-write"));
+    }
+
+    #[tokio::test]
+    async fn two_different_facts_with_the_same_title_do_not_clobber_each_other() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .with_memory_root(&mem);
+        let remember = |body: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                RememberTool
+                    .execute(
+                        serde_json::json!({ "title": "Deploy notes", "body": body }),
+                        ctx,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = remember("Staging deploys from the release branch.").await;
+        let second = remember("Production deploys are gated on the on-call approval.").await;
+        assert!(!first.is_error && !second.is_error);
+
+        // Both facts must be retrievable — the second must not have overwritten
+        // the first just because their titles slug to the same id.
+        let listed = MemoryTool
+            .execute(
+                serde_json::json!({"action": "search", "query": "deploy", "limit": 10}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.content.contains("release branch"),
+            "first fact was clobbered: {}",
+            listed.content
+        );
+        assert!(
+            listed.content.contains("on-call approval"),
+            "second fact missing: {}",
+            listed.content
+        );
+        // Idempotent re-remember of the SAME fact must not spawn a duplicate.
+        let again = remember("Staging deploys from the release branch.").await;
+        assert_eq!(again.content, first.content, "identical fact must reuse its id");
     }
 
     #[tokio::test]

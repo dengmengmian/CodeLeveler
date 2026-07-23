@@ -6,6 +6,7 @@
 //! between unified [`leveler_model`] types and the wire format, and provides a
 //! byte-fragmentation-tolerant [`sse::SseDecoder`].
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 pub mod anthropic_messages;
 pub mod openai_chat;

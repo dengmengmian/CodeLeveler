@@ -283,6 +283,15 @@ impl LspClient {
         }
     }
 
+    /// Whether the server has published *any* diagnostics report for `path`.
+    /// An empty report means "analyzed and clean"; the absence of a report means
+    /// the server never answered (still indexing / crashed) — a distinction
+    /// [`Self::wait_for_diagnostics`] collapses to an empty vec.
+    pub async fn diagnostics_reported(&self, path: &Path) -> bool {
+        let uri = path_to_uri(path);
+        self.diagnostics.lock().await.contains_key(&uri)
+    }
+
     /// The workspace root.
     pub fn root(&self) -> &Path {
         &self.root

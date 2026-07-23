@@ -104,20 +104,25 @@ async fn lsp_lookup(context: &ToolContext, root: &std::path::Path, symbol: &str)
             continue;
         };
 
-        let mut sessions = context.lsp_sessions.lock().await;
         let key = language.as_str().to_string();
-        if !sessions.contains_key(&key) {
-            match leveler_lsp::LspClient::start(&spec.program, &spec.args, root).await {
-                Ok(client) => {
-                    sessions.insert(key.clone(), client);
+        // Clone the session Arc out under the lock, then drop it before the
+        // request/retry loop so LSP tools don't serialize on the global lock.
+        let client = {
+            let mut sessions = context.lsp_sessions.lock().await;
+            if !sessions.contains_key(&key) {
+                match leveler_lsp::LspClient::start(&spec.program, &spec.args, root).await {
+                    Ok(client) => {
+                        sessions.insert(key.clone(), std::sync::Arc::new(client));
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
-        }
-        let client = sessions.get(&key)?;
+            sessions.get(&key)?.clone()
+        };
 
         // The server may still be indexing on first use; retry briefly.
         let mut located = Vec::new();
+        let mut server_died = false;
         for _ in 0..6 {
             match client.workspace_symbols(symbol).await {
                 Ok(found) if !found.is_empty() => {
@@ -125,8 +130,16 @@ async fn lsp_lookup(context: &ToolContext, root: &std::path::Path, symbol: &str)
                     break;
                 }
                 Ok(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-                Err(_) => break,
+                // Evict a crashed/timed-out server so the next call restarts it
+                // instead of reusing a corpse and degrading to scan forever.
+                Err(_) => {
+                    server_died = true;
+                    break;
+                }
             }
+        }
+        if server_died {
+            context.lsp_sessions.lock().await.remove(&key);
         }
 
         let matches: Vec<_> = located

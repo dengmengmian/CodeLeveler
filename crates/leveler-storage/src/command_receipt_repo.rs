@@ -32,6 +32,7 @@ pub struct CommandReceiptRepository<'a> {
 }
 
 impl<'a> CommandReceiptRepository<'a> {
+    /// Borrow `db` for the lifetime of this repository handle.
     pub fn new(db: &'a Database) -> Self {
         Self { db }
     }

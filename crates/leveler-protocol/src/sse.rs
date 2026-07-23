@@ -23,15 +23,25 @@ pub const MAX_SSE_EVENT_DATA_BYTES: usize = 8 * 1024 * 1024;
 /// A dispatched SSE event: its `event:` type (if any) and joined `data` payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
+    /// The `event:` field value, or `None` when the stream omitted it.
     pub event: Option<String>,
+    /// All `data:` fields of this event joined with `\n`.
     pub data: String,
 }
 
 /// A size-limit violation while decoding an SSE stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseDecodeError {
-    LineTooLong { limit: usize },
-    EventDataTooLarge { limit: usize },
+    /// One unterminated line exceeded [`MAX_SSE_LINE_BYTES`].
+    LineTooLong {
+        /// The limit that was exceeded, in bytes.
+        limit: usize,
+    },
+    /// One event's joined `data` payload exceeded [`MAX_SSE_EVENT_DATA_BYTES`].
+    EventDataTooLarge {
+        /// The limit that was exceeded, in bytes.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for SseDecodeError {
@@ -84,6 +94,7 @@ impl Default for SseDecoder {
 }
 
 impl SseDecoder {
+    /// A decoder at the start of a stream, using the default size limits.
     pub fn new() -> Self {
         Self::default()
     }

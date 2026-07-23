@@ -1,7 +1,7 @@
 //! `glob` — find files whose path matches a glob pattern (e.g. `**/*_test.go`).
 //! Complements `repository_search` (case-insensitive substring) and `grep`
-//! (file contents). Prefers tracked files via `git ls-files`, falling back to a
-//! filesystem walk, then matches each path against the pattern.
+//! (file contents). Lists tracked and untracked-but-not-ignored files via git
+//! (falling back to a filesystem walk), then matches each path against the pattern.
 
 use std::time::Duration;
 
@@ -44,10 +44,11 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &'static str {
-        "Find files whose path matches a glob pattern (`*` within a path segment, \
+        "Find files by a case-sensitive glob pattern (`*` within a path segment, \
          `**` across directories, `?` a single character), e.g. `**/*_test.go` or \
-         `src/**/*.rs`. Use this to locate files by name pattern; use \
-         `repository_search` for a plain substring and `grep` to search contents."
+         `src/**/*.rs`. Use this when you know the shape of the name. If you only \
+         have a rough, possibly mis-cased substring, use `repository_search` \
+         instead; use `grep` to search file contents."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -78,7 +79,7 @@ impl Tool for GlobTool {
             .collect();
         matches.sort();
         matches.dedup();
-        let truncated = matches.len() > max;
+        let total = matches.len();
         matches.truncate(max);
 
         if matches.is_empty() {
@@ -86,8 +87,11 @@ impl Tool for GlobTool {
         }
         let mut body = matches.join("\n");
         body.push('\n');
-        if truncated {
-            body.push_str("… [truncated]\n");
+        if total > max {
+            body.push_str(&format!(
+                "… [showing {max} of {total} matches; raise max_results or \
+                 narrow the pattern]\n"
+            ));
         }
         Ok(ToolOutput::ok(body))
     }
@@ -144,11 +148,19 @@ fn one_segment(pat: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Prefer tracked files via `git ls-files`; fall back to a filesystem walk.
+/// List candidate files via git (tracked **and** untracked-but-not-ignored, so
+/// a file the agent just wrote is found), falling back to a filesystem walk when
+/// not in a git repo. `--cached --others --exclude-standard` mirrors what a
+/// gitignore-aware `fd` would return.
 async fn list_files(context: &ToolContext, cancellation: &CancellationToken) -> Vec<String> {
     let mut request = ProcessRequest::new(
         "git",
-        vec!["ls-files".into()],
+        vec![
+            "ls-files".into(),
+            "--cached".into(),
+            "--others".into(),
+            "--exclude-standard".into(),
+        ],
         context.workspace.root().to_path_buf(),
     );
     request.timeout = Duration::from_secs(30);
@@ -232,6 +244,91 @@ mod tests {
         assert!(out.content.contains("user_test.go"), "got: {}", out.content);
         assert!(!out.content.contains("user.go"), "got: {}", out.content);
         assert!(!out.content.contains("main.go"), "got: {}", out.content);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// In a git repo, `git ls-files` alone only lists *tracked* files, so a file
+    /// the agent just created but hasn't `git add`ed is invisible to glob — it
+    /// fails to find its own new file. The listing must include untracked (but
+    /// not gitignored) files.
+    #[tokio::test]
+    async fn finds_untracked_new_files_in_a_git_repo() {
+        let dir = std::env::temp_dir()
+            .join(format!("leveler-glob-untracked-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("src/tracked.rs"), "").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        // A brand-new file the model wrote this turn — never git-added, not ignored.
+        std::fs::write(dir.join("src/fresh.rs"), "").unwrap();
+        std::fs::write(dir.join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(dir.join("src/ignored.rs"), "").unwrap();
+
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = GlobTool
+            .execute(
+                serde_json::json!({ "pattern": "src/*.rs" }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("tracked.rs"), "tracked: {}", out.content);
+        assert!(
+            out.content.contains("fresh.rs"),
+            "must find the just-created untracked file: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("ignored.rs"),
+            "gitignored file must stay excluded: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn capped_results_report_the_total() {
+        // The total is known before truncation — the marker must state it.
+        let dir =
+            std::env::temp_dir().join(format!("leveler-glob-cap-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.go"), "").unwrap();
+        std::fs::write(dir.join("b.go"), "").unwrap();
+        std::fs::write(dir.join("c.go"), "").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = GlobTool
+            .execute(
+                serde_json::json!({ "pattern": "*.go", "max_results": 2 }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("2 of 3"),
+            "marker must report shown/total: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("max_results"),
+            "marker must name the knob: {}",
+            out.content
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

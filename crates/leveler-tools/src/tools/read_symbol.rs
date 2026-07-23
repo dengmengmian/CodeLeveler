@@ -96,8 +96,18 @@ impl Tool for ReadSymbolTool {
     }
 }
 
-/// The first line index whose text contains the symbol as a whole word.
+/// The line index where `symbol` is defined. Prefers a line that actually
+/// *declares* it (`fn`/`struct`/`def`/`class`/…, via [`leveler_context::defines`])
+/// so an earlier `use`/import or a call site above the definition doesn't send
+/// the reader to the wrong block. Falls back to the first whole-word mention
+/// when no single line reads as a declaration.
 fn definition_line(text: &str, symbol: &str) -> Option<usize> {
+    if let Some(i) = text
+        .lines()
+        .position(|line| leveler_context::defines(line, symbol))
+    {
+        return Some(i);
+    }
     text.lines().position(|line| {
         line.split(|c: char| !c.is_alphanumeric() && c != '_')
             .any(|w| w == symbol)
@@ -163,5 +173,13 @@ mod tests {
     fn definition_line_returns_none_when_missing() {
         let text = "fn other() {}\n";
         assert_eq!(definition_line(text, "target"), None);
+    }
+
+    #[test]
+    fn definition_line_prefers_the_declaration_over_an_earlier_use_or_call() {
+        // A `use` import and a call site both mention `foo` before its real
+        // definition; the reader must land on the `fn foo` line, not line 0.
+        let text = "use crate::foo;\nfn bar() { foo(); }\nfn foo() {}\n";
+        assert_eq!(definition_line(text, "foo"), Some(2));
     }
 }

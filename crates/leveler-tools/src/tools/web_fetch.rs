@@ -90,7 +90,9 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Validate scheme and that every resolved IP is public-routable.
+/// Synchronous first-gate: scheme, `localhost`, and any *literal* IP in the
+/// host — the checks that need no DNS. Hostnames pass here and get their
+/// DNS-resolved addresses validated in [`resolve_and_validate`].
 pub(crate) fn assert_url_safe_for_fetch(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
     let scheme = parsed.scheme();
@@ -103,19 +105,59 @@ pub(crate) fn assert_url_safe_for_fetch(url: &str) -> Result<(), String> {
     if host.eq_ignore_ascii_case("localhost") {
         return Err("blocked host: localhost".to_string());
     }
-    // Literal IP in host.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
-            return Err(format!("blocked address: {ip}"));
-        }
-        return Ok(());
+    if let Some(ip) = parse_host_ip(host)
+        && is_blocked_ip(ip)
+    {
+        return Err(format!("blocked address: {ip}"));
     }
-    // DNS resolve all A/AAAA and block if any is private (fail closed).
+    Ok(())
+}
+
+/// Parse a URL host as a literal IP, tolerating the `[...]` brackets a URL puts
+/// around IPv6 literals (`[::1]`). `None` for a real domain name.
+fn parse_host_ip(host: &str) -> Option<IpAddr> {
+    let inner = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    inner.parse::<IpAddr>().ok()
+}
+
+/// A validated fetch target: the URL's host plus the exact public-routable IPs
+/// it resolved to. Pinning the connection to these addresses (instead of letting
+/// the HTTP client re-resolve the hostname) closes the DNS-rebinding window
+/// between our validation and the actual connect.
+pub(crate) struct SafeTarget {
+    host: String,
+    /// Empty for a literal-IP host — there is no DNS name to pin.
+    addrs: Vec<SocketAddr>,
+}
+
+/// Full validation: the sync gate above, then (for a hostname) resolve every
+/// A/AAAA and fail closed if any is private/link-local/metadata. DNS runs off
+/// the async worker so a slow resolver can't stall the executor.
+pub(crate) async fn resolve_and_validate(url: &str) -> Result<SafeTarget, String> {
+    assert_url_safe_for_fetch(url)?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "url missing host".to_string())?
+        .to_string();
+    if parse_host_ip(&host).is_some() {
+        // Literal IP: already validated by the sync gate; nothing to resolve.
+        return Ok(SafeTarget {
+            host,
+            addrs: Vec::new(),
+        });
+    }
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs: Vec<SocketAddr> = format!("{host}:{port}")
-        .to_socket_addrs()
-        .map_err(|e| format!("dns resolve failed for `{host}`: {e}"))?
-        .collect();
+    let hostport = format!("{host}:{port}");
+    let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
+        hostport.to_socket_addrs().map(|it| it.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| format!("dns task failed: {e}"))?
+    .map_err(|e| format!("dns resolve failed for `{host}`: {e}"))?;
     if addrs.is_empty() {
         return Err(format!("dns resolve returned no addresses for `{host}`"));
     }
@@ -124,7 +166,7 @@ pub(crate) fn assert_url_safe_for_fetch(url: &str) -> Result<(), String> {
             return Err(format!("blocked address after resolve: {}", addr.ip()));
         }
     }
-    Ok(())
+    Ok(SafeTarget { host, addrs })
 }
 
 use std::net::ToSocketAddrs;
@@ -158,22 +200,25 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 async fn fetch_url(url: &str, max_bytes: usize) -> Result<String, String> {
-    assert_url_safe_for_fetch(url)?;
-
-    let client = reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!(
-            "CodeLeveler-web_fetch/{}",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-
     let mut current = url.to_string();
     let mut hops = 0usize;
     loop {
-        assert_url_safe_for_fetch(&current)?;
+        // Resolve + validate this hop, then pin the client to the validated IPs
+        // so reqwest cannot re-resolve the hostname to a rebound internal
+        // address between the check and the connect (DNS-rebinding SSRF).
+        let target = resolve_and_validate(&current).await?;
+        let mut builder = reqwest::Client::builder()
+            .timeout(TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(format!(
+                "CodeLeveler-web_fetch/{}",
+                env!("CARGO_PKG_VERSION")
+            ));
+        if !target.addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&target.host, &target.addrs);
+        }
+        let client = builder.build().map_err(|e| format!("http client: {e}"))?;
+
         let resp = client
             .get(&current)
             .send()
@@ -199,23 +244,38 @@ async fn fetch_url(url: &str, max_bytes: usize) -> Result<String, String> {
         if !status.is_success() {
             return Err(format!("HTTP {status} for {current}"));
         }
-        let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
-        let truncated = bytes.len() > max_bytes;
-        let slice = if truncated {
-            &bytes[..max_bytes]
-        } else {
-            &bytes
-        };
-        // Lossy UTF-8; binary still surfaces as replacement chars rather than panic.
-        let mut body = String::from_utf8_lossy(slice).into_owned();
+        let (mut body, truncated) = read_body_capped(resp, max_bytes).await?;
         if truncated {
-            body.push_str(&format!(
-                "\n\n[web_fetch truncated at {max_bytes} bytes; original {} bytes]",
-                bytes.len()
-            ));
+            body.push_str(&format!("\n\n[web_fetch truncated at {max_bytes} bytes]"));
         }
         return Ok(format!("URL: {current}\n\n{body}"));
     }
+}
+
+/// Read the response body a chunk at a time, stopping once `max_bytes` are
+/// collected. Bounds memory regardless of what the server sends (or claims in
+/// `Content-Length`). Returns the decoded text and whether it was cut short.
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(String, bool), String> {
+    let mut collected: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("read body: {e}"))?
+    {
+        let remaining = max_bytes.saturating_sub(collected.len());
+        if chunk.len() >= remaining {
+            collected.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    // Lossy UTF-8; binary surfaces as replacement chars rather than panicking.
+    Ok((String::from_utf8_lossy(&collected).into_owned(), truncated))
 }
 
 #[cfg(test)]
@@ -258,6 +318,21 @@ mod tests {
     fn allows_public_literal_ip_shape() {
         // 8.8.8.8 is public; no DNS needed.
         assert!(assert_url_safe_for_fetch("https://8.8.8.8/resolve").is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_gate_and_pinning_for_literal_ips() {
+        // A public literal IP validates with nothing to pin (no DNS name).
+        let ok = resolve_and_validate("https://8.8.8.8/x").await.unwrap();
+        assert!(ok.addrs.is_empty(), "literal IP needs no DNS pinning");
+        // The async path must still fail closed on private / metadata / v6 loopback.
+        assert!(
+            resolve_and_validate("http://169.254.169.254/latest/meta-data")
+                .await
+                .is_err()
+        );
+        assert!(resolve_and_validate("http://[::1]/x").await.is_err());
+        assert!(resolve_and_validate("http://10.0.0.1/x").await.is_err());
     }
 
     #[tokio::test]

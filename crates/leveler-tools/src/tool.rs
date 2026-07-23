@@ -47,7 +47,7 @@ pub struct ToolContext {
     /// Long-lived language-server sessions, keyed by language, reused across
     /// tool calls so servers index the workspace once (spec §26 LSP platform).
     pub lsp_sessions:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, leveler_lsp::LspClient>>>,
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<leveler_lsp::LspClient>>>>,
     /// Where oversized command output is spilled (content-addressed) instead of
     /// being silently truncated. `None` disables spilling (output is truncated
     /// with a marker, the pre-artifact behavior).
@@ -63,6 +63,10 @@ pub struct ToolContext {
     pub turn_unrestricted_fs: bool,
     /// Background process task registry (run_command background=true).
     pub background_tasks: Option<std::sync::Arc<leveler_execution::BackgroundTaskRegistry>>,
+    /// Per-model byte budget for a single tool result (the central cap applied
+    /// after every tool call). Defaults to [`crate::registry::MAX_TOOL_OUTPUT`];
+    /// weaker models with small reliable contexts may configure less.
+    pub tool_output_budget: usize,
 }
 
 impl ToolContext {
@@ -101,6 +105,7 @@ impl ToolContext {
             read_only: false,
             turn_unrestricted_fs: false,
             background_tasks: None,
+            tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
         }
     }
 

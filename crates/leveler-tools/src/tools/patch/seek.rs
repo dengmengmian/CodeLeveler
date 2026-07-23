@@ -46,9 +46,15 @@ pub fn seek_sequence(
     None
 }
 
-/// Drop all whitespace so spacing-only drift still locates a line.
+/// Squash *internal* whitespace so spacing-only drift (`a+b` vs `a + b`) still
+/// locates a line, while preserving leading indentation — collapsing indent too
+/// would let a hunk match the same statement at the wrong nesting level, which
+/// silently corrupts indentation-significant files (Python, YAML).
 fn squash_ws(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
+    let body = s.trim_start();
+    let indent = &s[..s.len() - body.len()];
+    let squashed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    format!("{indent}{squashed}")
 }
 
 /// Fold typographic Unicode punctuation to its ASCII equivalent (and trim), so a
@@ -128,6 +134,20 @@ mod tests {
             ),
             Some(0),
             "squash pass must locate spacing-drifted body"
+        );
+    }
+
+    #[test]
+    fn squash_pass_does_not_cross_indentation_levels() {
+        // Two lines are equal after squashing internal whitespace ("x=1") but sit
+        // at different indent levels. A pattern indented to match the SECOND must
+        // not be silently located on the first — indentation is significant in
+        // Python/YAML, and squashing it away would patch the wrong block.
+        let file = v(&["if a:", "    x = 1", "if b:", "        x = 1"]);
+        assert_eq!(
+            seek_sequence(&file, &v(&["        x=1"]), 0, false),
+            Some(3),
+            "squash must preserve leading indentation, matching only the 8-space line"
         );
     }
 

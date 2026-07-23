@@ -21,6 +21,7 @@ pub struct MessageRepository<'a> {
 }
 
 impl<'a> MessageRepository<'a> {
+    /// Borrow `db` for the lifetime of this repository handle.
     pub fn new(db: &'a Database) -> Self {
         Self { db }
     }
