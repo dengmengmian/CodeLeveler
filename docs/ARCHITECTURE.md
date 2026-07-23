@@ -20,8 +20,11 @@ CodeLeveler is designed around five constraints:
 5. **Recoverable local state.** Sessions and runtime events can be persisted and
    resumed without requiring a remote control plane.
 
-Every crate forbids unsafe Rust. The application and CLI may use `anyhow` to add
-top-level context; reusable library crates expose typed `thiserror` errors.
+Every crate forbids unsafe Rust except `leveler-execution`, which is
+`#![deny(unsafe_code)]` with a single audited exception (the Linux
+`PR_SET_PDEATHSIG` prctl call for orphan-process cleanup). The application and
+CLI may use `anyhow` to add top-level context; reusable library crates expose
+typed `thiserror` errors.
 
 ## Component map
 
@@ -53,7 +56,9 @@ User
          └──────────── used by the engine ──────┘
 
   Supporting libraries: leveler-storage, leveler-project, leveler-vcs,
-  leveler-lsp, leveler-skills, leveler-memory, leveler-media, leveler-core
+  leveler-lsp, leveler-skills, leveler-memory, leveler-media, leveler-core,
+  leveler-lifecycle (shared plan/evidence vocabulary across storage, engine,
+  and agent), leveler-eval (offline evaluation harness)
 ```
 
 The arrows represent dependency and call direction at a conceptual level. Some

@@ -379,13 +379,9 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
 }
 
 pub(crate) fn mode_from_str(s: &str) -> Option<PermissionProfile> {
-    // Current wire values first; then legacy 0003 defaults still present as
-    // SQLite column DEFAULT until every insert path writes an explicit mode.
-    PermissionProfile::parse(s).or_else(|| match s.trim() {
-        "workspace_write" => Some(PermissionProfile::Assisted),
-        "plan" => Some(PermissionProfile::RequestApproval),
-        _ => None,
-    })
+    // parse() covers current wire values and the legacy 0003 names ("plan",
+    // "workspace_write") still present as SQLite column DEFAULTs.
+    PermissionProfile::parse(s)
 }
 
 impl Application {

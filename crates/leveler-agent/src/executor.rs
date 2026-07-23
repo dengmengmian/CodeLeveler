@@ -567,7 +567,6 @@ pub(crate) struct StreamRoundResult {
     retry_count: u32,
 }
 
-
 /// The execution-policy slice a delegated executor needs. The engine resolves
 /// one value per role from model facts, task facts, and eval-only overrides;
 /// the agent loop only consumes the already-resolved values.
@@ -824,7 +823,6 @@ impl Executor {
         self
     }
 
-
     /// Whether delivery process evidence is enforced on update_goal(complete).
     pub fn delivery_gate_enabled(&self) -> bool {
         self.delivery_gate
@@ -856,7 +854,6 @@ impl Executor {
         self.goal_mode = on;
         self
     }
-
 
     /// Build a sub-agent that reuses this agent's runtime, tools, model, and
     /// permissions, but runs silently on its own fresh conversation with a
@@ -927,7 +924,12 @@ impl Executor {
                 max_duration: Some(crate::sub_agent::SUB_AGENT_MAX_DURATION),
                 ..StepLimits::default()
             },
-            permission_rules: std::sync::RwLock::new(self.permission_rules.read().unwrap().clone()),
+            permission_rules: std::sync::RwLock::new(
+                self.permission_rules
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
             permission_rules_path: self.permission_rules_path.clone(),
             hook_runner: self.hook_runner.clone(),
             grants_state_dir: self.grants_state_dir.clone(),
@@ -1442,8 +1444,7 @@ mod compaction_tests {
     }
 
     #[test]
-    fn advisory_model_calls_have_a_short_independent_deadline() {
-    }
+    fn advisory_model_calls_have_a_short_independent_deadline() {}
 
     fn assistant_call(name: &str, path: &str) -> Message {
         Message {

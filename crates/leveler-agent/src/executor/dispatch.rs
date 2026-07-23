@@ -60,11 +60,14 @@ impl Executor {
         let rule_paths: Vec<std::path::PathBuf> =
             scoped_paths.iter().map(std::path::PathBuf::from).collect();
 
-        let rule_decision = self.permission_rules.read().unwrap().evaluate(
-            &call.name,
-            command_line.as_deref(),
-            &rule_paths,
-        );
+        // A poisoned lock only means a rules writer panicked mid-update; the
+        // rule set is append-only, so read the latest state instead of turning
+        // every future dispatch into a panic.
+        let rule_decision = self
+            .permission_rules
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evaluate(&call.name, command_line.as_deref(), &rule_paths);
         match rule_decision {
             leveler_execution::RuleDecision::Deny => {
                 return Err("forbidden by permission rule".to_string());
@@ -174,7 +177,7 @@ impl Executor {
         }
         self.permission_rules
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(leveler_execution::PermissionRuleSet::from_rules(rules));
     }
 
