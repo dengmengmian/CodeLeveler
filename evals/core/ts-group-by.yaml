@@ -1,7 +1,7 @@
 id: ts-group-by
 name: Group records without shared buckets
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export function groupBy<T>(values: T[], key: (value: T) => string): Record<string,T[]> { return {}; }
   spec.ts: |

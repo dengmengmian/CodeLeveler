@@ -1,7 +1,7 @@
 id: ts-retry-limit
 name: Bound async retries and preserve the final error
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export async function retry<T>(operation:()=>Promise<T>, attempts:number):Promise<T>{ return operation(); }
   spec.ts: |

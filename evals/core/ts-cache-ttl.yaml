@@ -1,7 +1,7 @@
 id: ts-cache-ttl
 name: Expire cached values at the TTL boundary
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export class Cache<T>{ #entries=new Map<string,{value:T,expires:number}>(); constructor(private now:()=>number=Date.now){} set(key:string,value:T,ttl:number){this.#entries.set(key,{value,expires:this.now()+ttl});} get(key:string):T|undefined{return this.#entries.get(key)?.value;} }
   spec.ts: |

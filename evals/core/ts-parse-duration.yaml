@@ -1,7 +1,7 @@
 id: ts-parse-duration
 name: Parse strict duration strings
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export function parseDuration(raw: string): number { return Number.parseInt(raw,10); }
   spec.ts: |

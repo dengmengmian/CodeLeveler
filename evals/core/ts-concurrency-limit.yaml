@@ -1,7 +1,7 @@
 id: ts-concurrency-limit
 name: Enforce an async concurrency limit
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export async function mapLimit<T,R>(values:T[],limit:number,fn:(value:T)=>Promise<R>):Promise<R[]>{ return Promise.all(values.map(fn)); }
   spec.ts: |

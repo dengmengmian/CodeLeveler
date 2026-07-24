@@ -1,7 +1,7 @@
 id: ts-result-type
 name: Preserve zero in a Result conversion
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export type Result<T> = {ok:true,value:T}|{ok:false,error:string};
     export function parseCount(raw: string): Result<number> { const value=Number(raw); return value ? {ok:true,value} : {ok:false,error:"invalid"}; }

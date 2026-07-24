@@ -1,7 +1,7 @@
 id: ts-chunk-boundaries
 name: Chunk arrays at exact boundaries
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export function chunk<T>(values: T[], size: number): T[][] { return [values]; }
   spec.ts: |

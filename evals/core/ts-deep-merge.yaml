@@ -1,7 +1,7 @@
 id: ts-deep-merge
 name: Merge nested configuration without losing siblings
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export function merge(base: Record<string,unknown>, patch: Record<string,unknown>): Record<string,unknown> { return {...base,...patch}; }
   spec.ts: |

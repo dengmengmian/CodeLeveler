@@ -1,7 +1,7 @@
 id: ts-dedup-stable
 name: Stable TypeScript deduplication
 files:
-  package.json: '{"type":"module"}'
+  package.json: '{"type":"module","scripts":{"test":"node --test spec.ts"}}'
   src.ts: |
     export function dedup(values: string[]): string[] { return [...new Set(values)].sort(); }
   spec.ts: |
