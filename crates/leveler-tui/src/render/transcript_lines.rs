@@ -412,9 +412,7 @@ fn localized_turn_detail<'a>(detail: &'a str, t: &'a crate::i18n::UiText) -> &'a
         }
         // The label already says "验证未通过"; drop the redundant English prefix
         // and keep just the failing gate name(s) as the detail.
-        s if s.starts_with("failed gate(s): ") => {
-            s.strip_prefix("failed gate(s): ").unwrap_or(s)
-        }
+        s if s.starts_with("failed gate(s): ") => s.strip_prefix("failed gate(s): ").unwrap_or(s),
         other => other,
     }
 }
@@ -1021,7 +1019,10 @@ mod tests {
         assert!(incomplete.contains("⚠ 未完成"), "{incomplete}");
         // A failed verification gate reads as "验证未通过" with just the gate name,
         // NOT "被阻塞 · failed gate(s): cargo test" (the false-blocked UX).
-        let gate = turn_end_text(TurnEndStatus::Incomplete, Some("failed gate(s): cargo test"));
+        let gate = turn_end_text(
+            TurnEndStatus::Incomplete,
+            Some("failed gate(s): cargo test"),
+        );
         assert!(gate.contains("⚠ 验证未通过"), "{gate}");
         assert!(gate.contains("cargo test"), "{gate}");
         assert!(!gate.contains("被阻塞"), "{gate}");

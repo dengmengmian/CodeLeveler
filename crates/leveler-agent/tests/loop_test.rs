@@ -1302,6 +1302,24 @@ async fn configured_token_budget_stops_before_another_model_request() {
     assert_eq!(outcome.rounds, 1);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(outcome.final_text.contains("token"));
+    let exhaustion = outcome
+        .budget_exhaustion
+        .as_ref()
+        .expect("token budget exhaust must carry structured dimension");
+    assert_eq!(
+        exhaustion.dimension,
+        leveler_agent::BudgetDimension::ModelTokens
+    );
+    assert!(exhaustion.spent >= exhaustion.cap);
+    assert_eq!(exhaustion.cap, 100);
+    assert!(
+        outcome
+            .stop_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("dimension=model_tokens") && d.contains("cap=100")),
+        "stop_detail must be parseable: {:?}",
+        outcome.stop_detail
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1354,6 +1372,13 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
     assert_eq!(outcome.rounds, 1);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(outcome.final_text.contains("cost"));
+    let exhaustion = outcome
+        .budget_exhaustion
+        .as_ref()
+        .expect("cost budget exhaust must carry structured dimension");
+    assert_eq!(exhaustion.dimension, leveler_agent::BudgetDimension::Cost);
+    assert!(exhaustion.spent >= exhaustion.cap);
+    assert_eq!(exhaustion.cap, 30);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1663,6 +1688,118 @@ async fn retryable_mid_stream_error_is_retried_not_fatal() {
     assert_eq!(
         visible, "all done",
         "only the successful divergent attempt may become visible"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn retryable_stream_error_exhausts_to_failed_after_max_attempts() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-flaky-exhaust-{}",
+        std::process::id() as u64 * 19 + 8
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Always fail with a retryable error — must surface as Model error after
+    // the bounded attempt budget (MAX_ATTEMPTS=5), not hang forever.
+    let runtime = Arc::new(FlakyStreamRuntime {
+        fails_left: Mutex::new(100),
+        response: Mutex::new(Some(assistant_text("never reached"))),
+    });
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        5,
+    );
+
+    let err = executor
+        .run(
+            "say done",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("exhausted retries must fail the run");
+    match err {
+        AgentError::Model(e) => {
+            assert!(e.retryable, "underlying error stays retryable: {e}");
+            assert_eq!(e.kind, leveler_model::ModelErrorKind::StreamInterrupted);
+        }
+        other => panic!("expected Model error after retry exhaustion, got {other}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn non_retryable_model_error_is_not_retried() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-auth-fail-{}",
+        std::process::id() as u64 * 19 + 9
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    struct AuthFailRuntime;
+    #[async_trait]
+    impl ModelRuntime for AuthFailRuntime {
+        async fn generate(
+            &self,
+            _r: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            unimplemented!()
+        }
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            Err(ModelError::new(
+                leveler_model::ModelErrorKind::Auth,
+                "bad key",
+            ))
+        }
+        async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+            unimplemented!()
+        }
+    }
+
+    let executor = Executor::new(
+        Arc::new(AuthFailRuntime),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        5,
+    );
+    let mut attempts = 0u32;
+    let err = executor
+        .run(
+            "say done",
+            &mut |event| {
+                if matches!(event, AgentEvent::StreamAttemptStarted) {
+                    attempts += 1;
+                }
+            },
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("auth failure must fail the run");
+    assert!(
+        matches!(&err, AgentError::Model(e) if e.kind == leveler_model::ModelErrorKind::Auth),
+        "got {err}"
+    );
+    assert_eq!(
+        attempts, 1,
+        "non-retryable errors must not be re-attempted (attempts={attempts})"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2701,6 +2838,16 @@ async fn command_budget_is_enforced_before_the_call() {
         "the reason must name the exhausted budget: {}",
         outcome.final_text
     );
+    let exhaustion = outcome
+        .budget_exhaustion
+        .as_ref()
+        .expect("command budget exhaust must carry structured dimension");
+    assert_eq!(
+        exhaustion.dimension,
+        leveler_agent::BudgetDimension::Commands
+    );
+    assert_eq!(exhaustion.cap, 1);
+    assert!(exhaustion.spent >= 1);
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -2771,6 +2918,15 @@ async fn modified_files_budget_blocks_further_edits() {
         "the reason must name the exhausted budget: {}",
         outcome.final_text
     );
+    let exhaustion = outcome
+        .budget_exhaustion
+        .as_ref()
+        .expect("file budget exhaust must carry structured dimension");
+    assert_eq!(
+        exhaustion.dimension,
+        leveler_agent::BudgetDimension::ModifiedFiles
+    );
+    assert_eq!(exhaustion.cap, 1);
     let b = std::fs::read_to_string(dir.join("src/b.rs")).unwrap();
     assert_eq!(b, "pub fn b() {}\n", "the over-budget edit must not land");
 
@@ -2901,6 +3057,16 @@ async fn duration_budget_stops_the_run_between_rounds() {
         "the reason must name the exhausted budget: {}",
         outcome.final_text
     );
+    let exhaustion = outcome
+        .budget_exhaustion
+        .as_ref()
+        .expect("duration budget exhaust must carry structured dimension");
+    assert_eq!(
+        exhaustion.dimension,
+        leveler_agent::BudgetDimension::Duration
+    );
+    assert!(exhaustion.spent >= exhaustion.cap);
+    assert_eq!(exhaustion.cap, 10, "cap is milliseconds for duration");
 
     std::fs::remove_dir_all(&dir).ok();
 }

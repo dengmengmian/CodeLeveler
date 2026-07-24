@@ -252,7 +252,8 @@ impl Executor {
         let mut commands_run = progress.cumulative_commands;
         let mut model_tokens_spent = progress.cumulative_model_tokens;
         let mut cost_spent_micros = progress.cumulative_cost_usd_micros;
-        let mut budget_exceeded: Option<String> = None;
+        // Human reason + structured dimension when a step limit trips mid-round.
+        let mut budget_exceeded: Option<(String, crate::budget::BudgetExhaustion)> = None;
         let epoch_tokens_at_start = progress.cumulative_model_tokens;
         let epoch_rounds_at_start = progress.cumulative_rounds;
 
@@ -288,12 +289,15 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome::drive_result(
+                return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
                     modified_files,
-                    StopReason::BudgetExhausted,
-                    Some("model token budget exhausted".to_string()),
+                    crate::budget::BudgetExhaustion::new(
+                        crate::budget::BudgetDimension::ModelTokens,
+                        model_tokens_spent,
+                        max,
+                    ),
                     &metrics,
                     &progress,
                     &objective,
@@ -323,12 +327,15 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome::drive_result(
+                return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
                     modified_files,
-                    StopReason::BudgetExhausted,
-                    Some("model cost budget exhausted".to_string()),
+                    crate::budget::BudgetExhaustion::new(
+                        crate::budget::BudgetDimension::Cost,
+                        cost_spent_micros,
+                        max,
+                    ),
                     &metrics,
                     &progress,
                     &objective,
@@ -425,12 +432,15 @@ impl Executor {
                         ledger: progress.clone(),
                     });
 
-                    return Ok(AgentOutcome::drive_result(
+                    return Ok(AgentOutcome::drive_budget_exhausted(
                         reason,
                         round - 1,
                         modified_files,
-                        StopReason::BudgetExhausted,
-                        None,
+                        crate::budget::BudgetExhaustion::new(
+                            crate::budget::BudgetDimension::Duration,
+                            elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                            max.as_millis().min(u128::from(u64::MAX)) as u64,
+                        ),
                         &metrics,
                         &progress,
                         &objective,
@@ -532,8 +542,15 @@ impl Executor {
             if let Some(max) = self.step_limits.max_cost_usd_micros
                 && cost_spent_micros >= max
             {
-                budget_exceeded = Some(format!(
-                    "Stopped: the {max}-micro-USD model cost budget was exhausted after {round} round(s)."
+                budget_exceeded = Some((
+                    format!(
+                        "Stopped: the {max}-micro-USD model cost budget was exhausted after {round} round(s)."
+                    ),
+                    crate::budget::BudgetExhaustion::new(
+                        crate::budget::BudgetDimension::Cost,
+                        cost_spent_micros,
+                        max,
+                    ),
                 ));
             }
             // Epoch totals for continue/resume inheritance (absolute spend).
@@ -680,7 +697,7 @@ impl Executor {
 
             // Cost tip-over after this response with no tools: end now (no more rounds).
             if calls.is_empty()
-                && let Some(reason) = budget_exceeded.take()
+                && let Some((reason, exhaustion)) = budget_exceeded.take()
             {
                 sink.append(&[assistant]).await?;
                 observer(AgentEvent::Finished(reason.clone()));
@@ -700,12 +717,11 @@ impl Executor {
                 observer(AgentEvent::ProgressUpdated {
                     ledger: progress.clone(),
                 });
-                return Ok(AgentOutcome::drive_result(
+                return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
                     modified_files,
-                    StopReason::BudgetExhausted,
-                    Some("model cost budget exhausted".to_string()),
+                    exhaustion,
                     &metrics,
                     &progress,
                     &objective,
@@ -1278,9 +1294,14 @@ impl Executor {
                             .max_commands
                             .is_some_and(|max| commands_run >= max) =>
                     {
-                        Some(format!(
-                            "the {}-command budget is exhausted",
-                            self.step_limits.max_commands.unwrap_or(0)
+                        let cap = u64::from(self.step_limits.max_commands.unwrap_or(0));
+                        Some((
+                            format!("the {cap}-command budget is exhausted"),
+                            crate::budget::BudgetExhaustion::new(
+                                crate::budget::BudgetDimension::Commands,
+                                u64::from(commands_run),
+                                cap,
+                            ),
                         ))
                     }
                     "apply_patch" | "replace" => file_budget_refusal(
@@ -1289,12 +1310,23 @@ impl Executor {
                         &call,
                         &progress,
                         &modified_files,
-                    ),
+                    )
+                    .map(|which| {
+                        let cap = self.step_limits.max_modified_files.unwrap_or(0) as u64;
+                        (
+                            which,
+                            crate::budget::BudgetExhaustion::new(
+                                crate::budget::BudgetDimension::ModifiedFiles,
+                                epoch_file_count as u64,
+                                cap,
+                            ),
+                        )
+                    }),
                     _ => None,
                 };
-                if let Some(which) = over_budget {
+                if let Some((which, exhaustion)) = over_budget {
                     let msg = format!("Refused: {which}. The run stops here.");
-                    budget_exceeded = Some(format!("Stopped: {which}."));
+                    budget_exceeded = Some((format!("Stopped: {which}."), exhaustion));
                     denied_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
@@ -2130,6 +2162,7 @@ impl Executor {
                         stop_detail: Some(
                             "no-progress streak; all-refused rounds short-circuited".to_string(),
                         ),
+                        budget_exhaustion: None,
                         metrics: metrics.clone(),
                         progress: progress.clone(),
                         objective: objective.clone(),
@@ -2282,7 +2315,7 @@ impl Executor {
             }
 
             // A step limit tripped this round: results are committed, stop now.
-            if let Some(reason) = budget_exceeded {
+            if let Some((reason, exhaustion)) = budget_exceeded {
                 observer(AgentEvent::Finished(reason.clone()));
                 sync_epoch_progress(
                     &mut progress,
@@ -2301,12 +2334,11 @@ impl Executor {
                     ledger: progress.clone(),
                 });
 
-                return Ok(AgentOutcome::drive_result(
+                return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
                     modified_files,
-                    StopReason::BudgetExhausted,
-                    None,
+                    exhaustion,
                     &metrics,
                     &progress,
                     &objective,

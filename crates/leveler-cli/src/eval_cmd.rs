@@ -329,7 +329,11 @@ fn run_trend(
                 None => skipped += 1,
             },
             Err(e) => {
-                eprintln!("  {} skipping {}: {e}", console::style("!").yellow(), path.display());
+                eprintln!(
+                    "  {} skipping {}: {e}",
+                    console::style("!").yellow(),
+                    path.display()
+                );
                 skipped += 1;
             }
         }

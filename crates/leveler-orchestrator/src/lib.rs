@@ -19,7 +19,10 @@ pub mod state;
 
 pub use discuss::{Discussion, DiscussionEvent, DiscussionOutcome, Participant};
 pub use error::OrchestratorError;
-pub use graph::{GraphValidationError, NodeStatus, StepBudget, TaskGraph, TaskNode, TaskNodeKind};
+pub use graph::{
+    GraphValidationError, NodeBudgetSignals, NodeStatus, StepBudget, TaskGraph, TaskNode,
+    TaskNodeKind,
+};
 pub use orchestrator::{Orchestrator, OrchestratorEvent};
 pub use planner::{
     Planner, ReviewConfig, allowed_paths, compose_node_goal, compose_repair_goal, is_repairable,

@@ -1058,11 +1058,22 @@ mod tests {
             ToolStatus::Running,
         )]);
         // Turn is 45s in; the command started at elapsed 0 → 45s of runtime.
-        let lines: Vec<String> =
-            render_group(&g, &Theme::no_color(), 100, Locale::Zh, Locale::Zh.text(), 45)
-                .into_iter()
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-                .collect();
+        let lines: Vec<String> = render_group(
+            &g,
+            &Theme::no_color(),
+            100,
+            Locale::Zh,
+            Locale::Zh.text(),
+            45,
+        )
+        .into_iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
         assert!(
             lines[0].contains("45s"),
             "running command must show live elapsed: {lines:?}"

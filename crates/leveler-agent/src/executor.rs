@@ -433,6 +433,10 @@ pub struct AgentOutcome {
     /// Human-readable cause for non-success stops (audit gaps, stall, budget…).
     /// Empty when the stop reason is self-explanatory.
     pub stop_detail: Option<String>,
+    /// When `stop_reason` is [`StopReason::BudgetExhausted`], which limit fired
+    /// and spent vs cap. `None` for other stops (and for legacy bounded-round
+    /// exits that reuse the BudgetExhausted label without a resource dimension).
+    pub budget_exhaustion: Option<crate::budget::BudgetExhaustion>,
     /// Continuous-use / latency counters for S0/S3 hard gates.
     pub metrics: leveler_lifecycle::DepthUseMetrics,
     /// Final progress / closeout state (engine continue_active_goal reads this).
@@ -463,6 +467,33 @@ impl AgentOutcome {
             modified_files,
             stop_reason,
             stop_detail,
+            budget_exhaustion: None,
+            metrics: metrics.clone(),
+            progress: progress.clone(),
+            objective: objective.clone(),
+        }
+    }
+
+    /// Like [`Self::drive_result`], but stamps structured budget-exhaust facts
+    /// and a parseable `stop_detail` contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn drive_budget_exhausted(
+        final_text: String,
+        rounds: u32,
+        modified_files: Vec<String>,
+        exhaustion: crate::budget::BudgetExhaustion,
+        metrics: &leveler_lifecycle::DepthUseMetrics,
+        progress: &ProgressLedger,
+        objective: &ObjectiveAnchor,
+    ) -> Self {
+        let stop_detail = Some(exhaustion.stop_detail());
+        Self {
+            final_text,
+            rounds,
+            modified_files,
+            stop_reason: StopReason::BudgetExhausted,
+            stop_detail,
+            budget_exhaustion: Some(exhaustion),
             metrics: metrics.clone(),
             progress: progress.clone(),
             objective: objective.clone(),

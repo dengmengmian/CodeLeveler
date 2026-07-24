@@ -1446,10 +1446,10 @@ mod tests {
         let report = EvalReport {
             model: "m".into(),
             cases: vec![
-                result("ok", true, true),        // honest pass
+                result("ok", true, true),          // honest pass
                 result("false_done", true, false), // claimed done, check failed
-                result("gave_up", false, false),  // honest incomplete
-                result("odd", false, true),       // did not claim, yet check passed
+                result("gave_up", false, false),   // honest incomplete
+                result("odd", false, true),        // did not claim, yet check passed
             ],
         };
         assert_eq!(report.false_completion_count(), 1);
@@ -1482,7 +1482,8 @@ mod tests {
             false_completion_rate: fc,
         };
         // Out-of-order input; the report sorts by version and detects the 0.3 dip.
-        let report = TrendReport::from_points(vec![p("03", 81, 0.1), p("01", 72, 0.0), p("02", 89, 0.0)]);
+        let report =
+            TrendReport::from_points(vec![p("03", 81, 0.1), p("01", 72, 0.0), p("02", 89, 0.0)]);
         let versions: Vec<&str> = report.points.iter().map(|p| p.version.as_str()).collect();
         assert_eq!(versions, ["01", "02", "03"]);
         // 89 → 81 is a regression; 72 → 89 is not.
@@ -1494,7 +1495,10 @@ mod tests {
         let md = report.render_markdown();
         assert!(md.contains("| 01 |"));
         assert!(md.contains("72"));
-        assert!(md.contains("Regressions"), "must surface a regression section");
+        assert!(
+            md.contains("Regressions"),
+            "must surface a regression section"
+        );
     }
 
     #[test]
@@ -1508,8 +1512,14 @@ mod tests {
         // Compare docs carry two models and no single score → no trend point.
         let cmp = BaselineDocument::from_compare(
             meta(),
-            EvalReport { model: "a".into(), cases: vec![] },
-            EvalReport { model: "b".into(), cases: vec![] },
+            EvalReport {
+                model: "a".into(),
+                cases: vec![],
+            },
+            EvalReport {
+                model: "b".into(),
+                cases: vec![],
+            },
         );
         assert!(cmp.trend_point().is_none());
     }
@@ -1953,8 +1963,8 @@ expect: { program: cargo, args: [test] }
         // id silently corrupts checkpoints and cross-suite dedup.
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
         let all = EvaluationCase::load_dir(&root).expect("recursive eval suite");
-        let scenarios = EvaluationCase::load_dir(&root.join("scenarios"))
-            .expect("evals/scenarios must parse");
+        let scenarios =
+            EvaluationCase::load_dir(&root.join("scenarios")).expect("evals/scenarios must parse");
         assert!(
             !scenarios.is_empty(),
             "evals/scenarios must contain at least one case"

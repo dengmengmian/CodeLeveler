@@ -72,6 +72,108 @@ impl Default for StepBudget {
     }
 }
 
+/// Cheap size signals available when the planner materializes a node.
+/// Used only for budget assignment — not a complexity ML model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeBudgetSignals {
+    pub allowed_paths: usize,
+    pub acceptance_criteria: usize,
+    pub expected_outputs: usize,
+    pub description_chars: usize,
+}
+
+impl NodeBudgetSignals {
+    /// Discrete size units above the baseline for proportional headroom.
+    pub fn size_units(self) -> usize {
+        let bulk = self
+            .allowed_paths
+            .saturating_add(self.acceptance_criteria)
+            .saturating_add(self.expected_outputs);
+        let long_desc = usize::from(self.description_chars > 200);
+        bulk.saturating_add(long_desc)
+    }
+}
+
+impl StepBudget {
+    /// Assign per-node caps from kind + simple size signals.
+    ///
+    /// - **Edit**: balanced command/file headroom; grows with paths/criteria.
+    /// - **Test / Verify**: prefer command headroom over file headroom (run
+    ///   suites more than mutate sources).
+    /// - **Inspect / Design / Review**: modest commands, almost no writes.
+    ///
+    /// Growth above [`WORKLOAD_BASELINE`] is proportional and capped so a single
+    /// node cannot monopolize resources. Only apply when the node still carries
+    /// the flat default budget; explicit budgets are honored as given.
+    pub fn for_node(kind: TaskNodeKind, signals: NodeBudgetSignals) -> Self {
+        let base = Self::base_for_kind(kind);
+        let extra = signals.size_units().saturating_sub(WORKLOAD_BASELINE);
+        if extra == 0 {
+            return base;
+        }
+        // Test/Verify grow commands more aggressively; Edit also grows files.
+        let (cmd_per, file_per) = match kind {
+            TaskNodeKind::Test | TaskNodeKind::Verify => (CMD_PER_UNIT + 2, 0usize),
+            TaskNodeKind::Edit => (CMD_PER_UNIT, FILES_PER_UNIT),
+            TaskNodeKind::Inspect | TaskNodeKind::Design | TaskNodeKind::Review => {
+                (CMD_PER_UNIT, 0usize)
+            }
+        };
+        Self {
+            max_commands: (base.max_commands + extra as u32 * cmd_per).min(MAX_COMMANDS_CAP),
+            max_modified_files: (base.max_modified_files + extra * file_per)
+                .min(MAX_MODIFIED_FILES_CAP),
+            max_duration: (base.max_duration + Duration::from_secs(extra as u64 * SECS_PER_UNIT))
+                .min(Duration::from_secs(MAX_DURATION_SECS_CAP)),
+            ..base
+        }
+    }
+
+    /// Kind-only base table (size_units at or below baseline).
+    pub fn base_for_kind(kind: TaskNodeKind) -> Self {
+        let d = Self::default();
+        match kind {
+            TaskNodeKind::Edit => d,
+            TaskNodeKind::Test | TaskNodeKind::Verify => Self {
+                // Prefer shell/test command headroom over write headroom.
+                max_commands: 20,
+                max_modified_files: 2,
+                max_duration: Duration::from_secs(20 * 60),
+                ..d
+            },
+            TaskNodeKind::Inspect | TaskNodeKind::Design | TaskNodeKind::Review => Self {
+                max_commands: 12,
+                max_modified_files: 0,
+                max_duration: Duration::from_secs(10 * 60),
+                ..d
+            },
+        }
+    }
+
+    /// Scale the default Edit budget by a coarse workload count.
+    ///
+    /// Prefer [`Self::for_node`] for kind-aware assignment. Kept for callers that
+    /// only have a single integer size signal.
+    pub fn scaled_for_workload(workload: usize) -> Self {
+        Self::for_node(
+            TaskNodeKind::Edit,
+            NodeBudgetSignals {
+                acceptance_criteria: workload,
+                ..NodeBudgetSignals::default()
+            },
+        )
+    }
+}
+
+/// Size units at or below this keep the kind's base budget.
+const WORKLOAD_BASELINE: usize = 2;
+const CMD_PER_UNIT: u32 = 3;
+const MAX_COMMANDS_CAP: u32 = 40;
+const FILES_PER_UNIT: usize = 2;
+const MAX_MODIFIED_FILES_CAP: usize = 24;
+const SECS_PER_UNIT: u64 = 3 * 60;
+const MAX_DURATION_SECS_CAP: u64 = 45 * 60;
+
 /// A single node in the task graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskNode {
@@ -336,5 +438,70 @@ mod tests {
     fn budget_duration_serializes_as_seconds() {
         let json = serde_json::to_value(StepBudget::default()).unwrap();
         assert_eq!(json["max_duration"], 900);
+    }
+
+    #[test]
+    fn scaled_budget_at_or_below_baseline_is_default() {
+        assert_eq!(StepBudget::scaled_for_workload(0), StepBudget::default());
+        assert_eq!(StepBudget::scaled_for_workload(2), StepBudget::default());
+    }
+
+    #[test]
+    fn scaled_budget_grows_above_baseline() {
+        // workload 5 => extra 3: +9 cmd, +6 files, +9 min over Edit default.
+        let b = StepBudget::scaled_for_workload(5);
+        assert_eq!(b.max_commands, 10 + 9);
+        assert_eq!(b.max_modified_files, 8 + 6);
+        assert_eq!(b.max_duration, Duration::from_secs((15 + 9) * 60));
+        assert_eq!(b.max_tool_rounds, StepBudget::default().max_tool_rounds);
+        assert_eq!(b.max_repairs, StepBudget::default().max_repairs);
+    }
+
+    #[test]
+    fn scaled_budget_is_capped() {
+        let b = StepBudget::scaled_for_workload(10_000);
+        assert_eq!(b.max_commands, 40);
+        assert_eq!(b.max_modified_files, 24);
+        assert_eq!(b.max_duration, Duration::from_secs(45 * 60));
+    }
+
+    #[test]
+    fn large_edit_gets_strictly_higher_cap_than_small_edit() {
+        let small = StepBudget::for_node(
+            TaskNodeKind::Edit,
+            NodeBudgetSignals {
+                allowed_paths: 1,
+                acceptance_criteria: 1,
+                ..NodeBudgetSignals::default()
+            },
+        );
+        let large = StepBudget::for_node(
+            TaskNodeKind::Edit,
+            NodeBudgetSignals {
+                allowed_paths: 6,
+                acceptance_criteria: 4,
+                expected_outputs: 2,
+                description_chars: 400,
+            },
+        );
+        assert!(
+            large.max_commands > small.max_commands
+                || large.max_modified_files > small.max_modified_files
+                || large.max_duration > small.max_duration,
+            "large edit must raise at least one cap: small={small:?} large={large:?}"
+        );
+        assert!(large.max_commands >= small.max_commands);
+        assert!(large.max_modified_files >= small.max_modified_files);
+    }
+
+    #[test]
+    fn test_verify_prefer_command_headroom_over_files_vs_edit() {
+        let edit = StepBudget::base_for_kind(TaskNodeKind::Edit);
+        let test = StepBudget::base_for_kind(TaskNodeKind::Test);
+        let verify = StepBudget::base_for_kind(TaskNodeKind::Verify);
+        assert!(test.max_commands > edit.max_commands);
+        assert!(verify.max_commands > edit.max_commands);
+        assert!(test.max_modified_files < edit.max_modified_files);
+        assert!(verify.max_modified_files < edit.max_modified_files);
     }
 }

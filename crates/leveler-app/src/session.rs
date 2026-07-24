@@ -370,6 +370,7 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
         modified_files: report.modified_files,
         stop_reason,
         stop_detail: verification_failure.or(unverified_detail),
+        budget_exhaustion: None,
         metrics: Default::default(),
         progress: Default::default(),
         objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),

@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod authorization;
+mod budget;
 mod compaction;
 mod executor;
 mod injected_tools;
@@ -17,6 +18,10 @@ mod nudges;
 mod prompt;
 mod sub_agent;
 
+pub use budget::{
+    BudgetDimension, BudgetExhaustion, MAX_BUDGET_EXTENSIONS, budget_extension_allowed,
+    grant_budget_extension, stop_detail_indicates_no_progress,
+};
 pub use compaction::{
     COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages, estimate_tokens,
     summarize_with_model,

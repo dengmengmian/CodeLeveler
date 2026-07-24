@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{Clarifier, ContinuationPolicy, StepLimits, StopReason};
+use leveler_agent::{
+    Clarifier, ContinuationPolicy, MAX_BUDGET_EXTENSIONS, StepLimits, StopReason,
+    budget_extension_allowed, grant_budget_extension, stop_detail_indicates_no_progress,
+};
 use leveler_core::{SessionId, TurnId};
 use leveler_execution::{Approver, PermissionProfile, RiskLevel};
 use leveler_storage::{Database, SessionRecord, SessionRepository, TerminalRepository};
@@ -1169,6 +1172,90 @@ impl TaskEngine {
         Ok(outcome)
     }
 
+    /// When a drive stops on resource budget with real progress, grant a small
+    /// extra allowance and resume the transcript (at most
+    /// [`MAX_BUDGET_EXTENSIONS`] times). Absolute round ceilings and
+    /// no-progress stops never extend.
+    async fn extend_budget_exhausted(
+        &self,
+        _log: &EventLog<'_>,
+        runner: &TurnRunner<'_>,
+        spec: &TaskSpec,
+        mut outcome: leveler_agent::AgentOutcome,
+        observer: &mut dyn FnMut(EngineEvent),
+        cancellation: CancellationToken,
+    ) -> Result<leveler_agent::AgentOutcome, EngineError> {
+        let mut extensions = 0u32;
+        let mut limits = spec.limits;
+        while budget_extension_allowed(
+            outcome.stop_reason,
+            extensions,
+            !outcome.modified_files.is_empty(),
+            stop_detail_indicates_no_progress(outcome.stop_detail.as_deref()),
+        ) {
+            let Some(exhaustion) = outcome.budget_exhaustion.clone() else {
+                break;
+            };
+            limits = grant_budget_extension(limits, &exhaustion);
+            extensions = extensions.saturating_add(1);
+            observer(EngineEvent::AdvisoryStarted {
+                kind: format!(
+                    "budget_extension:{}/{}:{}",
+                    extensions,
+                    MAX_BUDGET_EXTENSIONS,
+                    exhaustion.dimension.as_str()
+                ),
+            });
+            let payloads = leveler_storage::MessageRepository::new(&self.db)
+                .load(&runner.session_id)
+                .await?;
+            let prior = payloads
+                .iter()
+                .map(|payload| serde_json::from_str(payload))
+                .collect::<Result<Vec<leveler_model::Message>, _>>()
+                .map_err(|error| {
+                    EngineError::Corrupt(format!(
+                        "unreplayable transcript during budget extension: {error}"
+                    ))
+                })?;
+            if prior.is_empty() {
+                break;
+            }
+            let continued = runner
+                .run_turn(
+                    TurnKind::User,
+                    TurnProfile::Goal {
+                        continuation: spec.continuation,
+                        limits,
+                    },
+                    TurnInput::Resume(prior),
+                    observer,
+                    cancellation.clone(),
+                )
+                .await?;
+            outcome.rounds = outcome.rounds.saturating_add(continued.outcome.rounds);
+            outcome.final_text = continued.outcome.final_text;
+            outcome.stop_reason = continued.outcome.stop_reason;
+            outcome.stop_detail = continued.outcome.stop_detail;
+            outcome.budget_exhaustion = continued.outcome.budget_exhaustion;
+            outcome.progress = continued.outcome.progress;
+            outcome.metrics.model_tokens = outcome
+                .metrics
+                .model_tokens
+                .saturating_add(continued.outcome.metrics.model_tokens);
+            outcome.metrics.extra_model_calls = outcome
+                .metrics
+                .extra_model_calls
+                .saturating_add(continued.outcome.metrics.extra_model_calls);
+            for path in continued.outcome.modified_files {
+                if !outcome.modified_files.contains(&path) {
+                    outcome.modified_files.push(path);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Shared tail of fresh and resumed direct runs: map the stop reason,
     /// then verify + bounded repair.
     async fn conclude_direct(
@@ -1180,6 +1267,16 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
+        // Bounded L2 resource extension: BudgetExhausted + real progress may
+        // get up to MAX_BUDGET_EXTENSIONS extra grants. TurnLimitReached and
+        // no-progress stops never extend. Eval cases with a fixed round budget
+        // skip auto-extend (reproducibility).
+        if spec.continuation.round_limit().is_none() {
+            outcome = self
+                .extend_budget_exhausted(log, runner, spec, outcome, observer, cancellation.clone())
+                .await?;
+        }
+
         // Completed and Answered both count as clean finishes — and both must
         // verify if they touched files. Most other stop reasons are terminal
         // failure (Stalled/Blocked/BudgetExhausted never read as success).
@@ -1188,8 +1285,8 @@ impl TaskEngine {
         // expect-green work is not reported as Failed (orchestrate node_status
         // uses the same rule).
         if let Some(terminal) = direct_non_success_outcome(outcome.stop_reason) {
-            let incomplete_with_work = outcome.stop_reason == StopReason::Incomplete
-                && !outcome.modified_files.is_empty();
+            let incomplete_with_work =
+                outcome.stop_reason == StopReason::Incomplete && !outcome.modified_files.is_empty();
             if !incomplete_with_work {
                 return Ok(TaskReport::new(
                     terminal,
@@ -1504,39 +1601,92 @@ impl TaskEngine {
             .await?;
             graph.nodes[index].status = NodeStatus::Running;
 
-            let recorded = runner
-                .run_turn(
-                    TurnKind::Node {
-                        node_id: node.id.to_string(),
-                    },
-                    TurnProfile::Node {
-                        continuation: node_continuation,
-                        limits: leveler_agent::StepLimits {
-                            // Wall clock is the node's backstop under
-                            // UntilTerminal (rounds caps are deliberately
-                            // retired; see the twenty-round test). Zero means
-                            // unlimited, like the legacy caps.
-                            max_duration: (!node.budget.max_duration.is_zero())
-                                .then_some(node.budget.max_duration),
-                            ..leveler_agent::StepLimits::from_legacy_caps(
-                                node.budget.max_commands,
-                                node.budget.max_modified_files,
-                            )
-                        },
-                        write_allowlist: (!node.allowed_paths.is_empty())
-                            .then(|| node.allowed_paths.clone()),
-                    },
-                    match resume_in_flight.take_if(|(id, _)| *id == node.id.to_string()) {
-                        Some((_, prior)) => TurnInput::Resume(prior),
-                        None => TurnInput::Goal {
-                            goal: compose_node_goal(requirement, context, &node),
-                            prior: Vec::new(),
-                        },
-                    },
-                    observer,
-                    cancellation.clone(),
+            // Wall clock is the node's backstop under UntilTerminal (rounds
+            // caps are deliberately retired; see the twenty-round test). Zero
+            // means unlimited, like the legacy caps.
+            let mut node_limits = leveler_agent::StepLimits {
+                max_duration: (!node.budget.max_duration.is_zero())
+                    .then_some(node.budget.max_duration),
+                ..leveler_agent::StepLimits::from_legacy_caps(
+                    node.budget.max_commands,
+                    node.budget.max_modified_files,
                 )
-                .await?;
+            };
+            let write_allowlist =
+                (!node.allowed_paths.is_empty()).then(|| node.allowed_paths.clone());
+            let mut turn_input =
+                match resume_in_flight.take_if(|(id, _)| *id == node.id.to_string()) {
+                    Some((_, prior)) => TurnInput::Resume(prior),
+                    None => TurnInput::Goal {
+                        goal: compose_node_goal(requirement, context, &node),
+                        prior: Vec::new(),
+                    },
+                };
+            let mut extensions = 0u32;
+            let recorded = loop {
+                let attempt = runner
+                    .run_turn(
+                        TurnKind::Node {
+                            node_id: node.id.to_string(),
+                        },
+                        TurnProfile::Node {
+                            continuation: node_continuation,
+                            limits: node_limits,
+                            write_allowlist: write_allowlist.clone(),
+                        },
+                        turn_input,
+                        observer,
+                        cancellation.clone(),
+                    )
+                    .await?;
+                // Case-wide round budgets stay reproducible: no auto-extend.
+                let may_extend = spec.continuation.round_limit().is_none()
+                    && budget_extension_allowed(
+                        attempt.outcome.stop_reason,
+                        extensions,
+                        !attempt.outcome.modified_files.is_empty(),
+                        stop_detail_indicates_no_progress(attempt.outcome.stop_detail.as_deref()),
+                    );
+                if !may_extend {
+                    break attempt;
+                }
+                let Some(exhaustion) = attempt.outcome.budget_exhaustion.clone() else {
+                    break attempt;
+                };
+                node_limits = grant_budget_extension(node_limits, &exhaustion);
+                extensions = extensions.saturating_add(1);
+                observer(EngineEvent::AdvisoryStarted {
+                    kind: format!(
+                        "budget_extension:{}/{}:{}",
+                        extensions,
+                        MAX_BUDGET_EXTENSIONS,
+                        exhaustion.dimension.as_str()
+                    ),
+                });
+                let payloads = leveler_storage::MessageRepository::new(&self.db)
+                    .load(&runner.session_id)
+                    .await?;
+                let prior = payloads
+                    .iter()
+                    .map(|payload| serde_json::from_str(payload))
+                    .collect::<Result<Vec<leveler_model::Message>, _>>()
+                    .map_err(|error| {
+                        EngineError::Corrupt(format!(
+                            "unreplayable transcript during node budget extension: {error}"
+                        ))
+                    })?;
+                if prior.is_empty() {
+                    break attempt;
+                }
+                // Accumulate spend from the exhausted attempt before resume.
+                rounds += attempt.outcome.rounds;
+                for f in &attempt.outcome.modified_files {
+                    if !modified_files.contains(f) {
+                        modified_files.push(f.clone());
+                    }
+                }
+                turn_input = TurnInput::Resume(prior);
+            };
             rounds += recorded.outcome.rounds;
             last_text = recorded.outcome.final_text.clone();
             let node_modified = recorded.outcome.modified_files.clone();
@@ -2058,10 +2208,9 @@ fn node_status(
         }
         // Work already landed (this node or prior): do not fail the graph.
         (_, StopReason::Incomplete) if task_has_mutation => NodeStatus::Completed,
-        (
-            _,
-            StopReason::Completed | StopReason::Answered | StopReason::CloseoutForced,
-        ) => NodeStatus::Completed,
+        (_, StopReason::Completed | StopReason::Answered | StopReason::CloseoutForced) => {
+            NodeStatus::Completed
+        }
         _ => NodeStatus::Failed,
     }
 }
@@ -2159,12 +2308,7 @@ mod node_status_tests {
             NodeStatus::Completed
         );
         assert_eq!(
-            node_status(
-                TaskNodeKind::Edit,
-                StopReason::BudgetExhausted,
-                false,
-                true
-            ),
+            node_status(TaskNodeKind::Edit, StopReason::BudgetExhausted, false, true),
             NodeStatus::Failed
         );
     }
@@ -2173,21 +2317,11 @@ mod node_status_tests {
     fn closeout_forced_completes_node_like_direct() {
         // Direct lets CloseoutForced enter verify; orchestrate nodes must too.
         assert_eq!(
-            node_status(
-                TaskNodeKind::Edit,
-                StopReason::CloseoutForced,
-                false,
-                true
-            ),
+            node_status(TaskNodeKind::Edit, StopReason::CloseoutForced, false, true),
             NodeStatus::Completed
         );
         assert_eq!(
-            node_status(
-                TaskNodeKind::Test,
-                StopReason::CloseoutForced,
-                true,
-                false
-            ),
+            node_status(TaskNodeKind::Test, StopReason::CloseoutForced, true, false),
             NodeStatus::Completed
         );
     }
@@ -2367,6 +2501,63 @@ mod continue_cap_tests {
             &progress,
             caps,
         ));
+    }
+
+    #[test]
+    fn budget_extension_policy_grants_refuses_and_caps() {
+        use leveler_agent::{
+            BudgetDimension, BudgetExhaustion, MAX_BUDGET_EXTENSIONS, StepLimits,
+            budget_extension_allowed, grant_budget_extension, stop_detail_indicates_no_progress,
+        };
+
+        // Grant path: BudgetExhausted + mutation + room under MAX.
+        assert!(budget_extension_allowed(
+            leveler_agent::StopReason::BudgetExhausted,
+            0,
+            true,
+            false
+        ));
+        // Refuse: no real progress.
+        assert!(!budget_extension_allowed(
+            leveler_agent::StopReason::BudgetExhausted,
+            0,
+            false,
+            false
+        ));
+        // Refuse: stagnation / no-progress detail.
+        assert!(stop_detail_indicates_no_progress(Some(
+            "no-progress streak; all-refused rounds short-circuited"
+        )));
+        assert!(!budget_extension_allowed(
+            leveler_agent::StopReason::BudgetExhausted,
+            0,
+            true,
+            true
+        ));
+        // Refuse: absolute round ceiling.
+        assert!(!budget_extension_allowed(
+            leveler_agent::StopReason::TurnLimitReached,
+            0,
+            true,
+            false
+        ));
+        // Cap exhaustion.
+        assert!(!budget_extension_allowed(
+            leveler_agent::StopReason::BudgetExhausted,
+            MAX_BUDGET_EXTENSIONS,
+            true,
+            false
+        ));
+        // Grant raises the fired dimension above spent.
+        let limits = StepLimits {
+            max_model_tokens: Some(100),
+            ..StepLimits::default()
+        };
+        let next = grant_budget_extension(
+            limits,
+            &BudgetExhaustion::new(BudgetDimension::ModelTokens, 100, 100),
+        );
+        assert_eq!(next.max_model_tokens, Some(150));
     }
 
     #[test]

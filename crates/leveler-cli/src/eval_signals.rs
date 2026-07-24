@@ -316,7 +316,11 @@ mod tests {
     #[test]
     fn loop_guard_trips_classify_as_tooling() {
         let mut c = SignalCollector::new(Vec::new());
-        c.observe_agent(&call("c1", "read_file", serde_json::json!({"path": "a.rs"})));
+        c.observe_agent(&call(
+            "c1",
+            "read_file",
+            serde_json::json!({"path": "a.rs"}),
+        ));
         c.observe_agent(&result(
             "c1",
             "read_file",

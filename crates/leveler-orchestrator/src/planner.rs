@@ -14,7 +14,7 @@ use leveler_tools::{ToolContext, ToolRegistry};
 use leveler_verifier::VerificationReport;
 
 use crate::error::OrchestratorError;
-use crate::graph::{NodeStatus, TaskGraph, TaskNode, TaskNodeKind};
+use crate::graph::{NodeBudgetSignals, NodeStatus, StepBudget, TaskGraph, TaskNode, TaskNodeKind};
 use crate::json::request_json;
 use crate::requirement::Requirement;
 use crate::review::{
@@ -140,11 +140,28 @@ impl Planner {
             Err(OrchestratorError::Json(_)) => PlanSpec { nodes: Vec::new() },
             Err(e) => return Err(e),
         };
-        let nodes = if spec.nodes.is_empty() {
+        let mut nodes = if spec.nodes.is_empty() {
             vec![fallback_node(&requirement.goal)]
         } else {
             spec.nodes
         };
+        // Size each node's budget by kind + simple size signals. A node the
+        // model gave an explicit (non-default) budget is honored as-is; the
+        // rest get kind-aware caps so Test/Verify keep command headroom and
+        // large Edits are not starved mid-plan.
+        for node in &mut nodes {
+            if node.budget == StepBudget::default() {
+                node.budget = StepBudget::for_node(
+                    node.kind,
+                    NodeBudgetSignals {
+                        allowed_paths: node.allowed_paths.len(),
+                        acceptance_criteria: node.acceptance_criteria.len(),
+                        expected_outputs: node.expected_outputs.len(),
+                        description_chars: node.description.len(),
+                    },
+                );
+            }
+        }
         let graph = TaskGraph {
             id: leveler_core::TaskId::generate(),
             goal: requirement.goal.clone(),
