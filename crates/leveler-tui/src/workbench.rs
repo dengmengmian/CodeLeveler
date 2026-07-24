@@ -532,6 +532,7 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
                     width,
                     state.locale,
                     t,
+                    state.elapsed_secs,
                 ));
             }
             TranscriptItem::SubAgent(first) => {
@@ -1156,6 +1157,7 @@ mod tests {
             "read_file".into(),
             r#"{"path":"README.md"}"#.into(),
             false,
+            0,
         );
         s.transcript.complete_tool(&call, true, "ok".into(), 1);
         let id = leveler_client_protocol::MessageId::new("m1");

@@ -28,6 +28,7 @@ pub(crate) fn render_group(
     width: usize,
     locale: Locale,
     t: &UiText,
+    now_elapsed_secs: u64,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // A concurrent batch gets one quiet dim header so the user sees these
@@ -52,6 +53,7 @@ pub(crate) fn render_group(
                     group.expanded,
                     1,
                     None,
+                    now_elapsed_secs,
                 ));
                 if !group.expanded {
                     continue;
@@ -84,6 +86,8 @@ pub(crate) fn render_group(
                     group.expanded,
                     calls.len(),
                     (total_ms >= 100).then_some(total_ms),
+                    // FailMerge is a finished failure group, never live-running.
+                    0,
                 ));
                 if group.expanded {
                     append_call_detail(calls[0], theme, width, true, locale, t, &mut out);
@@ -219,6 +223,7 @@ fn is_shell_call(call: &ToolCallBlock) -> bool {
 /// once with a `×N` suffix on the result row. `duration_override` lets the
 /// merged unit show the summed duration instead of the first call's.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn unit_lines(
     call: &ToolCallBlock,
     theme: &Theme,
@@ -228,6 +233,7 @@ fn unit_lines(
     expanded: bool,
     repeat: usize,
     duration_override: Option<u64>,
+    now_elapsed_secs: u64,
 ) -> Vec<Line<'static>> {
     // Plan/goal guard rejections carry internal English validation text for the
     // model — show a warning glyph and a localized note instead. Other failures
@@ -245,9 +251,18 @@ fn unit_lines(
         tool_action_label_for(&call.name, locale)
     };
 
-    // Trailing status marker: running ellipsis or duration.
+    // Trailing status marker: a running call shows its live elapsed time so a
+    // long command (e.g. `go test`) is visibly working rather than a static
+    // block; a finished call shows its final duration.
     let tail = match call.status {
-        ToolStatus::Running => " …".to_string(),
+        ToolStatus::Running => {
+            let secs = now_elapsed_secs.saturating_sub(call.started_elapsed_secs);
+            if secs > 0 {
+                format!(" · {}", crate::status_line::fmt_elapsed(secs))
+            } else {
+                " …".to_string()
+            }
+        }
         _ => duration_override
             .or(call.duration_ms)
             .filter(|ms| *ms >= 100)
@@ -656,7 +671,7 @@ pub(crate) fn render_group_text(
     width: usize,
     locale: Locale,
 ) -> Vec<String> {
-    render_group(group, &Theme::no_color(), width, locale, locale.text())
+    render_group(group, &Theme::no_color(), width, locale, locale.text(), 0)
         .into_iter()
         .map(|line| {
             line.spans
@@ -681,6 +696,7 @@ mod tests {
             preview: Some("ok".into()),
             duration_ms: Some(5),
             parallel: false,
+            started_elapsed_secs: 0,
         }
     }
 
@@ -1029,6 +1045,27 @@ mod tests {
         assert!(
             lines[0].contains("$ ") && lines[0].contains("cargo build"),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn running_command_shows_live_elapsed_time() {
+        // A long command must show its live elapsed so it reads as "working",
+        // not a static block (the reported blank-during-command issue).
+        let g = group(vec![call(
+            "run_command",
+            r#"{"program":"go","args":["test","./..."]}"#,
+            ToolStatus::Running,
+        )]);
+        // Turn is 45s in; the command started at elapsed 0 → 45s of runtime.
+        let lines: Vec<String> =
+            render_group(&g, &Theme::no_color(), 100, Locale::Zh, Locale::Zh.text(), 45)
+                .into_iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect();
+        assert!(
+            lines[0].contains("45s"),
+            "running command must show live elapsed: {lines:?}"
         );
     }
 

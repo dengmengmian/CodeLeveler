@@ -51,6 +51,9 @@ pub struct ToolCallBlock {
     pub duration_ms: Option<u64>,
     /// True when this call ran in the concurrent read-only batch.
     pub parallel: bool,
+    /// The turn's `elapsed_secs` when this call started, so a running command
+    /// can show a live elapsed (`now - started`) instead of a static block.
+    pub started_elapsed_secs: u64,
 }
 
 /// A consecutive burst of tool calls between two assistant messages.
@@ -447,6 +450,7 @@ impl TranscriptState {
         name: String,
         arguments: String,
         parallel: bool,
+        started_elapsed_secs: u64,
     ) {
         self.bump();
         let call = ToolCallBlock {
@@ -457,6 +461,7 @@ impl TranscriptState {
             preview: None,
             duration_ms: None,
             parallel,
+            started_elapsed_secs,
         };
         match self.items.last_mut() {
             Some(TranscriptItem::ToolGroup(group)) if group.open => group.calls.push(call),
@@ -703,6 +708,7 @@ mod tests {
             "read_file".into(),
             "{}".into(),
             false,
+            0,
         );
         let v2 = t.version();
         assert!(v2 > v1, "push_tool_started must bump");
@@ -726,6 +732,7 @@ mod tests {
                 preview: Some("ok".into()),
                 duration_ms: Some(1),
                 parallel: false,
+                started_elapsed_secs: 0,
             }],
             open: false,
             expanded,

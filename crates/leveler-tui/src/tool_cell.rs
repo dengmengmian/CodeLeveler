@@ -1193,6 +1193,7 @@ mod m1_tests {
             preview: Some("ok".into()),
             duration_ms: Some(12),
             parallel: false,
+            started_elapsed_secs: 0,
         };
         tool_lines(&block, &theme, 80, true, t, &mut out);
         let text: String = out
@@ -1367,6 +1368,7 @@ mod tests {
             preview: Some(preview.to_string()),
             duration_ms: None,
             parallel: false,
+            started_elapsed_secs: 0,
         }
     }
 
@@ -1412,6 +1414,7 @@ mod tests {
             preview: Some("replaced 1 occurrence".to_string()),
             duration_ms: None,
             parallel: false,
+            started_elapsed_secs: 0,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1454,6 +1457,7 @@ mod tests {
             preview: Some("old text not found in src/lib.rs".to_string()),
             duration_ms: None,
             parallel: false,
+            started_elapsed_secs: 0,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1491,6 +1495,7 @@ mod tests {
             ),
             duration_ms: None,
             parallel: false,
+            started_elapsed_secs: 0,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1533,6 +1538,7 @@ mod tests {
             ),
             duration_ms: None,
             parallel: false,
+            started_elapsed_secs: 0,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -1621,6 +1627,7 @@ mod tests {
             preview: Some("tool error: unknown tool `task`".into()),
             duration_ms: None,
             parallel: false,
+            started_elapsed_secs: 0,
         };
         let mut out = Vec::new();
         tool_lines(

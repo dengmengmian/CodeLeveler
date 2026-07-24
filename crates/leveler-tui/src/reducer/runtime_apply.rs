@@ -145,9 +145,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             } else {
                 format!("{verb} {target}")
             });
+            let started = state.elapsed_secs;
             state
                 .transcript
-                .push_tool_started(id, name, arguments, parallel);
+                .push_tool_started(id, name, arguments, parallel, started);
         }
         RuntimeEvent::ToolCallCompleted {
             id,
@@ -768,9 +769,10 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     for tool in session.active_tools {
         // Restored mid-flight calls are shown as normal (not grouped as parallel);
         // the snapshot does not carry the batch flag.
+        let started = state.elapsed_secs;
         state
             .transcript
-            .push_tool_started(tool.id, tool.name, tool.arguments, false);
+            .push_tool_started(tool.id, tool.name, tool.arguments, false, started);
     }
 
     // Welcome card removed: Header owns project context; Input owns model/mode.

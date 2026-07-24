@@ -91,8 +91,9 @@ pub fn item_render(
             // `tools_expanded` is legacy — expand is per-group via Ctrl+O.
             let _ = tools_expanded;
             let locale = locale_from_ui_text(t);
+            // Scrollback: finished tools show their final duration, not live (0).
             out.extend(crate::activity_stream::render_group(
-                group, theme, wrap_width, locale, t,
+                group, theme, wrap_width, locale, t, 0,
             ));
         }
         // Scrollback: the agent is finished, so no live elapsed is shown (0).
@@ -911,6 +912,7 @@ mod tests {
                 preview: Some("Goal resolved.".into()),
                 duration_ms: Some(1),
                 parallel: false,
+                started_elapsed_secs: 0,
             }],
             open: false,
             expanded: false,
