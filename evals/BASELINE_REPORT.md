@@ -9,14 +9,14 @@
 | 项 | 值 |
 |----|----|
 | 版本 | 0.1.2（workspace） |
-| git commit | `89f2bba2e7d5a90682f9c51f8ef92ebabcfd879d` |
-| 简述 | Add command-progress heartbeat; fix false-blocked terminal wording |
+| git commit | `9627123fbdb3daf1235684968a57283b143eb336` |
+| 简述 | Fix orchestrate false-fails on green workspaces; add acceptance docs |
 | 系统 | macOS Darwin 25.5.0 arm64 (Apple Silicon) |
 | rustc | 1.90.0 |
 | 模型 | `deepseek/deepseek-v4-pro` |
 | Provider | deepseek，`base_url` = `https://taotoken.net/api/v1`（非 mock、非 localhost） |
 | API key | `DEEPSEEK_API_KEY` 已配置 |
-| 启动方式 | `./target/debug/leveler`（debug binary）；TUI 测试经 `cargo test` 真实客户端路径 |
+| 启动方式 | `./target/release/leveler` + `~/.cargo/bin/leveler`（release 覆盖 PATH）；TUI 经 `cargo test` 客户端路径 |
 | 配置 | `~/.leveler/config.toml`：`default_model = "deepseek/deepseek-v4-pro"`；reasoning_effort=max |
 | 禁项 | 未直调内部 Agent Loop API；验收 agent 质量不使用 mock 替代模型 |
 
@@ -80,3 +80,14 @@
 | `tui_session_e2e` | pass（3 tests） |
 
 交互式全键盘（长输出复制、多轮历史）环境限制见验收报告；Cancel 语义：`AgentError::Cancelled` → `TurnCancelled`（非 Blocked）。
+
+## Live re-verify
+
+| 项 | 值 |
+|----|----|
+| re-verify time | re-run after pull/rebuild |
+| HEAD | `9627123fbdb3daf1235684968a57283b143eb336` (`9627123`) |
+| tip | 9627123 Fix orchestrate false-fails on green workspaces; add acceptance docs. |
+| PATH binary | `~/.cargo/bin/leveler` (release overwrite) |
+| release binary | `./target/release/leveler` |
+
