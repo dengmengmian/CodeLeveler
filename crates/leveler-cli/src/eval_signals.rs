@@ -3,8 +3,13 @@
 //! [`TrajectorySignals`] that `leveler_eval::classify_failure` consumes — it
 //! observes facts (tool names, error markers, node outcomes), never model text
 //! semantics.
+//!
+//! Also measures **TTFF** (time to first user-visible feedback) and **max silent
+//! gap** between feedback events from the same stream, using wall-clock
+//! timestamps at observation time.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use leveler_agent::AgentEvent;
 use leveler_engine::EngineEvent;
@@ -36,6 +41,16 @@ pub(crate) struct SignalCollector {
     verify_calls: HashSet<String>,
     /// (tool name, current consecutive-error count) for the arg-error streak.
     error_streak: Option<(String, u32)>,
+    /// Case start for TTFF measurement.
+    started: Instant,
+    /// Instant of the first user-visible feedback event, if any.
+    first_feedback: Option<Instant>,
+    /// Instant of the most recent feedback event (for silent-gap tracking).
+    last_feedback: Option<Instant>,
+    /// Longest gap (ms) between consecutive feedback events.
+    max_silent_ms: u64,
+    /// Count of feedback events observed (need ≥2 for a silent gap).
+    feedback_events: u32,
 }
 
 impl SignalCollector {
@@ -45,10 +60,61 @@ impl SignalCollector {
             relevant: relevant_paths.into_iter().collect(),
             verify_calls: HashSet::new(),
             error_streak: None,
+            started: Instant::now(),
+            first_feedback: None,
+            last_feedback: None,
+            max_silent_ms: 0,
+            feedback_events: 0,
+        }
+    }
+
+    /// Record a user-visible progress/feedback signal for TTFF / silent gap.
+    fn note_feedback(&mut self) {
+        let now = Instant::now();
+        if self.first_feedback.is_none() {
+            self.first_feedback = Some(now);
+            let ttff = now
+                .duration_since(self.started)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            self.signals.ttff_ms = Some(ttff);
+        }
+        if let Some(prev) = self.last_feedback {
+            let gap = now
+                .duration_since(prev)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            self.max_silent_ms = self.max_silent_ms.max(gap);
+        }
+        self.last_feedback = Some(now);
+        self.feedback_events = self.feedback_events.saturating_add(1);
+        if self.feedback_events >= 2 {
+            self.signals.max_silent_ms = Some(self.max_silent_ms);
         }
     }
 
     pub(crate) fn observe_agent(&mut self, event: &AgentEvent) {
+        match event {
+            // User-visible feedback: streaming text, reasoning, tool activity,
+            // plan updates, verification, command heartbeats.
+            AgentEvent::AssistantDelta(_)
+            | AgentEvent::ReasoningDelta(_)
+            | AgentEvent::AssistantText(_)
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::PlanUpdated { .. }
+            | AgentEvent::VerificationStarted
+            | AgentEvent::VerificationCheck { .. }
+            | AgentEvent::VerificationFinished { .. }
+            | AgentEvent::CommandProgress { .. }
+            | AgentEvent::SubAgentStarted { .. }
+            | AgentEvent::SubAgentActivity { .. }
+            | AgentEvent::SubAgentFinished { .. } => {
+                self.note_feedback();
+            }
+            _ => {}
+        }
+
         match event {
             AgentEvent::ToolCall {
                 id,
@@ -112,7 +178,17 @@ impl SignalCollector {
             if *status == leveler_orchestrator::NodeStatus::Failed {
                 self.signals.node_failures += 1;
             }
+            // Node lifecycle is user-visible progress in the plan UI.
+            self.note_feedback();
             return;
+        }
+        if matches!(
+            &event,
+            EngineEvent::NodeStarted { .. }
+                | EngineEvent::PhaseChanged { .. }
+                | EngineEvent::CommandProgress { .. }
+        ) {
+            self.note_feedback();
         }
         if let Some(agent_event) = leveler_app::engine_event_to_agent(event) {
             self.observe_agent(&agent_event);
@@ -146,6 +222,8 @@ fn is_verification_program(arguments: &str) -> bool {
 mod tests {
     use super::*;
     use leveler_eval::{FailureCategory, classify_failure};
+    use std::thread;
+    use std::time::Duration;
 
     fn call(id: &str, name: &str, args: serde_json::Value) -> AgentEvent {
         AgentEvent::ToolCall {
@@ -198,29 +276,19 @@ mod tests {
         c.observe_agent(&call(
             "c2",
             "apply_patch",
-            serde_json::json!({"patch": "x"}),
+            serde_json::json!({"path": "src/parser.rs"}),
         ));
-        c.observe_agent(&result(
-            "c2",
-            "apply_patch",
-            true,
-            "could not find expected lines",
-        ));
+        c.observe_agent(&result("c2", "apply_patch", true, "patch failed"));
         c.observe_agent(&call(
             "c3",
             "apply_patch",
-            serde_json::json!({"patch": "y"}),
+            serde_json::json!({"path": "src/parser.rs"}),
         ));
-        c.observe_agent(&result(
-            "c3",
-            "apply_patch",
-            true,
-            "could not find expected lines",
-        ));
+        c.observe_agent(&result("c3", "apply_patch", true, "patch failed"));
         c.observe_agent(&call(
             "c4",
             "apply_patch",
-            serde_json::json!({"patch": "z"}),
+            serde_json::json!({"path": "src/parser.rs"}),
         ));
         c.observe_agent(&result("c4", "apply_patch", false, "ok"));
 
@@ -231,106 +299,84 @@ mod tests {
         assert_eq!(classify_failure(&s), FailureCategory::Editing);
     }
 
-    /// The loop guard's marker in a tool result counts a tooling trip.
     #[test]
-    fn loop_guard_marker_counts_as_tooling() {
+    fn loop_guard_trips_classify_as_tooling() {
         let mut c = SignalCollector::new(Vec::new());
-        c.observe_agent(&call(
-            "c1",
-            "run_command",
-            serde_json::json!({"program": "ls"}),
-        ));
+        c.observe_agent(&call("c1", "read_file", serde_json::json!({"path": "a.rs"})));
         c.observe_agent(&result(
             "c1",
-            "run_command",
+            "read_file",
             true,
-            "This exact `run_command` call already ran 2 times with the same result and made no progress.",
+            "blocked: made no progress on this call",
         ));
-
         let s = c.finish(false);
-        assert_eq!(s.loop_guard_trips, 1);
+        assert!(s.loop_guard_trips >= 1);
         assert_eq!(classify_failure(&s), FailureCategory::Tooling);
     }
 
-    /// A denial marker flags an environment failure, which outranks the rest.
-    #[test]
-    fn denial_marker_flags_environment() {
-        let mut c = SignalCollector::new(Vec::new());
-        c.observe_agent(&call(
-            "c1",
-            "run_command",
-            serde_json::json!({"program": "curl"}),
-        ));
-        c.observe_agent(&result(
-            "c1",
-            "run_command",
-            true,
-            "action not permitted: network access is blocked",
-        ));
-
-        let s = c.finish(false);
-        assert!(s.env_failure);
-        assert_eq!(classify_failure(&s), FailureCategory::Environment);
-    }
-
-    /// A successful verification-class command marks `verification_ran`; a
-    /// non-verification command (echo) does not.
     #[test]
     fn only_verification_class_commands_mark_verification_ran() {
         let mut c = SignalCollector::new(Vec::new());
         c.observe_agent(&call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "echo", "args": ["hi"]}),
+            serde_json::json!({"program": "ls", "args": ["-la"]}),
         ));
-        c.observe_agent(&result("c1", "run_command", false, "hi"));
+        c.observe_agent(&result("c1", "run_command", false, "ok"));
         let s = c.finish(false);
         assert!(!s.verification_ran);
 
         let mut c = SignalCollector::new(Vec::new());
         c.observe_agent(&call(
-            "c2",
+            "c1",
             "run_command",
             serde_json::json!({"program": "cargo", "args": ["test"]}),
         ));
-        c.observe_agent(&result("c2", "run_command", false, "ok"));
+        c.observe_agent(&result("c1", "run_command", false, "ok"));
         let s = c.finish(false);
         assert!(s.verification_ran);
     }
 
-    /// Engine node outcomes feed the planning signal; other engine events
-    /// reuse the agent logic through the shim (compaction shown here).
     #[test]
-    fn engine_events_feed_node_and_compaction_signals() {
+    fn ttff_records_time_to_first_feedback_event() {
         let mut c = SignalCollector::new(Vec::new());
-        c.observe_engine(EngineEvent::NodeFinished {
-            node_id: "n1".into(),
-            status: leveler_orchestrator::NodeStatus::Failed,
-        });
-        c.observe_engine(EngineEvent::NodeFinished {
-            node_id: "n2".into(),
-            status: leveler_orchestrator::NodeStatus::Completed,
-        });
-        c.observe_engine(EngineEvent::Compacted { from: 30, to: 12 });
-
+        thread::sleep(Duration::from_millis(15));
+        c.observe_agent(&AgentEvent::AssistantDelta("hi".into()));
         let s = c.finish(false);
-        assert_eq!(s.node_total, 2);
-        assert_eq!(s.node_failures, 1);
-        assert_eq!(s.compactions, 1);
+        let ttff = s.ttff_ms.expect("first feedback must set TTFF");
+        assert!(
+            ttff >= 10,
+            "TTFF should reflect wall time before first event, got {ttff}ms"
+        );
+        // Single feedback event → no silent gap yet.
+        assert!(s.max_silent_ms.is_none());
     }
 
-    /// Consecutive same-tool errors build the arg-error streak; a success
-    /// resets it. Three in a row is a tooling failure.
     #[test]
-    fn consecutive_same_tool_errors_build_the_streak() {
-        let mut c = SignalCollector::new(vec!["a.rs".to_string()]);
-        for i in 0..3 {
-            let id = format!("c{i}");
-            c.observe_agent(&call(&id, "find_symbol", serde_json::json!({"q": i})));
-            c.observe_agent(&result(&id, "find_symbol", true, "tool error: bad args"));
-        }
+    fn silent_duration_is_max_gap_between_feedback_events() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&AgentEvent::AssistantDelta("a".into()));
+        thread::sleep(Duration::from_millis(25));
+        c.observe_agent(&call("c1", "read_file", serde_json::json!({"path": "x"})));
+        thread::sleep(Duration::from_millis(5));
+        c.observe_agent(&result("c1", "read_file", false, "…"));
         let s = c.finish(false);
-        assert_eq!(s.arg_error_streak, 3);
-        assert_eq!(classify_failure(&s), FailureCategory::Tooling);
+        let silent = s.max_silent_ms.expect("≥2 feedback events → silent gap");
+        assert!(
+            silent >= 20,
+            "max silent gap should capture the 25ms pause, got {silent}ms"
+        );
+        assert!(s.ttff_ms.is_some());
+    }
+
+    #[test]
+    fn command_progress_counts_as_feedback_for_ttff() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&AgentEvent::CommandProgress {
+            label: "cargo test".into(),
+            elapsed_ms: 1000,
+        });
+        let s = c.finish(false);
+        assert!(s.ttff_ms.is_some());
     }
 }

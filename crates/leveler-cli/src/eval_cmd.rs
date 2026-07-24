@@ -806,6 +806,8 @@ async fn run_eval_case(
         loop_guard_trips: 0,
         verification_ran: false,
         is_recovery: case.recovery,
+        ttff_ms: None,
+        silent_duration_ms: None,
     };
 
     // Materialize the workspace. Two modes:
@@ -1073,6 +1075,8 @@ async fn run_eval_case(
         loop_guard_trips: signals.loop_guard_trips,
         verification_ran: signals.verification_ran,
         is_recovery: case.recovery,
+        ttff_ms: signals.ttff_ms,
+        silent_duration_ms: signals.max_silent_ms,
     }
 }
 
@@ -1151,6 +1155,30 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
         report.loop_rate() * 100.0,
         report.validation_rate() * 100.0,
     );
+    // Runtime transparency: TTFF / silent gap from real event timestamps.
+    // Never print fabricated zeros when no case recorded feedback.
+    match (report.avg_ttff_ms(), report.max_silent_duration_ms()) {
+        (Some(ttff), Some(silent)) => println!(
+            "  {} avg TTFF {:.0}ms · max silent duration {}ms",
+            console::style("→").bold(),
+            ttff,
+            silent
+        ),
+        (Some(ttff), None) => println!(
+            "  {} avg TTFF {:.0}ms · silent duration n/a (<2 feedback events)",
+            console::style("→").bold(),
+            ttff
+        ),
+        (None, Some(silent)) => println!(
+            "  {} TTFF n/a · max silent duration {}ms",
+            console::style("→").bold(),
+            silent
+        ),
+        (None, None) => println!(
+            "  {} TTFF/silent duration n/a (no feedback events observed)",
+            console::style("→").bold()
+        ),
+    }
     let breakdown = report.failure_breakdown();
     if !breakdown.is_empty() {
         let parts: Vec<String> = breakdown

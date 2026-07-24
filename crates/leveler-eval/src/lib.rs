@@ -162,6 +162,16 @@ pub struct CaseResult {
     /// so it counts toward `recovery_rate`. Defaulted for legacy baselines.
     #[serde(default)]
     pub is_recovery: bool,
+    /// Time-to-first-feedback (ms): wall time from case start to the first
+    /// user-visible agent signal (text delta, tool call, command progress, …).
+    /// `None` when no feedback event was observed (or legacy baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttff_ms: Option<u64>,
+    /// Longest silent gap (ms) between consecutive user-visible feedback
+    /// events during the run. `None` when fewer than two feedback events
+    /// were observed (or legacy baseline). Never invented as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silent_duration_ms: Option<u64>,
 }
 
 const fn default_repetition() -> u32 {
@@ -329,6 +339,36 @@ impl EvalReport {
         }
         let verified = self.cases.iter().filter(|c| c.verification_ran).count();
         verified as f32 / self.total() as f32
+    }
+
+    /// Mean TTFF over cases that observed at least one feedback event.
+    /// `None` when no case recorded TTFF (never fabricates 0).
+    pub fn avg_ttff_ms(&self) -> Option<f32> {
+        let samples: Vec<u64> = self.cases.iter().filter_map(|c| c.ttff_ms).collect();
+        if samples.is_empty() {
+            return None;
+        }
+        let sum: u64 = samples.iter().sum();
+        Some(sum as f32 / samples.len() as f32)
+    }
+
+    /// Maximum silent-duration across cases that recorded one. `None` if none.
+    pub fn max_silent_duration_ms(&self) -> Option<u64> {
+        self.cases.iter().filter_map(|c| c.silent_duration_ms).max()
+    }
+
+    /// Mean silent-duration over cases that recorded one. `None` if none.
+    pub fn avg_silent_duration_ms(&self) -> Option<f32> {
+        let samples: Vec<u64> = self
+            .cases
+            .iter()
+            .filter_map(|c| c.silent_duration_ms)
+            .collect();
+        if samples.is_empty() {
+            return None;
+        }
+        let sum: u64 = samples.iter().sum();
+        Some(sum as f32 / samples.len() as f32)
     }
 
     /// Tool efficiency — the share of tool calls NOT spent looping, averaged
@@ -917,6 +957,8 @@ pub enum FailureSource {
 /// A trajectory summary the harness derives from the agent's event stream,
 /// sufficient for first-cause failure attribution (L1 taskset doc §8). All
 /// signals are observable facts; the classifier never inspects model text.
+/// Timing fields (`ttff_ms`, `max_silent_ms`) are filled by the eval signal
+/// collector from wall-clock observation of feedback events.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrajectorySignals {
     /// Sandbox denial, network block, or a workspace/expect command that could
@@ -943,6 +985,11 @@ pub struct TrajectorySignals {
     pub node_total: u32,
     /// A verification-class command (build/test) ran during the run.
     pub verification_ran: bool,
+    /// Time-to-first-feedback in ms (case start → first user-visible event).
+    /// `None` until a feedback event is observed.
+    pub ttff_ms: Option<u64>,
+    /// Longest inter-feedback silent gap in ms. `None` if <2 feedback events.
+    pub max_silent_ms: Option<u64>,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order
@@ -1047,7 +1094,34 @@ mod tests {
             loop_guard_trips: 0,
             verification_ran: false,
             is_recovery: false,
+            ttff_ms: None,
+            silent_duration_ms: None,
         }
+    }
+
+    #[test]
+    fn ttff_and_silent_duration_aggregate_without_fabricating_zeros() {
+        let mut a = result("a", true, true);
+        a.ttff_ms = Some(1200);
+        a.silent_duration_ms = Some(4000);
+        let mut b = result("b", true, true);
+        b.ttff_ms = Some(2800);
+        b.silent_duration_ms = Some(1000);
+        let c = result("c", false, false); // no signals → excluded from means
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![a, b, c],
+        };
+        assert!((report.avg_ttff_ms().unwrap() - 2000.0).abs() < 1e-3);
+        assert_eq!(report.max_silent_duration_ms(), Some(4000));
+        assert!((report.avg_silent_duration_ms().unwrap() - 2500.0).abs() < 1e-3);
+
+        let empty = EvalReport {
+            model: "m".into(),
+            cases: vec![result("x", true, true)],
+        };
+        assert!(empty.avg_ttff_ms().is_none());
+        assert!(empty.max_silent_duration_ms().is_none());
     }
 
     #[test]
@@ -1612,6 +1686,8 @@ mod tests {
             loop_guard_trips: 0,
             verification_ran: false,
             is_recovery: false,
+            ttff_ms: None,
+            silent_duration_ms: None,
         }
     }
 
@@ -1937,6 +2013,8 @@ expect: { program: cargo, args: [test] }
                 loop_guard_trips: 0,
                 verification_ran: false,
                 is_recovery: false,
+                ttff_ms: None,
+                silent_duration_ms: None,
             }
             .passed()
         );
@@ -1960,6 +2038,8 @@ expect: { program: cargo, args: [test] }
                 loop_guard_trips: 0,
                 verification_ran: false,
                 is_recovery: false,
+                ttff_ms: None,
+                silent_duration_ms: None,
             }
             .passed()
         );
