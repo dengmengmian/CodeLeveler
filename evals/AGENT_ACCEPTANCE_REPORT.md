@@ -92,10 +92,32 @@ soak 独立 `cargo test`；测试本身绿。
 
 **结论**：真实用户路径（release `leveler eval` orchestrated + TUI 客户端路径）上，当前 **quick 100% / 假完成 0 / 循环 0**，P0/P1 假失败已闭合且本轮 re-verify 通过。残留 P2 已列明。
 
+## Phase 7 回归 — core 假阴性案例（决定性验证）
+
+> 缺口修补：上文 quick(smoke) 在**修复前也能 3/3**，并不触发该 bug。真正触发 63% 假阴性的是
+> **core 案例**（go-copy-map / go-batch-boundaries / go-normalize-email / rust-dedup-stable）。
+> 用**含 `9627123` 修复的重编二进制**对这 4 例各跑 3 次，与修复前对比：
+
+| case | 修复前 假阴性 | 修复后 假阴性 |
+|------|--------------|--------------|
+| go-batch-boundaries | 1/3 | **0/3** |
+| go-copy-map | 2/3 | **0/3** |
+| go-normalize-email | 2/3 | **0/3** |
+| rust-dedup-stable | 2/2 | **0/3** |
+| **合计** | **7/11 = 63%** | **0/12 = 0%** |
+
+修复后：**11/12 完成（92%）、false-negative 0%、completion accuracy 100%、Quality Score 96/100**。
+唯一 1 例失败（rust-dedup#2）是**真实**提前放弃（4 步 / planning / expect_passed=False，代码未解出），
+非假阴性——属模型变异（同例 #1#3 通过），非确定性 bug。
+
+**结论**：`9627123` 的 `incomplete_with_work` / node_status 修复**在真实失败案例上把假阴性从 63% 降到 0%**，
+经真实模型 12 次重复验证。存档 `evals/history/regression-falseneg-9627123.json`。
+
 ## Artifacts
 
 | 路径 | 内容 |
 |------|------|
+| `evals/history/regression-falseneg-9627123.json` | Phase 7 core 回归（修后 11/12，假阴性 0%） |
 | `evals/CURRENT_ACCEPTANCE_ANALYSIS.md` | Phase 0 |
 | `evals/BASELINE_REPORT.md` | Phase 1（HEAD 刷新） |
 | `evals/regression/` | 回归入口 |
