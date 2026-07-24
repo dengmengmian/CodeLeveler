@@ -322,9 +322,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     .transcript
                     .complete_sub_agent(&id, &nickname, ok, detail);
             } else {
+                let started = state.elapsed_secs;
                 state
                     .transcript
-                    .push_sub_agent_started(id, nickname, role, detail);
+                    .push_sub_agent_started(id, nickname, role, detail, started);
             }
         }
         RuntimeEvent::SubAgentProgress {

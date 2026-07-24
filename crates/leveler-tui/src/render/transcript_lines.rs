@@ -95,7 +95,10 @@ pub fn item_render(
                 group, theme, wrap_width, locale, t,
             ));
         }
-        TranscriptItem::SubAgent(block) => sub_agent_lines(block, theme, wrap_width, &mut out, t),
+        // Scrollback: the agent is finished, so no live elapsed is shown (0).
+        TranscriptItem::SubAgent(block) => {
+            sub_agent_lines(block, theme, wrap_width, &mut out, t, 0)
+        }
         TranscriptItem::Completion(report) => completion_lines(report, theme, &mut out, t),
         TranscriptItem::Error(text) => {
             push_prefixed(
@@ -513,6 +516,7 @@ fn sub_agent_lines(
     wrap_width: usize,
     out: &mut Vec<Line<'static>>,
     t: &crate::i18n::UiText,
+    now_elapsed_secs: u64,
 ) {
     let (glyph, color) = match block.status {
         ToolStatus::Running => ("◌", theme.accent),
@@ -532,6 +536,13 @@ fn sub_agent_lines(
         format!(" · {}", sub_agent_status(block, t)),
         Style::default().fg(theme.muted),
     ));
+    let elapsed = sub_agent_elapsed(block, now_elapsed_secs);
+    if !elapsed.is_empty() {
+        head_spans.push(Span::styled(
+            format!(" · {elapsed}"),
+            Style::default().fg(theme.muted),
+        ));
+    }
     if let Some(step) = block.recent_step.as_deref().filter(|s| !s.is_empty()) {
         head_spans.push(Span::styled(
             format!(" · {step}"),
@@ -575,14 +586,24 @@ pub fn sub_agent_tree_lines(
     theme: &Theme,
     wrap_width: usize,
     t: &crate::i18n::UiText,
+    now_elapsed_secs: u64,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     match blocks {
         [] => {}
-        [single] => sub_agent_lines(single, theme, wrap_width, &mut out, t),
-        many => sub_agent_tree_group_lines(many, theme, &mut out, t),
+        [single] => sub_agent_lines(single, theme, wrap_width, &mut out, t, now_elapsed_secs),
+        many => sub_agent_tree_group_lines(many, theme, &mut out, t, now_elapsed_secs),
     }
     out
+}
+
+/// A running sub-agent's own elapsed time (`now - started`), formatted, or empty
+/// when not running / start unknown. Lets a live view show per-agent runtime.
+fn sub_agent_elapsed(block: &crate::transcript::SubAgentBlock, now_elapsed_secs: u64) -> String {
+    if block.status != ToolStatus::Running {
+        return String::new();
+    }
+    crate::status_line::fmt_elapsed(now_elapsed_secs.saturating_sub(block.started_elapsed_secs))
 }
 
 /// The multi-agent tree (two or more consecutive blocks).
@@ -591,6 +612,7 @@ fn sub_agent_tree_group_lines(
     theme: &Theme,
     out: &mut Vec<Line<'static>>,
     t: &crate::i18n::UiText,
+    now_elapsed_secs: u64,
 ) {
     let n = blocks.len();
     let any_running = blocks.iter().any(|b| b.status == ToolStatus::Running);
@@ -693,11 +715,23 @@ fn sub_agent_tree_group_lines(
         // successful batch shows usage stats instead of repeating "completed".
         // While running, prefer the real recent tool/step when present.
         let (right, right_color) = if block.status == ToolStatus::Running {
-            if let Some(step) = block.recent_step.as_deref().filter(|s| !s.is_empty()) {
-                (step.to_string(), theme.accent)
-            } else {
-                sub_agent_tree_child_status(block, theme, t)
-            }
+            // Running children lead with their own elapsed time so the user can
+            // see each agent is alive and how long it has worked, then the real
+            // recent tool/step (or a plain running status when none yet).
+            let elapsed = sub_agent_elapsed(block, now_elapsed_secs);
+            let detail = block
+                .recent_step
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| sub_agent_tree_child_status(block, theme, t).0);
+            let text = match (elapsed.is_empty(), detail.is_empty()) {
+                (false, false) => format!("{elapsed} · {detail}"),
+                (false, true) => elapsed,
+                (true, false) => detail,
+                (true, true) => String::new(),
+            };
+            (text, theme.accent)
         } else if all_ok {
             (sub_agent_tree_child_usage(block), theme.dim)
         } else {
@@ -1031,6 +1065,7 @@ mod tests {
             },
             progress: Default::default(),
             recent_step: None,
+            started_elapsed_secs: 0,
         }
     }
 
@@ -1044,7 +1079,7 @@ mod tests {
         let mut b = sub_agent("agent-2", "Newton", ToolStatus::Running);
         b.progress.active = true;
         b.recent_step = Some("grep ✓".into());
-        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("list_files"), "{text}");
         assert!(text.contains("grep ✓"), "{text}");
@@ -1061,7 +1096,7 @@ mod tests {
         let mut b = sub_agent("agent-2", "Newton", ToolStatus::Running);
         b.progress.input_tokens = 2_400;
         b.progress.output_tokens = 160;
-        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("◌ 2 个 agents 正在运行"), "{text}");
         assert!(text.contains("↑ 3.6k · ↓ 240"), "{text}");
@@ -1072,13 +1107,28 @@ mod tests {
     }
 
     #[test]
+    fn running_sub_agents_show_their_own_elapsed_time() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
+        a.started_elapsed_secs = 3; // started 3s into the turn
+        let mut b = sub_agent("agent-2", "Newton", ToolStatus::Running);
+        b.started_elapsed_secs = 10;
+        // Turn is now 15s in: Euclid has run 12s, Newton 5s.
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 15);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("12s"), "Euclid elapsed missing: {text}");
+        assert!(text.contains("5s"), "Newton elapsed missing: {text}");
+    }
+
+    #[test]
     fn sub_agent_tree_all_done_shows_stats_not_status_words() {
         let theme = Theme::default();
         let t = Locale::Zh.text();
         let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
         a.progress.input_tokens = 87_800;
         let b = sub_agent("agent-2", "Newton", ToolStatus::Ok);
-        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("✓ 2 个 agents 完成"), "{text}");
         assert!(text.contains("├─ Euclid"), "{text}");
@@ -1092,7 +1142,7 @@ mod tests {
         let t = Locale::Zh.text();
         let a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
         let b = sub_agent("agent-2", "Newton", ToolStatus::Failed);
-        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t);
+        let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("⚠ 2 个 agents 结束"), "{text}");
         assert!(text.contains("1 已完成 · 1 超时"), "{text}");
@@ -1106,7 +1156,7 @@ mod tests {
         let theme = Theme::default();
         let t = Locale::Zh.text();
         let a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
-        let lines = sub_agent_tree_lines(&[&a], &theme, 100, t);
+        let lines = sub_agent_tree_lines(&[&a], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("◌ 探索 Agent 1"), "{text}");
         assert!(!text.contains("├─"), "{text}");

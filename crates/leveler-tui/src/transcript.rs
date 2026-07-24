@@ -121,6 +121,10 @@ pub struct SubAgentBlock {
     pub progress: SubAgentProgress,
     /// Latest tool/step from the runtime (real event; not invented stats).
     pub recent_step: Option<String>,
+    /// The turn's `elapsed_secs` when this sub-agent started, so a live view can
+    /// show each agent's own running time (`now_elapsed - started`). `0` when the
+    /// start time is unknown (finish-without-start fallback).
+    pub started_elapsed_secs: u64,
 }
 
 /// Ephemeral side question (`/btw`) — rendered in the UI but never loaded
@@ -571,6 +575,7 @@ impl TranscriptState {
         nickname: String,
         role: String,
         task: String,
+        started_elapsed_secs: u64,
     ) {
         if let Some(block) = self.sub_agent_mut(&id) {
             block.detail = task;
@@ -585,6 +590,7 @@ impl TranscriptState {
             detail: task,
             progress: SubAgentProgress::default(),
             recent_step: None,
+            started_elapsed_secs,
         }));
     }
 
@@ -613,6 +619,7 @@ impl TranscriptState {
             detail: summary,
             progress: SubAgentProgress::default(),
             recent_step: None,
+            started_elapsed_secs: 0,
         }));
     }
 

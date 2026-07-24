@@ -610,6 +610,7 @@ mod tests {
             detail: "done".into(),
             progress: Default::default(),
             recent_step: None,
+            started_elapsed_secs: 0,
         });
         let text: String = item_render(
             &item,
@@ -641,6 +642,7 @@ mod tests {
                     .into(),
             progress: Default::default(),
             recent_step: None,
+            started_elapsed_secs: 0,
         });
         let text: String = item_render(
             &item,
@@ -676,6 +678,7 @@ mod tests {
                 ..Default::default()
             },
             recent_step: None,
+            started_elapsed_secs: 0,
         });
         let text = item_render(
             &item,

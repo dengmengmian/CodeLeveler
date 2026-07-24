@@ -543,7 +543,13 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
                     blocks.push(next);
                     idx += 1;
                 }
-                out.extend(sub_agent_tree_lines(&blocks, theme, width, t));
+                out.extend(sub_agent_tree_lines(
+                    &blocks,
+                    theme,
+                    width,
+                    t,
+                    state.elapsed_secs,
+                ));
             }
             _ => {
                 out.extend(item_render(item, theme, width, state.tools_expanded, t));
@@ -1125,12 +1131,14 @@ mod tests {
             "Euclid".into(),
             "explorer".into(),
             "task A".into(),
+            0,
         );
         s.transcript.push_sub_agent_started(
             "agent-2".into(),
             "Newton".into(),
             "explorer".into(),
             "task B".into(),
+            0,
         );
         let lines = build_conversation_lines(&s, 100);
         let text = lines.iter().map(rule_plain).collect::<Vec<_>>().join("\n");
