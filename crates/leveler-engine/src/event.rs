@@ -196,6 +196,13 @@ pub enum EngineEvent {
     AdvisoryStarted {
         kind: String,
     },
+    /// Heartbeat while a long command tool runs (runtime observability). Carries
+    /// the command line, so it is a LocalOnly UI hint — never projected remotely
+    /// or persisted. Lets a status line show "运行 cargo test" with a live elapsed.
+    CommandProgress {
+        label: String,
+        elapsed_ms: u64,
+    },
     /// The model replaced its structured plan (update_plan tool). Full list,
     /// not a delta; step text derives from the task/model output.
     PlanUpdated {
@@ -452,8 +459,9 @@ impl EngineEvent {
             | EngineEvent::PlanReady { .. }
             | EngineEvent::ReviewFinding { .. }
             | EngineEvent::ReviewFailed { .. }
-            // Transient local UI hint (no source/model content), never projected.
-            | EngineEvent::AdvisoryStarted { .. } => LocalOnly,
+            // Transient local UI hints (may carry command text), never projected.
+            | EngineEvent::AdvisoryStarted { .. }
+            | EngineEvent::CommandProgress { .. } => LocalOnly,
         }
     }
 
@@ -583,7 +591,8 @@ impl EngineEvent {
             | EngineEvent::PlanReady { .. }
             | EngineEvent::ReviewFinding { .. }
             | EngineEvent::ReviewFailed { .. }
-            | EngineEvent::AdvisoryStarted { .. } => return None,
+            | EngineEvent::AdvisoryStarted { .. }
+            | EngineEvent::CommandProgress { .. } => return None,
         })
     }
 }
@@ -775,6 +784,9 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
             A::AdvisoryStarted { kind } => EngineEvent::AdvisoryStarted {
                 kind: kind.as_key().to_string(),
             },
+            A::CommandProgress { label, elapsed_ms } => {
+                EngineEvent::CommandProgress { label, elapsed_ms }
+            }
             A::PlanUpdated { steps } => EngineEvent::PlanUpdated { steps },
             A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
             A::EvidenceLedgerUpdated { ledger } => EngineEvent::EvidenceLedgerUpdated { ledger },

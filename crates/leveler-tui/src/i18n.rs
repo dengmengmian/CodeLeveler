@@ -309,6 +309,9 @@ pub struct UiText {
     pub final_completed_warnings: &'static str,
     pub final_waiting_confirmation: &'static str,
     pub final_blocked: &'static str,
+    /// Terminal marker when the run stopped on a failed verification gate
+    /// (e.g. cargo test failed) — a verification failure, not a system block.
+    pub final_verification_failed: &'static str,
     pub final_failed: &'static str,
     pub final_cancelled: &'static str,
 
@@ -616,7 +619,8 @@ static ZH: UiText = UiText {
     final_completed: "已完成",
     final_completed_warnings: "已完成，但有警告",
     final_waiting_confirmation: "等待确认",
-    final_blocked: "被阻塞",
+    final_blocked: "未完成",
+    final_verification_failed: "验证未通过",
     final_failed: "失败",
     final_cancelled: "已取消",
     turn_end_completed: "任务已完成",
@@ -859,7 +863,8 @@ static EN: UiText = UiText {
     final_completed: "Completed",
     final_completed_warnings: "Completed with warnings",
     final_waiting_confirmation: "Waiting for confirmation",
-    final_blocked: "Blocked",
+    final_blocked: "Incomplete",
+    final_verification_failed: "Verification failed",
     final_failed: "Failed",
     final_cancelled: "Cancelled",
     turn_end_completed: "Task completed",

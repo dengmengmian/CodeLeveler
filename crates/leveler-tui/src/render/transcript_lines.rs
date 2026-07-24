@@ -296,10 +296,20 @@ fn turn_end_lines(
             (format!("✓ {}", t.turn_end_completed), theme.success)
         }
         TurnEndStatus::Truncated => (format!("⚠ {}", t.final_completed_warnings), theme.warning),
-        // Incomplete = the run stopped mid-task on its own (budget / loop
-        // guard); "blocked" names that honestly — the appended detail says how
-        // to unblock ("说「继续」…").
-        TurnEndStatus::Incomplete => (format!("⚠ {}", t.final_blocked), theme.warning),
+        // Incomplete = the run stopped mid-task on its own (budget / loop guard /
+        // failed verification gate / model gave up). None of these are a *system*
+        // block, so the honest word is "未完成"; the detail says how to continue.
+        // A failed verification gate gets its own accurate word ("验证未通过")
+        // instead of the misleading "被阻塞" — that was the false-blocked UX.
+        TurnEndStatus::Incomplete => {
+            let is_gate_failure = detail_token.is_some_and(|d| d.starts_with("failed gate(s)"));
+            let word = if is_gate_failure {
+                t.final_verification_failed
+            } else {
+                t.final_blocked
+            };
+            (format!("⚠ {word}"), theme.warning)
+        }
         TurnEndStatus::Unverified if no_code_changes => {
             (t.turn_no_code_changes.to_string(), theme.success)
         }
@@ -395,6 +405,11 @@ fn localized_turn_detail<'a>(detail: &'a str, t: &'a crate::i18n::UiText) -> &'a
             || s.contains("goal 未确认") =>
         {
             t.turn_stalled_goal
+        }
+        // The label already says "验证未通过"; drop the redundant English prefix
+        // and keep just the failing gate name(s) as the detail.
+        s if s.starts_with("failed gate(s): ") => {
+            s.strip_prefix("failed gate(s): ").unwrap_or(s)
         }
         other => other,
     }
@@ -965,8 +980,16 @@ mod tests {
         assert!(answered.contains("✓ 任务已完成"), "{answered}");
         let truncated = turn_end_text(TurnEndStatus::Truncated, Some("context limit"));
         assert!(truncated.contains("⚠ 已完成，但有警告"), "{truncated}");
+        // Budget/loop/stall incompletes read as "未完成", not the old "被阻塞".
         let incomplete = turn_end_text(TurnEndStatus::Incomplete, Some("预算已耗尽"));
-        assert!(incomplete.contains("⚠ 被阻塞"), "{incomplete}");
+        assert!(incomplete.contains("⚠ 未完成"), "{incomplete}");
+        // A failed verification gate reads as "验证未通过" with just the gate name,
+        // NOT "被阻塞 · failed gate(s): cargo test" (the false-blocked UX).
+        let gate = turn_end_text(TurnEndStatus::Incomplete, Some("failed gate(s): cargo test"));
+        assert!(gate.contains("⚠ 验证未通过"), "{gate}");
+        assert!(gate.contains("cargo test"), "{gate}");
+        assert!(!gate.contains("被阻塞"), "{gate}");
+        assert!(!gate.contains("failed gate(s)"), "{gate}");
         let unverified = turn_end_text(TurnEndStatus::Unverified, Some("verify failed"));
         assert!(unverified.contains("⚠ 已完成，但有警告"), "{unverified}");
         let failed = turn_end_text(TurnEndStatus::Failed, Some("boom"));

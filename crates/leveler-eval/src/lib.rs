@@ -351,17 +351,14 @@ impl EvalReport {
     /// PASSED: `tokens(passed) / tokens(all)`. Measures how much of the budget
     /// produced a correct result. `None` when no tokens were recorded.
     pub fn cost_efficiency(&self) -> Option<f32> {
-        let tokens = |c: &CaseResult| (c.input_tokens + c.output_tokens) as f32;
-        let total: f32 = self.cases.iter().map(|c| tokens(c)).sum();
+        fn tokens(c: &CaseResult) -> f32 {
+            (c.input_tokens + c.output_tokens) as f32
+        }
+        let total: f32 = self.cases.iter().map(tokens).sum();
         if total == 0.0 {
             return None;
         }
-        let productive: f32 = self
-            .cases
-            .iter()
-            .filter(|c| c.passed())
-            .map(|c| tokens(c))
-            .sum();
+        let productive: f32 = self.cases.iter().filter(|c| c.passed()).map(tokens).sum();
         Some(productive / total)
     }
 

@@ -228,6 +228,9 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             // Unknown keys (older/newer logs) degrade to the audit label.
             kind: AdvisoryKind::from_key(&kind).unwrap_or(AdvisoryKind::ContextCompaction),
         },
+        EngineEvent::CommandProgress { label, elapsed_ms } => {
+            AgentEvent::CommandProgress { label, elapsed_ms }
+        }
         EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }

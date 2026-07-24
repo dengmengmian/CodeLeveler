@@ -333,6 +333,14 @@ impl EventBridge {
                     label: label.to_string(),
                 });
             }
+            AgentEvent::CommandProgress { label, elapsed_ms } => {
+                // Structured event; the TUI reducer turns it into the status-line
+                // label ("运行 cargo test · 02:31"). Single source, so Web/logs get
+                // the same structured data instead of a pre-formatted string.
+                let _ = self
+                    .events
+                    .send(RuntimeEvent::CommandProgress { label, elapsed_ms });
+            }
             AgentEvent::ProgressUpdated { ledger } => {
                 let phase = match ledger.phase {
                     leveler_lifecycle::TurnPhase::Active => "active",

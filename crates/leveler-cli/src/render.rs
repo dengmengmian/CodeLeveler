@@ -360,6 +360,14 @@ fn render_event_text(event: AgentEvent) {
             };
             println!("  {} {label}", console::style("⋯").yellow());
         }
+        AgentEvent::CommandProgress { label, elapsed_ms } => {
+            // Long-command heartbeat so headless runs aren't a silent wait.
+            println!(
+                "  {} 运行 {label} · {}s",
+                console::style("⋯").yellow(),
+                elapsed_ms / 1000
+            );
+        }
         AgentEvent::Finished(_) => {}
     }
 }
@@ -501,6 +509,9 @@ fn render_event_jsonl(event: AgentEvent) {
         }),
         AgentEvent::AdvisoryStarted { kind } => serde_json::json!({
             "type": "advisory_started", "kind": kind.as_key(),
+        }),
+        AgentEvent::CommandProgress { label, elapsed_ms } => serde_json::json!({
+            "type": "command_progress", "label": label, "elapsed_ms": elapsed_ms,
         }),
     };
     emit_jsonl(value);

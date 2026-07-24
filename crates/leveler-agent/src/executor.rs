@@ -193,6 +193,11 @@ pub enum AgentEvent {
     /// bare "waiting for model" for many seconds with no idea why. Emitting the
     /// kind lets the status line name the wait ("completeness audit…").
     AdvisoryStarted { kind: AdvisoryKind },
+    /// Heartbeat for a long-running command tool (spec: runtime observability).
+    /// Emitted every few seconds while a `run_command`/`shell_command` is still
+    /// executing, so the UI shows "运行 cargo test" with a live elapsed instead
+    /// of a bare "等待模型" black box. `label` is the command line being run.
+    CommandProgress { label: String, elapsed_ms: u64 },
     /// The loop finished with a final answer.
     Finished(String),
 }

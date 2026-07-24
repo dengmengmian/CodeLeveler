@@ -801,6 +801,24 @@ fn visible_quit_prompt_is_enough_to_confirm_quit() {
 }
 
 #[test]
+fn command_progress_heartbeat_names_the_running_command_with_elapsed() {
+    // Long-command heartbeat: the status line must read "运行 cargo test · <mm:ss>"
+    // instead of a bare "等待模型" while a command runs (runtime observability).
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::CommandProgress {
+            label: "cargo test".into(),
+            elapsed_ms: 151_000, // 2m31s
+        }),
+    );
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    let activity = s.activity.clone().unwrap_or_default();
+    assert!(activity.contains("cargo test"), "activity: {activity}");
+    assert!(activity.contains("2m 31s"), "activity: {activity}");
+}
+
+#[test]
 fn enter_on_queued_item_starts_now_and_interrupts_turn() {
     let mut s = state();
     reduce(

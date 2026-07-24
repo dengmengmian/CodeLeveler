@@ -1385,9 +1385,35 @@ impl Executor {
                                 ctx.turn_unrestricted_fs = true;
                             }
                             let files_before = modified_files.clone();
-                            let (content, is_error, image, workspace_snapshot, plan) = self
-                                .dispatch(&call, ctx, &mut modified_files, &cancellation)
-                                .await;
+                            // Heartbeat: while a long command runs, emit a
+                            // CommandProgress every few seconds so the UI shows
+                            // "运行 cargo test · <elapsed>" instead of a bare
+                            // "等待模型". select! keeps this in the same task, so
+                            // calling `observer` from the ticker branch is sound.
+                            let progress_label = command_progress_label(&call);
+                            let (content, is_error, image, workspace_snapshot, plan) = {
+                                let started = std::time::Instant::now();
+                                let dispatch_fut =
+                                    self.dispatch(&call, ctx, &mut modified_files, &cancellation);
+                                tokio::pin!(dispatch_fut);
+                                let mut ticker = tokio::time::interval(
+                                    std::time::Duration::from_secs(COMMAND_HEARTBEAT_SECS),
+                                );
+                                ticker.tick().await; // drop the immediate first tick
+                                loop {
+                                    tokio::select! {
+                                        r = &mut dispatch_fut => break r,
+                                        _ = ticker.tick() => {
+                                            if let Some(label) = &progress_label {
+                                                observer(AgentEvent::CommandProgress {
+                                                    label: label.clone(),
+                                                    elapsed_ms: started.elapsed().as_millis() as u64,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            };
                             // Cancel during a long tool must stop the batch — do not
                             // keep running subsequent tools after the user hit Ctrl+C.
                             // This call's own result still flows through: it ran, so
@@ -2526,6 +2552,26 @@ fn projected_epoch_file_count(
 /// substantive tools after the plan is complete is.
 fn is_bookkeeping_tool(name: &str) -> bool {
     matches!(name, "update_plan" | UPDATE_GOAL_TOOL | COMPLETE_STEP_TOOL)
+}
+
+/// How often to emit a [`AgentEvent::CommandProgress`] heartbeat while a command
+/// tool is still running. Short enough to prove liveness, long enough to be quiet.
+const COMMAND_HEARTBEAT_SECS: u64 = 3;
+
+/// The command line a heartbeat should name, or `None` if this call is not a
+/// long-running command tool (only those get a heartbeat). Reads the `cmd`
+/// argument the command tools take; falls back to the tool name.
+fn command_progress_label(call: &ToolCall) -> Option<String> {
+    if !matches!(call.name.as_str(), "run_command" | "shell_command") {
+        return None;
+    }
+    let cmd = call
+        .arguments
+        .get("cmd")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some(cmd.map_or_else(|| call.name.clone(), str::to_string))
 }
 
 /// Epoch + this-drive distinct modified paths (source of truth for residual).

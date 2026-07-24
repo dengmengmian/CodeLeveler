@@ -74,6 +74,10 @@ pub enum RuntimeEvent {
     AssistantMessageCompleted { message_id: MessageId },
     /// Coarse progress label from the runtime, shown in the status line.
     AgentActivity { label: String },
+    /// Heartbeat while a long command tool runs (runtime observability). Lets a
+    /// client show "运行 cargo test" with a live elapsed instead of a bare
+    /// "等待模型". Structured so TUI/Web/logs can consume it uniformly.
+    CommandProgress { label: String, elapsed_ms: u64 },
     /// Project behavior constraints loaded for this turn. Sources are
     /// workspace-relative paths; instruction contents never enter UI chrome.
     ProjectRulesLoaded { sources: Vec<String> },

@@ -108,6 +108,18 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.input_queues.clear_pending();
             state.activity = Some(label);
         }
+        RuntimeEvent::CommandProgress { label, elapsed_ms } => {
+            // Long-command heartbeat: name the running command with a live
+            // elapsed so the status line reads "运行 cargo test · 02:31" instead
+            // of a bare "等待模型". Reuses the activity slot (single source).
+            mark_turn_busy(state);
+            state.input_queues.clear_pending();
+            let secs = elapsed_ms / 1000;
+            state.activity = Some(format!(
+                "运行 {label} · {}",
+                crate::status_line::fmt_elapsed(secs)
+            ));
+        }
         RuntimeEvent::ProjectRulesLoaded { sources } => {
             mark_turn_busy(state);
             state.project_rule_sources = sources;
