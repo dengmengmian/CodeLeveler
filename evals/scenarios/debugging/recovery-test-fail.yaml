@@ -1,0 +1,45 @@
+id: recovery-test-fail
+name: "recovery: fix a failing test to reach green"
+# Recovery case (spec §4): the workspace COMPILES but a test FAILS due to a
+# logic bug. Passing means the agent located and recovered it. Counts toward
+# recovery_rate.
+recovery: true
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    /// Return the maximum of the slice, or 0 for an empty slice.
+    /// BUG: seeds the running max with the first element's *index-0 assumption*
+    /// wrong — it starts from u64::MAX so nothing ever beats it.
+    pub fn max_or_zero(values: &[u64]) -> u64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let mut best = u64::MAX;
+        for &v in values {
+            if v > best {
+                best = v;
+            }
+        }
+        best
+    }
+  tests/spec.rs: |
+    use evalcase::max_or_zero;
+    #[test]
+    fn finds_max() {
+        assert_eq!(max_or_zero(&[3, 7, 2]), 7);
+        assert_eq!(max_or_zero(&[]), 0);
+    }
+max_rounds: 60
+task: |
+  `cargo test` compiles but `tests/spec.rs` fails: `max_or_zero` returns the
+  wrong value for a non-empty slice. Find and fix the logic bug so the test
+  passes. Do not modify tests/spec.rs.
+expect:
+  program: cargo
+  args: [test, --quiet]

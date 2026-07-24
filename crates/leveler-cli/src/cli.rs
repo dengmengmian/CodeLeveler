@@ -410,6 +410,54 @@ pub enum EvalCommand {
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
     },
+    /// Quick tier (spec §2, L1): the fast pre-commit gate — `evals/smoke`.
+    /// Aim: under 5 minutes, core loop + tools + a simple edit.
+    Quick {
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        /// Repeat every case to expose run-to-run variance.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        /// Write a durable JSON baseline (report + score + meta) to this path.
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Daily tier (spec §2, L2): the regression gate — `evals/core` + `evals/hard`.
+    /// Broader debug/feature/refactor/multi-file coverage.
+    Daily {
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Release tier (spec §2, L3): the full gate — every suite including the
+    /// real-repo `evals/scenarios`. Long-running; run `scripts/fetch_eval_repos.sh`
+    /// first so the pinned real repos are present.
+    Release {
+        /// Model reference.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+    },
+    /// Version-over-version trend: read a directory of run baselines and render
+    /// a Markdown quality-trend table + regression flags (spec §6).
+    Trend {
+        /// Directory of baseline JSON files written by `--json-out`
+        /// (e.g. `evals/history`).
+        #[arg(long, default_value = "evals/history")]
+        history: PathBuf,
+        /// Write the report here (e.g. `evals/REGRESSION_REPORT.md`).
+        /// Without it, the report prints to stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
     /// Single-knob ablation: run the SAME model twice — knob as configured
     /// (control) vs flipped (ablated) — and report what the knob is worth.
     /// Run once per model to measure whether the mechanism helps or hurts it.

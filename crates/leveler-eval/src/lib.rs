@@ -30,6 +30,11 @@ pub struct EvaluationCase {
     /// whole workspace; with `repo`, they overlay the clone.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+    /// Marks a recovery case: it starts from an injected failure (compile error,
+    /// failing test, or tool error) and passing means the agent recovered. Only
+    /// these cases count toward `EvalReport::recovery_rate` (spec §4 Recovery).
+    #[serde(default)]
+    pub recovery: bool,
     /// The natural-language task handed to the agent.
     pub task: String,
     /// Total agent/model rounds allowed for this case. Evals stay bounded so
@@ -142,6 +147,21 @@ pub struct CaseResult {
     /// Independent command evidence used to decide `expect_passed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_evidence: Option<VerificationEvidence>,
+    /// Behavior metric: total tool calls in the run (Tool Efficiency). Defaulted
+    /// so legacy baseline files still load.
+    #[serde(default)]
+    pub tool_calls: u32,
+    /// Behavior metric: times the no-progress loop guard blocked a repeat call
+    /// (Loop Rate). `>0` means the run looped.
+    #[serde(default)]
+    pub loop_guard_trips: u32,
+    /// Engineering metric: a build/test/lint ran during the run (Validation Rate).
+    #[serde(default)]
+    pub verification_ran: bool,
+    /// This result came from a recovery case (see `EvaluationCase::recovery`),
+    /// so it counts toward `recovery_rate`. Defaulted for legacy baselines.
+    #[serde(default)]
+    pub is_recovery: bool,
 }
 
 const fn default_repetition() -> u32 {
@@ -227,6 +247,51 @@ impl EvalReport {
         self.cases.iter().map(|c| c.rounds as f32).sum::<f32>() / self.total() as f32
     }
 
+    /// Cases where the agent claimed completion but the independent check
+    /// disproved it (`completed && !expect_passed`). This is the headline
+    /// agent-quality signal — a *false* "done", distinct from an honest give-up.
+    pub fn false_completion_count(&self) -> usize {
+        self.cases
+            .iter()
+            .filter(|c| c.completed && !c.expect_passed)
+            .count()
+    }
+
+    /// False completions as a fraction of all cases, in `0.0..=1.0`. Lower is
+    /// better; this must be reported alongside `completion_rate`, never hidden.
+    pub fn false_completion_rate(&self) -> f32 {
+        if self.cases.is_empty() {
+            return 0.0;
+        }
+        self.false_completion_count() as f32 / self.total() as f32
+    }
+
+    /// Of the cases where the agent claimed completion, the fraction that were
+    /// actually correct (`completed && expect_passed` over `completed`). This is
+    /// the trust score for "done"; `1.0` when nothing was claimed (no false
+    /// "done" is possible). Complements `false_completion_rate`.
+    pub fn completion_accuracy(&self) -> f32 {
+        let claimed = self.cases.iter().filter(|c| c.completed).count();
+        if claimed == 0 {
+            return 1.0;
+        }
+        let truly_done = self
+            .cases
+            .iter()
+            .filter(|c| c.completed && c.expect_passed)
+            .count();
+        truly_done as f32 / claimed as f32
+    }
+
+    /// Ids of the false-completion cases, for failure triage.
+    pub fn false_completion_case_ids(&self) -> Vec<String> {
+        self.cases
+            .iter()
+            .filter(|c| c.completed && !c.expect_passed)
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
     /// Case ids that did not pass (failed completion and/or expectation).
     pub fn failed_case_ids(&self) -> Vec<String> {
         self.cases
@@ -234,6 +299,172 @@ impl EvalReport {
             .filter(|c| !c.passed())
             .map(|c| c.id.clone())
             .collect()
+    }
+
+    /// Behavior metric — average tool calls per case (Tool Efficiency). Read
+    /// alongside `completion_rate`: high calls with low completion signals churn.
+    pub fn avg_tool_calls(&self) -> f32 {
+        if self.cases.is_empty() {
+            return 0.0;
+        }
+        self.cases.iter().map(|c| c.tool_calls as f32).sum::<f32>() / self.total() as f32
+    }
+
+    /// Behavior metric — fraction of cases where the no-progress loop guard
+    /// tripped at least once (Loop Rate). Lower is better.
+    pub fn loop_rate(&self) -> f32 {
+        if self.cases.is_empty() {
+            return 0.0;
+        }
+        let looped = self.cases.iter().filter(|c| c.loop_guard_trips > 0).count();
+        looped as f32 / self.total() as f32
+    }
+
+    /// Engineering metric — fraction of cases where the agent ran a
+    /// build/test/lint (Validation Rate). An agent that never verifies its work
+    /// is the main driver of false completions.
+    pub fn validation_rate(&self) -> f32 {
+        if self.cases.is_empty() {
+            return 0.0;
+        }
+        let verified = self.cases.iter().filter(|c| c.verification_ran).count();
+        verified as f32 / self.total() as f32
+    }
+
+    /// Tool efficiency — the share of tool calls NOT spent looping, averaged
+    /// over cases that used tools: `mean(1 - min(1, loop_guard_trips/tool_calls))`.
+    /// A narrow, non-arbitrary signal (it penalizes no-progress loops, not
+    /// over-reading). `None` when no case used a tool, so it is never fabricated.
+    pub fn tool_efficiency(&self) -> Option<f32> {
+        let using: Vec<&CaseResult> = self.cases.iter().filter(|c| c.tool_calls > 0).collect();
+        if using.is_empty() {
+            return None;
+        }
+        let sum: f32 = using
+            .iter()
+            .map(|c| 1.0 - (c.loop_guard_trips as f32 / c.tool_calls as f32).min(1.0))
+            .sum();
+        Some(sum / using.len() as f32)
+    }
+
+    /// Cost efficiency — the share of total token spend that went to cases that
+    /// PASSED: `tokens(passed) / tokens(all)`. Measures how much of the budget
+    /// produced a correct result. `None` when no tokens were recorded.
+    pub fn cost_efficiency(&self) -> Option<f32> {
+        let tokens = |c: &CaseResult| (c.input_tokens + c.output_tokens) as f32;
+        let total: f32 = self.cases.iter().map(|c| tokens(c)).sum();
+        if total == 0.0 {
+            return None;
+        }
+        let productive: f32 = self
+            .cases
+            .iter()
+            .filter(|c| c.passed())
+            .map(|c| tokens(c))
+            .sum();
+        Some(productive / total)
+    }
+
+    /// Recovery metric — completion over ONLY the recovery cases (those seeded
+    /// with an injected failure). `None` when the report has no recovery cases,
+    /// so it is never fabricated from unrelated tasks.
+    pub fn recovery_rate(&self) -> Option<f32> {
+        let recovery: Vec<&CaseResult> = self.cases.iter().filter(|c| c.is_recovery).collect();
+        if recovery.is_empty() {
+            return None;
+        }
+        let passed = recovery.iter().filter(|c| c.passed()).count();
+        Some(passed as f32 / recovery.len() as f32)
+    }
+
+    /// The single headline number: a weighted composite of quality components,
+    /// derived from this report where possible. See [`QualityScore`].
+    pub fn quality_score(&self) -> QualityScore {
+        QualityScore::from_report(self)
+    }
+}
+
+/// A single 0.0..=1.0 "how good is this Agent" number (spec §7). It is a
+/// weighted average of named components, each also 0.0..=1.0 with higher =
+/// better. Components that are not yet instrumented are `None` and simply drop
+/// out — the remaining weights renormalize — so the score reflects only real
+/// measurements and never fabricates a value for something we didn't observe.
+///
+/// Default weights (must sum to 1.0):
+/// task_success 0.40, completion_accuracy 0.20, tool_efficiency 0.15,
+/// recovery 0.10, tui_stability 0.10, cost_efficiency 0.05.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct QualityScore {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_success: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_accuracy: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_efficiency: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_stability: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_efficiency: Option<f32>,
+}
+
+impl QualityScore {
+    pub const W_TASK_SUCCESS: f32 = 0.40;
+    pub const W_COMPLETION_ACCURACY: f32 = 0.20;
+    pub const W_TOOL_EFFICIENCY: f32 = 0.15;
+    pub const W_RECOVERY: f32 = 0.10;
+    pub const W_TUI_STABILITY: f32 = 0.10;
+    pub const W_COST_EFFICIENCY: f32 = 0.05;
+
+    /// Derive the components a single report can support WITHOUT fabricating the
+    /// rest. task_success, completion_accuracy, tool_efficiency, cost_efficiency
+    /// come from the report; recovery is present only when the report has
+    /// recovery cases. `tui_stability` lives in a different test layer (the TUI
+    /// soak) and stays `None` here — see `scenarios/tui/README.md`.
+    pub fn from_report(report: &EvalReport) -> Self {
+        if report.cases.is_empty() {
+            return Self::default();
+        }
+        Self {
+            task_success: Some(report.completion_rate()),
+            completion_accuracy: Some(report.completion_accuracy()),
+            tool_efficiency: report.tool_efficiency(),
+            recovery: report.recovery_rate(),
+            tui_stability: None,
+            cost_efficiency: report.cost_efficiency(),
+        }
+    }
+
+    /// Weighted average over the components that are present, with the present
+    /// weights renormalized to sum to 1.0. Returns `0.0` when nothing is
+    /// measured (never NaN from an empty denominator).
+    pub fn overall(&self) -> f32 {
+        let parts = [
+            (self.task_success, Self::W_TASK_SUCCESS),
+            (self.completion_accuracy, Self::W_COMPLETION_ACCURACY),
+            (self.tool_efficiency, Self::W_TOOL_EFFICIENCY),
+            (self.recovery, Self::W_RECOVERY),
+            (self.tui_stability, Self::W_TUI_STABILITY),
+            (self.cost_efficiency, Self::W_COST_EFFICIENCY),
+        ];
+        let mut weighted = 0.0;
+        let mut weight_sum = 0.0;
+        for (value, weight) in parts {
+            if let Some(v) = value {
+                weighted += v.clamp(0.0, 1.0) * weight;
+                weight_sum += weight;
+            }
+        }
+        if weight_sum == 0.0 {
+            return 0.0;
+        }
+        weighted / weight_sum
+    }
+
+    /// The overall score on a 0..100 scale, for human-facing trend tables.
+    pub fn score_100(&self) -> u32 {
+        (self.overall() * 100.0).round() as u32
     }
 }
 
@@ -285,6 +516,18 @@ pub enum BaselineDocument {
         passed: usize,
         total: usize,
         failed_case_ids: Vec<String>,
+        /// Headline agent-quality signal: claimed done but check failed.
+        /// Defaulted so pre-existing baseline files still load.
+        #[serde(default)]
+        false_completion_rate: f32,
+        #[serde(default)]
+        false_completion_case_ids: Vec<String>,
+        /// Weighted composite quality score (spec §7) and its 0..100 form, the
+        /// number the trend/regression report tracks across versions.
+        #[serde(default)]
+        quality_score: QualityScore,
+        #[serde(default)]
+        quality_score_100: u32,
     },
     Compare {
         meta: BaselineMeta,
@@ -303,6 +546,10 @@ impl BaselineDocument {
         let total = report.total();
         let completion_rate = report.completion_rate();
         let failed_case_ids = report.failed_case_ids();
+        let false_completion_rate = report.false_completion_rate();
+        let false_completion_case_ids = report.false_completion_case_ids();
+        let quality_score = report.quality_score();
+        let quality_score_100 = quality_score.score_100();
         Self::Run {
             meta,
             report,
@@ -310,6 +557,10 @@ impl BaselineDocument {
             passed,
             total,
             failed_case_ids,
+            false_completion_rate,
+            false_completion_case_ids,
+            quality_score,
+            quality_score_100,
         }
     }
 
@@ -344,6 +595,118 @@ impl BaselineDocument {
     pub fn load_json(path: &Path) -> Result<Self, EvalError> {
         let raw = std::fs::read_to_string(path).map_err(|e| EvalError::Io(e.to_string()))?;
         serde_json::from_str(&raw).map_err(|e| EvalError::Parse(e.to_string()))
+    }
+
+    /// One trend data point for the version-over-version report. Only single-run
+    /// baselines carry a single Agent Quality Score; `Compare` artifacts hold two
+    /// models and are skipped (`None`).
+    pub fn trend_point(&self) -> Option<TrendPoint> {
+        match self {
+            BaselineDocument::Run {
+                meta,
+                completion_rate,
+                false_completion_rate,
+                quality_score_100,
+                ..
+            } => Some(TrendPoint {
+                version: meta.engine_version.clone(),
+                model: meta.model_refs.join(","),
+                created_at: meta.created_at.clone(),
+                score_100: *quality_score_100,
+                completion_rate: *completion_rate,
+                false_completion_rate: *false_completion_rate,
+            }),
+            BaselineDocument::Compare { .. } => None,
+        }
+    }
+}
+
+/// A single point on the version-over-version quality trend (spec §6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrendPoint {
+    /// The engine version that produced the run (`BaselineMeta::engine_version`).
+    pub version: String,
+    pub model: String,
+    /// RFC 3339 timestamp of the run; the tiebreaker when versions repeat.
+    pub created_at: String,
+    /// Agent Quality Score on a 0..100 scale.
+    pub score_100: u32,
+    pub completion_rate: f32,
+    pub false_completion_rate: f32,
+}
+
+/// A detected version-over-version quality drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Regression {
+    pub from_version: String,
+    pub to_version: String,
+    /// `to.score_100 - from.score_100`; negative for a regression.
+    pub score_delta: i32,
+}
+
+/// The version-over-version trend, built from a set of run baselines. Renders a
+/// Markdown table and flags any consecutive score drop (spec §6, REGRESSION_REPORT).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrendReport {
+    pub points: Vec<TrendPoint>,
+}
+
+impl TrendReport {
+    /// Sort points by (version, created_at) so the table reads oldest → newest
+    /// regardless of file discovery order.
+    pub fn from_points(mut points: Vec<TrendPoint>) -> Self {
+        points.sort_by(|a, b| {
+            a.version
+                .cmp(&b.version)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        Self { points }
+    }
+
+    /// Consecutive points where the score dropped. Empty when monotonic or flat.
+    pub fn regressions(&self) -> Vec<Regression> {
+        self.points
+            .windows(2)
+            .filter_map(|w| {
+                let delta = w[1].score_100 as i32 - w[0].score_100 as i32;
+                (delta < 0).then(|| Regression {
+                    from_version: w[0].version.clone(),
+                    to_version: w[1].version.clone(),
+                    score_delta: delta,
+                })
+            })
+            .collect()
+    }
+
+    /// Render the trend as a Markdown report: a Version→Score table plus a
+    /// Regressions section (only listing real drops).
+    pub fn render_markdown(&self) -> String {
+        let mut out = String::from("# Agent Quality Regression Report\n\n");
+        out.push_str("| Version | Model | Score | Completion | False completion |\n");
+        out.push_str("|---------|-------|------:|-----------:|-----------------:|\n");
+        for p in &self.points {
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.0}% | {:.0}% |\n",
+                p.version,
+                p.model,
+                p.score_100,
+                p.completion_rate * 100.0,
+                p.false_completion_rate * 100.0,
+            ));
+        }
+        let regs = self.regressions();
+        out.push_str("\n## Regressions\n\n");
+        if regs.is_empty() {
+            out.push_str("None — score is flat or improving across all recorded versions.\n");
+        } else {
+            for r in regs {
+                out.push_str(&format!(
+                    "- **{} → {}**: {} points\n",
+                    r.from_version, r.to_version, r.score_delta
+                ));
+            }
+        }
+        out
     }
 }
 
@@ -683,6 +1046,10 @@ mod tests {
             failure_source: None,
             note: String::new(),
             verification_evidence: None,
+            tool_calls: 0,
+            loop_guard_trips: 0,
+            verification_ran: false,
+            is_recovery: false,
         }
     }
 
@@ -1001,6 +1368,220 @@ mod tests {
     }
 
     #[test]
+    fn false_completion_counts_only_claimed_but_unverified() {
+        // The headline agent-quality signal: the agent said "done" but the
+        // independent check disagreed. A case that never claimed completion is
+        // an honest failure, NOT a false completion — it must not count here.
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![
+                result("ok", true, true),        // honest pass
+                result("false_done", true, false), // claimed done, check failed
+                result("gave_up", false, false),  // honest incomplete
+                result("odd", false, true),       // did not claim, yet check passed
+            ],
+        };
+        assert_eq!(report.false_completion_count(), 1);
+        // 1 false completion out of 4 cases.
+        assert!((report.false_completion_rate() - 0.25).abs() < f32::EPSILON);
+        assert_eq!(report.false_completion_case_ids(), vec!["false_done"]);
+        // 2 cases claimed completion (ok, false_done); 1 was truly done.
+        assert!((report.completion_accuracy() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn completion_accuracy_is_one_when_no_case_claims_completion() {
+        // With nothing claimed, there are no false "done"s to punish — accuracy
+        // is vacuously perfect (never NaN from a zero denominator).
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![result("a", false, false), result("b", false, true)],
+        };
+        assert!((report.completion_accuracy() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn trend_report_orders_points_and_flags_score_regressions() {
+        let p = |version: &str, score: u32, fc: f32| TrendPoint {
+            version: version.into(),
+            model: "m".into(),
+            created_at: format!("2026-07-{version}"),
+            score_100: score,
+            completion_rate: 1.0,
+            false_completion_rate: fc,
+        };
+        // Out-of-order input; the report sorts by version and detects the 0.3 dip.
+        let report = TrendReport::from_points(vec![p("03", 81, 0.1), p("01", 72, 0.0), p("02", 89, 0.0)]);
+        let versions: Vec<&str> = report.points.iter().map(|p| p.version.as_str()).collect();
+        assert_eq!(versions, ["01", "02", "03"]);
+        // 89 → 81 is a regression; 72 → 89 is not.
+        let regs = report.regressions();
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0].from_version, "02");
+        assert_eq!(regs[0].to_version, "03");
+        assert_eq!(regs[0].score_delta, -8);
+        let md = report.render_markdown();
+        assert!(md.contains("| 01 |"));
+        assert!(md.contains("72"));
+        assert!(md.contains("Regressions"), "must surface a regression section");
+    }
+
+    #[test]
+    fn trend_extracts_point_from_run_baseline_only() {
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![result("a", true, true)],
+        };
+        let doc = BaselineDocument::from_run(meta(), report);
+        assert!(doc.trend_point().is_some());
+        // Compare docs carry two models and no single score → no trend point.
+        let cmp = BaselineDocument::from_compare(
+            meta(),
+            EvalReport { model: "a".into(), cases: vec![] },
+            EvalReport { model: "b".into(), cases: vec![] },
+        );
+        assert!(cmp.trend_point().is_none());
+    }
+
+    #[test]
+    fn quality_score_renormalizes_over_present_components() {
+        // Today only two components are derivable; the score must weight what it
+        // has and renormalize — never fabricate the unmeasured ones.
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![result("a", true, true), result("b", true, false)],
+        };
+        let score = QualityScore::from_report(&report);
+        assert_eq!(score.task_success, Some(0.5)); // 1/2 passed
+        assert_eq!(score.completion_accuracy, Some(0.5)); // 2 claimed, 1 true
+        assert!(score.recovery.is_none());
+        assert!(score.tui_stability.is_none());
+        // present weights 0.40 + 0.20; overall = (.5*.4 + .5*.2)/.6 = .5
+        assert!((score.overall() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tool_and_cost_efficiency_have_defined_non_fabricated_meaning() {
+        // tool_efficiency = share of tool calls NOT spent looping, over cases
+        // that used tools. cost_efficiency = share of token spend on passing
+        // cases. Both None when the denominator is absent (never faked).
+        let mut a = result("a", true, true);
+        a.tool_calls = 10;
+        a.loop_guard_trips = 0; // no waste → 1.0
+        a.input_tokens = 100;
+        a.output_tokens = 100; // 200, passed → productive
+        let mut b = result("b", true, false);
+        b.tool_calls = 10;
+        b.loop_guard_trips = 5; // half wasted → 0.5
+        b.input_tokens = 100;
+        b.output_tokens = 100; // 200, failed → wasted
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![a, b],
+        };
+        // mean(1.0, 0.5)
+        assert!((report.tool_efficiency().unwrap() - 0.75).abs() < 1e-6);
+        // 200 productive / 400 total
+        assert!((report.cost_efficiency().unwrap() - 0.5).abs() < 1e-6);
+        let score = QualityScore::from_report(&report);
+        assert_eq!(score.tool_efficiency, Some(0.75));
+        assert_eq!(score.cost_efficiency, Some(0.5));
+    }
+
+    #[test]
+    fn efficiency_is_none_without_tool_use_or_tokens() {
+        // result() has zero tool_calls and zero tokens → both efficiencies None.
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![result("a", true, true)],
+        };
+        assert!(report.tool_efficiency().is_none());
+        assert!(report.cost_efficiency().is_none());
+    }
+
+    #[test]
+    fn recovery_rate_covers_only_recovery_cases_and_feeds_the_score() {
+        // Recovery cases start from an injected failure (compile/test/tool). The
+        // rate is completion over ONLY those cases; normal cases must not dilute
+        // it. It also becomes the score's recovery component.
+        let mut r1 = result("rec-pass", true, true);
+        r1.is_recovery = true;
+        let mut r2 = result("rec-fail", true, false); // claimed done, still broken
+        r2.is_recovery = true;
+        let normal = result("normal", true, true);
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![r1, r2, normal],
+        };
+        assert!((report.recovery_rate().unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(QualityScore::from_report(&report).recovery, Some(0.5));
+    }
+
+    #[test]
+    fn recovery_rate_is_none_without_recovery_cases() {
+        // No recovery cases → no measurement → None (never a fabricated 0/1).
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![result("a", true, true)],
+        };
+        assert!(report.recovery_rate().is_none());
+        assert!(QualityScore::from_report(&report).recovery.is_none());
+    }
+
+    #[test]
+    fn quality_score_supplied_components_shift_overall() {
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![result("a", true, true)], // task 1.0, accuracy 1.0
+        };
+        let mut score = QualityScore::from_report(&report);
+        score.recovery = Some(0.0);
+        // present weights 0.40 + 0.20 + 0.10; overall = (1*.4 + 1*.2 + 0*.1)/.7
+        assert!((score.overall() - (0.6 / 0.7)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn quality_score_with_no_components_is_zero_not_nan() {
+        let score = QualityScore::default();
+        assert!(score.overall().abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn behavior_and_engineering_metrics_aggregate_over_cases() {
+        // Tool Efficiency / Loop Rate / Validation Rate must be derivable from
+        // the persisted per-case record, not recomputed from a discarded signal
+        // stream. Build cases with explicit behavior fields and assert the rollup.
+        let mut a = result("a", true, true);
+        a.tool_calls = 10;
+        a.loop_guard_trips = 0;
+        a.verification_ran = true;
+        let mut b = result("b", true, false);
+        b.tool_calls = 30;
+        b.loop_guard_trips = 2; // this case looped
+        b.verification_ran = false;
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![a, b],
+        };
+        assert!((report.avg_tool_calls() - 20.0).abs() < f32::EPSILON);
+        // 1 of 2 cases tripped the loop guard.
+        assert!((report.loop_rate() - 0.5).abs() < f32::EPSILON);
+        // 1 of 2 cases ran a build/test.
+        assert!((report.validation_rate() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn false_completion_rate_of_empty_report_is_zero() {
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![],
+        };
+        assert_eq!(report.false_completion_count(), 0);
+        assert!((report.false_completion_rate() - 0.0).abs() < f32::EPSILON);
+        assert!(report.false_completion_case_ids().is_empty());
+    }
+
+    #[test]
     fn comparison_gap() {
         let a = EvalReport {
             model: "strong".into(),
@@ -1030,6 +1611,10 @@ mod tests {
             failure_source: None,
             note: String::new(),
             verification_evidence: None,
+            tool_calls: 0,
+            loop_guard_trips: 0,
+            verification_ran: false,
+            is_recovery: false,
         }
     }
 
@@ -1289,6 +1874,26 @@ expect: { program: cargo, args: [test] }
     }
 
     #[test]
+    fn scenario_suite_parses_and_ids_are_unique_across_the_tree() {
+        // Scenario cases (evals/scenarios/**) must parse under the same schema
+        // and never collide with an id anywhere else in the tree — a duplicate
+        // id silently corrupts checkpoints and cross-suite dedup.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        let all = EvaluationCase::load_dir(&root).expect("recursive eval suite");
+        let scenarios = EvaluationCase::load_dir(&root.join("scenarios"))
+            .expect("evals/scenarios must parse");
+        assert!(
+            !scenarios.is_empty(),
+            "evals/scenarios must contain at least one case"
+        );
+        let mut ids: Vec<&str> = all.iter().map(|c| c.id.as_str()).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "duplicate case id across the eval tree");
+    }
+
+    #[test]
     fn root_suite_is_recursive_and_covers_all_first_class_languages() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
         let cases = EvaluationCase::load_dir(&root).expect("recursive eval suite");
@@ -1331,6 +1936,10 @@ expect: { program: cargo, args: [test] }
                 failure_source: None,
                 note: "model said done".into(),
                 verification_evidence: None,
+                tool_calls: 0,
+                loop_guard_trips: 0,
+                verification_ran: false,
+                is_recovery: false,
             }
             .passed()
         );
@@ -1350,6 +1959,10 @@ expect: { program: cargo, args: [test] }
                 failure_source: None,
                 note: "tests green but agent failed".into(),
                 verification_evidence: None,
+                tool_calls: 0,
+                loop_guard_trips: 0,
+                verification_ran: false,
+                is_recovery: false,
             }
             .passed()
         );

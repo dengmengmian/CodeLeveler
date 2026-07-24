@@ -1,0 +1,55 @@
+id: ripgrep-total-count
+name: "ripgrep: add a --total-count summary flag (real repo, long context)"
+
+# Real-world repository scenario. The repo is cloned locally by
+# `scripts/fetch_eval_repos.sh` (pinned to tag 14.1.1) — not committed. The
+# agent must navigate ripgrep's full source (~40k LOC across many crates) to
+# wire one CLI flag end to end: arg definition → parsing → output path → help.
+repo: fixtures/repos/ripgrep
+base_ref: "14.1.1"
+
+# No overlay files: the task is a pure feature addition, so the agent starts
+# from an unmodified pinned checkout and must locate the relevant code itself.
+files: {}
+
+# Real repos need a larger budget than synthetic cases: locating the flag
+# plumbing in a large codebase costs exploration rounds.
+max_rounds: 140
+
+task: |
+  ripgrep currently has no way to print a single grand total of matching lines
+  across ALL files searched in one invocation. Add a new global command-line
+  flag `--total-count` that, in addition to ripgrep's normal output, prints
+  exactly one final line to stdout of the form `TOTAL:<N>`, where `<N>` is the
+  total number of matching lines across every file searched in this run.
+
+  Requirements:
+  - The flag must appear in `rg --help`.
+  - When `--total-count` is NOT passed, behavior must be unchanged.
+  - The `TOTAL:<N>` line must be the last line printed, using that exact format
+    (uppercase `TOTAL`, a colon, the integer, no spaces).
+
+  Do not weaken or delete existing tests to make the build pass.
+
+# Independent acceptance. Lives here in the harness, NOT as a workspace file, so
+# the agent cannot edit the check to force a pass. Builds the agent's result and
+# asserts BOTH help-wiring and runtime behavior on a controlled fixture.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cargo build -q
+      BIN="$(pwd)/target/debug/rg"
+      # 1) flag is discoverable in help
+      "$BIN" --help 2>/dev/null | grep -q -- '--total-count'
+      # 2) runtime behavior: 3 matching lines across 2 files → TOTAL:3
+      d="$(mktemp -d)"
+      printf 'alpha needle\nbeta\ngamma needle\n' > "$d/a.txt"
+      printf 'needle delta\n' > "$d/b.txt"
+      out="$("$BIN" --total-count --no-heading --no-messages needle "$d")"
+      printf '%s\n' "$out" | grep -qx 'TOTAL:3'
+      # 3) absence of the flag leaves output unchanged (no TOTAL line leaks)
+      out2="$("$BIN" --no-heading --no-messages needle "$d")"
+      ! printf '%s\n' "$out2" | grep -q '^TOTAL:'

@@ -22,6 +22,11 @@ CLAUDE.md
 # Generated evaluation output
 evals/baselines/*.json
 evals/baselines/*.jsonl
+# Version-trend history (run baselines) + generated regression report
+evals/history/*.json
+evals/history/*.jsonl
+evals/results/*.json
+evals/REGRESSION_REPORT.md
 
 # Env / secrets — never commit
 .env

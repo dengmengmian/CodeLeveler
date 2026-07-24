@@ -249,7 +249,194 @@ pub(crate) async fn cmd_eval(
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
+        EvalCommand::Quick {
+            model,
+            repetitions,
+            json_out,
+        } => {
+            let app = Application::assemble(layout)?;
+            let model_ref = resolve_model(&app, model)?;
+            run_tier(
+                &config_dir,
+                &model_ref,
+                "quick",
+                &["evals/smoke"],
+                repetitions,
+                json_out,
+            )
+            .await
+        }
+        EvalCommand::Daily {
+            model,
+            repetitions,
+            json_out,
+        } => {
+            let app = Application::assemble(layout)?;
+            let model_ref = resolve_model(&app, model)?;
+            run_tier(
+                &config_dir,
+                &model_ref,
+                "daily",
+                // Synthetic recovery scenarios join the daily gate; the heavy
+                // real-repo scenarios stay in `release`.
+                &["evals/core", "evals/hard", "evals/scenarios/debugging"],
+                repetitions,
+                json_out,
+            )
+            .await
+        }
+        EvalCommand::Release {
+            model,
+            repetitions,
+            json_out,
+        } => {
+            let app = Application::assemble(layout)?;
+            let model_ref = resolve_model(&app, model)?;
+            run_tier(
+                &config_dir,
+                &model_ref,
+                "release",
+                &["evals/smoke", "evals/core", "evals/hard", "evals/scenarios"],
+                repetitions,
+                json_out,
+            )
+            .await
+        }
+        EvalCommand::Trend { history, out } => run_trend(&history, out),
     }
+}
+
+/// Build the version-over-version trend from a directory of run baselines.
+/// Reuses the existing `--json-out` artifacts — no new result path — so history
+/// is just "keep pointing `--json-out` at `evals/history/<version>.json`".
+fn run_trend(
+    history: &std::path::Path,
+    out: Option<std::path::PathBuf>,
+) -> anyhow::Result<std::process::ExitCode> {
+    let entries = std::fs::read_dir(history)
+        .map_err(|e| anyhow::anyhow!("reading history dir {}: {e}", history.display()))?;
+    let mut points = Vec::new();
+    let mut skipped = 0usize;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match leveler_eval::BaselineDocument::load_json(&path) {
+            Ok(doc) => match doc.trend_point() {
+                Some(p) => points.push(p),
+                // Compare artifacts have no single score — expected, not an error.
+                None => skipped += 1,
+            },
+            Err(e) => {
+                eprintln!("  {} skipping {}: {e}", console::style("!").yellow(), path.display());
+                skipped += 1;
+            }
+        }
+    }
+    if points.is_empty() {
+        anyhow::bail!(
+            "no run baselines with a quality score in {} \
+             (write some with `leveler eval quick --json-out {}/<version>.json`)",
+            history.display(),
+            history.display()
+        );
+    }
+    let report = leveler_eval::TrendReport::from_points(points);
+    let markdown = report.render_markdown();
+    match out {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&path, &markdown)
+                .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+            println!(
+                "  {} {} ({} version(s), {} skipped)",
+                console::style("trend").dim(),
+                path.display(),
+                report.points.len(),
+                skipped
+            );
+        }
+        None => print!("{markdown}"),
+    }
+    // A regression is a soft signal here (reporting tool, not a gate): surface it
+    // but exit 0 so CI can decide the policy.
+    for r in report.regressions() {
+        println!(
+            "  {} regression {} → {}: {} points",
+            console::style("⚠").red().bold(),
+            r.from_version,
+            r.to_version,
+            r.score_delta
+        );
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Shared driver for the three tiered gates (spec §2). A tier is just a fixed
+/// set of case directories run orchestrated against one model — no new runner,
+/// no new result path. Cases from all dirs are concatenated; a missing dir is a
+/// hard error so a mistyped tier can't silently shrink coverage.
+async fn run_tier(
+    config_dir: &std::path::Path,
+    model_ref: &ModelRef,
+    tier: &str,
+    dirs: &[&str],
+    repetitions: u32,
+    json_out: Option<std::path::PathBuf>,
+) -> anyhow::Result<std::process::ExitCode> {
+    let mut cases = Vec::new();
+    for dir in dirs {
+        let loaded = leveler_eval::EvaluationCase::load_dir(std::path::Path::new(dir))
+            .map_err(|e| anyhow::anyhow!("loading {dir}: {e}"))?;
+        cases.extend(loaded);
+    }
+    if cases.is_empty() {
+        anyhow::bail!(
+            "tier `{tier}` found no cases in [{}] — run from the repo root; \
+             for release, fetch real repos first (scripts/fetch_eval_repos.sh)",
+            dirs.join(", ")
+        );
+    }
+    println!(
+        "  tier: {tier} ({} cases across {})",
+        cases.len(),
+        dirs.join(", ")
+    );
+    println!("  mode: orchestrated");
+    let checkpoint = json_out.as_deref().map(checkpoint_path);
+    let report = run_eval(
+        config_dir,
+        model_ref,
+        &cases,
+        false,
+        false,
+        repetitions,
+        None,
+        checkpoint.as_deref(),
+    )
+    .await;
+    print_eval_report(&report);
+    if let Some(path) = json_out {
+        let doc = leveler_eval::BaselineDocument::from_run(
+            baseline_meta(
+                std::path::Path::new(&dirs.join(",")),
+                &format!("tier-{tier}"),
+                repetitions,
+                std::slice::from_ref(model_ref),
+                &cases,
+            ),
+            report.clone(),
+        );
+        write_baseline(&path, &doc)?;
+    }
+    Ok(if report.passed_count() == report.total() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    })
 }
 
 /// Flip one boolean policy knob in place; returns `(before, after)` for the
@@ -615,6 +802,10 @@ async fn run_eval_case(
         failure_source: Some(leveler_eval::FailureSource::Auto),
         note,
         verification_evidence: None,
+        tool_calls: 0,
+        loop_guard_trips: 0,
+        verification_ran: false,
+        is_recovery: case.recovery,
     };
 
     // Materialize the workspace. Two modes:
@@ -878,6 +1069,10 @@ async fn run_eval_case(
             passed: expect_passed,
             exit_code: verification_exit_code,
         }),
+        tool_calls: signals.tool_calls,
+        loop_guard_trips: signals.loop_guard_trips,
+        verification_ran: signals.verification_ran,
+        is_recovery: case.recovery,
     }
 }
 
@@ -926,12 +1121,35 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
         );
     }
     println!(
-        "  {} {}/{} passed ({:.0}% completion), avg {:.1} steps",
+        "  {} {}/{} passed ({:.0}% completion, {:.0}% completion accuracy), avg {:.1} steps",
         console::style("→").bold(),
         report.passed_count(),
         report.total(),
         report.completion_rate() * 100.0,
+        report.completion_accuracy() * 100.0,
         report.avg_rounds()
+    );
+    // Headline agent-quality signal: the agent claimed "done" but the
+    // independent check disagreed. Surface it prominently, never buried.
+    let false_completions = report.false_completion_count();
+    if false_completions > 0 {
+        println!(
+            "  {} false completion: {:.0}% ({}/{}) — claimed done, verification failed: {}",
+            console::style("⚠").red().bold(),
+            report.false_completion_rate() * 100.0,
+            false_completions,
+            report.total(),
+            report.false_completion_case_ids().join(", ")
+        );
+    }
+    // Behavior + engineering metrics: how the agent worked, not just whether it
+    // passed. Validation rate is the leading indicator for false completions.
+    println!(
+        "  {} avg {:.1} tool calls · loop rate {:.0}% · validation rate {:.0}%",
+        console::style("→").bold(),
+        report.avg_tool_calls(),
+        report.loop_rate() * 100.0,
+        report.validation_rate() * 100.0,
     );
     let breakdown = report.failure_breakdown();
     if !breakdown.is_empty() {
@@ -953,6 +1171,20 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
             unstable.join(", ")
         );
     }
+    if let Some(recovery) = report.recovery_rate() {
+        println!(
+            "  {} recovery rate {:.0}% (over injected-failure cases)",
+            console::style("→").bold(),
+            recovery * 100.0,
+        );
+    }
+    // Headline composite: the single number the version-trend report tracks.
+    let score = report.quality_score();
+    println!(
+        "  {} Agent Quality Score: {}/100 (over measured components)",
+        console::style("★").yellow().bold(),
+        score.score_100(),
+    );
 }
 
 #[cfg(test)]
@@ -1019,6 +1251,7 @@ mod ablation_tests {
             repo: None,
             base_ref: None,
             files: Default::default(),
+            recovery: false,
             task: "do the thing".into(),
             max_rounds: 40,
             expect: leveler_eval::ExpectCommand {

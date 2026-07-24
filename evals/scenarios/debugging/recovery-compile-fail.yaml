@@ -1,0 +1,37 @@
+id: recovery-compile-fail
+name: "recovery: fix a compile error to reach green"
+# Recovery case (spec §4): the workspace starts from an injected COMPILE error.
+# Passing means the agent diagnosed and recovered it. Counts toward recovery_rate.
+recovery: true
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    // Injected compile error: `total` is used after being moved, and the return
+    // type does not match. Fix the function so it compiles and the test passes.
+    pub fn sum(values: Vec<u64>) -> u64 {
+        let total = values;
+        for v in total {
+            // `total` was moved into the loop; the accumulator is missing.
+        }
+        total
+    }
+  tests/spec.rs: |
+    use evalcase::sum;
+    #[test]
+    fn sums() {
+        assert_eq!(sum(vec![1, 2, 3, 4]), 10);
+    }
+max_rounds: 60
+task: |
+  `cargo test` currently fails to COMPILE in src/lib.rs. Fix `sum` so the crate
+  compiles and `tests/spec.rs` passes: it must return the sum of the input
+  values. Do not modify tests/spec.rs.
+expect:
+  program: cargo
+  args: [test, --quiet]
