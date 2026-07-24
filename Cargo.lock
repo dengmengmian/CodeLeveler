@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-agent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-app"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-client-protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "leveler-core",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-context"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "leveler-core",
  "leveler-project",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "serde",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-engine"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-eval"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-execution"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "cap-std",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-lifecycle"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-local-transport"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "leveler-client-protocol",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-lsp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "leveler-core",
  "leveler-execution",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-media"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "image",
@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-memory"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "serde",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-model"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-orchestrator"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-project"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "leveler-core",
  "serde",
@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-stream",
  "bytes",
@@ -2088,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-provider"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-skills"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "leveler-core",
  "serde",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-storage"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2136,14 +2136,14 @@ dependencies = [
 
 [[package]]
 name = "leveler-test-support"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "leveler-tools"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arboard",
  "chrono",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-vcs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "leveler-core",
  "leveler-execution",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-verifier"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "leveler-core",
  "leveler-execution",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-web"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "axum",

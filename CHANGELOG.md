@@ -6,6 +6,43 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-25
+
+### Added
+- Out-of-the-box multi-agent: concurrent sub-agents emit live attributed tool
+  activity; the TUI shows each child's current step and elapsed time.
+  `agents.delegation` can hide `spawn_agent` when multi-agent is not wanted.
+- Command-progress heartbeat and live elapsed time on running command blocks
+  in the TUI (and CLI event renderers for `SubAgentActivity`).
+- Three-layer agent budget control: telemetry, sized quotas, and bounded
+  extend so hard cases stop for budget reasons instead of silent starvation.
+- Early phase progress on the eval path so TTFF is host-side, not first LLM
+  token; silent-duration metrics accompany it.
+- Eval quality-gate tiers (`quick` / `daily` / `release`), scenario cases, and
+  trend reporting via `leveler eval`.
+- `find_files` tool (consolidates former `glob` + `repository_search`).
+- Interactive chat baseline anchoring and project-gate-only completion
+  verdict (`Verified` only when the project's own checks pass).
+
+### Changed
+- Completion closeout drops `MissingEvidence` / answer-audit guessing; the
+  verdict is driven only by gating checks that actually ran (or by the user).
+- Tool surface hardened: shared replace/apply_patch CAS commit, conservative
+  fuzzy replace fallback, CRLF/BOM-safe patching, shell/credential path
+  refusals shared with `read_file`.
+- Security semantics: MCP tools prompt under Assisted/RequestApproval;
+  explicit `read_only_subset` allowlist; sensitive paths enforced at every
+  layer; opaque shells (`pwsh`/`powershell`/`fish`) classify Dangerous.
+- TUI edit diffs show line numbers with cleaner add/remove gutters.
+- Orchestrate no longer false-fails on already-green workspaces.
+
+### Fixed
+- Windows `replace` permissions mapping for cap-std / checkpoint restore
+  (CI clippy and unit tests green).
+- Long-running commands no longer look "blocked" while still producing
+  heartbeat progress.
+- Permission-rules poison recovery and related hygiene cleanups.
+
 ## [0.1.1] - 2026-07-21
 
 ### Added
