@@ -61,11 +61,26 @@
 
 `package.json` 加 `scripts.test`（`aa67dbc`）→ daily 中 TS 几乎全绿。
 
+### P1 已修：大节点预算饿死 → hard 案例早停假失败（`463e7d9`）
+
+| | |
+|--|--|
+| **问题** | `go-gitcmd-semaphore`（hard 并发）常在 **4 步早停**（`incomplete`），代码半截留盘上；曾被误判为「模型方差」 |
+| **原因** | 一刀切的 per-node 默认预算（`max_commands`/`max_modified_files`/`max_duration`）对高 workload 节点不足，中途耗尽即停 |
+| **修复** | 三层预算控制：telemetry + 按 workload 放大的 sized quotas（各维度带 CAP）+ bounded extend（`463e7d9`） |
+| **验证（独立复跑 ×3）** | **3/3 Verified**；轮数从早停的 **4 步 → 24 / 18 / 5 轮**——拿到足够预算即跑完。**证实「早停」实为预算饿死，非纯模型变异**（`gcs2.json`） |
+
+### 归因修正
+
+此前将 `go-gitcmd-semaphore` 失败整体归为「模型变异」**部分有误**：其中「4 步早停」类实为**预算饿死**，已由
+`463e7d9` 修复。剩余（偶发 round17 `term=failed`）才是真·瞬时 Err 路径（`StopReason` 无 `Failed` 变体）。
+
 ### 残留
 
 | 项 | 级别 | 说明 |
 |----|------|------|
 | `ts-group-by` 偶发失败 | 模型方差 | 本轮 daily 1 例；此前单独重跑可 Verified；非结构性 gate 问题 |
+| 瞬时 provider Err（如 round17） | 环境/网络 | 非确定，重跑可过；`term=failed` 走 `Err(_)=>Failed` 路径 |
 | 模型静默段可达数分钟 | 体验 | **SilentDuration 已度量**；非「无反馈」——主机侧阶段/工具心跳已发出 |
 
 ## Agent Score
