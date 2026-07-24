@@ -1,0 +1,37 @@
+id: reg-recovery-compile-fail
+name: '[regression] recovery: fix a compile error to reach green'
+recovery: true
+files:
+  Cargo.toml: '[package]
+
+    name = "evalcase"
+
+    version = "0.1.0"
+
+    edition = "2021"
+
+    [lib]
+
+    path = "src/lib.rs"
+
+    '
+  src/lib.rs: "// Injected compile error: `total` is used after being moved, and the\
+    \ return\n// type does not match. Fix the function so it compiles and the test\
+    \ passes.\npub fn sum(values: Vec<u64>) -> u64 {\n    let total = values;\n  \
+    \  for v in total {\n        // `total` was moved into the loop; the accumulator\
+    \ is missing.\n    }\n    total\n}\n"
+  tests/spec.rs: "use evalcase::sum;\n#[test]\nfn sums() {\n    assert_eq!(sum(vec![1,\
+    \ 2, 3, 4]), 10);\n}\n"
+max_rounds: 60
+task: '`cargo test` currently fails to COMPILE in src/lib.rs. Fix `sum` so the crate
+
+  compiles and `tests/spec.rs` passes: it must return the sum of the input
+
+  values. Do not modify tests/spec.rs.
+
+  '
+expect:
+  program: cargo
+  args:
+  - test
+  - --quiet

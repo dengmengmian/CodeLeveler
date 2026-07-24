@@ -1,0 +1,22 @@
+id: reg-go-copy-map
+name: '[regression] Copy a map without aliasing nested slices'
+files:
+  go.mod: 'module evalcase
+
+    go 1.21
+
+    '
+  copy.go: "package evalcase\nfunc Clone(input map[string][]string) map[string][]string\
+    \ {\n    output := make(map[string][]string, len(input))\n    for key, value :=\
+    \ range input { output[key] = value }\n    return output\n}\n"
+  copy_test.go: "package evalcase\nimport \"testing\"\nfunc TestCloneDoesNotAliasSlices(t\
+    \ *testing.T) {\n    original := map[string][]string{\"roles\": {\"reader\"}}\n\
+    \    cloned := Clone(original)\n    cloned[\"roles\"][0] = \"admin\"\n    if original[\"\
+    roles\"][0] != \"reader\" { t.Fatal(\"clone aliases original slice\") }\n}\n"
+task: Fix Clone so neither the map nor its nested string slices alias the input. Do
+  not modify tests.
+expect:
+  program: go
+  args:
+  - test
+  - ./...

@@ -1,0 +1,27 @@
+id: reg-go-batch-boundaries
+name: '[regression] Split values into bounded non-aliasing batches'
+files:
+  go.mod: 'module evalcase
+
+    go 1.21
+
+    '
+  batch.go: 'package evalcase
+
+    func Batches(values []int, size int) [][]int { return [][]int{values} }
+
+    '
+  batch_test.go: "package evalcase\nimport \"testing\"\nfunc TestBatches(t *testing.T)\
+    \ {\n    got := Batches([]int{1,2,3,4,5}, 2)\n    if len(got) != 3 || len(got[0])\
+    \ != 2 || len(got[1]) != 2 || len(got[2]) != 1 { t.Fatalf(\"%v\", got) }\n   \
+    \ got[0][0] = 99\n    if got[1][0] != 3 { t.Fatal(\"batches overlap\") }\n   \
+    \ if Batches([]int{1}, 0) != nil { t.Fatal(\"non-positive size must return nil\"\
+    ) }\n}\n"
+task: Implement Batches so each batch has at most size elements, preserves order,
+  returns nil for size <= 0, and batches do not overlap each other. Do not modify
+  tests.
+expect:
+  program: go
+  args:
+  - test
+  - ./...

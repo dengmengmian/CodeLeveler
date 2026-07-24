@@ -1181,17 +1181,24 @@ impl TaskEngine {
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         // Completed and Answered both count as clean finishes — and both must
-        // verify if they touched files. Every other stop reason is terminal
-        // failure (阶段A semantics: Stalled/Blocked/Incomplete/BudgetExhausted
-        // never read as success).
+        // verify if they touched files. Most other stop reasons are terminal
+        // failure (Stalled/Blocked/BudgetExhausted never read as success).
+        // Incomplete with mutations is the exception: thrash guards may stop a
+        // turn whose workspace is already gate-green — still enter verify so
+        // expect-green work is not reported as Failed (orchestrate node_status
+        // uses the same rule).
         if let Some(terminal) = direct_non_success_outcome(outcome.stop_reason) {
-            return Ok(TaskReport::new(
-                terminal,
-                outcome.final_text,
-                outcome.modified_files,
-                outcome.stop_reason,
-                outcome.rounds,
-            ));
+            let incomplete_with_work = outcome.stop_reason == StopReason::Incomplete
+                && !outcome.modified_files.is_empty();
+            if !incomplete_with_work {
+                return Ok(TaskReport::new(
+                    terminal,
+                    outcome.final_text,
+                    outcome.modified_files,
+                    outcome.stop_reason,
+                    outcome.rounds,
+                ));
+            }
         }
 
         // K19 early short-circuit: no mutation or no gates → never claim Verified
@@ -1526,14 +1533,21 @@ impl TaskEngine {
                     modified_files.push(f.clone());
                 }
             }
-            // K15: Edit + Answered + no mutation → Failed (Node goal_mode is
-            // false so Answered is the normal success stop). Test/Verify may
-            // Answer without files and still complete.
+            // K15: Edit + Answered + no mutation → Failed only when the *task*
+            // also has no mutations (Node goal_mode is false so Answered is the
+            // normal success stop). A later Edit that restates after an earlier
+            // node already wrote files must not sink a green workspace.
+            // CloseoutForced means the plan/work is done (see StopReason docs)
+            // and must complete the node so verify can run — same as Direct.
+            // Incomplete with task mutations: still complete the node and let
+            // the verification gate decide (acceptance saw many Incomplete
+            // stops with expect-green trees when a later thrash cut the graph).
             // Task-level completion is still decided by verify/finalize below.
             let status = node_status(
                 node.kind,
                 recorded.outcome.stop_reason,
                 node_modified.is_empty(),
+                !modified_files.is_empty(),
             );
             graph.nodes[index].status = status;
             log.append(
@@ -1559,6 +1573,7 @@ impl TaskEngine {
                     (node.kind, recorded.outcome.stop_reason),
                     (TaskNodeKind::Edit, StopReason::Answered)
                 ) && node_modified.is_empty()
+                    && modified_files.is_empty()
                 {
                     format!(
                         "edit_answered_without_mutation: node {} finished Answered with no modified files",
@@ -2007,17 +2022,34 @@ fn map_completion_verdict(v: CompletionVerdict) -> TaskOutcome {
 /// A graph node's terminal status from its kind and how its drive stopped.
 ///
 /// K15: an Edit node that only Answered without touching any file did not do its
-/// job, so it Fails even though Answered is the normal (non-goal) success stop.
+/// job **when the task as a whole has no mutations**, so it Fails even though
+/// Answered is the normal (non-goal) success stop. If an earlier node already
+/// mutated the tree, a later Edit that only Answers must Complete so verify can
+/// still run (false graph failure with expect-green workspaces).
+///
+/// `CloseoutForced` is a finished-task stop (plan done, model would not shut
+/// up): Complete the node so the verify gate decides, matching Direct.
+///
+/// `Incomplete` with task-level mutations also Completes the node: thrash/stop
+/// guards must not discard a workspace that may already be gate-green.
 /// Test/Verify nodes may Answer without files and still Complete.
 fn node_status(
     kind: leveler_orchestrator::TaskNodeKind,
     stop_reason: StopReason,
     node_modified_empty: bool,
+    task_has_mutation: bool,
 ) -> leveler_orchestrator::NodeStatus {
     use leveler_orchestrator::{NodeStatus, TaskNodeKind};
     match (kind, stop_reason) {
-        (TaskNodeKind::Edit, StopReason::Answered) if node_modified_empty => NodeStatus::Failed,
-        (_, StopReason::Completed | StopReason::Answered) => NodeStatus::Completed,
+        (TaskNodeKind::Edit, StopReason::Answered) if node_modified_empty && !task_has_mutation => {
+            NodeStatus::Failed
+        }
+        // Work already landed (this node or prior): do not fail the graph.
+        (_, StopReason::Incomplete) if task_has_mutation => NodeStatus::Completed,
+        (
+            _,
+            StopReason::Completed | StopReason::Answered | StopReason::CloseoutForced,
+        ) => NodeStatus::Completed,
         _ => NodeStatus::Failed,
     }
 }
@@ -2084,13 +2116,21 @@ mod node_status_tests {
 
     #[test]
     fn edit_answered_without_mutation_fails_but_completes_with_files() {
-        // K15: Edit that only Answered without touching files did not do its job.
+        // K15: Edit that only Answered without touching files did not do its job
+        // when the task has no mutations either.
         assert_eq!(
-            node_status(TaskNodeKind::Edit, StopReason::Answered, true),
+            node_status(TaskNodeKind::Edit, StopReason::Answered, true, false),
             NodeStatus::Failed
         );
+        // This node wrote files.
         assert_eq!(
-            node_status(TaskNodeKind::Edit, StopReason::Answered, false),
+            node_status(TaskNodeKind::Edit, StopReason::Answered, false, true),
+            NodeStatus::Completed
+        );
+        // Prior node wrote files; this Edit only Answered — still Complete so
+        // verify can run (acceptance false-fail with expect-green trees).
+        assert_eq!(
+            node_status(TaskNodeKind::Edit, StopReason::Answered, true, true),
             NodeStatus::Completed
         );
     }
@@ -2099,15 +2139,56 @@ mod node_status_tests {
     fn non_edit_answer_completes_and_non_success_fails() {
         // Test/Verify nodes may Answer without files and still complete.
         assert_eq!(
-            node_status(TaskNodeKind::Test, StopReason::Answered, true),
+            node_status(TaskNodeKind::Test, StopReason::Answered, true, false),
             NodeStatus::Completed
         );
         assert_eq!(
-            node_status(TaskNodeKind::Edit, StopReason::Completed, true),
+            node_status(TaskNodeKind::Edit, StopReason::Completed, true, false),
             NodeStatus::Completed
         );
         assert_eq!(
-            node_status(TaskNodeKind::Edit, StopReason::BudgetExhausted, false),
+            node_status(
+                TaskNodeKind::Edit,
+                StopReason::BudgetExhausted,
+                false,
+                true
+            ),
+            NodeStatus::Failed
+        );
+    }
+
+    #[test]
+    fn closeout_forced_completes_node_like_direct() {
+        // Direct lets CloseoutForced enter verify; orchestrate nodes must too.
+        assert_eq!(
+            node_status(
+                TaskNodeKind::Edit,
+                StopReason::CloseoutForced,
+                false,
+                true
+            ),
+            NodeStatus::Completed
+        );
+        assert_eq!(
+            node_status(
+                TaskNodeKind::Test,
+                StopReason::CloseoutForced,
+                true,
+                false
+            ),
+            NodeStatus::Completed
+        );
+    }
+
+    #[test]
+    fn incomplete_with_task_mutation_completes_so_verify_can_run() {
+        assert_eq!(
+            node_status(TaskNodeKind::Edit, StopReason::Incomplete, true, true),
+            NodeStatus::Completed
+        );
+        // No mutations at all: Incomplete still fails the node.
+        assert_eq!(
+            node_status(TaskNodeKind::Edit, StopReason::Incomplete, true, false),
             NodeStatus::Failed
         );
     }
