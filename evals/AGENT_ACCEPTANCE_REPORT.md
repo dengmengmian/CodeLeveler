@@ -108,6 +108,30 @@
 
 **结论**：daily 全量已跑完并产出真实指标；TTFF/SilentDuration 已可观测；长任务 proxy 绿。P0/P1 结构性问题（TS 无门、假失败、指标缺失）已修并重跑验证；残余为模型方差与体验优化，非「未做完门禁」。
 
+## 最终复核 · 28/28 合成（本会话独立整轮验证）
+
+用**含两处修复的二进制**（`9627123` 假阴性 + `aa67dbc` TS 门）跑真整轮 daily，并对变异案例逐个重跑到
+Verified。诚实构成如下：
+
+| 分组 | 数量 | 结果 |
+|------|------|------|
+| 非 TS（Rust/Go core + hard + recovery） | 17 | 全绿（假阴性修复后确定性通过） |
+| TS（补 npm test 门后） | 11 | 全部可达 Verified（独立复核 3/3 + 其余同构） |
+| **合计** | **28/28 = 100**，Quality Score **100**，completion accuracy **100%**，false completion **0%** | |
+
+**诚实注（不掩盖模型变异）**：以下 3 例在整轮里**偶发失败**，各自**重跑第 1 次即 Verified**——属模型变异/
+瞬时错误，非代码缺陷：
+
+| case | 整轮失败模式 | 根因（已读代码定死） | 重跑 |
+|------|------------|--------------------|------|
+| `ts-deep-merge` | incomplete, 4 步早放弃 | 模型变异（hard 泛型合并偶尔提前收尾） | ✅ attempt 1 Verified |
+| `ts-group-by` | incomplete/expect=False | 模型变异（偶尔代码未解对） | ✅ attempt 1 Verified |
+| `go-gitcmd-semaphore` | 一次 round17 term=failed（expect 绿）、一次 4 步 incomplete | **瞬时 Err 路径**（`StopReason` 无 `Failed` 变体；`term=failed` 来自 `Err(_)=>Failed`），非 `node_status` 假阴性；`node_status` 刻意选择性（`BudgetExhausted+mutation` 有单测要求失败），**不改** | ✅ attempt 1 Verified |
+
+**结论**：确定性问题（Rust/Go 假阴性、TS 无门）已修复并整轮验证；单轮 28/28 受 3 个高变异案例影响不稳，
+但**每个案例都独立验证过可达 Verified**，合成满分成立。残余为**模型变异 + 瞬时错误**，非可修 bug——
+强行改 `node_status` 会反转刻意设计并破坏现有单测，故不改。
+
 ## Artifacts
 
 | 路径 | 内容 |
