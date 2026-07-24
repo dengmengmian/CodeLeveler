@@ -95,9 +95,13 @@ impl SignalCollector {
 
     pub(crate) fn observe_agent(&mut self, event: &AgentEvent) {
         match event {
-            // User-visible feedback: streaming text, reasoning, tool activity,
-            // plan updates, verification, command heartbeats.
-            AgentEvent::AssistantDelta(_)
+            // User-visible feedback: status/wait labels, streaming text,
+            // reasoning, tools, plan, verification, command heartbeats.
+            // StreamAttemptStarted / AdvisoryStarted name the wait so TTFF is
+            // not stuck behind the first model token (often tens of seconds).
+            AgentEvent::StreamAttemptStarted
+            | AgentEvent::AdvisoryStarted { .. }
+            | AgentEvent::AssistantDelta(_)
             | AgentEvent::ReasoningDelta(_)
             | AgentEvent::AssistantText(_)
             | AgentEvent::ToolCall { .. }
@@ -109,7 +113,8 @@ impl SignalCollector {
             | AgentEvent::CommandProgress { .. }
             | AgentEvent::SubAgentStarted { .. }
             | AgentEvent::SubAgentActivity { .. }
-            | AgentEvent::SubAgentFinished { .. } => {
+            | AgentEvent::SubAgentFinished { .. }
+            | AgentEvent::ProgressUpdated { .. } => {
                 self.note_feedback();
             }
             _ => {}
@@ -182,11 +187,20 @@ impl SignalCollector {
             self.note_feedback();
             return;
         }
+        // TaskStarted / phase / plan lifecycle / command heartbeats are the
+        // earliest host-side signals — must count toward TTFF so the metric
+        // reflects user-visible progress, not first LLM token alone.
         if matches!(
             &event,
-            EngineEvent::NodeStarted { .. }
+            EngineEvent::TaskStarted { .. }
+                | EngineEvent::NodeStarted { .. }
                 | EngineEvent::PhaseChanged { .. }
+                | EngineEvent::RequirementReady { .. }
+                | EngineEvent::ContextReady { .. }
+                | EngineEvent::PlanReady { .. }
                 | EngineEvent::CommandProgress { .. }
+                | EngineEvent::StreamAttemptStarted
+                | EngineEvent::AdvisoryStarted { .. }
         ) {
             self.note_feedback();
         }
@@ -378,5 +392,34 @@ mod tests {
         });
         let s = c.finish(false);
         assert!(s.ttff_ms.is_some());
+    }
+
+    #[test]
+    fn stream_attempt_and_task_started_count_as_early_feedback() {
+        // Host-side "work started" must set TTFF without waiting for tokens.
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        let s = c.finish(false);
+        assert!(s.ttff_ms.is_some());
+        assert!(
+            s.ttff_ms.unwrap() < 1000,
+            "StreamAttemptStarted is immediate host feedback"
+        );
+
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_engine(EngineEvent::TaskStarted {
+            goal: "x".into(),
+            model: "m".into(),
+            mode: "assisted".into(),
+            sandbox: false,
+            kind: leveler_engine::ExecutionKind::Orchestrate,
+        });
+        let s = c.finish(false);
+        assert!(s.ttff_ms.is_some());
+        assert!(
+            s.ttff_ms.unwrap() < 1000,
+            "TaskStarted is immediate host feedback, got {:?}",
+            s.ttff_ms
+        );
     }
 }

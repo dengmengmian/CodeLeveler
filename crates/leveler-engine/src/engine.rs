@@ -1315,7 +1315,19 @@ impl TaskEngine {
         use leveler_orchestrator::{AgentState, Planner};
 
         let planner = self.planner();
+        // Start in Understand and *announce* it before any model call so the
+        // UI/eval TTFF is not stuck on a silent wait for the first LLM token
+        // (runtime transparency: user must know work has started).
         let mut phase = AgentState::Understand;
+        log.append(
+            None,
+            EngineEvent::PhaseChanged {
+                from: AgentState::Understand,
+                to: AgentState::Understand,
+            },
+            observer,
+        )
+        .await?;
         let _: Option<Planner> = None;
         macro_rules! advance {
             ($to:expr) => {{
