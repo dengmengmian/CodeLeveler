@@ -1,8 +1,12 @@
 # CodeLeveler 真实用户验收 · 现状分析（Phase 0）
 
 > 结论先行：验收应**扩展**现有 `crates/leveler-eval` + `evals/` + `leveler eval`，
-> 禁止平行 runner。地基已覆盖验证驱动判定、质量指标、三层门禁与 TUI 客户端路径测试；
-> 缺口在 regression 目录接线、TTFF/SilentDuration、以及把验收产物固化为门禁证据。
+> 禁止平行 runner。地基已覆盖验证驱动判定、质量指标、三层门禁、TUI 客户端路径测试，
+> 以及 **`evals/regression/` 独立回归入口**。剩余缺口主要是 TTFF/SilentDuration
+> 度量与 TUI Stability 折进 QualityScore。
+
+**文档刷新**：与仓库 tip 同步（见 `BASELINE_REPORT.md` Live re-verify 的 tip SHA）；
+功能验收 SHA 见同文件的 functional re-verify 行。
 
 关联文档（不重复展开）：
 
@@ -12,6 +16,8 @@
 | [`AGENT_EVAL_SYSTEM_DESIGN.md`](AGENT_EVAL_SYSTEM_DESIGN.md) | 质量门禁设计与指标状态 |
 | [`CURRENT_EVAL_ANALYSIS.md`](CURRENT_EVAL_ANALYSIS.md) | 验收视角摘要（较早） |
 | [`ACCEPTANCE_BASELINE_REPORT.md`](ACCEPTANCE_BASELINE_REPORT.md) | 上一轮验收基线草稿 |
+| [`BASELINE_REPORT.md`](BASELINE_REPORT.md) | Phase 1 正式基线 |
+| [`AGENT_ACCEPTANCE_REPORT.md`](AGENT_ACCEPTANCE_REPORT.md) | 验收结论与指标 |
 
 ---
 
@@ -26,15 +32,15 @@
 
 ### 1.2 Scenario / 套件
 
-| 路径 | 用途 |
-|------|------|
-| `evals/smoke` | quick 门禁（3 例） |
-| `evals/core` / `evals/hard` | daily 主体 |
-| `evals/scenarios/debugging` | recovery（compile/test fail） |
-| `evals/scenarios/feature` | 真实仓（ripgrep） |
-| `evals/scenarios/permission` | 金丝雀密钥保护 |
-| `evals/scenarios/tui` | 文档登记 TUI 测试（非 YAML case） |
-| `evals/regression` | **本轮补齐**：失败固化回归集（见改造方案） |
+| 路径 | 用途 | 状态 |
+|------|------|------|
+| `evals/smoke` | quick 门禁（3 例） | ✅ 在用 |
+| `evals/core` / `evals/hard` | daily 主体 | ✅ 在用 |
+| `evals/scenarios/debugging` | recovery（compile/test fail） | ✅ daily 已挂 |
+| `evals/scenarios/feature` | 真实仓（ripgrep） | ✅ release |
+| `evals/scenarios/permission` | 金丝雀密钥保护 | ✅ release |
+| `evals/scenarios/tui` | 文档登记 TUI 测试（非 YAML case） | ✅ 登记 |
+| `evals/regression/` | 失败固化回归集（`reg-*` id） | ✅ **已建立**；入口 `leveler eval run --cases evals/regression`（独立门禁，不并入 daily 以免与 core 重复跑同一内容） |
 
 ### 1.3 Runner
 
@@ -46,6 +52,7 @@
   - `quick` → `evals/smoke`
   - `daily` → `evals/core` + `hard` + `scenarios/debugging`
   - `release` → smoke + core + hard + **全部** `scenarios`
+- 回归：`leveler eval run --cases evals/regression`（与 quick/daily 同 runner，非平行 harness）
 
 ### 1.4 Validator / Result / Report
 
@@ -90,6 +97,7 @@ User → Terminal → leveler (CLI/TUI)
 | Command Executor | `leveler-execution` command/background | 心跳 `CommandProgress`（L2） |
 | TUI Event Flow | event_bridge → RuntimeEvent → reducer | Cancelled ≠ Blocked；进度可见 |
 | Stop 语义 | `StopReason` → `TurnCancelled` / `TurnIncomplete` | 用户取消必须 Cancelled |
+| Graph 收口 | `leveler-engine` `node_status` | CloseoutForced / Incomplete+mutation 可进 verify（`9627123`） |
 
 真实用户路径（本验收采用）：
 
@@ -100,16 +108,16 @@ User → Terminal → leveler (CLI/TUI)
 
 ---
 
-## 3. 缺失能力
+## 3. 缺失能力（相对 live 树刷新后）
 
-| 缺口 | 影响 | 优先级 |
-|------|------|--------|
-| `evals/regression/` 未建立 / 未入门禁 | 失败 case 无固化重跑入口 | P0 基建 |
-| TTFF / SilentDuration 未度量 | 无法量化「用户多久看到反馈」 | P1 指标 |
-| TUI Stability 未进 QualityScore | 综合分缺 10% 分量（诚实 None） | P2 |
-| daily 完整跑通与问题闭环 | 基线草稿 daily 段未完成 | P0 验收 |
-| 假完成 / incomplete 归因闭环 | daily 部分结果见 incomplete+expect 绿 | P1 Agent |
-| 交互 Ctrl+C 文案回归用例 | 靠 e2e/i18n，缺统一验收日志 | P2 |
+| 缺口 | 影响 | 优先级 | 状态 |
+|------|------|--------|------|
+| regression 目录 | — | — | ✅ **已落地**：`evals/regression/{README,reg-*.yaml}` + `leveler eval run --cases evals/regression` |
+| TTFF / SilentDuration 未度量 | 无法量化「用户多久看到反馈」 | P2 指标 | 仍缺 |
+| TUI Stability 未进 QualityScore | 综合分缺 10% 分量（诚实 None） | P2 | 仍缺；soak 本身绿 |
+| daily 完整跑通与问题闭环 | 宽集耗时长 | P2 覆盖 | 未本轮强制全跑；quick 门禁绿 |
+| 假完成 / incomplete 归因闭环 | 绿代码报 Failed | P1 | ✅ 产品侧 `node_status` 已修；quick re-verify 3/3 |
+| 交互 Ctrl+C 全键盘 PTY | 长 session 未全覆盖 | P2 | soak/e2e + 静态 Cancelled 映射 |
 
 ---
 
@@ -117,21 +125,22 @@ User → Terminal → leveler (CLI/TUI)
 
 1. **模型/Provider 主导成功率**：无真实 key 时只能证明 harness/TUI 结构，不能宣称 agent 质量绿。
 2. **Eval ≠ 全交互 TUI**：`leveler eval` 是真实 agent 编排路径，不是完整键盘 TUI；二者必须**组合**才覆盖用户面。
-3. **Incomplete + expect 通过**：代码可能已对但 turn 未 `completed` → 门禁失败；若只盯 false_completion 会漏「不会收口」。
+3. **Incomplete + expect 通过**（历史）：代码可能已对但 turn 未 `completed` → 已用 `node_status` 缓解；仍须盯 false_completion **与** 收口类失败。
 4. **长任务 / 20min+**：墙钟与预算限制下可能截断；需诚实记录而非假绿。
-5. **「修到零问题」无界**：有限门禁 = P0 清零 + quick/regression 绿 + 残留 P2 列明。
+5. **「修到零问题」无界**：有限门禁 = P0 清零 + quick/regression 入口绿 + 残留 P2 列明。
 
 ---
 
 ## 5. 改造方案（复用现有，不平行）
 
-| 步骤 | 动作 | 改哪里 |
-|------|------|--------|
-| A | 写本分析 + `BASELINE_REPORT.md` | `evals/` 文档 |
-| B | 建 `evals/regression/` + README；daily/release 可加载或 `leveler eval run --cases evals/regression` | cases + 可选 `run_tier` 接线 |
-| C | 真实跑 `leveler eval quick`（及可负担的 daily 样本） | 证据 → scratch + history |
-| D | TUI：`cargo test -p leveler-app --test tui_path_soak` + `leveler-tui tui_session_e2e` | 稳定性门禁 |
-| E | 失败 case 固化进 regression；P0/P1 修代码 → rebuild → 重跑 | agent/tui/eval |
-| F | `AGENT_ACCEPTANCE_REPORT.md` 对齐证据数字 | `evals/` |
+| 步骤 | 动作 | 状态 |
+|------|------|------|
+| A | 写本分析 + `BASELINE_REPORT.md` | ✅ |
+| B | 建 `evals/regression/` + README；`leveler eval run --cases evals/regression` | ✅ |
+| C | 真实跑 `leveler eval quick` | ✅（含 re-verify） |
+| D | TUI soak + e2e | ✅ |
+| E | P0/P1：`node_status` 假失败修复 + 重跑 | ✅（`9627123`） |
+| F | `AGENT_ACCEPTANCE_REPORT.md` | ✅ |
+| G | TTFF / Score 接 TUI | 后续可选 |
 
 **明确不做**：新建 crate、第二套 benchmark runner、用 mock 代理「agent 质量绿」。

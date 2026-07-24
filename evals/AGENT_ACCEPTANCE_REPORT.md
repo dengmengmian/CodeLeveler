@@ -5,8 +5,9 @@
 | 项 | 值 |
 |----|----|
 | 版本 | 0.1.2 |
-| git commit | `9627123fbdb3daf1235684968a57283b143eb336` |
-| 简述 | Fix orchestrate false-fails on green workspaces; add acceptance docs |
+| functional re-verify SHA | `9627123fbdb3daf1235684968a57283b143eb336`（`eval_quick` meta.git_sha） |
+| tip SHA | 见 `git rev-parse HEAD`（文档刷新可能新于 functional） |
+| 简述 | Fix orchestrate false-fails…；Phase-0/报告文档与 live tree 对齐 |
 | 系统 | macOS Darwin 25.5.0 arm64 |
 | 模型 | `deepseek/deepseek-v4-pro` |
 | Provider | deepseek @ `https://taotoken.net/api/v1`（真实 API，非 mock） |

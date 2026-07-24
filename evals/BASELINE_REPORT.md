@@ -9,8 +9,9 @@
 | 项 | 值 |
 |----|----|
 | 版本 | 0.1.2（workspace） |
-| git commit | `9627123fbdb3daf1235684968a57283b143eb336` |
-| 简述 | Fix orchestrate false-fails on green workspaces; add acceptance docs |
+| tip SHA（docs tip） | 以 `git rev-parse HEAD` 为准；文档提交后 tip 前进，见 **Live re-verify** |
+| functional re-verify SHA | `9627123fbdb3daf1235684968a57283b143eb336` — 含 `node_status` 修复；`eval_quick.json` 的 `meta.git_sha` 与此对齐 |
+| 简述（functional） | Fix orchestrate false-fails on green workspaces; add acceptance docs |
 | 系统 | macOS Darwin 25.5.0 arm64 (Apple Silicon) |
 | rustc | 1.90.0 |
 | 模型 | `deepseek/deepseek-v4-pro` |
@@ -85,9 +86,12 @@
 
 | 项 | 值 |
 |----|----|
-| re-verify time | re-run after pull/rebuild |
-| HEAD | `9627123fbdb3daf1235684968a57283b143eb336` (`9627123`) |
-| tip | 9627123 Fix orchestrate false-fails on green workspaces; add acceptance docs. |
+| re-verify time | pull/rebuild 后对 **functional** 提交再跑 quick + TUI |
+| **tip SHA** | 文档 tip = 当前 `git rev-parse HEAD`（报告/Phase-0 刷新会前进；**不等于** agent 行为 SHA） |
+| **functional re-verify SHA** | `9627123fbdb3daf1235684968a57283b143eb336`（`node_status` + regression 落地） |
+| eval JSON `meta.git_sha` | 与 functional 对齐（本轮 `eval_quick.json` → `9627123…`） |
+| quick 结果 | 3/3 Verified，Quality 100，false completion 0% |
+| tip note | docs-only 提交（如 `d9ea0a6` 及后续）不改变 agent 逻辑；agent 质量以 functional SHA 的 re-verify 为准 |
 | PATH binary | `~/.cargo/bin/leveler` (release overwrite) |
 | release binary | `./target/release/leveler` |
 
