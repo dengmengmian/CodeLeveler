@@ -19,6 +19,7 @@ mod permissions_cmds;
 mod render;
 mod run_cmds;
 mod sessions_cmd;
+mod trust_cmds;
 mod upgrade_cmd;
 
 use std::path::PathBuf;
@@ -121,12 +122,35 @@ fn merge_cli_readonly_roots(roots: &[PathBuf]) {
     leveler_app::set_process_readonly_roots(roots.to_vec());
 }
 
+/// Tell the user when this repository ships `.leveler/hooks.yaml` or
+/// `.leveler/permissions.yaml` that is being ignored for lack of trust.
+///
+/// Goes to stderr so it never contaminates machine-readable stdout, and runs
+/// before dispatch so it precedes any alternate-screen UI.
+fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
+    let home = leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+        .unwrap_or_else(|| std::path::PathBuf::from(".leveler"));
+    let ignored = leveler_execution::untrusted_project_files(&home, &layout.repo_root);
+    if ignored.is_empty() {
+        return;
+    }
+    for entry in &ignored {
+        eprintln!(
+            "{} 忽略了仓库内 {}（未信任）",
+            crate::output::Line::warn("!"),
+            entry.path.display()
+        );
+    }
+    eprintln!("  它可以执行命令或授予免批准权限。确认内容后运行：leveler trust");
+}
+
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
     let config_overridden = args.config_dir.is_some();
     // Merge CLI readonly roots into the env the composition root already reads
     // (`Application::default_readonly_roots`), so every assemble path inherits them.
     merge_cli_readonly_roots(&args.readonly_root);
     let layout = resolve_layout(args.repo, args.config_dir)?;
+    warn_untrusted_project_config(&layout);
 
     // No subcommand (or explicit `tui`) opens the interactive terminal UI.
     let command = match args.command {
@@ -212,6 +236,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Doctor => cmd_doctor(layout),
         Command::Memory(mc) => cmd_memory(layout, mc),
         Command::Permissions(pc) => cmd_permissions(layout, pc),
+        Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
         Command::Config(ConfigCommand::Show) => cmd_config_show(layout),
         Command::Models(ModelsCommand::List) => cmd_models_list(layout),
         Command::Models(ModelsCommand::Show { model }) => cmd_models_show(layout, &model).await,

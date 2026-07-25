@@ -33,6 +33,19 @@ pub(crate) fn cmd_permissions(
             print_source("global", &global_path);
             print_source("project", &layout.permissions_path());
             print_source("repo", &project_rules_path(&layout.repo_root));
+            // The repo file is trust-gated, so listing its rules without saying
+            // whether they apply would misrepresent what is in force.
+            if !leveler_execution::untrusted_project_files(&global_home, &layout.repo_root)
+                .iter()
+                .any(|entry| entry.path.ends_with("permissions.yaml"))
+            {
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            println!(
+                "{}",
+                Line::warn("the repo rules above are NOT in force — the file is untrusted")
+            );
+            println!("  review it, then run: leveler trust");
             Ok(std::process::ExitCode::SUCCESS)
         }
         PermissionsCommand::Clear => {

@@ -32,6 +32,29 @@ Reports about a provider's service, an operating-system sandbox implementation,
 or a third-party dependency may need to be coordinated with that upstream
 project.
 
+## In-repo configuration is inert until trusted
+
+Two files a repository can carry are gated, because both take effect before
+any approval prompt:
+
+- `<repo>/.leveler/hooks.yaml` — runs commands ahead of every tool call.
+- `<repo>/.leveler/permissions.yaml` — an `Allow` rule here short-circuits the
+  approval policy.
+
+Cloning a repository is therefore not enough to make either apply. They are
+ignored, with a notice on stderr, until you run `leveler trust` for that
+repository. Trust records the SHA-256 of the exact bytes you accepted, so a
+later edit — by a teammate, by `git pull`, or by the agent — drops the file
+back to untrusted. `leveler trust show` reports the current state and
+`leveler trust revoke` clears it.
+
+The global `~/.leveler/hooks.yaml` and `~/.leveler/permissions.yaml` are your
+own files, outside any repository, and are not gated.
+
+The workspace layer additionally refuses **writes** to both in-repo files, so
+the agent cannot grant itself hooks or standing permissions. Reads stay
+allowed.
+
 ## Known trade-offs (by design)
 
 These are deliberate boundaries, documented so they are not mistaken for

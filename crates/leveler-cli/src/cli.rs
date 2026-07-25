@@ -127,6 +127,14 @@ pub enum Command {
     /// Manage durable permission rules (`.leveler/permissions.yaml`).
     #[command(subcommand)]
     Permissions(PermissionsCommand),
+    /// Trust this repository's in-repo `.leveler/hooks.yaml` /
+    /// `.leveler/permissions.yaml`. Both are ignored until trusted, and trust
+    /// is keyed to the file contents — editing one drops it back to untrusted.
+    #[command(subcommand_negates_reqs = true)]
+    Trust {
+        #[command(subcommand)]
+        command: Option<TrustCommand>,
+    },
 
     /// Inspect configuration.
     #[command(subcommand)]
@@ -281,6 +289,24 @@ pub enum PermissionsCommand {
     /// Remove all project rules (delete `<repo>/.leveler/permissions.yaml`).
     /// Global `~/.leveler/permissions.yaml` is left untouched.
     Clear,
+}
+
+/// In-repo config trust (`<repo>/.leveler/hooks.yaml`, `permissions.yaml`).
+///
+/// With no subcommand, `leveler trust` lists what is untrusted and asks to
+/// confirm — the same as `leveler trust allow`.
+#[derive(Debug, Subcommand)]
+pub enum TrustCommand {
+    /// Trust the current contents of this repository's gated files.
+    Allow {
+        /// Skip the confirmation prompt (required when stdin is not a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show what is trusted, untrusted, or absent for this repository.
+    Show,
+    /// Drop every trust record for this repository.
+    Revoke,
 }
 
 /// Project memory commands (`~/.leveler/projects/<repo>/memory/`).

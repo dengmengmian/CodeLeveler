@@ -1,6 +1,12 @@
 # Copy to ~/.leveler/hooks.yaml and/or <repo>/.leveler/hooks.yaml
 # Both files are loaded when present; project hooks run after global hooks.
 #
+# TRUST: the global file is yours and always loads. The in-repo file travels
+# with a clone and runs commands before every tool call, so it is IGNORED until
+# you run `leveler trust` in that repository. Trust is keyed to the file's
+# contents — edit it and you must trust it again. `leveler trust show` reports
+# the current state.
+#
 # PreToolUse (pre_tool_use):
 #   exit 0  → allow
 #   exit 2  → hard deny (tool blocked)

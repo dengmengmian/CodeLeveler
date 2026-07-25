@@ -24,6 +24,7 @@ pub mod permission_rules;
 pub mod risk;
 mod shell_ast;
 pub mod snapshot;
+pub mod trust;
 pub mod windows_acl;
 pub mod windows_appcontainer;
 pub mod windows_sandbox;
@@ -51,12 +52,16 @@ pub use permission_grants::{
     GrantFile, grants_path, load_grants, remember_project_grant, signatures_from_file,
 };
 pub use permission_rules::{
-    PermissionRule, PermissionRuleSet, RuleDecision, RuleEffect, RuleMatch, always_rules_for,
-    append_project_rule, append_rule_file, clear_project_rules, clear_rules_file,
-    load_merged_rules, load_rules_file, project_rules_path,
+    MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet, RuleDecision,
+    RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
+    clear_project_rules, clear_rules_file, load_merged_rules, load_rules_file, project_rules_path,
 };
 pub use risk::{PermissionProfile, RiskLevel};
 pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};
+pub use trust::{
+    TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,
+    read_trusted_project_file, store_is_outside_repo, trust_store_path, untrusted_project_files,
+};
 pub use windows_sandbox::{
     FilesystemIntent, FsCapability, ProcessTreeCapability, SandboxBackend, SandboxCapabilities,
     WindowsSandboxError, assert_intent_spawn_allowed, assert_windows_spawn_allowed,

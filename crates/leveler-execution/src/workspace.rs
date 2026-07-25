@@ -219,7 +219,7 @@ impl Workspace {
             ));
         }
 
-        self.check_sensitive(&normalized, input)?;
+        self.check_sensitive(&normalized, input, access)?;
 
         // Full path exists: return canonical form and re-check scope (symlink escape).
         if let Ok(real) = std::fs::canonicalize(&normalized) {
@@ -231,7 +231,7 @@ impl Workspace {
                     &self.readonly_roots,
                 ));
             }
-            self.check_sensitive(&real, input)?;
+            self.check_sensitive(&real, input, access)?;
             return Ok(real);
         }
 
@@ -264,8 +264,19 @@ impl Workspace {
         None
     }
 
-    fn check_sensitive(&self, normalized: &Path, original: &Path) -> Result<(), WorkspaceError> {
+    fn check_sensitive(
+        &self,
+        normalized: &Path,
+        original: &Path,
+        access: PathAccess,
+    ) -> Result<(), WorkspaceError> {
         let denied = |p: &Path| WorkspaceError::Denied(p.display().to_string());
+
+        // Writing these would let the agent pick its own hooks and its own
+        // standing permissions, defeating the content-keyed trust gate.
+        if access == PathAccess::Write && self.is_trust_gated_project_file(normalized) {
+            return Err(denied(original));
+        }
 
         for comp in normalized.components() {
             if let Component::Normal(os) = comp {
@@ -283,6 +294,15 @@ impl Workspace {
         }
 
         Ok(())
+    }
+
+    /// Whether `normalized` is one of this repository's trust-gated config
+    /// files. Matched against the primary root, so a same-named file elsewhere
+    /// in the tree (`ci/hooks.yaml`) is untouched.
+    fn is_trust_gated_project_file(&self, normalized: &Path) -> bool {
+        crate::trust::TRUSTED_PROJECT_FILES
+            .iter()
+            .any(|relative| normalized == self.root.join(relative))
     }
 }
 
@@ -452,6 +472,41 @@ mod tests {
         // Public halves and ordinary files stay readable.
         for name in ["id_rsa.pub", "src/main.rs", "package.json"] {
             assert!(ws.resolve(name).is_ok(), "{name} must stay allowed");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `.leveler/hooks.yaml` and `.leveler/permissions.yaml` are trust-gated
+    /// (see `crate::trust`), and the gate is keyed on their content. If a tool
+    /// could rewrite them the agent would be choosing its own hooks and its own
+    /// standing permissions — so writes are refused at this layer regardless of
+    /// mode. Reads stay allowed: the agent should be able to show the user what
+    /// their repository ships.
+    #[test]
+    fn writes_to_trust_gated_project_config_are_denied() {
+        let (ws, dir) = workspace();
+        for name in [".leveler/hooks.yaml", ".leveler/permissions.yaml"] {
+            assert!(
+                matches!(ws.resolve(name), Err(WorkspaceError::Denied(_))),
+                "{name} must not be writable"
+            );
+            assert!(ws.resolve_read(name).is_ok(), "{name} must stay readable");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn other_leveler_files_and_same_named_files_elsewhere_stay_writable() {
+        let (ws, dir) = workspace();
+        for name in [
+            ".leveler/config.yaml",
+            ".leveler/skills/pack/SKILL.md",
+            // Only the two files under `.leveler/` are gated — a project's own
+            // `hooks.yaml` elsewhere in the tree is an ordinary file.
+            "ci/hooks.yaml",
+            "config/permissions.yaml",
+        ] {
+            assert!(ws.resolve(name).is_ok(), "{name} must stay writable");
         }
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -6,6 +6,22 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- In-repo `.leveler/hooks.yaml` and `.leveler/permissions.yaml` no longer take
+  effect just because a repository ships them. Hooks run commands before every
+  tool call and an in-repo `Allow` rule short-circuits the approval policy, so
+  cloning an untrusted repository was enough to execute its commands or grant
+  it standing permission. Both are now ignored — with a stderr notice — until
+  `leveler trust` records the SHA-256 of the exact contents the user accepted;
+  any later edit drops the file back to untrusted. Global
+  `~/.leveler/hooks.yaml` / `permissions.yaml` are unaffected.
+- The workspace layer refuses writes to those two in-repo files, so the agent
+  cannot grant itself hooks or standing permissions. Reads are unchanged.
+
+### Added
+- `leveler trust` (`allow [--yes]` / `show` / `revoke`) to manage in-repo
+  configuration trust per repository.
+
 ## [0.1.4] - 2026-07-25
 
 ### Added

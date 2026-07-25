@@ -232,28 +232,57 @@ pub fn load_rules_file(path: &Path) -> Result<PermissionRuleSet, String> {
     Ok(PermissionRuleSet::from_rules(file.rules))
 }
 
+/// Merged rules plus any in-repo rules file that was skipped for lack of trust.
+#[derive(Debug, Clone, Default)]
+pub struct MergedRules {
+    pub rules: PermissionRuleSet,
+    pub untrusted: Vec<crate::hooks::UntrustedConfig>,
+}
+
 /// Merge the three rule sources. Order is cosmetic — evaluation is
 /// deny > ask > allow regardless:
 /// - global: `<global_home>/permissions.yaml` (user-authored);
 /// - project state: `state_rules` — the per-project file under the global
 ///   home (`Layout::permissions_path()`), where `ApproveAlways` persists
 ///   rules — never inside the repo;
-/// - in-repo: `<repo>/.leveler/permissions.yaml` (user-authored / legacy
-///   ApproveAlways target, still honored).
-pub fn load_merged_rules(
-    global_home: &Path,
-    state_rules: &Path,
-    repo_root: &Path,
-) -> PermissionRuleSet {
+/// - in-repo: `<repo>/.leveler/permissions.yaml` (user-authored), applied only
+///   when the user has trusted its exact contents — see [`crate::trust`].
+pub fn load_merged_rules(global_home: &Path, state_rules: &Path, repo_root: &Path) -> MergedRules {
     let mut set = load_rules_file(&global_home.join("permissions.yaml")).unwrap_or_default();
     set.extend(load_rules_file(state_rules).unwrap_or_default());
-    set.extend(load_rules_file(&project_rules_path(repo_root)).unwrap_or_default());
-    set
+
+    // The first two sources live under the user's own global home. The in-repo
+    // file travels with a clone and its `Allow` short-circuits the approval
+    // policy, so it only applies once the user has trusted these exact bytes.
+    let mut untrusted = Vec::new();
+    match crate::trust::read_trusted_project_file(global_home, repo_root, PROJECT_RULES_RELATIVE) {
+        crate::trust::TrustedRead::Absent => {}
+        crate::trust::TrustedRead::Trusted(raw) => {
+            if let Ok(file) = serde_yaml::from_str::<PermissionRulesFile>(&raw) {
+                set.extend(PermissionRuleSet::from_rules(file.rules));
+            }
+        }
+        crate::trust::TrustedRead::Untrusted { path, digest } => {
+            tracing::warn!(
+                path = %path.display(),
+                "ignoring untrusted in-repo permission rules; run `leveler trust` to enable them"
+            );
+            untrusted.push(crate::hooks::UntrustedConfig { path, digest });
+        }
+    }
+
+    MergedRules {
+        rules: set,
+        untrusted,
+    }
 }
+
+/// The in-repo rules file, relative to the repository root. Trust-gated.
+pub const PROJECT_RULES_RELATIVE: &str = crate::trust::TRUSTED_PROJECT_FILES[1];
 
 /// Path of the user-authored rules file under a repo root.
 pub fn project_rules_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".leveler/permissions.yaml")
+    repo_root.join(PROJECT_RULES_RELATIVE)
 }
 
 /// Derive durable allow rules for an `ApproveAlways` decision (SEC-1).
@@ -702,6 +731,73 @@ rules:
         assert_eq!(load_rules_file(&path).unwrap().rules().len(), 1);
     }
 
+    /// A repository can ship `.leveler/permissions.yaml`, and an `Allow` there
+    /// returns from dispatch before the approval policy is ever consulted. So
+    /// cloning a repository must not be enough to make its rules apply.
+    #[test]
+    fn in_repo_rules_are_ignored_until_the_repository_is_trusted() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let rule = PermissionRule {
+            match_: RuleMatch {
+                tool: Some("run_command".into()),
+                command_prefix: Some("curl".into()),
+                command_exact: None,
+                path_glob: None,
+            },
+            effect: RuleEffect::Allow,
+        };
+        append_project_rule(repo.path(), &rule).unwrap();
+
+        let merged = load_merged_rules(
+            home.path(),
+            &home.path().join("state/permissions.yaml"),
+            repo.path(),
+        );
+        assert_eq!(
+            merged
+                .rules
+                .evaluate("run_command", Some("curl evil.sh"), &[]),
+            RuleDecision::NoMatch,
+            "untrusted in-repo rules must not grant anything"
+        );
+        assert_eq!(merged.untrusted.len(), 1, "the skip must be reportable");
+    }
+
+    #[test]
+    fn in_repo_rules_apply_once_trusted() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let rule = PermissionRule {
+            match_: RuleMatch {
+                tool: Some("run_command".into()),
+                command_prefix: Some("cargo test".into()),
+                command_exact: None,
+                path_glob: None,
+            },
+            effect: RuleEffect::Allow,
+        };
+        append_project_rule(repo.path(), &rule).unwrap();
+        let body = std::fs::read(project_rules_path(repo.path())).unwrap();
+
+        let mut store = crate::trust::TrustStore::load(home.path());
+        store.trust(repo.path(), ".leveler/permissions.yaml", &body);
+        store.save().unwrap();
+
+        let merged = load_merged_rules(
+            home.path(),
+            &home.path().join("state/permissions.yaml"),
+            repo.path(),
+        );
+        assert_eq!(
+            merged
+                .rules
+                .evaluate("run_command", Some("cargo test -q"), &[]),
+            RuleDecision::Allow
+        );
+        assert!(merged.untrusted.is_empty());
+    }
+
     /// ApproveAlways persists into the per-project state dir under the global
     /// home (`~/.leveler/projects/<hash>/permissions.yaml`); merged loading
     /// must read that file alongside the global and in-repo ones.
@@ -721,7 +817,7 @@ rules:
         };
         let state_rules = state.path().join("permissions.yaml");
         append_rule_file(&state_rules, &rule).unwrap();
-        let set = load_merged_rules(home.path(), &state_rules, repo.path());
+        let set = load_merged_rules(home.path(), &state_rules, repo.path()).rules;
         assert_eq!(
             set.evaluate("run_command", Some("git push origin main"), &[]),
             RuleDecision::Allow
@@ -749,7 +845,8 @@ rules:
             dir.path(),
             &dir.path().join("state/permissions.yaml"),
             dir.path(),
-        );
+        )
+        .rules;
         assert!(set.is_empty());
     }
 

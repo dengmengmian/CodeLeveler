@@ -1,5 +1,10 @@
 # Copy to ~/.leveler/permissions.yaml and/or <repo>/.leveler/permissions.yaml
 #
+# TRUST: the global file is yours and always loads. The in-repo file travels
+# with a clone, and an `allow` here skips the approval prompt entirely, so it is
+# IGNORED until you run `leveler trust` in that repository. Trust is keyed to
+# the file's contents — edit it and you must trust it again.
+#
 # Among matching rules: deny > ask > allow.
 # No match → fall through to the session permission profile
 # (request_approval | assisted | full_access).
