@@ -18,11 +18,15 @@
 //! wire code and never reaches step 5.
 
 use leveler_client_protocol::{
-    ClientCommand, ClientOrigin, CommandEnvelope, CommandId, InteractiveRuntimeClient,
-    ProtocolEnvelope, SessionId,
+    ClientCommand, ClientOrigin, CommandEnvelope, CommandId, ProtocolEnvelope, SessionId,
 };
+use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService};
+use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::policy::{RemotePolicy, RemoteVerdict};
-use leveler_remote_protocol::{SignedEnvelope, VerifyParams};
+use leveler_remote_protocol::tunnel::{RpcMethod, RpcRequestPayload};
+use leveler_remote_protocol::{
+    ContentType, Sender, SignedEnvelope, SigningKey, VerifyParams, VerifyingKey,
+};
 use leveler_session_wire::UpstreamMessage;
 
 use crate::devices::{TrustError, TrustedDevices};
@@ -70,26 +74,119 @@ pub enum Admitted {
 }
 
 /// Everything the bridge needs to judge one runtime's inbound frames.
-pub struct AgentBridge<R: InteractiveRuntimeClient> {
+pub struct AgentBridge<R: LocalRuntimeService> {
     runtime: R,
     devices: TrustedDevices,
     runtime_id: String,
+    /// Signs every response carrying a business body, so the APP can tell a
+    /// genuine result from one a relay composed.
+    runtime_key: SigningKey,
     allow_full_access: bool,
 }
 
-impl<R: InteractiveRuntimeClient> AgentBridge<R> {
+impl<R: LocalRuntimeService> AgentBridge<R> {
     pub fn new(
         runtime: R,
         devices: TrustedDevices,
         runtime_id: impl Into<String>,
+        runtime_key: SigningKey,
         allow_full_access: bool,
     ) -> Self {
         Self {
             runtime,
             devices,
             runtime_id: runtime_id.into(),
+            runtime_key,
             allow_full_access,
         }
+    }
+
+    /// The public half the APP anchors from the pairing QR.
+    pub fn runtime_public_key(&self) -> VerifyingKey {
+        self.runtime_key.verifying_key()
+    }
+
+    /// Serve one RPC and return a **runtime-signed** response.
+    ///
+    /// The response is signed for the same reason the upstream frame is
+    /// verified: a relay must not be able to author a `SessionBootstrap` or a
+    /// snapshot. Those carry session ids and pending approvals, so an APP that
+    /// accepted an unsigned one would render — and let the user act on — state
+    /// the relay chose. The response reuses the request's `stream_id`, which
+    /// binds the pair cryptographically so a genuine response cannot be
+    /// re-matched to a different request.
+    pub async fn handle_rpc(
+        &self,
+        frame: &SignedEnvelope,
+        now: &str,
+        relay_claimed_pubkey: Option<&str>,
+    ) -> Result<SignedEnvelope, AdmissionError> {
+        let device_id = frame.sender_id.clone();
+        let (key, scope) = self.devices.key_for(&device_id, relay_claimed_pubkey)?;
+        let payload = frame.verify(&VerifyParams {
+            expected_recipient_id: &self.runtime_id,
+            public_key: &key,
+            now,
+        })?;
+
+        let request: RpcRequestPayload =
+            serde_json::from_slice(&payload).map_err(|_| AdmissionError::MalformedPayload)?;
+
+        // Creating a session is a mutation, so an observe pairing may not.
+        if scope == PairingScope::Observe && request.method == RpcMethod::CreateSession {
+            return Err(AdmissionError::Refused {
+                code: "command_not_allowed_remote",
+                reason: "this device is paired for observation only",
+            });
+        }
+
+        let body = match request.method {
+            RpcMethod::CreateSession => {
+                let create: CreateSessionRequest = serde_json::from_value(request.body)
+                    .map_err(|_| AdmissionError::MalformedPayload)?;
+                let bootstrap = self
+                    .runtime
+                    .create_session(create)
+                    .await
+                    .map_err(|error| AdmissionError::Runtime(error.to_string()))?;
+                serde_json::to_vec(&bootstrap).map_err(|_| AdmissionError::MalformedPayload)?
+            }
+            RpcMethod::Snapshot => {
+                let session_id = request
+                    .body
+                    .get("session_id")
+                    .and_then(|value| value.as_str())
+                    .ok_or(AdmissionError::MalformedPayload)?;
+                let snapshot = self
+                    .runtime
+                    .snapshot(&SessionId::new(session_id))
+                    .await
+                    .map_err(|error| AdmissionError::Runtime(error.to_string()))?;
+                serde_json::to_vec(&snapshot).map_err(|_| AdmissionError::MalformedPayload)?
+            }
+            // The upload path exists in the protocol but has no agent-side
+            // implementation yet; refusing is honest, and silently accepting
+            // would let an APP believe an attachment was stored.
+            RpcMethod::UploadAttachment => {
+                return Err(AdmissionError::Refused {
+                    code: "command_not_allowed_remote",
+                    reason: "attachment upload is not implemented on this host yet",
+                });
+            }
+        };
+
+        SignedEnvelope::sign(
+            &self.runtime_key,
+            Sender::Runtime,
+            &self.runtime_id,
+            &device_id,
+            &frame.stream_id,
+            frame.seq,
+            now,
+            ContentType::RpcResponse,
+            &body,
+        )
+        .map_err(AdmissionError::Envelope)
     }
 
     pub fn devices(&self) -> &TrustedDevices {

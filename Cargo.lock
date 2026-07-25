@@ -2116,6 +2116,7 @@ name = "leveler-remote-agent"
 version = "0.1.4"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "leveler-client-protocol",
  "leveler-local-transport",

@@ -1273,7 +1273,8 @@ pub enum ClientOrigin {
   - 伪造签名 ✅ / **relay 换钥负例** ✅（relay 提供密钥仅作**比对**，永不用于验签，不符即 `pubkey_mismatch`）/ TOFU `devices.json` ✅（原子写 + 0600 + 重复 accept 替换旧行，不留可用的陈旧密钥）/ 未配对 ✅ / 已撤销 ✅ / 跨 runtime 重放 ✅ / policy 拒绝（`ApproveAlways`、`FullAccess`、observe）✅
   - **不依赖 `leveler-web`** ✅，session framing 取自 PR0 的 `leveler-session-wire`。
 - **牙口已验：** 本 PR 我是实现与测试同写、**未观察到红**，故补做验证——把实现改成「relay 给了密钥就用它」，`a_relay_supplied_key_is_never_used_to_verify` 单条转红、其余 10 条仍绿，随后还原。
-- **未完成（PR5 剩余）：** 真实 WSS 隧道客户端、`AgentToRelay`/`RelayToAgent` 帧收发循环、**signed `rpc_response`（create/snapshot/upload）**、假 relay 端到端、审批超时定时器接线（用 PR4 的状态机 + waiter 计数）。当前 crate 只是可被隧道调用的纯准入函数，**尚无任何网络代码**。
+- **signed `rpc_response` 与假 relay 端到端已补齐（追加 6 测试，共 17 绿）：** `create_session` / `snapshot` 返回 **runtime 签名**信封，APP 用 QR 锚定的 `runtime_pubkey` 验签。负例覆盖：relay 自撰响应、relay 篡改响应体、以及**响应错配**（响应复用请求的 `rpc:{uuid}` stream_id，该值在签名内，故 relay 无法拿另一请求的合法响应来顶替）。`upload_attachment` 显式返回未实现而非静默成功——否则 APP 会以为附件已入库。
+- **未完成（PR5 剩余）：** 真实 WSS 隧道客户端与 `AgentToRelay`/`RelayToAgent` 帧收发循环；`upload_attachment` 的 agent 侧实现；审批超时定时器接线（PR4 的状态机与 waiter 计数**仍未被调用**）。当前 crate **尚无任何网络代码**，是可被隧道调用的纯函数。
 - **接口形状：** `project_id` 尚未预留，留待 PR5b 与 ProjectRouter 一并引入。
 
 ### PR5b — ProjectRouter：多已打开项目

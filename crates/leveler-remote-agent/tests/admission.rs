@@ -10,6 +10,7 @@ use leveler_client_protocol::{
     ApprovalDecision, ApprovalId, ClientCommand, ClientError, InteractiveRuntimeClient,
     PermissionProfile, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
+use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
 use leveler_remote_agent::{Admitted, AgentBridge, TrustedDevices};
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::{ContentType, Sender, SignedEnvelope, SigningKey};
@@ -17,6 +18,7 @@ use tokio::sync::broadcast;
 
 const DEVICE_SEED: [u8; 32] = [11u8; 32];
 const RELAY_SEED: [u8; 32] = [22u8; 32];
+const RUNTIME_SEED: [u8; 32] = [77u8; 32];
 const RUNTIME_ID: &str = "rt_host";
 const DEVICE_ID: &str = "dev_phone";
 const AT: &str = "2026-07-25T12:00:00Z";
@@ -45,8 +47,22 @@ impl InteractiveRuntimeClient for RecordingRuntime {
     }
 }
 
+#[async_trait]
+impl LocalRuntimeService for RecordingRuntime {
+    async fn create_session(
+        &self,
+        _request: CreateSessionRequest,
+    ) -> Result<SessionBootstrap, ClientError> {
+        Err(ClientError::Runtime("not needed for these tests".into()))
+    }
+}
+
 fn device_key() -> SigningKey {
     SigningKey::from_seed(&DEVICE_SEED).expect("seed is valid")
+}
+
+fn runtime_key() -> SigningKey {
+    SigningKey::from_seed(&RUNTIME_SEED).expect("seed is valid")
 }
 
 /// A bridge with one accepted device, plus a handle on what got delivered.
@@ -72,7 +88,7 @@ fn bridge_with_paired_device(
     let runtime = RecordingRuntime::default();
     let delivered = runtime.delivered.clone();
     (
-        AgentBridge::new(runtime, devices, RUNTIME_ID, false),
+        AgentBridge::new(runtime, devices, RUNTIME_ID, runtime_key(), false),
         delivered,
     )
 }
@@ -208,7 +224,7 @@ async fn a_revoked_device_stops_being_admitted() {
 
     let runtime = RecordingRuntime::default();
     let delivered = runtime.delivered.clone();
-    let bridge = AgentBridge::new(runtime, devices, RUNTIME_ID, false);
+    let bridge = AgentBridge::new(runtime, devices, RUNTIME_ID, runtime_key(), false);
 
     let frame = upstream(
         &device_key(),
