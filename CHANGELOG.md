@@ -21,6 +21,10 @@ All notable changes to CodeLeveler are documented here. The format follows
 ### Added
 - `leveler trust` (`allow [--yes]` / `show` / `revoke`) to manage in-repo
   configuration trust per repository.
+- TUI surfaces ignored in-repo config directly: the empty-session splash names
+  the file and the command that enables it, and the composer border carries a
+  marker for as long as the condition holds. The CLI's stderr notice never
+  survived the alternate screen.
 
 ## [0.1.4] - 2026-07-25
 

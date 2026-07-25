@@ -52,6 +52,7 @@ fn state() -> AppState {
             history_path: None,
             context_window: 0,
             locale: leveler_tui::Locale::Zh,
+            untrusted_config: Vec::new(),
         },
     )
 }

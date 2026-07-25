@@ -592,6 +592,7 @@ pub(crate) async fn cmd_tui(
             history_path: Some(layout.state_dir.join("input_history.json")),
             context_window,
             locale: leveler_tui::Locale::resolve(global.lang.as_deref()),
+            untrusted_config: crate::trust_cmds::untrusted_config_display(&layout.repo_root),
         };
         let client: Arc<dyn InteractiveRuntimeClient> = client;
         // Daemon-attached TUI: no local runtime to bind a Web UI onto. `/web`
@@ -701,6 +702,7 @@ pub(crate) async fn cmd_tui(
         context_window,
         // LEVELER_LANG → ~/.leveler/config.toml lang → system → zh.
         locale: leveler_tui::Locale::resolve(app.config.lang.as_deref()),
+        untrusted_config: crate::trust_cmds::untrusted_config_display(&app.layout.repo_root),
     };
 
     leveler_tui::run(client, Some(web_launcher), boot).await?;

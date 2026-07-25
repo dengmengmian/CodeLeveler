@@ -51,6 +51,9 @@ pub struct Boot {
     pub context_window: u32,
     /// UI language (resolved once at process start).
     pub locale: Locale,
+    /// In-repo config files present but ignored for lack of trust, as display
+    /// paths. Resolved by the composition root; see [`AppState::untrusted_config`].
+    pub untrusted_config: Vec<String>,
 }
 
 /// A transient status-line notification.
@@ -325,6 +328,14 @@ pub struct AppState {
     /// UI language for chrome / help / notifications.
     pub locale: Locale,
 
+    /// In-repo config files (`.leveler/hooks.yaml`, `.leveler/permissions.yaml`)
+    /// present but ignored for lack of trust, as repo-relative display paths.
+    ///
+    /// The CLI prints this on stderr at startup, which the alternate screen
+    /// swallows — so the TUI carries it itself, on the splash and on the
+    /// composer border, for as long as it is true.
+    pub untrusted_config: Vec<String>,
+
     boot: Boot,
 }
 
@@ -416,6 +427,7 @@ impl AppState {
             dark: true,
             jump_to_bottom: false,
             locale: boot.locale,
+            untrusted_config: boot.untrusted_config.clone(),
             boot,
         }
     }

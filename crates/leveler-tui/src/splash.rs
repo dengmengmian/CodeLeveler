@@ -104,6 +104,29 @@ pub(crate) fn splash_lines(
         ]);
     }
 
+    // The CLI's stderr notice never survives the alternate screen, so the first
+    // thing a TUI user sees has to carry it: which file is being ignored, and
+    // the one command that changes that. Truncated to the column so the box
+    // keeps its right-edge alignment.
+    if !state.untrusted_config.is_empty() {
+        let warn = Style::default().fg(theme.warning);
+        right.push(Vec::new());
+        right.push(vec![Span::styled(
+            truncate_w(&format!("⚠ {}", t.untrusted_config_title), right_w),
+            warn,
+        )]);
+        for path in &state.untrusted_config {
+            right.push(vec![Span::styled(
+                truncate_w(&format!("  {path}"), right_w),
+                muted,
+            )]);
+        }
+        right.push(vec![Span::styled(
+            truncate_w(t.untrusted_config_hint, right_w),
+            muted,
+        )]);
+    }
+
     // ── Assemble the box ────────────────────────────────────────────────────
     let rows = right.len().max(LOGO.len());
     let logo_top = (rows - LOGO.len()) / 2;
@@ -294,6 +317,7 @@ mod tests {
                 history_path: None,
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
             },
         )
     }
@@ -326,6 +350,49 @@ mod tests {
         );
         assert!(text.contains("/goal"), "tips list missing: {text}");
         assert!(conversation_is_empty(&s));
+    }
+
+    /// A repository shipping `.leveler/hooks.yaml` is being ignored, and the
+    /// stderr notice never survives the alternate screen. The splash is the
+    /// first thing a TUI user sees, so it has to carry the news — with the file
+    /// named and the fix spelled out.
+    #[test]
+    fn splash_warns_about_ignored_in_repo_config() {
+        let mut s = empty_state();
+        let clean = joined(&splash_lines(&s, 90, &s.theme, s.t()));
+        assert!(!clean.contains('⚠'), "clean repo shows no warning: {clean}");
+
+        s.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+        let text = joined(&splash_lines(&s, 90, &s.theme, s.t()));
+        assert!(text.contains('⚠'), "{text}");
+        assert!(text.contains("hooks.yaml"), "name the file: {text}");
+        assert!(text.contains("leveler trust"), "name the fix: {text}");
+    }
+
+    /// The warning rows are inside the same box, so they must not break the
+    /// right-edge alignment the box relies on.
+    #[test]
+    fn warning_rows_keep_the_box_aligned() {
+        let mut s = empty_state();
+        s.untrusted_config = vec![
+            ".leveler/hooks.yaml".to_string(),
+            ".leveler/permissions.yaml".to_string(),
+        ];
+        let lines = splash_lines(&s, 90, &s.theme, s.t());
+        let edges: Vec<usize> = lines
+            .iter()
+            .filter_map(|l| {
+                let plain: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                let trimmed = plain.trim_end();
+                (trimmed.ends_with('│') || trimmed.ends_with('╮') || trimmed.ends_with('╯'))
+                    .then(|| disp_w(trimmed))
+            })
+            .collect();
+        assert!(edges.len() >= 5, "{edges:?}");
+        assert!(
+            edges.iter().all(|w| *w == edges[0]),
+            "right borders misaligned with warning rows: {edges:?}"
+        );
     }
 
     #[test]

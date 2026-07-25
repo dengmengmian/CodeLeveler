@@ -42,8 +42,9 @@ any approval prompt:
   approval policy.
 
 Cloning a repository is therefore not enough to make either apply. They are
-ignored, with a notice on stderr, until you run `leveler trust` for that
-repository. Trust records the SHA-256 of the exact bytes you accepted, so a
+ignored until you run `leveler trust` for that repository. The skip is always
+visible: a notice on stderr for CLI runs, and in the TUI both the empty-session
+splash and a marker on the composer border. Trust records the SHA-256 of the exact bytes you accepted, so a
 later edit — by a teammate, by `git pull`, or by the agent — drops the file
 back to untrusted. `leveler trust show` reports the current state and
 `leveler trust revoke` clears it.

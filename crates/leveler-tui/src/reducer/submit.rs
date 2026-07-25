@@ -779,6 +779,7 @@ mod export_tests {
                 history_path: None,
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
             },
         );
         s.transcript.push_user("帮我加个导出功能".into());
@@ -886,6 +887,7 @@ mod export_tests {
                 history_path: None,
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
             },
         );
         let effects = export_conversation(&mut s, "export");

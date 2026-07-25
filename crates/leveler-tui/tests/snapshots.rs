@@ -28,6 +28,7 @@ fn opened_state() -> AppState {
             history_path: None,
             context_window: 200_000,
             locale: leveler_tui::Locale::Zh,
+            untrusted_config: Vec::new(),
         },
     );
     let snap = UiSessionSnapshot {
@@ -180,6 +181,37 @@ fn empty_session_shows_splash_with_logo() {
     assert!(
         text.contains("CodeLeveler") && text.contains('█'),
         "empty session splash missing brand/logo: {text}"
+    );
+}
+
+/// End-to-end through the real render path: a repository shipping ignored
+/// `.leveler` config must be visible on screen, because the CLI's stderr notice
+/// is swallowed by the alternate screen. The splash carries the detail and the
+/// composer border carries a marker that outlives the splash.
+#[test]
+fn ignored_in_repo_config_is_visible_on_screen() {
+    let mut state = opened_state();
+    let clean = render_at(100, 24, &mut state);
+    assert!(!clean.contains('⚠'), "clean repo shows no warning: {clean}");
+
+    state.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains("hooks.yaml"),
+        "splash must name the file: {text}"
+    );
+    assert!(
+        text.contains("leveler trust"),
+        "splash must name the fix: {text}"
+    );
+
+    // Once the conversation has content the splash is gone, but the composer
+    // border marker must remain — the condition still holds.
+    state.transcript.push_user("开始干活".into());
+    let after = render_at(100, 24, &mut state);
+    assert!(
+        after.contains('⚠'),
+        "the marker must outlive the splash: {after}"
     );
 }
 

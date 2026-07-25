@@ -131,6 +131,26 @@ pub(crate) fn cmd_trust(
     }
 }
 
+/// Ignored in-repo config as repo-relative display paths, for the TUI.
+///
+/// The startup notice goes to stderr, which the alternate screen swallows, so
+/// the TUI has to carry this itself — see `leveler_tui::Boot::untrusted_config`.
+/// Paths are relative because they share a width-limited box column.
+pub(crate) fn untrusted_config_display(repo_root: &std::path::Path) -> Vec<String> {
+    let home = leveler_home();
+    leveler_execution::untrusted_project_files(&home, repo_root)
+        .into_iter()
+        .map(|entry| {
+            entry
+                .path
+                .strip_prefix(repo_root)
+                .unwrap_or(&entry.path)
+                .display()
+                .to_string()
+        })
+        .collect()
+}
+
 /// State of every gated file for a repository, in a stable order.
 pub(crate) fn states(home: &std::path::Path, repo: &std::path::Path) -> Vec<(String, FileState)> {
     TRUSTED_PROJECT_FILES

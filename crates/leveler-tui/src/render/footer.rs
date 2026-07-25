@@ -377,7 +377,13 @@ pub(crate) fn composer_box_lines(
 /// Token stats and context belong on the Footer, not here.
 fn composer_trust_chip(state: &AppState) -> String {
     let perm = crate::status_line::permission_chip_label(state);
-    format!("{} · {perm}", state.model_label)
+    let base = format!("{} · {perm}", state.model_label);
+    if state.untrusted_config.is_empty() {
+        return base;
+    }
+    // Ignored in-repo config is a standing condition, not an event, so it rides
+    // the chip for as long as it holds rather than fading like a notification.
+    format!("{base} · {}", state.t().untrusted_config_chip)
 }
 
 /// The slash-command completion popup as inline lines (a bordered box shown just
@@ -895,8 +901,29 @@ mod p1_tests {
                 history_path: None,
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
             },
         )
+    }
+
+    /// The stderr startup notice is swallowed by the alternate screen, so the
+    /// composer border is where a TUI user learns their repository ships config
+    /// that is being ignored. It must persist for the whole session, not fade.
+    #[test]
+    fn trust_chip_flags_ignored_in_repo_config() {
+        let mut s = state();
+        assert!(
+            !composer_trust_chip(&s).contains('⚠'),
+            "clean repo shows no warning"
+        );
+
+        s.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+        let chip = composer_trust_chip(&s);
+        assert!(chip.contains('⚠'), "{chip}");
+        assert!(
+            chip.contains(&s.model_label) && chip.contains("assisted") || chip.contains('·'),
+            "the model/permission chip must survive: {chip}"
+        );
     }
 
     #[test]

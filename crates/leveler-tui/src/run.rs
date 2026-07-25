@@ -707,6 +707,7 @@ mod tests {
                 history_path: None,
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
             },
         )
     }

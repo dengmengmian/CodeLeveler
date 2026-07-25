@@ -48,6 +48,7 @@ fn opened() -> AppState {
             history_path: None,
             context_window: 200_000,
             locale: leveler_tui::Locale::Zh,
+            untrusted_config: Vec::new(),
         },
     );
     s.size = (100, 32);

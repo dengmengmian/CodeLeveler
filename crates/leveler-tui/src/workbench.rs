@@ -881,6 +881,7 @@ mod tests {
                 history_path: None,
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
             },
         )
     }
@@ -1050,6 +1051,7 @@ mod tests {
                 history_path: None,
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
             },
         );
         // Busy goal with no plan must not reserve chrome for "等待计划".

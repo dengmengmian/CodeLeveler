@@ -363,6 +363,15 @@ pub struct UiText {
     // Tools screen footer hint
     pub tools_footer_hint_full: &'static str,
     pub tools_footer_hint_compact: &'static str,
+
+    // Untrusted in-repo config (`.leveler/hooks.yaml`, `.leveler/permissions.yaml`)
+    /// Splash headline, above the list of ignored files.
+    pub untrusted_config_title: &'static str,
+    /// Splash line telling the user how to act on it. Kept short: it shares a
+    /// width-limited box column with the logo.
+    pub untrusted_config_hint: &'static str,
+    /// Composer-border chip; kept short because the border is width-limited.
+    pub untrusted_config_chip: &'static str,
 }
 
 #[derive(Debug)]
@@ -654,6 +663,9 @@ static ZH: UiText = UiText {
     edit_merge_summary: "{} 处修改",
     tools_footer_hint_full: "Tab 过滤 · ↑↓ 选择 · PgUp/PgDn 滚动 · Esc 返回",
     tools_footer_hint_compact: "Tab 过滤 · ↑↓ 选择 · Esc 返回",
+    untrusted_config_title: "已忽略仓库内配置（未信任）",
+    untrusted_config_hint: "核对内容后运行 leveler trust",
+    untrusted_config_chip: "⚠ 仓库配置未信任",
 };
 
 static EN: UiText = UiText {
@@ -898,6 +910,9 @@ static EN: UiText = UiText {
     edit_merge_summary: "{} changes",
     tools_footer_hint_full: "Tab filter · ↑↓ select · PgUp/PgDn scroll · Esc back",
     tools_footer_hint_compact: "Tab filter · ↑↓ select · Esc back",
+    untrusted_config_title: "Ignored in-repo config (untrusted)",
+    untrusted_config_hint: "Review it, then run leveler trust",
+    untrusted_config_chip: "⚠ repo config untrusted",
 };
 
 #[cfg(test)]
