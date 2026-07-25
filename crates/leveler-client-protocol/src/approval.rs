@@ -11,6 +11,7 @@ use leveler_core::{ApprovalId, ClarificationId};
 
 /// A pending permission request, projected for display.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiApprovalRequest {
     pub id: ApprovalId,
     /// The tool requesting permission (e.g. `run_command`).
@@ -25,6 +26,7 @@ pub struct UiApprovalRequest {
 
 /// A mid-task clarification the agent needs answered (spec §35).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiClarificationRequest {
     pub id: ClarificationId,
     pub question: String,
@@ -36,6 +38,7 @@ pub struct UiClarificationRequest {
 /// an in-process waiter are projected; interrupted turns never resurrect stale
 /// buttons after a process restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "request", rename_all = "snake_case")]
 pub enum UiPendingInteraction {
     Approval(UiApprovalRequest),

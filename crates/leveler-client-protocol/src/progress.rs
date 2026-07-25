@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStepStatus {
     Pending,
@@ -19,6 +20,7 @@ pub enum PlanStepStatus {
 
 /// One step in the execution plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiPlanStep {
     pub index: usize,
     pub description: String,
@@ -27,12 +29,14 @@ pub struct UiPlanStep {
 
 /// The execution plan (spec §20).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiPlan {
     pub steps: Vec<UiPlanStep>,
 }
 
 /// The state of one verification check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CheckState {
     Running,
@@ -43,6 +47,7 @@ pub enum CheckState {
 
 /// One verification check (spec §22).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiCheck {
     pub name: String,
     pub status: CheckState,
@@ -52,6 +57,7 @@ pub struct UiCheck {
 
 /// The verification result. `passed` is `None` while still running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiVerification {
     pub checks: Vec<UiCheck>,
     pub passed: Option<bool>,
@@ -59,6 +65,7 @@ pub struct UiVerification {
 
 /// One changed file (spec §21).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiDiffFile {
     pub path: String,
     pub added: u32,
@@ -69,6 +76,7 @@ pub struct UiDiffFile {
 
 /// A summary of working-tree changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiDiff {
     pub files: Vec<UiDiffFile>,
 }
@@ -119,6 +127,7 @@ mod tests {
 
 /// The final completion report (spec §23).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiCompletionReport {
     pub files_changed: usize,
     pub added: u32,

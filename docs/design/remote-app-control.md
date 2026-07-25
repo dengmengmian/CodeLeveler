@@ -1218,12 +1218,14 @@ pub enum ClientOrigin {
 - **DoD:** web 现有测试绿；无行为变化；remote 可依赖该 crate 而不依赖 web
 - **实测：** `crates/leveler-session-wire` 落地；`UpstreamMessage`/`DownstreamMessage` **及 `ProjectStatus`**（WS 帧与 REST 共用，不带走则新 crate 会反向依赖 web）连同 7 条 golden 迁入，新增 1 条 `ProjectStatus` 小写序列化断言 = **8 绿**；`leveler-web` 30 测试与基线**逐条一致**（golden 字符串逐字节未变）；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo tree` 确认新 crate **无 axum / rust-embed / leveler-web**（tokio 为 client-protocol 固有传递依赖）。`leveler-web` 继续 `pub use` 三个类型，下游调用点零改动。
 
-### PR1 — client-protocol schema 导出（尽力）
+### PR1 — client-protocol schema 导出（尽力）✅ 已完成
 
 - **Title:** `export JSON schemas for ClientCommand/RuntimeEvent/UiSessionSnapshot`
 - **Affects:** `leveler-client-protocol`（schemars feature 或 build 脚本）、CI
 - **Deps:** 无（可与 PR0 并行）
 - **DoD:** schema 伪像上传/入库；enum 变更 CI 失败提示更新
+- **实测：** 走 schemars feature 路线（**非** build 脚本）。`schema` feature 级联至 `leveler-core`（id 新类型，宏内一处条件派生覆盖全部 12 个）与 `leveler-model`（`ModelRef`），三者均 **optional + 默认关**，发行二进制不受影响；schemars 本就是 workspace 既有依赖（`leveler-tools` 在用），**未引入任何新外部依赖**。产物入库 `schemas/{client_command,runtime_event,ui_session_snapshot}.schema.json`，`ClientCommand` 生成 **31 个变体**，与本文穷尽 allowlist 表逐一吻合（互为反向印证）。**CI 无需改动**：现有 `cargo test --workspace --all-features --locked` 已覆盖该 feature，drift 测试自动生效。**牙口已验**：临时加一个变体 → 仅 `client_command` 一条转红并给出重生成命令，另两条保持绿（精准而非一锅端），随后还原。
+- **未做（留待需要时）：** 未加「schema 校验真实 serde 输出」的自动化测试。已手工核对 `SessionId` 等 newtype 正确降为 `type: string`、无退化定义、`type` 判别式使 `oneOf` 唯一命中；但这是一次性人工核对，**不是**回归防护。
 
 ### PR2 — `leveler-remote-protocol` + agent tunnel / auth DTO golden
 
@@ -1359,6 +1361,7 @@ pub enum ClientOrigin {
 | 交付物 | 形态 | Phase 1 必达 | 状态 |
 | --- | --- | --- | --- |
 | `leveler-session-wire` | crate | 是 | ✅ PR0 已落地 |
+| `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | 未开始（PR2） |
 | `leveler-remote-agent` + ProjectRouter | binary | 是 | 未开始（PR5/5b） |
 | `leveler-relay` self-host | docker | 是 | 未开始（PR6） |

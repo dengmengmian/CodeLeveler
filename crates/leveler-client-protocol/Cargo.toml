@@ -16,10 +16,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+schemars = { workspace = true, optional = true }
 
 [features]
 # Enables the in-memory MockRuntimeClient for client tests (TUI, integration).
 testing = []
+# Derives `JsonSchema` on the protocol types and enables the export test that
+# keeps `schemas/*.json` in step with them. Off by default: the schemas are a
+# build-time contract artifact for non-Rust clients, not a runtime concern.
+schema = ["dep:schemars", "leveler-core/schema", "leveler-model/schema"]
 
 [dev-dependencies]
 tokio = { workspace = true }

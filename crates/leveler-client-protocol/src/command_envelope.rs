@@ -20,6 +20,7 @@ use crate::command::ClientCommand;
 /// was issued, and the payload. Production in-process and socket clients use
 /// the same envelope path; raw `send` remains only as a low-level/testing seam.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CommandEnvelope {
     pub command_id: CommandId,
     pub session_id: SessionId,

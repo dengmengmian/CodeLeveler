@@ -1866,6 +1866,7 @@ dependencies = [
  "async-trait",
  "leveler-core",
  "leveler-model",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -1891,6 +1892,7 @@ name = "leveler-core"
 version = "0.1.4"
 dependencies = [
  "chrono",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -2031,6 +2033,7 @@ dependencies = [
  "bytes",
  "futures",
  "leveler-core",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",

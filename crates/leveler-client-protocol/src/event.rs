@@ -24,6 +24,7 @@ pub const REASON_NO_AUTOMATIC_VERIFICATION: &str = "no_automatic_verification";
 
 /// Severity for a transient notification .
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationLevel {
     Info,
@@ -33,6 +34,7 @@ pub enum NotificationLevel {
 
 /// An event flowing from the runtime to clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     /// The runtime finished booting and is ready for commands.
@@ -244,6 +246,7 @@ pub fn parse_runtime_event(json: &str) -> Result<Option<RuntimeEvent>, serde_jso
 
 /// Compact durable-memory row for TUI list surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiMemoryEntry {
     pub id: String,
     pub title: String,

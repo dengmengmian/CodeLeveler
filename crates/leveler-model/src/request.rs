@@ -10,6 +10,7 @@ use crate::profile::ReasoningEffort;
 /// A provider + model pair. The rest of the system routes on this, never on a
 /// bare model-name string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ModelRef {
     pub provider: String,
     pub model: String,

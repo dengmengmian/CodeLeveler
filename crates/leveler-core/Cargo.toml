@@ -14,3 +14,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+schemars = { workspace = true, optional = true }
+
+[features]
+# Derives `JsonSchema` on the shared id types so the client protocol can export
+# JSON Schema artifacts. Off by default: shipped binaries never pay for it.
+schema = ["dep:schemars"]

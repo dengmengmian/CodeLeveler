@@ -17,3 +17,9 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
+schemars = { workspace = true, optional = true }
+
+[features]
+# Derives `JsonSchema` on `ModelRef`, which the client protocol embeds. See
+# `leveler-core`'s `schema` feature.
+schema = ["dep:schemars", "leveler-core/schema"]

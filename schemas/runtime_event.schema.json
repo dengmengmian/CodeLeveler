@@ -1,0 +1,1762 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RuntimeEvent",
+  "description": "An event flowing from the runtime to clients.",
+  "oneOf": [
+    {
+      "description": "The runtime finished booting and is ready for commands.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "runtime_ready"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A session was opened / its snapshot refreshed.",
+      "type": "object",
+      "required": [
+        "session",
+        "type"
+      ],
+      "properties": {
+        "session": {
+          "$ref": "#/definitions/UiSessionSnapshot"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "session_opened"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Session metadata changed (model/mode/branch) without touching the transcript — refresh the header only.",
+      "type": "object",
+      "required": [
+        "session",
+        "type"
+      ],
+      "properties": {
+        "session": {
+          "$ref": "#/definitions/UiSessionSnapshot"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "session_updated"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The runtime needs the user to approve a risky action .",
+      "type": "object",
+      "required": [
+        "request",
+        "type"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "#/definitions/UiApprovalRequest"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "approval_requested"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A pending approval was resolved (by any connected client, or by a timeout/cancel). Clients dismiss the matching prompt so a second client never answers an approval that no longer exists.",
+      "type": "object",
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/ApprovalId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "approval_resolved"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The agent is asking the user a clarifying question (spec §35).",
+      "type": "object",
+      "required": [
+        "request",
+        "type"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "#/definitions/UiClarificationRequest"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "clarification_requested"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A pending clarification was resolved (by any client, timeout, or cancel).",
+      "type": "object",
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/ClarificationId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "clarification_resolved"
+          ]
+        }
+      }
+    },
+    {
+      "description": "An imported attachment was processed and stored (spec §39).",
+      "type": "object",
+      "required": [
+        "attachment",
+        "type"
+      ],
+      "properties": {
+        "attachment": {
+          "$ref": "#/definitions/AttachmentRef"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "attachment_added"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Importing an attachment failed.",
+      "type": "object",
+      "required": [
+        "error",
+        "type"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "attachment_processing_failed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A user message was appended to the transcript.",
+      "type": "object",
+      "required": [
+        "message",
+        "type"
+      ],
+      "properties": {
+        "message": {
+          "$ref": "#/definitions/UiMessage"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "user_message_added"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A new assistant message began; deltas will target this id.",
+      "type": "object",
+      "required": [
+        "message_id",
+        "type"
+      ],
+      "properties": {
+        "message_id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "assistant_message_started"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A retry attempt began. Remove the prior transient message, if present, and clear its reasoning before applying new deltas.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "message_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "assistant_attempt_reset"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A chunk of assistant text for an in-flight message.",
+      "type": "object",
+      "required": [
+        "delta",
+        "message_id",
+        "type"
+      ],
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "message_id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "assistant_text_delta"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A chunk of model reasoning/summary, rendered separately from the answer.",
+      "type": "object",
+      "required": [
+        "delta",
+        "type"
+      ],
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "reasoning_delta"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The assistant message is complete.",
+      "type": "object",
+      "required": [
+        "message_id",
+        "type"
+      ],
+      "properties": {
+        "message_id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "assistant_message_completed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Coarse progress label from the runtime, shown in the status line.",
+      "type": "object",
+      "required": [
+        "label",
+        "type"
+      ],
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "agent_activity"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Heartbeat while a long command tool runs (runtime observability). Lets a client show \"运行 cargo test\" with a live elapsed instead of a bare \"等待模型\". Structured so TUI/Web/logs can consume it uniformly.",
+      "type": "object",
+      "required": [
+        "elapsed_ms",
+        "label",
+        "type"
+      ],
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "label": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "command_progress"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome.",
+      "type": "object",
+      "required": [
+        "sources",
+        "type"
+      ],
+      "properties": {
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "project_rules_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A tool call started .",
+      "type": "object",
+      "required": [
+        "arguments",
+        "id",
+        "name",
+        "type"
+      ],
+      "properties": {
+        "arguments": {
+          "description": "Compacted JSON arguments.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "parallel": {
+          "description": "True when this call ran in the concurrent read-only batch; a UI can group such calls as one parallel burst.",
+          "default": false,
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool_call_started"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side.",
+      "type": "object",
+      "required": [
+        "duration_ms",
+        "id",
+        "ok",
+        "preview",
+        "type"
+      ],
+      "properties": {
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "preview": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool_call_completed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The execution plan was created or a step's status changed (spec §20).",
+      "type": "object",
+      "required": [
+        "plan",
+        "type"
+      ],
+      "properties": {
+        "plan": {
+          "$ref": "#/definitions/UiPlan"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "plan_updated"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Verification progress: a check finished or the run concluded (spec §22).",
+      "type": "object",
+      "required": [
+        "type",
+        "verification"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "verification_updated"
+          ]
+        },
+        "verification": {
+          "$ref": "#/definitions/UiVerification"
+        }
+      }
+    },
+    {
+      "description": "The working-tree diff was (re)computed (spec §21).",
+      "type": "object",
+      "required": [
+        "diff",
+        "type"
+      ],
+      "properties": {
+        "diff": {
+          "$ref": "#/definitions/UiDiff"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "diff_updated"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A conversation checkpoint was created (spec §68).",
+      "type": "object",
+      "required": [
+        "checkpoint",
+        "type"
+      ],
+      "properties": {
+        "checkpoint": {
+          "$ref": "#/definitions/UiCheckpoint"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "checkpoint_created"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The list of stored sessions (spec §52).",
+      "type": "object",
+      "required": [
+        "sessions",
+        "type"
+      ],
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiSessionSummary"
+          }
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "session_list"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Context package info from an orchestrated run (spec §53).",
+      "type": "object",
+      "required": [
+        "candidate_files",
+        "estimated_tokens",
+        "type"
+      ],
+      "properties": {
+        "candidate_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimated_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "context_updated"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`.",
+      "type": "object",
+      "required": [
+        "cached_input_tokens",
+        "input_tokens",
+        "output_tokens",
+        "type"
+      ],
+      "properties": {
+        "cached_input_tokens": {
+          "description": "Subset of `input_tokens` the provider served from its prefix cache. Zero when the provider reports no cache stats.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "token_usage"
+          ]
+        }
+      }
+    },
+    {
+      "description": "An orchestrated run completed; carries the summary report (spec §23).",
+      "type": "object",
+      "required": [
+        "report",
+        "type"
+      ],
+      "properties": {
+        "report": {
+          "$ref": "#/definitions/UiCompletionReport"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "session_completed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The current turn finished successfully.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_completed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The assistant naturally finished its answer, without claiming that an external task was independently verified as complete.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_answered"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The turn stopped at an output limit even after bounded continuation.",
+      "type": "object",
+      "required": [
+        "error",
+        "type"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_truncated"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal).",
+      "type": "object",
+      "required": [
+        "reason",
+        "type"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_incomplete"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The turn finished its work, but leveler could not independently verify it (no verification gate produced passing evidence). Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish).",
+      "type": "object",
+      "required": [
+        "reason",
+        "type"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_completed_unverified"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The current turn failed.",
+      "type": "object",
+      "required": [
+        "error",
+        "type"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_failed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The current turn was cancelled (resumable).",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_cancelled"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done.",
+      "type": "object",
+      "required": [
+        "detail",
+        "done",
+        "id",
+        "nickname",
+        "ok",
+        "role",
+        "type"
+      ],
+      "properties": {
+        "detail": {
+          "description": "The task while running; a short result summary once done.",
+          "type": "string"
+        },
+        "done": {
+          "description": "false while running; true once the agent finished.",
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "ok": {
+          "description": "Whether it finished successfully (only meaningful when `done`).",
+          "type": "boolean"
+        },
+        "role": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "sub_agent_updated"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Live execution state and cumulative model usage for one spawned agent.",
+      "type": "object",
+      "required": [
+        "active",
+        "cached_input_tokens",
+        "id",
+        "input_tokens",
+        "output_tokens",
+        "type"
+      ],
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "cached_input_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "id": {
+          "type": "string"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "sub_agent_progress"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Live tool/step for one spawned sub-agent (attributed by `id`). Transient; older clients ignore unknown types via [`parse_runtime_event`].",
+      "type": "object",
+      "required": [
+        "id",
+        "is_error",
+        "phase",
+        "preview",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "is_error": {
+          "type": "boolean"
+        },
+        "phase": {
+          "description": "`tool_started` or `tool_finished`.",
+          "type": "string"
+        },
+        "preview": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "sub_agent_activity"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A transient notification for the status line.",
+      "type": "object",
+      "required": [
+        "level",
+        "message",
+        "type"
+      ],
+      "properties": {
+        "level": {
+          "$ref": "#/definitions/NotificationLevel"
+        },
+        "message": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "notification"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A background process task was started (`run_command` background=true).",
+      "type": "object",
+      "required": [
+        "args",
+        "program",
+        "task_id",
+        "type"
+      ],
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "program": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "background_task_started"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A background task finished (exit or kill).",
+      "type": "object",
+      "required": [
+        "duration_ms",
+        "ok",
+        "task_id",
+        "type"
+      ],
+      "properties": {
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "background_task_exited"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Project memory listing (response to [`crate::ClientCommand::ListMemory`]).",
+      "type": "object",
+      "required": [
+        "active",
+        "archived",
+        "memory_dir",
+        "type"
+      ],
+      "properties": {
+        "active": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiMemoryEntry"
+          }
+        },
+        "archived": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiMemoryEntry"
+          }
+        },
+        "memory_dir": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory_list"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Side-question (`/btw`) started; not persisted to session history.",
+      "type": "object",
+      "required": [
+        "question",
+        "type"
+      ],
+      "properties": {
+        "question": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw_started"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Side-question answer chunk (often one full answer in MVP).",
+      "type": "object",
+      "required": [
+        "delta",
+        "type"
+      ],
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw_text_delta"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Side-question finished successfully.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw_completed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Side-question failed.",
+      "type": "object",
+      "required": [
+        "error",
+        "type"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw_failed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2).\n\nNo free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`].",
+      "type": "object",
+      "required": [
+        "closeout_deny_rounds",
+        "closing",
+        "no_progress_streak",
+        "phase",
+        "type"
+      ],
+      "properties": {
+        "closeout_deny_rounds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "closing": {
+          "type": "boolean"
+        },
+        "no_progress_streak": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "phase": {
+          "description": "Active | Closing | Terminal (and similar host phase labels).",
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_progress"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "ApprovalId": {
+      "description": "Identifies a pending permission approval request.",
+      "type": "string"
+    },
+    "AttachmentId": {
+      "description": "Identifies a pending or sent attachment.",
+      "type": "string"
+    },
+    "AttachmentKind": {
+      "description": "The kind of attachment.",
+      "type": "string",
+      "enum": [
+        "image",
+        "text_file",
+        "document",
+        "unknown"
+      ]
+    },
+    "AttachmentRef": {
+      "description": "A reference to a processed, stored attachment (spec §39). Carries only metadata; the bytes are addressed by `sha256` in the media store.",
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "mime_type",
+        "name",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "height": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "id": {
+          "$ref": "#/definitions/AttachmentId"
+        },
+        "kind": {
+          "$ref": "#/definitions/AttachmentKind"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Content-address of the processed bytes in the media store.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "width": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CheckState": {
+      "description": "The state of one verification check.",
+      "type": "string",
+      "enum": [
+        "running",
+        "passed",
+        "failed",
+        "skipped"
+      ]
+    },
+    "CheckpointId": {
+      "description": "Identifies a conversation checkpoint (restore point).",
+      "type": "string"
+    },
+    "ClarificationId": {
+      "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "MessageId": {
+      "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "A provider + model pair. The rest of the system routes on this, never on a bare model-name string.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      }
+    },
+    "NotificationLevel": {
+      "description": "Severity for a transient notification .",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "PermissionProfile": {
+      "type": "string",
+      "enum": [
+        "request_approval",
+        "assisted",
+        "full_access"
+      ]
+    },
+    "PlanStepStatus": {
+      "description": "The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`).",
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "done",
+        "failed",
+        "skipped"
+      ]
+    },
+    "SessionId": {
+      "description": "Identifies a single agent session (one user goal end to end).",
+      "type": "string"
+    },
+    "ToolCallId": {
+      "description": "Identifies a tool call. Must be stable across streaming reassembly.",
+      "type": "string"
+    },
+    "UiActiveToolCall": {
+      "description": "A tool invocation that was still running when a client took its snapshot.",
+      "type": "object",
+      "required": [
+        "arguments",
+        "id",
+        "name"
+      ],
+      "properties": {
+        "arguments": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "UiApprovalRequest": {
+      "description": "A pending permission request, projected for display.",
+      "type": "object",
+      "required": [
+        "id",
+        "risks",
+        "summary",
+        "tool"
+      ],
+      "properties": {
+        "command": {
+          "description": "The concrete command, when the tool is `run_command`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/definitions/ApprovalId"
+        },
+        "risks": {
+          "description": "Human-readable risk bullets (paths touched, network, etc.).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "description": "A one-line summary of what will happen.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "The tool requesting permission (e.g. `run_command`).",
+          "type": "string"
+        }
+      }
+    },
+    "UiCheck": {
+      "description": "One verification check (spec §22).",
+      "type": "object",
+      "required": [
+        "name",
+        "status"
+      ],
+      "properties": {
+        "evidence": {
+          "description": "Captured evidence (command output), for failures.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/CheckState"
+        }
+      }
+    },
+    "UiCheckpoint": {
+      "description": "A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git.",
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "ordinal"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/CheckpointId"
+        },
+        "label": {
+          "type": "string"
+        },
+        "ordinal": {
+          "description": "The persisted-message count to truncate back to.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiClarificationRequest": {
+      "description": "A mid-task clarification the agent needs answered (spec §35).",
+      "type": "object",
+      "required": [
+        "id",
+        "options",
+        "question"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/ClarificationId"
+        },
+        "options": {
+          "description": "Candidate answers, when the model offered a choice.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "question": {
+          "type": "string"
+        }
+      }
+    },
+    "UiCompletionReport": {
+      "description": "The final completion report (spec §23).",
+      "type": "object",
+      "required": [
+        "added",
+        "checks_passed",
+        "checks_total",
+        "files_changed",
+        "removed",
+        "success"
+      ],
+      "properties": {
+        "added": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "checks_passed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "checks_total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "files_changed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "success": {
+          "description": "Whether the run completed and verified successfully.",
+          "type": "boolean"
+        }
+      }
+    },
+    "UiDiff": {
+      "description": "A summary of working-tree changes.",
+      "type": "object",
+      "required": [
+        "files"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiDiffFile"
+          }
+        }
+      }
+    },
+    "UiDiffFile": {
+      "description": "One changed file (spec §21).",
+      "type": "object",
+      "required": [
+        "added",
+        "path",
+        "removed"
+      ],
+      "properties": {
+        "added": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "patch": {
+          "description": "The unified diff hunk text, loaded on demand.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiMemoryEntry": {
+      "description": "Compact durable-memory row for TUI list surfaces.",
+      "type": "object",
+      "required": [
+        "id",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
+    "UiMessage": {
+      "description": "A rendered message in the transcript.",
+      "type": "object",
+      "required": [
+        "id",
+        "role",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "role": {
+          "$ref": "#/definitions/UiRole"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "UiPendingInteraction": {
+      "description": "A live control request included in a reconnect snapshot. Only requests with an in-process waiter are projected; interrupted turns never resurrect stale buttons after a process restart.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiApprovalRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "approval"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiClarificationRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "clarification"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "UiPlan": {
+      "description": "The execution plan (spec §20).",
+      "type": "object",
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiPlanStep"
+          }
+        }
+      }
+    },
+    "UiPlanStep": {
+      "description": "One step in the execution plan.",
+      "type": "object",
+      "required": [
+        "description",
+        "index",
+        "status"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "status": {
+          "$ref": "#/definitions/PlanStepStatus"
+        }
+      }
+    },
+    "UiRole": {
+      "description": "Who authored a message.",
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "system",
+        "tool"
+      ]
+    },
+    "UiSessionSnapshot": {
+      "description": "Everything a client needs to render a session's header and transcript.",
+      "type": "object",
+      "required": [
+        "goal",
+        "id",
+        "messages",
+        "mode",
+        "repository",
+        "status"
+      ],
+      "properties": {
+        "active_tools": {
+          "description": "Live render state needed to reconnect while a long turn is still running. All fields are additive/defaulted for protocol compatibility.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiActiveToolCall"
+          }
+        },
+        "available_models": {
+          "description": "Models the user can switch to (for the model picker, ).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ModelRef"
+          }
+        },
+        "branch": {
+          "description": "VCS branch, if the repository is a git repo.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkpoints": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiCheckpoint"
+          }
+        },
+        "completion_report": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiCompletionReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diff": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiDiff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "goal": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "last_sequence": {
+          "description": "The event-log sequence this snapshot reflects — the resync anchor. A client that fell behind (broadcast lag, reconnect) takes a fresh snapshot and resumes the event stream *after* this sequence, so it neither double-applies nor misses a canonical event. `None` when unknown (e.g. a brand-new session with no events yet).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiMessage"
+          }
+        },
+        "mode": {
+          "$ref": "#/definitions/PermissionProfile"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending_interactions": {
+          "description": "Live approval/clarification waiters for reconnect/resync.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiPendingInteraction"
+          }
+        },
+        "plan": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiPlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "repository": {
+          "type": "string"
+        },
+        "status": {
+          "description": "Persisted status string (e.g. \"running\", \"completed\").",
+          "type": "string"
+        },
+        "verification": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiVerification"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vision": {
+          "description": "Whether the current model accepts image input (spec §42).",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "UiSessionSummary": {
+      "description": "A one-line session summary for the Sessions screen (spec §52).",
+      "type": "object",
+      "required": [
+        "goal",
+        "id",
+        "model",
+        "status",
+        "updated_at"
+      ],
+      "properties": {
+        "goal": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "model": {
+          "type": "string"
+        },
+        "repository": {
+          "description": "Repository root the session belongs to. Filled by the runtime that owns the session and by the WebUI aggregation router (multi-project grouping); omitted on the wire when unknown so old fixtures and clients keep parsing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      }
+    },
+    "UiVerification": {
+      "description": "The verification result. `passed` is `None` while still running.",
+      "type": "object",
+      "required": [
+        "checks"
+      ],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiCheck"
+          }
+        },
+        "passed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

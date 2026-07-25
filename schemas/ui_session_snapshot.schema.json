@@ -1,0 +1,560 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "UiSessionSnapshot",
+  "description": "Everything a client needs to render a session's header and transcript.",
+  "type": "object",
+  "required": [
+    "goal",
+    "id",
+    "messages",
+    "mode",
+    "repository",
+    "status"
+  ],
+  "properties": {
+    "active_tools": {
+      "description": "Live render state needed to reconnect while a long turn is still running. All fields are additive/defaulted for protocol compatibility.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiActiveToolCall"
+      }
+    },
+    "available_models": {
+      "description": "Models the user can switch to (for the model picker, ).",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ModelRef"
+      }
+    },
+    "branch": {
+      "description": "VCS branch, if the repository is a git repo.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "checkpoints": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiCheckpoint"
+      }
+    },
+    "completion_report": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiCompletionReport"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "diff": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiDiff"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "goal": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/definitions/SessionId"
+    },
+    "last_sequence": {
+      "description": "The event-log sequence this snapshot reflects — the resync anchor. A client that fell behind (broadcast lag, reconnect) takes a fresh snapshot and resumes the event stream *after* this sequence, so it neither double-applies nor misses a canonical event. `None` when unknown (e.g. a brand-new session with no events yet).",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "messages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiMessage"
+      }
+    },
+    "mode": {
+      "$ref": "#/definitions/PermissionProfile"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ModelRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pending_interactions": {
+      "description": "Live approval/clarification waiters for reconnect/resync.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiPendingInteraction"
+      }
+    },
+    "plan": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiPlan"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "repository": {
+      "type": "string"
+    },
+    "status": {
+      "description": "Persisted status string (e.g. \"running\", \"completed\").",
+      "type": "string"
+    },
+    "verification": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiVerification"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "vision": {
+      "description": "Whether the current model accepts image input (spec §42).",
+      "default": false,
+      "type": "boolean"
+    }
+  },
+  "definitions": {
+    "ApprovalId": {
+      "description": "Identifies a pending permission approval request.",
+      "type": "string"
+    },
+    "CheckState": {
+      "description": "The state of one verification check.",
+      "type": "string",
+      "enum": [
+        "running",
+        "passed",
+        "failed",
+        "skipped"
+      ]
+    },
+    "CheckpointId": {
+      "description": "Identifies a conversation checkpoint (restore point).",
+      "type": "string"
+    },
+    "ClarificationId": {
+      "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "MessageId": {
+      "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "A provider + model pair. The rest of the system routes on this, never on a bare model-name string.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      }
+    },
+    "PermissionProfile": {
+      "type": "string",
+      "enum": [
+        "request_approval",
+        "assisted",
+        "full_access"
+      ]
+    },
+    "PlanStepStatus": {
+      "description": "The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`).",
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "done",
+        "failed",
+        "skipped"
+      ]
+    },
+    "SessionId": {
+      "description": "Identifies a single agent session (one user goal end to end).",
+      "type": "string"
+    },
+    "ToolCallId": {
+      "description": "Identifies a tool call. Must be stable across streaming reassembly.",
+      "type": "string"
+    },
+    "UiActiveToolCall": {
+      "description": "A tool invocation that was still running when a client took its snapshot.",
+      "type": "object",
+      "required": [
+        "arguments",
+        "id",
+        "name"
+      ],
+      "properties": {
+        "arguments": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "UiApprovalRequest": {
+      "description": "A pending permission request, projected for display.",
+      "type": "object",
+      "required": [
+        "id",
+        "risks",
+        "summary",
+        "tool"
+      ],
+      "properties": {
+        "command": {
+          "description": "The concrete command, when the tool is `run_command`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/definitions/ApprovalId"
+        },
+        "risks": {
+          "description": "Human-readable risk bullets (paths touched, network, etc.).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "description": "A one-line summary of what will happen.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "The tool requesting permission (e.g. `run_command`).",
+          "type": "string"
+        }
+      }
+    },
+    "UiCheck": {
+      "description": "One verification check (spec §22).",
+      "type": "object",
+      "required": [
+        "name",
+        "status"
+      ],
+      "properties": {
+        "evidence": {
+          "description": "Captured evidence (command output), for failures.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/CheckState"
+        }
+      }
+    },
+    "UiCheckpoint": {
+      "description": "A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git.",
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "ordinal"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/CheckpointId"
+        },
+        "label": {
+          "type": "string"
+        },
+        "ordinal": {
+          "description": "The persisted-message count to truncate back to.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiClarificationRequest": {
+      "description": "A mid-task clarification the agent needs answered (spec §35).",
+      "type": "object",
+      "required": [
+        "id",
+        "options",
+        "question"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/ClarificationId"
+        },
+        "options": {
+          "description": "Candidate answers, when the model offered a choice.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "question": {
+          "type": "string"
+        }
+      }
+    },
+    "UiCompletionReport": {
+      "description": "The final completion report (spec §23).",
+      "type": "object",
+      "required": [
+        "added",
+        "checks_passed",
+        "checks_total",
+        "files_changed",
+        "removed",
+        "success"
+      ],
+      "properties": {
+        "added": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "checks_passed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "checks_total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "files_changed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "success": {
+          "description": "Whether the run completed and verified successfully.",
+          "type": "boolean"
+        }
+      }
+    },
+    "UiDiff": {
+      "description": "A summary of working-tree changes.",
+      "type": "object",
+      "required": [
+        "files"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiDiffFile"
+          }
+        }
+      }
+    },
+    "UiDiffFile": {
+      "description": "One changed file (spec §21).",
+      "type": "object",
+      "required": [
+        "added",
+        "path",
+        "removed"
+      ],
+      "properties": {
+        "added": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "patch": {
+          "description": "The unified diff hunk text, loaded on demand.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiMessage": {
+      "description": "A rendered message in the transcript.",
+      "type": "object",
+      "required": [
+        "id",
+        "role",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "role": {
+          "$ref": "#/definitions/UiRole"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "UiPendingInteraction": {
+      "description": "A live control request included in a reconnect snapshot. Only requests with an in-process waiter are projected; interrupted turns never resurrect stale buttons after a process restart.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiApprovalRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "approval"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiClarificationRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "clarification"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "UiPlan": {
+      "description": "The execution plan (spec §20).",
+      "type": "object",
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiPlanStep"
+          }
+        }
+      }
+    },
+    "UiPlanStep": {
+      "description": "One step in the execution plan.",
+      "type": "object",
+      "required": [
+        "description",
+        "index",
+        "status"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "status": {
+          "$ref": "#/definitions/PlanStepStatus"
+        }
+      }
+    },
+    "UiRole": {
+      "description": "Who authored a message.",
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "system",
+        "tool"
+      ]
+    },
+    "UiVerification": {
+      "description": "The verification result. `passed` is `None` while still running.",
+      "type": "object",
+      "required": [
+        "checks"
+      ],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiCheck"
+          }
+        },
+        "passed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -18,6 +18,7 @@ use crate::{UiCompletionReport, UiDiff, UiPlan, UiVerification};
 /// A protocol-level id (the runtime persists messages as an ordered log, not by
 /// id); it lets streaming deltas target the right in-flight message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MessageId(String);
 
 impl MessageId {
@@ -55,6 +56,7 @@ mod tests {
 
 /// Who authored a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UiRole {
     User,
@@ -65,6 +67,7 @@ pub enum UiRole {
 
 /// A rendered message in the transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiMessage {
     pub id: MessageId,
     pub role: UiRole,
@@ -73,6 +76,7 @@ pub struct UiMessage {
 
 /// Coarse runtime state, surfaced in the status line .
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeStatus {
     /// Ready for input.
@@ -86,6 +90,7 @@ pub enum RuntimeStatus {
 /// A conversation restore point (spec §68). Restoring truncates the transcript
 /// back to `ordinal` messages; working-tree files are left to the user's git.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiCheckpoint {
     pub id: leveler_core::CheckpointId,
     pub label: String,
@@ -95,6 +100,7 @@ pub struct UiCheckpoint {
 
 /// A tool invocation that was still running when a client took its snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiActiveToolCall {
     pub id: ToolCallId,
     pub name: String,
@@ -103,6 +109,7 @@ pub struct UiActiveToolCall {
 
 /// A one-line session summary for the Sessions screen (spec §52).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiSessionSummary {
     pub id: SessionId,
     pub goal: String,
@@ -119,6 +126,7 @@ pub struct UiSessionSummary {
 
 /// Everything a client needs to render a session's header and transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiSessionSnapshot {
     pub id: SessionId,
     pub repository: String,

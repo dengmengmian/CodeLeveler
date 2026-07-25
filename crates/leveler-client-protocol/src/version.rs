@@ -15,6 +15,7 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor:
 /// A semantic-ish protocol version. Same `major` = compatible; `minor` is
 /// forward/backward compatible within a major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
@@ -42,6 +43,7 @@ pub enum ProtocolError {
 /// snapshot). Local command issuance and future remote transports both validate
 /// this envelope before dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProtocolEnvelope<T> {
     pub protocol: ProtocolVersion,
     pub body: T,

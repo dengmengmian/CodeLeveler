@@ -1,0 +1,793 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ClientCommand",
+  "description": "A command from a UI client to the runtime.",
+  "oneOf": [
+    {
+      "description": "Submit a user message; the runtime drives a turn in the given session.",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "attachments": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AttachmentRef"
+          }
+        },
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "submit_message"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Run an explicit goal task. Unlike ordinary chat messages, this enables goal-mode completion (`update_goal`) in the agent loop.",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "run_goal"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import a file as an attachment; the runtime processes and stores it.",
+      "type": "object",
+      "required": [
+        "path",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "add_attachment"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import an attachment from immutable base64-encoded bytes already read by a trusted client. This avoids reopening an ambient path after a security-sensitive upload or file-picker validation.",
+      "type": "object",
+      "required": [
+        "data_base64",
+        "name",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "data_base64": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "add_attachment_data"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import an image from the system clipboard (spec §38.1).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "add_clipboard_image"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Cooperatively cancel the running turn (graceful; resumable).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_current_turn"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Escalate a cancel the user has already requested once.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "force_cancel_current_turn"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Resolve a pending permission request .",
+      "type": "object",
+      "required": [
+        "decision",
+        "request_id",
+        "type"
+      ],
+      "properties": {
+        "decision": {
+          "$ref": "#/definitions/ApprovalDecision"
+        },
+        "request_id": {
+          "$ref": "#/definitions/ApprovalId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "approval_decision"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Answer a pending clarification (spec §35). An empty answer means \"skip\".",
+      "type": "object",
+      "required": [
+        "answer",
+        "request_id",
+        "type"
+      ],
+      "properties": {
+        "answer": {
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "#/definitions/ClarificationId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "answer_clarification"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Switch the model used for subsequent turns .",
+      "type": "object",
+      "required": [
+        "model",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "model": {
+          "$ref": "#/definitions/ModelRef"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "select_model"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Switch the execution mode used for subsequent turns .",
+      "type": "object",
+      "required": [
+        "mode",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/PermissionProfile"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "set_permission_profile"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced|delivery; collaboration = chat|plan|goal.",
+      "type": "object",
+      "required": [
+        "collaboration",
+        "session_id",
+        "type",
+        "work_profile"
+      ],
+      "properties": {
+        "collaboration": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "set_product_axes"
+          ]
+        },
+        "work_profile": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Confirm a collaboration-plan proposal and auto-enter goal mode (K24).",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "description": "Optional plan body; empty uses the last assistant proposal text.",
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "confirm_plan_to_goal"
+          ]
+        }
+      }
+    },
+    {
+      "description": "List project durable memory (active; optional archived) for TUI/CLI.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "include_archived": {
+          "description": "Include archived (forgotten) entries.",
+          "default": false,
+          "type": "boolean"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "list_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Archive (forget) one active memory id — user-authoritative (no model).",
+      "type": "object",
+      "required": [
+        "id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "forget_memory"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Choose whether turns run the direct tool loop or the full orchestrated state machine (Understand to Plan to Execute to Verify to Review).",
+      "type": "object",
+      "required": [
+        "orchestrate",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "orchestrate": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "set_agent_mode"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Recompute and push the working-tree diff.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "request_diff"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Summarize and compact the conversation history (spec §28, §53).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "compact_context"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Start a fresh conversation: drop the session's stored message history so the next turn carries no prior context (a real \"new chat\", not a screen clear).",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "clear_conversation"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Ask for the list of stored sessions (spec §52).",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "request_session_list"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Ask for the session list and route the response only to the requesting session's event stream.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "request_session_list_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Open a stored session, loading its transcript into the view.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "open_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Open a stored session on behalf of another currently displayed session. The switch event is delivered to the requester before the client moves its subscription to the target.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "open_session_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Delete a stored session.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "delete_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Delete a stored session and route the refreshed list to the requester.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "delete_session_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Rename a stored session (overwrite its goal/title text).",
+      "type": "object",
+      "required": [
+        "name",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "rename_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Archive a stored session: it keeps its transcript but leaves the default session list.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "archive_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fork a stored session: create a new session with a copy of the transcript, so an alternative direction can be explored without touching the original.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "fork_session"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Restore the conversation to a checkpoint (spec §68).",
+      "type": "object",
+      "required": [
+        "checkpoint_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "checkpoint_id": {
+          "$ref": "#/definitions/CheckpointId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "restore_checkpoint"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Side question (`/btw`): single-turn answer using current session context, without tools and without appending to the transcript store.",
+      "type": "object",
+      "required": [
+        "question",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "question": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "quit"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "ApprovalDecision": {
+      "type": "string",
+      "enum": [
+        "approve_once",
+        "approve_session",
+        "approve_always",
+        "deny"
+      ]
+    },
+    "ApprovalId": {
+      "description": "Identifies a pending permission approval request.",
+      "type": "string"
+    },
+    "AttachmentId": {
+      "description": "Identifies a pending or sent attachment.",
+      "type": "string"
+    },
+    "AttachmentKind": {
+      "description": "The kind of attachment.",
+      "type": "string",
+      "enum": [
+        "image",
+        "text_file",
+        "document",
+        "unknown"
+      ]
+    },
+    "AttachmentRef": {
+      "description": "A reference to a processed, stored attachment (spec §39). Carries only metadata; the bytes are addressed by `sha256` in the media store.",
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "mime_type",
+        "name",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "height": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "id": {
+          "$ref": "#/definitions/AttachmentId"
+        },
+        "kind": {
+          "$ref": "#/definitions/AttachmentKind"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Content-address of the processed bytes in the media store.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "width": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CheckpointId": {
+      "description": "Identifies a conversation checkpoint (restore point).",
+      "type": "string"
+    },
+    "ClarificationId": {
+      "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "A provider + model pair. The rest of the system routes on this, never on a bare model-name string.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      }
+    },
+    "PermissionProfile": {
+      "type": "string",
+      "enum": [
+        "request_approval",
+        "assisted",
+        "full_access"
+      ]
+    },
+    "SessionId": {
+      "description": "Identifies a single agent session (one user goal end to end).",
+      "type": "string"
+    }
+  }
+}

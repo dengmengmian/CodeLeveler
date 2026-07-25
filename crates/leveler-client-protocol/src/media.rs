@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Identifies a pending or sent attachment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachmentId(String);
 
 impl AttachmentId {
@@ -28,6 +29,7 @@ impl std::fmt::Display for AttachmentId {
 
 /// The kind of attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
     Image,
@@ -39,6 +41,7 @@ pub enum AttachmentKind {
 /// A reference to a processed, stored attachment (spec §39). Carries only
 /// metadata; the bytes are addressed by `sha256` in the media store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachmentRef {
     pub id: AttachmentId,
     pub kind: AttachmentKind,

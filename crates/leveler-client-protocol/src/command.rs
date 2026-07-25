@@ -14,6 +14,7 @@ use super::{ApprovalDecision, PermissionProfile};
 
 /// A command from a UI client to the runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCommand {
     /// Submit a user message; the runtime drives a turn in the given session.
