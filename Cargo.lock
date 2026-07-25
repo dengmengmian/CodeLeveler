@@ -2117,6 +2117,7 @@ version = "0.1.4"
 dependencies = [
  "base64",
  "chrono",
+ "leveler-client-protocol",
  "ring",
  "serde",
  "serde_json",

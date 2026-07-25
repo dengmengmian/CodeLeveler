@@ -17,6 +17,13 @@ chrono = { workspace = true }
 # Ed25519 + SHA-256. `ring` is already linked through rustls/reqwest, so the
 # signing layer adds no new crate to the supply chain.
 ring = { workspace = true }
+leveler-client-protocol = { workspace = true, optional = true }
+
+[features]
+# The remote capability gate. Pulls in the client protocol because the policy is
+# a decision *about* `ClientCommand`. Off by default so a relay — which must
+# never enforce policy, only route — gets the framing types alone.
+policy = ["dep:leveler-client-protocol"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -282,7 +282,7 @@ stateDiagram-v2
 | --- | --- |
 | Single-flight | 同一 `runtime_id` 同时最多 **一个** `pending_*` pairing；新 `PairBegin` 取消旧 pending |
 | APP 不能自确认 | 无 agent 确认则永不 `active` |
-| **Scope（配对时选择）** | `interactive`（默认，allowlist 控制）或 `observe`（只收 event/snapshot，**拒一切** mutating deliver） |
+| **Scope（配对时选择）** | `interactive`（默认，allowlist 控制）或 `observe`（只收 event/snapshot，**拒一切 deliver**——包括 `RequestSessionList` 这类只读命令；与 §Capability model 一致） |
 | 并发 | 第二台手机可另开 pairing（前一 active 保留）；不自动踢除非 revoke |
 | TOFU | accept **一次性**绑定 pubkey；见上表 |
 
@@ -1239,12 +1239,17 @@ pub enum ClientOrigin {
 - **写 fixture 时发现并修正的实质问题：** 原本把「原样转发到另一 host」与「中继改写 recipient 以迁就目标」当成一条向量。二者判定不同（`recipient_mismatch` vs `signature_invalid`），且**只有后者**能证明 `recipient_id` 确实在签名输入内——已拆为两条独立向量。
 - **未做：** 本 crate 只提供纯函数式验签，**不含** seq 重放窗口的有状态跟踪与 `(device_id, nonce)` 去重（属 PR5 agent / PR6 relay 的运行期状态）。`stream_id` 与 `seq` 已在签名覆盖内，是那层的前提而非替代。
 
-### PR3 — 穷尽 remote policy（TDD）
+### PR3 — 穷尽 remote policy（TDD）✅ 已完成
 
 - **Title:** `remote allowlist: exhaustive ClientCommand + nested decisions`
 - **Affects:** policy 模块（crate 归属 PR2 或 agent）
 - **Deps:** PR2 可选
 - **DoD:** 每个 ClientCommand 变体测试；ApproveAlways/FullAccess 红绿；observe scope；**远程 Deny AddAttachmentData**
+- **实测：** 落在 `leveler-remote-protocol::policy`，置于**默认关**的 `policy` feature 之后——policy 必须依赖 `leveler-client-protocol`（它是关于 `ClientCommand` 的判断），而 relay **只路由不执法**，feature 门让 relay 仍只拿到 framing 类型。全部 31 变体逐条测试，与本文穷尽表一致。
+- **默认拒绝的牙口已验：** 临时新增一个变体 → `E0004: non-exhaustive patterns` **编译失败**（match 无 wildcard 分支），即设计要求的「新 variant 编译失败」，随后还原。
+- **完整性交叉校验：** 测试把 policy 分类表与 PR1 导出的 `schemas/client_command.schema.json` 比对，漏分类某个命令会在此处失败——让 PR1 的产物承担实际防护，而非仅作文档。
+- **嵌套过滤：** `ApproveAlways` → `approval_decision_not_allowed_remote`（另三种决策放行）；`FullAccess` → `permission_profile_not_allowed_remote`，仅本机 `allow_full_access` 可开。拒绝码区分命令层与嵌套层，便于 APP 给出准确文案。
+- **顺带修正的文档矛盾：** `observe` 原在两处写法不一——配对状态机说「拒一切 **mutating** deliver」，能力模型说「**所有** deliver deny」。对 `RequestSessionList` 这类只读命令结论相反。已统一为**全拒**（取能力模型这一 policy 规范章节的读法，也是更安全的一侧），两处措辞同步。
 
 ### PR4 — ClientOrigin + remote approval timeout hooks
 

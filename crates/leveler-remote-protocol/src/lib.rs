@@ -27,6 +27,8 @@ pub mod auth;
 mod envelope;
 mod keys;
 pub mod pairing;
+#[cfg(feature = "policy")]
+pub mod policy;
 pub mod tunnel;
 
 pub use envelope::{
