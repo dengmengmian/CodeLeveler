@@ -223,10 +223,10 @@ pub fn collect_turn_candidates(
     if let Some(o) = store.propose_from_user_text(user_text)? {
         out.push(o);
     }
-    if let Some(root) = repo_root {
-        if let Some(o) = store.propose_package_manager(root)? {
-            out.push(o);
-        }
+    if let Some(root) = repo_root
+        && let Some(o) = store.propose_package_manager(root)?
+    {
+        out.push(o);
     }
     Ok(out)
 }

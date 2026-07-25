@@ -187,14 +187,14 @@ fn extract_remember_body(text: &str) -> Option<String> {
 
     let lower = trimmed.to_ascii_lowercase();
     for prefix in ["please remember", "remember"] {
-        if let Some(idx) = lower.find(prefix) {
-            if idx == 0 {
-                let rest = trimmed[prefix.len()..]
-                    .trim_start_matches([':', ' ', '\t', '：'])
-                    .trim();
-                if !rest.is_empty() {
-                    return Some(rest.to_string());
-                }
+        if let Some(idx) = lower.find(prefix)
+            && idx == 0
+        {
+            let rest = trimmed[prefix.len()..]
+                .trim_start_matches([':', ' ', '\t', '：'])
+                .trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
             }
         }
     }
