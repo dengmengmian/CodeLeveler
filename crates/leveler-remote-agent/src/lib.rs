@@ -13,6 +13,8 @@
 
 mod bridge;
 mod devices;
+mod tunnel;
 
 pub use bridge::{AdmissionError, Admitted, AgentBridge};
 pub use devices::{TrustError, TrustedDevices};
+pub use tunnel::{TunnelError, run_tunnel};

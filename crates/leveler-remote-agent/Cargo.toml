@@ -19,8 +19,14 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = "0.26"
 
 [dev-dependencies]
 tokio = { workspace = true }
+leveler-relay = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"

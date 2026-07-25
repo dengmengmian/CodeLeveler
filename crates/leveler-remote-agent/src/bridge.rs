@@ -193,6 +193,46 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
         &self.devices
     }
 
+    /// A session snapshot, for answering a device's snapshot request.
+    pub async fn snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<leveler_client_protocol::UiSessionSnapshot, AdmissionError> {
+        self.runtime
+            .snapshot(session_id)
+            .await
+            .map_err(|error| AdmissionError::Runtime(error.to_string()))
+    }
+
+    /// Sign an outbound frame with the runtime key.
+    ///
+    /// Exposed so the tunnel can sign session downstream frames without holding
+    /// the key itself — one place owns it, and the transport is not it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_downstream(
+        &self,
+        runtime_id: &str,
+        device_id: &str,
+        stream_id: &str,
+        seq: u64,
+        ts: &str,
+        content_type: ContentType,
+        payload: &[u8],
+    ) -> Result<SignedEnvelope, AdmissionError> {
+        SignedEnvelope::sign(
+            &self.runtime_key,
+            Sender::Runtime,
+            runtime_id,
+            device_id,
+            stream_id,
+            seq,
+            ts,
+            content_type,
+            payload,
+        )
+        .map_err(AdmissionError::Envelope)
+    }
+
     /// Admit one upstream frame.
     ///
     /// `relay_claimed_pubkey` is whatever the relay attached, if anything; it

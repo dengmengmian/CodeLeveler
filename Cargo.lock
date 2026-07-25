@@ -2138,17 +2138,22 @@ name = "leveler-remote-agent"
 version = "0.1.4"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
  "chrono",
+ "futures-util",
  "leveler-client-protocol",
  "leveler-local-transport",
+ "leveler-relay",
  "leveler-remote-protocol",
  "leveler-session-wire",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tracing",
 ]
 

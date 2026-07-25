@@ -1274,7 +1274,14 @@ pub enum ClientOrigin {
   - **不依赖 `leveler-web`** ✅，session framing 取自 PR0 的 `leveler-session-wire`。
 - **牙口已验：** 本 PR 我是实现与测试同写、**未观察到红**，故补做验证——把实现改成「relay 给了密钥就用它」，`a_relay_supplied_key_is_never_used_to_verify` 单条转红、其余 10 条仍绿，随后还原。
 - **signed `rpc_response` 与假 relay 端到端已补齐（追加 6 测试，共 17 绿）：** `create_session` / `snapshot` 返回 **runtime 签名**信封，APP 用 QR 锚定的 `runtime_pubkey` 验签。负例覆盖：relay 自撰响应、relay 篡改响应体、以及**响应错配**（响应复用请求的 `rpc:{uuid}` stream_id，该值在签名内，故 relay 无法拿另一请求的合法响应来顶替）。`upload_attachment` 显式返回未实现而非静默成功——否则 APP 会以为附件已入库。
-- **未完成（PR5 剩余）：** 真实 WSS 隧道客户端与 `AgentToRelay`/`RelayToAgent` 帧收发循环；`upload_attachment` 的 agent 侧实现；审批超时定时器接线（PR4 的状态机与 waiter 计数**仍未被调用**）。当前 crate **尚无任何网络代码**，是可被隧道调用的纯函数。
+- **隧道客户端已补齐（PR5 收尾）：** `run_tunnel` 出站连 relay，处理 `open_stream` / `forward_upstream` / `rpc_request` / `close_stream`，回送 runtime 签名的 `forward_downstream` 与 `rpc_response`。拒绝也会**签名回送**给设备（带 `command_id` 关联）——手机若什么都收不到，无法区分"被拒"与"丢了"。
+- **端到端首次真正跑通（5 测试绿，`tests/end_to_end.rs`）：** 真 `leveler-relay` router + 真 agent 隧道 + 真 Ed25519 签名的假手机，只有 runtime 是假的（否则无法断言"什么没到达"）。
+  - 手机 `SubmitMessage` 穿过不受信 relay 抵达 runtime，回程 ack 被手机用 QR 锚定的 `runtime_pubkey` 验签 ✅
+  - `ApproveAlways` 在链路末端被拒，**runtime 收到 0 条命令** ✅
+  - relay 用自己的密钥伪造帧 → `signature_invalid`，未触达 runtime ✅
+  - snapshot 请求返回 runtime 签名的会话状态 ✅
+  - observe 配对全程无法投递 ✅
+- **未完成（PR5 剩余）：** 运行时**事件流**下行（手机目前收不到助手输出，只有 ack/error/snapshot）；`upload_attachment` 的 agent 侧实现；审批超时定时器接线（PR4 的状态机与 waiter 计数**仍未被调用**）。
 - **接口形状：** `project_id` 尚未预留，留待 PR5b 与 ProjectRouter 一并引入。
 
 ### PR5b — ProjectRouter：多已打开项目
