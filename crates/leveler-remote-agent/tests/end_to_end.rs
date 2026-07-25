@@ -17,6 +17,7 @@ use leveler_client_protocol::{
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
 use leveler_relay::{RelayState, build_router};
 use leveler_remote_agent::{AgentBridge, TrustedDevices, run_tunnel};
+use leveler_remote_protocol::auth::{RUNTIME_AUTH_HEADER, runtime_action};
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::{
     ContentType, Sender, SignedEnvelope, SigningKey, VerifyParams, VerifyingKey,
@@ -29,6 +30,23 @@ const DEVICE_SEED: [u8; 32] = [61u8; 32];
 const RUNTIME_SEED: [u8; 32] = [62u8; 32];
 const RUNTIME_ID: &str = "rt_host";
 const DEVICE_ID: &str = "dev_phone";
+/// The secret the relay's operator configured; the host presents it once, to
+/// enroll.
+const ENROLLMENT_SECRET: &str = "operator-secret";
+
+/// The header the host signs its own control-plane requests with.
+fn runtime_auth(key: &SigningKey, action: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = format!("n{}", NEXT.fetch_add(1, Ordering::SeqCst));
+    leveler_remote_protocol::auth::RuntimeAssertion::header_value(
+        key,
+        action,
+        RUNTIME_ID,
+        &now_stamp(),
+        &nonce,
+    )
+}
 /// The agent stamps its own frames with the real clock, because the relay
 /// checks registration freshness against it.
 fn now_stamp() -> String {
@@ -99,7 +117,7 @@ struct Chain {
 
 async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
     // The relay, as a real process would run it.
-    let state = RelayState::new();
+    let state = RelayState::with_enrollment_secret(ENROLLMENT_SECRET);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = build_router(state.clone());
@@ -112,9 +130,29 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
     let device_key = SigningKey::from_seed(&DEVICE_SEED).unwrap();
     let client = reqwest::Client::new();
     let http = format!("http://{base}");
+    let host_key = SigningKey::from_seed(&RUNTIME_SEED).unwrap();
+    let enrolled = client
+        .post(format!("{http}/v1/runtimes/enroll"))
+        .bearer_auth(ENROLLMENT_SECRET)
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&host_key, runtime_action::ENROLL),
+        )
+        .json(&json!({
+            "runtime_id": RUNTIME_ID,
+            "runtime_pubkey": host_key.verifying_key().to_base64url()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enrolled.status(), 204, "the host enrolls with the relay");
     let begin: serde_json::Value = client
         .post(format!("{http}/v1/pair/begin"))
-        .json(&json!({"runtime_id": RUNTIME_ID, "runtime_pubkey": SigningKey::from_seed(&RUNTIME_SEED).unwrap().verifying_key().to_base64url()}))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&host_key, runtime_action::PAIR_BEGIN),
+        )
+        .json(&json!({"runtime_id": RUNTIME_ID}))
         .send()
         .await
         .unwrap()
@@ -139,6 +177,10 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
         .unwrap();
     client
         .post(format!("{http}/v1/pair/confirm"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&host_key, runtime_action::PAIR_CONFIRM),
+        )
         .json(&json!({
             "runtime_id": RUNTIME_ID,
             "pairing_id": complete["pairing_id"].as_str().unwrap(),

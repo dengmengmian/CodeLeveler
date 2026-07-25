@@ -6,14 +6,109 @@
 
 use leveler_relay::{RelayState, build_router};
 use leveler_remote_protocol::SigningKey;
-use leveler_remote_protocol::auth::SessionAuthRequest;
+use leveler_remote_protocol::auth::{
+    RUNTIME_AUTH_HEADER, RuntimeAssertion, SessionAuthRequest, runtime_action,
+};
 use serde_json::json;
 use tokio::sync::mpsc;
 
 const DEVICE_SEED: [u8; 32] = [70u8; 32];
+const RUNTIME_SEED: [u8; 32] = [71u8; 32];
+/// What an operator configures on their own relay.
+const ENROLLMENT_SECRET: &str = "operator-secret";
 
 fn device_key() -> SigningKey {
     SigningKey::from_seed(&DEVICE_SEED).unwrap()
+}
+
+/// The key a developer machine enrolls and then signs its control-plane
+/// requests with. Distinct per machine, so a test that crosses machines cannot
+/// pass by accident on a shared key.
+fn runtime_key(runtime_id: &str) -> SigningKey {
+    let mut seed = RUNTIME_SEED;
+    seed[0] = runtime_id
+        .bytes()
+        .fold(0u8, |accumulated, byte| accumulated.wrapping_add(byte));
+    SigningKey::from_seed(&seed).unwrap()
+}
+
+/// A fresh nonce per assertion, since the relay spends each one exactly once.
+fn nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("n{}", NEXT.fetch_add(1, Ordering::SeqCst))
+}
+
+/// The header a runtime attaches to prove a control-plane request is its own.
+fn runtime_auth(key: &SigningKey, action: &str, runtime_id: &str) -> String {
+    RuntimeAssertion::header_value(key, action, runtime_id, &now_stamp(), &nonce())
+}
+
+/// Register a machine's public key with the relay, the way an operator would.
+async fn enroll(client: &reqwest::Client, base: &str, runtime_id: &str, key: &SigningKey) {
+    let response = client
+        .post(format!("{base}/v1/runtimes/enroll"))
+        .bearer_auth(ENROLLMENT_SECRET)
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(key, runtime_action::ENROLL, runtime_id),
+        )
+        .json(&json!({
+            "runtime_id": runtime_id,
+            "runtime_pubkey": key.verifying_key().to_base64url(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204, "enrollment should succeed");
+}
+
+/// Begin a pairing as the enrolled runtime does, returning the one-shot secret.
+async fn begin_pairing(client: &reqwest::Client, base: &str, runtime_id: &str) -> String {
+    let response = client
+        .post(format!("{base}/v1/pair/begin"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(
+                &runtime_key(runtime_id),
+                runtime_action::PAIR_BEGIN,
+                runtime_id,
+            ),
+        )
+        .json(&json!({"runtime_id": runtime_id}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "pair/begin should succeed");
+    let body: serde_json::Value = response.json().await.unwrap();
+    body["pairing_secret"].as_str().unwrap().to_string()
+}
+
+/// Accept a pending pairing as the host user does.
+async fn confirm_pairing(
+    client: &reqwest::Client,
+    base: &str,
+    runtime_id: &str,
+    pairing_id: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{base}/v1/pair/confirm"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(
+                &runtime_key(runtime_id),
+                runtime_action::PAIR_CONFIRM,
+                runtime_id,
+            ),
+        )
+        .json(&json!({
+            "runtime_id": runtime_id,
+            "pairing_id": pairing_id,
+            "decision": "accept"
+        }))
+        .send()
+        .await
+        .unwrap()
 }
 
 fn now_stamp() -> String {
@@ -39,6 +134,21 @@ fn device_auth_body(device_id: &str, runtime_id: &str, nonce: &str) -> serde_jso
     })
 }
 
+/// The refresh body, including the device assertion the relay requires.
+fn refresh_body(device_id: &str, refresh_token: &str) -> serde_json::Value {
+    let timestamp = now_stamp();
+    let input =
+        leveler_remote_protocol::auth::DeviceAssertion::signing_input(device_id, &timestamp);
+    json!({
+        "refresh_token": refresh_token,
+        "device_assertion": {
+            "device_id": device_id,
+            "timestamp": timestamp,
+            "sig": b64(&device_key().sign_detached(input.as_bytes())),
+        }
+    })
+}
+
 /// Register a runtime as online the way the tunnel does, keeping the receiver
 /// alive so the route stays valid for the duration of the test.
 fn bring_online(
@@ -53,7 +163,7 @@ fn bring_online(
 
 /// Start the router on an ephemeral port and return its base URL.
 async fn serve() -> (String, RelayState) {
-    let state = RelayState::new();
+    let state = RelayState::with_enrollment_secret(ENROLLMENT_SECRET);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = build_router(state.clone());
@@ -70,16 +180,8 @@ async fn pair_device(
     runtime_id: &str,
     device_id: &str,
 ) -> String {
-    let begin: serde_json::Value = client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": runtime_id, "runtime_pubkey": device_key().verifying_key().to_base64url()}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let secret = begin["pairing_secret"].as_str().unwrap().to_string();
+    enroll(client, base, runtime_id, &runtime_key(runtime_id)).await;
+    let secret = begin_pairing(client, base, runtime_id).await;
 
     let complete = client
         .post(format!("{base}/v1/pair/complete"))
@@ -98,16 +200,7 @@ async fn pair_device(
     let complete: serde_json::Value = complete.json().await.unwrap();
     let pairing_id = complete["pairing_id"].as_str().unwrap().to_string();
 
-    let confirm = client
-        .post(format!("{base}/v1/pair/confirm"))
-        .json(&json!({
-            "runtime_id": runtime_id,
-            "pairing_id": pairing_id,
-            "decision": "accept"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let confirm = confirm_pairing(client, base, runtime_id, &pairing_id).await;
     assert_eq!(confirm.status(), 204);
 
     let auth: serde_json::Value = client
@@ -132,16 +225,8 @@ async fn a_device_cannot_activate_its_own_pairing() {
     let (base, state) = serve().await;
     let client = reqwest::Client::new();
 
-    let begin: serde_json::Value = client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let secret = begin["pairing_secret"].as_str().unwrap();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    let secret = begin_pairing(&client, &base, "rt_a").await;
 
     client
         .post(format!("{base}/v1/pair/complete"))
@@ -170,12 +255,8 @@ async fn a_device_cannot_activate_its_own_pairing() {
 async fn a_wrong_pairing_secret_is_refused() {
     let (base, _state) = serve().await;
     let client = reqwest::Client::new();
-    client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
-        .send()
-        .await
-        .unwrap();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    begin_pairing(&client, &base, "rt_a").await;
 
     let wrong = client
         .post(format!("{base}/v1/pair/complete"))
@@ -331,6 +412,10 @@ async fn revoking_a_device_invalidates_its_tokens_at_once() {
 
     let revoke = client
         .delete(format!("{base}/v1/devices/dev_a?runtime_id=rt_a"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&runtime_key("rt_a"), runtime_action::DEVICE_REVOKE, "rt_a"),
+        )
         .send()
         .await
         .unwrap();
@@ -365,12 +450,21 @@ async fn a_runtime_cannot_revoke_another_runtimes_device() {
     let client = reqwest::Client::new();
     pair_device(&client, &base, "rt_a", "dev_a").await;
 
+    enroll(&client, &base, "rt_b", &runtime_key("rt_b")).await;
     let response = client
         .delete(format!("{base}/v1/devices/dev_a?runtime_id=rt_b"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&runtime_key("rt_b"), runtime_action::DEVICE_REVOKE, "rt_b"),
+        )
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 404);
+    assert_eq!(
+        response.status(),
+        404,
+        "rt_b is a legitimate machine, but this is not its device"
+    );
 }
 
 /// Refresh rotates, and replaying a spent token is treated as theft rather than
@@ -380,16 +474,8 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
     let (base, state) = serve().await;
     let client = reqwest::Client::new();
 
-    let begin: serde_json::Value = client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let secret = begin["pairing_secret"].as_str().unwrap().to_string();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    let secret = begin_pairing(&client, &base, "rt_a").await;
     let complete: serde_json::Value = client
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
@@ -402,16 +488,13 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
         .json()
         .await
         .unwrap();
-    client
-        .post(format!("{base}/v1/pair/confirm"))
-        .json(&json!({
-            "runtime_id": "rt_a",
-            "pairing_id": complete["pairing_id"].as_str().unwrap(),
-            "decision": "accept"
-        }))
-        .send()
-        .await
-        .unwrap();
+    confirm_pairing(
+        &client,
+        &base,
+        "rt_a",
+        complete["pairing_id"].as_str().unwrap(),
+    )
+    .await;
     let auth: serde_json::Value = client
         .post(format!("{base}/v1/auth/session"))
         .json(&device_auth_body("dev_a", "rt_a", &format!("n{}", line!())))
@@ -426,7 +509,7 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
 
     let rotated: serde_json::Value = client
         .post(format!("{base}/v1/auth/refresh"))
-        .json(&json!({"refresh_token": first_refresh}))
+        .json(&refresh_body("dev_a", &first_refresh))
         .send()
         .await
         .unwrap()
@@ -443,7 +526,7 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
     // Replay the spent one.
     let replay = client
         .post(format!("{base}/v1/auth/refresh"))
-        .json(&json!({"refresh_token": first_refresh}))
+        .json(&refresh_body("dev_a", &first_refresh))
         .send()
         .await
         .unwrap();
@@ -473,23 +556,9 @@ async fn beginning_a_second_pairing_retires_the_first_secret() {
     let (base, _state) = serve().await;
     let client = reqwest::Client::new();
 
-    let first: serde_json::Value = client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let stale = first["pairing_secret"].as_str().unwrap().to_string();
-
-    client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
-        .send()
-        .await
-        .unwrap();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    let stale = begin_pairing(&client, &base, "rt_a").await;
+    begin_pairing(&client, &base, "rt_a").await;
 
     let response = client
         .post(format!("{base}/v1/pair/complete"))
@@ -511,21 +580,14 @@ async fn the_pending_confirmation_exposes_the_device_public_key() {
     let (base, _state) = serve().await;
     let client = reqwest::Client::new();
 
-    let begin: serde_json::Value = client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    let secret = begin_pairing(&client, &base, "rt_a").await;
     client
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
             "device_id": "dev_a", "device_pubkey": "the-real-key", "device_name": "iPhone",
             "platform": "ios",
-            "pairing_secret": begin["pairing_secret"].as_str().unwrap(),
+            "pairing_secret": secret,
             "scope": "interactive"
         }))
         .send()
@@ -534,6 +596,10 @@ async fn the_pending_confirmation_exposes_the_device_public_key() {
 
     let pending: serde_json::Value = client
         .get(format!("{base}/v1/pair/pending?runtime_id=rt_a"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&runtime_key("rt_a"), runtime_action::PAIR_PENDING, "rt_a"),
+        )
         .send()
         .await
         .unwrap()
@@ -603,28 +669,22 @@ async fn an_auth_assertion_cannot_be_replayed() {
     );
 }
 
-/// A runtime id is a name, not a credential. Binding the key on first use means
-/// a later claim signed by a different key is refused rather than treated as a
-/// rotation.
+/// A runtime id is a name, not a credential. Once a machine is enrolled, a claim
+/// signed by a different key is refused rather than treated as a rotation.
 #[tokio::test]
-async fn a_runtime_id_cannot_be_rebound_to_another_key() {
+async fn an_enrolled_runtime_id_cannot_be_rebound_to_another_key() {
     let (base, _state) = serve().await;
     let client = reqwest::Client::new();
-
-    let first = client
-        .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({
-            "runtime_id": "rt_a",
-            "runtime_pubkey": device_key().verifying_key().to_base64url()
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(first.status().is_success());
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
 
     let impostor = SigningKey::from_seed(&[124u8; 32]).unwrap();
     let hijack = client
-        .post(format!("{base}/v1/pair/begin"))
+        .post(format!("{base}/v1/runtimes/enroll"))
+        .bearer_auth(ENROLLMENT_SECRET)
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&impostor, runtime_action::ENROLL, "rt_a"),
+        )
         .json(&json!({
             "runtime_id": "rt_a",
             "runtime_pubkey": impostor.verifying_key().to_base64url()
@@ -637,4 +697,294 @@ async fn a_runtime_id_cannot_be_rebound_to_another_key() {
         401,
         "claiming another machine's runtime id must be refused"
     );
+}
+
+/// Enrollment is the one moment the relay learns a `runtime_id → pubkey`
+/// binding. Trust-on-first-use would grant that binding to whoever asked first:
+/// anyone able to reach the relay could become a host on it.
+#[tokio::test]
+async fn enrolling_requires_the_operators_secret() {
+    let (base, state) = serve().await;
+    let client = reqwest::Client::new();
+    let key = runtime_key("rt_a");
+
+    for authorization in [None, Some("not-the-secret")] {
+        let mut request = client
+            .post(format!("{base}/v1/runtimes/enroll"))
+            .header(
+                RUNTIME_AUTH_HEADER,
+                runtime_auth(&key, runtime_action::ENROLL, "rt_a"),
+            )
+            .json(&json!({
+                "runtime_id": "rt_a",
+                "runtime_pubkey": key.verifying_key().to_base64url()
+            }));
+        if let Some(secret) = authorization {
+            request = request.bearer_auth(secret);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 401, "secret {authorization:?}");
+    }
+
+    assert!(
+        state.runtime_key("rt_a").is_none(),
+        "a refused enrollment must not leave a binding behind"
+    );
+}
+
+/// The secret says an operator permitted this relay to gain a host; the
+/// signature says the caller actually holds the key it is registering. Without
+/// the second, anyone who learned the secret could enroll a key they control
+/// under someone else's machine name.
+#[tokio::test]
+async fn enrolling_requires_holding_the_key_being_registered() {
+    let (base, state) = serve().await;
+    let client = reqwest::Client::new();
+    let impostor = SigningKey::from_seed(&[125u8; 32]).unwrap();
+
+    let response = client
+        .post(format!("{base}/v1/runtimes/enroll"))
+        .bearer_auth(ENROLLMENT_SECRET)
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&impostor, runtime_action::ENROLL, "rt_a"),
+        )
+        // Signed by the impostor, but registering the victim's key.
+        .json(&json!({
+            "runtime_id": "rt_a",
+            "runtime_pubkey": runtime_key("rt_a").verifying_key().to_base64url()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert!(state.runtime_key("rt_a").is_none());
+}
+
+/// The hole this closes: `pair/begin` hands out the one secret that can pair a
+/// phone to a machine. Unauthenticated, anyone who learned a `runtime_id` — a
+/// name, not a credential — could take it.
+#[tokio::test]
+async fn beginning_a_pairing_requires_the_runtimes_signature() {
+    let (base, _state) = serve().await;
+    let client = reqwest::Client::new();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+
+    let unsigned = client
+        .post(format!("{base}/v1/pair/begin"))
+        .json(&json!({"runtime_id": "rt_a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), 401, "no assertion, no pairing secret");
+
+    let impostor = SigningKey::from_seed(&[126u8; 32]).unwrap();
+    let forged = client
+        .post(format!("{base}/v1/pair/begin"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&impostor, runtime_action::PAIR_BEGIN, "rt_a"),
+        )
+        .json(&json!({"runtime_id": "rt_a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 401);
+
+    // Signed for a different operation: an assertion captured from one request
+    // must not authorize another.
+    let wrong_action = client
+        .post(format!("{base}/v1/pair/begin"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&runtime_key("rt_a"), runtime_action::DEVICE_REVOKE, "rt_a"),
+        )
+        .json(&json!({"runtime_id": "rt_a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_action.status(), 401);
+}
+
+/// Confirmation is the accept the whole trust model rests on. If it were
+/// unauthenticated, a caller who claimed a pairing could also accept it, and the
+/// user at the keyboard would never see a prompt.
+#[tokio::test]
+async fn confirming_a_pairing_requires_the_runtimes_signature() {
+    let (base, state) = serve().await;
+    let client = reqwest::Client::new();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    let secret = begin_pairing(&client, &base, "rt_a").await;
+
+    let complete: serde_json::Value = client
+        .post(format!("{base}/v1/pair/complete"))
+        .json(&json!({
+            "device_id": "dev_a", "device_pubkey": device_key().verifying_key().to_base64url(),
+            "device_name": "iPhone", "platform": "ios",
+            "pairing_secret": secret, "scope": "interactive"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let self_accept = client
+        .post(format!("{base}/v1/pair/confirm"))
+        .json(&json!({
+            "runtime_id": "rt_a",
+            "pairing_id": complete["pairing_id"].as_str().unwrap(),
+            "decision": "accept"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(self_accept.status(), 401);
+    assert!(
+        state.device("dev_a").is_none(),
+        "no device record may exist without the host's own accept"
+    );
+}
+
+/// Revocation and the device list are the runtime's own resources.
+#[tokio::test]
+async fn device_administration_requires_the_runtimes_signature() {
+    let (base, _state) = serve().await;
+    let client = reqwest::Client::new();
+    pair_device(&client, &base, "rt_a", "dev_a").await;
+
+    let revoke = client
+        .delete(format!("{base}/v1/devices/dev_a?runtime_id=rt_a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        revoke.status(),
+        401,
+        "an unsigned revoke is a denial of service"
+    );
+
+    let list = client
+        .get(format!("{base}/v1/devices?runtime_id=rt_a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 401);
+}
+
+/// A captured runtime assertion stays signature-valid for its whole window.
+#[tokio::test]
+async fn a_runtime_assertion_cannot_be_replayed() {
+    let (base, _state) = serve().await;
+    let client = reqwest::Client::new();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+
+    let header = runtime_auth(&runtime_key("rt_a"), runtime_action::PAIR_BEGIN, "rt_a");
+    let first = client
+        .post(format!("{base}/v1/pair/begin"))
+        .header(RUNTIME_AUTH_HEADER, header.clone())
+        .json(&json!({"runtime_id": "rt_a"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success());
+
+    let replay = client
+        .post(format!("{base}/v1/pair/begin"))
+        .header(RUNTIME_AUTH_HEADER, header)
+        .json(&json!({"runtime_id": "rt_a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        401,
+        "the same assertion must not work twice"
+    );
+}
+
+/// A refresh token alone is a bearer credential. The design pairs it with a
+/// device assertion so a captured token cannot be spent by whoever holds it.
+#[tokio::test]
+async fn refreshing_requires_a_device_assertion() {
+    let (base, _state) = serve().await;
+    let client = reqwest::Client::new();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    let secret = begin_pairing(&client, &base, "rt_a").await;
+    let complete: serde_json::Value = client
+        .post(format!("{base}/v1/pair/complete"))
+        .json(&json!({
+            "device_id": "dev_a", "device_pubkey": device_key().verifying_key().to_base64url(),
+            "device_name": "iPhone", "platform": "ios",
+            "pairing_secret": secret, "scope": "interactive"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    confirm_pairing(
+        &client,
+        &base,
+        "rt_a",
+        complete["pairing_id"].as_str().unwrap(),
+    )
+    .await;
+    let auth: serde_json::Value = client
+        .post(format!("{base}/v1/auth/session"))
+        .json(&device_auth_body("dev_a", "rt_a", &nonce()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let refresh_token = auth["refresh_token"].as_str().unwrap().to_string();
+
+    let bare = client
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({"refresh_token": refresh_token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 401, "a stolen refresh token is not enough");
+
+    // The right shape from the wrong key fails too.
+    let impostor = SigningKey::from_seed(&[127u8; 32]).unwrap();
+    let timestamp = now_stamp();
+    let input = leveler_remote_protocol::auth::DeviceAssertion::signing_input("dev_a", &timestamp);
+    let forged = client
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({
+            "refresh_token": refresh_token,
+            "device_assertion": {
+                "device_id": "dev_a",
+                "timestamp": timestamp,
+                "sig": b64(&impostor.sign_detached(input.as_bytes())),
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 401);
+
+    // And the genuine one still works, so the check is not simply "always no".
+    let timestamp = now_stamp();
+    let input = leveler_remote_protocol::auth::DeviceAssertion::signing_input("dev_a", &timestamp);
+    let genuine = client
+        .post(format!("{base}/v1/auth/refresh"))
+        .json(&json!({
+            "refresh_token": refresh_token,
+            "device_assertion": {
+                "device_id": "dev_a",
+                "timestamp": timestamp,
+                "sig": b64(&device_key().sign_detached(input.as_bytes())),
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(genuine.status().is_success());
 }

@@ -10,7 +10,10 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use leveler_relay::{RelayState, build_router};
 use leveler_remote_protocol::SigningKey;
-use leveler_remote_protocol::auth::{AgentRegisterAssertion, SessionAuthRequest};
+use leveler_remote_protocol::auth::{
+    AgentRegisterAssertion, RUNTIME_AUTH_HEADER, RuntimeAssertion, SessionAuthRequest,
+    runtime_action,
+};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -46,8 +49,10 @@ fn urlencode(value: &str) -> String {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+const ENROLLMENT_SECRET: &str = "operator-secret";
+
 async fn serve() -> (String, RelayState) {
-    let state = RelayState::new();
+    let state = RelayState::with_enrollment_secret(ENROLLMENT_SECRET);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = build_router(state.clone());
@@ -57,12 +62,40 @@ async fn serve() -> (String, RelayState) {
     (address.to_string(), state)
 }
 
+/// The header a runtime signs its own control-plane requests with. Every test
+/// machine here shares one key; the relay's isolation is by id, not by key.
+fn runtime_auth(action: &str, runtime_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = format!("n{}", NEXT.fetch_add(1, Ordering::SeqCst));
+    RuntimeAssertion::header_value(&key(), action, runtime_id, &now_stamp(), &nonce)
+}
+
 async fn pair_device(base: &str, runtime_id: &str, device_id: &str) -> String {
     let client = reqwest::Client::new();
     let http = format!("http://{base}");
+    let enrolled = client
+        .post(format!("{http}/v1/runtimes/enroll"))
+        .bearer_auth(ENROLLMENT_SECRET)
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(runtime_action::ENROLL, runtime_id),
+        )
+        .json(&json!({
+            "runtime_id": runtime_id,
+            "runtime_pubkey": key().verifying_key().to_base64url()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enrolled.status(), 204);
     let begin: serde_json::Value = client
         .post(format!("{http}/v1/pair/begin"))
-        .json(&json!({"runtime_id": runtime_id, "runtime_pubkey": key().verifying_key().to_base64url()}))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(runtime_action::PAIR_BEGIN, runtime_id),
+        )
+        .json(&json!({"runtime_id": runtime_id}))
         .send()
         .await
         .unwrap()
@@ -85,6 +118,10 @@ async fn pair_device(base: &str, runtime_id: &str, device_id: &str) -> String {
         .unwrap();
     client
         .post(format!("{http}/v1/pair/confirm"))
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(runtime_action::PAIR_CONFIRM, runtime_id),
+        )
         .json(&json!({
             "runtime_id": runtime_id,
             "pairing_id": complete["pairing_id"].as_str().unwrap(),

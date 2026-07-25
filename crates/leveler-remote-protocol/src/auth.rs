@@ -90,6 +90,90 @@ impl AgentRegisterAssertion {
     }
 }
 
+/// Header carrying a runtime's proof on the relay's control plane.
+///
+/// Value shape: `{runtime_id}|{timestamp}|{nonce}|{sig_b64}`. Ids exclude `|`
+/// by the envelope's charset rule and standard base64 never contains it, so the
+/// four fields cannot be made ambiguous by their contents.
+pub const RUNTIME_AUTH_HEADER: &str = "x-leveler-runtime-auth";
+
+/// What a runtime signs to act on its own control-plane resources.
+///
+/// Pairing, confirmation and revocation all decide who may reach a developer's
+/// machine. Without a signature they would be authorized by nothing but a
+/// `runtime_id`, which is a name rather than a secret: anyone who learned one
+/// could mint a pairing secret for that host, claim it with their own device
+/// key, accept it on the host's behalf and hold a routing token to it. End-to-end
+/// signing still stops their frames at the agent, but the control plane would be
+/// theirs.
+///
+/// The `action` is inside the signed bytes so an assertion captured from one
+/// operation cannot be replayed against a different one.
+pub struct RuntimeAssertion;
+
+impl RuntimeAssertion {
+    /// `{action}|{runtime_id}|{timestamp}|{nonce}` — the same `|`-joined shape
+    /// and id rules as the envelope's canonical string.
+    pub fn signing_input(action: &str, runtime_id: &str, timestamp: &str, nonce: &str) -> String {
+        format!("{action}|{runtime_id}|{timestamp}|{nonce}")
+    }
+
+    /// Build the [`RUNTIME_AUTH_HEADER`] value for one request.
+    pub fn header_value(
+        key: &crate::SigningKey,
+        action: &str,
+        runtime_id: &str,
+        timestamp: &str,
+        nonce: &str,
+    ) -> String {
+        use base64::Engine as _;
+        let input = Self::signing_input(action, runtime_id, timestamp, nonce);
+        let sig =
+            base64::engine::general_purpose::STANDARD.encode(key.sign_detached(input.as_bytes()));
+        format!("{runtime_id}|{timestamp}|{nonce}|{sig}")
+    }
+
+    /// Split a header value into `(runtime_id, timestamp, nonce, sig_b64)`.
+    pub fn parse_header(value: &str) -> Option<(&str, &str, &str, &str)> {
+        let mut parts = value.splitn(4, '|');
+        let runtime_id = parts.next()?;
+        let timestamp = parts.next()?;
+        let nonce = parts.next()?;
+        let sig = parts.next()?;
+        if runtime_id.is_empty() || timestamp.is_empty() || nonce.is_empty() || sig.is_empty() {
+            return None;
+        }
+        Some((runtime_id, timestamp, nonce, sig))
+    }
+}
+
+/// The control-plane operations a [`RuntimeAssertion`] can authorize. Named
+/// constants rather than free strings so both sides sign the same word.
+pub mod runtime_action {
+    pub const ENROLL: &str = "enroll";
+    pub const PAIR_BEGIN: &str = "pair_begin";
+    pub const PAIR_PENDING: &str = "pair_pending";
+    pub const PAIR_CONFIRM: &str = "pair_confirm";
+    pub const DEVICES_LIST: &str = "devices_list";
+    pub const DEVICE_REVOKE: &str = "device_revoke";
+}
+
+/// `POST /v1/runtimes/enroll` — a machine registers its public key with the
+/// relay it will connect to.
+///
+/// Enrollment is the one moment the relay learns a `runtime_id → pubkey`
+/// binding, so it is the one moment worth authenticating. It takes the relay's
+/// configured enrollment secret (in the `Authorization: Bearer` header) *and* a
+/// signature from the key being registered: the secret says an operator
+/// permitted this relay to gain a host, the signature says the caller actually
+/// holds the key it is claiming. Trust-on-first-use would grant both to whoever
+/// asked first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollRequest {
+    pub runtime_id: String,
+    pub runtime_pubkey: String,
+}
+
 /// The protocol version a peer speaks, mirrored from the client protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersionDto {
@@ -115,6 +199,13 @@ pub struct DeviceAssertion {
     pub device_id: String,
     pub timestamp: String,
     pub sig: String,
+}
+
+impl DeviceAssertion {
+    /// `{device_id}|{timestamp}` — what the device signs on a refresh.
+    pub fn signing_input(device_id: &str, timestamp: &str) -> String {
+        format!("{device_id}|{timestamp}")
+    }
 }
 
 /// `POST /v1/auth/refresh`.

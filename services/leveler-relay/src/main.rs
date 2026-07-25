@@ -12,11 +12,24 @@ use leveler_relay::{RelayState, build_router};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    // Required, with no default: the secret is what decides which machines may
+    // become hosts on this relay. A generated or empty fallback would turn a
+    // missing configuration into an open enrollment endpoint, which is precisely
+    // the failure this refuses to have.
+    let enrollment_secret = std::env::var("LEVELER_RELAY_ENROLLMENT_SECRET").map_err(|_| {
+        "LEVELER_RELAY_ENROLLMENT_SECRET is required: it is the secret a developer machine \
+         presents to enroll. Generate one with `openssl rand -base64 32`."
+    })?;
+    if enrollment_secret.len() < 16 {
+        return Err("LEVELER_RELAY_ENROLLMENT_SECRET must be at least 16 characters".into());
+    }
+
     let address =
         std::env::var("LEVELER_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!(%address, "leveler-relay listening");
 
-    axum::serve(listener, build_router(RelayState::new())).await?;
+    let state = RelayState::with_enrollment_secret(&enrollment_secret);
+    axum::serve(listener, build_router(state)).await?;
     Ok(())
 }

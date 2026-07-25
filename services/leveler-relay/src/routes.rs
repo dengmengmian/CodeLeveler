@@ -1,14 +1,17 @@
 //! HTTP surface.
 //!
 //! Two audiences with different authentication, kept apart on purpose. A
-//! *runtime* proves itself by naming its id on the agent tunnel and manages its
-//! own pairings and devices. A *device* presents a routing token and can reach
-//! only the one host it is paired to.
+//! *runtime* enrolls its public key once against the operator's secret and
+//! signs every later request about its own pairings and devices. A *device*
+//! presents a routing token and can reach only the one host it is paired to.
 //!
-//! The pairing endpoints are the sensitive ones: `/pair/complete` is reachable
-//! without any credential (that is the point — a fresh phone has none), so it
+//! Exactly one endpoint is reachable without a credential: `/pair/complete`,
+//! because a fresh phone has none — that is what the pairing secret is for. It
 //! compares secrets in constant time and answers failures identically whether
-//! the secret was wrong or absent.
+//! the secret was wrong or absent. Everything else on the runtime side is
+//! signed, since a `runtime_id` is a name and naming one must not be enough to
+//! mint a pairing secret for that machine, accept a pairing on its behalf, or
+//! revoke its devices.
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -19,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use leveler_remote_protocol::VerifyingKey;
 use leveler_remote_protocol::auth::{
-    ACCESS_TOKEN_TTL_SECS, ProtocolVersionDto, SessionAuthRequest, SessionAuthResponse,
+    ACCESS_TOKEN_TTL_SECS, DeviceAssertion, EnrollRequest, ProtocolVersionDto, RUNTIME_AUTH_HEADER,
+    RefreshRequest, RuntimeAssertion, SessionAuthRequest, SessionAuthResponse, runtime_action,
 };
 use leveler_remote_protocol::pairing::{
     PairCompleteRequest, PairDecision, PairingPending, PairingScope,
@@ -30,6 +34,7 @@ use crate::state::{ClaimedBy, RelayError, RelayState};
 /// The relay's HTTP router.
 pub fn build_router(state: RelayState) -> Router {
     Router::new()
+        .route("/v1/runtimes/enroll", post(enroll_runtime))
         .route("/v1/pair/begin", post(pair_begin))
         .route("/v1/pair/complete", post(pair_complete))
         .route("/v1/pair/pending", get(pair_pending))
@@ -112,14 +117,90 @@ pub(crate) fn within_window(timestamp: &str) -> Result<(), RelayError> {
     Ok(())
 }
 
+// ------------------------------------------------------- runtime identity
+
+/// Check the [`RUNTIME_AUTH_HEADER`] assertion on a runtime's own request.
+///
+/// Every control-plane operation below decides who may reach a developer's
+/// machine, so each one is proved by the machine's key rather than by naming its
+/// id. The `action` is inside the signed bytes, so an assertion lifted from one
+/// request cannot authorize a different operation; the nonce is spent, so it
+/// cannot authorize the same one twice.
+fn runtime_auth(
+    state: &RelayState,
+    headers: &HeaderMap,
+    action: &str,
+    runtime_id: &str,
+) -> Result<(), RelayError> {
+    let header = headers
+        .get(RUNTIME_AUTH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(RelayError::Unauthorized)?;
+    let (asserted_id, timestamp, nonce, sig) =
+        RuntimeAssertion::parse_header(header).ok_or(RelayError::Unauthorized)?;
+    // The assertion must be about the runtime the request names, or a valid one
+    // for a machine the caller does control would authorize acting on another.
+    if asserted_id != runtime_id {
+        return Err(RelayError::Unauthorized);
+    }
+
+    let pubkey = state
+        .runtime_key(runtime_id)
+        .ok_or(RelayError::Unauthorized)?;
+    let key = VerifyingKey::from_base64url(&pubkey).map_err(|_| RelayError::Unauthorized)?;
+    let input = RuntimeAssertion::signing_input(action, runtime_id, timestamp, nonce);
+    verify_signature(&key, input.as_bytes(), sig)?;
+    within_window(timestamp)?;
+    state.spend_nonce(runtime_id, nonce, now())
+}
+
+/// Register a machine's public key.
+///
+/// Two credentials, because they answer two different questions: the operator's
+/// enrollment secret says this relay is willing to gain a host at all, and the
+/// signature says the caller holds the key it is registering. Neither alone is
+/// enough — a leaked secret would otherwise let anyone enroll a key they control
+/// under someone else's machine name.
+async fn enroll_runtime(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Json(request): Json<EnrollRequest>,
+) -> Result<StatusCode, Failure> {
+    state.rate_limit("enroll", 10, 60, now())?;
+    let secret = bearer(&headers)?;
+
+    // Verify against the key being *presented*, not one already on file: this is
+    // proof of possession, and for a first enrollment there is nothing on file.
+    let header = headers
+        .get(RUNTIME_AUTH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(RelayError::Unauthorized)?;
+    let (asserted_id, timestamp, nonce, sig) =
+        RuntimeAssertion::parse_header(header).ok_or(RelayError::Unauthorized)?;
+    if asserted_id != request.runtime_id {
+        return Err(Failure(RelayError::Unauthorized));
+    }
+    let key = VerifyingKey::from_base64url(&request.runtime_pubkey)
+        .map_err(|_| RelayError::Unauthorized)?;
+    let input = RuntimeAssertion::signing_input(
+        runtime_action::ENROLL,
+        &request.runtime_id,
+        timestamp,
+        nonce,
+    );
+    verify_signature(&key, input.as_bytes(), sig)?;
+    within_window(timestamp)?;
+    state.spend_nonce(&request.runtime_id, nonce, now())?;
+
+    state.enroll_runtime(&request.runtime_id, &request.runtime_pubkey, &secret)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---------------------------------------------------------------- pairing
 
 #[derive(Debug, Deserialize)]
 struct PairBeginRequest {
     runtime_id: String,
-    /// Bound on first use. Everything the runtime later signs is checked
-    /// against this, so a name alone never grants control of an id.
-    runtime_pubkey: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,11 +211,21 @@ struct PairBeginResponse {
     ttl_secs: i64,
 }
 
+/// Mint the one secret that can pair a phone to this machine.
+///
+/// Signed by the runtime: unauthenticated, anyone who learned a `runtime_id`
+/// could take that secret and walk the rest of the pairing themselves.
 async fn pair_begin(
     State(state): State<RelayState>,
+    headers: HeaderMap,
     Json(request): Json<PairBeginRequest>,
 ) -> Result<Json<PairBeginResponse>, Failure> {
-    state.bind_runtime_key(&request.runtime_id, &request.runtime_pubkey)?;
+    runtime_auth(
+        &state,
+        &headers,
+        runtime_action::PAIR_BEGIN,
+        &request.runtime_id,
+    )?;
     let (pairing_id, pairing_secret) = state.begin_pairing(&request.runtime_id, now())?;
     Ok(Json(PairBeginResponse {
         pairing_id,
@@ -188,8 +279,15 @@ struct RuntimeQuery {
 /// user recognised the label.
 async fn pair_pending(
     State(state): State<RelayState>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<RuntimeQuery>,
 ) -> Result<Json<Option<PairingPending>>, Failure> {
+    runtime_auth(
+        &state,
+        &headers,
+        runtime_action::PAIR_PENDING,
+        &query.runtime_id,
+    )?;
     let Some(pairing) = state.pending_confirm_for(&query.runtime_id) else {
         return Ok(Json(None));
     };
@@ -211,10 +309,20 @@ struct PairConfirmRequest {
     decision: PairDecision,
 }
 
+/// The accept the whole trust model rests on: the person at the keyboard says
+/// yes to a fingerprint. Signed by the runtime, so a caller who claimed a
+/// pairing cannot also accept it and skip the prompt entirely.
 async fn pair_confirm(
     State(state): State<RelayState>,
+    headers: HeaderMap,
     Json(request): Json<PairConfirmRequest>,
 ) -> Result<StatusCode, Failure> {
+    runtime_auth(
+        &state,
+        &headers,
+        runtime_action::PAIR_CONFIRM,
+        &request.runtime_id,
+    )?;
     state.confirm_pairing(
         &request.pairing_id,
         &request.runtime_id,
@@ -236,9 +344,16 @@ struct DeviceView {
 
 async fn list_devices(
     State(state): State<RelayState>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<RuntimeQuery>,
-) -> Json<Vec<DeviceView>> {
-    Json(
+) -> Result<Json<Vec<DeviceView>>, Failure> {
+    runtime_auth(
+        &state,
+        &headers,
+        runtime_action::DEVICES_LIST,
+        &query.runtime_id,
+    )?;
+    Ok(Json(
         state
             .devices_for(&query.runtime_id)
             .into_iter()
@@ -249,14 +364,21 @@ async fn list_devices(
                 revoked: device.revoked,
             })
             .collect(),
-    )
+    ))
 }
 
 async fn revoke_device(
     State(state): State<RelayState>,
     Path(device_id): Path<String>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<RuntimeQuery>,
 ) -> Result<StatusCode, Failure> {
+    runtime_auth(
+        &state,
+        &headers,
+        runtime_action::DEVICE_REVOKE,
+        &query.runtime_id,
+    )?;
     state.revoke_device(&device_id, &query.runtime_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -307,11 +429,6 @@ async fn auth_session(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-struct RefreshBody {
-    refresh_token: String,
-}
-
 #[derive(Debug, Serialize)]
 struct RefreshView {
     access_token: String,
@@ -319,11 +436,39 @@ struct RefreshView {
     refresh_token: String,
 }
 
+/// Rotate a refresh token.
+///
+/// The device assertion is required, not optional: a refresh token on its own is
+/// a bearer credential, so a captured one would be spendable by whoever holds
+/// it. Proving possession of the paired key makes the theft useless without the
+/// phone's secure element.
 async fn auth_refresh(
     State(state): State<RelayState>,
-    Json(request): Json<RefreshBody>,
+    body: axum::body::Bytes,
 ) -> Result<Json<RefreshView>, Failure> {
-    let (access_token, refresh_token) = state.rotate_refresh(&request.refresh_token, now())?;
+    state.rate_limit("auth_refresh", 30, 60, now())?;
+    // Parsed here rather than by an extractor so that a body with no assertion
+    // is refused the same way as one with a bad assertion: 401 either way, with
+    // no shape difference to probe.
+    let request: RefreshRequest =
+        serde_json::from_slice(&body).map_err(|_| RelayError::Unauthorized)?;
+    let device = state
+        .device(&request.device_assertion.device_id)
+        .ok_or(RelayError::Unauthorized)?;
+    if device.revoked {
+        return Err(Failure(RelayError::Revoked));
+    }
+    let key = VerifyingKey::from_base64url(&device.device_pubkey)
+        .map_err(|_| RelayError::Unauthorized)?;
+    let input = DeviceAssertion::signing_input(
+        &request.device_assertion.device_id,
+        &request.device_assertion.timestamp,
+    );
+    verify_signature(&key, input.as_bytes(), &request.device_assertion.sig)?;
+    within_window(&request.device_assertion.timestamp)?;
+
+    let (access_token, refresh_token) =
+        state.rotate_refresh(&request.refresh_token, &device.device_id, now())?;
     Ok(Json(RefreshView {
         access_token,
         expires_in_secs: ACCESS_TOKEN_TTL_SECS,

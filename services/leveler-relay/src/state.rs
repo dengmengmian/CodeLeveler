@@ -146,7 +146,7 @@ struct Inner {
     streams: HashMap<String, StreamRoute>,
     /// Runtime public keys, learned on first use and fixed thereafter.
     runtime_keys: HashMap<String, String>,
-    /// `(device_id, nonce)` already spent, with when — so a captured auth
+    /// `(subject_id, nonce)` already spent, with when — so a captured auth
     /// assertion cannot be replayed inside its own validity window.
     spent_nonces: HashMap<(String, String), i64>,
     /// Recent attempts per bucket, for rate limiting.
@@ -186,20 +186,53 @@ pub struct StreamRoute {
 #[derive(Clone, Default)]
 pub struct RelayState {
     inner: Arc<Mutex<Inner>>,
+    /// Hash of the operator's enrollment secret. `None` means no runtime can
+    /// enroll — a relay with nothing configured accepts no hosts rather than
+    /// accepting all of them.
+    enrollment_secret_hash: Option<Arc<[u8; 32]>>,
 }
 
 impl RelayState {
+    /// A relay that cannot enroll anything. Useful for tests of the parts that
+    /// operate on already-enrolled runtimes; a real deployment wants
+    /// [`Self::with_enrollment_secret`].
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record a runtime's public key, or check it against what was recorded.
+    /// A relay an operator can enroll hosts into by presenting `secret`.
+    pub fn with_enrollment_secret(secret: &str) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            enrollment_secret_hash: Some(Arc::new(sha256(secret.as_bytes()))),
+        }
+    }
+
+    /// Register a runtime's public key against the operator's enrollment secret.
     ///
-    /// Trust-on-first-use, mirroring what the agent does for devices: the first
-    /// registration for an id fixes the key, and a later mismatch is refused
-    /// rather than accepted as a rotation. Rotating means re-provisioning the
-    /// relay, which is deliberate — silent key changes are the attack.
-    pub fn bind_runtime_key(&self, runtime_id: &str, pubkey: &str) -> Result<(), RelayError> {
+    /// This is the relay's only writer of `runtime_id → pubkey`. It is not
+    /// trust-on-first-use: TOFU would hand the binding to whoever asked first,
+    /// which on a reachable relay means anyone. The caller must present the
+    /// secret the operator configured; the *signature* proving they hold the key
+    /// is checked at the route, on the same request.
+    ///
+    /// Re-enrolling the same key is accepted so a host can retry; a different
+    /// key for an id already bound is refused rather than treated as a rotation,
+    /// because a silent key change is the attack. Rotating means removing the
+    /// binding on the relay deliberately.
+    pub fn enroll_runtime(
+        &self,
+        runtime_id: &str,
+        pubkey: &str,
+        presented_secret: &str,
+    ) -> Result<(), RelayError> {
+        let Some(expected) = self.enrollment_secret_hash.as_deref() else {
+            return Err(RelayError::Unauthorized);
+        };
+        if !constant_time_eq(expected, &sha256(presented_secret.as_bytes())) {
+            return Err(RelayError::Unauthorized);
+        }
+
         let mut inner = self.inner.lock().unwrap();
         match inner.runtime_keys.get(runtime_id) {
             Some(existing) if existing == pubkey => Ok(()),
@@ -222,16 +255,17 @@ impl RelayState {
             .cloned()
     }
 
-    /// Spend a `(device_id, nonce)` pair once.
+    /// Spend a `(subject_id, nonce)` pair once, for either a device or a runtime
+    /// assertion.
     ///
     /// A signed assertion is only good for one use; without this the signature
     /// would remain valid — and replayable — for its whole timestamp window.
-    pub fn spend_nonce(&self, device_id: &str, nonce: &str, now: i64) -> Result<(), RelayError> {
+    pub fn spend_nonce(&self, subject_id: &str, nonce: &str, now: i64) -> Result<(), RelayError> {
         let mut inner = self.inner.lock().unwrap();
         // Forget entries that can no longer be inside anyone's window, so the
         // map does not grow without bound.
         inner.spent_nonces.retain(|_, at| now - *at < 600);
-        let key = (device_id.to_string(), nonce.to_string());
+        let key = (subject_id.to_string(), nonce.to_string());
         if inner.spent_nonces.contains_key(&key) {
             return Err(RelayError::Unauthorized);
         }
@@ -476,6 +510,7 @@ impl RelayState {
     pub fn rotate_refresh(
         &self,
         presented: &str,
+        asserting_device: &str,
         now: i64,
     ) -> Result<(String, String), RelayError> {
         let mut inner = self.inner.lock().unwrap();
@@ -492,6 +527,11 @@ impl RelayState {
             .ok_or(RelayError::Unauthorized)?;
         if record.claims.exp <= now {
             return Err(RelayError::Expired);
+        }
+        // The assertion proves possession of *a* paired key; this is what ties it
+        // to *this* token, so one device cannot spend another's captured one.
+        if record.claims.sub != asserting_device {
+            return Err(RelayError::Unauthorized);
         }
         let device_id = record.claims.sub.clone();
         let runtime_id = record.claims.aud.clone();

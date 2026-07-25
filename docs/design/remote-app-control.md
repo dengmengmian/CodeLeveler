@@ -1017,13 +1017,15 @@ APP 推送审批、生物识别锁、产物按需下载、AEAD、可选 `serve -
 
 | Method | Path | Auth | 成功 | 主要错误码 |
 | --- | --- | --- | --- | --- |
+| POST | `/v1/runtimes/enroll` | **operator secret + runtime sig（enroll 专用）** | 204，绑定 `runtime_id → pubkey` | `unauthorized`, `rate_limited` |
 | POST | `/v1/pair/begin` | runtime assertion | pairing_secret, ttl, qr_payload | `already_pending` |
 | POST | `/v1/pair/complete` | none + secret | device_id pending | `invalid_pairing`, `rate_limited` |
-| POST | `/v1/pair/confirm` | runtime | active binding | `not_found`, `expired` |
-| GET | `/v1/devices` | runtime | list | |
-| DELETE | `/v1/devices/{id}` | runtime | 204 | |
+| POST | `/v1/pair/confirm` | runtime assertion | active binding | `not_found`, `expired` |
+| GET | `/v1/pair/pending` | runtime assertion | 待确认 pairing | |
+| GET | `/v1/devices` | runtime assertion | list | |
+| DELETE | `/v1/devices/{id}` | runtime assertion | 204 | |
 | POST | `/v1/auth/session` | device sig | tokens + protocol | `not_paired`, `revoked` |
-| POST | `/v1/auth/refresh` | refresh + device sig | tokens | `reuse_detected`, `revoked` |
+| POST | `/v1/auth/refresh` | refresh + **device sig（必需）** | tokens | `reuse_detected`, `revoked` |
 | GET | `/v1/hosts` | device access | HostInfo[]（原 runtimes 列表升级为 host） | |
 | GET | `/v1/hosts/{host_id}/projects` | access | **SignedEnvelope**（payload=`ProjectInfo[]`：id/path_display/status） | 503 if host offline |
 | POST | `/v1/hosts/{host_id}/projects/{project_id}/leveler-sessions` | access + device-signed rpc_request | **SignedEnvelope**（SessionBootstrap） | `project_offline` 503 |
@@ -1313,6 +1315,11 @@ pub enum ClientOrigin {
   - **RPC 响应按签名内的 stream_id 路由** ✅ 保持响应与请求的绑定。
 - **这一步抓到一个真实缺陷：** 撤销原本**没有**关闭在途流（我先前那段代码因 `cargo fmt` 改过缩进而未被应用）。测试红了才发现——正是"已撤销但仍在投递"这一威胁。已修。
 - **未完成：** `project_id`（待 PR5b）。`/leveler-sessions` REST 在「已鉴权且 host 在线」时仍返回 **501**（RPC 代理未接），而不是假装 503——把在线的 host 误报为不可达会掩盖真实状态。
+- **控制面认证补齐（追加 7 条负例，relay 共 27 绿）：** 此前只有 tunnel 与 `/v1/auth/session` 验签，runtime 侧 REST **全部无凭据**——`runtime_id` 是个名字，知道它就能：`pair/begin` 取走配对密钥 → `pair/complete` 用自己的密钥认领 → `pair/confirm` 替主人接受 → 拿到 routing token；还能任意 `revoke` 别人的设备。E2E 签名让这些帧到 agent 仍被拒（设计生效），但控制面等于送人。现在：
+  - **`POST /v1/runtimes/enroll`**：运营者密钥（`LEVELER_RELAY_ENROLLMENT_SECRET`，无默认值、缺失即拒绝启动）+ **被注册密钥本人的签名**。两者缺一不可：密钥说「这台 relay 愿意接纳一台 host」，签名说「调用者确实持有它声称的密钥」。原先的 TOFU 是把这个绑定送给先到者。
+  - **runtime 断言头** `x-leveler-runtime-auth: {runtime_id}|{ts}|{nonce}|{sig}`，签名覆盖 **action**（`pair_begin` / `pair_confirm` / `pair_pending` / `devices_list` / `device_revoke` / `enroll`），故一次请求的断言不能挪用到另一种操作；nonce 一次性消费，同一断言不能用第二次。
+  - **`/v1/auth/refresh` 现要求 device 断言**（此前 DTO 里定义了却没验），并校验该断言的 device 就是该 refresh token 的属主——否则甲设备可以花掉乙设备被窃的 token。缺断言与错断言都回 401，形状一致。
+  - **牙口已验：** 去掉 `pair/begin` 的断言检查 → `beginning_a_pairing_requires_the_runtimes_signature` 与 `a_runtime_assertion_cannot_be_replayed` 转红，其余 18 条绿，随后还原。
 - **三个 MVP 安全缺口已补齐（追加 3 条负例，relay 共 20 绿）：**
   - **agent 注册验签**：`/v1/agent/tunnel` 现要求 runtime 签名断言（`{runtime_id}|{timestamp}`）。此前 `runtime_id` 只是个名字，任何能连到 relay 的人都能冒充某台机器并接管它的流。runtime 公钥在首次 `pair/begin` 时**绑定（TOFU）**，之后换钥被拒而非当作轮换——静默换钥正是攻击本身。
   - **`/v1/auth/session` 验设备断言**：签名覆盖 `device_id|runtime_id|timestamp|nonce`，并**消费 nonce**（同一断言不能用第二次）。`device_id` 不是秘密，只凭它签发 token 等于谁看到都能冒充。

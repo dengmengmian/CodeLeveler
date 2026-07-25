@@ -9,6 +9,13 @@
 # AEAD lands, whatever terminates TLS can read session traffic, so the design
 # treats self-hosting as the privacy-default path — that machine should be
 # yours.
+#
+# Run it with the enrollment secret a developer machine presents to register
+# itself. It is required and has no default: the relay refuses to start without
+# one rather than accepting any machine that asks.
+#
+#   docker run -e LEVELER_RELAY_ENROLLMENT_SECRET="$(openssl rand -base64 32)" \
+#     -p 8443:8443 leveler-relay
 
 FROM rust:1.90-slim AS build
 WORKDIR /src
