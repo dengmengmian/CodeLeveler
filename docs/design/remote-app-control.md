@@ -1448,8 +1448,8 @@ pub enum ClientOrigin {
 | `leveler-session-wire` | crate | 是 | ✅ PR0 已落地 |
 | `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
-| `leveler-remote-agent` + ProjectRouter | binary | 是 | ⚠️ 准入管道已落地（PR5 部分）；隧道/RPC/ProjectRouter 未开始 |
-| `leveler-relay` self-host | docker | 是 | ⚠️ 控制面 + WSS 转发 + Dockerfile 已落地；RPC 代理未接 |
+| `leveler-remote-agent` + ProjectRouter | **lib（尚无二进制入口）** | 是 | ⚠️ 准入 + 隧道 + RPC + ProjectRouter + 事件下行 + 审批超时已落地；**缺 `leveler remote-agent` 可执行入口与配置读取（PR7）**、`upload_attachment` |
+| `leveler-relay` self-host | docker | 是 | ✅ 控制面（含 enroll/断言认证）+ WSS 转发 + RPC 代理 + Dockerfile |
 | `leveler remote` CLI | CLI | 是 | ⚠️ status/devices/revoke 可用；pair/confirm 待 relay |
 | **leveler-mobile** | iOS + Android 内测包 | **是** | 未开始（PR11a–f） |
 | Security gate 记录 | 文档 | 是 | 未开始（PR10） |
