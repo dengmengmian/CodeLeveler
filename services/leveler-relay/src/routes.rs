@@ -20,7 +20,6 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use leveler_remote_protocol::VerifyingKey;
 use leveler_remote_protocol::auth::{
     ACCESS_TOKEN_TTL_SECS, DeviceAssertion, EnrollRequest, ProtocolVersionDto, RUNTIME_AUTH_HEADER,
     RefreshRequest, RuntimeAssertion, SessionAuthRequest, SessionAuthResponse, runtime_action,
@@ -28,8 +27,9 @@ use leveler_remote_protocol::auth::{
 use leveler_remote_protocol::pairing::{
     PairCompleteRequest, PairDecision, PairingPending, PairingScope,
 };
+use leveler_remote_protocol::{SignedEnvelope, VerifyingKey};
 
-use crate::state::{ClaimedBy, RelayError, RelayState};
+use crate::state::{ClaimedBy, RelayError, RelayState, RpcOutcome};
 
 /// The relay's HTTP router.
 pub fn build_router(state: RelayState) -> Router {
@@ -49,7 +49,7 @@ pub fn build_router(state: RelayState) -> Router {
             "/v1/hosts/{host_id}/session",
             get(crate::tunnel::app_session),
         )
-        .route("/v1/hosts/{host_id}/leveler-sessions", post(create_session))
+        .route("/v1/hosts/{host_id}/rpc", post(host_rpc))
         .with_state(state)
 }
 
@@ -515,23 +515,60 @@ async fn list_hosts(
     ))
 }
 
-/// Create a session on a host.
+/// How long the relay waits for an agent to answer an RPC before giving up. Long
+/// enough for a runtime doing real work, short enough that a wedged agent does
+/// not hold a phone's request open indefinitely.
+const RPC_TIMEOUT_SECS: u64 = 30;
+
+/// Carry one device-signed RPC to a host and return the runtime's signed answer.
+///
+/// A single endpoint rather than one per method: the method, the project and the
+/// body all live *inside* the device's signature, so a URL that restated them
+/// would be a second, unsigned copy for the relay to disagree with. What the URL
+/// does carry is the host, which is what the token's audience is checked
+/// against.
 ///
 /// Refuses with 503 when the host has no live tunnel. It does not queue: a
 /// command accepted now and run later could outlive the revocation of the device
 /// that sent it, so the device retries instead.
-async fn create_session(
+async fn host_rpc(
     State(state): State<RelayState>,
     Path(host_id): Path<String>,
     headers: HeaderMap,
-) -> Result<StatusCode, Failure> {
+    body: axum::body::Bytes,
+) -> Result<Response, Failure> {
     let token = bearer(&headers)?;
     // The audience check is what stops a token minted for one host from
     // reaching another.
-    state.authorize(&token, Some(&host_id), now())?;
-    state.require_online(&host_id)?;
-    // Reaching here means authorized and online. Forwarding needs the agent
-    // tunnel, which does not exist yet — so say so rather than returning 503,
-    // which would misreport a live host as unreachable.
-    Ok(StatusCode::NOT_IMPLEMENTED)
+    let claims = state.authorize(&token, Some(&host_id), now())?;
+
+    let envelope: SignedEnvelope =
+        serde_json::from_slice(&body).map_err(|_| RelayError::InvalidPairing)?;
+    // The relay cannot verify the signature — it holds no device key, which is
+    // the point. It can check the envelope claims to be from the device this
+    // token was minted for, so one device's traffic is never carried under
+    // another's authorization.
+    if envelope.sender_id != claims.sub || envelope.recipient_id != host_id {
+        return Err(Failure(RelayError::Unauthorized));
+    }
+
+    let waiting = state.begin_rpc(&host_id, envelope)?;
+    let outcome =
+        tokio::time::timeout(std::time::Duration::from_secs(RPC_TIMEOUT_SECS), waiting).await;
+
+    match outcome {
+        // The agent's own envelope, carried out whole. Unwrapping it to re-wrap
+        // the payload would strip the signature that makes it worth having.
+        Ok(Ok(RpcOutcome::Signed(envelope))) => Ok(Json(*envelope).into_response()),
+        // A routing failure has no runtime result behind it, so it carries no
+        // body the phone could verify — and the relay must not invent one.
+        Ok(Ok(RpcOutcome::Failed(error))) => Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"code": error.code, "message": error.message})),
+        )
+            .into_response()),
+        // Sender dropped: the agent went away with the request in flight.
+        Ok(Err(_)) => Err(Failure(RelayError::RuntimeOffline)),
+        Err(_) => Err(Failure(RelayError::RuntimeOffline)),
+    }
 }

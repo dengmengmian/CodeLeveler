@@ -22,7 +22,7 @@ use leveler_remote_protocol::SignedEnvelope;
 use leveler_remote_protocol::auth::{AgentRegisterAssertion, ProtocolVersionDto};
 use leveler_remote_protocol::tunnel::{AgentToRelay, RelayToAgent};
 
-use crate::state::RelayState;
+use crate::state::{RelayState, RpcOutcome};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TunnelQuery {
@@ -118,16 +118,30 @@ fn handle_agent_frame(state: &RelayState, frame: AgentToRelay) {
             }
         }
         AgentToRelay::RpcResponse {
-            envelope: Some(envelope),
-            ..
-        } => {
-            // RPC responses ride the stream named in the signed envelope, which
-            // is what binds a response to its request.
-            let stream_id = envelope.stream_id.clone();
-            if let Err(error) = state.forward_downstream(&stream_id, envelope) {
-                tracing::debug!(code = error.code(), %stream_id, "rpc response not routable");
+            rpc_id,
+            envelope,
+            error,
+        } => match (envelope, error) {
+            // An answer to an HTTP-borne RPC goes back to the request waiting on
+            // it. The `rpc_id` is the relay's own correlation handle; the
+            // response's *binding* to the request is the signed stream id inside
+            // the envelope, which the phone checks.
+            (Some(envelope), _) => {
+                let stream_id = envelope.stream_id.clone();
+                let unmatched = state.complete_rpc(&rpc_id, RpcOutcome::Signed(Box::new(envelope)));
+                // No HTTP request waiting: the answer belongs to a session
+                // stream, addressed by the stream id inside its own signature.
+                if let Some(RpcOutcome::Signed(envelope)) = unmatched
+                    && let Err(error) = state.forward_downstream(&stream_id, *envelope)
+                {
+                    tracing::debug!(code = error.code(), %stream_id, "rpc response not routable");
+                }
             }
-        }
+            (None, Some(error)) => {
+                let _ = state.complete_rpc(&rpc_id, RpcOutcome::Failed(error));
+            }
+            (None, None) => tracing::debug!(%rpc_id, "rpc response with neither body nor error"),
+        },
         AgentToRelay::StreamRejected { stream_id, code } => {
             state.close_stream(&stream_id, &code);
         }

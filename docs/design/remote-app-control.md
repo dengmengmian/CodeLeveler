@@ -1027,11 +1027,10 @@ APP 推送审批、生物识别锁、产物按需下载、AEAD、可选 `serve -
 | POST | `/v1/auth/session` | device sig | tokens + protocol | `not_paired`, `revoked` |
 | POST | `/v1/auth/refresh` | refresh + **device sig（必需）** | tokens | `reuse_detected`, `revoked` |
 | GET | `/v1/hosts` | device access | HostInfo[]（原 runtimes 列表升级为 host） | |
-| GET | `/v1/hosts/{host_id}/projects` | access | **SignedEnvelope**（payload=`ProjectInfo[]`：id/path_display/status） | 503 if host offline |
-| POST | `/v1/hosts/{host_id}/projects/{project_id}/leveler-sessions` | access + device-signed rpc_request | **SignedEnvelope**（SessionBootstrap） | `project_offline` 503 |
-| GET | `/v1/hosts/{host_id}/projects/{project_id}/leveler-sessions/{sid}/snapshot` | access + signed | **SignedEnvelope**（snapshot） | 503/404 |
-| POST | `/v1/hosts/{host_id}/projects/{project_id}/attachments` | access + device-signed chunks | **SignedEnvelope**（AttachmentRef） | 503, `too_large` |
-| GET | `/v1/hosts/{host_id}/session` | access Bearer WSS；query/subprotocol 带 `project_id` 或首帧 bind | - | protocol / auth |
+| POST | `/v1/hosts/{host_id}/rpc` | access + **device 签名的 rpc_request 信封（请求体）** | **SignedEnvelope**（`rpc_response`：`ProjectInfo[]` / `SessionBootstrap` / `UiSessionSnapshot` / `AttachmentRef`） | 503 `runtime_offline`（含 Retry-After）、502 + routing 错误码（无 body）、401 |
+| GET | `/v1/hosts/{host_id}/session` | access Bearer WSS；`?project_id=` 绑定项目 | - | protocol / auth |
+
+> **实现与本表原稿的偏差（已定）：** 原稿为 `projects` / `leveler-sessions` / `snapshot` / `attachments` 各开一条 REST 路径。实际收敛为**单一 `POST /rpc`**：method、`project_id` 与 body 全都在**设备签名内**，URL 若再复述一遍就是一份未签名的副本，relay 迟早会拿它去「校验」并与签名分歧。URL 只保留 `host_id`——那是 token audience 要比对的东西。附件分块上传仍走同一入口（`upload_attachment`，agent 侧未实现）。
 
 > 兼容：实现期可将旧路径 `/v1/runtimes/{id}/…` 映射为「单 project 的 host」，但 **APP 契约以 hosts/projects 为准**。
 
@@ -1286,12 +1285,19 @@ pub enum ClientOrigin {
 - **未完成（PR5 剩余）：** 运行时**事件流**下行（手机目前收不到助手输出，只有 ack/error/snapshot）；`upload_attachment` 的 agent 侧实现；审批超时定时器接线（PR4 的状态机与 waiter 计数**仍未被调用**）。
 - **接口形状：** `project_id` 尚未预留，留待 PR5b 与 ProjectRouter 一并引入。
 
-### PR5b — ProjectRouter：多已打开项目
+### PR5b — ProjectRouter：多已打开项目 ✅ 已完成
 
 - **Title:** `remote-agent: ProjectRouter over web-projects registry + per-repo daemons`
 - **Affects:** `leveler-remote-agent`；可选抽出与 web 共享的「probe socket / spawn serve」库（**不**依赖 `leveler-web`）
 - **Deps:** PR5
 - **DoD：** `projects` 列表 API 签包；2 project 路由 deliver；事件不串台；一 project offline 隔离；注册表与 `web-projects.json` 一致或明确双写策略
+- **实测（agent 侧 +9 测试，e2e +2）：** `ProjectRoutes` trait（`SingleProject` / `ProjectRouter`）+ `AgentBridge` 去泛型改持路由表。`projects` 列表走 `list_projects` RPC，返回 **runtime 签名**信封 ✅；两 project 各自 deliver 且**互不可见**（每条正例都配「另一个项目收到 0 条」）✅；一个 project offline 时另一个照常工作、且**仍在列表中显示为 offline**（不是消失）✅；未知 project 的 stream 在 open 时即被 `stream_rejected`，e2e 断言 runtime 收到 0 条 ✅。
+- **`project_id` 的来源分两处，按「这条帧能干什么」决定：**
+  - **会话流**：来自 relay 的 `open_stream`（路由元数据）。误绑的后果是命令投到别的仓库——但 session id 是按项目的，**解析不到即失败**，不会落在意外的地方。
+  - **`create_session`**：来自**签名 payload 内**的 `project_id`。它会创建状态，所以「在哪个项目里建会话」不能是 relay 的决定。
+- **注册表复用而非双写：** 只读 `web-projects.json`（含 `aliases` / `ignored`），agent **不写**它；`project_id` = 该仓库 socket 的文件名主干（即 daemon 已用的 repo-path hash），**由 socket 路径推导**而非另造一套 hash，因此 id 不可能与端点漂移。有一条测试直接吃 web 写出的 registry 形状，形状变了这里会红。
+- **刻意不做：** agent **不 spawn daemon**（会与 web 抢 socket 并留孤儿进程），**不接受来自网络的路径**（那是「让机器在新位置跑代码」，属 Phase 1.5 且需要本机确认 UX）。
+- **牙口已验：** 让 `create_session` 忽略签名内的 `project_id` → `create_session_goes_to_the_project_the_device_signed_for` 单条转红。
 
 ### PR6 — self-host relay MVP ⚠️ 控制面完成，转发未接
 
@@ -1314,7 +1320,13 @@ pub enum ClientOrigin {
   - **agent 掉线连带结束其 device 流** ✅ 不留任何东西待重连投递。
   - **RPC 响应按签名内的 stream_id 路由** ✅ 保持响应与请求的绑定。
 - **这一步抓到一个真实缺陷：** 撤销原本**没有**关闭在途流（我先前那段代码因 `cargo fmt` 改过缩进而未被应用）。测试红了才发现——正是"已撤销但仍在投递"这一威胁。已修。
-- **未完成：** `project_id`（待 PR5b）。`/leveler-sessions` REST 在「已鉴权且 host 在线」时仍返回 **501**（RPC 代理未接），而不是假装 503——把在线的 host 误报为不可达会掩盖真实状态。
+- **RPC 代理已补齐（追加 6 测试，relay 共 33 绿）：** `POST /v1/hosts/{host_id}/rpc` 把设备签名的信封搬到 agent 隧道，再把 **runtime 签名的答复原样交回**（测试断言收到的信封与 agent 发出的**完全相等**）。
+  - **不排队** ✅ host 无隧道 → 503 + `Retry-After: 5`；**RPC 在途时 agent 掉线 → 立刻 503**，pending 表随 runtime 一起清空（保留待重连就是被禁止的持久队列）。
+  - **routing 错误无 body** ✅ agent 回 `error` 时返回 502 + 错误码，**不**编造业务体——runtime 从未产出结果，也就没有它能签的东西。
+  - **信封发件人必须是 token 持有者** ✅ 否则 401，且断言 agent **完全没被打扰**。
+  - **跨 host 的 token** ✅ 401。
+  - **牙口已验：** 去掉发件人比对 → `an_envelope_from_another_device_is_refused` 单条转红。
+- **未完成：** `upload_attachment` 的 agent 侧实现（协议已在，agent 明确返回未实现）。
 - **控制面认证补齐（追加 7 条负例，relay 共 27 绿）：** 此前只有 tunnel 与 `/v1/auth/session` 验签，runtime 侧 REST **全部无凭据**——`runtime_id` 是个名字，知道它就能：`pair/begin` 取走配对密钥 → `pair/complete` 用自己的密钥认领 → `pair/confirm` 替主人接受 → 拿到 routing token；还能任意 `revoke` 别人的设备。E2E 签名让这些帧到 agent 仍被拒（设计生效），但控制面等于送人。现在：
   - **`POST /v1/runtimes/enroll`**：运营者密钥（`LEVELER_RELAY_ENROLLMENT_SECRET`，无默认值、缺失即拒绝启动）+ **被注册密钥本人的签名**。两者缺一不可：密钥说「这台 relay 愿意接纳一台 host」，签名说「调用者确实持有它声称的密钥」。原先的 TOFU 是把这个绑定送给先到者。
   - **runtime 断言头** `x-leveler-runtime-auth: {runtime_id}|{ts}|{nonce}|{sig}`，签名覆盖 **action**（`pair_begin` / `pair_confirm` / `pair_pending` / `devices_list` / `device_revoke` / `enroll`），故一次请求的断言不能挪用到另一种操作；nonce 一次性消费，同一断言不能用第二次。

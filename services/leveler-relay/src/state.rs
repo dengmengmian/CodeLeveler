@@ -24,7 +24,7 @@ use leveler_remote_protocol::auth::{
     ACCESS_TOKEN_TTL_SECS, REFRESH_TOKEN_TTL_SECS, SCOPE_REMOTE_SESSION, TokenClaims, TokenUse,
 };
 use leveler_remote_protocol::pairing::{PairingScope, PairingState};
-use leveler_remote_protocol::tunnel::RelayToAgent;
+use leveler_remote_protocol::tunnel::{RelayToAgent, RoutingError};
 
 /// How long a pairing secret stays claimable.
 pub const PAIRING_TTL_SECS: i64 = 5 * 60;
@@ -151,7 +151,25 @@ struct Inner {
     spent_nonces: HashMap<(String, String), i64>,
     /// Recent attempts per bucket, for rate limiting.
     attempts: HashMap<String, Vec<i64>>,
+    /// RPCs waiting on an agent, with the runtime they were sent to. Held only
+    /// for the life of one HTTP request — this is a correlation table, not a
+    /// queue: nothing here survives the agent going away.
+    pending_rpc: HashMap<String, PendingRpc>,
     counter: u64,
+}
+
+/// One in-flight RPC.
+struct PendingRpc {
+    runtime_id: String,
+    answer: tokio::sync::oneshot::Sender<RpcOutcome>,
+}
+
+/// What an agent answered with: its runtime-signed envelope, or a routing-level
+/// failure that carries no business body because the runtime produced no result.
+#[derive(Debug, Clone)]
+pub enum RpcOutcome {
+    Signed(Box<SignedEnvelope>),
+    Failed(RoutingError),
 }
 
 /// A registered, currently-connected runtime.
@@ -594,6 +612,58 @@ impl RelayState {
         );
     }
 
+    /// Send an RPC to a runtime's agent and hand back the receiver for its
+    /// answer.
+    ///
+    /// The envelope goes through verbatim: it is the device's signature over
+    /// the method, the project and the body, and the relay is only choosing
+    /// which socket it leaves by.
+    pub fn begin_rpc(
+        &self,
+        runtime_id: &str,
+        envelope: SignedEnvelope,
+    ) -> Result<tokio::sync::oneshot::Receiver<RpcOutcome>, RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        let online = inner
+            .online
+            .get(runtime_id)
+            .cloned()
+            .ok_or(RelayError::RuntimeOffline)?;
+
+        inner.counter += 1;
+        let rpc_id = format!("rpc_{}", inner.counter);
+        let (answer, receiver) = tokio::sync::oneshot::channel();
+        inner.pending_rpc.insert(
+            rpc_id.clone(),
+            PendingRpc {
+                runtime_id: runtime_id.to_string(),
+                answer,
+            },
+        );
+
+        online
+            .to_agent
+            .send(RelayToAgent::RpcRequest { rpc_id, envelope })
+            .map_err(|_| RelayError::RuntimeOffline)?;
+        Ok(receiver)
+    }
+
+    /// An agent answered an RPC.
+    ///
+    /// Returns the outcome untouched when no request is waiting on that id, so
+    /// the caller can decide what an unmatched answer means rather than having
+    /// it silently swallowed here.
+    pub fn complete_rpc(&self, rpc_id: &str, outcome: RpcOutcome) -> Option<RpcOutcome> {
+        let pending = self.inner.lock().unwrap().pending_rpc.remove(rpc_id);
+        match pending {
+            Some(pending) => {
+                let _ = pending.answer.send(outcome);
+                None
+            }
+            None => Some(outcome),
+        }
+    }
+
     /// A runtime's agent tunnel went away.
     ///
     /// Its streams go with it and nothing is retained: no queue, so a command
@@ -605,6 +675,12 @@ impl RelayState {
         inner
             .streams
             .retain(|_, route| route.runtime_id != runtime_id);
+        // Dropping a pending sender ends its waiting request. The alternative —
+        // holding it for a reconnect — is the durable queue this design refuses
+        // to have.
+        inner
+            .pending_rpc
+            .retain(|_, pending| pending.runtime_id != runtime_id);
     }
 
     /// Open an APP session stream and tell the agent about it.

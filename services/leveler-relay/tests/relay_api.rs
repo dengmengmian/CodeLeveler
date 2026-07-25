@@ -149,6 +149,38 @@ fn refresh_body(device_id: &str, refresh_token: &str) -> serde_json::Value {
     })
 }
 
+/// Probe a host with a device-signed RPC: 503 when the token is good but no
+/// agent is attached, 401 when the token is not good for that host. Used to ask
+/// "is this token still authorized here" without needing a live agent.
+async fn probe(
+    client: &reqwest::Client,
+    base: &str,
+    host_id: &str,
+    device_id: &str,
+    token: &str,
+) -> reqwest::StatusCode {
+    let envelope = leveler_remote_protocol::SignedEnvelope::sign(
+        &device_key(),
+        leveler_remote_protocol::Sender::Device,
+        device_id,
+        host_id,
+        &leveler_remote_protocol::tunnel::rpc_stream_id("probe"),
+        1,
+        &now_stamp(),
+        leveler_remote_protocol::ContentType::RpcRequest,
+        b"{}",
+    )
+    .unwrap();
+    client
+        .post(format!("{base}/v1/hosts/{host_id}/rpc"))
+        .bearer_auth(token)
+        .json(&envelope)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
 /// Register a runtime as online the way the tunnel does, keeping the receiver
 /// alive so the route stays valid for the duration of the test.
 fn bring_online(
@@ -290,39 +322,27 @@ async fn a_wrong_pairing_secret_is_refused() {
 /// The isolation the design requires: two phones, two machines, no crossing.
 #[tokio::test]
 async fn a_token_for_one_host_is_inert_against_another() {
-    let (base, state) = serve().await;
+    let (base, _state) = serve().await;
     let client = reqwest::Client::new();
 
     let token_a = pair_device(&client, &base, "rt_a", "dev_a").await;
     let token_b = pair_device(&client, &base, "rt_b", "dev_b").await;
-    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
-    let _agent_rt_b = bring_online(&state, "rt_b", "machine B");
 
-    // Each reaches its own host.
-    for (token, host) in [(&token_a, "rt_a"), (&token_b, "rt_b")] {
-        let response = client
-            .post(format!("{base}/v1/hosts/{host}/leveler-sessions"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
+    // Each is authorized against its own host. Neither host has an agent, so the
+    // answer is "offline" rather than a result — which is exactly the point: it
+    // got past authorization.
+    for (token, host, device) in [(&token_a, "rt_a", "dev_a"), (&token_b, "rt_b", "dev_b")] {
         assert_eq!(
-            response.status(),
-            501,
-            "authorized and online: forwarding is simply not built yet"
+            probe(&client, &base, host, device, token).await,
+            503,
+            "a device's own host is reachable, just not attached"
         );
     }
 
     // Neither reaches the other's.
-    for (token, host) in [(&token_a, "rt_b"), (&token_b, "rt_a")] {
-        let response = client
-            .post(format!("{base}/v1/hosts/{host}/leveler-sessions"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
+    for (token, host, device) in [(&token_a, "rt_b", "dev_a"), (&token_b, "rt_a", "dev_b")] {
         assert_eq!(
-            response.status(),
+            probe(&client, &base, host, device, token).await,
             401,
             "a token minted for one host must not reach another"
         );
@@ -362,9 +382,22 @@ async fn an_offline_host_is_503_with_a_retry_hint() {
     let token = pair_device(&client, &base, "rt_a", "dev_a").await;
 
     // Never registered.
+    let envelope = leveler_remote_protocol::SignedEnvelope::sign(
+        &device_key(),
+        leveler_remote_protocol::Sender::Device,
+        "dev_a",
+        "rt_a",
+        &leveler_remote_protocol::tunnel::rpc_stream_id("probe"),
+        1,
+        &now_stamp(),
+        leveler_remote_protocol::ContentType::RpcRequest,
+        b"{}",
+    )
+    .unwrap();
     let response = client
-        .post(format!("{base}/v1/hosts/rt_a/leveler-sessions"))
+        .post(format!("{base}/v1/hosts/rt_a/rpc"))
         .bearer_auth(&token)
+        .json(&envelope)
         .send()
         .await
         .unwrap();
@@ -380,34 +413,25 @@ async fn an_offline_host_is_503_with_a_retry_hint() {
     let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
     assert!(state.is_online("rt_a"));
     state.unregister_runtime("rt_a");
-    let again = client
-        .post(format!("{base}/v1/hosts/rt_a/leveler-sessions"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(again.status(), 503);
+    assert_eq!(
+        probe(&client, &base, "rt_a", "dev_a", &token).await,
+        503,
+        "nothing was retained from the earlier attempt"
+    );
 }
 
 /// Revocation takes effect on the next request. Dropping the tokens with the
 /// device is what makes that true without an access-token denylist.
 #[tokio::test]
 async fn revoking_a_device_invalidates_its_tokens_at_once() {
-    let (base, state) = serve().await;
+    let (base, _state) = serve().await;
     let client = reqwest::Client::new();
     let token = pair_device(&client, &base, "rt_a", "dev_a").await;
-    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
 
     assert_eq!(
-        client
-            .post(format!("{base}/v1/hosts/rt_a/leveler-sessions"))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        501,
-        "works before revocation"
+        probe(&client, &base, "rt_a", "dev_a", &token).await,
+        503,
+        "authorized before revocation"
     );
 
     let revoke = client
@@ -422,13 +446,7 @@ async fn revoking_a_device_invalidates_its_tokens_at_once() {
     assert_eq!(revoke.status(), 204);
 
     assert_eq!(
-        client
-            .post(format!("{base}/v1/hosts/rt_a/leveler-sessions"))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        probe(&client, &base, "rt_a", "dev_a", &token).await,
         401,
         "the same token must stop working immediately"
     );
@@ -471,7 +489,7 @@ async fn a_runtime_cannot_revoke_another_runtimes_device() {
 /// as a retry — the device loses everything and must authenticate again.
 #[tokio::test]
 async fn a_replayed_refresh_token_costs_the_device_its_session() {
-    let (base, state) = serve().await;
+    let (base, _state) = serve().await;
     let client = reqwest::Client::new();
 
     enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
@@ -505,7 +523,6 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
         .await
         .unwrap();
     let first_refresh = auth["refresh_token"].as_str().unwrap().to_string();
-    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
 
     let rotated: serde_json::Value = client
         .post(format!("{base}/v1/auth/refresh"))
@@ -538,13 +555,7 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
     // The access token handed out moments ago is gone too: a captured refresh
     // token means the device's whole session is suspect.
     assert_eq!(
-        client
-            .post(format!("{base}/v1/hosts/rt_a/leveler-sessions"))
-            .bearer_auth(&fresh_access)
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        probe(&client, &base, "rt_a", "dev_a", &fresh_access).await,
         401
     );
 }
