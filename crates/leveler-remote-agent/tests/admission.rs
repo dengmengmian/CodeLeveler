@@ -11,7 +11,7 @@ use leveler_client_protocol::{
     PermissionProfile, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
-use leveler_remote_agent::{Admitted, AgentBridge, TrustedDevices};
+use leveler_remote_agent::{Admitted, AgentBridge, SingleProject, TrustedDevices};
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::{ContentType, Sender, SignedEnvelope, SigningKey};
 use tokio::sync::broadcast;
@@ -22,6 +22,7 @@ const RUNTIME_SEED: [u8; 32] = [77u8; 32];
 const RUNTIME_ID: &str = "rt_host";
 const DEVICE_ID: &str = "dev_phone";
 const AT: &str = "2026-07-25T12:00:00Z";
+const PROJECT_ID: &str = "0123456789abcdef";
 
 /// Records what actually reached the runtime, so a test can assert that a
 /// refused frame delivered *nothing* rather than merely returning an error.
@@ -69,10 +70,7 @@ fn runtime_key() -> SigningKey {
 fn bridge_with_paired_device(
     dir: &tempfile::TempDir,
     scope: PairingScope,
-) -> (
-    AgentBridge<RecordingRuntime>,
-    Arc<Mutex<Vec<ClientCommand>>>,
-) {
+) -> (AgentBridge, Arc<Mutex<Vec<ClientCommand>>>) {
     let path = dir.path().join("remote").join("devices.json");
     let mut devices = TrustedDevices::load(&path).expect("empty store loads");
     devices
@@ -87,8 +85,9 @@ fn bridge_with_paired_device(
 
     let runtime = RecordingRuntime::default();
     let delivered = runtime.delivered.clone();
+    let routes = Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime)));
     (
-        AgentBridge::new(runtime, devices, RUNTIME_ID, runtime_key(), false),
+        AgentBridge::new(routes, devices, RUNTIME_ID, runtime_key(), false),
         delivered,
     )
 }
@@ -125,7 +124,10 @@ async fn a_frame_from_a_paired_device_reaches_the_runtime() {
         &deliver_body(r#"{"type":"submit_message","session_id":"s1","content":"hi"}"#),
     );
 
-    let admitted = bridge.admit_upstream(&frame, AT, None).await.unwrap();
+    let admitted = bridge
+        .admit_upstream(PROJECT_ID, &frame, AT, None)
+        .await
+        .unwrap();
     assert!(matches!(admitted, Admitted::Delivered { .. }));
     assert_eq!(delivered.lock().unwrap().len(), 1);
 }
@@ -144,7 +146,10 @@ async fn a_forged_signature_delivers_nothing() {
         &deliver_body(r#"{"type":"submit_message","session_id":"s1","content":"hi"}"#),
     );
 
-    let error = bridge.admit_upstream(&frame, AT, None).await.unwrap_err();
+    let error = bridge
+        .admit_upstream(PROJECT_ID, &frame, AT, None)
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), "signature_invalid");
     assert!(
         delivered.lock().unwrap().is_empty(),
@@ -170,7 +175,7 @@ async fn a_relay_supplied_key_is_never_used_to_verify() {
     );
 
     let error = bridge
-        .admit_upstream(&frame, AT, Some(&relay_pubkey))
+        .admit_upstream(PROJECT_ID, &frame, AT, Some(&relay_pubkey))
         .await
         .unwrap_err();
     assert_eq!(
@@ -196,7 +201,7 @@ async fn an_unpaired_device_is_refused() {
 
     assert_eq!(
         bridge
-            .admit_upstream(&frame, AT, None)
+            .admit_upstream(PROJECT_ID, &frame, AT, None)
             .await
             .unwrap_err()
             .code(),
@@ -224,7 +229,13 @@ async fn a_revoked_device_stops_being_admitted() {
 
     let runtime = RecordingRuntime::default();
     let delivered = runtime.delivered.clone();
-    let bridge = AgentBridge::new(runtime, devices, RUNTIME_ID, runtime_key(), false);
+    let bridge = AgentBridge::new(
+        Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime))),
+        devices,
+        RUNTIME_ID,
+        runtime_key(),
+        false,
+    );
 
     let frame = upstream(
         &device_key(),
@@ -234,7 +245,7 @@ async fn a_revoked_device_stops_being_admitted() {
     );
     assert_eq!(
         bridge
-            .admit_upstream(&frame, AT, None)
+            .admit_upstream(PROJECT_ID, &frame, AT, None)
             .await
             .unwrap_err()
             .code(),
@@ -257,7 +268,7 @@ async fn a_frame_addressed_to_another_runtime_is_refused() {
 
     assert_eq!(
         bridge
-            .admit_upstream(&frame, AT, None)
+            .admit_upstream(PROJECT_ID, &frame, AT, None)
             .await
             .unwrap_err()
             .code(),
@@ -287,7 +298,7 @@ async fn a_signed_but_disallowed_command_is_refused() {
 
     assert_eq!(
         bridge
-            .admit_upstream(&frame, AT, None)
+            .admit_upstream(PROJECT_ID, &frame, AT, None)
             .await
             .unwrap_err()
             .code(),
@@ -319,7 +330,7 @@ async fn full_access_is_refused_without_the_host_opt_in() {
 
     assert_eq!(
         bridge
-            .admit_upstream(&frame, AT, None)
+            .admit_upstream(PROJECT_ID, &frame, AT, None)
             .await
             .unwrap_err()
             .code(),
@@ -342,7 +353,7 @@ async fn an_observe_pairing_cannot_deliver() {
 
     assert_eq!(
         bridge
-            .admit_upstream(&frame, AT, None)
+            .admit_upstream(PROJECT_ID, &frame, AT, None)
             .await
             .unwrap_err()
             .code(),

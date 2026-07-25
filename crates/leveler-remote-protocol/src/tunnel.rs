@@ -43,6 +43,20 @@ pub enum RelayToAgent {
         device_id: String,
         pairing_scope: PairingScope,
         access_jti: String,
+        /// Which open project on the host this stream talks to.
+        ///
+        /// Routing metadata, so it is the relay's word rather than the device's.
+        /// A relay that bound a stream to the wrong project would misdirect the
+        /// device's commands — but session ids are per project, so those
+        /// commands fail to resolve rather than landing somewhere unintended.
+        /// The one operation that creates state, `create_session`, takes its
+        /// project from the *signed* RPC payload instead.
+        ///
+        /// Absent means "the host's only project", which keeps single-repo
+        /// deployments working; with more than one open, the agent refuses the
+        /// stream rather than guessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
     },
     CloseStream {
         stream_id: String,
@@ -121,6 +135,8 @@ pub struct RoutingError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RpcMethod {
+    /// The host's open projects, with their status.
+    ListProjects,
     CreateSession,
     Snapshot,
     UploadAttachment,
@@ -135,6 +151,11 @@ pub enum RpcMethod {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RpcRequestPayload {
     pub method: RpcMethod,
+    /// Which project the call is about. Inside the signed payload, so a relay
+    /// cannot redirect a `create_session` to a project the device never chose.
+    /// Absent means the host's only project; `list_projects` ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub body: serde_json::Value,
 }
 

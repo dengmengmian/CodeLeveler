@@ -16,7 +16,7 @@ use leveler_client_protocol::{
 };
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
 use leveler_relay::{RelayState, build_router};
-use leveler_remote_agent::{AgentBridge, TrustedDevices, run_tunnel};
+use leveler_remote_agent::{AgentBridge, SingleProject, TrustedDevices, run_tunnel};
 use leveler_remote_protocol::auth::{RUNTIME_AUTH_HEADER, runtime_action};
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::{
@@ -30,6 +30,7 @@ const DEVICE_SEED: [u8; 32] = [61u8; 32];
 const RUNTIME_SEED: [u8; 32] = [62u8; 32];
 const RUNTIME_ID: &str = "rt_host";
 const DEVICE_ID: &str = "dev_phone";
+const PROJECT_ID: &str = "0123456789abcdef";
 /// The secret the relay's operator configured; the host presents it once, to
 /// enroll.
 const ENROLLMENT_SECRET: &str = "operator-secret";
@@ -231,7 +232,7 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
     };
     let delivered = runtime.delivered.clone();
     let bridge = Arc::new(AgentBridge::new(
-        runtime,
+        Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime))),
         devices,
         RUNTIME_ID,
         runtime_key,
@@ -265,8 +266,16 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
 }
 
 async fn connect_app(chain: &Chain) -> Socket {
+    connect_app_to(chain, None).await
+}
+
+/// Connect naming a project, the way a phone that has switched projects does.
+async fn connect_app_to(chain: &Chain, project_id: Option<&str>) -> Socket {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-    let mut request = format!("ws://{}/v1/hosts/{RUNTIME_ID}/session", chain.base)
+    let query = project_id
+        .map(|id| format!("?project_id={id}"))
+        .unwrap_or_default();
+    let mut request = format!("ws://{}/v1/hosts/{RUNTIME_ID}/session{query}", chain.base)
         .into_client_request()
         .unwrap();
     request.headers_mut().insert(
@@ -476,4 +485,65 @@ async fn an_observe_pairing_is_refused_across_the_chain() {
     let error = recv_verified(&mut app, &chain).await;
     assert_eq!(error["code"], "command_not_allowed_remote");
     assert!(chain.delivered.lock().unwrap().is_empty());
+}
+
+/// A stream can only be opened against a project the host actually has. The
+/// relay names the project; the agent decides whether it exists, and closes the
+/// stream rather than falling back to whichever repository happens to be first.
+#[tokio::test]
+async fn a_stream_for_an_unknown_project_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = build_chain(&dir, PairingScope::Interactive).await;
+    let mut app = connect_app_to(&chain, Some("no_such_project")).await;
+
+    send_command(
+        &mut app,
+        &ClientCommand::SubmitMessage {
+            session_id: SessionId::new("s1"),
+            content: "错的项目".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await;
+
+    // The agent refused the stream, so the relay dropped the route and the
+    // device's socket ends rather than silently going nowhere.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = app.next().await {
+            if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                return true;
+            }
+        }
+        true
+    })
+    .await
+    .expect("the stream should end");
+    assert!(closed);
+    assert!(
+        chain.delivered.lock().unwrap().is_empty(),
+        "nothing may reach a runtime through a stream that was never accepted"
+    );
+}
+
+/// Naming the host's one open project works, so the check is not simply
+/// "refuse everything".
+#[tokio::test]
+async fn a_stream_naming_the_hosts_project_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = build_chain(&dir, PairingScope::Interactive).await;
+    let mut app = connect_app_to(&chain, Some(PROJECT_ID)).await;
+
+    send_command(
+        &mut app,
+        &ClientCommand::SubmitMessage {
+            session_id: SessionId::new("s1"),
+            content: "对的项目".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await;
+
+    let ack = recv_verified(&mut app, &chain).await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(chain.delivered.lock().unwrap().len(), 1);
 }

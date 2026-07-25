@@ -13,7 +13,7 @@ use leveler_client_protocol::{
     SessionId, UiSessionSnapshot,
 };
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
-use leveler_remote_agent::{AgentBridge, TrustedDevices};
+use leveler_remote_agent::{AgentBridge, SingleProject, TrustedDevices};
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::tunnel::{RpcMethod, RpcRequestPayload, rpc_stream_id};
 use leveler_remote_protocol::{
@@ -27,6 +27,7 @@ const RELAY_SEED: [u8; 32] = [55u8; 32];
 const RUNTIME_ID: &str = "rt_host";
 const DEVICE_ID: &str = "dev_phone";
 const AT: &str = "2026-07-25T12:00:00Z";
+const PROJECT_ID: &str = "0123456789abcdef";
 
 struct FakeRuntime {
     delivered: Arc<Mutex<Vec<ClientCommand>>>,
@@ -95,7 +96,12 @@ struct Device {
 
 impl Device {
     fn rpc(&self, uuid: &str, method: RpcMethod, body: serde_json::Value) -> SignedEnvelope {
-        let payload = serde_json::to_vec(&RpcRequestPayload { method, body }).unwrap();
+        let payload = serde_json::to_vec(&RpcRequestPayload {
+            method,
+            project_id: None,
+            body,
+        })
+        .unwrap();
         SignedEnvelope::sign(
             &self.key,
             Sender::Device,
@@ -121,7 +127,7 @@ impl Device {
     }
 }
 
-fn setup(dir: &tempfile::TempDir) -> (AgentBridge<FakeRuntime>, Device) {
+fn setup(dir: &tempfile::TempDir) -> (AgentBridge, Device) {
     let device_key = SigningKey::from_seed(&DEVICE_SEED).unwrap();
     let runtime_key = SigningKey::from_seed(&RUNTIME_SEED).unwrap();
 
@@ -141,7 +147,13 @@ fn setup(dir: &tempfile::TempDir) -> (AgentBridge<FakeRuntime>, Device) {
         delivered: Arc::new(Mutex::new(Vec::new())),
     };
     let anchored = runtime_key.verifying_key();
-    let bridge = AgentBridge::new(runtime, devices, RUNTIME_ID, runtime_key, false);
+    let bridge = AgentBridge::new(
+        Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime))),
+        devices,
+        RUNTIME_ID,
+        runtime_key,
+        false,
+    );
     (
         bridge,
         Device {
@@ -271,6 +283,7 @@ async fn an_unpaired_device_gets_no_signed_body() {
 
     let payload = serde_json::to_vec(&RpcRequestPayload {
         method: RpcMethod::Snapshot,
+        project_id: None,
         body: serde_json::json!({"session_id": "s1"}),
     })
     .unwrap();
@@ -316,9 +329,13 @@ async fn an_observe_pairing_can_snapshot_but_not_create_a_session() {
         .unwrap();
     let anchored = runtime_key.verifying_key();
     let bridge = AgentBridge::new(
-        FakeRuntime {
-            delivered: Arc::new(Mutex::new(Vec::new())),
-        },
+        Arc::new(SingleProject::new(
+            PROJECT_ID,
+            "repo",
+            Arc::new(FakeRuntime {
+                delivered: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )),
         devices,
         RUNTIME_ID,
         runtime_key,

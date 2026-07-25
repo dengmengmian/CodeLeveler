@@ -17,6 +17,8 @@
 //! Nothing short-circuits: a frame that fails at any step is refused with a
 //! wire code and never reaches step 5.
 
+use std::sync::Arc;
+
 use leveler_client_protocol::{
     ClientCommand, ClientOrigin, CommandEnvelope, CommandId, ProtocolEnvelope, SessionId,
 };
@@ -30,12 +32,15 @@ use leveler_remote_protocol::{
 use leveler_session_wire::UpstreamMessage;
 
 use crate::devices::{TrustError, TrustedDevices};
+use crate::projects::{ProjectRoutes, RouteError};
 
 /// Why an inbound frame was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdmissionError {
     #[error("{0}")]
     Trust(#[from] TrustError),
+    #[error("{0}")]
+    Route(#[from] RouteError),
     #[error("envelope rejected: {0}")]
     Envelope(#[from] leveler_remote_protocol::EnvelopeError),
     #[error("payload is not a valid session message")]
@@ -53,6 +58,7 @@ impl AdmissionError {
     pub fn code(&self) -> &'static str {
         match self {
             AdmissionError::Trust(error) => error.code(),
+            AdmissionError::Route(error) => error.code(),
             AdmissionError::Envelope(error) => error.code(),
             AdmissionError::MalformedPayload => "invalid_frame",
             AdmissionError::Refused { code, .. } => code,
@@ -73,9 +79,13 @@ pub enum Admitted {
     SnapshotRequested { session_id: SessionId },
 }
 
-/// Everything the bridge needs to judge one runtime's inbound frames.
-pub struct AgentBridge<R: LocalRuntimeService> {
-    runtime: R,
+/// Everything the bridge needs to judge one host's inbound frames.
+///
+/// One bridge per machine, not per repository: the pairing is with the machine,
+/// and which project a frame belongs to is a routing question answered by
+/// [`ProjectRoutes`] after the frame has proved who sent it.
+pub struct AgentBridge {
+    routes: Arc<dyn ProjectRoutes>,
     devices: TrustedDevices,
     runtime_id: String,
     /// Signs every response carrying a business body, so the APP can tell a
@@ -84,20 +94,52 @@ pub struct AgentBridge<R: LocalRuntimeService> {
     allow_full_access: bool,
 }
 
-impl<R: LocalRuntimeService> AgentBridge<R> {
+impl AgentBridge {
     pub fn new(
-        runtime: R,
+        routes: Arc<dyn ProjectRoutes>,
         devices: TrustedDevices,
         runtime_id: impl Into<String>,
         runtime_key: SigningKey,
         allow_full_access: bool,
     ) -> Self {
         Self {
-            runtime,
+            routes,
             devices,
             runtime_id: runtime_id.into(),
             runtime_key,
             allow_full_access,
+        }
+    }
+
+    /// The projects this host exposes.
+    pub async fn projects(&self) -> Vec<crate::projects::ProjectInfo> {
+        self.routes.projects().await
+    }
+
+    /// Resolve the project a caller named, or the only one open.
+    ///
+    /// A named project must exist on this host — *exist*, not be online: an id
+    /// that is merely offline still binds, so a stream opened while a daemon is
+    /// restarting reports `project_offline` per frame instead of the phone
+    /// having to notice a closed socket. An id that is not this host's at all is
+    /// refused here, at the one place the answer is knowable, rather than
+    /// becoming a stream whose every frame fails.
+    pub async fn resolve_project(&self, project_id: Option<&str>) -> Result<String, RouteError> {
+        match project_id {
+            Some(id) => {
+                if self
+                    .routes
+                    .projects()
+                    .await
+                    .iter()
+                    .any(|project| project.project_id == id)
+                {
+                    Ok(id.to_string())
+                } else {
+                    Err(RouteError::UnknownProject)
+                }
+            }
+            None => self.routes.implied_project().await,
         }
     }
 
@@ -141,24 +183,32 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
         }
 
         let body = match request.method {
+            // Answered by the agent itself: it is the question "which projects
+            // exist", so there is no one runtime to ask.
+            RpcMethod::ListProjects => {
+                let projects = self.routes.projects().await;
+                serde_json::to_vec(&projects).map_err(|_| AdmissionError::MalformedPayload)?
+            }
             RpcMethod::CreateSession => {
+                // From the *signed* payload, so the project a session is created
+                // in is the device's choice and not a relay's routing decision.
+                let runtime = self.runtime_for(request.project_id.as_deref()).await?;
                 let create: CreateSessionRequest = serde_json::from_value(request.body)
                     .map_err(|_| AdmissionError::MalformedPayload)?;
-                let bootstrap = self
-                    .runtime
+                let bootstrap = runtime
                     .create_session(create)
                     .await
                     .map_err(|error| AdmissionError::Runtime(error.to_string()))?;
                 serde_json::to_vec(&bootstrap).map_err(|_| AdmissionError::MalformedPayload)?
             }
             RpcMethod::Snapshot => {
+                let runtime = self.runtime_for(request.project_id.as_deref()).await?;
                 let session_id = request
                     .body
                     .get("session_id")
                     .and_then(|value| value.as_str())
                     .ok_or(AdmissionError::MalformedPayload)?;
-                let snapshot = self
-                    .runtime
+                let snapshot = runtime
                     .snapshot(&SessionId::new(session_id))
                     .await
                     .map_err(|error| AdmissionError::Runtime(error.to_string()))?;
@@ -193,15 +243,44 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
         &self.devices
     }
 
-    /// A session snapshot, for answering a device's snapshot request.
+    /// The runtime for a named project, or for the only open one.
+    async fn runtime_for(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Arc<dyn LocalRuntimeService>, RouteError> {
+        let project_id = match project_id {
+            Some(id) => id.to_string(),
+            None => self.routes.implied_project().await?,
+        };
+        self.routes.runtime(&project_id).await
+    }
+
+    /// A session snapshot from one project, for answering a device's request.
     pub async fn snapshot(
         &self,
+        project_id: &str,
         session_id: &SessionId,
     ) -> Result<leveler_client_protocol::UiSessionSnapshot, AdmissionError> {
-        self.runtime
+        self.routes
+            .runtime(project_id)
+            .await?
             .snapshot(session_id)
             .await
             .map_err(|error| AdmissionError::Runtime(error.to_string()))
+    }
+
+    /// Subscribe to one project's runtime event stream.
+    ///
+    /// Per project, so a phone attached to one repository never sees another's
+    /// output — the isolation the browser UI gets from subscribing per session.
+    pub async fn subscribe(
+        &self,
+        project_id: &str,
+    ) -> Result<
+        tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent>,
+        AdmissionError,
+    > {
+        Ok(self.routes.runtime(project_id).await?.subscribe())
     }
 
     /// Sign a bare assertion with the runtime key, for the relay registration
@@ -246,6 +325,7 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
     /// is only ever compared against the local store.
     pub async fn admit_upstream(
         &self,
+        project_id: &str,
         frame: &SignedEnvelope,
         now: &str,
         relay_claimed_pubkey: Option<&str>,
@@ -287,7 +367,8 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
                     );
                     return Err(AdmissionError::Refused { code, reason });
                 }
-                self.deliver(&command_id, &session_id, command).await?;
+                self.deliver(project_id, &command_id, &session_id, command)
+                    .await?;
                 Ok(Admitted::Delivered { command_id, origin })
             }
             // A snapshot mutates nothing, but an observe pairing is still not
@@ -300,6 +381,7 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
 
     async fn deliver(
         &self,
+        project_id: &str,
         command_id: &str,
         session_id: &str,
         command: ClientCommand,
@@ -311,7 +393,9 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
             issued_at: chrono::Utc::now().to_rfc3339(),
             command,
         };
-        self.runtime
+        self.routes
+            .runtime(project_id)
+            .await?
             .deliver_protocol(ProtocolEnvelope::wrap(envelope))
             .await
             .map_err(|error| AdmissionError::Runtime(error.to_string()))

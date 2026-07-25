@@ -13,8 +13,12 @@
 
 mod bridge;
 mod devices;
+mod projects;
 mod tunnel;
 
 pub use bridge::{AdmissionError, Admitted, AgentBridge};
 pub use devices::{TrustError, TrustedDevices};
+#[cfg(unix)]
+pub use projects::ProjectRouter;
+pub use projects::{ProjectInfo, ProjectRoutes, RouteError, SingleProject};
 pub use tunnel::{TunnelError, run_tunnel};

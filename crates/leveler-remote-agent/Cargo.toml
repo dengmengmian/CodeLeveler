@@ -26,6 +26,7 @@ tokio-tungstenite = "0.26"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 leveler-relay = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }

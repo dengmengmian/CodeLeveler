@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use leveler_local_transport::LocalRuntimeService;
 use leveler_remote_protocol::auth::AgentRegisterAssertion;
 use leveler_remote_protocol::tunnel::{AgentToRelay, RelayToAgent, RoutingError};
 use leveler_remote_protocol::{ContentType, SignedEnvelope};
@@ -33,6 +32,10 @@ pub enum TunnelError {
 /// One live APP stream, from this agent's point of view.
 struct StreamState {
     device_id: String,
+    /// The project this stream talks to, fixed when the stream opened. Frames
+    /// are routed by it rather than by anything inside the frame, so a stream
+    /// cannot wander between repositories mid-conversation.
+    project_id: String,
     /// Monotonic per stream, as the envelope spec requires. Starting from the
     /// agent's own counter rather than echoing the device's keeps the two
     /// directions independent.
@@ -43,15 +46,14 @@ struct StreamState {
 ///
 /// `now` is injected so a test can pin the clock the signatures are stamped
 /// with; production passes a closure reading the real one.
-pub async fn run_tunnel<R, F>(
+pub async fn run_tunnel<F>(
     relay_ws_url: &str,
     runtime_id: &str,
     display_name: &str,
-    bridge: Arc<AgentBridge<R>>,
+    bridge: Arc<AgentBridge>,
     now: F,
 ) -> Result<(), TunnelError>
 where
-    R: LocalRuntimeService + Send + Sync + 'static,
     F: Fn() -> String + Send + Sync + 'static,
 {
     // Prove ownership of the runtime id. A relay that accepted the name alone
@@ -108,23 +110,37 @@ where
     Ok(())
 }
 
-async fn handle<R, F>(
-    bridge: &Arc<AgentBridge<R>>,
+async fn handle<F>(
+    bridge: &Arc<AgentBridge>,
     streams: &mut HashMap<String, StreamState>,
     outbox: &mpsc::UnboundedSender<AgentToRelay>,
     runtime_id: &str,
     now: &F,
     frame: RelayToAgent,
 ) where
-    R: LocalRuntimeService + Send + Sync + 'static,
     F: Fn() -> String,
 {
     match frame {
         RelayToAgent::OpenStream {
             stream_id,
             device_id,
+            project_id,
             ..
         } => {
+            // Bind the stream to a project up front. Refusing here — rather than
+            // guessing — is what keeps a two-project host from quietly sending
+            // one repository's work to the other.
+            let project_id = match bridge.resolve_project(project_id.as_deref()).await {
+                Ok(project_id) => project_id,
+                Err(error) => {
+                    let _ = outbox.send(AgentToRelay::StreamRejected {
+                        stream_id,
+                        code: error.code().to_string(),
+                    });
+                    return;
+                }
+            };
+
             // Accepting only means "this stream exists". Whether the device is
             // trusted is decided per frame against the local store, so a stream
             // opened for a device this host never paired with simply produces
@@ -133,6 +149,7 @@ async fn handle<R, F>(
                 stream_id.clone(),
                 StreamState {
                     device_id,
+                    project_id,
                     next_seq: 1,
                 },
             );
@@ -145,16 +162,24 @@ async fn handle<R, F>(
 
         RelayToAgent::ForwardUpstream { stream_id, frame } => {
             let timestamp = now();
+            // A frame for a stream this agent never opened has no project and no
+            // signing seq; there is nothing to answer on.
+            let Some(project_id) = streams.get(&stream_id).map(|s| s.project_id.clone()) else {
+                tracing::warn!(%stream_id, "upstream frame for an unknown stream");
+                return;
+            };
             // `None`: the relay is never asked for a key, so it cannot supply
             // one to be compared against — let alone used.
-            let outcome = bridge.admit_upstream(&frame, &timestamp, None).await;
+            let outcome = bridge
+                .admit_upstream(&project_id, &frame, &timestamp, None)
+                .await;
 
             let downstream = match outcome {
                 Ok(Admitted::Delivered { command_id, .. }) => {
                     session_json(&serde_json::json!({"type": "ack", "command_id": command_id}))
                 }
                 Ok(Admitted::SnapshotRequested { session_id }) => {
-                    match bridge.snapshot(&session_id).await {
+                    match bridge.snapshot(&project_id, &session_id).await {
                         Ok(snapshot) => session_json(&serde_json::json!({
                             "type": "snapshot",
                             "session": snapshot

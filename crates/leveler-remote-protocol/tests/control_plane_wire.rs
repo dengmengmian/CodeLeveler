@@ -66,10 +66,24 @@ fn relay_to_agent_frames_round_trip() {
         device_id: "dev_1".to_string(),
         pairing_scope: PairingScope::Interactive,
         access_jti: "jti_1".to_string(),
+        project_id: None,
     };
     assert_eq!(
         serde_json::to_string(&open).unwrap(),
-        r#"{"type":"open_stream","stream_id":"str_1","device_id":"dev_1","pairing_scope":"interactive","access_jti":"jti_1"}"#
+        r#"{"type":"open_stream","stream_id":"str_1","device_id":"dev_1","pairing_scope":"interactive","access_jti":"jti_1"}"#,
+        "a stream with no project named stays byte-identical to the single-project shape"
+    );
+
+    let with_project = RelayToAgent::OpenStream {
+        stream_id: "str_1".to_string(),
+        device_id: "dev_1".to_string(),
+        pairing_scope: PairingScope::Interactive,
+        access_jti: "jti_1".to_string(),
+        project_id: Some("a1b2c3d4e5f60708".to_string()),
+    };
+    assert_eq!(
+        serde_json::to_string(&with_project).unwrap(),
+        r#"{"type":"open_stream","stream_id":"str_1","device_id":"dev_1","pairing_scope":"interactive","access_jti":"jti_1","project_id":"a1b2c3d4e5f60708"}"#
     );
 
     let ack = RelayToAgent::RegisterAck {
@@ -91,6 +105,7 @@ fn open_stream_carries_no_device_public_key() {
         device_id: "dev_1".to_string(),
         pairing_scope: PairingScope::Interactive,
         access_jti: "jti_1".to_string(),
+        project_id: Some("a1b2c3d4e5f60708".to_string()),
     };
     let json = serde_json::to_string(&open).unwrap();
     assert!(
@@ -141,10 +156,23 @@ fn rpc_response_omits_the_absent_half() {
 fn rpc_request_payload_keeps_its_body_opaque() {
     let payload = RpcRequestPayload {
         method: RpcMethod::CreateSession,
+        project_id: None,
         body: serde_json::json!({"repository": "/repo", "goal": "hi"}),
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(json.starts_with(r#"{"method":"create_session","body":{"#));
+
+    // The project a session is created in travels inside the signed payload, so
+    // routing it is not a decision the relay gets to make.
+    let targeted = RpcRequestPayload {
+        method: RpcMethod::CreateSession,
+        project_id: Some("a1b2c3d4e5f60708".to_string()),
+        body: serde_json::json!({"goal": "hi"}),
+    };
+    assert_eq!(
+        serde_json::to_string(&targeted).unwrap(),
+        r#"{"method":"create_session","project_id":"a1b2c3d4e5f60708","body":{"goal":"hi"}}"#
+    );
 
     // Round-trips unchanged: this crate never interprets the body, so a field
     // it has never heard of survives.

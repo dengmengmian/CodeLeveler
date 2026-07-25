@@ -136,10 +136,20 @@ fn handle_agent_frame(state: &RelayState, frame: AgentToRelay) {
     }
 }
 
+/// Which project a device's stream is for. Optional, so a single-project host
+/// needs no extra ceremony; the agent refuses the stream if the host has more
+/// than one open and the device named none.
+#[derive(Debug, Deserialize)]
+pub(crate) struct SessionQuery {
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
 /// A device's session stream.
 pub(crate) async fn app_session(
     State(state): State<RelayState>,
     Path(host_id): Path<String>,
+    Query(query): Query<SessionQuery>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, crate::routes::Failure> {
@@ -152,21 +162,40 @@ pub(crate) async fn app_session(
     let device_id = claims.sub.clone();
     let scope = claims.pairing_scope;
     let jti = claims.jti.clone();
-    Ok(upgrade.on_upgrade(move |socket| serve_app(state, socket, device_id, host_id, scope, jti)))
+    Ok(upgrade.on_upgrade(move |socket| {
+        serve_app(
+            state,
+            socket,
+            device_id,
+            host_id,
+            query.project_id,
+            scope,
+            jti,
+        )
+    }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_app(
     state: RelayState,
     socket: WebSocket,
     device_id: String,
     runtime_id: String,
+    project_id: Option<String>,
     scope: leveler_remote_protocol::pairing::PairingScope,
     jti: String,
 ) {
     let (mut sink, mut incoming) = socket.split();
     let (to_app, mut outbox) = mpsc::unbounded_channel::<SignedEnvelope>();
 
-    let stream_id = match state.open_stream(&device_id, &runtime_id, scope, &jti, to_app) {
+    let stream_id = match state.open_stream(
+        &device_id,
+        &runtime_id,
+        project_id.as_deref(),
+        scope,
+        &jti,
+        to_app,
+    ) {
         Ok(stream_id) => stream_id,
         Err(_) => return,
     };

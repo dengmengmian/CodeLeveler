@@ -612,10 +612,12 @@ impl RelayState {
     /// The `open_stream` frame carries no device public key on purpose: the
     /// agent resolves that from its own store. A key supplied here would let the
     /// relay choose what the agent trusts.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_stream(
         &self,
         device_id: &str,
         runtime_id: &str,
+        project_id: Option<&str>,
         pairing_scope: PairingScope,
         access_jti: &str,
         to_app: tokio::sync::mpsc::UnboundedSender<SignedEnvelope>,
@@ -642,6 +644,9 @@ impl RelayState {
         let _ = online.to_agent.send(RelayToAgent::OpenStream {
             stream_id: stream_id.clone(),
             device_id: device_id.to_string(),
+            // Passed through as the device asked for it. The agent decides
+            // whether that project exists; the relay holds no project truth.
+            project_id: project_id.map(|id| id.to_string()),
             pairing_scope,
             access_jti: access_jti.to_string(),
         });
