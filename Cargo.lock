@@ -2114,6 +2114,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "leveler-relay"
+version = "0.1.4"
+dependencies = [
+ "axum",
+ "base64",
+ "chrono",
+ "leveler-remote-protocol",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "leveler-remote-agent"
 version = "0.1.4"
 dependencies = [

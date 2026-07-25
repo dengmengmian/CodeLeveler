@@ -1,0 +1,535 @@
+//! Everything the relay remembers — and, more importantly, everything it does not.
+//!
+//! The relay holds pairings, device records, routing tokens and live tunnel
+//! registrations. It deliberately holds **no command queue and no transcript**.
+//! That is a security decision, not a simplification: a queue would let a
+//! command survive the revocation of the device that issued it, and a
+//! transcript would put the user's session content on a machine the design
+//! assumes may be compromised. When a host is offline the answer is 503, and
+//! the device retries — the truth stays on the developer's machine.
+//!
+//! Tokens are opaque random strings looked up here, not self-contained JWTs.
+//! The design permits either. This choice makes revocation a deletion, which
+//! removes the need for an access-token denylist and with it a whole class of
+//! "the denylist had a gap" bug. The cost is that horizontal scaling needs
+//! shared storage for this table; that is a documented prerequisite rather than
+//! something a second replica would silently get wrong.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use leveler_remote_protocol::auth::{
+    ACCESS_TOKEN_TTL_SECS, REFRESH_TOKEN_TTL_SECS, SCOPE_REMOTE_SESSION, TokenClaims, TokenUse,
+};
+use leveler_remote_protocol::pairing::{PairingScope, PairingState};
+
+/// How long a pairing secret stays claimable.
+pub const PAIRING_TTL_SECS: i64 = 5 * 60;
+/// How long the host has to accept or reject after a device claims a secret.
+pub const CONFIRM_TTL_SECS: i64 = 10 * 60;
+
+/// A pairing in flight.
+#[derive(Debug, Clone)]
+pub struct Pairing {
+    pub pairing_id: String,
+    pub runtime_id: String,
+    /// Stored hashed: a relay database dump must not hand out claimable secrets.
+    pub secret_hash: [u8; 32],
+    pub state: PairingState,
+    pub created_at: i64,
+    /// Set once a device claims the secret.
+    pub claimed: Option<ClaimedBy>,
+}
+
+/// What a device presented when it claimed a pairing secret.
+#[derive(Debug, Clone)]
+pub struct ClaimedBy {
+    pub device_id: String,
+    pub device_pubkey: String,
+    pub device_name: String,
+    pub platform: String,
+    pub scope: PairingScope,
+    pub claimed_at: i64,
+}
+
+/// A device the host accepted. The relay keeps a copy for routing decisions;
+/// the agent's own `devices.json` remains the authority for verification.
+#[derive(Debug, Clone)]
+pub struct DeviceRecord {
+    pub device_id: String,
+    pub runtime_id: String,
+    pub device_pubkey: String,
+    pub scope: PairingScope,
+    pub revoked: bool,
+}
+
+/// A live token. Storing the claims rather than encoding them keeps one
+/// definition of what a token asserts.
+#[derive(Debug, Clone)]
+pub struct TokenRecord {
+    pub claims: TokenClaims,
+}
+
+/// Why a request was refused, with the wire code the design's catalogue names.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RelayError {
+    #[error("invalid pairing")]
+    InvalidPairing,
+    #[error("a pairing is already pending for this runtime")]
+    AlreadyPending,
+    #[error("not found")]
+    NotFound,
+    #[error("expired")]
+    Expired,
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("device revoked")]
+    Revoked,
+    #[error("refresh token reuse detected")]
+    ReuseDetected,
+    #[error("runtime is offline")]
+    RuntimeOffline,
+}
+
+impl RelayError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            RelayError::InvalidPairing => "invalid_pairing",
+            RelayError::AlreadyPending => "already_pending",
+            RelayError::NotFound => "not_found",
+            RelayError::Expired => "expired",
+            RelayError::Unauthorized => "unauthorized",
+            RelayError::Revoked => "revoked",
+            RelayError::ReuseDetected => "reuse_detected",
+            RelayError::RuntimeOffline => "runtime_offline",
+        }
+    }
+
+    pub fn http_status(&self) -> axum::http::StatusCode {
+        use axum::http::StatusCode;
+        match self {
+            RelayError::InvalidPairing | RelayError::Expired => StatusCode::BAD_REQUEST,
+            RelayError::AlreadyPending => StatusCode::CONFLICT,
+            RelayError::NotFound => StatusCode::NOT_FOUND,
+            RelayError::Unauthorized | RelayError::Revoked | RelayError::ReuseDetected => {
+                StatusCode::UNAUTHORIZED
+            }
+            RelayError::RuntimeOffline => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+/// The relay's whole memory. One process, one lock — adequate for a self-hosted
+/// single-user relay and honest about not being more than that.
+#[derive(Default)]
+struct Inner {
+    pairings: HashMap<String, Pairing>,
+    devices: HashMap<String, DeviceRecord>,
+    /// Opaque access token → claims.
+    access: HashMap<String, TokenRecord>,
+    /// Opaque refresh token → claims.
+    refresh: HashMap<String, TokenRecord>,
+    /// Refresh tokens already rotated away. A second use means the token was
+    /// captured, so it costs the device every session it has.
+    retired_refresh: HashMap<String, String>,
+    /// Runtimes with a live agent tunnel. Absence is what makes a request 503
+    /// rather than queueing it.
+    online: HashMap<String, RuntimeOnline>,
+    counter: u64,
+}
+
+/// A registered, currently-connected runtime.
+#[derive(Debug, Clone)]
+pub struct RuntimeOnline {
+    pub runtime_id: String,
+    pub display_name: String,
+}
+
+/// Shared relay state.
+#[derive(Clone, Default)]
+pub struct RelayState {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl RelayState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Begin a pairing, returning the secret exactly once.
+    ///
+    /// Single-flight per runtime: a second `begin` cancels the first, so a
+    /// stale QR left on a screen cannot be claimed later.
+    pub fn begin_pairing(
+        &self,
+        runtime_id: &str,
+        now: i64,
+    ) -> Result<(String, String), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .pairings
+            .retain(|_, pairing| pairing.runtime_id != runtime_id);
+
+        let secret = random_b64(32);
+        inner.counter += 1;
+        let pairing_id = format!("pair_{}", inner.counter);
+        inner.pairings.insert(
+            pairing_id.clone(),
+            Pairing {
+                pairing_id: pairing_id.clone(),
+                runtime_id: runtime_id.to_string(),
+                secret_hash: sha256(secret.as_bytes()),
+                state: PairingState::PendingApp,
+                created_at: now,
+                claimed: None,
+            },
+        );
+        Ok((pairing_id, secret))
+    }
+
+    /// A device claims a secret. Moves the pairing to awaiting host confirmation.
+    ///
+    /// The secret is compared in constant time and the failure is
+    /// indistinguishable from "no such pairing", so the endpoint cannot be used
+    /// to discover which secrets exist.
+    pub fn claim_pairing(
+        &self,
+        secret: &str,
+        claim: ClaimedBy,
+        now: i64,
+    ) -> Result<Pairing, RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        let presented = sha256(secret.as_bytes());
+
+        let pairing = inner
+            .pairings
+            .values_mut()
+            .find(|pairing| {
+                pairing.state == PairingState::PendingApp
+                    && constant_time_eq(&pairing.secret_hash, &presented)
+            })
+            .ok_or(RelayError::InvalidPairing)?;
+
+        if now - pairing.created_at > PAIRING_TTL_SECS {
+            pairing.state = PairingState::Expired;
+            return Err(RelayError::Expired);
+        }
+
+        pairing.state = PairingState::PendingConfirm;
+        pairing.claimed = Some(ClaimedBy {
+            claimed_at: now,
+            ..claim
+        });
+        Ok(pairing.clone())
+    }
+
+    /// The pairing this runtime is waiting to confirm, if any.
+    pub fn pending_confirm_for(&self, runtime_id: &str) -> Option<Pairing> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .pairings
+            .values()
+            .find(|pairing| {
+                pairing.runtime_id == runtime_id && pairing.state == PairingState::PendingConfirm
+            })
+            .cloned()
+    }
+
+    /// The host accepted or rejected. Only an accept creates a device record.
+    pub fn confirm_pairing(
+        &self,
+        pairing_id: &str,
+        runtime_id: &str,
+        accept: bool,
+        now: i64,
+    ) -> Result<(), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        let pairing = inner
+            .pairings
+            .get_mut(pairing_id)
+            .filter(|pairing| pairing.runtime_id == runtime_id)
+            .ok_or(RelayError::NotFound)?;
+
+        if pairing.state != PairingState::PendingConfirm {
+            return Err(RelayError::NotFound);
+        }
+        let claimed = pairing.claimed.clone().ok_or(RelayError::NotFound)?;
+        if now - claimed.claimed_at > CONFIRM_TTL_SECS {
+            pairing.state = PairingState::Expired;
+            return Err(RelayError::Expired);
+        }
+
+        if !accept {
+            pairing.state = PairingState::Rejected;
+            return Ok(());
+        }
+
+        pairing.state = PairingState::Active;
+        let runtime_id = pairing.runtime_id.clone();
+        inner.devices.insert(
+            claimed.device_id.clone(),
+            DeviceRecord {
+                device_id: claimed.device_id,
+                runtime_id,
+                device_pubkey: claimed.device_pubkey,
+                scope: claimed.scope,
+                revoked: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn device(&self, device_id: &str) -> Option<DeviceRecord> {
+        self.inner.lock().unwrap().devices.get(device_id).cloned()
+    }
+
+    pub fn devices_for(&self, runtime_id: &str) -> Vec<DeviceRecord> {
+        self.inner
+            .lock()
+            .unwrap()
+            .devices
+            .values()
+            .filter(|device| device.runtime_id == runtime_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Withdraw a device's access.
+    ///
+    /// Every token it holds is dropped in the same breath, so revocation takes
+    /// effect on the next request rather than whenever an access token would
+    /// have expired.
+    pub fn revoke_device(&self, device_id: &str, runtime_id: &str) -> Result<(), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        let device = inner
+            .devices
+            .get_mut(device_id)
+            .filter(|device| device.runtime_id == runtime_id)
+            .ok_or(RelayError::NotFound)?;
+        device.revoked = true;
+
+        inner
+            .access
+            .retain(|_, record| record.claims.sub != device_id);
+        inner
+            .refresh
+            .retain(|_, record| record.claims.sub != device_id);
+        Ok(())
+    }
+
+    /// Mint an access/refresh pair for a paired, unrevoked device.
+    pub fn issue_tokens(
+        &self,
+        device_id: &str,
+        runtime_id: &str,
+        now: i64,
+    ) -> Result<(String, String, PairingScope), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        let device = inner
+            .devices
+            .get(device_id)
+            .ok_or(RelayError::Unauthorized)?;
+        if device.revoked {
+            return Err(RelayError::Revoked);
+        }
+        // A device is paired to one runtime. Asking for a token against another
+        // is not an authorization question the relay should answer generously.
+        if device.runtime_id != runtime_id {
+            return Err(RelayError::Unauthorized);
+        }
+        let scope = device.scope;
+
+        let (access, refresh) = mint_pair(&mut inner, device_id, runtime_id, scope, now);
+        Ok((access, refresh, scope))
+    }
+
+    /// Rotate a refresh token.
+    ///
+    /// The old token is retired, and presenting a retired one is treated as
+    /// theft rather than as a retry: every token the device holds is dropped and
+    /// it has to authenticate again.
+    pub fn rotate_refresh(
+        &self,
+        presented: &str,
+        now: i64,
+    ) -> Result<(String, String), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+
+        if let Some(device_id) = inner.retired_refresh.get(presented).cloned() {
+            inner.access.retain(|_, r| r.claims.sub != device_id);
+            inner.refresh.retain(|_, r| r.claims.sub != device_id);
+            return Err(RelayError::ReuseDetected);
+        }
+
+        let record = inner
+            .refresh
+            .remove(presented)
+            .ok_or(RelayError::Unauthorized)?;
+        if record.claims.exp <= now {
+            return Err(RelayError::Expired);
+        }
+        let device_id = record.claims.sub.clone();
+        let runtime_id = record.claims.aud.clone();
+        let scope = record.claims.pairing_scope;
+
+        match inner.devices.get(&device_id) {
+            Some(device) if !device.revoked => {}
+            Some(_) => return Err(RelayError::Revoked),
+            None => return Err(RelayError::Unauthorized),
+        }
+
+        inner
+            .retired_refresh
+            .insert(presented.to_string(), device_id.clone());
+        let (access, refresh) = mint_pair(&mut inner, &device_id, &runtime_id, scope, now);
+        Ok((access, refresh))
+    }
+
+    /// Resolve a bearer token to its claims, checking the audience.
+    ///
+    /// `expected_runtime` is what makes a token for one host inert against
+    /// another — the isolation the design requires between paired machines.
+    pub fn authorize(
+        &self,
+        token: &str,
+        expected_runtime: Option<&str>,
+        now: i64,
+    ) -> Result<TokenClaims, RelayError> {
+        let inner = self.inner.lock().unwrap();
+        let record = inner.access.get(token).ok_or(RelayError::Unauthorized)?;
+        if record.claims.exp <= now {
+            return Err(RelayError::Unauthorized);
+        }
+        if let Some(runtime_id) = expected_runtime
+            && record.claims.aud != runtime_id
+        {
+            return Err(RelayError::Unauthorized);
+        }
+        match inner.devices.get(&record.claims.sub) {
+            Some(device) if !device.revoked => Ok(record.claims.clone()),
+            Some(_) => Err(RelayError::Revoked),
+            None => Err(RelayError::Unauthorized),
+        }
+    }
+
+    /// A runtime's agent tunnel came up.
+    pub fn register_runtime(&self, runtime_id: &str, display_name: &str) {
+        self.inner.lock().unwrap().online.insert(
+            runtime_id.to_string(),
+            RuntimeOnline {
+                runtime_id: runtime_id.to_string(),
+                display_name: display_name.to_string(),
+            },
+        );
+    }
+
+    /// A runtime's agent tunnel went away. Nothing is retained for it — no
+    /// queue, so a command aimed at it while offline is refused, not stored.
+    pub fn unregister_runtime(&self, runtime_id: &str) {
+        self.inner.lock().unwrap().online.remove(runtime_id);
+    }
+
+    pub fn is_online(&self, runtime_id: &str) -> bool {
+        self.inner.lock().unwrap().online.contains_key(runtime_id)
+    }
+
+    pub fn require_online(&self, runtime_id: &str) -> Result<RuntimeOnline, RelayError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .online
+            .get(runtime_id)
+            .cloned()
+            .ok_or(RelayError::RuntimeOffline)
+    }
+
+    /// Hosts this device may see: exactly the one it is paired to, and only
+    /// while it is online.
+    pub fn hosts_for_device(&self, device_id: &str) -> Vec<RuntimeOnline> {
+        let inner = self.inner.lock().unwrap();
+        let Some(device) = inner.devices.get(device_id) else {
+            return Vec::new();
+        };
+        inner
+            .online
+            .get(&device.runtime_id)
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+}
+
+fn mint_pair(
+    inner: &mut Inner,
+    device_id: &str,
+    runtime_id: &str,
+    scope: PairingScope,
+    now: i64,
+) -> (String, String) {
+    let access = random_b64(32);
+    let refresh = random_b64(32);
+    inner.counter += 1;
+    let jti = format!("jti_{}", inner.counter);
+
+    let base = TokenClaims {
+        iss: "leveler-relay".to_string(),
+        sub: device_id.to_string(),
+        aud: runtime_id.to_string(),
+        jti: jti.clone(),
+        iat: now,
+        exp: now + ACCESS_TOKEN_TTL_SECS,
+        scope: SCOPE_REMOTE_SESSION.to_string(),
+        pairing_scope: scope,
+        token_use: TokenUse::Access,
+    };
+    inner.access.insert(
+        access.clone(),
+        TokenRecord {
+            claims: base.clone(),
+        },
+    );
+    inner.refresh.insert(
+        refresh.clone(),
+        TokenRecord {
+            claims: TokenClaims {
+                exp: now + REFRESH_TOKEN_TTL_SECS,
+                token_use: TokenUse::Refresh,
+                ..base
+            },
+        },
+    );
+    (access, refresh)
+}
+
+/// CSPRNG bytes, base64url without padding.
+fn random_b64(bytes: usize) -> String {
+    use ring::rand::SecureRandom as _;
+    let mut buffer = vec![0u8; bytes];
+    ring::rand::SystemRandom::new()
+        .fill(&mut buffer)
+        .expect("system RNG is available");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buffer)
+}
+
+/// Compare without an early exit, matching the helper the web and transport
+/// layers already use. The values here are hashes rather than the secrets
+/// themselves, but a byte-by-byte comparison would still leak how far a guess
+/// got, so it accumulates the whole difference.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}

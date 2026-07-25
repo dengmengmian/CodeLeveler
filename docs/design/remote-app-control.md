@@ -1284,12 +1284,21 @@ pub enum ClientOrigin {
 - **Deps:** PR5
 - **DoD：** `projects` 列表 API 签包；2 project 路由 deliver；事件不串台；一 project offline 隔离；注册表与 `web-projects.json` 一致或明确双写策略
 
-### PR6 — self-host relay MVP
+### PR6 — self-host relay MVP ⚠️ 控制面完成，转发未接
 
 - **Title:** `services/leveler-relay: pairing, routing tokens, multiplex forward (host streams)`
 - **Affects:** relay 服务、Dockerfile、共享 denylist 说明
 - **Deps:** PR2, PR5（契约）
 - **DoD:** 双设备隔离负例；host/project offline 503；revoke 关流；**不存**队列/transcript；路由键含 `host_id`（+ stream 内 `project_id`）
+- **已完成（10 测试绿）：** `services/leveler-relay` 控制面——配对三步、routing token 签发与轮换、设备撤销、host 在线注册、`host_id` 路由键。Dockerfile 就绪（非 root、无数据卷，因为它不落盘）。`cargo deny` 全过且 **Cargo.lock 无新增外部依赖**。
+  - **双设备隔离负例** ✅ 两台手机各配对一台机器，交叉访问 401（牙口已验：去掉 audience 检查后该条单独转红）
+  - **host offline 503 + `Retry-After: 5`** ✅ 且上线再下线后仍 503，先前请求未被留存
+  - **revoke 关流** ✅ 撤销时连同该设备所有 token 一并删除，同一 token 下一请求即 401，且无法重新取 token
+  - **不存队列/transcript** ✅ 结构上就没有这类存储
+  - 另含：设备无法自行激活配对、错误 secret 与不存在 secret 回应一致（防枚举）、第二次 `begin` 令旧 QR 失效、refresh 轮换 + 重放视为失窃（连带吊销该设备全部 token）、一台机器无法撤销另一台的设备。
+- **一处刻意的取舍：** token 用**不透明随机串 + 服务端查表**，不是 JWT（设计允许二者）。撤销因此是删表项、立即生效，**不需要 access denylist**——直接消除了「denylist 有洞」这一整类 bug。代价是横向扩展需要共享存储，这是文档化的前提，而非第二个副本会静默做错的事。
+- **未完成：** agent tunnel WSS 与 APP session WSS、签名信封的不透明转发、RPC 代理、`project_id`（待 PR5b）。`/leveler-sessions` 在「已鉴权且 host 在线」时返回 **501**，而不是假装 503——把在线的 host 误报为不可达会掩盖真实状态。
+- **MVP 缺口（已在代码注释标明）：** `/v1/auth/session` 目前只校验配对记录，**未校验 device 签名断言**；`/pair/*` 与 `/auth/*` **未做速率限制**。两项都是设计要求的，须在 PR10 security gate 前补。
 
 ### PR7 — CLI `leveler remote` ⚠️ 部分完成（不依赖 relay 的子命令已可用）
 
@@ -1391,7 +1400,7 @@ pub enum ClientOrigin {
 | `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
 | `leveler-remote-agent` + ProjectRouter | binary | 是 | ⚠️ 准入管道已落地（PR5 部分）；隧道/RPC/ProjectRouter 未开始 |
-| `leveler-relay` self-host | docker | 是 | 未开始（PR6） |
+| `leveler-relay` self-host | docker | 是 | ⚠️ 控制面 + Dockerfile 已落地；WSS 转发未接 |
 | `leveler remote` CLI | CLI | 是 | ⚠️ status/devices/revoke 可用；pair/confirm 待 relay |
 | **leveler-mobile** | iOS + Android 内测包 | **是** | 未开始（PR11a–f） |
 | Security gate 记录 | 文档 | 是 | 未开始（PR10） |

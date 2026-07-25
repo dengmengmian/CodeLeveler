@@ -31,6 +31,7 @@ members = [
     "crates/leveler-web",
     "crates/leveler-cli",
     "crates/leveler-test-support",
+    "services/leveler-relay",
 ]
 
 [workspace.package]
@@ -67,6 +68,7 @@ leveler-client-protocol = { version = "0.1.4", path = "crates/leveler-client-pro
 leveler-session-wire = { version = "0.1.4", path = "crates/leveler-session-wire" }
 leveler-remote-protocol = { version = "0.1.4", path = "crates/leveler-remote-protocol" }
 leveler-remote-agent = { version = "0.1.4", path = "crates/leveler-remote-agent" }
+leveler-relay = { version = "0.1.4", path = "services/leveler-relay" }
 leveler-local-transport = { version = "0.1.4", path = "crates/leveler-local-transport" }
 leveler-media = { version = "0.1.4", path = "crates/leveler-media" }
 leveler-tui = { version = "0.1.4", path = "crates/leveler-tui" }
