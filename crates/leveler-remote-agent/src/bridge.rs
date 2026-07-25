@@ -243,6 +243,14 @@ impl AgentBridge {
         &self.devices
     }
 
+    /// The runtime serving one project, for callers that already know which.
+    pub async fn runtime_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Arc<dyn LocalRuntimeService>, RouteError> {
+        self.routes.runtime(project_id).await
+    }
+
     /// The runtime for a named project, or for the only open one.
     async fn runtime_for(
         &self,

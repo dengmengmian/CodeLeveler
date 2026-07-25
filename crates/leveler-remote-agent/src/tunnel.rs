@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use leveler_remote_protocol::auth::AgentRegisterAssertion;
+use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::tunnel::{AgentToRelay, RelayToAgent, RoutingError};
 use leveler_remote_protocol::{ContentType, SignedEnvelope};
 use leveler_session_wire::DownstreamMessage;
@@ -28,6 +29,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::approvals::{RemotePresence, WAITER_POLL, watch_approvals};
 use crate::bridge::{AdmissionError, Admitted, AgentBridge};
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +55,9 @@ struct StreamState {
     /// Forwards this project's runtime events. Aborted when the stream closes,
     /// so a departed phone stops costing a subscription.
     pump: tokio::task::JoinHandle<()>,
+    /// This stream's contribution to "somebody remote is watching this project",
+    /// which is what arms the approval timeout. Released when the stream closes.
+    presence: Option<RemotePresence>,
 }
 
 impl StreamState {
@@ -185,6 +190,9 @@ async fn pump_events<F>(
 
 /// Connect to `relay_ws_url` and serve frames until the connection ends.
 ///
+/// `approval_timeout` is the host's `remote.approval_timeout_secs`: how long a
+/// remote-only approval waits before the agent denies it.
+///
 /// `now` is injected so a test can pin the clock the signatures are stamped
 /// with; production passes a closure reading the real one.
 pub async fn run_tunnel<F>(
@@ -192,6 +200,7 @@ pub async fn run_tunnel<F>(
     runtime_id: &str,
     display_name: &str,
     bridge: Arc<AgentBridge>,
+    approval_timeout: std::time::Duration,
     now: F,
 ) -> Result<(), TunnelError>
 where
@@ -216,6 +225,9 @@ where
     // never blocks on the socket.
     let (outbox_tx, mut outbox) = mpsc::unbounded_channel::<AgentToRelay>();
     let mut streams: HashMap<String, StreamState> = HashMap::new();
+    // One approval watch per project, shared by every stream on it: two phones
+    // on the same repository must not each fire their own auto-deny.
+    let mut watches: HashMap<String, ProjectWatch> = HashMap::new();
     // Shared with each stream's event pump, which outlives a single frame.
     let now = Arc::new(now);
 
@@ -235,7 +247,17 @@ where
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<RelayToAgent>(&text) {
                         Ok(frame) => {
-                            handle(&bridge, &mut streams, &outbox_tx, runtime_id, &now, frame).await;
+                            handle(
+                                &bridge,
+                                &mut streams,
+                                &mut watches,
+                                &outbox_tx,
+                                runtime_id,
+                                approval_timeout,
+                                &now,
+                                frame,
+                            )
+                            .await;
 
                         }
                         Err(error) => {
@@ -249,14 +271,44 @@ where
                 Some(Ok(_)) => {}
                 Some(Err(error)) => {
                     abort_pumps(&mut streams);
+                    abort_watches(&mut watches);
                     return Err(TunnelError::Closed(error.to_string()));
                 }
             },
         }
     }
-    // The connection is gone; nothing may keep forwarding into it.
+    // The connection is gone; nothing may keep forwarding into it, and with no
+    // remote stream left there is no remote-only approval to expire.
     abort_pumps(&mut streams);
+    abort_watches(&mut watches);
     Ok(())
+}
+
+/// One project's approval watch, plus how many streams still need it.
+struct ProjectWatch {
+    presence: RemotePresence,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn abort_watches(watches: &mut HashMap<String, ProjectWatch>) {
+    for (_, watch) in watches.drain() {
+        watch.task.abort();
+    }
+}
+
+/// Release one stream's hold on its project's approval watch, stopping the watch
+/// when the last remote stream for that project goes.
+fn release_stream(watches: &mut HashMap<String, ProjectWatch>, state: &StreamState) {
+    state.pump.abort();
+    let Some(presence) = &state.presence else {
+        return;
+    };
+    presence.detach();
+    if presence.count() == 0
+        && let Some(watch) = watches.remove(&state.project_id)
+    {
+        watch.task.abort();
+    }
 }
 
 /// Stop every stream's event pump. Dropping the map alone would leave the tasks
@@ -267,11 +319,14 @@ fn abort_pumps(streams: &mut HashMap<String, StreamState>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle<F>(
     bridge: &Arc<AgentBridge>,
     streams: &mut HashMap<String, StreamState>,
+    watches: &mut HashMap<String, ProjectWatch>,
     outbox: &mpsc::UnboundedSender<AgentToRelay>,
     runtime_id: &str,
+    approval_timeout: std::time::Duration,
     now: &Arc<F>,
     frame: RelayToAgent,
 ) where
@@ -282,6 +337,7 @@ async fn handle<F>(
             stream_id,
             device_id,
             project_id,
+            pairing_scope,
             ..
         } => {
             // Bind the stream to a project up front. Refusing here — rather than
@@ -302,6 +358,41 @@ async fn handle<F>(
             // trusted is decided per frame against the local store, so a stream
             // opened for a device this host never paired with simply produces
             // refusals.
+            // Only an interactive stream counts as somebody who could answer an
+            // approval. An observe pairing cannot decide anything, so treating
+            // it as a waiter would arm a countdown nobody could stop.
+            let presence = if pairing_scope == PairingScope::Interactive {
+                if !watches.contains_key(&project_id) {
+                    match bridge.runtime_for_project(&project_id).await {
+                        Ok(runtime) => {
+                            let presence = RemotePresence::default();
+                            let task = tokio::spawn(watch_approvals(
+                                runtime,
+                                project_id.clone(),
+                                device_id.clone(),
+                                presence.clone(),
+                                approval_timeout,
+                                WAITER_POLL,
+                            ));
+                            watches.insert(project_id.clone(), ProjectWatch { presence, task });
+                        }
+                        // No runtime to watch: the stream still opens, and every
+                        // frame on it reports the same failure with a code.
+                        Err(error) => tracing::warn!(
+                            code = error.code(),
+                            %project_id,
+                            "no approval watch for this project"
+                        ),
+                    }
+                }
+                watches.get(&project_id).map(|watch| {
+                    watch.presence.attach();
+                    watch.presence.clone()
+                })
+            } else {
+                None
+            };
+
             let next_seq = Arc::new(Mutex::new(1));
             let pump = tokio::spawn(pump_events(
                 bridge.clone(),
@@ -320,16 +411,17 @@ async fn handle<F>(
                     project_id,
                     next_seq,
                     pump,
+                    presence,
                 },
             ) {
-                previous.pump.abort();
+                release_stream(watches, &previous);
             }
             let _ = outbox.send(AgentToRelay::StreamAccepted { stream_id });
         }
 
         RelayToAgent::CloseStream { stream_id, .. } => {
             if let Some(state) = streams.remove(&stream_id) {
-                state.pump.abort();
+                release_stream(watches, &state);
             }
         }
 
@@ -341,6 +433,16 @@ async fn handle<F>(
                 tracing::warn!(%stream_id, "upstream frame for an unknown stream");
                 return;
             };
+            // Which session the phone is on, for the approval timeout to answer
+            // in. Read before admission on purpose: the id is only a routing
+            // hint, and a frame that fails policy still tells us what the user
+            // is looking at.
+            if let Some(state) = streams.get(&stream_id)
+                && let Some(presence) = &state.presence
+                && let Some(session_id) = session_of(&frame)
+            {
+                presence.note_session(&session_id);
+            }
             // `None`: the relay is never asked for a key, so it cannot supply
             // one to be compared against — let alone used.
             let outcome = bridge
@@ -439,6 +541,19 @@ fn error_json(error: &AdmissionError, command_id: Option<String>) -> String {
         "command_id": command_id,
     })
     .to_string()
+}
+
+/// Which session an upstream frame targets, for the approval timeout. Read from
+/// an unverified payload, so it is treated as a hint and never as authority:
+/// the runtime binds each approval to its own session and refuses a decision
+/// aimed at another.
+fn session_of(frame: &SignedEnvelope) -> Option<String> {
+    let payload = frame.payload().ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value
+        .get("session_id")
+        .and_then(|id| id.as_str())
+        .map(|id| id.to_string())
 }
 
 /// Best-effort correlation for a refusal. The payload failed verification or

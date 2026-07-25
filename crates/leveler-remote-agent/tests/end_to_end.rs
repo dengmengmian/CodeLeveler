@@ -291,7 +291,15 @@ async fn serve_chain(
 
     let ws_base = format!("ws://{base}");
     tokio::spawn(async move {
-        let _ = run_tunnel(&ws_base, RUNTIME_ID, "dev-box", bridge, now_stamp).await;
+        let _ = run_tunnel(
+            &ws_base,
+            RUNTIME_ID,
+            "dev-box",
+            bridge,
+            std::time::Duration::from_secs(120),
+            now_stamp,
+        )
+        .await;
     });
 
     // Wait for the tunnel to register before a device tries to connect.

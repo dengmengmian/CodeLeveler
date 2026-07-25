@@ -11,11 +11,13 @@
 //! comes from `leveler-session-wire` instead.
 #![forbid(unsafe_code)]
 
+mod approvals;
 mod bridge;
 mod devices;
 mod projects;
 mod tunnel;
 
+pub use approvals::WAITER_POLL;
 pub use bridge::{AdmissionError, Admitted, AgentBridge};
 pub use devices::{TrustError, TrustedDevices};
 #[cfg(unix)]

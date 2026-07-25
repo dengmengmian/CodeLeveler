@@ -25,7 +25,9 @@ tokio = { workspace = true }
 tokio-tungstenite = "0.26"
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` gives the approval-timeout tests a paused clock, so a two-minute
+# window costs no wall clock and does not depend on scheduling luck.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 leveler-relay = { workspace = true }
 axum = { workspace = true }

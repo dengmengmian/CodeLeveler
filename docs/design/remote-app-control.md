@@ -1262,7 +1262,13 @@ pub enum ClientOrigin {
 - **`ClientOrigin` 分三态而非两态：** `Local` / `Remote{device_id}` / **`RemoteTimeout{device_id}`**。超时拒绝必须与人工远程拒绝可区分，否则审计会读成「手机用户拒绝了某个他从未看到的请求」。
 - **更正了设计的一处实现假设：** `client_kind` 挂在 `Subscribe` 而非握手，理由见上文「实现前提」。
 - **顺带修掉一个既有缺陷：** 服务端订阅循环原先只阻塞在 `events.recv()`、**不读 socket**，对端消失要等下一次写事件才发现；空闲会话上可能永远发现不了。后果是静默退出的 TUI 会让 waiter 计数长期偏高、超时永不武装——方向安全但功能等于失效。现改为同时监听对端 EOF，一并消除了每个死订阅者泄漏一个服务端任务的问题。
-- **未做：** 定时器本身与审批路径的实接线。设计规定**超时权威 = Agent 进程**，而 agent 尚不存在（PR5）。本 PR 交付的是它需要的三件套：origin 类型、waiter 计数、超时状态机。`leveler-app` 的 `PendingApprovals` **未改动**。
+- **接线已完成（agent 侧 +7 测试，local-transport +1）：** 状态机此前零调用者，现已接上。
+  - **watcher 按 project 一个**（不是按 stream），否则同一仓库上两台手机会各自发一次 auto-Deny。只有 `interactive` stream 计入 remote waiter——observe 配对做不了决定，把它算作 waiter 等于武装一个没人能停的倒计时。
+  - **local waiter 计数跨进程读：** 新增 `WireRequest::LocalWaiters`（daemon 用自己的计数器答），`LocalRuntimeService::local_waiter_count` 默认返回 **1**（「假定有人在看」）——该方向只会抑制 auto-Deny。sidecar agent 看不到这台机器的终端，只能问。**仅在有 pending 审批时**每秒轮询，空闲零流量。
+  - **矩阵全绿（DoD）：** remote-only 超时 Deny ✅ / local-only 不超时 ✅ / both 不超时 ✅ / both 后 local 离开 → **从离开那一刻**起重新计满 120s（并先验证「差 10s 时仍不 Deny」）✅ / `ApprovalResolved` 取消倒计时 ✅ / observe stream 不武装 ✅ / 手机断开后无人远程等待即不 Deny ✅。用 tokio 暂停时钟，两分钟窗口不耗真实时间也不靠调度运气。
+  - **auto-Deny 的 session 取自手机最后一帧的 `session_id`。** 猜错不会导致错误决定：runtime 把每个 pending 请求绑定到它自己的 session，投到别处会被拒——失败模式是一条日志，而不是投错地方的拒绝。
+  - **`ClientOrigin::RemoteTimeout` 目前只进审计行**，因为 `CommandEnvelope` 没有 origin 字段；把 origin 贯通进 runtime 是另一次独立改动。**这是明说的缺口，不是已完成项。** `leveler-app` 的 `PendingApprovals` 仍未改动。
+  - **牙口已验：** 把 local waiter 计数强制为 0 → `a_local_ui_keeps_the_approval_alive` 与 `both_attached_means_no_countdown` 转红，其余 5 条绿。
 
 ### PR5 — remote-agent：验签 + policy + **单 project** 桥 + mock relay ⚠️ 部分完成（准入管道已落地，隧道未接）
 

@@ -96,6 +96,18 @@ pub trait LocalRuntimeService: InteractiveRuntimeClient {
         &self,
         request: CreateSessionRequest,
     ) -> Result<SessionBootstrap, ClientError>;
+
+    /// How many local interactive UIs are attached to this runtime right now.
+    ///
+    /// The remote approval timeout needs this: it must not expire a prompt while
+    /// a person could still be reading it in their own terminal. The default
+    /// answers `1` — "assume someone is watching" — because that direction can
+    /// only suppress an auto-deny, whereas guessing zero would let a paired
+    /// phone's policy cut off a decision a human was making. The socket client
+    /// asks the daemon for the real number.
+    async fn local_waiter_count(&self) -> Result<usize, ClientError> {
+        Ok(1)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +140,9 @@ enum WireRequest {
         session_id: SessionId,
     },
     CreateSession(CreateSessionRequest),
+    /// How many local interactive UIs are attached. Asked by the remote agent,
+    /// which cannot see this machine's terminals from its own process.
+    LocalWaiters,
     Subscribe {
         session_id: Option<SessionId>,
         /// Absent from clients built before remote control existed; `default`
@@ -145,6 +160,7 @@ enum WireResponse {
     Snapshot(UiSessionSnapshot),
     SessionCreated(SessionBootstrap),
     Event(RuntimeEvent),
+    LocalWaiters(usize),
     Error(WireError),
 }
 
@@ -319,6 +335,16 @@ mod unix {
                         .create_session(request)
                         .await
                         .map(WireResponse::SessionCreated),
+                )
+                .await
+            }
+            // Answered from the daemon's own counter, not from the runtime:
+            // this is a fact about who is connected here, which only the
+            // transport knows.
+            WireRequest::LocalWaiters => {
+                send_response(
+                    &mut stream,
+                    WireResponse::LocalWaiters(local_waiters.count()),
                 )
                 .await
             }
@@ -619,6 +645,20 @@ mod unix {
             request: CreateSessionRequest,
         ) -> Result<SessionBootstrap, ClientError> {
             LocalSocketRuntimeClient::create_session(self, request).await
+        }
+
+        /// Ask the daemon, because a sidecar process cannot see this machine's
+        /// terminals from inside its own.
+        async fn local_waiter_count(&self) -> Result<usize, ClientError> {
+            match self
+                .request(WireRequest::LocalWaiters)
+                .await
+                .map_err(transport_client_error)?
+            {
+                WireResponse::LocalWaiters(count) => Ok(count),
+                WireResponse::Error(error) => Err(error.into_client_error()),
+                response => Err(unexpected_response(response)),
+            }
         }
     }
 
@@ -1106,6 +1146,20 @@ mod unsupported {
         ) -> Result<SessionBootstrap, ClientError> {
             LocalSocketRuntimeClient::create_session(self, request).await
         }
+
+        /// Ask the daemon, because a sidecar process cannot see this machine's
+        /// terminals from inside its own.
+        async fn local_waiter_count(&self) -> Result<usize, ClientError> {
+            match self
+                .request(WireRequest::LocalWaiters)
+                .await
+                .map_err(transport_client_error)?
+            {
+                WireResponse::LocalWaiters(count) => Ok(count),
+                WireResponse::Error(error) => Err(error.into_client_error()),
+                response => Err(unexpected_response(response)),
+            }
+        }
     }
 
     pub struct TcpRuntimeServer;
@@ -1349,6 +1403,43 @@ mod tests {
         wait_for_waiters(&waiters, 1).await;
         drop(web);
         wait_for_waiters(&waiters, 0).await;
+
+        drop(agent);
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
+    /// The remote agent runs in its own process, so the only way it can know
+    /// whether a person is at this machine is to ask the daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_daemon_reports_its_local_waiter_count_to_a_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let server = LocalSocketServer::bind(&path, Arc::new(TestRuntime::new()))
+            .await
+            .unwrap();
+        let waiters = server.local_waiters();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+
+        // The agent's own connection must not inflate the count it reads.
+        let agent = LocalSocketRuntimeClient::connect_as(&path, ClientKind::Remote)
+            .await
+            .unwrap();
+        assert_eq!(agent.local_waiter_count().await.unwrap(), 0);
+
+        let tui = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        wait_for_waiters(&waiters, 1).await;
+        assert_eq!(agent.local_waiter_count().await.unwrap(), 1);
+
+        drop(tui);
+        wait_for_waiters(&waiters, 0).await;
+        assert_eq!(
+            agent.local_waiter_count().await.unwrap(),
+            0,
+            "a terminal that closed must stop holding the timeout disarmed"
+        );
 
         drop(agent);
         shutdown.cancel();
