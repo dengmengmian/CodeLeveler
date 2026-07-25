@@ -31,10 +31,9 @@ use leveler_client_protocol::{
     ClientCommand, ClientError, CommandEnvelope, CommandId, ProtocolEnvelope, RuntimeEvent,
     SessionId,
 };
+use leveler_session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 
 use crate::auth;
-use crate::projects::ProjectStatus;
-use crate::protocol::{DownstreamMessage, UpstreamMessage};
 use crate::server::AppState;
 
 /// Query parameters accepted on the upgrade request: `/ws?session=<id>`.

@@ -20,18 +20,9 @@ use tokio::sync::{broadcast, oneshot};
 
 use leveler_local_transport::LocalSocketRuntimeClient;
 use leveler_project::Layout;
+use leveler_session_wire::ProjectStatus;
 
 use crate::router::RouterService;
-
-/// Where a registered project's daemon currently stands. Serialized lowercase
-/// on both the REST payloads and the WS `project_status` frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProjectStatus {
-    Online,
-    Starting,
-    Offline,
-}
 
 /// One row of `GET /api/projects`.
 #[derive(Debug, Clone, Serialize)]

@@ -2109,6 +2109,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "leveler-session-wire"
+version = "0.1.4"
+dependencies = [
+ "leveler-client-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "leveler-skills"
 version = "0.1.4"
 dependencies = [
@@ -2244,6 +2253,7 @@ dependencies = [
  "leveler-core",
  "leveler-local-transport",
  "leveler-project",
+ "leveler-session-wire",
  "leveler-storage",
  "mime_guess",
  "reqwest",

@@ -11,6 +11,7 @@ description = "Browser WebUI server for CodeLeveler: REST + WebSocket on top of 
 [dependencies]
 leveler-core = { workspace = true }
 leveler-client-protocol = { workspace = true }
+leveler-session-wire = { workspace = true }
 leveler-local-transport = { workspace = true }
 leveler-project = { workspace = true }
 leveler-storage = { workspace = true }

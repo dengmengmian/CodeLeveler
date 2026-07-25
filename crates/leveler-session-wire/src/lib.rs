@@ -1,18 +1,31 @@
-//! WebSocket wire DTOs: the browser ↔ server message shapes.
+//! Session WebSocket wire DTOs: the client ↔ server message shapes.
 //!
 //! These mirror the stable client protocol (commands in, events/snapshots out)
 //! with WebSocket-specific framing: each upstream command delivery carries a
-//! client-chosen `command_id` the server echoes in its `ack`, so the SPA can
+//! client-chosen `command_id` the server echoes in its `ack`, so the client can
 //! match acknowledgements to queued messages. Golden fixtures pin the wire
 //! shape — the TypeScript client depends on it byte for byte.
+//!
+//! The framing lives in its own crate so every session client speaks one
+//! dialect: the browser server (`leveler-web`) and, once it lands, the remote
+//! agent, which must reach these types without pulling in axum and the
+//! embedded SPA. Nothing here may depend on a transport or a UI shell.
 
 use serde::{Deserialize, Serialize};
 
 use leveler_client_protocol::{ClientCommand, RuntimeEvent, UiSessionSnapshot};
 
-use crate::projects::ProjectStatus;
+/// Where a registered project's daemon currently stands. Serialized lowercase
+/// on both the REST payloads and the WS `project_status` frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectStatus {
+    Online,
+    Starting,
+    Offline,
+}
 
-/// A message the browser sends upstream over the WebSocket.
+/// A message the client sends upstream over the WebSocket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UpstreamMessage {
@@ -129,6 +142,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&frame).unwrap(),
             r#"{"type":"project_status","path":"/Users/me/repo","status":"offline"}"#
+        );
+    }
+
+    #[test]
+    fn project_status_serializes_lowercase() {
+        // The REST payloads share this enum with the WS frames above.
+        assert_eq!(
+            serde_json::to_string(&ProjectStatus::Online).unwrap(),
+            r#""online""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ProjectStatus::Starting).unwrap(),
+            r#""starting""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ProjectStatus>(r#""offline""#).unwrap(),
+            ProjectStatus::Offline
         );
     }
 
