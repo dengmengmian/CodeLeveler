@@ -1263,12 +1263,18 @@ pub enum ClientOrigin {
 - **顺带修掉一个既有缺陷：** 服务端订阅循环原先只阻塞在 `events.recv()`、**不读 socket**，对端消失要等下一次写事件才发现；空闲会话上可能永远发现不了。后果是静默退出的 TUI 会让 waiter 计数长期偏高、超时永不武装——方向安全但功能等于失效。现改为同时监听对端 EOF，一并消除了每个死订阅者泄漏一个服务端任务的问题。
 - **未做：** 定时器本身与审批路径的实接线。设计规定**超时权威 = Agent 进程**，而 agent 尚不存在（PR5）。本 PR 交付的是它需要的三件套：origin 类型、waiter 计数、超时状态机。`leveler-app` 的 `PendingApprovals` **未改动**。
 
-### PR5 — remote-agent：验签 + policy + **单 project** 桥 + mock relay
+### PR5 — remote-agent：验签 + policy + **单 project** 桥 + mock relay ⚠️ 部分完成（准入管道已落地，隧道未接）
 
 - **Title:** `leveler-remote-agent: signed frames, policy, mock tunnel (single project first)`
 - **Affects:** 新 crate、PR0 wire、PR3 policy、PR4 origin
 - **Deps:** PR0, PR2, PR3, PR4
 - **DoD:** 伪造签名失败；TOFU devices.json；**signed rpc_response** for create/snapshot/upload；假 relay；relay 换钥负例。可先单 project，接口形状预留 `project_id`。
+- **已完成（11 测试绿）：** `crates/leveler-remote-agent` 的**准入管道**——信任解析 → 验签 → 解析 → policy → `deliver_protocol`。顺序刻意如此：每一步只作用于上一步已背书的输入。每条负例都断言**运行时收到 0 条命令**，而非仅仅返回了错误。
+  - 伪造签名 ✅ / **relay 换钥负例** ✅（relay 提供密钥仅作**比对**，永不用于验签，不符即 `pubkey_mismatch`）/ TOFU `devices.json` ✅（原子写 + 0600 + 重复 accept 替换旧行，不留可用的陈旧密钥）/ 未配对 ✅ / 已撤销 ✅ / 跨 runtime 重放 ✅ / policy 拒绝（`ApproveAlways`、`FullAccess`、observe）✅
+  - **不依赖 `leveler-web`** ✅，session framing 取自 PR0 的 `leveler-session-wire`。
+- **牙口已验：** 本 PR 我是实现与测试同写、**未观察到红**，故补做验证——把实现改成「relay 给了密钥就用它」，`a_relay_supplied_key_is_never_used_to_verify` 单条转红、其余 10 条仍绿，随后还原。
+- **未完成（PR5 剩余）：** 真实 WSS 隧道客户端、`AgentToRelay`/`RelayToAgent` 帧收发循环、**signed `rpc_response`（create/snapshot/upload）**、假 relay 端到端、审批超时定时器接线（用 PR4 的状态机 + waiter 计数）。当前 crate 只是可被隧道调用的纯准入函数，**尚无任何网络代码**。
+- **接口形状：** `project_id` 尚未预留，留待 PR5b 与 ProjectRouter 一并引入。
 
 ### PR5b — ProjectRouter：多已打开项目
 
@@ -1378,7 +1384,7 @@ pub enum ClientOrigin {
 | `leveler-session-wire` | crate | 是 | ✅ PR0 已落地 |
 | `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
-| `leveler-remote-agent` + ProjectRouter | binary | 是 | 未开始（PR5/5b） |
+| `leveler-remote-agent` + ProjectRouter | binary | 是 | ⚠️ 准入管道已落地（PR5 部分）；隧道/RPC/ProjectRouter 未开始 |
 | `leveler-relay` self-host | docker | 是 | 未开始（PR6） |
 | `leveler remote` CLI | CLI | 是 | 未开始（PR7） |
 | **leveler-mobile** | iOS + Android 内测包 | **是** | 未开始（PR11a–f） |

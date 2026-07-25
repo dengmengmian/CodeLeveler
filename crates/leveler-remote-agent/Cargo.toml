@@ -1,0 +1,25 @@
+[package]
+name = "leveler-remote-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Host-side bridge for remote APP control: verifies signed device frames, enforces the remote capability gate, and forwards to the local runtime."
+
+[dependencies]
+leveler-client-protocol = { workspace = true }
+leveler-local-transport = { workspace = true }
+leveler-remote-protocol = { workspace = true, features = ["policy"] }
+leveler-session-wire = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

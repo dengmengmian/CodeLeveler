@@ -2112,6 +2112,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "leveler-remote-agent"
+version = "0.1.4"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "leveler-client-protocol",
+ "leveler-local-transport",
+ "leveler-remote-protocol",
+ "leveler-session-wire",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "leveler-remote-protocol"
 version = "0.1.4"
 dependencies = [
