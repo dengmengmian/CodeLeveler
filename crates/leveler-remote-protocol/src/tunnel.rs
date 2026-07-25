@@ -105,6 +105,14 @@ pub enum AgentToRelay {
         stream_id: String,
         code: String,
     },
+    /// The agent is ending a stream it had accepted — the event subscription
+    /// lagged, or the project went away. Distinct from `stream_rejected`, which
+    /// is an answer to `open_stream`: this one can arrive at any time, and the
+    /// device is expected to reconnect and resynchronize from a snapshot.
+    CloseStream {
+        stream_id: String,
+        reason: String,
+    },
     ForwardDownstream {
         stream_id: String,
         frame: SignedEnvelope,

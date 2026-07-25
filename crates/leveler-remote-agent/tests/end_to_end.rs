@@ -59,6 +59,23 @@ type Socket =
 
 struct FakeRuntime {
     delivered: Arc<Mutex<Vec<ClientCommand>>>,
+    /// What the runtime emits, so a test can make the machine speak first.
+    events: broadcast::Sender<RuntimeEvent>,
+    /// When set, `subscribe` floods the channel *before* handing back the
+    /// receiver, so the pump's first `recv` is guaranteed to report a lag. The
+    /// alternative — racing a real subscriber — would be a flaky test of the
+    /// one path that must not be guesswork.
+    lag_on_subscribe: bool,
+}
+
+impl FakeRuntime {
+    fn new() -> Self {
+        Self {
+            delivered: Arc::new(Mutex::new(Vec::new())),
+            events: broadcast::channel(16).0,
+            lag_on_subscribe: false,
+        }
+    }
 }
 
 #[async_trait]
@@ -69,7 +86,14 @@ impl InteractiveRuntimeClient for FakeRuntime {
     }
 
     fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
-        let (_sender, receiver) = broadcast::channel(1);
+        let receiver = self.events.subscribe();
+        if self.lag_on_subscribe {
+            for index in 0..64 {
+                let _ = self.events.send(RuntimeEvent::AgentActivity {
+                    label: format!("flood {index}"),
+                });
+            }
+        }
         receiver
     }
 
@@ -112,11 +136,41 @@ struct Chain {
     base: String,
     token: String,
     delivered: Arc<Mutex<Vec<ClientCommand>>>,
+    /// Lets a test make the runtime emit, the way real work does.
+    events: broadcast::Sender<RuntimeEvent>,
     runtime_key: VerifyingKey,
     _relay_state: RelayState,
 }
 
 async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
+    build_chain_with(dir, scope, false).await
+}
+
+async fn build_chain_with(
+    dir: &tempfile::TempDir,
+    scope: PairingScope,
+    lag_on_subscribe: bool,
+) -> Chain {
+    let runtime = FakeRuntime {
+        lag_on_subscribe,
+        ..FakeRuntime::new()
+    };
+    let delivered = runtime.delivered.clone();
+    let events = runtime.events.clone();
+    let routes = Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime)));
+    serve_chain(dir, scope, routes, delivered, events).await
+}
+
+/// Everything between "a phone with no pairing" and "a phone holding a token
+/// against a live agent": the relay's real endpoints, the real tunnel, and the
+/// caller's projects behind it.
+async fn serve_chain(
+    dir: &tempfile::TempDir,
+    scope: PairingScope,
+    routes: Arc<dyn leveler_remote_agent::ProjectRoutes>,
+    delivered: Arc<Mutex<Vec<ClientCommand>>>,
+    events: broadcast::Sender<RuntimeEvent>,
+) -> Chain {
     // The relay, as a real process would run it.
     let state = RelayState::with_enrollment_secret(ENROLLMENT_SECRET);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -227,12 +281,8 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
         )
         .unwrap();
 
-    let runtime = FakeRuntime {
-        delivered: Arc::new(Mutex::new(Vec::new())),
-    };
-    let delivered = runtime.delivered.clone();
     let bridge = Arc::new(AgentBridge::new(
-        Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime))),
+        routes,
         devices,
         RUNTIME_ID,
         runtime_key,
@@ -260,6 +310,7 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
         base,
         token,
         delivered,
+        events,
         runtime_key: public_runtime_key,
         _relay_state: state,
     }
@@ -546,4 +597,189 @@ async fn a_stream_naming_the_hosts_project_works() {
     let ack = recv_verified(&mut app, &chain).await;
     assert_eq!(ack["type"], "ack");
     assert_eq!(chain.delivered.lock().unwrap().len(), 1);
+}
+
+/// The half the phone actually reads: the runtime speaking unprompted.
+///
+/// Without this the chain acknowledges commands and shows nothing — a phone
+/// could submit a message and never see the answer.
+#[tokio::test]
+async fn runtime_events_reach_the_phone_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = build_chain(&dir, PairingScope::Interactive).await;
+    let mut app = connect_app(&chain).await;
+
+    // The pump subscribes when the stream opens; emitting until it lands avoids
+    // depending on that having happened by any particular instant.
+    let event = RuntimeEvent::AssistantTextDelta {
+        message_id: leveler_client_protocol::MessageId::new("m1"),
+        delta: "助手输出".to_string(),
+    };
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // Wait for the pump to subscribe, then emit: a broadcast delivers only
+        // to receivers that already exist.
+        while chain.events.receiver_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        chain.events.send(event.clone()).unwrap();
+        recv_verified(&mut app, &chain).await
+    })
+    .await
+    .expect("an event should reach the device");
+
+    assert_eq!(frame["type"], "event");
+    assert_eq!(frame["event"]["type"], "assistant_text_delta");
+    assert_eq!(frame["event"]["delta"], "助手输出");
+}
+
+/// An observe pairing exists to watch: it delivers nothing, but it must still
+/// see the stream. A read-only pairing that also saw nothing would be pointless.
+#[tokio::test]
+async fn an_observe_pairing_still_receives_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = build_chain(&dir, PairingScope::Observe).await;
+    let mut app = connect_app(&chain).await;
+
+    let event = RuntimeEvent::AgentActivity {
+        label: "运行测试".to_string(),
+    };
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while chain.events.receiver_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        chain.events.send(event.clone()).unwrap();
+        recv_verified(&mut app, &chain).await
+    })
+    .await
+    .expect("an observer should still see events");
+
+    assert_eq!(frame["type"], "event");
+    assert_eq!(frame["event"]["label"], "运行测试");
+}
+
+/// A device that fell behind is told so and its stream ends. Continuing to feed
+/// it would render a transcript with holes, which reads as fact rather than as
+/// the gap it is.
+#[tokio::test]
+async fn a_lagged_subscriber_is_told_to_resync_and_the_stream_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = build_chain_with(&dir, PairingScope::Interactive, true).await;
+    let mut app = connect_app(&chain).await;
+
+    let frame = recv_verified(&mut app, &chain).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["code"], "resync_required");
+
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = app.next().await {
+            if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                return true;
+            }
+        }
+        true
+    })
+    .await
+    .expect("the stream should end after a resync demand");
+    assert!(ended);
+}
+
+/// Two projects open, two streams from one phone: the events of each reach only
+/// the stream bound to it.
+///
+/// This is the failure that would make multi-project remote control worse than
+/// none — a phone showing one repository's screen while another's output scrolls
+/// into it.
+#[tokio::test]
+async fn events_do_not_cross_between_two_open_projects() {
+    /// Two projects, each with its own runtime and its own event stream.
+    struct TwoProjects {
+        alpha: Arc<FakeRuntime>,
+        beta: Arc<FakeRuntime>,
+    }
+
+    #[async_trait]
+    impl leveler_remote_agent::ProjectRoutes for TwoProjects {
+        async fn projects(&self) -> Vec<leveler_remote_agent::ProjectInfo> {
+            ["alpha_project_id", "beta_project_id"]
+                .iter()
+                .map(|id| leveler_remote_agent::ProjectInfo {
+                    project_id: id.to_string(),
+                    path_display: id.to_string(),
+                    status: leveler_session_wire::ProjectStatus::Online,
+                })
+                .collect()
+        }
+
+        async fn runtime(
+            &self,
+            project_id: &str,
+        ) -> Result<Arc<dyn LocalRuntimeService>, leveler_remote_agent::RouteError> {
+            match project_id {
+                "alpha_project_id" => Ok(self.alpha.clone()),
+                "beta_project_id" => Ok(self.beta.clone()),
+                _ => Err(leveler_remote_agent::RouteError::UnknownProject),
+            }
+        }
+
+        async fn implied_project(&self) -> Result<String, leveler_remote_agent::RouteError> {
+            Err(leveler_remote_agent::RouteError::ProjectRequired)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = Arc::new(FakeRuntime::new());
+    let beta = Arc::new(FakeRuntime::new());
+    let alpha_events = alpha.events.clone();
+    let beta_events = beta.events.clone();
+    let chain = serve_chain(
+        &dir,
+        PairingScope::Interactive,
+        Arc::new(TwoProjects {
+            alpha: alpha.clone(),
+            beta: beta.clone(),
+        }),
+        alpha.delivered.clone(),
+        alpha_events.clone(),
+    )
+    .await;
+
+    let mut on_alpha = connect_app_to(&chain, Some("alpha_project_id")).await;
+    let mut on_beta = connect_app_to(&chain, Some("beta_project_id")).await;
+
+    // Both pumps attached.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while alpha_events.receiver_count() == 0 || beta_events.receiver_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both streams should subscribe");
+
+    alpha_events
+        .send(RuntimeEvent::AgentActivity {
+            label: "alpha 在跑".to_string(),
+        })
+        .unwrap();
+
+    let frame = recv_verified(&mut on_alpha, &chain).await;
+    assert_eq!(frame["event"]["label"], "alpha 在跑");
+
+    // The other project's stream saw nothing at all.
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), on_beta.next()).await;
+    assert!(
+        quiet.is_err(),
+        "the other project's stream must stay silent, got {quiet:?}"
+    );
+
+    // And it works the other way round, so the isolation is not just "beta is
+    // broken".
+    beta_events
+        .send(RuntimeEvent::AgentActivity {
+            label: "beta 在跑".to_string(),
+        })
+        .unwrap();
+    let frame = recv_verified(&mut on_beta, &chain).await;
+    assert_eq!(frame["event"]["label"], "beta 在跑");
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), on_alpha.next()).await;
+    assert!(quiet.is_err(), "alpha must not see beta's output");
 }

@@ -1282,8 +1282,13 @@ pub enum ClientOrigin {
   - relay 用自己的密钥伪造帧 → `signature_invalid`，未触达 runtime ✅
   - snapshot 请求返回 runtime 签名的会话状态 ✅
   - observe 配对全程无法投递 ✅
-- **未完成（PR5 剩余）：** 运行时**事件流**下行（手机目前收不到助手输出，只有 ack/error/snapshot）；`upload_attachment` 的 agent 侧实现；审批超时定时器接线（PR4 的状态机与 waiter 计数**仍未被调用**）。
-- **接口形状：** `project_id` 尚未预留，留待 PR5b 与 ProjectRouter 一并引入。
+- **事件流下行已补齐（e2e 追加 4 测试，共 11 绿）：** 每条已接受的 stream 起一个 pump，订阅**该 project** 的运行时事件流，签名后下行 `{"type":"event",...}`。此前手机只能收到 ack/error/snapshot——发得出去、看不见回音，那不叫远程控制。
+  - **订阅粒度取项目全量流**，与 TUI 及单项目模式的 web 对同一个 per-repo daemon 的做法一致；在这里改成按 session 过滤等于给一个全产品统一的问题发明第三种答案。
+  - **事件不串台** ✅ 一台手机两条 stream 分别绑 alpha / beta，alpha 的事件只到 alpha，**同时断言 beta 那条完全静默**，反向再验一次。
+  - **observe 配对照样收事件** ✅ 只读配对如果也看不见，就没有存在意义。
+  - **落后即断** ✅ 订阅 lag → 下行 `resync_required` 后由 agent 主动 `close_stream`；继续喂会渲染出一份有洞的对话记录，而洞看上去和事实一样。为此新增 `AgentToRelay::CloseStream`（与 `stream_rejected` 区分：后者是对 `open_stream` 的答复）。lag 用「subscribe 时先灌满再返回 receiver」构造，**确定性触发**，不是抢时序。
+  - **牙口已验：** 不 spawn pump → 上述 4 条全红，其余 7 条绿。
+- **未完成（PR5 剩余）：** `upload_attachment` 的 agent 侧实现。
 
 ### PR5b — ProjectRouter：多已打开项目 ✅ 已完成
 

@@ -86,6 +86,18 @@ fn relay_to_agent_frames_round_trip() {
         r#"{"type":"open_stream","stream_id":"str_1","device_id":"dev_1","pairing_scope":"interactive","access_jti":"jti_1","project_id":"a1b2c3d4e5f60708"}"#
     );
 
+    // The agent can end a stream it had accepted; distinct from rejecting one at
+    // open time, because the device has to tell "never started" from "stopped,
+    // resynchronize".
+    let closed = AgentToRelay::CloseStream {
+        stream_id: "str_1".to_string(),
+        reason: "resync_required".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_string(&closed).unwrap(),
+        r#"{"type":"close_stream","stream_id":"str_1","reason":"resync_required"}"#
+    );
+
     let ack = RelayToAgent::RegisterAck {
         runtime_id: "rt_7".to_string(),
         protocol: ProtocolVersionDto { major: 1, minor: 3 },

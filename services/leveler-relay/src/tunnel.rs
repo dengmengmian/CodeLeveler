@@ -145,6 +145,12 @@ fn handle_agent_frame(state: &RelayState, frame: AgentToRelay) {
         AgentToRelay::StreamRejected { stream_id, code } => {
             state.close_stream(&stream_id, &code);
         }
+        // The agent ended a stream it had accepted (a lagged subscription, a
+        // project gone). The device's socket goes with it, so the phone
+        // reconnects and resynchronizes instead of watching a silent stream.
+        AgentToRelay::CloseStream { stream_id, reason } => {
+            state.close_stream(&stream_id, &reason);
+        }
         // Heartbeats, registration and acceptance need no routing decision.
         _ => {}
     }

@@ -8,14 +8,23 @@
 //! This module is transport only: it reads frames, hands them to the bridge, and
 //! writes back what the bridge produced. It makes no authorization decision of
 //! its own, so there is no second place where a policy could be forgotten.
+//!
+//! Traffic runs both ways independently. Answers to a device's frames follow its
+//! requests, but the runtime also speaks unprompted — assistant output, tool
+//! activity, approval prompts — so each open stream carries a pump forwarding
+//! its project's event stream downstream. Without it a phone could send and be
+//! acknowledged while seeing nothing come back, which is the difference between
+//! a remote control and a write-only pipe.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use leveler_remote_protocol::auth::AgentRegisterAssertion;
 use leveler_remote_protocol::tunnel::{AgentToRelay, RelayToAgent, RoutingError};
 use leveler_remote_protocol::{ContentType, SignedEnvelope};
+use leveler_session_wire::DownstreamMessage;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -38,8 +47,140 @@ struct StreamState {
     project_id: String,
     /// Monotonic per stream, as the envelope spec requires. Starting from the
     /// agent's own counter rather than echoing the device's keeps the two
-    /// directions independent.
-    next_seq: u64,
+    /// directions independent. Shared with the event pump, because both write
+    /// to the same stream and the sequence must not fork.
+    next_seq: Arc<Mutex<u64>>,
+    /// Forwards this project's runtime events. Aborted when the stream closes,
+    /// so a departed phone stops costing a subscription.
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl StreamState {
+    fn take_seq(&self) -> u64 {
+        let mut next = self.next_seq.lock().unwrap();
+        let seq = *next;
+        *next += 1;
+        seq
+    }
+}
+
+/// Sign one downstream payload for a stream and queue it for the relay.
+///
+/// The seq comes from the stream's shared counter, so replies and events
+/// interleave without either overwriting the other's place in the sequence.
+fn send_downstream(
+    bridge: &AgentBridge,
+    outbox: &mpsc::UnboundedSender<AgentToRelay>,
+    runtime_id: &str,
+    device_id: &str,
+    stream_id: &str,
+    seq: u64,
+    timestamp: &str,
+    payload: &[u8],
+) {
+    match bridge.sign_downstream(
+        runtime_id,
+        device_id,
+        stream_id,
+        seq,
+        timestamp,
+        ContentType::SessionDownstream,
+        payload,
+    ) {
+        Ok(signed) => {
+            let _ = outbox.send(AgentToRelay::ForwardDownstream {
+                stream_id: stream_id.to_string(),
+                frame: signed,
+            });
+        }
+        Err(error) => tracing::warn!(code = error.code(), "could not sign a downstream frame"),
+    }
+}
+
+/// Forward one project's runtime events to one device stream until the stream
+/// closes.
+///
+/// Subscribes to the project's whole event stream, which is what the TUI and the
+/// single-project web server also do against a per-repository daemon. Filtering
+/// by session here would invent a third policy for a question the product has
+/// already answered in one way everywhere else.
+async fn pump_events<F>(
+    bridge: Arc<AgentBridge>,
+    outbox: mpsc::UnboundedSender<AgentToRelay>,
+    runtime_id: String,
+    device_id: String,
+    stream_id: String,
+    project_id: String,
+    next_seq: Arc<Mutex<u64>>,
+    now: Arc<F>,
+) where
+    F: Fn() -> String + Send + Sync + 'static,
+{
+    let mut events = match bridge.subscribe(&project_id).await {
+        Ok(events) => events,
+        Err(error) => {
+            // The stream stays open: commands will report the same failure with
+            // a code the device can act on, rather than the phone seeing a
+            // socket vanish for no stated reason.
+            tracing::warn!(code = error.code(), %project_id, "no event stream for this project");
+            return;
+        }
+    };
+
+    let take_seq = || {
+        let mut next = next_seq.lock().unwrap();
+        let seq = *next;
+        *next += 1;
+        seq
+    };
+
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                let Ok(payload) = serde_json::to_vec(&DownstreamMessage::Event { event }) else {
+                    continue;
+                };
+                send_downstream(
+                    &bridge,
+                    &outbox,
+                    &runtime_id,
+                    &device_id,
+                    &stream_id,
+                    take_seq(),
+                    &now(),
+                    &payload,
+                );
+            }
+            // The device missed events, so its view is now a guess. Say so and
+            // end the stream: continuing would render a transcript with holes
+            // in it, which is worse than a reconnect.
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, %stream_id, "remote event subscriber lagged");
+                if let Ok(payload) = serde_json::to_vec(&DownstreamMessage::Error {
+                    code: "resync_required".to_string(),
+                    message: "the event stream lagged; reconnect and resynchronize".to_string(),
+                    command_id: None,
+                }) {
+                    send_downstream(
+                        &bridge,
+                        &outbox,
+                        &runtime_id,
+                        &device_id,
+                        &stream_id,
+                        take_seq(),
+                        &now(),
+                        &payload,
+                    );
+                }
+                let _ = outbox.send(AgentToRelay::CloseStream {
+                    stream_id,
+                    reason: "resync_required".to_string(),
+                });
+                return;
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 /// Connect to `relay_ws_url` and serve frames until the connection ends.
@@ -75,6 +216,8 @@ where
     // never blocks on the socket.
     let (outbox_tx, mut outbox) = mpsc::unbounded_channel::<AgentToRelay>();
     let mut streams: HashMap<String, StreamState> = HashMap::new();
+    // Shared with each stream's event pump, which outlives a single frame.
+    let now = Arc::new(now);
 
     loop {
         tokio::select! {
@@ -93,6 +236,7 @@ where
                     match serde_json::from_str::<RelayToAgent>(&text) {
                         Ok(frame) => {
                             handle(&bridge, &mut streams, &outbox_tx, runtime_id, &now, frame).await;
+
                         }
                         Err(error) => {
                             // A frame this build cannot parse is the relay's
@@ -103,11 +247,24 @@ where
                 }
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(TunnelError::Closed(error.to_string())),
+                Some(Err(error)) => {
+                    abort_pumps(&mut streams);
+                    return Err(TunnelError::Closed(error.to_string()));
+                }
             },
         }
     }
+    // The connection is gone; nothing may keep forwarding into it.
+    abort_pumps(&mut streams);
     Ok(())
+}
+
+/// Stop every stream's event pump. Dropping the map alone would leave the tasks
+/// running with a sender nobody reads.
+fn abort_pumps(streams: &mut HashMap<String, StreamState>) {
+    for (_, state) in streams.drain() {
+        state.pump.abort();
+    }
 }
 
 async fn handle<F>(
@@ -115,10 +272,10 @@ async fn handle<F>(
     streams: &mut HashMap<String, StreamState>,
     outbox: &mpsc::UnboundedSender<AgentToRelay>,
     runtime_id: &str,
-    now: &F,
+    now: &Arc<F>,
     frame: RelayToAgent,
 ) where
-    F: Fn() -> String,
+    F: Fn() -> String + Send + Sync + 'static,
 {
     match frame {
         RelayToAgent::OpenStream {
@@ -145,19 +302,35 @@ async fn handle<F>(
             // trusted is decided per frame against the local store, so a stream
             // opened for a device this host never paired with simply produces
             // refusals.
-            streams.insert(
+            let next_seq = Arc::new(Mutex::new(1));
+            let pump = tokio::spawn(pump_events(
+                bridge.clone(),
+                outbox.clone(),
+                runtime_id.to_string(),
+                device_id.clone(),
+                stream_id.clone(),
+                project_id.clone(),
+                next_seq.clone(),
+                now.clone(),
+            ));
+            if let Some(previous) = streams.insert(
                 stream_id.clone(),
                 StreamState {
                     device_id,
                     project_id,
-                    next_seq: 1,
+                    next_seq,
+                    pump,
                 },
-            );
+            ) {
+                previous.pump.abort();
+            }
             let _ = outbox.send(AgentToRelay::StreamAccepted { stream_id });
         }
 
         RelayToAgent::CloseStream { stream_id, .. } => {
-            streams.remove(&stream_id);
+            if let Some(state) = streams.remove(&stream_id) {
+                state.pump.abort();
+            }
         }
 
         RelayToAgent::ForwardUpstream { stream_id, frame } => {
@@ -195,24 +368,17 @@ async fn handle<F>(
                 }
             };
 
-            if let Some(state) = streams.get_mut(&stream_id) {
-                let seq = state.next_seq;
-                state.next_seq += 1;
-                let device_id = state.device_id.clone();
-                if let Ok(signed) = bridge.sign_downstream(
+            if let Some(state) = streams.get(&stream_id) {
+                send_downstream(
+                    bridge,
+                    outbox,
                     runtime_id,
-                    &device_id,
+                    &state.device_id,
                     &stream_id,
-                    seq,
+                    state.take_seq(),
                     &timestamp,
-                    ContentType::SessionDownstream,
                     downstream.as_bytes(),
-                ) {
-                    let _ = outbox.send(AgentToRelay::ForwardDownstream {
-                        stream_id,
-                        frame: signed,
-                    });
-                }
+                );
             }
         }
 
