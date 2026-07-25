@@ -42,6 +42,7 @@ mod command;
 mod command_envelope;
 mod event;
 mod media;
+mod origin;
 mod progress;
 mod snapshot;
 mod version;
@@ -58,6 +59,7 @@ pub use event::{
     UiMemoryEntry, parse_runtime_event,
 };
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
+pub use origin::ClientOrigin;
 pub use progress::{
     CheckState, PlanStepStatus, UiCheck, UiCompletionReport, UiDiff, UiDiffFile, UiPlan,
     UiPlanStep, UiVerification,

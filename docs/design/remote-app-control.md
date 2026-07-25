@@ -686,7 +686,7 @@ stateDiagram-v2
 
 - **Local interactive approver registered**：存在已连接的本机交互 UI（TUI 或 loopback web 会话）且该 UI 订阅了同一 `session_id` 的审批提示（agent/app 维护 `local_waiter_count`）。
 - **Remote stream active**：存在至少一个该 runtime 上 `pairing_scope=interactive` 且未关闭的 APP stream。
-- **实现前提：** daemon 现有 `Handshake` 只有 token，无法区分订阅者类型；需在 `leveler-local-transport` attach 握手增加 `client_kind: tui | web | remote`（老客户端缺省按 **local** 计，避免误伤桌面用户触发 auto-Deny）。列入 PR4 Affects。
+- **实现前提（PR4 已落地，此处为更正后的写法）：** 字段挂在 **`WireRequest::Subscribe`** 上，**不是**握手。原先写「握手加 `client_kind`」是错的——`Handshake` 仅存在于 **TCP** 路径，Unix socket 客户端根本不发握手（信任边界是 socket 文件的 0600 权限），而 TUI/web 走的正是 Unix socket。`Subscribe` 才是每个订阅者必经、且两条传输都覆盖的 attach 点。字段带 `#[serde(default)]`，老客户端缺省按 **local** 计——该方向只会抑制 auto-Deny，反向则可能掐掉真人正在回答的提示。
 
 | 场景 | 是否启动 120s auto-Deny |
 | --- | --- |
@@ -1251,12 +1251,17 @@ pub enum ClientOrigin {
 - **嵌套过滤：** `ApproveAlways` → `approval_decision_not_allowed_remote`（另三种决策放行）；`FullAccess` → `permission_profile_not_allowed_remote`，仅本机 `allow_full_access` 可开。拒绝码区分命令层与嵌套层，便于 APP 给出准确文案。
 - **顺带修正的文档矛盾：** `observe` 原在两处写法不一——配对状态机说「拒一切 **mutating** deliver」，能力模型说「**所有** deliver deny」。对 `RequestSessionList` 这类只读命令结论相反。已统一为**全拒**（取能力模型这一 policy 规范章节的读法，也是更安全的一侧），两处措辞同步。
 
-### PR4 — ClientOrigin + remote approval timeout hooks
+### PR4 — ClientOrigin + remote approval timeout hooks ✅ 已完成（含一处设计更正）
 
 - **Title:** `app: ClientOrigin and remote approval deny-on-timeout`
-- **Affects:** `leveler-app`（PendingApprovals）、`leveler-local-transport`（Handshake 增加 `client_kind`，供 local_waiter_count 统计）、可能 agent executor 边界、测试
+- **Affects:** `leveler-client-protocol`（`ClientOrigin`）、`leveler-local-transport`（`Subscribe` 增加 `client_kind` + waiter 计数）、`leveler-remote-protocol::policy`（超时状态机）
 - **Deps:** 无（可先 Local 桩）
 - **DoD:** origin 进审计；**矩阵**：remote-only 超时 / local-only 不超时 / both 不超时 / local 离开后武装超时；人工决策取消 timer
+- **实测：** 超时矩阵 9 条测试全绿，含 DoD 四种场景与「人工决策取消 timer」。状态机只在**翻转时**发 `Arm`，这正是「从最后一个本地 waiter 离开的那一刻起算」——等了一小时的审批在人关掉终端后拿到完整 120s，而不是立刻超时。
+- **`ClientOrigin` 分三态而非两态：** `Local` / `Remote{device_id}` / **`RemoteTimeout{device_id}`**。超时拒绝必须与人工远程拒绝可区分，否则审计会读成「手机用户拒绝了某个他从未看到的请求」。
+- **更正了设计的一处实现假设：** `client_kind` 挂在 `Subscribe` 而非握手，理由见上文「实现前提」。
+- **顺带修掉一个既有缺陷：** 服务端订阅循环原先只阻塞在 `events.recv()`、**不读 socket**，对端消失要等下一次写事件才发现；空闲会话上可能永远发现不了。后果是静默退出的 TUI 会让 waiter 计数长期偏高、超时永不武装——方向安全但功能等于失效。现改为同时监听对端 EOF，一并消除了每个死订阅者泄漏一个服务端任务的问题。
+- **未做：** 定时器本身与审批路径的实接线。设计规定**超时权威 = Agent 进程**，而 agent 尚不存在（PR5）。本 PR 交付的是它需要的三件套：origin 类型、waiter 计数、超时状态机。`leveler-app` 的 `PendingApprovals` **未改动**。
 
 ### PR5 — remote-agent：验签 + policy + **单 project** 桥 + mock relay
 

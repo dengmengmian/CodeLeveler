@@ -16,6 +16,63 @@ use leveler_client_protocol::{CommandEnvelope, ProtocolEnvelope};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+/// What kind of client opened a subscription.
+///
+/// The daemon serves every subscriber identically; this exists so the *count*
+/// of attached local interactive UIs is knowable. The remote approval timeout
+/// must not fire while a person could still be reading the prompt in their own
+/// terminal, and that question cannot be answered without knowing who is
+/// attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    /// A UI on this machine: the TUI, or the loopback web server.
+    ///
+    /// The default, and deliberately the safe direction for an older client
+    /// that omits the field: counting an unknown subscriber as local can only
+    /// suppress an auto-deny, whereas counting it as remote could expire a
+    /// prompt a real person was answering.
+    #[default]
+    LocalInteractive,
+    /// The remote agent, bridging a paired device.
+    Remote,
+}
+
+/// Live count of attached local interactive UIs.
+///
+/// Cloned handles share one counter; a subscription holds a
+/// [`LocalWaiterGuard`] for exactly as long as its connection is served, so a
+/// dropped connection decrements even when the client vanished without saying
+/// goodbye.
+#[derive(Debug, Clone, Default)]
+pub struct LocalWaiters(Arc<std::sync::atomic::AtomicUsize>);
+
+impl LocalWaiters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Count one attached local UI until the returned guard drops.
+    pub fn attach(&self) -> LocalWaiterGuard {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        LocalWaiterGuard(self.0.clone())
+    }
+}
+
+/// Decrements its [`LocalWaiters`] on drop.
+#[derive(Debug)]
+pub struct LocalWaiterGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LocalWaiterGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Everything the daemon needs to create a new interactive session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -67,9 +124,17 @@ enum WireRequest {
     Ping,
     Send(ClientCommand),
     Deliver(ProtocolEnvelope<CommandEnvelope>),
-    Snapshot { session_id: SessionId },
+    Snapshot {
+        session_id: SessionId,
+    },
     CreateSession(CreateSessionRequest),
-    Subscribe { session_id: Option<SessionId> },
+    Subscribe {
+        session_id: Option<SessionId>,
+        /// Absent from clients built before remote control existed; `default`
+        /// makes those count as local, which is the safe direction.
+        #[serde(default)]
+        client_kind: ClientKind,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +262,7 @@ mod unix {
         mut stream: S,
         runtime: Arc<dyn LocalRuntimeService>,
         shutdown: CancellationToken,
+        local_waiters: LocalWaiters,
     ) -> Result<(), TransportError> {
         let request = read_frame::<WireRequest>(&mut stream).await?.into_body()?;
         match request {
@@ -256,17 +322,36 @@ mod unix {
                 )
                 .await
             }
-            WireRequest::Subscribe { session_id } => {
+            WireRequest::Subscribe {
+                session_id,
+                client_kind,
+            } => {
                 send_response(&mut stream, WireResponse::Ack).await?;
+                // Held for exactly as long as this subscription is served, so
+                // a client that dies without closing still decrements.
+                let _waiter = match client_kind {
+                    ClientKind::LocalInteractive => Some(local_waiters.attach()),
+                    ClientKind::Remote => None,
+                };
                 let mut events = match session_id {
                     Some(session_id) => runtime.subscribe_session(&session_id),
                     None => runtime.subscribe(),
                 };
+                // Split so the peer can be watched for EOF while events are
+                // written. Without a reader here the loop only discovers a
+                // departed client the next time it tries to write, which on an
+                // idle session may be never — and a subscriber that is counted
+                // long after it left would keep the remote approval timeout
+                // permanently disarmed.
+                let (mut reader, mut writer) = tokio::io::split(stream);
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => return Ok(()),
+                        // A subscription carries no further client bytes, so
+                        // EOF, an error, or unexpected data all mean "done".
+                        _ = reader.read_u8() => return Ok(()),
                         event = events.recv() => match event {
-                            Ok(event) => send_response(&mut stream, WireResponse::Event(event)).await?,
+                            Ok(event) => send_response(&mut writer, WireResponse::Event(event)).await?,
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "local socket event subscriber lagged");
                                 // Force a reconnect. Session-scoped clients
@@ -289,6 +374,7 @@ mod unix {
         socket_inode: u64,
         listener: UnixListener,
         runtime: Arc<dyn LocalRuntimeService>,
+        local_waiters: LocalWaiters,
     }
 
     impl Drop for LocalSocketServer {
@@ -346,11 +432,21 @@ mod unix {
                 socket_inode: metadata.ino(),
                 listener,
                 runtime,
+                local_waiters: LocalWaiters::new(),
             })
         }
 
         pub fn path(&self) -> &Path {
             &self.path
+        }
+
+        /// Live count of attached local interactive UIs.
+        ///
+        /// The remote agent reads this to decide whether an approval is
+        /// remote-only; the handle stays valid after `serve` consumes the
+        /// server.
+        pub fn local_waiters(&self) -> LocalWaiters {
+            self.local_waiters.clone()
         }
 
         pub async fn serve(self, shutdown: CancellationToken) -> Result<(), TransportError> {
@@ -363,8 +459,12 @@ mod unix {
                         let (stream, _) = accepted?;
                         let runtime = self.runtime.clone();
                         let connection_shutdown = child_shutdown.clone();
+                        let waiters = self.local_waiters.clone();
                         tasks.spawn(async move {
-                            if let Err(error) = handle_connection(stream, runtime, connection_shutdown).await {
+                            if let Err(error) =
+                                handle_connection(stream, runtime, connection_shutdown, waiters)
+                                    .await
+                            {
                                 tracing::debug!(%error, "local socket connection ended");
                             }
                         });
@@ -380,6 +480,8 @@ mod unix {
     /// Socket-backed implementation consumed by the TUI.
     pub struct LocalSocketRuntimeClient {
         endpoint: Endpoint,
+        /// Announced on every subscription this client opens.
+        client_kind: ClientKind,
         events: broadcast::Sender<RuntimeEvent>,
         session_events:
             Arc<Mutex<std::collections::HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>>,
@@ -388,7 +490,19 @@ mod unix {
 
     impl LocalSocketRuntimeClient {
         pub async fn connect(path: impl AsRef<Path>) -> Result<Self, TransportError> {
-            Self::open(Endpoint::Unix(path.as_ref().to_path_buf())).await
+            Self::connect_as(path, ClientKind::LocalInteractive).await
+        }
+
+        /// Connect while declaring what kind of client this is.
+        ///
+        /// Only the remote agent needs this; local UIs get
+        /// [`ClientKind::LocalInteractive`] from [`Self::connect`], so a phone
+        /// cannot be miscounted as somebody sitting at the machine.
+        pub async fn connect_as(
+            path: impl AsRef<Path>,
+            client_kind: ClientKind,
+        ) -> Result<Self, TransportError> {
+            Self::open(Endpoint::Unix(path.as_ref().to_path_buf()), client_kind).await
         }
 
         /// Connect to a loopback TCP daemon, authenticating with the bearer token
@@ -397,15 +511,27 @@ mod unix {
             addr: SocketAddr,
             token: impl Into<String>,
         ) -> Result<Self, TransportError> {
-            Self::open(Endpoint::Tcp {
-                addr,
-                token: Arc::from(token.into()),
-            })
+            Self::connect_tcp_as(addr, token, ClientKind::LocalInteractive).await
+        }
+
+        /// Loopback TCP variant of [`Self::connect_as`].
+        pub async fn connect_tcp_as(
+            addr: SocketAddr,
+            token: impl Into<String>,
+            client_kind: ClientKind,
+        ) -> Result<Self, TransportError> {
+            Self::open(
+                Endpoint::Tcp {
+                    addr,
+                    token: Arc::from(token.into()),
+                },
+                client_kind,
+            )
             .await
         }
 
-        async fn open(endpoint: Endpoint) -> Result<Self, TransportError> {
-            let stream = open_subscription(&endpoint, None).await?;
+        async fn open(endpoint: Endpoint, client_kind: ClientKind) -> Result<Self, TransportError> {
+            let stream = open_subscription(&endpoint, None, client_kind).await?;
             let (events, _) = broadcast::channel(2048);
             let session_events = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let shutdown = CancellationToken::new();
@@ -415,9 +541,11 @@ mod unix {
                 events.clone(),
                 None,
                 shutdown.clone(),
+                client_kind,
             ));
             Ok(Self {
                 endpoint,
+                client_kind,
                 events,
                 session_events,
                 shutdown,
@@ -435,7 +563,9 @@ mod unix {
             if let Some(events) = self.session_events.lock().unwrap().get(session_id).cloned() {
                 return Ok(events);
             }
-            let stream = open_subscription(&self.endpoint, Some(session_id.clone())).await?;
+            let stream =
+                open_subscription(&self.endpoint, Some(session_id.clone()), self.client_kind)
+                    .await?;
             let (events, _) = broadcast::channel(2048);
             self.session_events
                 .lock()
@@ -447,6 +577,7 @@ mod unix {
                 events.clone(),
                 Some(session_id.clone()),
                 self.shutdown.clone(),
+                self.client_kind,
             ));
             Ok(events)
         }
@@ -543,12 +674,21 @@ mod unix {
             let endpoint = self.endpoint.clone();
             let session_id = session_id.clone();
             let shutdown = self.shutdown.clone();
+            let client_kind = self.client_kind;
             tokio::spawn(async move {
                 loop {
-                    match open_subscription(&endpoint, Some(session_id.clone())).await {
+                    match open_subscription(&endpoint, Some(session_id.clone()), client_kind).await
+                    {
                         Ok(stream) => {
-                            subscription_loop(endpoint, stream, events, Some(session_id), shutdown)
-                                .await;
+                            subscription_loop(
+                                endpoint,
+                                stream,
+                                events,
+                                Some(session_id),
+                                shutdown,
+                                client_kind,
+                            )
+                            .await;
                             return;
                         }
                         Err(_) => tokio::select! {
@@ -632,11 +772,15 @@ mod unix {
     async fn open_subscription(
         endpoint: &Endpoint,
         session_id: Option<SessionId>,
+        client_kind: ClientKind,
     ) -> Result<ClientStream, TransportError> {
         let mut stream = connect_endpoint(endpoint).await?;
         write_frame(
             &mut stream,
-            &ProtocolEnvelope::wrap(WireRequest::Subscribe { session_id }),
+            &ProtocolEnvelope::wrap(WireRequest::Subscribe {
+                session_id,
+                client_kind,
+            }),
         )
         .await?;
         match read_frame::<WireResponse>(&mut stream).await?.into_body()? {
@@ -654,6 +798,7 @@ mod unix {
         events: broadcast::Sender<RuntimeEvent>,
         session_id: Option<SessionId>,
         shutdown: CancellationToken,
+        client_kind: ClientKind,
     ) {
         loop {
             loop {
@@ -677,7 +822,7 @@ mod unix {
             }
 
             while !shutdown.is_cancelled() {
-                match open_subscription(&endpoint, session_id.clone()).await {
+                match open_subscription(&endpoint, session_id.clone(), client_kind).await {
                     Ok(new_stream) => {
                         stream = new_stream;
                         if let Some(session_id) = session_id.clone()
@@ -732,6 +877,7 @@ mod unix {
         token: &str,
         runtime: Arc<dyn LocalRuntimeService>,
         shutdown: CancellationToken,
+        local_waiters: LocalWaiters,
     ) -> Result<(), TransportError> {
         let presented = read_frame::<Handshake>(&mut stream).await?.into_body()?;
         if !constant_time_eq(presented.token.as_bytes(), token.as_bytes()) {
@@ -746,7 +892,7 @@ mod unix {
             return Ok(());
         }
         send_response(&mut stream, WireResponse::Ack).await?;
-        handle_connection(stream, runtime, shutdown).await
+        handle_connection(stream, runtime, shutdown, local_waiters).await
     }
 
     /// A loopback TCP runtime server. Every connection presents a shared bearer
@@ -755,6 +901,7 @@ mod unix {
         listener: TcpListener,
         runtime: Arc<dyn LocalRuntimeService>,
         token: Arc<str>,
+        local_waiters: LocalWaiters,
     }
 
     impl TcpRuntimeServer {
@@ -774,12 +921,19 @@ mod unix {
                 listener,
                 runtime,
                 token: Arc::from(token),
+                local_waiters: LocalWaiters::new(),
             })
         }
 
         /// The actually-bound address (resolves an ephemeral `:0` port).
         pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
             Ok(self.listener.local_addr()?)
+        }
+
+        /// Live count of attached local interactive UIs. See
+        /// [`LocalSocketServer::local_waiters`].
+        pub fn local_waiters(&self) -> LocalWaiters {
+            self.local_waiters.clone()
         }
 
         pub async fn serve(self, shutdown: CancellationToken) -> Result<(), TransportError> {
@@ -798,9 +952,16 @@ mod unix {
                         let runtime = self.runtime.clone();
                         let token = self.token.clone();
                         let connection_shutdown = child_shutdown.clone();
+                        let waiters = self.local_waiters.clone();
                         tasks.spawn(async move {
                             if let Err(error) =
-                                serve_authenticated_tcp(stream, &token, runtime, connection_shutdown)
+                                serve_authenticated_tcp(
+                                    stream,
+                                    &token,
+                                    runtime,
+                                    connection_shutdown,
+                                    waiters,
+                                )
                                     .await
                             {
                                 tracing::debug!(%error, "tcp daemon connection ended");
@@ -1147,6 +1308,81 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.commands.lock().unwrap().len(), 1);
         shutdown.cancel();
+    }
+
+    /// The remote approval timeout must not fire while someone is at the
+    /// keyboard, so the daemon has to know how many local UIs are attached —
+    /// and must not count a phone's bridge among them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_waiters_counts_local_uis_and_excludes_the_remote_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let server = LocalSocketServer::bind(&path, Arc::new(TestRuntime::new()))
+            .await
+            .unwrap();
+        let waiters = server.local_waiters();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+
+        assert_eq!(waiters.count(), 0);
+
+        let tui = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        wait_for_waiters(&waiters, 1).await;
+
+        let web = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        wait_for_waiters(&waiters, 2).await;
+
+        // The agent bridging a paired device is not a person at this machine.
+        let agent = LocalSocketRuntimeClient::connect_as(&path, ClientKind::Remote)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            waiters.count(),
+            2,
+            "a remote subscriber must not be counted as a local waiter"
+        );
+
+        // Dropping decrements even though the client never said goodbye.
+        drop(tui);
+        wait_for_waiters(&waiters, 1).await;
+        drop(web);
+        wait_for_waiters(&waiters, 0).await;
+
+        drop(agent);
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
+    /// An older client omits `client_kind` entirely. It must still parse, and
+    /// must count as local: suppressing an auto-deny is recoverable, expiring a
+    /// prompt somebody was answering is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_subscribe_without_client_kind_defaults_to_local() {
+        let request: WireRequest =
+            serde_json::from_str(r#"{"type":"subscribe","body":{"session_id":null}}"#).unwrap();
+        let WireRequest::Subscribe {
+            client_kind,
+            session_id,
+        } = request
+        else {
+            panic!("expected subscribe");
+        };
+        assert_eq!(session_id, None);
+        assert_eq!(client_kind, ClientKind::LocalInteractive);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_waiters(waiters: &LocalWaiters, expected: usize) {
+        for _ in 0..100 {
+            if waiters.count() == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("expected {expected} local waiters, saw {}", waiters.count());
     }
 
     #[cfg(unix)]

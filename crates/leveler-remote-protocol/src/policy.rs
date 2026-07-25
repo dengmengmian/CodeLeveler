@@ -55,6 +55,84 @@ const DENIED_COMMAND: &str = "command_not_allowed_remote";
 const DENIED_DECISION: &str = "approval_decision_not_allowed_remote";
 const DENIED_PROFILE: &str = "permission_profile_not_allowed_remote";
 
+/// Default seconds before a remote-only approval auto-denies.
+/// Overridable per host via `remote.approval_timeout_secs`.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 120;
+
+/// Who can still answer one pending approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Waiters {
+    /// Connected local interactive UIs subscribed to this session — a TUI or a
+    /// loopback web client. Counted from the local transport's client kind.
+    pub local: usize,
+    /// Open interactive remote streams for this runtime.
+    pub remote: usize,
+}
+
+/// What the caller should do with its timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerTransition {
+    /// Start counting from now.
+    Arm,
+    /// Cancel any running countdown.
+    Disarm,
+    /// Whatever is running keeps its existing deadline.
+    Unchanged,
+}
+
+/// Tracks whether a remote-only auto-deny countdown should be running.
+///
+/// The timeout exists so a remote-only approval cannot block a turn forever.
+/// It deliberately does **not** run while a local interactive UI is attached:
+/// aiming it at someone reading the prompt in their terminal would let a paired
+/// phone expire a decision the person at the keyboard was still making.
+///
+/// Emitting [`TimerTransition::Arm`] only on the flip is what makes the
+/// countdown start when the last local waiter leaves, rather than when the
+/// approval was first raised. An approval that waited an hour with a person
+/// watching gets the full window once they close their terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ApprovalTimeoutState {
+    armed: bool,
+    resolved: bool,
+}
+
+impl ApprovalTimeoutState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Re-evaluate after the waiter population changed.
+    pub fn observe(&mut self, waiters: Waiters) -> TimerTransition {
+        // A resolved approval has nothing left to expire.
+        let should_arm = !self.resolved && waiters.remote > 0 && waiters.local == 0;
+        self.transition_to(should_arm)
+    }
+
+    /// The approval was answered — by a human on either side, or by the
+    /// timeout itself.
+    pub fn resolved(&mut self) -> TimerTransition {
+        self.resolved = true;
+        self.transition_to(false)
+    }
+
+    fn transition_to(&mut self, armed: bool) -> TimerTransition {
+        if armed == self.armed {
+            return TimerTransition::Unchanged;
+        }
+        self.armed = armed;
+        if armed {
+            TimerTransition::Arm
+        } else {
+            TimerTransition::Disarm
+        }
+    }
+}
+
 /// The policy in force for one paired device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemotePolicy {
