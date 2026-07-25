@@ -38,10 +38,10 @@ pub fn build_router(state: RelayState) -> Router {
         .route("/v1/auth/session", post(auth_session))
         .route("/v1/auth/refresh", post(auth_refresh))
         .route("/v1/hosts", get(list_hosts))
-        .route("/v1/runtimes/{runtime_id}/register", post(register_runtime))
+        .route("/v1/agent/tunnel", get(crate::tunnel::agent_tunnel))
         .route(
-            "/v1/runtimes/{runtime_id}/unregister",
-            post(unregister_runtime),
+            "/v1/hosts/{host_id}/session",
+            get(crate::tunnel::app_session),
         )
         .route("/v1/hosts/{host_id}/leveler-sessions", post(create_session))
         .with_state(state)
@@ -49,7 +49,7 @@ pub fn build_router(state: RelayState) -> Router {
 
 /// A refusal, rendered with the design's error code so a client can branch on
 /// it rather than on prose.
-struct Failure(RelayError);
+pub(crate) struct Failure(pub(crate) RelayError);
 
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
@@ -280,7 +280,7 @@ async fn auth_refresh(
 ///
 /// Header only: a token in a query string lands in access logs and browser
 /// history, which is why the design forbids it.
-fn bearer(headers: &HeaderMap) -> Result<String, RelayError> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Result<String, RelayError> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -313,30 +313,6 @@ async fn list_hosts(
             })
             .collect(),
     ))
-}
-
-/// Stand-in for the agent tunnel's `register` frame until the WebSocket lands,
-/// so the online/offline behaviour can be exercised.
-#[derive(Debug, Deserialize)]
-struct RegisterBody {
-    display_name: String,
-}
-
-async fn register_runtime(
-    State(state): State<RelayState>,
-    Path(runtime_id): Path<String>,
-    Json(request): Json<RegisterBody>,
-) -> StatusCode {
-    state.register_runtime(&runtime_id, &request.display_name);
-    StatusCode::NO_CONTENT
-}
-
-async fn unregister_runtime(
-    State(state): State<RelayState>,
-    Path(runtime_id): Path<String>,
-) -> StatusCode {
-    state.unregister_runtime(&runtime_id);
-    StatusCode::NO_CONTENT
 }
 
 /// Create a session on a host.

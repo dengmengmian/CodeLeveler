@@ -19,10 +19,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use leveler_remote_protocol::SignedEnvelope;
 use leveler_remote_protocol::auth::{
     ACCESS_TOKEN_TTL_SECS, REFRESH_TOKEN_TTL_SECS, SCOPE_REMOTE_SESSION, TokenClaims, TokenUse,
 };
 use leveler_remote_protocol::pairing::{PairingScope, PairingState};
+use leveler_remote_protocol::tunnel::RelayToAgent;
 
 /// How long a pairing secret stays claimable.
 pub const PAIRING_TTL_SECS: i64 = 5 * 60;
@@ -136,14 +138,37 @@ struct Inner {
     /// Runtimes with a live agent tunnel. Absence is what makes a request 503
     /// rather than queueing it.
     online: HashMap<String, RuntimeOnline>,
+    /// Live APP session streams, keyed by stream id.
+    streams: HashMap<String, StreamRoute>,
     counter: u64,
 }
 
 /// A registered, currently-connected runtime.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeOnline {
     pub runtime_id: String,
     pub display_name: String,
+    /// Frames queued for the agent's tunnel socket.
+    pub to_agent: tokio::sync::mpsc::UnboundedSender<RelayToAgent>,
+}
+
+impl std::fmt::Debug for RuntimeOnline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeOnline")
+            .field("runtime_id", &self.runtime_id)
+            .field("display_name", &self.display_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One live APP session stream.
+#[derive(Clone)]
+pub struct StreamRoute {
+    pub stream_id: String,
+    pub device_id: String,
+    pub runtime_id: String,
+    /// Frames queued for the device's socket.
+    pub to_app: tokio::sync::mpsc::UnboundedSender<SignedEnvelope>,
 }
 
 /// Shared relay state.
@@ -315,6 +340,27 @@ impl RelayState {
         inner
             .refresh
             .retain(|_, record| record.claims.sub != device_id);
+
+        // Close its live streams in the same breath. Dropping only the tokens
+        // would leave an already-open socket forwarding until it happened to
+        // reconnect — exactly the "revoked but still delivering" case the threat
+        // model calls out.
+        let doomed: Vec<String> = inner
+            .streams
+            .values()
+            .filter(|route| route.device_id == device_id)
+            .map(|route| route.stream_id.clone())
+            .collect();
+        for stream_id in doomed {
+            if let Some(route) = inner.streams.remove(&stream_id)
+                && let Some(online) = inner.online.get(&route.runtime_id)
+            {
+                let _ = online.to_agent.send(RelayToAgent::CloseStream {
+                    stream_id,
+                    reason: "revoked".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -414,20 +460,135 @@ impl RelayState {
     }
 
     /// A runtime's agent tunnel came up.
-    pub fn register_runtime(&self, runtime_id: &str, display_name: &str) {
+    pub fn register_runtime(
+        &self,
+        runtime_id: &str,
+        display_name: &str,
+        to_agent: tokio::sync::mpsc::UnboundedSender<RelayToAgent>,
+    ) {
         self.inner.lock().unwrap().online.insert(
             runtime_id.to_string(),
             RuntimeOnline {
                 runtime_id: runtime_id.to_string(),
                 display_name: display_name.to_string(),
+                to_agent,
             },
         );
     }
 
-    /// A runtime's agent tunnel went away. Nothing is retained for it — no
-    /// queue, so a command aimed at it while offline is refused, not stored.
+    /// A runtime's agent tunnel went away.
+    ///
+    /// Its streams go with it and nothing is retained: no queue, so a command
+    /// aimed at it while offline is refused rather than stored and replayed
+    /// later, possibly after the device that sent it was revoked.
     pub fn unregister_runtime(&self, runtime_id: &str) {
-        self.inner.lock().unwrap().online.remove(runtime_id);
+        let mut inner = self.inner.lock().unwrap();
+        inner.online.remove(runtime_id);
+        inner
+            .streams
+            .retain(|_, route| route.runtime_id != runtime_id);
+    }
+
+    /// Open an APP session stream and tell the agent about it.
+    ///
+    /// The `open_stream` frame carries no device public key on purpose: the
+    /// agent resolves that from its own store. A key supplied here would let the
+    /// relay choose what the agent trusts.
+    pub fn open_stream(
+        &self,
+        device_id: &str,
+        runtime_id: &str,
+        pairing_scope: PairingScope,
+        access_jti: &str,
+        to_app: tokio::sync::mpsc::UnboundedSender<SignedEnvelope>,
+    ) -> Result<String, RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        let online = inner
+            .online
+            .get(runtime_id)
+            .cloned()
+            .ok_or(RelayError::RuntimeOffline)?;
+
+        inner.counter += 1;
+        let stream_id = format!("str_{}", inner.counter);
+        inner.streams.insert(
+            stream_id.clone(),
+            StreamRoute {
+                stream_id: stream_id.clone(),
+                device_id: device_id.to_string(),
+                runtime_id: runtime_id.to_string(),
+                to_app,
+            },
+        );
+
+        let _ = online.to_agent.send(RelayToAgent::OpenStream {
+            stream_id: stream_id.clone(),
+            device_id: device_id.to_string(),
+            pairing_scope,
+            access_jti: access_jti.to_string(),
+        });
+        Ok(stream_id)
+    }
+
+    /// Close a stream and tell the agent why.
+    pub fn close_stream(&self, stream_id: &str, reason: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(route) = inner.streams.remove(stream_id)
+            && let Some(online) = inner.online.get(&route.runtime_id)
+        {
+            let _ = online.to_agent.send(RelayToAgent::CloseStream {
+                stream_id: stream_id.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    /// Forward a device frame to its runtime, unchanged.
+    ///
+    /// The envelope is moved through verbatim. Unwrapping it to re-wrap the
+    /// payload in JSON of the relay's own would strip the signature that makes
+    /// it trustworthy, so this function only routes.
+    pub fn forward_upstream(
+        &self,
+        stream_id: &str,
+        frame: SignedEnvelope,
+    ) -> Result<(), RelayError> {
+        let inner = self.inner.lock().unwrap();
+        let route = inner.streams.get(stream_id).ok_or(RelayError::NotFound)?;
+        let online = inner
+            .online
+            .get(&route.runtime_id)
+            .ok_or(RelayError::RuntimeOffline)?;
+        online
+            .to_agent
+            .send(RelayToAgent::ForwardUpstream {
+                stream_id: stream_id.to_string(),
+                frame,
+            })
+            .map_err(|_| RelayError::RuntimeOffline)
+    }
+
+    /// Forward a runtime frame to the device that owns the stream, unchanged.
+    pub fn forward_downstream(
+        &self,
+        stream_id: &str,
+        frame: SignedEnvelope,
+    ) -> Result<(), RelayError> {
+        let inner = self.inner.lock().unwrap();
+        let route = inner.streams.get(stream_id).ok_or(RelayError::NotFound)?;
+        route.to_app.send(frame).map_err(|_| RelayError::NotFound)
+    }
+
+    /// Streams belonging to a device, so revocation can close them.
+    pub fn streams_for_device(&self, device_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .streams
+            .values()
+            .filter(|route| route.device_id == device_id)
+            .map(|route| route.stream_id.clone())
+            .collect()
     }
 
     pub fn is_online(&self, runtime_id: &str) -> bool {

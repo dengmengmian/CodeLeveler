@@ -6,6 +6,19 @@
 
 use leveler_relay::{RelayState, build_router};
 use serde_json::json;
+use tokio::sync::mpsc;
+
+/// Register a runtime as online the way the tunnel does, keeping the receiver
+/// alive so the route stays valid for the duration of the test.
+fn bring_online(
+    state: &RelayState,
+    runtime_id: &str,
+    display_name: &str,
+) -> mpsc::UnboundedReceiver<leveler_remote_protocol::tunnel::RelayToAgent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    state.register_runtime(runtime_id, display_name, tx);
+    rx
+}
 
 /// Start the router on an ephemeral port and return its base URL.
 async fn serve() -> (String, RelayState) {
@@ -166,8 +179,8 @@ async fn a_token_for_one_host_is_inert_against_another() {
 
     let token_a = pair_device(&client, &base, "rt_a", "dev_a").await;
     let token_b = pair_device(&client, &base, "rt_b", "dev_b").await;
-    state.register_runtime("rt_a", "machine A");
-    state.register_runtime("rt_b", "machine B");
+    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
+    let _agent_rt_b = bring_online(&state, "rt_b", "machine B");
 
     // Each reaches its own host.
     for (token, host) in [(&token_a, "rt_a"), (&token_b, "rt_b")] {
@@ -208,8 +221,8 @@ async fn a_device_only_sees_its_own_host() {
 
     let token_a = pair_device(&client, &base, "rt_a", "dev_a").await;
     pair_device(&client, &base, "rt_b", "dev_b").await;
-    state.register_runtime("rt_a", "machine A");
-    state.register_runtime("rt_b", "machine B");
+    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
+    let _agent_rt_b = bring_online(&state, "rt_b", "machine B");
 
     let hosts: serde_json::Value = client
         .get(format!("{base}/v1/hosts"))
@@ -248,7 +261,7 @@ async fn an_offline_host_is_503_with_a_retry_hint() {
 
     // Comes online, then goes away again: still 503, and nothing was retained
     // from the earlier attempt.
-    state.register_runtime("rt_a", "machine A");
+    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
     assert!(state.is_online("rt_a"));
     state.unregister_runtime("rt_a");
     let again = client
@@ -267,7 +280,7 @@ async fn revoking_a_device_invalidates_its_tokens_at_once() {
     let (base, state) = serve().await;
     let client = reqwest::Client::new();
     let token = pair_device(&client, &base, "rt_a", "dev_a").await;
-    state.register_runtime("rt_a", "machine A");
+    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
 
     assert_eq!(
         client
@@ -374,7 +387,7 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
         .await
         .unwrap();
     let first_refresh = auth["refresh_token"].as_str().unwrap().to_string();
-    state.register_runtime("rt_a", "machine A");
+    let _agent_rt_a = bring_online(&state, "rt_a", "machine A");
 
     let rotated: serde_json::Value = client
         .post(format!("{base}/v1/auth/refresh"))

@@ -1297,7 +1297,15 @@ pub enum ClientOrigin {
   - **不存队列/transcript** ✅ 结构上就没有这类存储
   - 另含：设备无法自行激活配对、错误 secret 与不存在 secret 回应一致（防枚举）、第二次 `begin` 令旧 QR 失效、refresh 轮换 + 重放视为失窃（连带吊销该设备全部 token）、一台机器无法撤销另一台的设备。
 - **一处刻意的取舍：** token 用**不透明随机串 + 服务端查表**，不是 JWT（设计允许二者）。撤销因此是删表项、立即生效，**不需要 access denylist**——直接消除了「denylist 有洞」这一整类 bug。代价是横向扩展需要共享存储，这是文档化的前提，而非第二个副本会静默做错的事。
-- **未完成：** agent tunnel WSS 与 APP session WSS、签名信封的不透明转发、RPC 代理、`project_id`（待 PR5b）。`/leveler-sessions` 在「已鉴权且 host 在线」时返回 **501**，而不是假装 503——把在线的 host 误报为不可达会掩盖真实状态。
+- **WSS 转发已补齐（追加 7 端到端测试，relay 共 17 绿）：** `/v1/agent/tunnel`（agent 出站）与 `/v1/hosts/{host_id}/session`（device 持 token 接入），双向搬运签名信封。
+  - **逐字节不变** ✅ 上下行都断言收到的 JSON 与发出的**完全相等**——relay 若"顺手"重新序列化就会毁掉覆盖 header 的签名。
+  - **`open_stream` 不带 device 公钥** ✅ 断言该字段不存在；agent 只认自己的存储。
+  - **不串台** ✅ 两机两设备，A 的帧到 A 的 agent，同时断言 B 的 agent 与 B 的 device **静默无帧**。
+  - **撤销即关在途流** ✅ agent 收到 `close_stream{reason:"revoked"}`，device socket 随即结束。
+  - **agent 掉线连带结束其 device 流** ✅ 不留任何东西待重连投递。
+  - **RPC 响应按签名内的 stream_id 路由** ✅ 保持响应与请求的绑定。
+- **这一步抓到一个真实缺陷：** 撤销原本**没有**关闭在途流（我先前那段代码因 `cargo fmt` 改过缩进而未被应用）。测试红了才发现——正是"已撤销但仍在投递"这一威胁。已修。
+- **未完成：** `project_id`（待 PR5b）。`/leveler-sessions` REST 在「已鉴权且 host 在线」时仍返回 **501**（RPC 代理未接），而不是假装 503——把在线的 host 误报为不可达会掩盖真实状态。
 - **MVP 缺口（已在代码注释标明）：** `/v1/auth/session` 目前只校验配对记录，**未校验 device 签名断言**；`/pair/*` 与 `/auth/*` **未做速率限制**。两项都是设计要求的，须在 PR10 security gate 前补。
 
 ### PR7 — CLI `leveler remote` ⚠️ 部分完成（不依赖 relay 的子命令已可用）
@@ -1400,7 +1408,7 @@ pub enum ClientOrigin {
 | `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
 | `leveler-remote-agent` + ProjectRouter | binary | 是 | ⚠️ 准入管道已落地（PR5 部分）；隧道/RPC/ProjectRouter 未开始 |
-| `leveler-relay` self-host | docker | 是 | ⚠️ 控制面 + Dockerfile 已落地；WSS 转发未接 |
+| `leveler-relay` self-host | docker | 是 | ⚠️ 控制面 + WSS 转发 + Dockerfile 已落地；RPC 代理未接 |
 | `leveler remote` CLI | CLI | 是 | ⚠️ status/devices/revoke 可用；pair/confirm 待 relay |
 | **leveler-mobile** | iOS + Android 内测包 | **是** | 未开始（PR11a–f） |
 | Security gate 记录 | 文档 | 是 | 未开始（PR10） |

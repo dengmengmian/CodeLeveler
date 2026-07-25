@@ -22,9 +22,10 @@
 
 mod routes;
 mod state;
+mod tunnel;
 
 pub use routes::build_router;
 pub use state::{
     CONFIRM_TTL_SECS, ClaimedBy, DeviceRecord, PAIRING_TTL_SECS, Pairing, RelayError, RelayState,
-    RuntimeOnline,
+    RuntimeOnline, StreamRoute,
 };
