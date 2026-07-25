@@ -369,7 +369,9 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
         rounds: report.rounds,
         modified_files: report.modified_files,
         stop_reason,
-        stop_detail: verification_failure.or(unverified_detail),
+        stop_detail: verification_failure
+            .or(unverified_detail)
+            .or(report.stop_detail),
         budget_exhaustion: None,
         metrics: Default::default(),
         progress: Default::default(),
@@ -627,6 +629,9 @@ impl Application {
                 read_only,
             )
             .await?;
+        // System-side memory candidates (explicit intent + package-manager
+        // signals). Never writes active memory; user accept is separate (K36).
+        self.enqueue_memory_candidates(goal);
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.continuation = continuation;
         spec.limits = limits;
@@ -698,7 +703,11 @@ impl Application {
                 read_only,
             )
             .await?;
-        let spec = self.direct_spec(goal_from_content(&content), mode, sandbox);
+        let goal = goal_from_content(&content);
+        // System-side memory candidates (explicit intent + package-manager
+        // signals). Never writes active memory; user accept is separate (K36).
+        self.enqueue_memory_candidates(&goal);
+        let spec = self.direct_spec(goal, mode, sandbox);
         let result = engine
             .chat(
                 session_id,
@@ -852,6 +861,7 @@ mod unattended_limits_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leveler_client_protocol::RuntimeEvent;
     use leveler_engine::TaskOutcome;
     use leveler_execution::PermissionProfile;
 
@@ -885,10 +895,39 @@ mod tests {
             modified_files: modified.iter().map(|s| s.to_string()).collect(),
             verification: None,
             stop_reason,
+            stop_detail: None,
             rounds: 1,
             review: None,
             acceptance: None,
         }
+    }
+
+    #[test]
+    fn executor_stop_detail_survives_without_a_stronger_report_detail() {
+        let mut task = report(TaskOutcome::BudgetLimited, StopReason::BudgetExhausted, &[]);
+        task.stop_detail = Some("budget exhausted: model_tokens spent=120 limit=100".into());
+
+        let out = report_to_result(task).unwrap();
+
+        assert_eq!(
+            out.stop_detail.as_deref(),
+            Some("budget exhausted: model_tokens spent=120 limit=100")
+        );
+    }
+
+    #[test]
+    fn no_progress_detail_survives_report_and_runtime_event_mapping() {
+        const DETAIL: &str = "no-progress streak; all-refused rounds short-circuited";
+        let mut task = report(TaskOutcome::Failed, StopReason::Incomplete, &[]);
+        task.stop_detail = Some(DETAIL.into());
+
+        let RuntimeEvent::TurnIncomplete { reason } =
+            crate::event_bridge::turn_runtime_event(report_to_result(task))
+        else {
+            panic!("an incomplete report must emit TurnIncomplete");
+        };
+
+        assert_eq!(reason, DETAIL);
     }
 
     #[test]
@@ -908,12 +947,9 @@ mod tests {
 
     #[test]
     fn completed_without_tracked_changes_explains_why_checks_did_not_run() {
-        let out = report_to_result(report(
-            TaskOutcome::CompletedUnverified,
-            StopReason::Completed,
-            &[],
-        ))
-        .unwrap();
+        let mut task = report(TaskOutcome::CompletedUnverified, StopReason::Completed, &[]);
+        task.stop_detail = Some("executor fallback".into());
+        let out = report_to_result(task).unwrap();
 
         assert_eq!(out.stop_reason, StopReason::CompletedUnverified);
         assert_eq!(

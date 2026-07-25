@@ -230,18 +230,17 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // Pin viewport so agent streaming cannot yank us to the bottom.
                 state.conversation_auto_scroll = false;
                 ensure_conversation_plain(state);
-                // Cmd/Ctrl+click on a URL opens it in the browser instead of
-                // starting a selection. Both modifiers are accepted so it works
-                // whichever the terminal forwards (Cmd is often eaten by macOS
-                // terminals, which then open the link themselves anyway).
+                // Cmd/Ctrl+click on a URL opens it immediately (no selection).
+                // Both modifiers are accepted so it works whichever the terminal
+                // forwards (Cmd is often eaten by macOS terminals). Plain click
+                // opens on release when the selection stayed empty — see Up.
                 if mouse
                     .modifiers
                     .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
                     && let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row)
                     && let Some(url) = url_at_pos(state, pos)
                 {
-                    open_url(state, &url);
-                    return Vec::new();
+                    return open_url(state, &url);
                 }
                 state.selection_last_mouse = Some((mouse.column, mouse.row));
                 update_selection_edge(state, mouse.column, mouse.row);
@@ -270,7 +269,15 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // One last edge settle is not needed; stop continuous scroll.
                 clear_selection_drag(state);
                 state.selection.finish();
-                if !state.selection.is_empty() {
+                if state.selection.is_empty() {
+                    // Click without drag: open the URL under the cursor, if any.
+                    ensure_conversation_plain(state);
+                    if let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row)
+                        && let Some(url) = url_at_pos(state, pos)
+                    {
+                        return open_url(state, &url);
+                    }
+                } else {
                     ensure_conversation_plain(state);
                     let text = crate::selection::extract_selected_text(
                         &state.conversation_plain,
@@ -382,79 +389,18 @@ fn conversation_content_width(state: &AppState) -> usize {
         .unwrap_or_else(|| state.size.0.max(1) as usize)
 }
 
-/// The http(s) URL under char column `col` of plain line `pos.row`, if any.
+/// The http(s) URL under display column `pos.col` of plain line `pos.row`, if any.
 fn url_at_pos(state: &AppState, pos: crate::selection::TextPos) -> Option<String> {
-    url_at(state.conversation_plain.get(pos.row)?, pos.col)
+    crate::url_link::url_at(state.conversation_plain.get(pos.row)?, pos.col)
 }
 
-fn chars_start_with(chars: &[char], i: usize, pat: &str) -> bool {
-    pat.chars()
-        .enumerate()
-        .all(|(k, pc)| chars.get(i + k) == Some(&pc))
-}
-
-/// Extract the http(s) URL spanning char index `col` in `line`, or `None`.
-/// Only http/https are recognized so a click can never launch another scheme.
-fn url_at(line: &str, col: usize) -> Option<String> {
-    let chars: Vec<char> = line.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-    while i < n {
-        let scheme = if chars_start_with(&chars, i, "https://") {
-            8
-        } else if chars_start_with(&chars, i, "http://") {
-            7
-        } else {
-            i += 1;
-            continue;
-        };
-        let mut j = i;
-        while j < n && is_url_char(chars[j]) {
-            j += 1;
-        }
-        // Drop trailing sentence punctuation that is not really part of the URL.
-        let mut end = j;
-        while end > i + scheme && is_trailing_punct(chars[end - 1]) {
-            end -= 1;
-        }
-        if (i..end).contains(&col) {
-            return Some(chars[i..end].iter().collect());
-        }
-        i = j;
-    }
-    None
-}
-
-fn is_url_char(c: char) -> bool {
-    !c.is_whitespace() && !matches!(c, '<' | '>' | '"' | '`' | '\'' | '|')
-}
-
-fn is_trailing_punct(c: char) -> bool {
-    matches!(
-        c,
-        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
-    )
-}
-
-/// Open a URL in the OS default browser, notifying success/failure.
-fn open_url(state: &mut AppState, url: &str) {
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    state.notification = Some(match std::process::Command::new(program).arg(url).spawn() {
-        Ok(_) => Notification {
-            level: NotificationLevel::Info,
-            message: format!("已在浏览器打开 {url}"),
-        },
-        Err(e) => Notification {
-            level: NotificationLevel::Warning,
-            message: format!("打开失败: {e}"),
-        },
+/// Queue opening `url` in the OS default browser (handled by the event loop).
+fn open_url(state: &mut AppState, url: &str) -> Vec<Effect> {
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: format!("已在浏览器打开 {url}"),
     });
+    vec![Effect::OpenWebUrl(url.to_string())]
 }
 
 fn ensure_conversation_plain(state: &mut AppState) {
@@ -1139,32 +1085,5 @@ fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
             message: QUIT_CONFIRM_MESSAGE.to_string(),
         });
         Vec::new()
-    }
-}
-
-#[cfg(test)]
-mod url_tests {
-    use super::url_at;
-
-    #[test]
-    fn detects_http_url_only_under_the_clicked_column() {
-        let line = "见 https://example.com/path 了解详情";
-        // Column inside the URL → returns it.
-        assert_eq!(
-            url_at(line, 10).as_deref(),
-            Some("https://example.com/path")
-        );
-        // Column outside the URL → None.
-        assert_eq!(url_at(line, 0), None);
-        assert_eq!(url_at(line, 30), None);
-    }
-
-    #[test]
-    fn trims_trailing_punctuation_and_ignores_other_schemes() {
-        // A trailing period/paren is not part of the link.
-        assert_eq!(url_at("(http://a.io).", 3).as_deref(), Some("http://a.io"));
-        // Non-http schemes are never linkified.
-        assert_eq!(url_at("file:///etc/passwd", 3), None);
-        assert_eq!(url_at("run ssh://x", 6), None);
     }
 }

@@ -6,6 +6,31 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-25
+
+### Added
+- Proactive project memory pipeline: system-side candidates from explicit user
+  intent (`记住：…` / `remember: …`) and package-manager signals
+  (`pnpm-lock.yaml` / `yarn.lock` / `package-lock.json` / `packageManager`).
+  Candidates land in `pending/` and become durable only after user accept
+  (`leveler memory accept`); reject suppresses re-prompt for the same signal.
+- CLI: `leveler memory pending|accept|reject|propose` (plus existing
+  list/search/show/forget/remember).
+- Turn-start host enqueue of memory candidates (never writes active without
+  consent). K36: agent `remember`/`forget`/`consolidate_memory` remain
+  approval-gated; accept is not an agent tool.
+- Structured memory entry fields (`key` / `kind`) for package-manager and
+  preference upserts.
+- TUI: clickable http(s) URL detection/styling for transcript links.
+- Executor plan-gate repair: force `update_plan` when a structured plan is
+  still required after explore rounds.
+- Task reports propagate executor `stop_detail` through engine → app for
+  clearer incomplete / budget messages.
+
+### Fixed
+- Incomplete/budget stop reasons keep the concrete executor detail instead of
+  dropping it when mapping reports to runtime events.
+
 ## [0.1.3] - 2026-07-25
 
 ### Added

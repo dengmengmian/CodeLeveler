@@ -83,8 +83,8 @@ pub enum Effect {
     /// the injected [`WebLauncher`] and folds its result back as
     /// [`Action::WebLaunched`].
     StartWeb,
-    /// Open an already-running Web UI URL in the default browser (`/web`
-    /// re-invocation — the server is up, the browser tab may be long closed).
+    /// Open a URL in the default browser (conversation link click, or `/web`
+    /// re-invocation when the server is already up).
     OpenWebUrl(String),
     /// Tear down the UI and exit.
     Quit,

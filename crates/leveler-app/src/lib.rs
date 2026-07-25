@@ -507,9 +507,40 @@ pub(crate) fn load_memory_index(memory_dir: &std::path::Path) -> String {
     }
 }
 
+impl Application {
+    /// Enqueue pending memory candidates from this turn's user text and
+    /// package-manager signals. Never writes `active/` (K36: accept is separate).
+    pub(crate) fn enqueue_memory_candidates(&self, user_text: &str) {
+        let memory_dir = self.layout.memory_dir();
+        let Ok(store) = leveler_memory::MemoryStore::open(&memory_dir) else {
+            return;
+        };
+        match leveler_memory::collect_turn_candidates(
+            &store,
+            user_text,
+            Some(self.layout.repo_root.as_path()),
+        ) {
+            Ok(outcomes) => {
+                let pending = outcomes
+                    .iter()
+                    .filter(|o| matches!(o, leveler_memory::ProposeOutcome::Pending(_)))
+                    .count();
+                if pending > 0 {
+                    tracing::info!(pending, "enqueued memory candidates (await user accept)");
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "memory candidate enqueue skipped");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod memory_index_tests {
     use super::*;
+    use leveler_memory::{ProposeOutcome, collect_turn_candidates};
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -527,6 +558,24 @@ mod memory_index_tests {
         let index = load_memory_index(&mem);
         assert!(index.contains("Use workspace write"), "{index}");
         assert!(!index.contains("SECRET_BODY"), "{index}");
+    }
+
+    /// Host path used by `Application::enqueue_memory_candidates` — propose only.
+    #[test]
+    fn turn_candidate_collect_never_writes_active() {
+        let mem = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("pnpm-lock.yaml"), "").unwrap();
+        let store = leveler_memory::MemoryStore::open(mem.path()).unwrap();
+        let outcomes = collect_turn_candidates(&store, "记住：用 pnpm", Some(repo.path())).unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ProposeOutcome::Pending(_))),
+            "{outcomes:?}"
+        );
+        assert_eq!(store.list_active().unwrap().len(), 0);
+        assert!(!store.list_pending().unwrap().is_empty());
     }
 
     #[test]

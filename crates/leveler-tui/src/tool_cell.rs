@@ -713,10 +713,11 @@ pub(crate) fn tool_lines(
         let shown = lines.len().min(MAX_EXPANDED_PREVIEW);
         for (i, line) in lines.iter().take(shown).enumerate() {
             let lead = if i == 0 { "  └ " } else { "    " };
-            out.push(Line::from(vec![
-                Span::styled(lead, Style::default().fg(theme.dim)),
-                Span::styled(line.clone(), Style::default().fg(theme.muted)),
-            ]));
+            let base = Style::default().fg(theme.muted);
+            let link = crate::url_link::link_style(theme.accent);
+            let mut spans = vec![Span::styled(lead, Style::default().fg(theme.dim))];
+            spans.extend(crate::url_link::spans_with_bare_urls(line, base, link));
+            out.push(Line::from(spans));
         }
         if lines.len() > shown {
             out.push(Line::from(Span::styled(
@@ -747,11 +748,14 @@ pub(crate) fn tool_lines(
         } else {
             String::new()
         };
-        out.push(Line::from(vec![
-            Span::styled("  └ ", Style::default().fg(theme.dim)),
-            Span::styled(one, Style::default().fg(theme.muted)),
-            Span::styled(hint, Style::default().fg(theme.dim)),
-        ]));
+        let base = Style::default().fg(theme.muted);
+        let link = crate::url_link::link_style(theme.accent);
+        let mut spans = vec![Span::styled("  └ ", Style::default().fg(theme.dim))];
+        spans.extend(crate::url_link::spans_with_bare_urls(&one, base, link));
+        if !hint.is_empty() {
+            spans.push(Span::styled(hint, Style::default().fg(theme.dim)));
+        }
+        out.push(Line::from(spans));
     }
 }
 

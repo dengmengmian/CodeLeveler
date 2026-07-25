@@ -466,8 +466,20 @@ impl Executor {
             }
 
             let mut request = ModelRequest::new(self.model.clone(), messages.clone());
-            request.tools = tools.clone();
-            request.tool_choice = ToolChoice::Auto;
+            let plan_repair_required = structured_plan_required
+                && !structured_plan_started
+                && plan_explore_rounds_used >= PLAN_EXPLORE_ROUNDS;
+            if plan_repair_required {
+                request.tools = tools
+                    .iter()
+                    .filter(|tool| tool.name == "update_plan")
+                    .cloned()
+                    .collect();
+                request.tool_choice = ToolChoice::Tool("update_plan".to_string());
+            } else {
+                request.tools = tools.clone();
+                request.tool_choice = ToolChoice::Auto;
+            }
             request.max_output_tokens = Some(self.max_output_tokens);
             request.reasoning_effort = self.reasoning_effort;
 
@@ -726,6 +738,17 @@ impl Executor {
                     &progress,
                     &objective,
                 ));
+            }
+
+            if calls.is_empty() && plan_repair_required {
+                let feedback = Message::text(
+                    Role::User,
+                    "A structured plan is still required. Your text response did not satisfy \
+                     the plan gate. Call update_plan now; do not answer or continue in prose.",
+                );
+                sink.append(&[assistant, feedback.clone()]).await?;
+                messages.push(feedback);
+                continue;
             }
 
             if calls.is_empty() {
@@ -2101,6 +2124,15 @@ impl Executor {
                         ));
                     }
                 }
+            } else if plan_repair_required
+                && !call_snapshot.is_empty()
+                && denied_calls_this_round == call_snapshot.len()
+            {
+                // A provider may ignore the forced update_plan choice and emit
+                // a tool hidden from this repair request. The plan gate already
+                // denied it. Keep this neutral so the generic two-round
+                // all-refused watchdog does not preempt a later valid plan;
+                // absolute round and resource budgets still bound retries.
             } else if !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len() {
                 // Every call this round was refused before it ran — that is
                 // not progress. Feed the AC3 streak so an UntilTerminal run

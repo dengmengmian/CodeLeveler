@@ -1336,6 +1336,8 @@ mod recall_tests {
             created_at: "t".to_string(),
             updated_at: "t".to_string(),
             archived_at: None,
+            key: None,
+            kind: None,
         }
     }
 
@@ -1499,6 +1501,29 @@ mod compaction_tests {
         assert!(task_needs_structured_plan(task));
         assert!(!task_needs_structured_plan(
             "把 README 的标题改成 CodeLeveler"
+        ));
+    }
+
+    #[test]
+    fn url_output_labels_do_not_make_a_simple_request_complex() {
+        let task = concat!(
+            " - Local: http://localhost:3000\n",
+            " - Network: http://10.9.9.199:3000 这些URL 为什么在TUI上能不能让他可点击。"
+        );
+
+        assert!(!task_needs_structured_plan(task));
+        assert!(task_needs_structured_plan(
+            "1. inspect the current implementation\n\
+             2. change the behavior"
+        ));
+        assert!(!task_needs_structured_plan(
+            "- inspect the current implementation\n\
+             - change the behavior"
+        ));
+        assert!(task_needs_structured_plan(
+            "- inspect the current implementation\n\
+             - change the behavior\n\
+             - run verification"
         ));
     }
 

@@ -323,6 +323,27 @@ pub enum MemoryCommand {
         #[arg(long = "tag")]
         tags: Vec<String>,
     },
+    /// List pending memory candidates (awaiting accept/reject).
+    Pending,
+    /// Accept a pending candidate into active durable memory (user consent).
+    Accept {
+        /// Pending candidate id.
+        id: String,
+    },
+    /// Reject a pending candidate and suppress re-prompt for that signal.
+    Reject {
+        /// Pending candidate id.
+        id: String,
+    },
+    /// Extract candidates from text and/or package-manager signals (no active write).
+    Propose {
+        /// Explicit user text (e.g. "记住：用 pnpm"). Optional if `--scan-pm`.
+        #[arg(long)]
+        text: Option<String>,
+        /// Scan the current repo for package-manager lockfile / packageManager.
+        #[arg(long)]
+        scan_pm: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

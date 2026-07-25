@@ -1042,4 +1042,10 @@ async fn node_wall_clock_budget_reaches_the_executor() {
         leveler_agent::StopReason::BudgetExhausted,
         "an exhausted node wall-clock budget must stop the node: {report:?}"
     );
+    assert!(
+        report.stop_detail.as_deref().is_some_and(|detail| {
+            detail.contains("dimension=duration") && detail.contains("cap=1000")
+        }),
+        "the failed node's executor detail must survive into TaskReport: {report:?}"
+    );
 }

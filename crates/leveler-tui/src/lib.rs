@@ -36,6 +36,7 @@ mod tool_cell;
 mod tool_result;
 pub mod tool_taxonomy;
 pub mod transcript;
+mod url_link;
 mod workbench;
 
 mod run;

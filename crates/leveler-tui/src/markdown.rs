@@ -922,6 +922,15 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
                 }
                 continue;
             }
+            // Bare http(s) in non-code prose: same accent+underline as md links.
+            let token_style = if span.link.is_none()
+                && !span.code
+                && (token.starts_with("http://") || token.starts_with("https://"))
+            {
+                style.fg(theme.accent).add_modifier(Modifier::UNDERLINED)
+            } else {
+                style
+            };
             if tw > width {
                 // Break the overlong token by grapheme.
                 for g in token.graphemes(true) {
@@ -929,14 +938,14 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
                     if col + gw > width && col > 0 {
                         flush(&mut cur, &mut col, &mut lines);
                     }
-                    cur.push(Span::styled(g.to_string(), style));
+                    cur.push(Span::styled(g.to_string(), token_style));
                     col += gw;
                 }
             } else {
                 if col + tw > width && col > 0 {
                     flush(&mut cur, &mut col, &mut lines);
                 }
-                cur.push(Span::styled(token.clone(), style));
+                cur.push(Span::styled(token.clone(), token_style));
                 col += tw;
             }
         }
@@ -1632,6 +1641,32 @@ mod tests {
         assert!(
             joined.contains("see") && joined.contains("please"),
             "{joined}"
+        );
+    }
+
+    #[test]
+    fn bare_http_url_in_prose_is_underlined() {
+        let doc = MdDoc::parse("Local: http://localhost:3000 ready");
+        let lines = doc.to_lines(80, &Theme::dark());
+        let has = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content.contains("localhost:3000")
+                    && s.style.add_modifier.contains(Modifier::UNDERLINED)
+            })
+        });
+        assert!(has, "bare http URL must look like a link: {lines:?}");
+    }
+
+    #[test]
+    fn bare_url_inside_code_is_not_link_styled() {
+        let doc = MdDoc::parse("run `curl http://localhost:3000`");
+        let lines = doc.to_lines(80, &Theme::dark());
+        let underlined_url = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains("localhost") && s.style.add_modifier.contains(Modifier::UNDERLINED)
+        });
+        assert!(
+            !underlined_url,
+            "URL inside inline code must not be link-styled: {lines:?}"
         );
     }
 }

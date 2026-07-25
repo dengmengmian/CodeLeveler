@@ -166,10 +166,11 @@ fn append_details(
                     if shown == MAX_DETAIL_LINES {
                         break;
                     }
-                    out.push(Line::from(Span::styled(
-                        format!("      {line}"),
-                        Style::default().fg(theme.muted),
-                    )));
+                    let base = Style::default().fg(theme.muted);
+                    let link = crate::url_link::link_style(theme.accent);
+                    let mut spans =
+                        crate::url_link::spans_with_bare_urls(&format!("      {line}"), base, link);
+                    out.push(Line::from(std::mem::take(&mut spans)));
                     shown += 1;
                 }
                 if shown == MAX_DETAIL_LINES {

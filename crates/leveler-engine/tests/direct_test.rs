@@ -629,6 +629,30 @@ async fn bounded_eval_goal_still_stops_at_the_case_round_limit() {
 }
 
 #[tokio::test]
+async fn direct_budget_stop_preserves_the_executor_detail() {
+    let h = harness(vec![text("never reached")]).await;
+    let mut spec = spec(&h, VerificationPlan::default());
+    spec.limits.max_duration = Some(std::time::Duration::ZERO);
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::BudgetLimited);
+    assert_eq!(report.stop_reason, StopReason::BudgetExhausted);
+    assert!(
+        report
+            .stop_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("dimension=duration") && detail.contains("cap=0")),
+        "executor budget detail must survive into TaskReport: {report:?}"
+    );
+}
+
+#[tokio::test]
 async fn failed_verification_repairs_once_then_fails() {
     // Goal turn (patch + resolve), one repair turn (resolve again), gate
     // always fails → Failed after the bounded repair.

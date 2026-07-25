@@ -4033,3 +4033,74 @@ fn mouse_drag_selects_conversation_text() {
     assert!(!s.selection.dragging);
     assert!(!s.selection.is_empty());
 }
+
+#[test]
+fn mouse_click_without_drag_on_url_opens_browser() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mut s = opened();
+    s.size = (80, 30);
+    // Plain line with a bare URL; conversation_plain is what hit-testing reads.
+    s.conversation_rect = Some((0, 3, 80, 20));
+    s.conversation_auto_scroll = false;
+    s.conversation_scroll = 0;
+    s.conversation_plain = vec!["  Local: http://localhost:3000".into()];
+    s.conversation_plain_width = 80;
+
+    let url_col = "  Local: http://localhost:3000"
+        .find("http://")
+        .expect("url") as u16;
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: url_col, // rect x=0
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    };
+    reduce(&mut s, Action::Mouse(down));
+    assert!(s.selection.dragging);
+
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: url_col,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    };
+    let effects = reduce(&mut s, Action::Mouse(up));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::OpenWebUrl(u) if u == "http://localhost:3000")),
+        "expected OpenWebUrl effect, got {effects:?}"
+    );
+    assert!(!s.selection.is_active());
+}
+
+#[test]
+fn mouse_click_without_drag_off_url_does_not_open() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mut s = opened();
+    s.size = (80, 30);
+    s.conversation_rect = Some((0, 3, 80, 20));
+    s.conversation_auto_scroll = false;
+    s.conversation_scroll = 0;
+    s.conversation_plain = vec!["  Local: http://localhost:3000".into()];
+    s.conversation_plain_width = 80;
+
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 0,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    };
+    reduce(&mut s, Action::Mouse(down));
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 0,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    };
+    let effects = reduce(&mut s, Action::Mouse(up));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::OpenWebUrl(_))),
+        "click off URL must not open: {effects:?}"
+    );
+}

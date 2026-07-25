@@ -14,7 +14,7 @@ use leveler_execution::{
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
-    ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
+    ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall, ToolChoice,
 };
 use leveler_tools::{
     RiskLevel, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, default_registry,
@@ -4322,6 +4322,156 @@ async fn complex_task_allows_readonly_explore_before_plan() {
         read_ok,
         "read_file before plan must succeed; events={events:?}"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn exhausted_plan_explore_budget_restricts_the_next_request_until_plan_succeeds() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-plan-repair-{}",
+        std::process::id() as u64 * 31 + 53
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "a.txt"})),
+        assistant_tool_call("r2", "read_file", serde_json::json!({"path": "b.txt"})),
+        assistant_tool_call("r3", "read_file", serde_json::json!({"path": "a.txt"})),
+        assistant_tool_call("r4", "read_file", serde_json::json!({"path": "b.txt"})),
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({
+                "plan": [
+                    {"step": "inspect", "status": "completed"},
+                    {"step": "edit", "status": "in_progress"},
+                    {"step": "verify", "status": "pending"}
+                ]
+            }),
+        ),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_structure(true);
+
+    let outcome = executor
+        .run(
+            "1. inspect the implementation\n2. edit it\n3. verify the change",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
+
+    let requests = runtime.recorded_requests();
+    assert_eq!(requests.len(), 6);
+    for repair in &requests[2..=4] {
+        assert_eq!(repair.tool_choice, ToolChoice::Tool("update_plan".into()));
+        assert_eq!(
+            repair
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["update_plan"]
+        );
+    }
+
+    let after_plan = &requests[5];
+    assert_eq!(after_plan.tool_choice, ToolChoice::Auto);
+    assert!(
+        after_plan.tools.len() > requests[4].tools.len()
+            && after_plan.tools.iter().any(|tool| tool.name == "read_file")
+            && after_plan
+                .tools
+                .iter()
+                .any(|tool| tool.name == "apply_patch"),
+        "full tool registry must be restored after a successful plan: {:?}",
+        after_plan
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn plan_repair_text_only_response_is_retried_until_update_plan_succeeds() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-plan-text-repair-{}",
+        std::process::id() as u64 * 31 + 59
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "a.txt"})),
+        assistant_tool_call("r2", "read_file", serde_json::json!({"path": "b.txt"})),
+        assistant_text("I have enough context and will proceed."),
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({
+                "plan": [
+                    {"step": "inspect", "status": "completed"},
+                    {"step": "edit", "status": "in_progress"},
+                    {"step": "verify", "status": "pending"}
+                ]
+            }),
+        ),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_structure(true);
+
+    let outcome = executor
+        .run(
+            "1. inspect the implementation\n2. edit it\n3. verify the change",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
+    assert_eq!(outcome.rounds, 5);
+    let requests = runtime.recorded_requests();
+    assert_eq!(
+        requests[2].tool_choice,
+        ToolChoice::Tool("update_plan".into())
+    );
+    assert_eq!(requests[2].tools.len(), 1);
+    assert_eq!(requests[2].tools[0].name, "update_plan");
+    assert_eq!(
+        requests[3].tool_choice,
+        ToolChoice::Tool("update_plan".into())
+    );
+    assert_eq!(requests[3].tools.len(), 1);
+    assert_eq!(requests[3].tools[0].name, "update_plan");
+    assert_eq!(requests[4].tool_choice, ToolChoice::Auto);
+
     std::fs::remove_dir_all(&dir).ok();
 }
 

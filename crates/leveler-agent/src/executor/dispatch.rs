@@ -335,11 +335,34 @@ pub(crate) fn is_plan_explore_tool(name: &str) -> bool {
 /// work. The gate intentionally uses only obvious structure; uncertain tasks
 /// may still create a plan voluntarily without blocking simple edits.
 pub(crate) fn task_needs_structured_plan(task: &str) -> bool {
-    fn is_list_item(line: &str) -> bool {
+    fn is_output_labelled_url(line: &str) -> bool {
         let line = line.trim_start();
-        if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("• ") {
-            return true;
-        }
+        let Some(payload) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| line.strip_prefix("• "))
+        else {
+            return false;
+        };
+        let Some((label, value)) = payload.split_once(':') else {
+            return false;
+        };
+        let value = value.trim_start();
+        !label.is_empty()
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ' '))
+            && (value.starts_with("http://") || value.starts_with("https://"))
+    }
+
+    fn is_bullet_item(line: &str) -> bool {
+        let line = line.trim_start();
+        (line.starts_with("- ") || line.starts_with("* ") || line.starts_with("• "))
+            && !is_output_labelled_url(line)
+    }
+
+    fn is_numbered_item(line: &str) -> bool {
+        let line = line.trim_start();
         let digits = line.chars().take_while(char::is_ascii_digit).count();
         digits > 0
             && matches!(
@@ -348,13 +371,21 @@ pub(crate) fn task_needs_structured_plan(task: &str) -> bool {
             )
     }
 
-    if task
+    let numbered_items = task
         .lines()
-        .filter(|line| is_list_item(line))
+        .filter(|line| is_numbered_item(line))
         .take(2)
-        .count()
-        >= 2
-    {
+        .count();
+    if numbered_items >= 2 {
+        return true;
+    }
+
+    let bullet_items = task
+        .lines()
+        .filter(|line| is_bullet_item(line))
+        .take(3)
+        .count();
+    if bullet_items >= 3 {
         return true;
     }
 

@@ -73,6 +73,11 @@ impl Approver for AutoApprove {
 ///
 /// Includes `consolidate_memory`: with `auto_write=true` it persists entries and
 /// must not slip past K36 under WorkspaceWrite / FullAccess / AutoApprove.
+///
+/// Pending-candidate **accept** is deliberately **not** an agent tool: durable
+/// promotion goes through user-authoritative CLI (`leveler memory accept`) or a
+/// future UI consent surface that calls `MemoryStore::accept` after a human
+/// click. AutoApprove therefore cannot silently activate candidates.
 pub fn is_memory_write_tool(tool: &str) -> bool {
     matches!(tool, "remember" | "forget" | "consolidate_memory")
 }

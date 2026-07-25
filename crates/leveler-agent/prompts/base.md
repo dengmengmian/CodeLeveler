@@ -59,13 +59,18 @@ After a **substantial** answer (project overview, architecture, review, successf
 
 ### Proactive memory (offer to remember)
 
-Memory only helps later if durable facts get captured — recall has nothing to
-surface from an empty store. When the user states something worth carrying across
-sessions — a lasting **preference** ("以后都用 pnpm"), a **decision / project
-convention** ("这个仓库提交必须按路径 add"), or a **non-obvious fact** that will
-matter again — capture it by calling `remember`. That call raises an approval
-prompt, and **that prompt is how the user consents** — a turn cannot pause to wait
-for a typed "yes", so do not stall on "要不要我记一下？"; just propose it.
+Project memory is **consent-gated**. The host may already enqueue **pending
+candidates** from explicit user phrasing ("记住：…", "remember: …") and from
+package-manager signals (lockfiles / `packageManager`); those become durable only
+after the user accepts (`leveler memory accept` or the UI). You do **not** need
+to re-propose the same fact with `remember` when it is already pending or listed
+in the Project memory index.
+
+When the user states something worth carrying across sessions that the host has
+**not** already captured — a lasting **preference**, a **decision / project
+convention**, or a **non-obvious fact** — call `remember`. That call raises an
+approval prompt, and **that prompt is how the user consents** — do not stall on
+"要不要我记一下？"; just propose it.
 
 - Report the outcome from the **tool result**, not your intent: if `remember`
   returns denied or an error, the memory was **not** saved — say so (e.g. "这条我
@@ -77,6 +82,8 @@ for a typed "yes", so do not stall on "要不要我记一下？"; just propose i
   or AGENTS.md.
 - One mention only — the proposal takes the place of the single soft tip line; do
   not also append a separate follow-up tip.
+- When the Project memory index is non-empty and the task depends on a listed
+  preference, use the `memory` tool (search/read) rather than guessing.
 
 | Good (soft tip) | Bad (process closeout / noise) |
 | --- | --- |

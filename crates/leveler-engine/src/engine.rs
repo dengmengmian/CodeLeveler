@@ -198,6 +198,8 @@ pub struct TaskReport {
     pub verification: Option<VerificationReport>,
     /// The executor's stop reason (legacy status mapping needs its nuance).
     pub stop_reason: StopReason,
+    /// The executor's concrete reason for a non-success stop, when available.
+    pub stop_detail: Option<String>,
     pub rounds: u32,
     /// Merged review findings (orchestrated runs only).
     pub review: Option<Vec<leveler_orchestrator::ReviewFinding>>,
@@ -223,11 +225,31 @@ impl TaskReport {
             modified_files,
             verification: None,
             stop_reason,
+            stop_detail: None,
             rounds,
             review: None,
             acceptance: None,
         }
     }
+
+    fn with_stop_detail(mut self, stop_detail: Option<String>) -> Self {
+        self.stop_detail = stop_detail;
+        self
+    }
+}
+
+fn report_from_agent_outcome(
+    outcome: leveler_agent::AgentOutcome,
+    task_outcome: TaskOutcome,
+) -> TaskReport {
+    TaskReport::new(
+        task_outcome,
+        outcome.final_text,
+        outcome.modified_files,
+        outcome.stop_reason,
+        outcome.rounds,
+    )
+    .with_stop_detail(outcome.stop_detail)
 }
 
 pub fn mode_str(mode: PermissionProfile) -> &'static str {
@@ -1288,25 +1310,16 @@ impl TaskEngine {
             let incomplete_with_work =
                 outcome.stop_reason == StopReason::Incomplete && !outcome.modified_files.is_empty();
             if !incomplete_with_work {
-                return Ok(TaskReport::new(
-                    terminal,
-                    outcome.final_text,
-                    outcome.modified_files,
-                    outcome.stop_reason,
-                    outcome.rounds,
-                ));
+                return Ok(report_from_agent_outcome(outcome, terminal));
             }
         }
 
         // K19 early short-circuit: no mutation or no gates → never claim Verified
         // (pure Q&A over a green repo must stay CompletedUnverified).
         if outcome.modified_files.is_empty() || !spec.verification.has_gates() {
-            return Ok(TaskReport::new(
+            return Ok(report_from_agent_outcome(
+                outcome,
                 TaskOutcome::CompletedUnverified,
-                outcome.final_text,
-                outcome.modified_files,
-                outcome.stop_reason,
-                outcome.rounds,
             ));
         }
 
@@ -1385,16 +1398,11 @@ impl TaskEngine {
             has_mutation: !outcome.modified_files.is_empty(),
         };
         let task_outcome = map_completion_verdict(finalize_task_outcome(&report, expected));
+        let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
             verification: Some(report),
             acceptance: None,
-            ..TaskReport::new(
-                task_outcome,
-                outcome.final_text,
-                outcome.modified_files,
-                outcome.stop_reason,
-                outcome.rounds,
-            )
+            ..base
         })
     }
 
@@ -1754,7 +1762,8 @@ impl TaskEngine {
                     modified_files,
                     recorded.outcome.stop_reason,
                     rounds,
-                ));
+                )
+                .with_stop_detail(recorded.outcome.stop_detail));
             }
         }
 

@@ -8,6 +8,15 @@
 
 #![forbid(unsafe_code)]
 
+mod candidates;
+mod pipeline;
+
+pub use candidates::{
+    CandidateKind, CandidateSource, MemoryCandidate, detect_package_manager, fingerprint_of,
+    looks_like_secret, package_manager_from_root, parse_explicit_remember_intent,
+};
+pub use pipeline::{ProposeOutcome, SuppressRecord, collect_turn_candidates};
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -27,6 +36,12 @@ pub struct MemoryEntry {
     /// When set, the entry is archived (forgotten) and excluded from search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
+    /// Optional structured key (e.g. `package_manager`) for upserts / soft-hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Free-form kind label (`preference`, `package_manager`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +56,12 @@ pub enum MemoryError {
     Invalid(String),
 }
 
-/// File-backed memory store under `root/{active,archive}/`.
+/// File-backed memory store under `root/{active,archive,pending,suppress}/`.
+///
+/// - `active/` — user-accepted durable memories
+/// - `archive/` — forgotten entries
+/// - `pending/` — system/user candidates awaiting consent ([`Self::accept`])
+/// - `suppress/` — fingerprints rejected so the same signal does not re-spam
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     root: PathBuf,
@@ -52,6 +72,8 @@ impl MemoryStore {
         let root = root.into();
         fs::create_dir_all(root.join("active"))?;
         fs::create_dir_all(root.join("archive"))?;
+        fs::create_dir_all(root.join("pending"))?;
+        fs::create_dir_all(root.join("suppress"))?;
         Ok(Self { root })
     }
 
@@ -59,12 +81,31 @@ impl MemoryStore {
         &self.root
     }
 
-    fn active_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn active_path(&self, id: &str) -> PathBuf {
         self.root.join("active").join(format!("{id}.json"))
     }
 
-    fn archive_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn archive_path(&self, id: &str) -> PathBuf {
         self.root.join("archive").join(format!("{id}.json"))
+    }
+
+    pub(crate) fn pending_path(&self, id: &str) -> PathBuf {
+        self.root.join("pending").join(format!("{id}.json"))
+    }
+
+    pub(crate) fn suppress_path(&self, fingerprint: &str) -> PathBuf {
+        // Fingerprints are hex; still sanitize path segments.
+        let safe: String = fingerprint
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.root.join("suppress").join(format!("{safe}.json"))
     }
 
     /// Write or replace an active entry (caller handles approval).
@@ -300,10 +341,31 @@ pub fn new_entry(title: &str, body: &str, tags: Vec<String>) -> MemoryEntry {
         created_at: ts.clone(),
         updated_at: ts,
         archived_at: None,
+        key: None,
+        kind: None,
     }
 }
 
-fn slugify(title: &str) -> String {
+/// Build an active entry from an accepted candidate (preserves key/kind tags).
+pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
+    let mut entry = new_entry(&candidate.title, &candidate.body, candidate.tags.clone());
+    // Prefer stable id from key when present so re-accept upserts cleanly.
+    if let Some(key) = &candidate.key {
+        entry.id = slugify(key);
+        entry.key = Some(key.clone());
+    }
+    entry.kind = Some(
+        match candidate.kind {
+            CandidateKind::Preference => "preference",
+            CandidateKind::PackageManager => "package_manager",
+            CandidateKind::Free => "free",
+        }
+        .to_string(),
+    );
+    entry
+}
+
+pub(crate) fn slugify(title: &str) -> String {
     let mut s: String = title
         .chars()
         .map(|c| {
@@ -382,8 +444,12 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+pub(crate) fn write_atomically_pub(path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
+    write_atomically(path, bytes)
 }
 
 #[cfg(test)]
