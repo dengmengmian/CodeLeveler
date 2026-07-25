@@ -136,6 +136,10 @@ pub enum Command {
         command: Option<TrustCommand>,
     },
 
+    /// Manage remote control from a paired mobile device (provisional).
+    #[command(subcommand)]
+    Remote(RemoteCommand),
+
     /// Inspect configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -295,6 +299,21 @@ pub enum PermissionsCommand {
 ///
 /// With no subcommand, `leveler trust` lists what is untrusted and asks to
 /// confirm — the same as `leveler trust allow`.
+/// Remote control surface. Pairing needs a relay, which does not ship yet;
+/// what works today is inspecting and withdrawing trust in paired devices.
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommand {
+    /// Show whether remote control is configured on this machine.
+    Status,
+    /// List paired devices with the fingerprint the user confirmed.
+    Devices,
+    /// Withdraw trust in a device. Takes effect on its next frame.
+    Revoke {
+        /// The device id, as shown by `leveler remote devices`.
+        device_id: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TrustCommand {
     /// Trust the current contents of this repository's gated files.

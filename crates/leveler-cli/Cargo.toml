@@ -29,6 +29,8 @@ leveler-eval = { workspace = true }
 leveler-lsp = { workspace = true }
 leveler-app = { workspace = true }
 leveler-client-protocol = { workspace = true }
+leveler-remote-agent = { workspace = true }
+leveler-remote-protocol = { workspace = true }
 leveler-local-transport = { workspace = true }
 leveler-tui = { workspace = true }
 leveler-web = { workspace = true }

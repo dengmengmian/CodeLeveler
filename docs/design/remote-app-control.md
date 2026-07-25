@@ -1291,12 +1291,17 @@ pub enum ClientOrigin {
 - **Deps:** PR2, PR5（契约）
 - **DoD:** 双设备隔离负例；host/project offline 503；revoke 关流；**不存**队列/transcript；路由键含 `host_id`（+ stream 内 `project_id`）
 
-### PR7 — CLI `leveler remote`
+### PR7 — CLI `leveler remote` ⚠️ 部分完成（不依赖 relay 的子命令已可用）
 
 - **Title:** `cli: leveler remote enable|pair|confirm|open|projects|status|revoke (provisional)`
 - **Affects:** `leveler-cli`、STABILITY 一行
 - **Deps:** PR6（或 PR2 mock HTTP + PR6 前可测 contract）
 - **DoD:** QR 含 128-bit secret + **host/runtime_pubkey**；confirm 展示 **device 指纹**；`open`/`projects` 管理已打开项目；help 中文
+- **已完成：** `status` / `devices` / `revoke` 三个**无需 relay** 即可工作的子命令，中文输出，已手工实跑验证。这是本设计第一个用户可实际运行的入口——此前所有产出都是没有入口的库。
+  - `devices` **从存储的公钥重新推导指纹**，而非直接打印记录里的缓存字符串。两者不符即告警——用户当初确认的是密钥，不是它旁边那行文本。已构造篡改文件实测告警触发。
+  - `revoke` 写入 `revoked_at` 并提示「下一帧即生效」；撤销不存在的设备返回退出码 1。
+- **未完成：** `enable`（生成 runtime 密钥）、`pair`（出 QR）、`confirm`（展示 device 指纹并接受）、`open`/`projects`——全部依赖 relay 或 ProjectRouter。`status` 会明确告知用户 relay 尚未就绪，而不是假装可以配对。
+- **STABILITY 条目未加**：命令面尚不完整，等 PR6/PR7 收尾再一并登记。
 
 ### PR8 — 审计与指标（随 agent/relay，不晚于 e2e）
 
@@ -1387,7 +1392,7 @@ pub enum ClientOrigin {
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
 | `leveler-remote-agent` + ProjectRouter | binary | 是 | ⚠️ 准入管道已落地（PR5 部分）；隧道/RPC/ProjectRouter 未开始 |
 | `leveler-relay` self-host | docker | 是 | 未开始（PR6） |
-| `leveler remote` CLI | CLI | 是 | 未开始（PR7） |
+| `leveler remote` CLI | CLI | 是 | ⚠️ status/devices/revoke 可用；pair/confirm 待 relay |
 | **leveler-mobile** | iOS + Android 内测包 | **是** | 未开始（PR11a–f） |
 | Security gate 记录 | 文档 | 是 | 未开始（PR10） |
 

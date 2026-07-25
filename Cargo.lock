@@ -1843,6 +1843,8 @@ dependencies = [
  "leveler-orchestrator",
  "leveler-project",
  "leveler-provider",
+ "leveler-remote-agent",
+ "leveler-remote-protocol",
  "leveler-storage",
  "leveler-tools",
  "leveler-tui",

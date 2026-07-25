@@ -16,6 +16,7 @@ mod mcp_lsp_cmds;
 mod memory_cmds;
 mod output;
 mod permissions_cmds;
+mod remote_cmds;
 mod render;
 mod run_cmds;
 mod sessions_cmd;
@@ -237,6 +238,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Memory(mc) => cmd_memory(layout, mc),
         Command::Permissions(pc) => cmd_permissions(layout, pc),
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
+        Command::Remote(command) => crate::remote_cmds::cmd_remote(command),
         Command::Config(ConfigCommand::Show) => cmd_config_show(layout),
         Command::Models(ModelsCommand::List) => cmd_models_list(layout),
         Command::Models(ModelsCommand::Show { model }) => cmd_models_show(layout, &model).await,
