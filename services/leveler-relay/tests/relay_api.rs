@@ -5,8 +5,39 @@
 //! next request rather than whenever a token would have expired.
 
 use leveler_relay::{RelayState, build_router};
+use leveler_remote_protocol::SigningKey;
+use leveler_remote_protocol::auth::SessionAuthRequest;
 use serde_json::json;
 use tokio::sync::mpsc;
+
+const DEVICE_SEED: [u8; 32] = [70u8; 32];
+
+fn device_key() -> SigningKey {
+    SigningKey::from_seed(&DEVICE_SEED).unwrap()
+}
+
+fn now_stamp() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Sign the device assertion `/v1/auth/session` now requires. The nonce varies
+/// per call so a test can authenticate more than once.
+fn device_auth_body(device_id: &str, runtime_id: &str, nonce: &str) -> serde_json::Value {
+    let timestamp = now_stamp();
+    let input = SessionAuthRequest::signing_input(device_id, runtime_id, &timestamp, nonce);
+    json!({
+        "device_id": device_id,
+        "runtime_id": runtime_id,
+        "timestamp": timestamp,
+        "nonce": nonce,
+        "sig": b64(&device_key().sign_detached(input.as_bytes())),
+    })
+}
 
 /// Register a runtime as online the way the tunnel does, keeping the receiver
 /// alive so the route stays valid for the duration of the test.
@@ -41,7 +72,7 @@ async fn pair_device(
 ) -> String {
     let begin: serde_json::Value = client
         .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": runtime_id}))
+        .json(&json!({"runtime_id": runtime_id, "runtime_pubkey": device_key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap()
@@ -54,7 +85,7 @@ async fn pair_device(
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
             "device_id": device_id,
-            "device_pubkey": "cHVia2V5cHVia2V5cHVia2V5cHVia2V5cHVi",
+            "device_pubkey": device_key().verifying_key().to_base64url(),
             "device_name": "iPhone",
             "platform": "ios",
             "pairing_secret": secret,
@@ -81,7 +112,11 @@ async fn pair_device(
 
     let auth: serde_json::Value = client
         .post(format!("{base}/v1/auth/session"))
-        .json(&json!({"device_id": device_id, "runtime_id": runtime_id}))
+        .json(&device_auth_body(
+            device_id,
+            runtime_id,
+            &format!("n{}", line!()),
+        ))
         .send()
         .await
         .unwrap()
@@ -99,7 +134,7 @@ async fn a_device_cannot_activate_its_own_pairing() {
 
     let begin: serde_json::Value = client
         .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a"}))
+        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap()
@@ -111,7 +146,7 @@ async fn a_device_cannot_activate_its_own_pairing() {
     client
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
-            "device_id": "dev_a", "device_pubkey": "k", "device_name": "iPhone",
+            "device_id": "dev_a", "device_pubkey": device_key().verifying_key().to_base64url(), "device_name": "iPhone",
             "platform": "ios", "pairing_secret": secret, "scope": "interactive"
         }))
         .send()
@@ -122,7 +157,7 @@ async fn a_device_cannot_activate_its_own_pairing() {
     assert!(state.device("dev_a").is_none());
     let auth = client
         .post(format!("{base}/v1/auth/session"))
-        .json(&json!({"device_id": "dev_a", "runtime_id": "rt_a"}))
+        .json(&device_auth_body("dev_a", "rt_a", &format!("n{}", line!())))
         .send()
         .await
         .unwrap();
@@ -137,7 +172,7 @@ async fn a_wrong_pairing_secret_is_refused() {
     let client = reqwest::Client::new();
     client
         .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a"}))
+        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap();
@@ -145,7 +180,7 @@ async fn a_wrong_pairing_secret_is_refused() {
     let wrong = client
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
-            "device_id": "dev_a", "device_pubkey": "k", "device_name": "iPhone",
+            "device_id": "dev_a", "device_pubkey": device_key().verifying_key().to_base64url(), "device_name": "iPhone",
             "platform": "ios", "pairing_secret": "not-the-secret", "scope": "interactive"
         }))
         .send()
@@ -159,7 +194,7 @@ async fn a_wrong_pairing_secret_is_refused() {
     let absent = client
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
-            "device_id": "dev_b", "device_pubkey": "k", "device_name": "iPad",
+            "device_id": "dev_b", "device_pubkey": device_key().verifying_key().to_base64url(), "device_name": "iPad",
             "platform": "ios", "pairing_secret": "also-not-it", "scope": "interactive"
         }))
         .send()
@@ -316,7 +351,7 @@ async fn revoking_a_device_invalidates_its_tokens_at_once() {
     // And it cannot simply ask for a new one.
     let reauth = client
         .post(format!("{base}/v1/auth/session"))
-        .json(&json!({"device_id": "dev_a", "runtime_id": "rt_a"}))
+        .json(&device_auth_body("dev_a", "rt_a", &format!("n{}", line!())))
         .send()
         .await
         .unwrap();
@@ -347,7 +382,7 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
 
     let begin: serde_json::Value = client
         .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a"}))
+        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap()
@@ -358,7 +393,7 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
     let complete: serde_json::Value = client
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
-            "device_id": "dev_a", "device_pubkey": "k", "device_name": "iPhone",
+            "device_id": "dev_a", "device_pubkey": device_key().verifying_key().to_base64url(), "device_name": "iPhone",
             "platform": "ios", "pairing_secret": secret, "scope": "interactive"
         }))
         .send()
@@ -379,7 +414,7 @@ async fn a_replayed_refresh_token_costs_the_device_its_session() {
         .unwrap();
     let auth: serde_json::Value = client
         .post(format!("{base}/v1/auth/session"))
-        .json(&json!({"device_id": "dev_a", "runtime_id": "rt_a"}))
+        .json(&device_auth_body("dev_a", "rt_a", &format!("n{}", line!())))
         .send()
         .await
         .unwrap()
@@ -440,7 +475,7 @@ async fn beginning_a_second_pairing_retires_the_first_secret() {
 
     let first: serde_json::Value = client
         .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a"}))
+        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap()
@@ -451,7 +486,7 @@ async fn beginning_a_second_pairing_retires_the_first_secret() {
 
     client
         .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a"}))
+        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap();
@@ -459,7 +494,7 @@ async fn beginning_a_second_pairing_retires_the_first_secret() {
     let response = client
         .post(format!("{base}/v1/pair/complete"))
         .json(&json!({
-            "device_id": "dev_a", "device_pubkey": "k", "device_name": "iPhone",
+            "device_id": "dev_a", "device_pubkey": device_key().verifying_key().to_base64url(), "device_name": "iPhone",
             "platform": "ios", "pairing_secret": stale, "scope": "interactive"
         }))
         .send()
@@ -478,7 +513,7 @@ async fn the_pending_confirmation_exposes_the_device_public_key() {
 
     let begin: serde_json::Value = client
         .post(format!("{base}/v1/pair/begin"))
-        .json(&json!({"runtime_id": "rt_a"}))
+        .json(&json!({"runtime_id": "rt_a", "runtime_pubkey": device_key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap()
@@ -507,4 +542,99 @@ async fn the_pending_confirmation_exposes_the_device_public_key() {
         .unwrap();
     assert_eq!(pending["device_pubkey"], "the-real-key");
     assert_eq!(pending["device_id"], "dev_a");
+}
+
+/// A `device_id` is not a secret, so authenticating on the strength of one
+/// would let anyone who saw it mint tokens for that phone.
+#[tokio::test]
+async fn auth_requires_a_signature_from_the_paired_key() {
+    let (base, _state) = serve().await;
+    let client = reqwest::Client::new();
+    pair_device(&client, &base, "rt_a", "dev_a").await;
+
+    // The right shape, signed by the wrong key.
+    let impostor = SigningKey::from_seed(&[123u8; 32]).unwrap();
+    let timestamp = now_stamp();
+    let nonce = "n-impostor";
+    let input = SessionAuthRequest::signing_input("dev_a", "rt_a", &timestamp, nonce);
+    let response = client
+        .post(format!("{base}/v1/auth/session"))
+        .json(&json!({
+            "device_id": "dev_a", "runtime_id": "rt_a",
+            "timestamp": timestamp, "nonce": nonce,
+            "sig": b64(&impostor.sign_detached(input.as_bytes())),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+/// A captured assertion stays signature-valid for its whole window; spending the
+/// nonce is what stops it being replayed inside it.
+#[tokio::test]
+async fn an_auth_assertion_cannot_be_replayed() {
+    let (base, _state) = serve().await;
+    let client = reqwest::Client::new();
+    pair_device(&client, &base, "rt_a", "dev_a").await;
+
+    let body = device_auth_body("dev_a", "rt_a", "n-replay");
+    assert!(
+        client
+            .post(format!("{base}/v1/auth/session"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let replay = client
+        .post(format!("{base}/v1/auth/session"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        401,
+        "the same assertion must not work twice"
+    );
+}
+
+/// A runtime id is a name, not a credential. Binding the key on first use means
+/// a later claim signed by a different key is refused rather than treated as a
+/// rotation.
+#[tokio::test]
+async fn a_runtime_id_cannot_be_rebound_to_another_key() {
+    let (base, _state) = serve().await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("{base}/v1/pair/begin"))
+        .json(&json!({
+            "runtime_id": "rt_a",
+            "runtime_pubkey": device_key().verifying_key().to_base64url()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success());
+
+    let impostor = SigningKey::from_seed(&[124u8; 32]).unwrap();
+    let hijack = client
+        .post(format!("{base}/v1/pair/begin"))
+        .json(&json!({
+            "runtime_id": "rt_a",
+            "runtime_pubkey": impostor.verifying_key().to_base64url()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        hijack.status(),
+        401,
+        "claiming another machine's runtime id must be refused"
+    );
 }

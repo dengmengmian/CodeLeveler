@@ -17,8 +17,9 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use leveler_remote_protocol::VerifyingKey;
 use leveler_remote_protocol::auth::{
-    ACCESS_TOKEN_TTL_SECS, ProtocolVersionDto, SessionAuthResponse,
+    ACCESS_TOKEN_TTL_SECS, ProtocolVersionDto, SessionAuthRequest, SessionAuthResponse,
 };
 use leveler_remote_protocol::pairing::{
     PairCompleteRequest, PairDecision, PairingPending, PairingScope,
@@ -78,8 +79,37 @@ impl From<RelayError> for Failure {
     }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// Check a base64 Ed25519 signature over `message`.
+pub(crate) fn verify_signature(
+    key: &VerifyingKey,
+    message: &[u8],
+    sig_b64: &str,
+) -> Result<(), RelayError> {
+    use base64::Engine as _;
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .map_err(|_| RelayError::Unauthorized)?;
+    if leveler_remote_protocol::verify_detached(key, message, &signature) {
+        Ok(())
+    } else {
+        Err(RelayError::Unauthorized)
+    }
+}
+
+/// Reject a timestamp outside the envelope's window, so a signature cannot be
+/// presented indefinitely.
+pub(crate) fn within_window(timestamp: &str) -> Result<(), RelayError> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        .map_err(|_| RelayError::Unauthorized)?;
+    let skew = (chrono::Utc::now().timestamp() - parsed.and_utc().timestamp()).abs();
+    if skew > leveler_remote_protocol::TIMESTAMP_WINDOW_SECS {
+        return Err(RelayError::Unauthorized);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- pairing
@@ -87,6 +117,9 @@ fn now() -> i64 {
 #[derive(Debug, Deserialize)]
 struct PairBeginRequest {
     runtime_id: String,
+    /// Bound on first use. Everything the runtime later signs is checked
+    /// against this, so a name alone never grants control of an id.
+    runtime_pubkey: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +134,7 @@ async fn pair_begin(
     State(state): State<RelayState>,
     Json(request): Json<PairBeginRequest>,
 ) -> Result<Json<PairBeginResponse>, Failure> {
+    state.bind_runtime_key(&request.runtime_id, &request.runtime_pubkey)?;
     let (pairing_id, pairing_secret) = state.begin_pairing(&request.runtime_id, now())?;
     Ok(Json(PairBeginResponse {
         pairing_id,
@@ -120,6 +154,9 @@ async fn pair_complete(
     State(state): State<RelayState>,
     Json(request): Json<PairCompleteRequest>,
 ) -> Result<Json<PairCompleteResponse>, Failure> {
+    // Guessing a 128-bit secret is hopeless, but metering it keeps a flood from
+    // becoming a denial of service against the real pairing.
+    state.rate_limit("pair_complete", 10, 60, now())?;
     let pairing = state.claim_pairing(
         &request.pairing_secret,
         ClaimedBy {
@@ -226,20 +263,38 @@ async fn revoke_device(
 
 // ---------------------------------------------------------------- auth
 
-#[derive(Debug, Deserialize)]
-struct SessionAuthBody {
-    device_id: String,
-    runtime_id: String,
-}
-
 /// Issue routing tokens.
 ///
-/// The design has the device sign an assertion here; this MVP checks the pairing
-/// record only, which is noted as a gap rather than presented as complete.
+/// The device proves it holds the paired private key. Checking only the pairing
+/// record would let anyone who learned a `device_id` — which is not a secret —
+/// mint tokens for that phone.
 async fn auth_session(
     State(state): State<RelayState>,
-    Json(request): Json<SessionAuthBody>,
+    Json(request): Json<SessionAuthRequest>,
 ) -> Result<Json<SessionAuthResponse>, Failure> {
+    state.rate_limit("auth_session", 20, 60, now())?;
+
+    let device = state
+        .device(&request.device_id)
+        .ok_or(RelayError::Unauthorized)?;
+    if device.revoked {
+        return Err(Failure(RelayError::Revoked));
+    }
+
+    let key = VerifyingKey::from_base64url(&device.device_pubkey)
+        .map_err(|_| RelayError::Unauthorized)?;
+    let assertion = SessionAuthRequest::signing_input(
+        &request.device_id,
+        &request.runtime_id,
+        &request.timestamp,
+        &request.nonce,
+    );
+    verify_signature(&key, assertion.as_bytes(), &request.sig)?;
+    within_window(&request.timestamp)?;
+    // One assertion, one use: the signature stays valid for its whole window
+    // otherwise, and a captured request could be replayed inside it.
+    state.spend_nonce(&request.device_id, &request.nonce, now())?;
+
     let (access_token, refresh_token, scope) =
         state.issue_tokens(&request.device_id, &request.runtime_id, now())?;
     Ok(Json(SessionAuthResponse {

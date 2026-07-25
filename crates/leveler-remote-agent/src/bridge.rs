@@ -204,6 +204,13 @@ impl<R: LocalRuntimeService> AgentBridge<R> {
             .map_err(|error| AdmissionError::Runtime(error.to_string()))
     }
 
+    /// Sign a bare assertion with the runtime key, for the relay registration
+    /// handshake. Returns standard base64.
+    pub fn sign_assertion(&self, message: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(self.runtime_key.sign_detached(message))
+    }
+
     /// Sign an outbound frame with the runtime key.
     ///
     /// Exposed so the tunnel can sign session downstream frames without holding

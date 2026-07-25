@@ -19,7 +19,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use leveler_remote_protocol::SignedEnvelope;
-use leveler_remote_protocol::auth::ProtocolVersionDto;
+use leveler_remote_protocol::auth::{AgentRegisterAssertion, ProtocolVersionDto};
 use leveler_remote_protocol::tunnel::{AgentToRelay, RelayToAgent};
 
 use crate::state::RelayState;
@@ -29,20 +29,32 @@ pub(crate) struct TunnelQuery {
     runtime_id: String,
     #[serde(default)]
     display_name: Option<String>,
+    /// Signed over `{runtime_id}|{timestamp}` with the runtime key bound at
+    /// `pair/begin`.
+    timestamp: String,
+    sig: String,
 }
 
 /// The agent's outbound control channel.
 ///
-/// Authentication here is by `runtime_id` only, which is a known MVP gap: the
-/// design has the agent present a signed `register` assertion. It is recorded in
-/// the PR notes rather than papered over, because an unauthenticated register
-/// lets anyone claim a runtime id and receive its streams.
+/// The agent proves it owns the runtime id it claims. Without this a
+/// `runtime_id` would be a bare name, and anyone able to reach the relay could
+/// register as someone else's machine and be handed their devices' streams.
 pub(crate) async fn agent_tunnel(
     State(state): State<RelayState>,
     Query(query): Query<TunnelQuery>,
     upgrade: WebSocketUpgrade,
-) -> Response {
-    upgrade.on_upgrade(move |socket| serve_agent(state, query, socket))
+) -> Result<Response, crate::routes::Failure> {
+    let pubkey = state
+        .runtime_key(&query.runtime_id)
+        .ok_or(crate::state::RelayError::Unauthorized)?;
+    let key = leveler_remote_protocol::VerifyingKey::from_base64url(&pubkey)
+        .map_err(|_| crate::state::RelayError::Unauthorized)?;
+    let assertion = AgentRegisterAssertion::signing_input(&query.runtime_id, &query.timestamp);
+    crate::routes::verify_signature(&key, assertion.as_bytes(), &query.sig)?;
+    crate::routes::within_window(&query.timestamp)?;
+
+    Ok(upgrade.on_upgrade(move |socket| serve_agent(state, query, socket)))
 }
 
 async fn serve_agent(state: RelayState, query: TunnelQuery, socket: WebSocket) {

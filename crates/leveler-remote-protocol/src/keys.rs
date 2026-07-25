@@ -30,6 +30,11 @@ impl SigningKey {
         Ok(Self { pair })
     }
 
+    /// Sign arbitrary bytes, for assertions that travel outside an envelope.
+    pub fn sign_detached(&self, message: &[u8]) -> Vec<u8> {
+        self.sign_bytes(message)
+    }
+
     pub(crate) fn sign_bytes(&self, message: &[u8]) -> Vec<u8> {
         self.pair.sign(message).as_ref().to_vec()
     }
@@ -94,6 +99,14 @@ impl VerifyingKey {
             .map(|chunk| std::str::from_utf8(chunk).expect("hex is ascii"))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// Verify a detached signature over arbitrary bytes.
+    ///
+    /// Used for the pairing and registration assertions, which are signed
+    /// directly rather than wrapped in a [`crate::SignedEnvelope`].
+    pub fn verify_detached(&self, message: &[u8], signature: &[u8]) -> bool {
+        self.verify_bytes(message, signature)
     }
 
     pub(crate) fn verify_bytes(&self, message: &[u8], signature: &[u8]) -> bool {

@@ -92,6 +92,8 @@ pub enum RelayError {
     ReuseDetected,
     #[error("runtime is offline")]
     RuntimeOffline,
+    #[error("too many attempts")]
+    RateLimited,
 }
 
 impl RelayError {
@@ -105,6 +107,7 @@ impl RelayError {
             RelayError::Revoked => "revoked",
             RelayError::ReuseDetected => "reuse_detected",
             RelayError::RuntimeOffline => "runtime_offline",
+            RelayError::RateLimited => "rate_limited",
         }
     }
 
@@ -118,6 +121,7 @@ impl RelayError {
                 StatusCode::UNAUTHORIZED
             }
             RelayError::RuntimeOffline => StatusCode::SERVICE_UNAVAILABLE,
+            RelayError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }
@@ -140,6 +144,13 @@ struct Inner {
     online: HashMap<String, RuntimeOnline>,
     /// Live APP session streams, keyed by stream id.
     streams: HashMap<String, StreamRoute>,
+    /// Runtime public keys, learned on first use and fixed thereafter.
+    runtime_keys: HashMap<String, String>,
+    /// `(device_id, nonce)` already spent, with when — so a captured auth
+    /// assertion cannot be replayed inside its own validity window.
+    spent_nonces: HashMap<(String, String), i64>,
+    /// Recent attempts per bucket, for rate limiting.
+    attempts: HashMap<String, Vec<i64>>,
     counter: u64,
 }
 
@@ -180,6 +191,73 @@ pub struct RelayState {
 impl RelayState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a runtime's public key, or check it against what was recorded.
+    ///
+    /// Trust-on-first-use, mirroring what the agent does for devices: the first
+    /// registration for an id fixes the key, and a later mismatch is refused
+    /// rather than accepted as a rotation. Rotating means re-provisioning the
+    /// relay, which is deliberate — silent key changes are the attack.
+    pub fn bind_runtime_key(&self, runtime_id: &str, pubkey: &str) -> Result<(), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.runtime_keys.get(runtime_id) {
+            Some(existing) if existing == pubkey => Ok(()),
+            Some(_) => Err(RelayError::Unauthorized),
+            None => {
+                inner
+                    .runtime_keys
+                    .insert(runtime_id.to_string(), pubkey.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    pub fn runtime_key(&self, runtime_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .runtime_keys
+            .get(runtime_id)
+            .cloned()
+    }
+
+    /// Spend a `(device_id, nonce)` pair once.
+    ///
+    /// A signed assertion is only good for one use; without this the signature
+    /// would remain valid — and replayable — for its whole timestamp window.
+    pub fn spend_nonce(&self, device_id: &str, nonce: &str, now: i64) -> Result<(), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Forget entries that can no longer be inside anyone's window, so the
+        // map does not grow without bound.
+        inner.spent_nonces.retain(|_, at| now - *at < 600);
+        let key = (device_id.to_string(), nonce.to_string());
+        if inner.spent_nonces.contains_key(&key) {
+            return Err(RelayError::Unauthorized);
+        }
+        inner.spent_nonces.insert(key, now);
+        Ok(())
+    }
+
+    /// Allow at most `limit` attempts per `window_secs` for a bucket.
+    ///
+    /// Pairing secrets and auth assertions are the two things worth guessing, so
+    /// both endpoints are metered.
+    pub fn rate_limit(
+        &self,
+        bucket: &str,
+        limit: usize,
+        window_secs: i64,
+        now: i64,
+    ) -> Result<(), RelayError> {
+        let mut inner = self.inner.lock().unwrap();
+        let seen = inner.attempts.entry(bucket.to_string()).or_default();
+        seen.retain(|at| now - *at < window_secs);
+        if seen.len() >= limit {
+            return Err(RelayError::RateLimited);
+        }
+        seen.push(now);
+        Ok(())
     }
 
     /// Begin a pairing, returning the secret exactly once.

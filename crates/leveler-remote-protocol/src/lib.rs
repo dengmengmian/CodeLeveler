@@ -36,3 +36,9 @@ pub use envelope::{
     TIMESTAMP_WINDOW_SECS, VerifyParams, id_is_valid,
 };
 pub use keys::{SigningKey, VerifyingKey};
+
+/// Verify a detached signature over `message`. See
+/// [`VerifyingKey::verify_detached`].
+pub fn verify_detached(key: &VerifyingKey, message: &[u8], signature: &[u8]) -> bool {
+    key.verify_detached(message, signature)
+}

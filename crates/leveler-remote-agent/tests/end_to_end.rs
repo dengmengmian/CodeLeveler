@@ -29,8 +29,11 @@ const DEVICE_SEED: [u8; 32] = [61u8; 32];
 const RUNTIME_SEED: [u8; 32] = [62u8; 32];
 const RUNTIME_ID: &str = "rt_host";
 const DEVICE_ID: &str = "dev_phone";
-/// Pinned so signatures are deterministic and inside the verifier's window.
-const AT: &str = "2026-07-25T12:00:00Z";
+/// The agent stamps its own frames with the real clock, because the relay
+/// checks registration freshness against it.
+fn now_stamp() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -111,7 +114,7 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
     let http = format!("http://{base}");
     let begin: serde_json::Value = client
         .post(format!("{http}/v1/pair/begin"))
-        .json(&json!({"runtime_id": RUNTIME_ID}))
+        .json(&json!({"runtime_id": RUNTIME_ID, "runtime_pubkey": SigningKey::from_seed(&RUNTIME_SEED).unwrap().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap()
@@ -144,9 +147,20 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
         .send()
         .await
         .unwrap();
+    let timestamp = now_stamp();
+    let nonce = format!("n-{}", timestamp);
+    let input = leveler_remote_protocol::auth::SessionAuthRequest::signing_input(
+        DEVICE_ID, RUNTIME_ID, &timestamp, &nonce,
+    );
+    use base64::Engine as _;
+    let sig = base64::engine::general_purpose::STANDARD
+        .encode(device_key.sign_detached(input.as_bytes()));
     let auth: serde_json::Value = client
         .post(format!("{http}/v1/auth/session"))
-        .json(&json!({"device_id": DEVICE_ID, "runtime_id": RUNTIME_ID}))
+        .json(&json!({
+            "device_id": DEVICE_ID, "runtime_id": RUNTIME_ID,
+            "timestamp": timestamp, "nonce": nonce, "sig": sig,
+        }))
         .send()
         .await
         .unwrap()
@@ -161,7 +175,13 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
     let public_runtime_key = runtime_key.verifying_key();
     let mut devices = TrustedDevices::load(dir.path().join("remote/devices.json")).unwrap();
     devices
-        .accept(DEVICE_ID, &device_key.verifying_key(), "iPhone", scope, AT)
+        .accept(
+            DEVICE_ID,
+            &device_key.verifying_key(),
+            "iPhone",
+            scope,
+            &now_stamp(),
+        )
         .unwrap();
 
     let runtime = FakeRuntime {
@@ -178,7 +198,7 @@ async fn build_chain(dir: &tempfile::TempDir, scope: PairingScope) -> Chain {
 
     let ws_base = format!("ws://{base}");
     tokio::spawn(async move {
-        let _ = run_tunnel(&ws_base, RUNTIME_ID, "dev-box", bridge, || AT.to_string()).await;
+        let _ = run_tunnel(&ws_base, RUNTIME_ID, "dev-box", bridge, now_stamp).await;
     });
 
     // Wait for the tunnel to register before a device tries to connect.
@@ -231,7 +251,7 @@ async fn send_command(app: &mut Socket, command: &ClientCommand) {
         RUNTIME_ID,
         "str_app",
         1,
-        AT,
+        &now_stamp(),
         ContentType::SessionUpstream,
         body.as_bytes(),
     )
@@ -258,7 +278,7 @@ async fn recv_verified(app: &mut Socket, chain: &Chain) -> serde_json::Value {
         .verify(&VerifyParams {
             expected_recipient_id: DEVICE_ID,
             public_key: &chain.runtime_key,
-            now: AT,
+            now: &now_stamp(),
         })
         .expect("the runtime's signature must verify on the device");
     serde_json::from_slice(&payload).unwrap()
@@ -347,7 +367,7 @@ async fn a_relay_fabricated_frame_is_refused_by_the_agent() {
         RUNTIME_ID,
         "str_app",
         1,
-        AT,
+        &now_stamp(),
         ContentType::SessionUpstream,
         body.as_bytes(),
     )
@@ -379,7 +399,7 @@ async fn a_snapshot_request_returns_signed_session_state() {
         RUNTIME_ID,
         "str_app",
         1,
-        AT,
+        &now_stamp(),
         ContentType::SessionUpstream,
         body.as_bytes(),
     )

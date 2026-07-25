@@ -75,6 +75,21 @@ impl SessionAuthRequest {
     }
 }
 
+/// What an agent signs to prove it owns the runtime id it is claiming.
+///
+/// Without this, a relay's `runtime_id` is a bare name and anyone who can reach
+/// the relay could register as someone else's machine and be handed their
+/// devices' streams.
+pub struct AgentRegisterAssertion;
+
+impl AgentRegisterAssertion {
+    /// `{runtime_id}|{timestamp}` — the same `|`-joined shape and id rules as
+    /// the envelope's canonical string, so one set of constraints covers both.
+    pub fn signing_input(runtime_id: &str, timestamp: &str) -> String {
+        format!("{runtime_id}|{timestamp}")
+    }
+}
+
 /// The protocol version a peer speaks, mirrored from the client protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersionDto {

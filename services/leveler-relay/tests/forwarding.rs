@@ -9,8 +9,39 @@
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use leveler_relay::{RelayState, build_router};
+use leveler_remote_protocol::SigningKey;
+use leveler_remote_protocol::auth::{AgentRegisterAssertion, SessionAuthRequest};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
+
+const KEY_SEED: [u8; 32] = [70u8; 32];
+
+/// One key stands in for both the device and the runtime here: the relay only
+/// checks signatures, and these tests are about routing, not identity.
+fn key() -> SigningKey {
+    SigningKey::from_seed(&KEY_SEED).unwrap()
+}
+
+fn now_stamp() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn urlencode(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '+' => "%2B".to_string(),
+            '/' => "%2F".to_string(),
+            '=' => "%3D".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -31,7 +62,7 @@ async fn pair_device(base: &str, runtime_id: &str, device_id: &str) -> String {
     let http = format!("http://{base}");
     let begin: serde_json::Value = client
         .post(format!("{http}/v1/pair/begin"))
-        .json(&json!({"runtime_id": runtime_id}))
+        .json(&json!({"runtime_id": runtime_id, "runtime_pubkey": key().verifying_key().to_base64url()}))
         .send()
         .await
         .unwrap()
@@ -41,7 +72,7 @@ async fn pair_device(base: &str, runtime_id: &str, device_id: &str) -> String {
     let complete: serde_json::Value = client
         .post(format!("{http}/v1/pair/complete"))
         .json(&json!({
-            "device_id": device_id, "device_pubkey": "k", "device_name": "iPhone",
+            "device_id": device_id, "device_pubkey": key().verifying_key().to_base64url(), "device_name": "iPhone",
             "platform": "ios",
             "pairing_secret": begin["pairing_secret"].as_str().unwrap(),
             "scope": "interactive"
@@ -62,9 +93,16 @@ async fn pair_device(base: &str, runtime_id: &str, device_id: &str) -> String {
         .send()
         .await
         .unwrap();
+    let timestamp = now_stamp();
+    let nonce = format!("n-{device_id}-{runtime_id}");
+    let input = SessionAuthRequest::signing_input(device_id, runtime_id, &timestamp, &nonce);
     let auth: serde_json::Value = client
         .post(format!("{http}/v1/auth/session"))
-        .json(&json!({"device_id": device_id, "runtime_id": runtime_id}))
+        .json(&json!({
+            "device_id": device_id, "runtime_id": runtime_id,
+            "timestamp": timestamp, "nonce": nonce,
+            "sig": b64(&key().sign_detached(input.as_bytes())),
+        }))
         .send()
         .await
         .unwrap()
@@ -76,7 +114,12 @@ async fn pair_device(base: &str, runtime_id: &str, device_id: &str) -> String {
 
 /// Connect as an agent and wait for the registration ack.
 async fn connect_agent(base: &str, runtime_id: &str) -> Socket {
-    let url = format!("ws://{base}/v1/agent/tunnel?runtime_id={runtime_id}&display_name=dev-box");
+    let timestamp = now_stamp();
+    let assertion = AgentRegisterAssertion::signing_input(runtime_id, &timestamp);
+    let sig = urlencode(&b64(&key().sign_detached(assertion.as_bytes())));
+    let url = format!(
+        "ws://{base}/v1/agent/tunnel?runtime_id={runtime_id}&display_name=dev-box&timestamp={timestamp}&sig={sig}"
+    );
     let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let ack = next_json(&mut socket).await;
     assert_eq!(ack["type"], "register_ack");

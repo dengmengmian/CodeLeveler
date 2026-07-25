@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use leveler_local_transport::LocalRuntimeService;
+use leveler_remote_protocol::auth::AgentRegisterAssertion;
 use leveler_remote_protocol::tunnel::{AgentToRelay, RelayToAgent, RoutingError};
 use leveler_remote_protocol::{ContentType, SignedEnvelope};
 use tokio::sync::mpsc;
@@ -53,8 +54,15 @@ where
     R: LocalRuntimeService + Send + Sync + 'static,
     F: Fn() -> String + Send + Sync + 'static,
 {
+    // Prove ownership of the runtime id. A relay that accepted the name alone
+    // would hand this machine's streams to whoever asked for them first.
+    let timestamp = now();
+    let assertion = AgentRegisterAssertion::signing_input(runtime_id, &timestamp);
+    let sig = bridge.sign_assertion(assertion.as_bytes());
     let url = format!(
-        "{relay_ws_url}/v1/agent/tunnel?runtime_id={runtime_id}&display_name={display_name}"
+        "{relay_ws_url}/v1/agent/tunnel?runtime_id={runtime_id}&display_name={display_name}\
+         &timestamp={timestamp}&sig={}",
+        urlencode(&sig)
     );
     let (socket, _) = tokio_tungstenite::connect_async(url)
         .await
@@ -213,6 +221,19 @@ async fn handle<R, F>(
         | RelayToAgent::PairingPending { .. }
         | RelayToAgent::HeartbeatAck { .. } => {}
     }
+}
+
+/// Percent-encode the few characters standard base64 contributes to a query.
+fn urlencode(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '+' => "%2B".to_string(),
+            '/' => "%2F".to_string(),
+            '=' => "%3D".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
 }
 
 fn session_json(value: &serde_json::Value) -> String {

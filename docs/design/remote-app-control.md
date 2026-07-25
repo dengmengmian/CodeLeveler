@@ -1313,7 +1313,11 @@ pub enum ClientOrigin {
   - **RPC 响应按签名内的 stream_id 路由** ✅ 保持响应与请求的绑定。
 - **这一步抓到一个真实缺陷：** 撤销原本**没有**关闭在途流（我先前那段代码因 `cargo fmt` 改过缩进而未被应用）。测试红了才发现——正是"已撤销但仍在投递"这一威胁。已修。
 - **未完成：** `project_id`（待 PR5b）。`/leveler-sessions` REST 在「已鉴权且 host 在线」时仍返回 **501**（RPC 代理未接），而不是假装 503——把在线的 host 误报为不可达会掩盖真实状态。
-- **MVP 缺口（已在代码注释标明）：** `/v1/auth/session` 目前只校验配对记录，**未校验 device 签名断言**；`/pair/*` 与 `/auth/*` **未做速率限制**。两项都是设计要求的，须在 PR10 security gate 前补。
+- **三个 MVP 安全缺口已补齐（追加 3 条负例，relay 共 20 绿）：**
+  - **agent 注册验签**：`/v1/agent/tunnel` 现要求 runtime 签名断言（`{runtime_id}|{timestamp}`）。此前 `runtime_id` 只是个名字，任何能连到 relay 的人都能冒充某台机器并接管它的流。runtime 公钥在首次 `pair/begin` 时**绑定（TOFU）**，之后换钥被拒而非当作轮换——静默换钥正是攻击本身。
+  - **`/v1/auth/session` 验设备断言**：签名覆盖 `device_id|runtime_id|timestamp|nonce`，并**消费 nonce**（同一断言不能用第二次）。`device_id` 不是秘密，只凭它签发 token 等于谁看到都能冒充。
+  - **速率限制**：`pair/complete` 10 次/分，`auth/session` 20 次/分。
+  - 负例：错密钥签名 401 ✅ / 同一断言重放 401 ✅ / 用另一把密钥抢占已绑定的 `runtime_id` 401 ✅
 
 ### PR7 — CLI `leveler remote` ⚠️ 部分完成（不依赖 relay 的子命令已可用）
 
