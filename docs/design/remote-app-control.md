@@ -1227,12 +1227,17 @@ pub enum ClientOrigin {
 - **实测：** 走 schemars feature 路线（**非** build 脚本）。`schema` feature 级联至 `leveler-core`（id 新类型，宏内一处条件派生覆盖全部 12 个）与 `leveler-model`（`ModelRef`），三者均 **optional + 默认关**，发行二进制不受影响；schemars 本就是 workspace 既有依赖（`leveler-tools` 在用），**未引入任何新外部依赖**。产物入库 `schemas/{client_command,runtime_event,ui_session_snapshot}.schema.json`，`ClientCommand` 生成 **31 个变体**，与本文穷尽 allowlist 表逐一吻合（互为反向印证）。**CI 无需改动**：现有 `cargo test --workspace --all-features --locked` 已覆盖该 feature，drift 测试自动生效。**牙口已验**：临时加一个变体 → 仅 `client_command` 一条转红并给出重生成命令，另两条保持绿（精准而非一锅端），随后还原。
 - **未做（留待需要时）：** 未加「schema 校验真实 serde 输出」的自动化测试。已手工核对 `SessionId` 等 newtype 正确降为 `type: string`、无退化定义、`type` 判别式使 `oneOf` 唯一命中；但这是一次性人工核对，**不是**回归防护。
 
-### PR2 — `leveler-remote-protocol` + agent tunnel / auth DTO golden
+### PR2 — `leveler-remote-protocol` + agent tunnel / auth DTO golden ✅ 已完成
 
 - **Title:** `add leveler-remote-protocol (pair, auth, agent tunnel frames)`
 - **Affects:** 新 crate、serde golden
 - **Deps:** 无
 - **DoD:** tunnel 帧与 token claims 有类型与 fixture；**SignedEnvelope 规范化（含 `recipient_id` 与 id charset 校验）+ golden 正例与负例（错 recipient / 非法 id / 伪造签名）**；**不**重定义 CreateSessionRequest
+- **实测：** 29 测试绿。签名用 **`ring`**（Ed25519 + SHA-256）——它已随 rustls 链接进二进制，`cargo deny check` 通过且 **Cargo.lock 新增包只有本 crate 自己**，零新增外部依赖。canonical string 与本文示例逐字节一致。**不重定义业务类型**：`RpcRequestPayload.body` 保持 `serde_json::Value`，`CreateSessionRequest` / `SessionBootstrap` 仍归 local-transport 与 client-protocol。
+- **golden 向量** `testdata/signed_envelope.golden.json`：1 正 + **5 负**，且由 `every_golden_case_behaves_as_documented` 真实回放校验（文件声称的判定即实际判定，不是手写注释）。
+- **rev.6 三条修订已落地并各有负例：** `recipient_id` 进 canonical string；id charset `^[A-Za-z0-9_.:-]{1,64}$` 在签名/验签前拦截；时钟窗单一 ±120s。
+- **写 fixture 时发现并修正的实质问题：** 原本把「原样转发到另一 host」与「中继改写 recipient 以迁就目标」当成一条向量。二者判定不同（`recipient_mismatch` vs `signature_invalid`），且**只有后者**能证明 `recipient_id` 确实在签名输入内——已拆为两条独立向量。
+- **未做：** 本 crate 只提供纯函数式验签，**不含** seq 重放窗口的有状态跟踪与 `(device_id, nonce)` 去重（属 PR5 agent / PR6 relay 的运行期状态）。`stream_id` 与 `seq` 已在签名覆盖内，是那层的前提而非替代。
 
 ### PR3 — 穷尽 remote policy（TDD）
 
@@ -1362,7 +1367,7 @@ pub enum ClientOrigin {
 | --- | --- | --- | --- |
 | `leveler-session-wire` | crate | 是 | ✅ PR0 已落地 |
 | `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
-| `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | 未开始（PR2） |
+| `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
 | `leveler-remote-agent` + ProjectRouter | binary | 是 | 未开始（PR5/5b） |
 | `leveler-relay` self-host | docker | 是 | 未开始（PR6） |
 | `leveler remote` CLI | CLI | 是 | 未开始（PR7） |

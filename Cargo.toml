@@ -23,6 +23,7 @@ members = [
     "crates/leveler-app",
     "crates/leveler-client-protocol",
     "crates/leveler-session-wire",
+    "crates/leveler-remote-protocol",
     "crates/leveler-local-transport",
     "crates/leveler-media",
     "crates/leveler-tui",
@@ -63,6 +64,7 @@ leveler-engine = { version = "0.1.4", path = "crates/leveler-engine" }
 leveler-app = { version = "0.1.4", path = "crates/leveler-app" }
 leveler-client-protocol = { version = "0.1.4", path = "crates/leveler-client-protocol" }
 leveler-session-wire = { version = "0.1.4", path = "crates/leveler-session-wire" }
+leveler-remote-protocol = { version = "0.1.4", path = "crates/leveler-remote-protocol" }
 leveler-local-transport = { version = "0.1.4", path = "crates/leveler-local-transport" }
 leveler-media = { version = "0.1.4", path = "crates/leveler-media" }
 leveler-tui = { version = "0.1.4", path = "crates/leveler-tui" }
@@ -141,6 +143,10 @@ syntect = { version = "5", default-features = false, features = [
 # JSON Schema
 schemars = "0.8"
 jsonschema = "0.26"
+
+# Cryptography (Ed25519 signing, SHA-256). Already linked via rustls; kept
+# central so the remote agent and relay cannot drift to another version.
+ring = "0.17"
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }

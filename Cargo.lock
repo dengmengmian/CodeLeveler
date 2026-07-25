@@ -2112,6 +2112,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "leveler-remote-protocol"
+version = "0.1.4"
+dependencies = [
+ "base64",
+ "chrono",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "leveler-session-wire"
 version = "0.1.4"
 dependencies = [
