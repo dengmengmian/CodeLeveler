@@ -1,0 +1,131 @@
+{
+  "expected": {
+    "needs_resync_after_turn": false,
+    "pending_approvals_after_snapshot": [
+      "a_pending"
+    ],
+    "transcript_after_snapshot": [
+      {
+        "role": "user",
+        "text": "第一句"
+      },
+      {
+        "role": "assistant",
+        "text": "第一句的回答"
+      }
+    ],
+    "transcript_after_turn": [
+      {
+        "role": "user",
+        "text": "第一句"
+      },
+      {
+        "role": "assistant",
+        "text": "第一句的回答"
+      },
+      {
+        "role": "user",
+        "text": "1+1 等于几"
+      },
+      {
+        "role": "assistant",
+        "text": "等于 2"
+      }
+    ]
+  },
+  "note": "One session as the runtime really emits it. Replayed by apps/leveler-mobile/test/transcript_golden_test.dart; a client that mis-reads a field fails there instead of showing a user an empty bubble.",
+  "snapshot": {
+    "active_tools": [],
+    "available_models": [],
+    "branch": "main",
+    "checkpoints": [],
+    "completion_report": null,
+    "diff": null,
+    "goal": "修一个 bug",
+    "id": "s_golden",
+    "last_sequence": null,
+    "messages": [
+      {
+        "id": "m_user_1",
+        "role": "user",
+        "text": "第一句"
+      },
+      {
+        "id": "m_assistant_1",
+        "role": "assistant",
+        "text": "第一句的回答"
+      }
+    ],
+    "mode": "request_approval",
+    "model": null,
+    "pending_interactions": [
+      {
+        "request": {
+          "command": "rm -rf build",
+          "id": "a_pending",
+          "risks": [
+            "会删除文件"
+          ],
+          "summary": "删除 build 目录",
+          "tool": "run_command"
+        },
+        "type": "approval"
+      }
+    ],
+    "plan": null,
+    "repository": "/repo",
+    "status": "idle",
+    "verification": null,
+    "vision": false
+  },
+  "turn": [
+    {
+      "message": {
+        "id": "m_user_2",
+        "role": "user",
+        "text": "1+1 等于几"
+      },
+      "type": "user_message_added"
+    },
+    {
+      "label": "思考中",
+      "type": "agent_activity"
+    },
+    {
+      "message_id": "m_assistant_2",
+      "type": "assistant_message_started"
+    },
+    {
+      "delta": "等于 ",
+      "message_id": "m_assistant_2",
+      "type": "assistant_text_delta"
+    },
+    {
+      "delta": "（模型的推理，不该出现在对话里）",
+      "type": "reasoning_delta"
+    },
+    {
+      "cached_input_tokens": 0,
+      "input_tokens": 12,
+      "output_tokens": 3,
+      "type": "token_usage"
+    },
+    {
+      "delta": "2",
+      "message_id": "m_assistant_2",
+      "type": "assistant_text_delta"
+    },
+    {
+      "message_id": "m_assistant_2",
+      "type": "assistant_message_completed"
+    },
+    {
+      "level": "info",
+      "message": "顺带一提",
+      "type": "notification"
+    },
+    {
+      "type": "turn_completed"
+    }
+  ]
+}

@@ -28,7 +28,7 @@ void main() {
       state.applySnapshot({
         'status': 'idle',
         'messages': [
-          {'id': 'm1', 'role': 'assistant', 'content': '完整的一句'},
+          {'id': 'm1', 'role': 'assistant', 'text': '完整的一句'},
         ],
         'pending_interactions': const [],
       });
@@ -61,13 +61,28 @@ void main() {
       expect(state.approvals, isEmpty);
     });
 
-    test('an unknown event is counted and forces a resync, never rendered', () {
+    test('an unknown event is counted, never rendered, and does not force a resync', () {
       final state = SessionState('s1');
       state.applyEvent({'type': 'something_this_build_never_heard_of', 'payload': 1});
 
       expect(state.transcript, isEmpty, reason: 'nothing unreadable may appear as content');
       expect(state.unknownEvents['something_this_build_never_heard_of'], 1);
-      expect(state.needsResync, isTrue, reason: 'it may have changed state we do show');
+      // This assertion used to demand the opposite, and the opposite is what
+      // shipped: an ordinary turn carries kinds this build has no use for, and
+      // asking for a snapshot after each of them left the phone permanently
+      // showing "resynchronising". Staleness now comes only from a lagged
+      // subscription or an explicit resync_required.
+      expect(state.needsResync, isFalse);
+    });
+
+    test('a kind we know but do not render is not counted as unknown', () {
+      final state = SessionState('s1');
+      state.applyEvent({'type': 'token_usage', 'input_tokens': 1, 'output_tokens': 2});
+      state.applyEvent({'type': 'reasoning_delta', 'delta': '想一想'});
+
+      expect(state.unknownEvents, isEmpty,
+          reason: '"chose not to show" and "never heard of" are different states');
+      expect(state.transcript, isEmpty);
     });
 
     test('a delta for a message we never saw start is kept but marked suspect', () {

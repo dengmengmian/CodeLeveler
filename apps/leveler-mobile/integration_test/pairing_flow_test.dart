@@ -26,6 +26,13 @@ const String pairingPayload = String.fromEnvironment('PAIRING_PAYLOAD');
 /// the same machine rather than merely showing *a* fingerprint.
 const String expectedHostFingerprint = String.fromEnvironment('HOST_FINGERPRINT');
 
+/// Keep the pairing in the platform keystore instead of throwing it away.
+///
+/// Off by default: a test that reused the keychain would pass on its second run
+/// for the wrong reason — because the device was already paired. Turned on when
+/// the point is to leave a paired app behind to poke at by hand.
+const bool persistPairing = bool.fromEnvironment('PERSIST_PAIRING');
+
 /// Everything the screen is currently showing, so a failed expectation says
 /// what the app did instead of only what it did not do.
 String _visibleText(WidgetTester tester) => tester
@@ -80,10 +87,14 @@ void main() {
     expect(pairingPayload, isNotEmpty,
         reason: 'run this through scripts/simulator_pairing.sh');
 
-    // An in-memory vault: the device key path is exercised by launching the app
-    // normally, and a test that reused the keychain would pass on the second
-    // run for the wrong reason — because it was already paired.
-    final controller = AppController(vault: Vault(MemorySecretStore()));
+    final controller = AppController(
+      vault: Vault(persistPairing ? KeystoreSecretStore() : MemorySecretStore()),
+    );
+    if (persistPairing) {
+      // Start from nothing, so this is a real pairing rather than a leftover.
+      await controller.restore();
+      await controller.unpair();
+    }
     await tester.pumpWidget(LevelerApp(controller: controller));
     await tester.pumpAndSettle();
 
@@ -135,5 +146,23 @@ void main() {
     expect(find.text('项目'), findsOneWidget);
     expect(controller.connection, isNot(LinkState.untrusted),
         reason: 'a project list that failed verification must not be shown');
+
+    // Entering a project is the first thing that needs a *session stream*, and
+    // a stream needs an authorized WebSocket. Stopping at the project list left
+    // that untested — and untested it was broken: the socket carried no token,
+    // the upgrade was refused, and the screen said "loading" forever.
+    final online = controller.projects.where((project) => project.isOnline).toList();
+    expect(online, isNotEmpty, reason: '电脑上要有一个在线项目才能验这一步');
+    await _tapByText(tester, online.first.display, settle: false);
+
+    final opened = DateTime.now().add(const Duration(seconds: 30));
+    while (DateTime.now().isBefore(opened) && controller.sessionsLoading) {
+      await tester.pump(const Duration(milliseconds: 250));
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+    expect(controller.sessionsLoading, isFalse,
+        reason: '会话列表卡住了：${controller.lastError ?? "没有错误信息"}');
+    expect(controller.lastError, isNull,
+        reason: '进入项目不该报错：${controller.lastError}');
   });
 }

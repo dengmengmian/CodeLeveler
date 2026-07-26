@@ -25,10 +25,12 @@ done
 
 WORK="$(mktemp -d)"
 export LEVELER_HOME="$WORK/.leveler"
+mkdir -p "$LEVELER_HOME"
 export LEVELER_RELAY_ENROLLMENT_SECRET="simulator-acceptance-secret"
 PORT="${PORT:-18443}"
 
 cleanup() {
+  [[ -n "${SERVE_PID:-}" ]] && kill "$SERVE_PID" 2>/dev/null || true
   [[ -n "${AGENT_PID:-}" ]] && kill "$AGENT_PID" 2>/dev/null || true
   [[ -n "${RELAY_PID:-}" ]] && kill "$RELAY_PID" 2>/dev/null || true
   # `flutter test` rewrites ios/Flutter/Generated.xcconfig to point FLUTTER_TARGET
@@ -47,6 +49,16 @@ LEVELER_RELAY_BIND="127.0.0.1:$PORT" "$RELAY" > "$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
 sleep 1
 
+# Check it is *ours* listening. A port already taken by another relay makes the
+# next step fail with a bare 401 — the enrollment secret belongs to a different
+# process — and nothing about that error points at the port.
+if ! kill -0 "$RELAY_PID" 2>/dev/null; then
+  echo "relay 没起来（端口 $PORT 可能被占）：" >&2
+  cat "$WORK/relay.log" >&2
+  echo "换个端口重试： PORT=18444 $0 $DEVICE" >&2
+  exit 1
+fi
+
 echo "== 启用并注册本机 =="
 "$LEVELER" remote enable --relay-url "http://127.0.0.1:$PORT" --name "模拟器验收"
 "$LEVELER" remote enroll
@@ -56,10 +68,24 @@ echo "== 启用并注册本机 =="
 HOST_FINGERPRINT="$("$LEVELER" remote status | sed -n 's/.*公钥指纹：//p')"
 echo "本机指纹: $HOST_FINGERPRINT"
 
+# A project for the phone to enter. Without one the run stops at the project
+# list, which leaves the session stream — the part that needs an authorized
+# WebSocket — untested; it was broken that way once already.
+echo "== 打开一个项目（本仓库）=="
+printf '{"projects":["%s"],"aliases":{},"ignored":[]}' "$REPO" > "$LEVELER_HOME/web-projects.json"
+"$LEVELER" --repo "$REPO" serve > "$WORK/serve.log" 2>&1 &
+SERVE_PID=$!
+
 echo "== agent =="
 "$LEVELER" remote agent > "$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
-sleep 2
+sleep 4
+
+if ! "$LEVELER" remote projects | grep -q 在线; then
+  echo "项目没有上线，agent 会看到空列表：" >&2
+  tail -5 "$WORK/serve.log" >&2
+  exit 1
+fi
 
 echo "== 配对载荷 =="
 PAYLOAD="$("$LEVELER" remote pair | grep '^{')"

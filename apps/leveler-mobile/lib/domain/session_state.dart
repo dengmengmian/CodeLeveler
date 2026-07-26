@@ -85,7 +85,10 @@ class SessionState extends ChangeNotifier {
             return TranscriptEntry(
               id: message['id'] as String? ?? '',
               role: message['role'] as String? ?? 'assistant',
-              text: message['content'] as String? ?? '',
+              // `text`, which is what the type calls it. Reading `content`
+              // produced a transcript of empty bubbles that looked like the
+              // host had said nothing.
+              text: message['text'] as String? ?? '',
             );
           },
         ),
@@ -96,16 +99,18 @@ class SessionState extends ChangeNotifier {
     clarifications.clear();
     for (final raw in session['pending_interactions'] as List<dynamic>? ?? const []) {
       final interaction = raw as Map<String, dynamic>;
+      // The request is nested under `request`, not flattened into the wrapper.
+      final request = interaction['request'] as Map<String, dynamic>? ?? const {};
       switch (interaction['type']) {
         case 'approval':
-          final approval = PendingApproval.fromJson(interaction);
+          final approval = PendingApproval.fromJson(request);
           approvals[approval.id] = approval;
         case 'clarification':
-          final id = interaction['id'] as String? ?? '';
+          final id = request['id'] as String? ?? '';
           clarifications[id] = PendingClarification(
             id: id,
-            question: interaction['question'] as String? ?? '',
-            options: (interaction['options'] as List<dynamic>? ?? const [])
+            question: request['question'] as String? ?? '',
+            options: (request['options'] as List<dynamic>? ?? const [])
                 .map((option) => '$option')
                 .toList(growable: false),
           );
@@ -123,8 +128,11 @@ class SessionState extends ChangeNotifier {
         transcript.add(TranscriptEntry(
           id: message['id'] as String? ?? '',
           role: 'user',
-          text: message['content'] as String? ?? '',
+          text: message['text'] as String? ?? '',
         ));
+        // There is no `turn_started` on the wire; work begins when a message
+        // lands, and one of the `turn_*` kinds ends it.
+        status = 'running';
       case 'assistant_message_started':
         transcript.add(TranscriptEntry(
           id: event['message_id'] as String? ?? '',
@@ -176,21 +184,62 @@ class SessionState extends ChangeNotifier {
         if (session != null && session['id'] == sessionId) {
           status = session['status'] as String? ?? status;
         }
-      case 'turn_started':
-        status = 'running';
+      // Every way a turn can end.
       case 'turn_completed':
+      case 'turn_answered':
+      case 'turn_truncated':
+      case 'turn_incomplete':
       case 'turn_completed_unverified':
       case 'turn_failed':
+      case 'turn_cancelled':
         status = 'idle';
         activity = null;
       default:
-        final kind = event['type'] as String? ?? 'unknown';
-        unknownEvents.update(kind, (count) => count + 1, ifAbsent: () => 1);
-        // A kind we cannot render may have changed state we do render.
-        needsResync = true;
+        if (!_ignored.contains(event['type'])) {
+          final kind = event['type'] as String? ?? 'unknown';
+          unknownEvents.update(kind, (count) => count + 1, ifAbsent: () => 1);
+        }
     }
     notifyListeners();
   }
+
+  /// Kinds this screen deliberately does not render.
+  ///
+  /// Listing them is the difference between "we chose not to show this" and "we
+  /// have never heard of this". They used to fall through to the unknown branch,
+  /// which asked the host for a fresh snapshot — after *every* token-usage
+  /// event — and left the phone permanently displaying "resynchronising".
+  ///
+  /// Several deserve a place in the UI eventually (tool activity, plans, diffs).
+  /// Until they have one, being ignored on purpose is the honest state.
+  static const Set<String> _ignored = {
+    'runtime_ready',
+    'reasoning_delta',
+    'token_usage',
+    'context_updated',
+    'command_progress',
+    'notification',
+    'project_rules_loaded',
+    'tool_call_started',
+    'tool_call_completed',
+    'plan_updated',
+    'verification_updated',
+    'diff_updated',
+    'checkpoint_created',
+    'attachment_added',
+    'attachment_processing_failed',
+    'session_list',
+    'session_completed',
+    'sub_agent_updated',
+    'sub_agent_progress',
+    'sub_agent_activity',
+    'background_task_started',
+    'background_task_exited',
+    'memory_list',
+    'btw_started',
+    'btw_text_delta',
+    'btw_completed',
+  };
 
   void markResyncRequired() {
     needsResync = true;

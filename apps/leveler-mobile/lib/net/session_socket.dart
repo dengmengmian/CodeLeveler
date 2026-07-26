@@ -11,6 +11,10 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:cryptography/cryptography.dart';
+// The IO channel, not the cross-platform one: only this variant can send the
+// Authorization header, and the design forbids putting the token in the query
+// string, where it would land in access logs and proxy history.
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../protocol/envelope.dart';
@@ -56,8 +60,9 @@ class SessionSocket {
         ? relayUrl.replaceFirst('https://', 'wss://')
         : relayUrl.replaceFirst('http://', 'ws://');
     final uri = Uri.parse('$wsUrl/v1/hosts/$hostId/session?project_id=$projectId');
-    final channel = WebSocketChannel.connect(
+    final channel = IOWebSocketChannel.connect(
       uri,
+      headers: {'Authorization': 'Bearer $accessToken'},
       // Subprotocol negotiation, so a version mismatch fails at the handshake
       // rather than at the first frame nobody can parse.
       protocols: const ['leveler.session.v1'],

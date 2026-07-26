@@ -382,6 +382,13 @@ class AppController extends ChangeNotifier {
       connection = error.isTransient ? LinkState.offline : LinkState.idle;
       lastError = _explain(error);
       sessionsLoading = false;
+    } catch (error) {
+      // Anything else — a refused WebSocket upgrade, a socket that died mid
+      // handshake — must still end the spinner. A screen that says "loading"
+      // forever is the least useful way to report a failure.
+      connection = LinkState.idle;
+      lastError = '打不开这个项目的会话流：$error';
+      sessionsLoading = false;
     }
     notifyListeners();
   }
