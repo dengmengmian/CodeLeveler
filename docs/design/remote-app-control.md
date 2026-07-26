@@ -1393,12 +1393,18 @@ pub enum ClientOrigin {
   - CI 里作为**独立步骤** `Remote control acceptance`（非 Windows）先于全量 workspace 测试跑，配对/隔离/超时/撤销这条链断了会直接指出来，而不是埋在一大堆输出里。
 - **未做（明说）：** **「审批 pending + 进程重启」用例没有做。** 它验的是 runtime 重启后能否从 event log 重建 `pending_interactions`，属于 `leveler-app` + storage 的行为，用远程侧的假 runtime 测不出任何东西——那只会测到假货自己。要做就得在 leveler-app 里做，是另一次改动，不在远程表面内。
 
-### PR10 — Security gate
+### PR10 — Security gate ✅ 记录已产出（结论：未通过生产宣传门禁）
 
 - **Title:** `security review gate for remote surface`
 - **Affects:** docs 签字清单、fuzz 目标、CHANGELOG
 - **Deps:** PR9
 - **DoD:** 威胁模型评审记录；已知问题列表；**未过不得宣传生产**
+- **产出：** `docs/design/remote-security-gate.md`——威胁模型逐条核对（每条缓解指到具体测试名）、八类安全检查、**10 条已知问题**、fuzz 覆盖现状、结论。
+- **评审当场发现并已修两项，都不是「加固」而是承诺与实现不符：**
+  1. **id 分隔符歧义**：`pair/complete` / `enroll` / `auth/session` 此前不校验 id 字符集，可以注册一个含 `|` 的 device_id。它进不了信封（签名层会拒），但会在 relay 上留下一条永远无法发帧的记录，也把「分隔符歧义」这类问题的防线从入口挪到了每个签名点。已在入口统一校验，牙口已验（去掉校验 → 该条单独转红）。
+  2. relay 控制面无凭据、agent 缓存设备表——见 PR6 / PR7 条目。
+- **结论：不得宣称生产就绪。** 三条理由：Phase 1 完成定义含真机 APP（K23）而 APP 未开始；机密性只到 TLS，托管 relay 下「运营方看不到你的对话」这句话不成立；已知问题里还有 3 条可被利用的粗糙面（RPC 重放窗口、配对无 per-runtime 锁定、rpc 无限流）。
+- **未做：** 结构化 fuzz（`cargo-fuzz`）。现有负例是针对设计点名攻击的手写向量，不能替代对解析器的随机输入测试。
 
 ### PR11a — APP 工程脚手架 + 契约接入
 

@@ -117,6 +117,19 @@ pub(crate) fn within_window(timestamp: &str) -> Result<(), RelayError> {
     Ok(())
 }
 
+/// Refuse an identifier that could not appear in a signed envelope.
+///
+/// One rule for every id the relay stores or signs over: `^[A-Za-z0-9_.:-]{1,64}$`.
+/// The envelope layer already enforces it at signing time; enforcing it at
+/// entry means an id that could never be used is never recorded either.
+fn require_valid_id(id: &str) -> Result<(), RelayError> {
+    if leveler_remote_protocol::id_is_valid(id) {
+        Ok(())
+    } else {
+        Err(RelayError::InvalidPairing)
+    }
+}
+
 // ------------------------------------------------------- runtime identity
 
 /// Check the [`RUNTIME_AUTH_HEADER`] assertion on a runtime's own request.
@@ -184,6 +197,7 @@ async fn enroll_runtime(
     Json(request): Json<EnrollRequest>,
 ) -> Result<StatusCode, Failure> {
     state.rate_limit("enroll", 10, 60, now())?;
+    require_valid_id(&request.runtime_id)?;
     let secret = bearer(&headers)?;
 
     // Verify against the key being *presented*, not one already on file: this is
@@ -265,6 +279,11 @@ async fn pair_complete(
     // Guessing a 128-bit secret is hopeless, but metering it keeps a flood from
     // becoming a denial of service against the real pairing.
     state.rate_limit("pair_complete", 10, 60, now())?;
+    // This endpoint takes an id from an unauthenticated caller, and that id
+    // later joins `|`-separated signing inputs. A separator inside it would
+    // shift the field boundaries of every assertion about that device, so it is
+    // refused at the door rather than left to each signing site to remember.
+    require_valid_id(&request.device_id)?;
     let pairing = state.claim_pairing(
         &request.pairing_secret,
         ClaimedBy {
@@ -412,6 +431,8 @@ async fn auth_session(
     Json(request): Json<SessionAuthRequest>,
 ) -> Result<Json<SessionAuthResponse>, Failure> {
     state.rate_limit("auth_session", 20, 60, now())?;
+    require_valid_id(&request.device_id)?;
+    require_valid_id(&request.runtime_id)?;
 
     let device = state
         .device(&request.device_id)

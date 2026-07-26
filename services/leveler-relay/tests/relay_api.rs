@@ -999,3 +999,74 @@ async fn refreshing_requires_a_device_assertion() {
         .unwrap();
     assert!(genuine.status().is_success());
 }
+
+/// Ids reach `|`-separated signing inputs, so a separator inside one would move
+/// the field boundaries of every assertion made about it. The envelope layer
+/// refuses such an id at signing time; the relay refuses to record one at all,
+/// so a device that could never send a frame is never created.
+#[tokio::test]
+async fn an_id_that_could_never_be_signed_over_is_refused_at_entry() {
+    let (base, state) = serve().await;
+    let client = reqwest::Client::new();
+    enroll(&client, &base, "rt_a", &runtime_key("rt_a")).await;
+    let secret = begin_pairing(&client, &base, "rt_a").await;
+
+    for bad in ["dev|a", "", &"d".repeat(65), "dev a", "dev/a"] {
+        let response = client
+            .post(format!("{base}/v1/pair/complete"))
+            .json(&json!({
+                "device_id": bad,
+                "device_pubkey": device_key().verifying_key().to_base64url(),
+                "device_name": "iPhone", "platform": "ios",
+                "pairing_secret": secret, "scope": "interactive"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "device_id {bad:?} must be refused");
+        assert!(
+            state.device(bad).is_none(),
+            "a refused id must leave no record"
+        );
+    }
+
+    // And a legal one still works, so this is not "refuse everything".
+    let response = client
+        .post(format!("{base}/v1/pair/complete"))
+        .json(&json!({
+            "device_id": "dev_ok.1:2-3",
+            "device_pubkey": device_key().verifying_key().to_base64url(),
+            "device_name": "iPhone", "platform": "ios",
+            "pairing_secret": secret, "scope": "interactive"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+}
+
+/// The same rule on the runtime side: an unusable machine id must not be
+/// enrollable, or a relay would hold a binding no frame could ever match.
+#[tokio::test]
+async fn a_runtime_id_that_could_never_be_signed_over_is_refused() {
+    let (base, state) = serve().await;
+    let client = reqwest::Client::new();
+    let key = runtime_key("rt_bad");
+
+    let response = client
+        .post(format!("{base}/v1/runtimes/enroll"))
+        .bearer_auth(ENROLLMENT_SECRET)
+        .header(
+            RUNTIME_AUTH_HEADER,
+            runtime_auth(&key, runtime_action::ENROLL, "rt|evil"),
+        )
+        .json(&json!({
+            "runtime_id": "rt|evil",
+            "runtime_pubkey": key.verifying_key().to_base64url()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(state.runtime_key("rt|evil").is_none());
+}
