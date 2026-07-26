@@ -37,7 +37,7 @@
 ## 明确没做的
 
 - **扫二维码**：只做了粘贴。电脑端 `leveler remote pair` 打印的就是可粘贴的一行，设计里把粘贴列为等价路径。
-- **平台目录（`ios/`、`android/`）**：尚未生成，所以 `flutter build` 还跑不了；`analyze` 与 `test` 不需要它们。
+- **Android 构建**：平台目录已生成（最低 API 29 = Android 10），但本机没有 Android SDK，没构建过。
 - **附件上传**：电脑端的 `upload_attachment` 也还没实现。
 - **未确认指令的重发队列没有单测**：上限 16 条，重连后用**原 `command_id`** 重发（电脑端按该 id 去重，所以重发是同一条指令而不是第二条）。逻辑写了，没跑过。
 - **推送通知、生物识别锁、产物下载**：Phase 2（PR12）。
@@ -60,6 +60,6 @@ flutter analyze       # 应当 No issues found
 flutter test          # golden 测试会去读 ../../testdata/signed_envelope.golden.json
 ```
 
-要真机跑还差：`flutter create --platforms=ios,android .` 生成平台目录，再装 CocoaPods（iOS 插件需要）或 Android SDK。
+iOS 构建还需要 CocoaPods（已装）与 Xcode 的 iOS 平台组件；Android 需要 Android SDK。
 
 golden 测试读的是仓库根部 `testdata/signed_envelope.golden.json`——**与 Rust 侧同一份文件**。协议改了而这里没跟上，它会红。

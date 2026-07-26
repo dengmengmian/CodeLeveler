@@ -88,9 +88,10 @@ jobs:
         # failure in a late crate is not hidden behind an earlier one).
         run: cargo test --workspace --all-features --locked --no-fail-fast
 
-  # The phone client. It is Dart, so it cannot ride the Rust job — and it has
-  # never been compiled anywhere else: this is the first thing that will tell us
-  # whether it builds at all. Expected to be red until it is fixed.
+  # The phone client. It is Dart, so it cannot ride the Rust job. Analyze and
+  # test only: CI has no simulator, and building the app needs one platform
+  # toolchain per target. What this does guard is the cross-language envelope
+  # conformance, which is the part a host change can silently break.
   mobile:
     name: leveler-mobile · analyze · test
     runs-on: ubuntu-latest
