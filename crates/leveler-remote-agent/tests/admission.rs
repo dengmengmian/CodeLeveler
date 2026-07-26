@@ -538,3 +538,86 @@ async fn a_revocation_lands_on_the_next_frame_of_a_running_agent() {
         "nothing more may reach the runtime"
     );
 }
+
+/// The audit log answers "what did that phone do here" without becoming a
+/// second copy of what was said. Both halves matter: the record has to exist,
+/// and it has to be safe to keep.
+#[tokio::test]
+async fn the_audit_record_names_the_command_but_never_its_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(leveler_remote_agent::AuditLog::new(
+        dir.path().join("audit"),
+    ));
+    let path = dir.path().join("remote").join("devices.json");
+    let mut devices = TrustedDevices::load(&path).unwrap();
+    devices
+        .accept(
+            DEVICE_ID,
+            &device_key().verifying_key(),
+            "iPhone",
+            PairingScope::Interactive,
+            AT,
+        )
+        .unwrap();
+    let runtime = RecordingRuntime::default();
+    let bridge = AgentBridge::new(
+        Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime))),
+        devices,
+        RUNTIME_ID,
+        runtime_key(),
+        false,
+    )
+    .with_audit(audit.clone());
+
+    let secret_text = "把密码改成 hunter2";
+    let allowed = upstream(
+        &device_key(),
+        DEVICE_ID,
+        RUNTIME_ID,
+        &deliver_body(&format!(
+            r#"{{"type":"submit_message","session_id":"s1","content":"{secret_text}"}}"#
+        )),
+    );
+    bridge
+        .admit_upstream(PROJECT_ID, &allowed, AT, None)
+        .await
+        .unwrap();
+
+    let refused = upstream(
+        &device_key(),
+        DEVICE_ID,
+        RUNTIME_ID,
+        &deliver_body(
+            r#"{"type":"approval_decision","request_id":"a1","decision":"approve_always"}"#,
+        ),
+    );
+    bridge
+        .admit_upstream(PROJECT_ID, &refused, AT, None)
+        .await
+        .unwrap_err();
+
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let text = std::fs::read_to_string(dir.path().join("audit").join(format!("audit-{day}.jsonl")))
+        .expect("the agent should have written an audit file");
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["event"], "delivered");
+    assert_eq!(lines[0]["command"], "submit_message");
+    assert_eq!(lines[1]["event"], "refused");
+    assert_eq!(lines[1]["code"], "approval_decision_not_allowed_remote");
+    assert_eq!(lines[1]["command"], "approval_decision");
+
+    assert!(
+        !text.contains(secret_text),
+        "the message body must not be in the audit log: {text}"
+    );
+    assert!(
+        !text.contains(DEVICE_ID),
+        "the device id must be hashed, not written in the clear: {text}"
+    );
+    assert!(text.contains(&leveler_remote_agent::hashed(DEVICE_ID)));
+}

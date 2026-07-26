@@ -93,6 +93,7 @@ struct Countdown {
 /// the audit line, as [`ClientOrigin::RemoteTimeout`] — the runtime is told a
 /// `Deny`, and a `Deny` from a timeout must not read in the log as though the
 /// phone's user pressed it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn watch_approvals(
     runtime: Arc<dyn LocalRuntimeService>,
     project_id: String,
@@ -100,6 +101,7 @@ pub(crate) async fn watch_approvals(
     presence: RemotePresence,
     timeout: Duration,
     poll: Duration,
+    audit: Option<Arc<crate::audit::AuditLog>>,
 ) {
     let mut events = runtime.subscribe();
     let mut ticker = tokio::time::interval(poll);
@@ -166,6 +168,13 @@ pub(crate) async fn watch_approvals(
                 for id in due {
                     if let Some(mut countdown) = pending.remove(&id) {
                         countdown.state.resolved();
+                        if let Some(audit) = &audit {
+                            audit.record(crate::audit::AuditEvent::ApprovalTimeout {
+                                device: crate::audit::hashed(&device_id),
+                                project: project_id.clone(),
+                                approval: id.to_string(),
+                            });
+                        }
                         deny(&runtime, &presence, &project_id, &device_id, id).await;
                     }
                 }

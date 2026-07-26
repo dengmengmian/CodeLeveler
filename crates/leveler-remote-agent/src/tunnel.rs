@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::approvals::{RemotePresence, WAITER_POLL, watch_approvals};
+use crate::audit::{AuditEvent, hashed};
 use crate::bridge::{AdmissionError, Admitted, AgentBridge};
 
 #[derive(Debug, thiserror::Error)]
@@ -373,6 +374,7 @@ async fn handle<F>(
                                 presence.clone(),
                                 approval_timeout,
                                 WAITER_POLL,
+                                bridge.audit_log(),
                             ));
                             watches.insert(project_id.clone(), ProjectWatch { presence, task });
                         }
@@ -416,11 +418,22 @@ async fn handle<F>(
             ) {
                 release_stream(watches, &previous);
             }
+            if let Some(state) = streams.get(&stream_id) {
+                bridge.audit(AuditEvent::StreamOpened {
+                    device: hashed(&state.device_id),
+                    project: state.project_id.clone(),
+                });
+            }
             let _ = outbox.send(AgentToRelay::StreamAccepted { stream_id });
         }
 
-        RelayToAgent::CloseStream { stream_id, .. } => {
+        RelayToAgent::CloseStream { stream_id, reason } => {
             if let Some(state) = streams.remove(&stream_id) {
+                bridge.audit(AuditEvent::StreamClosed {
+                    device: hashed(&state.device_id),
+                    project: state.project_id.clone(),
+                    reason,
+                });
                 release_stream(watches, &state);
             }
         }
@@ -463,6 +476,17 @@ async fn handle<F>(
                     }
                 }
                 Err(error) => {
+                    // Frames refused before policy — bad signature, unknown
+                    // device, unroutable project — have no command kind to
+                    // record, only the check that stopped them.
+                    if !matches!(error, AdmissionError::Refused { .. }) {
+                        bridge.audit(AuditEvent::Refused {
+                            device: hashed(&frame.sender_id),
+                            project: project_id.clone(),
+                            command: None,
+                            code: error.code().to_string(),
+                        });
+                    }
                     // Report the refusal to the device rather than dropping the
                     // frame: a phone that never hears back cannot tell a denied
                     // command from a lost one.
@@ -486,8 +510,16 @@ async fn handle<F>(
 
         RelayToAgent::RpcRequest { rpc_id, envelope } => {
             let timestamp = now();
+            let method = rpc_method_of(&envelope);
+            let device = hashed(&envelope.sender_id);
             match bridge.handle_rpc(&envelope, &timestamp, None).await {
                 Ok(signed) => {
+                    bridge.audit(AuditEvent::Rpc {
+                        device,
+                        project: rpc_project_of(&envelope),
+                        method,
+                        result: "ok".to_string(),
+                    });
                     let _ = outbox.send(AgentToRelay::RpcResponse {
                         rpc_id,
                         envelope: Some(signed),
@@ -495,6 +527,12 @@ async fn handle<F>(
                     });
                 }
                 Err(error) => {
+                    bridge.audit(AuditEvent::Rpc {
+                        device,
+                        project: rpc_project_of(&envelope),
+                        method,
+                        result: error.code().to_string(),
+                    });
                     // Routing-level only: there is no runtime result to sign,
                     // so this carries no business body.
                     let _ = outbox.send(AgentToRelay::RpcResponse {
@@ -541,6 +579,27 @@ fn error_json(error: &AdmissionError, command_id: Option<String>) -> String {
         "command_id": command_id,
     })
     .to_string()
+}
+
+/// The RPC method named in a frame, for the audit line. Read before
+/// verification, so it is a label rather than a claim: an unverifiable frame is
+/// recorded as `unknown` and refused anyway.
+fn rpc_method_of(frame: &SignedEnvelope) -> String {
+    rpc_field(frame, "method").unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The project an RPC named, for the audit line.
+fn rpc_project_of(frame: &SignedEnvelope) -> String {
+    rpc_field(frame, "project_id").unwrap_or_else(|| "-".to_string())
+}
+
+fn rpc_field(frame: &SignedEnvelope, field: &str) -> Option<String> {
+    let payload = frame.payload().ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value
+        .get(field)
+        .and_then(|found| found.as_str())
+        .map(|found| found.to_string())
 }
 
 /// Which session an upstream frame targets, for the approval timeout. Read from

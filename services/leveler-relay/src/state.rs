@@ -602,6 +602,13 @@ impl RelayState {
         display_name: &str,
         to_agent: tokio::sync::mpsc::UnboundedSender<RelayToAgent>,
     ) {
+        // Hashed: an operator watching the log should be able to tell one host
+        // from another and correlate its lines, without the log becoming an
+        // inventory of whose machines use this relay.
+        tracing::info!(
+            runtime = %leveler_remote_protocol::hashed_label(runtime_id),
+            "runtime online"
+        );
         self.inner.lock().unwrap().online.insert(
             runtime_id.to_string(),
             RuntimeOnline {
@@ -670,6 +677,10 @@ impl RelayState {
     /// aimed at it while offline is refused rather than stored and replayed
     /// later, possibly after the device that sent it was revoked.
     pub fn unregister_runtime(&self, runtime_id: &str) {
+        tracing::info!(
+            runtime = %leveler_remote_protocol::hashed_label(runtime_id),
+            "runtime offline"
+        );
         let mut inner = self.inner.lock().unwrap();
         inner.online.remove(runtime_id);
         inner

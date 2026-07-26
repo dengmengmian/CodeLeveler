@@ -132,6 +132,23 @@ fn runtime_auth(
     action: &str,
     runtime_id: &str,
 ) -> Result<(), RelayError> {
+    let outcome = runtime_auth_inner(state, headers, action, runtime_id);
+    if outcome.is_err() {
+        tracing::info!(
+            runtime = %leveler_remote_protocol::hashed_label(runtime_id),
+            action,
+            "auth_fail: runtime assertion refused"
+        );
+    }
+    outcome
+}
+
+fn runtime_auth_inner(
+    state: &RelayState,
+    headers: &HeaderMap,
+    action: &str,
+    runtime_id: &str,
+) -> Result<(), RelayError> {
     let header = headers
         .get(RUNTIME_AUTH_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -411,7 +428,14 @@ async fn auth_session(
         &request.timestamp,
         &request.nonce,
     );
-    verify_signature(&key, assertion.as_bytes(), &request.sig)?;
+    if let Err(error) = verify_signature(&key, assertion.as_bytes(), &request.sig) {
+        tracing::info!(
+            device = %leveler_remote_protocol::hashed_label(&request.device_id),
+            runtime = %leveler_remote_protocol::hashed_label(&request.runtime_id),
+            "auth_fail: bad device assertion"
+        );
+        return Err(error.into());
+    }
     within_window(&request.timestamp)?;
     // One assertion, one use: the signature stays valid for its whole window
     // otherwise, and a captured request could be replayed inside it.

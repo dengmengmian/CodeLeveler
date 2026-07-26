@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod approvals;
+mod audit;
 mod bridge;
 mod config;
 mod devices;
@@ -19,6 +20,7 @@ mod projects;
 mod tunnel;
 
 pub use approvals::WAITER_POLL;
+pub use audit::{AuditEvent, AuditLog, DEFAULT_RETENTION_DAYS, hashed};
 pub use bridge::{AdmissionError, Admitted, AgentBridge};
 pub use config::{
     ConfigError, DEFAULT_APPROVAL_TIMEOUT_SECS, RemoteConfig, RemoteHome, runtime_id_for,

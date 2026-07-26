@@ -37,6 +37,20 @@ pub use envelope::{
 };
 pub use keys::{SigningKey, VerifyingKey};
 
+/// A truncated `SHA-256` of an identifier, as lowercase hex.
+///
+/// The observability convention for both sides: a log line should be
+/// correlatable with other lines about the same device or machine without the
+/// log itself becoming a list of a user's devices. Eight bytes, the same width
+/// as the pairing fingerprint, so one shape covers every id a human might see.
+pub fn hashed_label(value: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
+    digest.as_ref()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Verify a detached signature over `message`. See
 /// [`VerifyingKey::verify_detached`].
 pub fn verify_detached(key: &VerifyingKey, message: &[u8], signature: &[u8]) -> bool {

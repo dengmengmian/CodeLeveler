@@ -31,6 +31,7 @@ use leveler_remote_protocol::{
 };
 use leveler_session_wire::UpstreamMessage;
 
+use crate::audit::{AuditEvent, AuditLog, hashed};
 use crate::devices::{TrustError, TrustedDevices};
 use crate::projects::{ProjectRoutes, RouteError};
 
@@ -92,6 +93,9 @@ pub struct AgentBridge {
     /// genuine result from one a relay composed.
     runtime_key: SigningKey,
     allow_full_access: bool,
+    /// Where remote activity is written down. Absent in tests that are not
+    /// about the record.
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl AgentBridge {
@@ -108,6 +112,25 @@ impl AgentBridge {
             runtime_id: runtime_id.into(),
             runtime_key,
             allow_full_access,
+            audit: None,
+        }
+    }
+
+    /// Write remote activity to `audit`.
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// The audit log, for the tasks the bridge spawns rather than serves.
+    pub(crate) fn audit_log(&self) -> Option<Arc<AuditLog>> {
+        self.audit.clone()
+    }
+
+    /// Record one event, if this host keeps an audit log.
+    pub(crate) fn audit(&self, event: AuditEvent) {
+        if let Some(audit) = &self.audit {
+            audit.record(event);
         }
     }
 
@@ -366,17 +389,26 @@ impl AgentBridge {
                 session_id,
                 command,
             } => {
+                let kind = command_kind(&command);
                 if let RemoteVerdict::Deny { code, reason } = policy.evaluate(&command) {
-                    tracing::info!(
-                        device_id = %device_id,
-                        code,
-                        command = command_kind(&command),
-                        "refused a remote command"
-                    );
+                    // The kind, never the contents: a refusal is worth
+                    // recording, and the text of what was refused is not.
+                    tracing::info!(device = %hashed(&device_id), code, command = kind, "refused a remote command");
+                    self.audit(AuditEvent::Refused {
+                        device: hashed(&device_id),
+                        project: project_id.to_string(),
+                        command: Some(kind.to_string()),
+                        code: code.to_string(),
+                    });
                     return Err(AdmissionError::Refused { code, reason });
                 }
                 self.deliver(project_id, &command_id, &session_id, command)
                     .await?;
+                self.audit(AuditEvent::Delivered {
+                    device: hashed(&device_id),
+                    project: project_id.to_string(),
+                    command: kind.to_string(),
+                });
                 Ok(Admitted::Delivered { command_id, origin })
             }
             // A snapshot mutates nothing, but an observe pairing is still not

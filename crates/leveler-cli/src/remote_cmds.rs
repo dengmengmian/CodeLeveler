@@ -395,13 +395,19 @@ async fn agent() -> anyhow::Result<std::process::ExitCode> {
     let devices = TrustedDevices::load(home.devices_path())?;
     let paired = devices.devices().iter().filter(|d| d.is_active()).count();
 
-    let bridge = Arc::new(AgentBridge::new(
-        Arc::new(project_router()),
-        devices,
-        config.runtime_id.clone(),
-        key,
-        config.allow_full_access,
+    let audit = Arc::new(leveler_remote_agent::AuditLog::new(
+        home.dir().join("audit"),
     ));
+    let bridge = Arc::new(
+        AgentBridge::new(
+            Arc::new(project_router()),
+            devices,
+            config.runtime_id.clone(),
+            key,
+            config.allow_full_access,
+        )
+        .with_audit(audit.clone()),
+    );
 
     println!("远程 agent 启动：{}", config.runtime_id);
     println!("  relay：{}", config.relay_url);
@@ -409,6 +415,11 @@ async fn agent() -> anyhow::Result<std::process::ExitCode> {
     println!(
         "  审批超时：{} 秒（仅在无本机 UI 时生效）",
         config.approval_timeout_secs
+    );
+    println!(
+        "  审计日志：{}（按天轮转，保留 {} 天，不记录消息内容）",
+        audit.dir().display(),
+        leveler_remote_agent::DEFAULT_RETENTION_DAYS
     );
     println!("按 Ctrl-C 停止。");
 

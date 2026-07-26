@@ -1349,7 +1349,7 @@ pub enum ClientOrigin {
   - **速率限制**：`pair/complete` 10 次/分，`auth/session` 20 次/分。
   - 负例：错密钥签名 401 ✅ / 同一断言重放 401 ✅ / 用另一把密钥抢占已绑定的 `runtime_id` 401 ✅
 
-### PR7 — CLI `leveler remote` ⚠️ 部分完成（不依赖 relay 的子命令已可用）
+### PR7 — CLI `leveler remote` ✅ 已完成
 
 - **Title:** `cli: leveler remote enable|pair|confirm|open|projects|status|revoke (provisional)`
 - **Affects:** `leveler-cli`、STABILITY 一行
@@ -1358,15 +1358,29 @@ pub enum ClientOrigin {
 - **已完成：** `status` / `devices` / `revoke` 三个**无需 relay** 即可工作的子命令，中文输出，已手工实跑验证。这是本设计第一个用户可实际运行的入口——此前所有产出都是没有入口的库。
   - `devices` **从存储的公钥重新推导指纹**，而非直接打印记录里的缓存字符串。两者不符即告警——用户当初确认的是密钥，不是它旁边那行文本。已构造篡改文件实测告警触发。
   - `revoke` 写入 `revoked_at` 并提示「下一帧即生效」；撤销不存在的设备返回退出码 1。
-- **未完成：** `enable`（生成 runtime 密钥）、`pair`（出 QR）、`confirm`（展示 device 指纹并接受）、`open`/`projects`——全部依赖 relay 或 ProjectRouter。`status` 会明确告知用户 relay 尚未就绪，而不是假装可以配对。
-- **STABILITY 条目未加**：命令面尚不完整，等 PR6/PR7 收尾再一并登记。
+- **收尾已完成（含新增 `enroll` 与 `agent`）：** `enable` / `enroll` / `pair` / `confirm` / `projects` / `agent` 全部落地，**并按真实顺序手工实跑通过**（临时 LEVELER_HOME + 本地 relay：enable → enroll → agent → pair → 手机侧 pair/complete → confirm → status/devices/projects）。
+  - **`enroll` 是本轮新增的一步**：relay 改为认证式注册后，host 必须先用运营者密钥 + 自签断言注册公钥，否则新 relay 认不得这台机器。密钥从 `LEVELER_RELAY_ENROLLMENT_SECRET` 或 stdin 读，**不进 argv**。
+  - **`agent` 是子命令而非第二个二进制**：sidecar 要的是独立**进程**，不是独立可执行文件；多一个二进制就多一份安装与签名负担。断线按 1s→30s 退避重连，连接活过 60s 则退避重置。
+  - **`runtime_id` 由公钥推导**（`rt_` + 与配对指纹同样的 16 hex），不再是人取的名字：取的名字会撞、会打错、会被先到者在 relay 上占用，推导出来的则与必须为它签名的密钥绑定，用户看到的也只有一套标识。
+  - **`enable` 不会重新生成已有密钥**，否则所有已配对手机都会对着一把本机已不再持有的密钥验签——看起来有效、实际全废。
+  - **`confirm` 先写 devices.json 再通知 relay**：两步之间崩溃时，绝不能让 relay 认为某设备已配对而本机无法验签。
+- **手工实跑抓到一个真实缺陷：** agent 只在启动时读一次 `devices.json`。于是「先起 agent、再配对」这个**正常顺序**下新手机始终不被信任，撤销也要等重启才生效——正是威胁模型里「撤销后仍在投递」那个窗口，而 CLI 早就在嘴上承诺「下一帧即生效」。已改为**每次查表都读文件**（读失败才退回上次good副本），并补两条测试：运行中配对立即生效、运行中撤销下一帧即拒。牙口已验：改回读缓存 → 这两条单独转红。
+- **未做（明说）：** 二维码渲染（打印载荷供粘贴，设计里本就把粘贴列为等价路径）；密钥输入不回显（需要终端处理依赖，本 CLI 没有，假装有更糟）。
+- **STABILITY 条目未加**：等 PR10 安全门禁一并登记。
 
-### PR8 — 审计与指标（随 agent/relay，不晚于 e2e）
+### PR8 — 审计与指标（随 agent/relay，不晚于 e2e）⚠️ 审计已落地，指标导出未做
 
 - **Title:** `remote audit jsonl and hashed metric labels`
 - **Affects:** agent + relay
 - **Deps:** PR5, PR5b, PR6
 - **DoD:** 无 body；轮转配置；指标标签符合 Observability（project_id hash）
+- **已完成（+4 测试）：** agent 侧 `~/.leveler/remote/audit/audit-YYYY-MM-DD.jsonl`，0600、按天轮转、按**文件名日期**（不是 mtime）保留 30 天。记录 stream 开/关、deliver、refused（含拦下它的检查）、rpc 结果、审批超时。
+  - **无 body** ✅ 有一条测试真的发一句带「密码」的消息，然后断言审计文件里**既没有正文也没有明文 device_id**，只有命令种类与被哈希的 id。
+  - **project 用 id**（本身就是仓库路径的哈希），因此审计里**不存在明文路径**。
+  - **哈希只有一处定义**（`leveler_remote_protocol::hashed_label`，agent 与 relay 共用）——两边哈希方式不同的话，日志就没法放在一起读，而那是记录 id 的唯一理由。
+  - relay 侧：`runtime online/offline` 与两类 `auth_fail` 走 info 日志，id 一律哈希。
+  - **写失败被吞掉**：审计写不进去不能变成拒绝命令的新方式。
+- **未做（明说）：** **没有指标导出器**（Prometheus 之类）。仓库里本来就没有这套设施，为了对齐一张表而现造一套基础设施，代价大于收益。审计行本身可数（每条事件一行），需要指标时再从这里聚合。`forward_bytes` 同样未做。
 
 ### PR9 — monorepo e2e
 
