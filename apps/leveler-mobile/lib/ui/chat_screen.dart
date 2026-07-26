@@ -12,6 +12,7 @@
 library;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../domain/app_controller.dart';
 import '../domain/session_state.dart';
@@ -42,6 +43,25 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.trim().isEmpty) return;
     _input.clear();
     await widget.controller.submit(text);
+    _followTail();
+  }
+
+  /// Keep the newest message in view while a reply streams in.
+  ///
+  /// Only when the user is already near the bottom: yanking someone back down
+  /// while they are reading earlier output is worse than making them scroll.
+  void _followTail() {
+    if (!_scroll.hasClients) return;
+    final position = _scroll.position;
+    if (position.maxScrollExtent - position.pixels > 240) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _scroll.animateTo(
+        _scroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+      );
+    });
   }
 
   @override
@@ -53,6 +73,8 @@ class _ChatScreenState extends State<ChatScreen> {
     return ListenableBuilder(
       listenable: session,
       builder: (context, _) {
+        // New content arrived; follow it if the user was at the tail.
+        _followTail();
         final approval = session.approvals.values.firstOrNull;
         final clarification = session.clarifications.values.firstOrNull;
 
@@ -84,11 +106,16 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
               Expanded(
-                child: ListView.builder(
-                  controller: _scroll,
-                  padding: const EdgeInsets.all(12),
-                  itemCount: session.transcript.length,
-                  itemBuilder: (context, index) => _Bubble(entry: session.transcript[index]),
+                // Selection lives here rather than inside each bubble: a
+                // per-bubble SelectableText claims the vertical drag for
+                // selecting, so the list would not scroll under a mouse at all.
+                child: SelectionArea(
+                  child: ListView.builder(
+                    controller: _scroll,
+                    padding: const EdgeInsets.all(12),
+                    itemCount: session.transcript.length,
+                    itemBuilder: (context, index) => _Bubble(entry: session.transcript[index]),
+                  ),
                 ),
               ),
               if (session.activity != null)
@@ -135,7 +162,7 @@ class _Bubble extends StatelessWidget {
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: EdgeInsets.symmetric(horizontal: 14, vertical: mine ? 10 : 2),
         constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.82),
         decoration: BoxDecoration(
           color: mine
@@ -143,7 +170,26 @@ class _Bubble extends StatelessWidget {
               : theme.colorScheme.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(14),
         ),
-        child: SelectableText(entry.text),
+        // The assistant answers in Markdown — headings, bold, fenced code — and
+        // showing the source of that is showing the wrong thing. What the user
+        // types is not Markdown, so it stays literal.
+        child: mine
+            ? Text(entry.text)
+            : MarkdownBody(
+                data: entry.text,
+                selectable: false,
+                styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
+                  p: theme.textTheme.bodyMedium,
+                  code: theme.textTheme.bodySmall?.copyWith(
+                    fontFamily: 'monospace',
+                    backgroundColor: theme.colorScheme.surface,
+                  ),
+                  codeblockDecoration: BoxDecoration(
+                    color: theme.colorScheme.surface,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
       ),
     );
   }
