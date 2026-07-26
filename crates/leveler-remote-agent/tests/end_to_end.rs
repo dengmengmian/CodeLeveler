@@ -294,7 +294,10 @@ async fn serve_chain(
         let _ = run_tunnel(
             &ws_base,
             RUNTIME_ID,
-            "dev-box",
+            // A space and non-ASCII on purpose: this is what a user types when
+            // asked to name their machine, and it used to make the tunnel URL
+            // invalid.
+            "我的 Mac",
             bridge,
             std::time::Duration::from_secs(120),
             now_stamp,

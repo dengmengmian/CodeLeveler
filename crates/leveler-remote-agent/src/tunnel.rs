@@ -213,8 +213,11 @@ where
     let assertion = AgentRegisterAssertion::signing_input(runtime_id, &timestamp);
     let sig = bridge.sign_assertion(assertion.as_bytes());
     let url = format!(
-        "{relay_ws_url}/v1/agent/tunnel?runtime_id={runtime_id}&display_name={display_name}\
-         &timestamp={timestamp}&sig={}",
+        "{}/v1/agent/tunnel?runtime_id={}&display_name={}&timestamp={}&sig={}",
+        relay_ws_url,
+        urlencode(runtime_id),
+        urlencode(display_name),
+        urlencode(&timestamp),
         urlencode(&sig)
     );
     let (socket, _) = tokio_tungstenite::connect_async(url)
@@ -555,16 +558,24 @@ async fn handle<F>(
 }
 
 /// Percent-encode the few characters standard base64 contributes to a query.
+/// Percent-encode a query value.
+///
+/// Everything outside the unreserved set is escaped, not just the few
+/// characters base64 contributes. A display name is whatever the user typed —
+/// "我的 Mac" is an ordinary answer to "what is this machine called" — and a
+/// space alone makes the URI invalid, so the agent fails to connect at all with
+/// a message about the *URI* that says nothing about the name.
 fn urlencode(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            '+' => "%2B".to_string(),
-            '/' => "%2F".to_string(),
-            '=' => "%3D".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 fn session_json(value: &serde_json::Value) -> String {
