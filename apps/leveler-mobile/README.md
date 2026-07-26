@@ -55,6 +55,23 @@
 4. RPC 响应必须复用请求的 `stream_id`（该值在签名内），否则拒收：relay 不能拿另一个请求的合法响应来顶替。
 5. 只读配对在客户端就挡住发送，而不是让用户打完字再被电脑端拒绝。
 
+## 用 Xcode 打开
+
+```bash
+open ios/Runner.xcworkspace     # 必须是 .xcworkspace，不是 .xcodeproj（有 CocoaPods）
+```
+
+**如果 Xcode 报 `Command PhaseScriptExecution failed with a nonzero exit code`：**
+多半是 `ios/Flutter/Generated.xcconfig` 里的 `FLUTTER_TARGET` 指向了一个已被删除的临时文件——`flutter test integration_test/...` 会把它改成测试入口且不还原。真正的错误藏在日志深处（`listener.dart: No such file or directory`），表面那句什么都没说。
+
+修复：
+
+```bash
+flutter build ios --simulator --debug     # 会把 FLUTTER_TARGET 写回 lib/main.dart
+```
+
+`simulator_pairing.sh` 现在退出时会自己还原，所以只有手动裸跑集成测试才会碰到。
+
 ## 本地怎么跑（等你有工具链时）
 
 ```bash

@@ -31,6 +31,14 @@ PORT="${PORT:-18443}"
 cleanup() {
   [[ -n "${AGENT_PID:-}" ]] && kill "$AGENT_PID" 2>/dev/null || true
   [[ -n "${RELAY_PID:-}" ]] && kill "$RELAY_PID" 2>/dev/null || true
+  # `flutter test` rewrites ios/Flutter/Generated.xcconfig to point FLUTTER_TARGET
+  # at a temporary test entrypoint, and leaves it there. That temp file is gone
+  # by the time anyone opens Xcode, and the build then fails with a
+  # PhaseScriptExecution error that says nothing about why. Put it back.
+  if grep -q "flutter_test_listener" "$REPO/apps/leveler-mobile/ios/Flutter/Generated.xcconfig" 2>/dev/null; then
+    echo "== 还原 Generated.xcconfig（集成测试改过它）=="
+    (cd "$REPO/apps/leveler-mobile" && flutter build ios --simulator --debug >/dev/null 2>&1) || true
+  fi
 }
 trap cleanup EXIT
 
