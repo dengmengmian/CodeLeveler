@@ -4,23 +4,21 @@
 
 ---
 
-## ⚠️ 这份代码从未被编译或运行过
+## 验证到哪一步了
 
-写它的环境里**没有 Flutter / Dart 工具链**（`flutter` 与 `dart` 都不存在）。因此：
+装上 Flutter 3.44.8（Dart 3.12.2）之后跑过：
 
-| 项 | 状态 |
+| 命令 | 结果 |
 | --- | --- |
-| `flutter pub get` | **未跑过** |
-| `flutter analyze` | **未跑过**——很可能有编译错误 |
-| `flutter test` | **未跑过**——包括本目录下的 golden 测试 |
-| iOS / Android 真机 | **未跑过**，没有内测包 |
-| 依赖 API 是否与所选版本一致 | **未验证**（`cryptography` / `flutter_secure_storage` / `web_socket_channel` 的调用是按记忆写的） |
+| `flutter pub get` | ✅ 64 个依赖解析通过 |
+| `flutter analyze` | ✅ **No issues found** |
+| `flutter test` | ✅ **16 条全绿**，含跨语言 golden |
+| iOS / Android 真机 | ❌ 未跑：无 Android SDK、无 iOS 模拟器 runtime、无 CocoaPods、无设备 |
+| 内测包（TestFlight / Play） | ❌ 未做，见上 |
 
-CI 里加了 `mobile` job，**它会是第一个真正编译这份代码的地方**。第一次很可能是红的。把它当作「待修的初稿」，不要当作「已完成的 APP」。
+**golden 一致性是真的，不是空转。** 牙口验过：把 canonical string 里 `sender_id` 与 `recipient_id` 的位置互换，`envelope_golden_test.dart` 立刻转红并打印精确差异；换回即绿。也就是说这份 Dart 实现与 Rust 侧对着**同一份答案卷** `testdata/signed_envelope.golden.json`：1 条正例逐字节匹配 canonical string，5 条负例（伪造签名、错 recipient、relay 改写 recipient、id 含 `|`、时间戳过期）逐条被拒，指纹算法与电脑端打印的一致。
 
-设计文档把「真机跑通」列为 Phase 1 出门条件（K23）。**这条尚未满足。**
-
----
+**仍然没有做到的：** 这个 APP 从没在真机或模拟器上**跑起来过**——UI 是否好用、布局是否错乱、插件在真实平台上是否工作，全都未知。`analyze` 和 `test` 证明的是「能编译、协议逻辑对」，不是「这个 APP 能用」。设计里 Phase 1 出门要的是真机路径（K23），**那一条仍未满足**。
 
 ## 已经写出来的部分
 
@@ -34,13 +32,14 @@ CI 里加了 `mobile` job，**它会是第一个真正编译这份代码的地�
 | 网络 | `lib/net/relay_client.dart`、`lib/net/session_socket.dart` | REST + WSS；**每一帧先验签再交给 UI** |
 | 状态 | `lib/domain/session_state.dart`、`lib/domain/app_controller.dart` | 事件应用规则、连接状态、只读配对拦截 |
 | 界面 | `lib/ui/*.dart` | 配对、项目列表、**会话列表**、会话（含审批/澄清）、设置 |
-| 测试 | `test/*.dart` | golden 一致性、事件应用规则、id/载荷负例 |
+| 测试 | `test/*.dart` | golden 一致性、事件应用规则、id/载荷负例（16 条，全绿） |
 
 ## 明确没做的
 
-- **扫二维码**：只做了粘贴。电脑端 `leveler remote pair` 打印的就是可粘贴的一行，设计里把粘贴列为等价路径。加扫码要引入相机插件，而这份代码还没被编译过，不适合再叠一个未验证依赖。
+- **扫二维码**：只做了粘贴。电脑端 `leveler remote pair` 打印的就是可粘贴的一行，设计里把粘贴列为等价路径。
+- **平台目录（`ios/`、`android/`）**：尚未生成，所以 `flutter build` 还跑不了；`analyze` 与 `test` 不需要它们。
 - **附件上传**：电脑端的 `upload_attachment` 也还没实现。
-- **未确认指令的重发队列已写但未测**：上限 16 条，重连后用**原 `command_id`** 重发（电脑端按该 id 去重，所以重发是同一条指令而不是第二条）。逻辑写了，没跑过。
+- **未确认指令的重发队列没有单测**：上限 16 条，重连后用**原 `command_id`** 重发（电脑端按该 id 去重，所以重发是同一条指令而不是第二条）。逻辑写了，没跑过。
 - **推送通知、生物识别锁、产物下载**：Phase 2（PR12）。
 - **内测分发**（TestFlight / Play 内测轨）：需要真机构建，见上。
 
@@ -57,9 +56,10 @@ CI 里加了 `mobile` job，**它会是第一个真正编译这份代码的地�
 ```bash
 cd apps/leveler-mobile
 flutter pub get
-flutter analyze
+flutter analyze       # 应当 No issues found
 flutter test          # golden 测试会去读 ../../testdata/signed_envelope.golden.json
-flutter run
 ```
+
+要真机跑还差：`flutter create --platforms=ios,android .` 生成平台目录，再装 CocoaPods（iOS 插件需要）或 Android SDK。
 
 golden 测试读的是仓库根部 `testdata/signed_envelope.golden.json`——**与 Rust 侧同一份文件**。协议改了而这里没跟上，它会红。

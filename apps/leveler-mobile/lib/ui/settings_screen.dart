@@ -55,9 +55,9 @@ class SettingsScreen extends StatelessWidget {
             ),
           ],
           const Divider(),
-          ListTile(
-            title: const Text('协议版本'),
-            subtitle: const Text('leveler.session.v1 · 信封 v1'),
+          const ListTile(
+            title: Text('协议版本'),
+            subtitle: Text('leveler.session.v1 · 信封 v1'),
           ),
           if (unknown.isNotEmpty)
             ListTile(

@@ -9,7 +9,7 @@
 | ⏳ **待真机** | 需要 iOS/Android 设备与 Flutter 工具链，**尚未做** |
 | ⛔ **被阻塞** | 依赖尚未存在的东西 |
 
-**当前总状态：Phase 1 未完成。** 后端链路可自证，APP 从未编译运行过。
+**当前总状态：Phase 1 未完成。** 后端链路可自证；APP 能编译、协议层测试全绿，但从未在真机或模拟器上跑起来过。
 
 ---
 
@@ -46,7 +46,7 @@
 | 助手输出下行 | ✅ | `end_to_end.rs::runtime_events_reach_the_phone_signed` |
 | 订阅 lag → `resync_required` 并关流 | ✅ | `end_to_end.rs::a_lagged_subscriber_is_told_to_resync_and_the_stream_ends` |
 | 杀 APP 进程后重连 + snapshot | ✅ | `phase1_acceptance.rs` 第 6 步 |
-| `command_id` 重试有界 | ⏳ | APP 里已写（上限 16、重连原 id 重发），**未测、未编译** |
+| `command_id` 重试有界 | ⚠️ | APP 里已写（上限 16、重连原 id 重发），能编译，**没有单测** |
 | **真机蜂窝网络下的流式体验** | ⏳ | 需要真机 |
 
 ## 四、审批
@@ -76,8 +76,9 @@
 
 | 验收项 | 档 | 依据 |
 | --- | --- | --- |
-| `flutter pub get` / `analyze` / `test` 通过 | ⏳ | **从未跑过**；CI `mobile` job 是第一次 |
-| golden 向量跨语言一致 | ⏳ | 测试已写（`test/envelope_golden_test.dart` 读 Rust 同一份文件），未跑 |
+| `flutter pub get` / `analyze` / `test` 通过 | 🖐️ | Flutter 3.44.8 实跑：依赖解析通过、`analyze` 无问题、**16 条测试全绿** |
+| golden 向量跨语言一致 | 🖐️ | `envelope_golden_test.dart` 读 Rust 同一份 `testdata/signed_envelope.golden.json`；牙口已验（互换 canonical 字段即红） |
+| **APP 在真机/模拟器上跑起来** | ⛔ | 平台目录未生成；无 Android SDK、无 iOS 模拟器 runtime、无 CocoaPods、无设备 |
 | iOS TestFlight 包 | ⛔ | 无 macOS 构建环境与签名证书 |
 | Android 内测 APK | ⛔ | 无工具链 |
 | 真机蜂窝闭环 | ⛔ | 无设备 |
@@ -90,4 +91,4 @@
 
 **不能说：** Phase 1 完成。第六节四项里有三项被阻塞在「没有 Flutter 工具链 / 没有真机」，第一项（编译与测试）连一次都没跑过。
 
-**下一步最短路径：** 找一台装了 Flutter 的机器，跑 `cd apps/leveler-mobile && flutter pub get && flutter analyze && flutter test`。第一次预期是红的——那是这份代码第一次被真正检查。修到绿，再谈真机。
+**下一步最短路径：** 平台目录 + CocoaPods（iOS）或 Android SDK，然后让 APP 第一次真正跑起来。`analyze` 与 `test` 已经绿了，证明的是「能编译、协议逻辑对」；它不证明这个 APP 能用。

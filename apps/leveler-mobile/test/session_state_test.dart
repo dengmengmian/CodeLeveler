@@ -1,6 +1,8 @@
 /// What the transcript must and must not do with a stream of events.
 library;
 
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:leveler_mobile/domain/session_state.dart';
 import 'package:leveler_mobile/protocol/ids.dart';
@@ -79,13 +81,16 @@ void main() {
 
   group('wire', () {
     test('a downstream frame decodes to the kind it names', () {
+      // `utf8.encode`, not `codeUnits`: the wire carries UTF-8 bytes, and
+      // `codeUnits` gives UTF-16 units — identical for ASCII, wrong the moment
+      // a payload contains anything else, which every Chinese label does.
       final event = DownstreamMessage.decode(
-        '{"type":"event","event":{"type":"agent_activity","label":"跑测试"}}'.codeUnits,
+        utf8.encode('{"type":"event","event":{"type":"agent_activity","label":"跑测试"}}'),
       );
       expect(event, isA<RuntimeEventMessage>());
       expect((event as RuntimeEventMessage).kind, 'agent_activity');
 
-      final unknown = DownstreamMessage.decode('{"type":"from_the_future"}'.codeUnits);
+      final unknown = DownstreamMessage.decode(utf8.encode('{"type":"from_the_future"}'));
       expect(unknown, isA<UnknownDownstream>());
     });
 
