@@ -1406,6 +1406,8 @@ pub enum ClientOrigin {
 - **结论：不得宣称生产就绪。** 三条理由：Phase 1 完成定义含真机 APP（K23）而 APP 未开始；机密性只到 TLS，托管 relay 下「运营方看不到你的对话」这句话不成立；已知问题里还有 3 条可被利用的粗糙面（RPC 重放窗口、配对无 per-runtime 锁定、rpc 无限流）。
 - **未做：** 结构化 fuzz（`cargo-fuzz`）。现有负例是针对设计点名攻击的手写向量，不能替代对解析器的随机输入测试。
 
+> **PR11a–f 总状态：⚠️ 代码已写，从未编译运行。** 本机没有 Flutter / Dart 工具链（`flutter`、`dart` 均不存在），因此 `pub get` / `analyze` / `test` / 真机**一次都没跑过**，第三方包 API 是凭记忆写的。CI 新增 `mobile` job 是**第一个真正编译它的地方，很可能是红的**。把 `apps/leveler-mobile/` 当作待修初稿，不要当作已完成的 APP。详见 `apps/leveler-mobile/README.md` 开头的免责段。
+
 ### PR11a — APP 工程脚手架 + 契约接入
 
 - **Title:** `apps/leveler-mobile: Flutter scaffold, schema codegen, secure key storage`
@@ -1475,8 +1477,8 @@ pub enum ClientOrigin {
 | `leveler-remote-agent` + ProjectRouter | **lib（尚无二进制入口）** | 是 | ⚠️ 准入 + 隧道 + RPC + ProjectRouter + 事件下行 + 审批超时已落地；**缺 `leveler remote-agent` 可执行入口与配置读取（PR7）**、`upload_attachment` |
 | `leveler-relay` self-host | docker | 是 | ✅ 控制面（含 enroll/断言认证）+ WSS 转发 + RPC 代理 + Dockerfile |
 | `leveler remote` CLI | CLI | 是 | ⚠️ status/devices/revoke 可用；pair/confirm 待 relay |
-| **leveler-mobile** | iOS + Android 内测包 | **是** | 未开始（PR11a–f） |
-| Security gate 记录 | 文档 | 是 | 未开始（PR10） |
+| **leveler-mobile** | iOS + Android 内测包 | **是** | ⚠️ 源码已写（协议核心 / 密钥 / 网络 / 五个界面 / 测试），**从未编译或运行**；无内测包 |
+| Security gate 记录 | 文档 | 是 | ✅ `docs/design/remote-security-gate.md`（结论：未通过生产宣传门禁） |
 
 ---
 

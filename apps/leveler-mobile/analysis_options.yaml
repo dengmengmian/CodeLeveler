@@ -1,0 +1,16 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-raw-types: true
+  errors:
+    # An unawaited future in this app usually means a frame was sent without
+    # anyone watching whether it failed.
+    unawaited_futures: error
+
+linter:
+  rules:
+    - avoid_print
+    - prefer_const_constructors
+    - prefer_final_locals
