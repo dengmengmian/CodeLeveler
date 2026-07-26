@@ -197,6 +197,29 @@ fn start_web(state: &mut AppState) -> Vec<Effect> {
     vec![Effect::StartWeb]
 }
 
+/// `/remote` — make this machine reachable from a phone.
+///
+/// `/remote loc` binds the relay to this machine's own network address instead
+/// of expecting one on the internet. A phone on the same Wi-Fi can reach that,
+/// which is the difference between "works once you rent a server" and "works
+/// now". It is not advertised in the command list because it is a testing and
+/// same-network path, not the shape the product is aiming at.
+fn start_remote(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let local = command
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|arg| matches!(arg, "loc" | "local" | "lan"));
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: if local {
+            "正在把这台机器开放给同一 Wi-Fi 下的手机…".to_string()
+        } else {
+            "正在生成配对二维码…".to_string()
+        },
+    });
+    vec![Effect::StartRemote { local }]
+}
+
 /// Whether `name` (without the leading `/`) is a command `handle_slash` accepts.
 fn is_known_slash(name: &str) -> bool {
     matches!(
@@ -234,6 +257,7 @@ fn is_known_slash(name: &str) -> bool {
             | "memory"
             | "skill"
             | "web"
+            | "remote"
             | "clear"
             | "new"
             | "quit"
@@ -267,6 +291,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "memory" => memory_slash(state, command),
         "skill" => skill_slash(state, command),
         "web" => start_web(state),
+        "remote" => start_remote(state, command),
         "verify" => toggle_screen(state, Screen::Verification),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),

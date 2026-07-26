@@ -41,7 +41,9 @@ mod workbench;
 
 mod run;
 
-pub use action::WebLauncher;
+pub use action::{
+    PairingRequest, RemoteInvite, RemoteLauncher, RemoteOutcome, RemoteRequest, WebLauncher,
+};
 pub use i18n::Locale;
 pub use run::{TuiError, open_in_browser, run};
 pub use state::Boot;

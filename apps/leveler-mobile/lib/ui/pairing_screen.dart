@@ -8,6 +8,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 import '../domain/app_controller.dart';
 import '../protocol/pairing.dart';
@@ -34,6 +35,20 @@ class _PairingScreenState extends State<PairingScreen> {
     _payload.dispose();
     _name.dispose();
     super.dispose();
+  }
+
+  /// Scan the code the terminal drew.
+  ///
+  /// The QR carries the same payload as the text field, so both paths converge
+  /// on one parser — and on the same fingerprint comparison. A simulator has no
+  /// camera, which is why pasting stays.
+  Future<void> _scan() async {
+    final scanned = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const _ScannerScreen()),
+    );
+    if (scanned == null || !mounted) return;
+    _payload.text = scanned;
+    await _read();
   }
 
   Future<void> _read() async {
@@ -87,10 +102,11 @@ class _PairingScreenState extends State<PairingScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          Text('在电脑上运行 `leveler remote pair`，把它打印的那一行粘贴到这里。',
+          Text('在电脑的 CodeLeveler 里输入 /remote，屏幕上会出现一个二维码，用下面的「扫码」扫它。',
               style: theme.textTheme.bodyMedium),
           const SizedBox(height: 4),
-          Text('（扫码尚未内置；粘贴是等价的路径。）', style: theme.textTheme.bodySmall),
+          Text('（扫不了的时候，二维码下面那一行也可以直接粘贴过来。）',
+              style: theme.textTheme.bodySmall),
           const SizedBox(height: 16),
           TextField(
             controller: _payload,
@@ -124,7 +140,21 @@ class _PairingScreenState extends State<PairingScreen> {
             subtitle: const Text('可以看会话与事件，不能发送任何指令'),
           ),
           const SizedBox(height: 8),
-          FilledButton(onPressed: _read, child: const Text('读取载荷')),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _scan,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('扫码'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton(onPressed: _read, child: const Text('读取粘贴的载荷')),
+              ),
+            ],
+          ),
           if (_error != null) ...[
             const SizedBox(height: 16),
             Text(_error!, style: TextStyle(color: theme.colorScheme.error)),
@@ -215,6 +245,40 @@ class _Fingerprint extends StatelessWidget {
         ),
         Text(hint, style: theme.textTheme.bodySmall),
       ],
+    );
+  }
+}
+
+/// A camera that returns the first payload it recognises.
+class _ScannerScreen extends StatefulWidget {
+  const _ScannerScreen();
+
+  @override
+  State<_ScannerScreen> createState() => _ScannerScreenState();
+}
+
+class _ScannerScreenState extends State<_ScannerScreen> {
+  bool _handled = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('扫描电脑上的二维码')),
+      body: MobileScanner(
+        onDetect: (capture) {
+          // One result only: the camera fires repeatedly, and popping twice
+          // would tear down the screen underneath as well.
+          if (_handled) return;
+          for (final barcode in capture.barcodes) {
+            final value = barcode.rawValue;
+            if (value != null && value.isNotEmpty) {
+              _handled = true;
+              Navigator.of(context).pop(value);
+              return;
+            }
+          }
+        },
+      ),
     );
   }
 }

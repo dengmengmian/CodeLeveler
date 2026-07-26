@@ -133,6 +133,16 @@ impl InputQueues {
     }
 }
 
+/// The `/remote` invite, as the screen shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteState {
+    pub invite: crate::action::RemoteInvite,
+    /// Set once a phone has claimed the invite and is waiting to be accepted.
+    pub pending: Option<crate::action::PairingRequest>,
+    /// What happened after the user decided, so the screen can say so.
+    pub outcome: Option<String>,
+}
+
 /// The whole UI state.
 #[derive(Debug)]
 pub struct AppState {
@@ -220,6 +230,9 @@ pub struct AppState {
     pub web_url: Option<String>,
     /// True while `/web`'s server is starting (guards against double-launch).
     pub web_starting: bool,
+    /// The invite `/remote` produced, and who is waiting on it. Present only
+    /// while the invite screen is up.
+    pub remote: Option<RemoteState>,
 
     /// Models the user can switch to, and the current execution mode — used to
     /// build the model/mode pickers.
@@ -382,6 +395,7 @@ impl AppState {
             notification: None,
             web_url: None,
             web_starting: false,
+            remote: None,
             available_models: Vec::new(),
             mode: PermissionProfile::Assisted,
             screen_scroll: 0,

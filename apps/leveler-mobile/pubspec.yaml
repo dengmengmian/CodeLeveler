@@ -17,6 +17,7 @@ dependencies:
   http: ^1.2.2
   web_socket_channel: ^3.0.1
   flutter_markdown_plus: ^1.0.12
+  mobile_scanner: ^7.4.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

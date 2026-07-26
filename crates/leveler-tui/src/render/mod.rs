@@ -2,7 +2,9 @@
 //! the composer. Layout degrades on narrow terminals .
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::plan_cell::{render_agents_screen, render_plan_screen};
@@ -37,8 +39,6 @@ pub(crate) use footer::{
     COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, render_attachments,
     render_composer, render_slash_popup,
 };
-#[cfg(test)]
-use ratatui::text::Line;
 use screens::{
     render_context_screen, render_diff_screen, render_help_screen, render_sessions_screen,
     render_verification_screen,
@@ -90,6 +90,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Sessions => render_sessions_screen(frame, chunks[1], state),
         Screen::Context => render_context_screen(frame, chunks[1], state),
         Screen::Agents => render_agents_screen(frame, chunks[1], state),
+        Screen::Remote => render_remote_screen(frame, chunks[1], state),
         Screen::Help => render_help_screen(frame, chunks[1], state),
     }
     frame.render_widget(
@@ -1603,4 +1604,70 @@ mod tests {
             "list content: {text:?}"
         );
     }
+}
+
+/// The `/remote` invite.
+///
+/// A QR, the address it points at, and the fingerprint the user must compare
+/// with the phone. The comparison is the whole security of pairing, so it is
+/// not a footnote here — it is the thing the screen is about once a device
+/// shows up.
+fn render_remote_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+    let Some(remote) = &state.remote else {
+        frame.render_widget(Paragraph::new("正在准备…"), area);
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        "用手机扫这个码",
+        Style::default().add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(""));
+    for row in &remote.invite.qr {
+        lines.push(Line::from(row.clone()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("地址：{}", remote.invite.relay_url)));
+    lines.push(Line::from(format!(
+        "本机指纹：{}",
+        remote.invite.host_fingerprint
+    )));
+    lines.push(Line::from(""));
+
+    match (&remote.pending, &remote.outcome) {
+        (Some(pending), _) => {
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "「{}」（{}）想要连接",
+                    pending.device_name, pending.platform
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::from(format!("手机指纹：{}", pending.fingerprint)));
+            lines.push(Line::from(
+                "请与手机上显示的那一行逐字比对——你确认的是这把密钥，不是设备名字。",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "y 接受    n 拒绝",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]));
+        }
+        (None, Some(outcome)) => lines.push(Line::from(outcome.clone())),
+        (None, None) => {
+            lines.push(Line::from("扫码后，这里会显示手机的指纹等你确认。"));
+            lines.push(Line::from("扫不了码时，可以让手机粘贴下面这一行："));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                remote.invite.payload.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).scroll((state.screen_scroll as u16, 0)),
+        area,
+    );
 }

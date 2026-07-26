@@ -597,7 +597,7 @@ pub(crate) async fn cmd_tui(
         let client: Arc<dyn InteractiveRuntimeClient> = client;
         // Daemon-attached TUI: no local runtime to bind a Web UI onto. `/web`
         // reports this and points at `leveler web --connect`.
-        leveler_tui::run(client, None, boot).await?;
+        leveler_tui::run(client, None, None, boot).await?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
@@ -645,6 +645,9 @@ pub(crate) async fn cmd_tui(
     let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
     let web_repo_root = app.layout.repo_root.clone();
+    let remote_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
+        in_process_client.clone();
+    let remote_repo_root = app.layout.repo_root.clone();
     let web_launcher: leveler_tui::WebLauncher = Arc::new(move || {
         let service = web_service.clone();
         let repo_root = web_repo_root.clone();
@@ -705,7 +708,19 @@ pub(crate) async fn cmd_tui(
         untrusted_config: crate::trust_cmds::untrusted_config_display(&app.layout.repo_root),
     };
 
-    leveler_tui::run(client, Some(web_launcher), boot).await?;
+    // `/remote`: the agent serves paired phones over this same in-process
+    // runtime, so remote access lives exactly as long as this session.
+    let remote_launcher = crate::remote_invite::launcher(
+        remote_service,
+        remote_repo_root,
+        leveler_remote_agent::RemoteHome::new(
+            leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+                .unwrap_or_else(|| std::path::PathBuf::from(".leveler"))
+                .join("remote"),
+        ),
+    );
+
+    leveler_tui::run(client, Some(web_launcher), Some(remote_launcher), boot).await?;
     // The TUI owns the only runtime, and an in-process `/web` server is spawned
     // detached on a token it never cancels (it serves "until the process
     // exits"). Falling through to a normal return would drop the runtime with

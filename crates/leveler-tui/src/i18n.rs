@@ -405,6 +405,8 @@ pub struct SlashText {
     pub clear: &'static str,
     pub help: &'static str,
     pub quit: &'static str,
+    /// `/remote`
+    pub remote: &'static str,
 }
 
 /// Argument ghosts for commands that require free-text params.
@@ -575,6 +577,7 @@ static ZH: UiText = UiText {
         compact: "压缩上下文（节省 token）",
         export: "导出对话为 markdown（默认存当前目录，可 /export <路径>）",
         web: "在浏览器打开 Web UI（loopback + token，同一会话）",
+        remote: "让手机扫码连接这台机器",
         image: "添加图片附件",
         attach: "添加文件附件",
         paste: "粘贴剪贴板图片",
@@ -822,6 +825,7 @@ static EN: UiText = UiText {
         compact: "compact context",
         export: "export conversation to markdown (cwd by default; /export <path>)",
         web: "open the browser Web UI (loopback + token, same session)",
+        remote: "Pair a phone with this machine by QR",
         image: "attach image",
         attach: "add attachment",
         paste: "paste clipboard image",

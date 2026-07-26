@@ -45,6 +45,10 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             apply_effect_completion(state, completion);
             Vec::new()
         }
+        Action::Remote(outcome) => {
+            apply_remote(state, outcome);
+            Vec::new()
+        }
         Action::WebLaunched(result) => {
             state.web_starting = false;
             match result {
@@ -1085,5 +1089,49 @@ fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
             message: QUIT_CONFIRM_MESSAGE.to_string(),
         });
         Vec::new()
+    }
+}
+
+/// Fold what the host side reported into the invite screen.
+fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
+    use crate::action::RemoteOutcome;
+    match outcome {
+        RemoteOutcome::Invited(invite) => {
+            state.remote = Some(crate::state::RemoteState {
+                invite,
+                pending: None,
+                outcome: None,
+            });
+            state.active_screen = crate::screen::Screen::Remote;
+        }
+        // Polled while the invite is up; a phone has claimed it and is waiting
+        // for the person at the keyboard.
+        RemoteOutcome::Waiting(pending) => {
+            if let Some(remote) = state.remote.as_mut() {
+                remote.pending = pending;
+            }
+        }
+        RemoteOutcome::Paired { device_name } => {
+            if let Some(remote) = state.remote.as_mut() {
+                remote.pending = None;
+                remote.outcome = Some(format!("已接受「{device_name}」，手机现在可以连接了。"));
+            }
+        }
+        RemoteOutcome::Rejected => {
+            if let Some(remote) = state.remote.as_mut() {
+                remote.pending = None;
+                remote.outcome = Some("已拒绝这次配对，本机没有记录任何密钥。".to_string());
+            }
+        }
+        RemoteOutcome::Failed(message) => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message,
+            });
+            // Leave the screen up only if it already had something to show.
+            if state.remote.is_none() {
+                state.active_screen = crate::screen::Screen::Conversation;
+            }
+        }
     }
 }

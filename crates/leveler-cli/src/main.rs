@@ -17,6 +17,7 @@ mod memory_cmds;
 mod output;
 mod permissions_cmds;
 mod remote_cmds;
+mod remote_invite;
 mod render;
 mod run_cmds;
 mod sessions_cmd;

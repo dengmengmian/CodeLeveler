@@ -38,6 +38,23 @@ fn scroll_screen_key(state: &mut AppState, key: &KeyEvent, line_keys: bool) -> b
 /// conversation .
 pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     match state.active_screen {
+        // The one screen where a keystroke is a security decision, so only an
+        // explicit y/n counts and Esc simply leaves without answering.
+        Screen::Remote => {
+            let waiting = state.remote.as_ref().is_some_and(|r| r.pending.is_some());
+            match key.code {
+                KeyCode::Esc => close_screen(state),
+                KeyCode::Char('y') | KeyCode::Char('Y') if waiting => {
+                    return vec![Effect::AnswerPairing { accept: true }];
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if waiting => {
+                    return vec![Effect::AnswerPairing { accept: false }];
+                }
+                _ => {
+                    scroll_screen_key(state, &key, true);
+                }
+            }
+        }
         Screen::Tools => {
             let len = state
                 .transcript

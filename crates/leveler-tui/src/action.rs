@@ -40,6 +40,8 @@ pub enum EffectCompletion {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Action {
+    /// `/remote` finished, one way or another.
+    Remote(RemoteOutcome),
     /// An event from the runtime.
     Runtime(RuntimeEvent),
     /// A key press.
@@ -86,8 +88,74 @@ pub enum Effect {
     /// Open a URL in the default browser (conversation link click, or `/web`
     /// re-invocation when the server is already up).
     OpenWebUrl(String),
+    /// Make this machine reachable from a paired phone and produce an invite
+    /// (`/remote`). `local` binds the relay to this machine's LAN address
+    /// instead of expecting one on the internet — a phone on the same Wi-Fi can
+    /// reach that, and it needs no server anywhere.
+    StartRemote { local: bool },
+    /// Accept or reject the device waiting to pair, from the invite screen.
+    AnswerPairing { accept: bool },
     /// Tear down the UI and exit.
     Quit,
+}
+
+/// What `/remote` produced: everything the invite screen shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInvite {
+    /// The QR, already rendered as terminal rows. The TUI does not encode it
+    /// itself — that would put a QR library in a crate whose job is drawing.
+    pub qr: Vec<String>,
+    /// The payload the QR encodes, for a phone that cannot scan.
+    pub payload: String,
+    /// This machine's key fingerprint, for the user to compare on the phone.
+    pub host_fingerprint: String,
+    /// Where the phone will connect, shown so a user can see it is their own
+    /// network rather than someone else's server.
+    pub relay_url: String,
+}
+
+/// A device waiting for this machine to accept it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRequest {
+    pub device_name: String,
+    pub platform: String,
+    /// What the user compares with the phone's screen. The whole security of
+    /// pairing is this one comparison.
+    pub fingerprint: String,
+}
+
+/// Injected at startup by the CLI: makes this machine reachable and answers the
+/// pairing it produces. Opaque so `leveler-tui` needs neither the relay nor the
+/// agent — the same reason [`WebLauncher`] is a closure.
+pub type RemoteLauncher = std::sync::Arc<
+    dyn Fn(
+            RemoteRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RemoteOutcome> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What the TUI is asking the host side to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteRequest {
+    /// Start (if needed) and produce an invite.
+    Invite {
+        local: bool,
+    },
+    /// Is anybody waiting to be accepted?
+    Pending,
+    Accept,
+    Reject,
+}
+
+/// What came back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteOutcome {
+    Invited(RemoteInvite),
+    Waiting(Option<PairingRequest>),
+    Paired { device_name: String },
+    Rejected,
+    Failed(String),
 }
 
 /// Injected at startup by the CLI: binds and serves the browser Web UI over the

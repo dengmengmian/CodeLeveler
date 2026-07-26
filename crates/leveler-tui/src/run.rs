@@ -81,6 +81,7 @@ pub enum TuiError {
 pub async fn run(
     client: Arc<dyn InteractiveRuntimeClient>,
     web_launcher: Option<WebLauncher>,
+    remote_launcher: Option<crate::action::RemoteLauncher>,
     boot: Boot,
 ) -> Result<(), TuiError> {
     let (mut guard, mut stdout) = TerminalGuard::enter()?;
@@ -293,6 +294,7 @@ pub async fn run(
             &completion_tx,
             &delivery_tx,
             &web_launcher,
+            &remote_launcher,
         );
 
         // Busy spinner + elapsed clock, and draining queued input when idle.
@@ -310,6 +312,7 @@ pub async fn run(
                 &completion_tx,
                 &delivery_tx,
                 &web_launcher,
+                &remote_launcher,
             );
         }
 
@@ -405,6 +408,7 @@ fn dispatch_effects(
     completion_tx: &mpsc::UnboundedSender<Action>,
     delivery_tx: &mpsc::UnboundedSender<DeliveryJob>,
     web_launcher: &Option<WebLauncher>,
+    remote_launcher: &Option<crate::action::RemoteLauncher>,
 ) {
     for effect in effects {
         match effect {
@@ -476,6 +480,39 @@ fn dispatch_effects(
                     )));
                 }
             },
+            Effect::StartRemote { local } => {
+                run_remote(
+                    remote_launcher.as_ref(),
+                    crate::action::RemoteRequest::Invite { local },
+                    &completion_tx,
+                );
+                // A phone claims the invite seconds later and then waits for a
+                // person. Nothing pushes that fact here, so ask — a user who
+                // scanned a code should not have to guess what to press next.
+                if let Some(launcher) = remote_launcher.as_ref() {
+                    let launcher = Arc::clone(launcher);
+                    let tx = completion_tx.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..600 {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            let outcome = launcher(crate::action::RemoteRequest::Pending).await;
+                            let waiting =
+                                matches!(&outcome, crate::action::RemoteOutcome::Waiting(Some(_)));
+                            if tx.send(Action::Remote(outcome)).is_err() || waiting {
+                                return;
+                            }
+                        }
+                    });
+                }
+            }
+            Effect::AnswerPairing { accept } => {
+                let request = if accept {
+                    crate::action::RemoteRequest::Accept
+                } else {
+                    crate::action::RemoteRequest::Reject
+                };
+                run_remote(remote_launcher.as_ref(), request, &completion_tx);
+            }
             Effect::OpenWebUrl(url) => open_in_browser(&url),
             Effect::Quit => state.running = false,
         }
@@ -804,5 +841,30 @@ mod tests {
             s.notification.as_ref().map(|n| n.message.as_str()),
             Some("boom")
         );
+    }
+}
+
+/// Ask the host side to do one remote thing and fold the answer back.
+///
+/// Absent launcher means this TUI is attached to someone else's daemon, where
+/// "make *this* machine reachable" is not a question this process can answer.
+fn run_remote(
+    launcher: Option<&crate::action::RemoteLauncher>,
+    request: crate::action::RemoteRequest,
+    completion_tx: &tokio::sync::mpsc::UnboundedSender<Action>,
+) {
+    match launcher {
+        Some(launcher) => {
+            let launcher = Arc::clone(launcher);
+            let tx = completion_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(Action::Remote(launcher(request).await));
+            });
+        }
+        None => {
+            let _ = completion_tx.send(Action::Remote(crate::action::RemoteOutcome::Failed(
+                "当前 TUI 连接的是远程 daemon，不能把这台机器开放给手机".to_string(),
+            )));
+        }
     }
 }

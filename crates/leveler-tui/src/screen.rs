@@ -17,6 +17,8 @@ pub enum Screen {
     Sessions,
     Context,
     Agents,
+    /// The `/remote` invite: a QR to scan, and the fingerprint to compare.
+    Remote,
     Help,
 }
 
@@ -44,6 +46,7 @@ pub const SLASH_NAMES: &[&str] = &[
     "/compact",
     "/export",
     "/web",
+    "/remote",
     "/image",
     "/attach",
     "/paste",
@@ -79,6 +82,7 @@ pub fn slash_commands(t: &UiText) -> Vec<(&'static str, &'static str)> {
         ("/compact", s.compact),
         ("/export", s.export),
         ("/web", s.web),
+        ("/remote", s.remote),
         ("/image", s.image),
         ("/attach", s.attach),
         ("/paste", s.paste),
