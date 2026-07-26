@@ -23,6 +23,7 @@ tracing = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = "0.26"
+toml = { workspace = true }
 
 [dev-dependencies]
 # `test-util` gives the approval-timeout tests a paused clock, so a two-minute

@@ -441,3 +441,100 @@ fn re_accepting_a_device_replaces_its_key() {
     assert_eq!(key, replacement);
     assert_eq!(scope, PairingScope::Observe);
 }
+
+/// Pairing normally happens *while* the agent is running: the user starts the
+/// agent, then runs `leveler remote pair` and `confirm`. A store cached at
+/// startup would leave that phone untrusted until someone restarted the process.
+#[tokio::test]
+async fn a_device_paired_while_the_agent_runs_is_trusted_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("remote").join("devices.json");
+    // The agent starts with nothing paired.
+    let devices = TrustedDevices::load(&path).unwrap();
+    let runtime = RecordingRuntime::default();
+    let delivered = runtime.delivered.clone();
+    let bridge = AgentBridge::new(
+        Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime))),
+        devices,
+        RUNTIME_ID,
+        runtime_key(),
+        false,
+    );
+
+    let frame = upstream(
+        &device_key(),
+        DEVICE_ID,
+        RUNTIME_ID,
+        &deliver_body(r#"{"type":"submit_message","session_id":"s1","content":"先来一句"}"#),
+    );
+    let error = bridge
+        .admit_upstream(PROJECT_ID, &frame, AT, None)
+        .await
+        .expect_err("not paired yet");
+    assert_eq!(error.code(), "unauthorized");
+
+    // The CLI accepts the device in its own process, writing the same file.
+    let mut cli_side = TrustedDevices::load(&path).unwrap();
+    cli_side
+        .accept(
+            DEVICE_ID,
+            &device_key().verifying_key(),
+            "iPhone",
+            PairingScope::Interactive,
+            AT,
+        )
+        .unwrap();
+
+    let frame = upstream(
+        &device_key(),
+        DEVICE_ID,
+        RUNTIME_ID,
+        &deliver_body(r#"{"type":"submit_message","session_id":"s1","content":"配对之后"}"#),
+    );
+    bridge
+        .admit_upstream(PROJECT_ID, &frame, AT, None)
+        .await
+        .expect("the running agent must see the new pairing");
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+}
+
+/// And the reverse, which the CLI promises out loud: revoking takes effect on
+/// the next frame, not at the next restart.
+#[tokio::test]
+async fn a_revocation_lands_on_the_next_frame_of_a_running_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge, delivered) = bridge_with_paired_device(&dir, PairingScope::Interactive);
+
+    let frame = upstream(
+        &device_key(),
+        DEVICE_ID,
+        RUNTIME_ID,
+        &deliver_body(r#"{"type":"submit_message","session_id":"s1","content":"撤销之前"}"#),
+    );
+    bridge
+        .admit_upstream(PROJECT_ID, &frame, AT, None)
+        .await
+        .expect("paired");
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+
+    let mut cli_side =
+        TrustedDevices::load(dir.path().join("remote").join("devices.json")).unwrap();
+    assert!(cli_side.revoke(DEVICE_ID, AT).unwrap());
+
+    let frame = upstream(
+        &device_key(),
+        DEVICE_ID,
+        RUNTIME_ID,
+        &deliver_body(r#"{"type":"submit_message","session_id":"s1","content":"撤销之后"}"#),
+    );
+    let error = bridge
+        .admit_upstream(PROJECT_ID, &frame, AT, None)
+        .await
+        .expect_err("a revoked device must stop being admitted");
+    assert_eq!(error.code(), "device_revoked");
+    assert_eq!(
+        delivered.lock().unwrap().len(),
+        1,
+        "nothing more may reach the runtime"
+    );
+}

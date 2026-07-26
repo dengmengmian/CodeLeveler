@@ -23,6 +23,22 @@ impl std::fmt::Debug for SigningKey {
 }
 
 impl SigningKey {
+    /// Create a fresh key, returning it with the seed to persist.
+    ///
+    /// The seed is handed back rather than written anywhere here: this crate
+    /// defines key material, and where a host's key lives is the host's
+    /// decision. Callers are expected to store it with `0600` permissions.
+    pub fn generate() -> Result<(Self, [u8; 32]), EnvelopeError> {
+        use ring::rand::SecureRandom as _;
+
+        let mut seed = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut seed)
+            .map_err(|_| EnvelopeError::InvalidKey)?;
+        let key = Self::from_seed(&seed)?;
+        Ok((key, seed))
+    }
+
     /// Build from a 32-byte Ed25519 seed.
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self, EnvelopeError> {
         let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(seed)

@@ -7,8 +7,17 @@
 //! on their own terminal, and a relay that could later substitute a key would
 //! make that confirmation meaningless while leaving the signature check looking
 //! like it still worked.
+//!
+//! Because the file is the authority, every lookup reads it. The alternative —
+//! caching at startup — makes two ordinary things quietly not work: a device
+//! paired while the agent is running stays untrusted, and a revocation does not
+//! take effect until someone restarts the process, which is exactly the window
+//! the threat model calls "revoked but still delivering". Upstream frames are
+//! user-initiated and rare, so a small read costs nothing next to the signature
+//! verification that follows it.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use leveler_remote_protocol::pairing::{DeviceStore, PairedDevice, PairingScope};
 use leveler_remote_protocol::{EnvelopeError, VerifyingKey};
@@ -39,26 +48,47 @@ impl TrustError {
 }
 
 /// Reads and writes `~/.leveler/remote/devices.json`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TrustedDevices {
     path: PathBuf,
-    store: DeviceStore,
+    /// Last known-good contents, used only when the file cannot be read — a
+    /// truncated write must not drop trust in every device mid-flight.
+    cached: Mutex<DeviceStore>,
 }
 
 impl TrustedDevices {
     /// Load the store, treating a missing file as "nothing is paired yet".
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let store = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DeviceStore::default(),
-            Err(error) => return Err(error),
-        };
-        Ok(Self { path, store })
+        let store = read_store(&path)?;
+        Ok(Self {
+            path,
+            cached: Mutex::new(store),
+        })
     }
 
-    pub fn devices(&self) -> &[PairedDevice] {
-        &self.store.devices
+    /// The devices on disk right now.
+    pub fn devices(&self) -> Vec<PairedDevice> {
+        self.current().devices
+    }
+
+    /// The file's contents, falling back to the last good copy if it cannot be
+    /// read or parsed.
+    fn current(&self) -> DeviceStore {
+        match read_store(&self.path) {
+            Ok(store) => {
+                *self.cached.lock().unwrap() = store.clone();
+                store
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "could not read the device store; using the last good copy"
+                );
+                self.cached.lock().unwrap().clone()
+            }
+        }
     }
 
     /// Record a device the user accepted.
@@ -73,10 +103,12 @@ impl TrustedDevices {
         scope: PairingScope,
         paired_at: &str,
     ) -> std::io::Result<()> {
-        self.store
-            .devices
-            .retain(|device| device.device_id != device_id);
-        self.store.devices.push(PairedDevice {
+        // Read-modify-write against what is on disk, not against whatever this
+        // handle saw when it was created: another process may have paired a
+        // device since.
+        let mut store = self.current();
+        store.devices.retain(|device| device.device_id != device_id);
+        store.devices.push(PairedDevice {
             device_id: device_id.to_string(),
             device_pubkey_b64: key.to_base64url(),
             fingerprint: key.fingerprint(),
@@ -85,14 +117,14 @@ impl TrustedDevices {
             paired_at: paired_at.to_string(),
             revoked_at: None,
         });
-        self.persist()
+        self.persist(&store)
     }
 
     /// Mark a device revoked, keeping the row so an operator can still see what
     /// was paired and when it was withdrawn.
     pub fn revoke(&mut self, device_id: &str, revoked_at: &str) -> std::io::Result<bool> {
-        let Some(device) = self
-            .store
+        let mut store = self.current();
+        let Some(device) = store
             .devices
             .iter_mut()
             .find(|device| device.device_id == device_id)
@@ -100,7 +132,7 @@ impl TrustedDevices {
             return Ok(false);
         };
         device.revoked_at = Some(revoked_at.to_string());
-        self.persist()?;
+        self.persist(&store)?;
         Ok(true)
     }
 
@@ -114,8 +146,10 @@ impl TrustedDevices {
         device_id: &str,
         relay_claimed_pubkey: Option<&str>,
     ) -> Result<(VerifyingKey, PairingScope), TrustError> {
-        let device = self
-            .store
+        // From disk, every time: pairing and revocation happen in another
+        // process, and both must take effect on the very next frame.
+        let store = self.current();
+        let device = store
             .devices
             .iter()
             .find(|device| device.device_id == device_id)
@@ -148,17 +182,27 @@ impl TrustedDevices {
 
     /// Write the store, replacing the file atomically so a crash mid-write
     /// cannot leave a truncated list of trusted keys behind.
-    fn persist(&self) -> std::io::Result<()> {
+    fn persist(&self, store: &DeviceStore) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
             restrict(parent, 0o700)?;
         }
         let temporary = self.path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(&self.store).map_err(std::io::Error::other)?;
+        let bytes = serde_json::to_vec_pretty(store).map_err(std::io::Error::other)?;
         std::fs::write(&temporary, &bytes)?;
         restrict(&temporary, 0o600)?;
         std::fs::rename(&temporary, &self.path)?;
+        *self.cached.lock().unwrap() = store.clone();
         Ok(())
+    }
+}
+
+/// Read the store, treating a missing file as "nothing is paired yet".
+fn read_store(path: &Path) -> std::io::Result<DeviceStore> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DeviceStore::default()),
+        Err(error) => Err(error),
     }
 }
 

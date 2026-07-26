@@ -299,10 +299,46 @@ pub enum PermissionsCommand {
 ///
 /// With no subcommand, `leveler trust` lists what is untrusted and asks to
 /// confirm — the same as `leveler trust allow`.
-/// Remote control surface. Pairing needs a relay, which does not ship yet;
-/// what works today is inspecting and withdrawing trust in paired devices.
+/// Remote control surface: enable the host, enroll it with a relay, pair a
+/// phone, and run the agent that serves it.
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
+    /// Create this machine's remote identity and point it at a relay.
+    Enable {
+        /// Base URL of the relay, e.g. https://relay.example
+        #[arg(long, value_name = "URL")]
+        relay_url: String,
+        /// What the phone shows for this machine. Defaults to the hostname.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Register this machine's public key with the relay.
+    ///
+    /// Needs the relay operator's enrollment secret, read from
+    /// `LEVELER_RELAY_ENROLLMENT_SECRET` or stdin — never from the command
+    /// line, where it would land in shell history and the process table.
+    Enroll,
+    /// Start a pairing and print the payload a phone scans or pastes.
+    Pair {
+        /// `interactive` (default) or `observe` for a read-only device.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+    },
+    /// Accept or reject the device waiting to pair, after comparing its
+    /// fingerprint with the one on the phone's screen.
+    Confirm {
+        /// Reject instead of accepting.
+        #[arg(long)]
+        reject: bool,
+        /// Skip the interactive prompt. Refuses to run without a terminal
+        /// otherwise, because accepting is a decision, not a default.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List the projects a paired phone can reach, with their daemon status.
+    Projects,
+    /// Run the remote agent: connect out to the relay and serve paired devices.
+    Agent,
     /// Show whether remote control is configured on this machine.
     Status,
     /// List paired devices with the fingerprint the user confirmed.

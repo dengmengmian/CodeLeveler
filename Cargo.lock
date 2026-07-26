@@ -1823,6 +1823,7 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "console",
@@ -1845,6 +1846,7 @@ dependencies = [
  "leveler-provider",
  "leveler-remote-agent",
  "leveler-remote-protocol",
+ "leveler-session-wire",
  "leveler-storage",
  "leveler-tools",
  "leveler-tui",
@@ -2155,6 +2157,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
+ "toml",
  "tracing",
 ]
 
