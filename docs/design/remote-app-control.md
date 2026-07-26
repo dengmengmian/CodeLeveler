@@ -1382,12 +1382,16 @@ pub enum ClientOrigin {
   - **写失败被吞掉**：审计写不进去不能变成拒绝命令的新方式。
 - **未做（明说）：** **没有指标导出器**（Prometheus 之类）。仓库里本来就没有这套设施，为了对齐一张表而现造一套基础设施，代价大于收益。审计行本身可数（每条事件一行），需要指标时再从这里聚合。`forward_bytes` 同样未做。
 
-### PR9 — monorepo e2e
+### PR9 — monorepo e2e ⚠️ 验收路径已自动化，重启用例未做
 
 - **Title:** `e2e: multi-project switch, pair, deliver, approval timeout, resync, revoke, offline 503`
 - **Affects:** CI job
 - **Deps:** PR5–PR8
 - **DoD:** Phase 1 验收路径自动化；**≥2 project 切换不串台**；审批重启用例
+- **已完成：** `tests/phase1_acceptance.rs` 把整条路径**按用户真实顺序走一遍**：enroll → 配对（先写本机信任再通知 relay）→ 取 token → `list_projects` 签包 → `create_session` 签包 → alpha 对话 + 事件下行 → 切到 beta（**断言 alpha 没收到 beta 的流量**）→ 远程独有审批超时被本机自动拒绝 → 杀掉手机连接后重连并 resync snapshot → 撤销（本机 + relay 双向）→ host 下线不排队。3 秒跑完。
+  - 每一步单独都有专门测试；这条的价值是**顺序本身**：只在组合下才出现的 bug（切换项目后撤销失效、重连丢失 stream 绑定）在单独起 fixture 的测试里无处显形。
+  - CI 里作为**独立步骤** `Remote control acceptance`（非 Windows）先于全量 workspace 测试跑，配对/隔离/超时/撤销这条链断了会直接指出来，而不是埋在一大堆输出里。
+- **未做（明说）：** **「审批 pending + 进程重启」用例没有做。** 它验的是 runtime 重启后能否从 event log 重建 `pending_interactions`，属于 `leveler-app` + storage 的行为，用远程侧的假 runtime 测不出任何东西——那只会测到假货自己。要做就得在 leveler-app 里做，是另一次改动，不在远程表面内。
 
 ### PR10 — Security gate
 

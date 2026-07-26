@@ -70,6 +70,18 @@ jobs:
         if: runner.os == 'Linux'
         run: sh scripts/test_install.sh
 
+      # The remote-control surface as its own required step. It is one chain
+      # across three crates — a phone, a relay nobody trusts, and a host — and a
+      # break in pairing, project isolation, the approval timeout or revocation
+      # should be visible here rather than buried in the workspace run that
+      # follows. Unix only: the MVP host is macOS/Linux.
+      - name: Remote control acceptance
+        if: runner.os != 'Windows'
+        run: |
+          cargo test -p leveler-remote-protocol --all-features --locked
+          cargo test -p leveler-remote-agent --all-features --locked
+          cargo test -p leveler-relay --all-features --locked
+
       - name: Test
         # --no-fail-fast: run every test binary and report ALL failures in one
         # run instead of stopping at the first failing crate (so a Windows-only
