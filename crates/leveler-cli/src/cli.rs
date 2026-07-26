@@ -324,6 +324,12 @@ pub enum RemoteCommand {
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
     },
+    /// Show the device waiting to pair, without deciding anything.
+    ///
+    /// Separate from `confirm` because looking and accepting are different
+    /// acts: a script (or a careful person) needs to see who is waiting
+    /// without that glance counting as a yes.
+    Pending,
     /// Accept or reject the device waiting to pair, after comparing its
     /// fingerprint with the one on the phone's screen.
     Confirm {

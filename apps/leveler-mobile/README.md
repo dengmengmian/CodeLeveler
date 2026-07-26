@@ -13,12 +13,16 @@
 | `flutter pub get` | ✅ 64 个依赖解析通过 |
 | `flutter analyze` | ✅ **No issues found** |
 | `flutter test` | ✅ **16 条全绿**，含跨语言 golden |
-| iOS / Android 真机 | ❌ 未跑：无 Android SDK、无 iOS 模拟器 runtime、无 CocoaPods、无设备 |
-| 内测包（TestFlight / Play） | ❌ 未做，见上 |
+| iOS 模拟器（iPhone 17 Pro / iOS 26.5）构建并启动 | ✅ 装进模拟器跑起来了，中文渲染正常，设备密钥真的写进了 Keychain |
+| **模拟器上的完整配对验收** | ✅ `scripts/simulator_pairing.sh`：真 relay + 真 agent + 真人工确认，一条命令跑完 |
+| Android | ❌ 无 Android SDK，未构建 |
+| 真机蜂窝 / 内测包（TestFlight、Play） | ❌ 未做：需要真设备与签名证书 |
 
 **golden 一致性是真的，不是空转。** 牙口验过：把 canonical string 里 `sender_id` 与 `recipient_id` 的位置互换，`envelope_golden_test.dart` 立刻转红并打印精确差异；换回即绿。也就是说这份 Dart 实现与 Rust 侧对着**同一份答案卷** `testdata/signed_envelope.golden.json`：1 条正例逐字节匹配 canonical string，5 条负例（伪造签名、错 recipient、relay 改写 recipient、id 含 `|`、时间戳过期）逐条被拒，指纹算法与电脑端打印的一致。
 
-**仍然没有做到的：** 这个 APP 从没在真机或模拟器上**跑起来过**——UI 是否好用、布局是否错乱、插件在真实平台上是否工作，全都未知。`analyze` 和 `test` 证明的是「能编译、协议逻辑对」，不是「这个 APP 能用」。设计里 Phase 1 出门要的是真机路径（K23），**那一条仍未满足**。
+**模拟器验收跑通了什么：** `./scripts/simulator_pairing.sh <udid>` 启动 relay、注册本机、起 agent、打印配对载荷，然后驱动模拟器上的 APP 粘贴载荷、核对指纹、提交配对，**在电脑确认之前的 4 秒里断言手机仍未配对**（电脑端故意等 8 秒才接受），确认后 APP 取得 token、签名 RPC、验签返回的项目列表并进入项目页。指纹断言比对的是电脑端 `leveler remote status` 打印的那一串——不是「有个指纹」而是「是这台机器的指纹」。
+
+**仍然没有做到的：** 真机、蜂窝网络、内测包、Android。模拟器不是真机：网络栈、后台策略、推送、生物识别在真设备上会不一样。设计里 Phase 1 出门要的是**真机**路径（K23），**那一条仍未满足**。
 
 ## 已经写出来的部分
 

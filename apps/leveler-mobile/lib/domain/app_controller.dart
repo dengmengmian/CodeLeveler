@@ -108,6 +108,10 @@ class AppController extends ChangeNotifier {
   /// The last thing that went wrong, in words a user can act on.
   String? lastError;
 
+  /// True while the phone has claimed a pairing secret and is waiting for a
+  /// person to accept it on the host.
+  bool awaitingHostConfirmation = false;
+
   bool get isPaired => pairing != null;
   bool get isObserveOnly => _tokens?.isObserveOnly ?? false;
 
@@ -160,12 +164,14 @@ class AppController extends ChangeNotifier {
       scope: scope,
     );
 
-    final tokens = await relay.authenticate(
-      identity: identity!,
-      runtimeId: payload.runtimeId,
-      now: DateTime.now(),
-      nonce: _nonce(),
-    );
+    // The relay will not issue tokens until a human accepts on the host, so
+    // this waits for that rather than failing on the 401 that is the *expected*
+    // answer for the next few seconds. Asking first and waiting second is the
+    // whole point of the design: the phone cannot promote its own pairing.
+    awaitingHostConfirmation = true;
+    notifyListeners();
+    final tokens = await _awaitHostAcceptance(relay, payload.runtimeId);
+    awaitingHostConfirmation = false;
 
     final stored = Pairing(
       relayUrl: payload.relayUrl,
@@ -181,6 +187,37 @@ class AppController extends ChangeNotifier {
     _relay = relay;
     _tokens = tokens;
     notifyListeners();
+  }
+
+  /// Poll for tokens until the host accepts, the host rejects, or time runs out.
+  ///
+  /// The host's confirmation window is ten minutes; this gives up sooner,
+  /// because a phone showing "waiting" for ten minutes teaches its user that
+  /// the app is broken. Giving up is not the same as failing: the pairing is
+  /// still claimable on the host, and trying again resumes it.
+  Future<SessionTokens> _awaitHostAcceptance(RelayClient relay, String runtimeId) async {
+    final deadline = DateTime.now().add(const Duration(minutes: 3));
+    RelayException? last;
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        return await relay.authenticate(
+          identity: identity!,
+          runtimeId: runtimeId,
+          now: DateTime.now(),
+          nonce: _nonce(),
+        );
+      } on RelayException catch (error) {
+        // `unauthorized` here means "not accepted yet" — the device record does
+        // not exist until the host writes it. `revoked` means the human said
+        // no, and waiting longer would be waiting for nothing.
+        if (error.code == 'revoked') rethrow;
+        if (!error.needsReauth) rethrow;
+        last = error;
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+    }
+    throw last ??
+        RelayException(408, 'timeout', '电脑一直没有确认这次配对');
   }
 
   /// Ensure a usable access token, refreshing or re-authenticating as needed.

@@ -9,7 +9,7 @@
 | ⏳ **待真机** | 代码已写、能编译，但需要设备或模拟器才能验，**尚未做** |
 | ⛔ **被阻塞** | 依赖尚未存在的东西 |
 
-**当前总状态：Phase 1 未完成。** 后端链路可自证；APP 能编译、协议层测试全绿，但从未在真机或模拟器上跑起来过。
+**当前总状态：Phase 1 未完成。** 后端链路可自证；APP 已在 iOS 模拟器上跑通完整配对验收。**差的是真机**——模拟器不是真机，且 Android 与内测包均未做。
 
 ---
 
@@ -22,7 +22,8 @@
 | 电脑显示 device 指纹并要求人工确认 | 🖐️ | `leveler remote confirm`，实跑 |
 | 指纹两端算法一致 | ✅ | `testdata/signed_envelope.golden.json` 的 `device_fingerprint`，Rust 与 Dart 各有测试读同一份 |
 | 拒绝配对不留任何本机记录 | ✅ | `relay_api.rs::confirming_a_pairing_requires_the_runtimes_signature` |
-| **手机上扫码/粘贴 → 显示指纹 → 用户比对** | ⏳ | 粘贴路径已写并能编译，未在设备上看过；扫码未做 |
+| **手机上粘贴 → 显示指纹 → 用户比对** | ✅ | `integration_test/pairing_flow_test.dart` 在模拟器上真跑，并断言显示的是**电脑那把密钥**的指纹；扫码未做 |
+| **手机不能自己给自己配对** | ✅ | 同上：电脑故意等 8 秒，测试在这段窗口内断言手机仍未配对 |
 
 ## 二、多项目
 
@@ -35,7 +36,8 @@
 | 未知 project 的 stream 被拒 | ✅ | `end_to_end.rs::a_stream_for_an_unknown_project_is_closed` |
 | `leveler remote projects` 列出状态 | 🖐️ | 实跑（空注册表场景） |
 | 真注册表 + 两个活 daemon | ✅ | `projects.rs::the_router_attaches_to_live_daemons_and_reports_the_rest_offline` |
-| **手机上切换项目，界面不串台** | ⏳ | 代码已写并能编译，未在设备上验过 |
+| 配对后进入项目页（含签名 RPC 验签） | ✅ | 同上，测试末尾断言到达项目页且连接未进入 `untrusted` |
+| **手机上切换项目，界面不串台** | ⏳ | 代码已写，模拟器上未验（需要两个在线项目） |
 
 ## 三、对话与流式
 
@@ -78,7 +80,9 @@
 | --- | --- | --- |
 | `flutter pub get` / `analyze` / `test` 通过 | 🖐️ | Flutter 3.44.8 实跑：依赖解析通过、`analyze` 无问题、**16 条测试全绿** |
 | golden 向量跨语言一致 | 🖐️ | `envelope_golden_test.dart` 读 Rust 同一份 `testdata/signed_envelope.golden.json`；牙口已验（互换 canonical 字段即红） |
-| **APP 在真机/模拟器上跑起来** | ⛔ | 平台目录未生成；无 Android SDK、无 iOS 模拟器 runtime、无 CocoaPods、无设备 |
+| **APP 在 iOS 模拟器上跑起来** | 🖐️ | iPhone 17 Pro / iOS 26.5，构建 → 安装 → 启动 → 截图确认渲染正常 |
+| **模拟器端到端配对验收** | ✅ | `scripts/simulator_pairing.sh` 一条命令：真 relay + 真 agent + 真确认 |
+| Android 构建 | ⛔ | 无 Android SDK |
 | iOS TestFlight 包 | ⛔ | Xcode 26.6 在，但缺平台目录、CocoaPods、模拟器 runtime 与签名证书 |
 | Android 内测 APK | ⛔ | 无 Android SDK |
 | 真机蜂窝闭环 | ⛔ | 无设备 |
@@ -91,4 +95,4 @@
 
 **不能说：** Phase 1 完成。APP 的编译与协议测试已经绿了，但第六节后四项仍被阻塞在「没有平台目录 / 没有 Android SDK / 没有 CocoaPods 与模拟器 runtime / 没有设备」——**这个 APP 一次都没跑起来过**，界面是否可用完全未知。
 
-**下一步最短路径：** 平台目录 + CocoaPods（iOS）或 Android SDK，然后让 APP 第一次真正跑起来。`analyze` 与 `test` 已经绿了，证明的是「能编译、协议逻辑对」；它不证明这个 APP 能用。
+**下一步最短路径：** 一台真 iPhone + 开发者签名，把 `simulator_pairing.sh` 的同一套流程在真机蜂窝网络下跑一遍；以及装 Android SDK 补上另一端。

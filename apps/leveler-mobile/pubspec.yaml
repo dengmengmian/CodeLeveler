@@ -20,6 +20,10 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  # Drives the app on a real simulator against a real host; see
+  # scripts/simulator_pairing.sh.
+  integration_test:
+    sdk: flutter
   flutter_lints: ^5.0.0
 
 flutter:

@@ -169,8 +169,21 @@ class _PairingScreenState extends State<PairingScreen> {
               label: const Text('指纹一致，提交配对'),
             ),
             const SizedBox(height: 8),
-            Text('提交后，请在电脑上运行 `leveler remote confirm` 接受。',
-                style: theme.textTheme.bodySmall),
+            if (widget.controller.awaitingHostConfirmation)
+              Row(
+                children: [
+                  const SizedBox(
+                      width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text('等待电脑确认——请在电脑上运行 `leveler remote confirm`',
+                        style: theme.textTheme.bodySmall),
+                  ),
+                ],
+              )
+            else
+              Text('提交后，请在电脑上运行 `leveler remote confirm` 接受。',
+                  style: theme.textTheme.bodySmall),
           ],
         ],
       ),

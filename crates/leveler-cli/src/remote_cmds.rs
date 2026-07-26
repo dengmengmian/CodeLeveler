@@ -27,6 +27,7 @@ pub(crate) async fn cmd_remote(cmd: RemoteCommand) -> anyhow::Result<std::proces
         RemoteCommand::Enable { relay_url, name } => enable(&relay_url, name),
         RemoteCommand::Enroll => enroll().await,
         RemoteCommand::Pair { scope } => pair(scope.as_deref()).await,
+        RemoteCommand::Pending => pending().await,
         RemoteCommand::Confirm { reject, yes } => confirm(reject, yes).await,
         RemoteCommand::Projects => projects().await,
         RemoteCommand::Agent => agent().await,
@@ -258,11 +259,35 @@ async fn pair(scope: Option<&str>) -> anyhow::Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-async fn confirm(reject: bool, yes: bool) -> anyhow::Result<std::process::ExitCode> {
-    let (config, key, home) = require_enabled()?;
-    let http = reqwest::Client::new();
+/// Who is waiting to pair, if anyone. Exit code 1 when nobody is, so a script
+/// can branch on it.
+async fn pending() -> anyhow::Result<std::process::ExitCode> {
+    let Some((pending, _config, _key)) = pending_pairing().await? else {
+        println!("当前没有等待确认的配对。");
+        return Ok(std::process::ExitCode::FAILURE);
+    };
+    let device_key = VerifyingKey::from_base64url(&pending.device_pubkey)
+        .map_err(|_| anyhow::anyhow!("relay 给的设备公钥无法解析"))?;
+    println!("等待确认：{} ({})", pending.device_name, pending.device_id);
+    println!("  平台：{}", pending.platform);
+    println!("  权限：{:?}", pending.scope);
+    println!("  指纹：{}", device_key.fingerprint_display());
+    println!();
+    println!("接受：leveler remote confirm      拒绝：leveler remote confirm --reject");
+    Ok(std::process::ExitCode::SUCCESS)
+}
 
-    let response = http
+/// Ask the relay what is waiting for this host, with the config and key the
+/// caller will need next.
+async fn pending_pairing() -> anyhow::Result<
+    Option<(
+        leveler_remote_protocol::pairing::PairingPending,
+        RemoteConfig,
+        leveler_remote_protocol::SigningKey,
+    )>,
+> {
+    let (config, key, _home) = require_enabled()?;
+    let response = reqwest::Client::new()
         .get(format!("{}/v1/pair/pending", config.relay_url))
         .query(&[("runtime_id", config.runtime_id.as_str())])
         .header(
@@ -276,7 +301,14 @@ async fn confirm(reject: bool, yes: bool) -> anyhow::Result<std::process::ExitCo
         return Err(relay_error("查询待确认配对", response).await);
     }
     let pending: Option<leveler_remote_protocol::pairing::PairingPending> = response.json().await?;
-    let Some(pending) = pending else {
+    Ok(pending.map(|pending| (pending, config, key)))
+}
+
+async fn confirm(reject: bool, yes: bool) -> anyhow::Result<std::process::ExitCode> {
+    let home = home();
+    let http = reqwest::Client::new();
+
+    let Some((pending, config, key)) = pending_pairing().await? else {
         println!("当前没有等待确认的配对。先运行 `leveler remote pair`，再在手机上提交。");
         return Ok(std::process::ExitCode::SUCCESS);
     };
