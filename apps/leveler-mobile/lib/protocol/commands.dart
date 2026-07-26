@@ -13,16 +13,11 @@
 ///   not show the button at all, so nobody wonders why it failed.
 /// - **No session deletion, renaming, forking or checkpoint restore.** They are
 ///   destructive or history-rewriting and have no remote confirmation UX yet.
+///
+/// Only what a screen actually sends lives here. The host's allowlist is longer,
+/// and adding builders for the rest would be API nobody calls — the gate that
+/// matters is on the host either way.
 library;
-
-/// The permission profiles a remote client may ask for.
-enum PermissionProfile {
-  requestApproval('request_approval'),
-  assisted('assisted');
-
-  const PermissionProfile(this.wire);
-  final String wire;
-}
 
 /// The decisions a remote client may make on an approval.
 enum ApprovalChoice {
@@ -57,14 +52,8 @@ class Commands {
         'attachments': attachments,
       };
 
-  static Map<String, dynamic> runGoal({required String sessionId, required String goal}) =>
-      {'type': 'run_goal', 'session_id': sessionId, 'goal': goal};
-
   static Map<String, dynamic> cancelCurrentTurn(String sessionId) =>
       {'type': 'cancel_current_turn', 'session_id': sessionId};
-
-  static Map<String, dynamic> forceCancelCurrentTurn(String sessionId) =>
-      {'type': 'force_cancel_current_turn', 'session_id': sessionId};
 
   static Map<String, dynamic> approvalDecision({
     required String requestId,
@@ -79,23 +68,8 @@ class Commands {
   }) =>
       {'type': 'answer_clarification', 'request_id': requestId, 'answer': answer};
 
-  static Map<String, dynamic> setPermissionProfile({
-    required String sessionId,
-    required PermissionProfile mode,
-  }) =>
-      {'type': 'set_permission_profile', 'session_id': sessionId, 'mode': mode.wire};
-
   static Map<String, dynamic> requestSessionList() => {'type': 'request_session_list'};
 
   static Map<String, dynamic> openSession(String sessionId) =>
       {'type': 'open_session', 'session_id': sessionId};
-
-  static Map<String, dynamic> requestDiff(String sessionId) =>
-      {'type': 'request_diff', 'session_id': sessionId};
-
-  static Map<String, dynamic> compactContext(String sessionId) =>
-      {'type': 'compact_context', 'session_id': sessionId};
-
-  static Map<String, dynamic> clearConversation(String sessionId) =>
-      {'type': 'clear_conversation', 'session_id': sessionId};
 }
