@@ -33,13 +33,14 @@ CI 里加了 `mobile` job，**它会是第一个真正编译这份代码的地�
 | 密钥 | `lib/crypto/keys.dart`、`lib/crypto/store.dart` | Ed25519、指纹、Keychain/Keystore、清除配对 |
 | 网络 | `lib/net/relay_client.dart`、`lib/net/session_socket.dart` | REST + WSS；**每一帧先验签再交给 UI** |
 | 状态 | `lib/domain/session_state.dart`、`lib/domain/app_controller.dart` | 事件应用规则、连接状态、只读配对拦截 |
-| 界面 | `lib/ui/*.dart` | 配对、项目列表、会话、审批、设置 |
+| 界面 | `lib/ui/*.dart` | 配对、项目列表、**会话列表**、会话（含审批/澄清）、设置 |
 | 测试 | `test/*.dart` | golden 一致性、事件应用规则、id/载荷负例 |
 
 ## 明确没做的
 
 - **扫二维码**：只做了粘贴。电脑端 `leveler remote pair` 打印的就是可粘贴的一行，设计里把粘贴列为等价路径。加扫码要引入相机插件，而这份代码还没被编译过，不适合再叠一个未验证依赖。
 - **附件上传**：电脑端的 `upload_attachment` 也还没实现。
+- **未确认指令的重发队列已写但未测**：上限 16 条，重连后用**原 `command_id`** 重发（电脑端按该 id 去重，所以重发是同一条指令而不是第二条）。逻辑写了，没跑过。
 - **推送通知、生物识别锁、产物下载**：Phase 2（PR12）。
 - **内测分发**（TestFlight / Play 内测轨）：需要真机构建，见上。
 

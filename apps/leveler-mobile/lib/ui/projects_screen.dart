@@ -25,20 +25,7 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => widget.controller.loadProjects());
   }
 
-  Future<void> _open(String projectId) async {
-    final goal = await showDialog<String>(
-      context: context,
-      builder: (context) => const _NewSessionDialog(),
-    );
-    if (goal == null || !mounted) return;
-    try {
-      await widget.controller.startSession(projectId, goal: goal);
-    } catch (error) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$error')));
-      }
-    }
-  }
+  Future<void> _open(String projectId) => widget.controller.openProject(projectId);
 
   @override
   Widget build(BuildContext context) {
@@ -84,47 +71,6 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _NewSessionDialog extends StatefulWidget {
-  const _NewSessionDialog();
-
-  @override
-  State<_NewSessionDialog> createState() => _NewSessionDialogState();
-}
-
-class _NewSessionDialogState extends State<_NewSessionDialog> {
-  final TextEditingController _goal = TextEditingController();
-
-  @override
-  void dispose() {
-    _goal.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('新建会话'),
-      content: TextField(
-        controller: _goal,
-        autofocus: true,
-        minLines: 2,
-        maxLines: 4,
-        decoration: const InputDecoration(
-          labelText: '这次要做什么',
-          border: OutlineInputBorder(),
-        ),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
-        FilledButton(
-          onPressed: () => Navigator.pop(context, _goal.text.trim()),
-          child: const Text('开始'),
-        ),
-      ],
     );
   }
 }

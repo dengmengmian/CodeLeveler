@@ -1443,12 +1443,15 @@ pub enum ClientOrigin {
 - **Deps:** PR4 超时语义、PR11d
 - **DoD:** Allow/Deny only；超时后状态与 snapshot 一致；澄清空答=skip
 
-### PR11f — APP 内测打包与 Phase 1 验收清单
+### PR11f — APP 内测打包与 Phase 1 验收清单 ⚠️ 清单已产出，打包被阻塞
 
 - **Title:** `mobile: TestFlight/internal APK + phase1 acceptance checklist`
 - **Affects:** APP 发布轨、docs 验收表
 - **Deps:** PR11b–e、PR9 e2e（可对 dev relay）
 - **DoD:** 内测包链接；清单勾选「真机蜂窝多项目闭环」；**与 PR10 一起作为 Phase 1 出门条件**
+- **产出：** `docs/design/phase1-acceptance-checklist.md`——验收路径逐条列出，每条标注「✅ 自动化 / 🖐️ 已手工验过 / ⏳ 待真机 / ⛔ 被阻塞」并指到具体测试名。
+- **结论：Phase 1 未完成。** 后端部分已自动化（`phase1_acceptance.rs` 一次走完全流程），CLI 全流程手工实跑通过；但 APP **一次都没编译过**，内测包、真机蜂窝闭环三项被「无 Flutter 工具链 / 无 macOS 签名环境 / 无设备」阻塞。
+- **最短下一步：** 在装有 Flutter 的机器上跑 `flutter pub get && flutter analyze && flutter test`——第一次预期是红的，那是这份代码第一次被真正检查。
 
 ### PR12 — APP Phase 2：推送 + 生物锁 + 产物下载
 

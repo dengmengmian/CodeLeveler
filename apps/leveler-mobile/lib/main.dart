@@ -12,6 +12,7 @@ import 'domain/app_controller.dart';
 import 'ui/chat_screen.dart';
 import 'ui/pairing_screen.dart';
 import 'ui/projects_screen.dart';
+import 'ui/sessions_screen.dart';
 
 void main() {
   runApp(LevelerApp(controller: AppController(vault: Vault(KeystoreSecretStore()))));
@@ -66,8 +67,23 @@ class _Root extends StatelessWidget {
         if (controller.session != null) {
           return ChatScreen(controller: controller);
         }
+        final projectId = controller.currentProjectId;
+        if (projectId != null) {
+          return SessionsScreen(
+            controller: controller,
+            projectName: controller.projects
+                    .where((project) => project.id == projectId)
+                    .map((project) => project.display)
+                    .firstOrNull ??
+                '项目',
+          );
+        }
         return ProjectsScreen(controller: controller);
       },
     );
   }
+}
+
+extension _FirstOrNull<T> on Iterable<T> {
+  T? get firstOrNull => isEmpty ? null : first;
 }

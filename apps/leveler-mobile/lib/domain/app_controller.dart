@@ -23,6 +23,28 @@ import '../protocol/pairing.dart';
 import '../protocol/wire.dart';
 import 'session_state.dart';
 
+/// One session in a project, as the list shows it.
+class SessionSummary {
+  SessionSummary({
+    required this.id,
+    required this.goal,
+    required this.status,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String goal;
+  final String status;
+  final String updatedAt;
+
+  static SessionSummary fromJson(Map<String, dynamic> json) => SessionSummary(
+        id: json['id'] as String? ?? '',
+        goal: json['goal'] as String? ?? '',
+        status: json['status'] as String? ?? '',
+        updatedAt: json['updated_at'] as String? ?? '',
+      );
+}
+
 /// One project on the paired host.
 class ProjectSummary {
   ProjectSummary({required this.id, required this.display, required this.status});
@@ -66,6 +88,20 @@ class AppController extends ChangeNotifier {
   List<ProjectSummary> projects = [];
   String? currentProjectId;
   SessionState? session;
+
+  /// Sessions in the project currently open, newest activity first.
+  List<SessionSummary> sessions = [];
+  bool sessionsLoading = false;
+
+  /// Commands sent but not yet acknowledged, oldest first.
+  ///
+  /// Resent on reconnect *with their original `command_id`*, which is what
+  /// makes a retry the same command rather than a second one — the host's
+  /// receipt store dedupes on that id. Bounded, because a phone that queued
+  /// without limit would eventually replay a long-forgotten instruction into a
+  /// session that had moved on.
+  final Map<String, DeliverMessage> _unacked = {};
+  static const int _maxUnacked = 16;
 
   LinkState connection = LinkState.idle;
 
@@ -273,6 +309,55 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Enter a project: open its stream and ask for the sessions in it.
+  ///
+  /// The stream is opened first because the session list arrives as a runtime
+  /// *event*, not as a reply — there is nowhere else for it to come from.
+  Future<void> openProject(String projectId) async {
+    await _closeSocket();
+    currentProjectId = projectId;
+    session = null;
+    sessions = [];
+    sessionsLoading = true;
+    _seq = SeqCounter();
+    notifyListeners();
+
+    try {
+      final token = await _accessToken();
+      final socket = await SessionSocket.connect(
+        relayUrl: pairing!.relayUrl,
+        hostId: pairing!.runtimeId,
+        projectId: projectId,
+        accessToken: token,
+        deviceId: identity!.deviceId,
+        runtimePublicKey: _anchoredRuntimeKey!,
+      );
+      _socket = socket;
+      _socketEvents = socket.events.listen(_onSocketEvent);
+      connection = LinkState.online;
+      // No session id yet, so this one cannot ride `_deliver`.
+      await _send(DeliverMessage(
+        commandId: _uuid(),
+        sessionId: '',
+        command: Commands.requestSessionList(),
+      ));
+    } on RelayException catch (error) {
+      connection = error.isTransient ? LinkState.offline : LinkState.idle;
+      lastError = _explain(error);
+      sessionsLoading = false;
+    }
+    notifyListeners();
+  }
+
+  /// Leave the project list level.
+  Future<void> closeProject() async {
+    await _closeSocket();
+    currentProjectId = null;
+    sessions = [];
+    session = null;
+    notifyListeners();
+  }
+
   /// Create a session in a project and open its stream.
   Future<void> startSession(String projectId, {required String goal}) async {
     final bootstrap = await _rpc(
@@ -294,29 +379,44 @@ class AppController extends ChangeNotifier {
     String sessionId, {
     Map<String, dynamic>? snapshot,
   }) async {
-    await _closeSocket();
-    currentProjectId = projectId;
     session = SessionState(sessionId);
-    _seq = SeqCounter();
 
-    final token = await _accessToken();
-    final socket = await SessionSocket.connect(
-      relayUrl: pairing!.relayUrl,
-      hostId: pairing!.runtimeId,
-      projectId: projectId,
-      accessToken: token,
-      deviceId: identity!.deviceId,
-      runtimePublicKey: _anchoredRuntimeKey!,
-    );
-    _socket = socket;
-    _socketEvents = socket.events.listen(_onSocketEvent);
+    // Reuse the project's stream when there is one: reconnecting would drop
+    // events between the two sockets, and the gap would show up as a
+    // transcript that quietly skips a few seconds.
+    if (_socket == null || currentProjectId != projectId) {
+      await _closeSocket();
+      currentProjectId = projectId;
+      _seq = SeqCounter();
+      final token = await _accessToken();
+      final socket = await SessionSocket.connect(
+        relayUrl: pairing!.relayUrl,
+        hostId: pairing!.runtimeId,
+        projectId: projectId,
+        accessToken: token,
+        deviceId: identity!.deviceId,
+        runtimePublicKey: _anchoredRuntimeKey!,
+      );
+      _socket = socket;
+      _socketEvents = socket.events.listen(_onSocketEvent);
+    }
     connection = LinkState.online;
+
+    // Tell the host which session this stream is now watching, so its
+    // per-session state (and the approval timeout's idea of what we are
+    // looking at) follows the user.
+    await _send(DeliverMessage(
+      commandId: _uuid(),
+      sessionId: sessionId,
+      command: Commands.openSession(sessionId),
+    ));
 
     if (snapshot != null) {
       session!.applySnapshot(snapshot);
     } else {
       await requestSnapshot();
     }
+    await _resendUnacked();
     notifyListeners();
   }
 
@@ -325,12 +425,19 @@ class AppController extends ChangeNotifier {
       case SocketMessage(message: final message):
         switch (message) {
           case RuntimeEventMessage(event: final runtimeEvent):
+            if (runtimeEvent['type'] == 'session_list') {
+              sessions = (runtimeEvent['sessions'] as List<dynamic>? ?? const [])
+                  .map((raw) => SessionSummary.fromJson(raw as Map<String, dynamic>))
+                  .toList(growable: false);
+              sessionsLoading = false;
+            }
             session?.applyEvent(runtimeEvent);
           case SnapshotMessage(session: final snapshot):
             session?.applySnapshot(snapshot);
-          case AckMessage():
-            break;
-          case ErrorMessage(code: final code, message: final text):
+          case AckMessage(commandId: final commandId):
+            _unacked.remove(commandId);
+          case ErrorMessage(code: final code, message: final text, commandId: final failed):
+            if (failed != null) _unacked.remove(failed);
             if (code == 'resync_required') {
               session?.markResyncRequired();
               unawaited(requestSnapshot());
@@ -366,9 +473,7 @@ class AppController extends ChangeNotifier {
   /// `notifyListeners`, which is protected — and which would also skip closing
   /// the socket, leaving a stream open for a screen nobody is looking at.
   Future<void> closeSession() async {
-    await _closeSocket();
     session = null;
-    currentProjectId = null;
     notifyListeners();
   }
 
@@ -405,11 +510,27 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    await _send(DeliverMessage(
+    if (_unacked.length >= _maxUnacked) {
+      lastError = '还有 ${_unacked.length} 条指令没有收到确认，先恢复连接再继续。';
+      notifyListeners();
+      return;
+    }
+    final message = DeliverMessage(
       commandId: _uuid(),
       sessionId: current.sessionId,
       command: command,
-    ));
+    );
+    _unacked[message.commandId] = message;
+    await _send(message);
+  }
+
+  /// Re-send what was never acknowledged, after a stream comes back.
+  ///
+  /// Same ids, so the host treats a duplicate as the command it already has.
+  Future<void> _resendUnacked() async {
+    for (final message in _unacked.values.toList(growable: false)) {
+      await _send(message);
+    }
   }
 
   Future<void> _send(UpstreamMessage message) async {
