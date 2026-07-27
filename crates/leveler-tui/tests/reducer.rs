@@ -4105,3 +4105,52 @@ fn mouse_click_without_drag_off_url_does_not_open() {
         "click off URL must not open: {effects:?}"
     );
 }
+
+#[test]
+fn mouse_click_on_url_glued_to_chinese_prose_opens_clean_host() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use unicode_width::UnicodeWidthChar;
+    let mut s = opened();
+    s.size = (100, 30);
+    s.conversation_rect = Some((0, 3, 100, 20));
+    s.conversation_auto_scroll = false;
+    s.conversation_scroll = 0;
+    // Matches real assistant copy that previously produced toast:
+    // "已在浏览器打开 http://localhost:8081，前端页面可以直接打开。"
+    let line = "访问地址：http://localhost:8081，前端页面可以直接打开。";
+    s.conversation_plain = vec![line.into()];
+    s.conversation_plain_width = 100;
+
+    let byte = line.find("http://").expect("url");
+    let url_col: u16 = line[..byte]
+        .chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+        .sum();
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: url_col + 5,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    };
+    reduce(&mut s, Action::Mouse(down));
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: url_col + 5,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    };
+    let effects = reduce(&mut s, Action::Mouse(up));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::OpenWebUrl(u) if u == "http://localhost:8081")),
+        "must open clean URL without Chinese glue, got {effects:?}"
+    );
+    if let Some(n) = &s.notification {
+        assert!(
+            !n.message.contains('，') && !n.message.contains("前端"),
+            "toast must not claim the Chinese prose is part of the URL: {}",
+            n.message
+        );
+    }
+}

@@ -107,14 +107,69 @@ fn chars_start_with(chars: &[char], i: usize, pat: &str) -> bool {
         .all(|(k, pc)| chars.get(i + k) == Some(&pc))
 }
 
+/// Characters that may appear inside a bare http(s) URL for hit-testing.
+///
+/// Restricted to the ASCII URL set (RFC 3986 unreserved + reserved). Anything
+/// else — CJK, fullwidth punctuation (`，` `。` `：`), spaces — ends the run.
+/// The previous "any non-whitespace" rule glued Chinese prose onto localhost
+/// links so click-to-open passed garbage to the OS browser opener.
 fn is_url_char(c: char) -> bool {
-    !c.is_whitespace() && !matches!(c, '<' | '>' | '"' | '`' | '\'' | '|')
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            // gen-delims / sub-delims / unreserved extras commonly in paths
+            ':' | '/'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
+                | '-'
+                | '.'
+                | '_'
+                | '~'
+        )
 }
 
 fn is_trailing_punct(c: char) -> bool {
     matches!(
         c,
-        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+        // ASCII sentence / bracket closers that often sit after a URL.
+        '.' | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '"'
+            | '\''
+            // Fullwidth / CJK closers (common in zh product copy after a host:port).
+            | '，'
+            | '。'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '）'
+            | '】'
+            | '』'
+            | '」'
+            | '》'
+            | '〉'
     )
 }
 
@@ -204,5 +259,43 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content.as_ref(), "no links here");
         assert_eq!(spans[0].style.fg, Some(Color::Gray));
+    }
+
+    #[test]
+    fn chinese_and_fullwidth_punctuation_do_not_glue_onto_url() {
+        // Product copy often writes: "访问地址：http://host:port，前端页面可以直接打开。"
+        // The fullwidth comma and following CJK must not be part of the URL —
+        // otherwise click-to-open feeds `open` a garbage string and the toast
+        // claims success while the browser never lands on the service.
+        let line = "访问地址：http://localhost:8081，前端页面可以直接打开。";
+        let start = line.find("http://").expect("url");
+        // Display column of the 'h' in http — CJK before it is wide.
+        let mut col = 0usize;
+        for c in line[..start].chars() {
+            col += char_disp_width(c);
+        }
+        assert_eq!(
+            url_at(line, col + 5).as_deref(),
+            Some("http://localhost:8081"),
+            "fullwidth comma / CJK must stop the bare URL"
+        );
+        // Trailing fullwidth period after a bare host:port.
+        assert_eq!(
+            url_at("打开 http://127.0.0.1:3000。", 5).as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        let base = Style::default().fg(Color::Gray);
+        let link = link_style(Color::Cyan);
+        let spans = spans_with_bare_urls(line, base, link);
+        let url_span = spans
+            .iter()
+            .find(|s| s.content.contains("localhost"))
+            .expect("url span");
+        assert_eq!(url_span.content.as_ref(), "http://localhost:8081");
+        assert!(
+            !url_span.content.contains('，') && !url_span.content.contains("前端"),
+            "styled link must not swallow Chinese prose: {}",
+            url_span.content
+        );
     }
 }

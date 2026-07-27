@@ -922,31 +922,38 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
                 }
                 continue;
             }
-            // Bare http(s) in non-code prose: same accent+underline as md links.
-            let token_style = if span.link.is_none()
-                && !span.code
-                && (token.starts_with("http://") || token.starts_with("https://"))
-            {
-                style.fg(theme.accent).add_modifier(Modifier::UNDERLINED)
+            // Bare http(s) inside a non-code token (including CJK-glued runs
+            // like "地址：http://localhost:8081") get accent+underline. Whole-
+            // token starts_with("http") misses those; split with the shared
+            // detector used by click hit-testing.
+            let pieces: Vec<(String, Style)> = if span.link.is_none() && !span.code {
+                let link = crate::url_link::link_style(theme.accent);
+                crate::url_link::spans_with_bare_urls(&token, style, link)
+                    .into_iter()
+                    .map(|s| (s.content.to_string(), s.style))
+                    .collect()
             } else {
-                style
+                vec![(token.clone(), style)]
             };
-            if tw > width {
-                // Break the overlong token by grapheme.
-                for g in token.graphemes(true) {
-                    let gw = grapheme_width(g).max(1);
-                    if col + gw > width && col > 0 {
+            for (piece, piece_style) in pieces {
+                let pw = disp_width(&piece);
+                if pw > width {
+                    // Break the overlong piece by grapheme.
+                    for g in piece.graphemes(true) {
+                        let gw = grapheme_width(g).max(1);
+                        if col + gw > width && col > 0 {
+                            flush(&mut cur, &mut col, &mut lines);
+                        }
+                        cur.push(Span::styled(g.to_string(), piece_style));
+                        col += gw;
+                    }
+                } else {
+                    if col + pw > width && col > 0 {
                         flush(&mut cur, &mut col, &mut lines);
                     }
-                    cur.push(Span::styled(g.to_string(), token_style));
-                    col += gw;
+                    cur.push(Span::styled(piece, piece_style));
+                    col += pw;
                 }
-            } else {
-                if col + tw > width && col > 0 {
-                    flush(&mut cur, &mut col, &mut lines);
-                }
-                cur.push(Span::styled(token.clone(), token_style));
-                col += tw;
             }
         }
     }
@@ -1655,6 +1662,32 @@ mod tests {
             })
         });
         assert!(has, "bare http URL must look like a link: {lines:?}");
+    }
+
+    #[test]
+    fn bare_url_glued_to_cjk_prefix_is_underlined() {
+        // Real assistant copy: no space between fullwidth colon and the URL,
+        // so word-split keeps one token. Click hit-testing finds the URL; the
+        // layout path must style only the http(s) run, not the CJK prefix.
+        let doc = MdDoc::parse("- 地址：http://localhost:8081");
+        let lines = doc.to_lines(80, &Theme::dark());
+        let url_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("localhost:8081"))
+            .expect("url span present");
+        assert!(
+            url_span.style.add_modifier.contains(Modifier::UNDERLINED),
+            "bare URL after CJK must look clickable: {lines:?}"
+        );
+        // Prefix prose must not inherit link styling.
+        let prefix_underlined = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains('地') && s.style.add_modifier.contains(Modifier::UNDERLINED)
+        });
+        assert!(
+            !prefix_underlined,
+            "CJK prefix must stay plain: {lines:?}"
+        );
     }
 
     #[test]
