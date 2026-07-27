@@ -36,7 +36,12 @@ fn user_input_description(primary_name: &str, alias: Option<&str>) -> String {
          user's to make: an ambiguous requirement, a choice between viable approaches, \
          overwriting existing work, or a destructive/irreversible action. Prefer asking \
          over guessing at these forks. Do NOT ask about trivial choices you can \
-         reasonably make yourself. Provide `options` when the answer is a choice."
+         reasonably make yourself. For approach/scope choice forks, always pass \
+         `options` with 2–4 mutually exclusive answers (short label + consequence); \
+         put the recommended option first when you have a preference. Do not rely on \
+         open-ended chat prose alone (\"想问一下\", \"waiting for confirmation\") — that \
+         is a fake pause. Omit `options` only for free-form answers (credentials, \
+         names, paths the user must type). Keep `question` to one short sentence."
     )
 }
 
@@ -439,6 +444,19 @@ mod tests {
         assert_eq!(primary.name, "request_user_input");
         assert!(primary.description.contains("ask_user"));
         assert!(primary.input_schema["properties"].get("question").is_some());
+        assert!(
+            primary.description.contains("mutually exclusive")
+                || primary.description.contains("2–4")
+                || primary.description.contains("2-4"),
+            "tool description must require structured choice options: {}",
+            primary.description
+        );
+        assert!(
+            primary.description.contains("fake pause")
+                || primary.description.contains("waiting for confirmation"),
+            "tool description must ban prose-only waiting: {}",
+            primary.description
+        );
 
         let legacy = ask_user_tool_definition();
         assert_eq!(legacy.name, "ask_user");

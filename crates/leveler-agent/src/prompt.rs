@@ -844,6 +844,35 @@ mod tests {
         );
     }
 
+    /// Choice forks must use structured options via request_user_input, not a
+    /// prose "waiting for confirmation" pause (L1 decision-gate rule).
+    #[test]
+    fn base_prompt_requires_structured_decision_gates() {
+        let prompt = PromptBuilder::new().build();
+        assert!(
+            prompt.contains("Decision gates") || prompt.contains("decision gate"),
+            "base prompt must name decision gates: {prompt}"
+        );
+        assert!(
+            prompt.contains("request_user_input"),
+            "decision gates must route through request_user_input"
+        );
+        assert!(
+            prompt.contains("options"),
+            "decision gates must require concrete options"
+        );
+        assert!(
+            prompt.contains("fake pause")
+                || prompt.contains("waiting for confirmation")
+                || prompt.contains("想问一下"),
+            "must ban prose-only waiting as a substitute for a real gate"
+        );
+        assert!(
+            prompt.contains("mutually exclusive") || prompt.contains("2–4") || prompt.contains("2-4"),
+            "must specify option shape for choice forks"
+        );
+    }
+
     /// Full access grants no network prompt, so the blocked-network rules must not fire.
     #[test]
     fn full_access_does_not_emit_the_blocked_network_rules() {
