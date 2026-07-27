@@ -65,11 +65,11 @@ Future<void> bringIntoView(WidgetTester tester, Finder target) async {
   for (var attempt = 0; attempt < 12; attempt++) {
     if (target.evaluate().isNotEmpty) {
       await tester.ensureVisible(target);
-      await tester.pumpAndSettle();
+      await settleUi(tester);
       return;
     }
     await tester.drag(find.byType(ListView).first, const Offset(0, -220));
-    await tester.pumpAndSettle();
+    await settleUi(tester);
   }
 }
 
@@ -85,9 +85,31 @@ Future<void> tapByText(WidgetTester tester, String label, {bool settle = true}) 
   // pumpAndSettle runs real frames until the UI stops moving, which here means
   // waiting out the very window the test is trying to observe.
   if (settle) {
-    await tester.pumpAndSettle();
+    await settleUi(tester);
   } else {
     await tester.pump();
+  }
+}
+
+/// Let the UI catch up, without requiring it to ever stand still.
+///
+/// `pumpAndSettle` waits for *no* animation to be running, and a turn in flight
+/// shows a spinner that never stops — so it pumps until its own timeout and
+/// takes the test with it. What these tests actually want is "a few frames have
+/// passed", which is what this does.
+Future<void> settleUi(WidgetTester tester) async {
+  try {
+    await tester.pumpAndSettle(
+      const Duration(milliseconds: 100),
+      EnginePhase.sendSemanticsUpdate,
+      const Duration(seconds: 2),
+    );
+  } on FlutterError {
+    // Something is still animating. That is the UI being honest about work in
+    // progress, not a failure.
+    for (var frame = 0; frame < 5; frame++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
   }
 }
 
@@ -132,9 +154,9 @@ Future<void> sendMessage(WidgetTester tester, String text) async {
   // the field really holds focus, and after an earlier `unfocus()` there is
   // none — the text then goes nowhere and the field stays empty.
   await tester.tap(composer);
-  await tester.pumpAndSettle();
+  await settleUi(tester);
   await tester.enterText(composer, text);
-  await tester.pumpAndSettle();
+  await settleUi(tester);
   expect(
     tester.widget<TextField>(composer).controller?.text,
     text,
@@ -150,11 +172,11 @@ Future<void> startSession(WidgetTester tester, AppController controller, String 
   await tapByText(tester, '新会话');
   await tester.enterText(find.byType(TextField).last, goal);
   FocusManager.instance.primaryFocus?.unfocus();
-  await tester.pumpAndSettle();
+  await settleUi(tester);
   await tapByText(tester, '开始', settle: false);
 
   await until(tester, () => controller.session != null, what: '会话建立');
-  await tester.pumpAndSettle();
+  await settleUi(tester);
   expect(find.byTooltip('发送'), findsOneWidget,
       reason: '会话界面应当有输入框，屏幕上是：${visibleText(tester)}');
 }
@@ -177,7 +199,7 @@ Future<AppController> pairAndReachProjects(
     await controller.unpair();
   }
   await tester.pumpWidget(LevelerApp(controller: controller));
-  await tester.pumpAndSettle();
+  await settleUi(tester);
 
   expect(find.text('配对开发机'), findsOneWidget);
 
@@ -185,7 +207,7 @@ Future<AppController> pairAndReachProjects(
   // leaves a selection overlay above the page that swallows the next tap.
   await tester.enterText(find.byType(TextField).first, pairingPayload);
   FocusManager.instance.primaryFocus?.unfocus();
-  await tester.pumpAndSettle();
+  await settleUi(tester);
 
   await tapByText(tester, '读取粘贴的载荷');
 

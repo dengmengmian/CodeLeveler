@@ -138,6 +138,11 @@ fn the_transcript_golden_matches_the_types() {
                 {"role": "assistant", "text": "第一句的回答"},
                 {"role": "user", "text": "1+1 等于几"},
                 {"role": "assistant", "text": "等于 2"},
+                // A notification is the host speaking, not the assistant. It
+                // belongs in the transcript as an aside — dropping it, which is
+                // what the mobile client used to do, loses the one channel the
+                // host has for telling a user something outside an answer.
+                {"role": "notice", "text": "顺带一提"},
             ],
             // The point of the whole file: an ordinary turn must not leave a
             // client believing its view is stale.

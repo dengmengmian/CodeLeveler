@@ -56,10 +56,10 @@ void main() {
     // ---- Switch, the way a user does: back out of the chat, then out of the
     // project. Two screens, two taps on the same arrow. ----
     await tester.tap(find.byIcon(Icons.arrow_back));
-    await tester.pumpAndSettle();
+    await settleUi(tester);
     await until(tester, () => first.session == null, what: '退回会话列表');
     await tester.tap(find.byIcon(Icons.arrow_back));
-    await tester.pumpAndSettle();
+    await settleUi(tester);
     await until(tester, () => first.currentProjectId == null, what: '退回项目列表');
 
     await enterProject(tester, first, beta);
@@ -100,11 +100,11 @@ void main() {
     // new one would never load the pairing it is supposed to find. An empty
     // frame in between makes this a relaunch rather than a rebuild.
     await tester.pumpWidget(const SizedBox.shrink());
-    await tester.pumpAndSettle();
+    await settleUi(tester);
 
     final second = AppController(vault: Vault(store));
     await tester.pumpWidget(LevelerApp(controller: second));
-    await tester.pumpAndSettle();
+    await settleUi(tester);
 
     await until(tester, () => second.isPaired, what: '重启后恢复配对');
     expect(find.text('项目'), findsOneWidget,

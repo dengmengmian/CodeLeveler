@@ -30,6 +30,10 @@
       {
         "role": "assistant",
         "text": "等于 2"
+      },
+      {
+        "role": "notice",
+        "text": "顺带一提"
       }
     ]
   },

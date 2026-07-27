@@ -49,7 +49,7 @@ void main() {
     await sendMessage(tester, '你好，介绍一下这个项目');
     await until(tester, () => assistantSource(tester).contains('列表第二项'),
         limit: const Duration(seconds: 90), what: '中文回答');
-    await tester.pumpAndSettle();
+    await settleUi(tester);
 
     final chineseOnScreen = renderedText(tester);
     expect(chineseOnScreen, contains('中文回答'), reason: '中文回答没有出现在屏幕上');
@@ -66,7 +66,7 @@ void main() {
     await sendMessage(tester, 'now answer in English please');
     await until(tester, () => assistantSource(tester).contains('second item'),
         limit: const Duration(seconds: 90), what: 'English answer');
-    await tester.pumpAndSettle();
+    await settleUi(tester);
 
     final englishOnScreen = renderedText(tester);
     expect(englishOnScreen, contains('English answer'));
@@ -77,7 +77,7 @@ void main() {
     await sendMessage(tester, '请删除 scratch.txt');
     await until(tester, () => controller.session!.approvals.isNotEmpty,
         limit: const Duration(seconds: 90), what: '审批请求');
-    await tester.pumpAndSettle();
+    await settleUi(tester);
 
     expect(find.text('需要你批准'), findsOneWidget,
         reason: '审批卡片没有出现，屏幕上是：${visibleText(tester)}');
@@ -110,7 +110,7 @@ void main() {
     // `docs/design/remote-app-control.md`. Cancelling deserves a test about
     // cancelling.
     await tester.tap(find.byIcon(Icons.arrow_back));
-    await tester.pumpAndSettle();
+    await settleUi(tester);
     await until(tester, () => controller.session == null, what: '退回会话列表');
     await startSession(tester, controller, '验收：取消回合');
 
@@ -122,7 +122,7 @@ void main() {
         limit: const Duration(seconds: 60), what: '回合开始', controller: controller);
     await until(tester, () => renderedText(tester).contains('这是一段很长的回答'),
         limit: const Duration(seconds: 60), what: '慢回答开始流下来', controller: controller);
-    await tester.pumpAndSettle();
+    await settleUi(tester);
 
     // The assistant's own text, not the whole screen: the app bar changes from
     // 「运行中…」 to 「会话」 when the turn ends, and a screen-wide comparison
@@ -142,11 +142,11 @@ void main() {
     // network timing.
     await tester.pump(const Duration(seconds: 2));
     await Future<void>.delayed(const Duration(seconds: 2));
-    await tester.pumpAndSettle();
+    await settleUi(tester);
     final atStop = assistantSource(tester);
     await tester.pump(const Duration(seconds: 4));
     await Future<void>.delayed(const Duration(seconds: 4));
-    await tester.pumpAndSettle();
+    await settleUi(tester);
     expect(assistantSource(tester), atStop, reason: '取消之后还在继续输出');
 
     // And it really was cut short: the scripted answer runs to 第39句, which a

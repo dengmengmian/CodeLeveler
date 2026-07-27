@@ -62,6 +62,74 @@ void main() {
     expect(find.byType(MarkdownBody), findsNothing);
   });
 
+  testWidgets('a session with nothing in it shows what it is for', (tester) async {
+    // Not a blank screen. A user who has just typed a goal and landed here
+    // needs to see that it arrived; the old empty state showed nothing at all,
+    // which reads as a failure rather than as a fresh session.
+    final session = SessionState('s1')
+      ..applySnapshot({
+        'status': 'idle',
+        'goal': '把登录页的报错文案改掉',
+        'messages': const [],
+        'pending_interactions': const [],
+      });
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('把登录页的报错文案改掉'), findsOneWidget);
+    expect(find.textContaining('开始这次会话'), findsOneWidget);
+  });
+
+  testWidgets('a short conversation sits against the composer', (tester) async {
+    // Top-aligned, a single reply floated at the top of the screen with a
+    // screenful of nothing between it and the composer. A chat reads from the
+    // bottom.
+    final session = SessionState('s1')
+      ..applyEvent({
+        'type': 'user_message_added',
+        'message': {'id': 'u1', 'role': 'user', 'text': '就一句话'},
+      });
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    final bubble = tester.getRect(find.text('就一句话'));
+    final composer = tester.getRect(find.byType(TextField));
+    final screen = tester.getSize(find.byType(ChatScreen));
+    // Within a couple of bubble-heights of the composer, rather than up at the
+    // top of the screen.
+    expect(
+      composer.top - bubble.bottom,
+      lessThan(screen.height * 0.25),
+      reason: '短对话不该悬在屏幕顶端，离输入框还有大半屏',
+    );
+  });
+
+  testWidgets('a host notification is shown, and not as the assistant speaking',
+      (tester) async {
+    // Dropped silently before. The host has no other way to say something that
+    // is not an answer.
+    final session = SessionState('s1')
+      ..applyEvent({
+        'type': 'assistant_message_started',
+        'message_id': 'm1',
+      })
+      ..applyEvent({
+        'type': 'assistant_text_delta',
+        'message_id': 'm1',
+        'delta': '好的。',
+      })
+      ..applyEvent({'type': 'notification', 'level': 'warning', 'message': '磁盘快满了'});
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('磁盘快满了'), findsOneWidget);
+    // One Markdown body: the answer. The notice is not a second one.
+    expect(find.byType(MarkdownBody), findsOneWidget);
+  });
+
   testWidgets('a long conversation scrolls', (tester) async {
     final session = SessionState('s1');
     for (var i = 0; i < 40; i++) {
@@ -76,9 +144,13 @@ void main() {
 
     final list = find.byType(ListView);
     final before = tester.widget<ListView>(list).controller!.position.pixels;
+    // The list is reversed, so it opens at the newest message and offset zero
+    // *is* the bottom. Scrolling back through history therefore means dragging
+    // downward; the old upward drag is a no-op against the end stop.
+    expect(before, 0, reason: '打开时应当停在最新一条');
     // A drag that starts on a bubble must move the list. Every bubble owning a
     // SelectableText meant this drag selected text instead.
-    await tester.drag(list, const Offset(0, -400));
+    await tester.drag(list, const Offset(0, 400));
     await tester.pumpAndSettle();
     final after = tester.widget<ListView>(list).controller!.position.pixels;
 

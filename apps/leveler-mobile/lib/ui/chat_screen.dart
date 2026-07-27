@@ -48,16 +48,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Keep the newest message in view while a reply streams in.
   ///
-  /// Only when the user is already near the bottom: yanking someone back down
-  /// while they are reading earlier output is worse than making them scroll.
+  /// The list is reversed, so "the bottom" is offset zero. Only follows when
+  /// the user is already near it: yanking someone back down while they are
+  /// reading earlier output is worse than making them scroll.
   void _followTail() {
     if (!_scroll.hasClients) return;
-    final position = _scroll.position;
-    if (position.maxScrollExtent - position.pixels > 240) return;
+    if (_scroll.position.pixels > 240) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
       _scroll.animateTo(
-        _scroll.position.maxScrollExtent,
+        0,
         duration: const Duration(milliseconds: 180),
         curve: Curves.easeOut,
       );
@@ -110,12 +110,21 @@ class _ChatScreenState extends State<ChatScreen> {
                 // per-bubble SelectableText claims the vertical drag for
                 // selecting, so the list would not scroll under a mouse at all.
                 child: SelectionArea(
-                  child: ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.all(12),
-                    itemCount: session.transcript.length,
-                    itemBuilder: (context, index) => _Bubble(entry: session.transcript[index]),
-                  ),
+                  child: session.transcript.isEmpty
+                      ? _EmptySession(goal: session.goal)
+                      // Reversed, which is what makes a short conversation sit
+                      // against the composer instead of floating at the top of
+                      // an empty screen. It also puts "the newest message" at
+                      // offset zero, so following the tail is a scroll to 0.
+                      : ListView.builder(
+                          controller: _scroll,
+                          reverse: true,
+                          padding: const EdgeInsets.all(12),
+                          itemCount: session.transcript.length,
+                          itemBuilder: (context, index) => _Bubble(
+                            entry: session.transcript[session.transcript.length - 1 - index],
+                          ),
+                        ),
                 ),
               ),
               if (session.activity != null)
@@ -150,6 +159,42 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
+/// What a session shows before anyone has said anything.
+///
+/// It used to show nothing at all: a user who had just typed a goal arrived at
+/// a blank screen with no sign the goal had been received, or that this was a
+/// session rather than a failure.
+class _EmptySession extends StatelessWidget {
+  const _EmptySession({required this.goal});
+  final String goal;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (goal.isNotEmpty) ...[
+              Text('这次要做的', style: theme.textTheme.labelMedium),
+              const SizedBox(height: 6),
+              Text(goal, textAlign: TextAlign.center, style: theme.textTheme.titleMedium),
+              const SizedBox(height: 20),
+            ],
+            Text(
+              '在下面说点什么，开始这次会话。',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _Bubble extends StatelessWidget {
   const _Bubble({required this.entry});
   final TranscriptEntry entry;
@@ -157,6 +202,7 @@ class _Bubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (entry.role == 'notice') return _Notice(text: entry.text);
     final mine = entry.role == 'user';
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
@@ -195,6 +241,35 @@ class _Bubble extends StatelessWidget {
   }
 }
 
+/// Something the host said that is not part of the conversation — a warning, a
+/// failure, a note. Centred and quiet, so it reads as an aside rather than as
+/// the assistant speaking.
+class _Notice extends StatelessWidget {
+  const _Notice({required this.text});
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.info_outline, size: 15, color: theme.colorScheme.outline),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.outline),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ApprovalCard extends StatelessWidget {
   const _ApprovalCard({required this.approval, required this.onDecision});
   final PendingApproval approval;
@@ -227,20 +302,26 @@ class _ApprovalCard extends StatelessWidget {
                 child: Text('• $risk', style: theme.textTheme.bodySmall),
               ),
             const SizedBox(height: 12),
+            // Weight follows how much each answer gives away, not how likely
+            // it is to be tapped. Two filled buttons for "allow" against a
+            // ghost "deny" made the wide answer the easy one on the screen
+            // where a mis-tap costs the most. Only the single allow is filled;
+            // the session-wide one and the refusal are equals beside it.
+            //
+            // Minimum 44pt targets throughout, for the same reason.
             Wrap(
               spacing: 8,
+              runSpacing: 8,
               children: [
-                // Minimum 44pt targets: this is the screen where a mis-tap is
-                // most expensive.
                 for (final choice in ApprovalChoice.values)
                   ConstrainedBox(
                     constraints: const BoxConstraints(minHeight: 44),
-                    child: choice == ApprovalChoice.deny
-                        ? OutlinedButton(
+                    child: choice == ApprovalChoice.approveOnce
+                        ? FilledButton(
                             onPressed: () => onDecision(choice),
                             child: Text(choice.label),
                           )
-                        : FilledButton(
+                        : OutlinedButton(
                             onPressed: () => onDecision(choice),
                             child: Text(choice.label),
                           ),

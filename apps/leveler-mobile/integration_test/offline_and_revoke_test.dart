@@ -66,7 +66,7 @@ void main() {
       anyOf(contains('撤销'), contains('重新配对')),
       reason: '撤销后应当说清楚发生了什么：${controller.lastError}',
     );
-    await tester.pumpAndSettle();
+    await settleUi(tester);
     expect(find.textContaining(RegExp('撤销|重新配对')), findsWidgets,
         reason: '这句话要真的显示在屏幕上，屏幕上是：${visibleText(tester)}');
 

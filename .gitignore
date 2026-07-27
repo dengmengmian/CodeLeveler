@@ -51,3 +51,7 @@ leveler-chat-*.md
 
 # Local per-session test scratch dir
 fixtures/
+
+# Screenshot runs (scripts/screenshots.sh writes wherever it is told; this is
+# the default place I point it at when looking at the app).
+.shots*/

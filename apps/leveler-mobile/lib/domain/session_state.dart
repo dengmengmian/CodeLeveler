@@ -67,6 +67,11 @@ class SessionState extends ChangeNotifier {
   String status = 'idle';
   String? activity;
 
+  /// What this session was started to do. Shown while the transcript is still
+  /// empty, so a session the user just created does not look like a blank
+  /// screen that swallowed their goal.
+  String goal = '';
+
   /// Event kinds this build does not know. Surfaced in settings rather than
   /// hidden: a user seeing "3 unknown events" has a reason to update the app,
   /// where silence would just look like missing output.
@@ -94,6 +99,7 @@ class SessionState extends ChangeNotifier {
         ),
       );
     status = session['status'] as String? ?? status;
+    goal = session['goal'] as String? ?? goal;
 
     approvals.clear();
     clarifications.clear();
@@ -158,6 +164,22 @@ class SessionState extends ChangeNotifier {
         activity = null;
       case 'agent_activity':
         activity = event['label'] as String?;
+      case 'tool_call_started':
+        // The only sign a phone has that work is happening between messages.
+        // Dropping these left a minute of "运行中…" with nothing under it.
+        activity = event['name'] as String?;
+      case 'tool_call_completed':
+        activity = null;
+      case 'notification':
+      case 'warning':
+      case 'error':
+        // Something the host wanted to say. It is not part of the conversation,
+        // so it gets its own row rather than an assistant bubble — but it must
+        // not vanish, which is what happened before.
+        final text = (event['message'] ?? event['error'] ?? event['detail']) as String?;
+        if (text != null && text.isNotEmpty) {
+          transcript.add(TranscriptEntry(id: '', role: 'notice', text: text));
+        }
       case 'approval_requested':
         final approval = PendingApproval.fromJson(
           event['request'] as Map<String, dynamic>? ?? const {},
