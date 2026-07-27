@@ -62,6 +62,60 @@ pub struct PairingQrPayload {
     pub pairing_secret: String,
 }
 
+/// The prefix of the short form written into a QR code.
+pub const COMPACT_PAIRING_PREFIX: &str = "LV1";
+
+impl PairingQrPayload {
+    /// The short form, for a code a camera has to read off a screen.
+    ///
+    /// JSON costs about a hundred characters in field names and punctuation,
+    /// and every character is more modules in the code. At full length the
+    /// result did not fit a terminal pane, and a QR with a row missing does not
+    /// decode at all — it is not a smaller code, it is no code.
+    ///
+    /// `runtime_id` stays in it. Deriving it from the key would save twenty
+    /// characters, but only on a reader that can hash — and on the phone that
+    /// means an async parser, which is a larger change than those characters
+    /// are worth.
+    pub fn to_compact(&self) -> String {
+        format!(
+            "{COMPACT_PAIRING_PREFIX}|{}|{}|{}|{}",
+            self.runtime_id, self.runtime_pubkey, self.relay_url, self.pairing_secret
+        )
+    }
+
+    /// Read the short form.
+    ///
+    /// Base64url and URLs contain no `|`, and ids may not either — the charset
+    /// rule that keeps signing inputs unambiguous makes it a safe separator.
+    pub fn parse_compact(text: &str) -> Option<Self> {
+        let mut parts = text.trim().split('|');
+        if parts.next()? != COMPACT_PAIRING_PREFIX {
+            return None;
+        }
+        let runtime_id = parts.next()?.to_string();
+        let runtime_pubkey = parts.next()?.to_string();
+        let relay_url = parts.next()?.to_string();
+        let pairing_secret = parts.next()?.to_string();
+        if parts.next().is_some() {
+            return None;
+        }
+        if runtime_id.is_empty()
+            || runtime_pubkey.is_empty()
+            || relay_url.is_empty()
+            || pairing_secret.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            runtime_id,
+            runtime_pubkey,
+            relay_url,
+            pairing_secret,
+        })
+    }
+}
+
 /// Relay → agent: a device is waiting for this host to accept it.
 ///
 /// `device_pubkey` is the field the user is asked to confirm by fingerprint. A

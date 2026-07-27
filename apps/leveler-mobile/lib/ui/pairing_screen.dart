@@ -6,11 +6,14 @@
 /// and the wording says what is being confirmed — a key, not a name.
 library;
 
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
 import '../domain/app_controller.dart';
+import '../net/relay_client.dart';
 import '../protocol/pairing.dart';
 
 class PairingScreen extends StatefulWidget {
@@ -88,10 +91,74 @@ class _PairingScreenState extends State<PairingScreen> {
         scope: _observeOnly ? 'observe' : 'interactive',
       );
     } catch (error) {
-      setState(() => _error = '$error');
+      setState(() => _error = _explainPairingFailure(error, parsed.relayUrl));
     } finally {
       if (mounted) setState(() => _working = false);
     }
+  }
+
+  /// Say what a user can act on, not what the socket layer called it.
+  ///
+  /// The common failure here is not a bug: the phone is on cellular, or on a
+  /// different Wi-Fi, and the address in the pairing payload belongs to a local
+  /// network it cannot see. iOS reports that in several ways — a refused
+  /// connection, a timeout, and, when the local-network permission is missing,
+  /// `Bad file descriptor` — none of which name the cause. A raw
+  /// `ClientException with SocketException: … errno = 9` on screen tells the
+  /// person holding the phone nothing at all.
+  String _explainPairingFailure(Object error, String relayUrl) {
+    // The relay answered — so the network is fine and the code is the message.
+    if (error is RelayException) {
+      return switch (error.code) {
+        // The secret in that QR is not one this relay knows. Almost always the
+        // code is simply old: `/remote-loc` runs its relay inside the terminal
+        // session, so reopening the terminal starts a relay that never issued
+        // it, and each new invitation retires the one before.
+        'invalid_pairing' =>
+          '这个二维码已经失效了。\n在电脑上重新输入 /remote-loc 生成一个新的，再扫一次。',
+        'rate_limited' => '尝试太频繁，等一会儿再试。',
+        'revoked' => '这台设备的配对已经被撤销。',
+        _ => '配对被拒绝（${error.code}）：${error.message}',
+      };
+    }
+
+    final text = '$error';
+    final networkish = error is SocketException ||
+        text.contains('SocketException') ||
+        text.contains('Connection refused') ||
+        text.contains('Bad file descriptor') ||
+        text.contains('No route to host') ||
+        text.contains('timed out');
+    if (!networkish) return text;
+
+    final host = Uri.tryParse(relayUrl)?.host ?? relayUrl;
+    final local = _looksLocal(host);
+    return [
+      '连不上开发机（$relayUrl）。',
+      if (local)
+        '这是一个局域网地址，只有和电脑在同一个 Wi-Fi 下才能连上——'
+            '如果手机现在走的是蜂窝网络，先连上那个 Wi-Fi。',
+      if (local) '另外，系统会问「允许查找本地网络设备」，必须允许，否则连接会被静默拦下。',
+      if (!local) '检查电脑上的 relay 是否在运行，以及这个地址手机能不能访问。',
+      '',
+      '原始错误：$text',
+    ].join('\n');
+  }
+
+  /// Whether an address is one only reachable from the same network.
+  static bool _looksLocal(String host) {
+    if (host == 'localhost' || host.endsWith('.local')) return true;
+    final parts = host.split('.');
+    if (parts.length != 4) return false;
+    final octets = parts.map(int.tryParse).toList();
+    if (octets.any((value) => value == null)) return false;
+    return switch (octets.cast<int>()) {
+      [10, _, _, _] => true,
+      [127, _, _, _] => true,
+      [192, 168, _, _] => true,
+      [172, final second, _, _] when second >= 16 && second <= 31 => true,
+      _ => false,
+    };
   }
 
   @override
@@ -120,10 +187,10 @@ class _PairingScreenState extends State<PairingScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('在电脑上输入 /remote', style: theme.textTheme.titleSmall),
+                      Text('在电脑上输入 /remote-loc', style: theme.textTheme.titleSmall),
                       const SizedBox(height: 6),
                       Text(
-                        '屏幕上会出现一个二维码，用下面的「扫码」扫它。',
+                        '屏幕上会出现一个二维码，用下面的「扫码」扫它。手机要和电脑在同一个 Wi-Fi 下。',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),

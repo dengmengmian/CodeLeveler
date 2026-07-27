@@ -241,7 +241,11 @@ async fn invite(
         relay_url: config.relay_url.clone(),
         pairing_secret: secret.to_string(),
     };
-    let payload_text = serde_json::to_string(&payload)?;
+    // The short form, both in the code and on the line under it. JSON spent
+    // about a hundred characters on field names, every one of them more modules
+    // in the code, and the result did not fit a terminal pane — a QR missing a
+    // row does not decode at all.
+    let payload_text = payload.to_compact();
 
     Ok(RemoteOutcome::Invited(RemoteInvite {
         qr: qr_rows(&payload_text)?,
@@ -462,15 +466,23 @@ mod tests {
     /// terminal. A code that is right but 90 rows tall is a code nobody scans.
     #[test]
     fn the_invite_qr_encodes_the_payload_and_fits_a_terminal() {
-        let payload = serde_json::to_string(&PairingQrPayload {
+        let payload = (PairingQrPayload {
             runtime_id: "rt_a3dd6a43c99c7f46".to_string(),
             runtime_pubkey: "HKnYa5ASZp5Z-WdmjNJAQ5mZW7-XTABC0l7NBVE7-GI".to_string(),
             relay_url: "http://192.168.1.23:18443".to_string(),
             pairing_secret: "3y9mp9_qB53NfJ7lL2biQ8ztTyTAFtUqEE69D_k6ldo".to_string(),
         })
-        .unwrap();
+        .to_compact();
 
         let rows = qr_rows(&payload).expect("a real payload encodes");
+        // The size that matters is the one a camera has to resolve off a
+        // screen. At JSON's length the code needed 69 modules a side and got
+        // clipped by the pane it was drawn in.
+        assert!(
+            rows[0].chars().count() <= 58,
+            "{} columns is a code nobody can hold a phone up to",
+            rows[0].chars().count()
+        );
         assert!(!rows.is_empty());
         // Half blocks: two module rows per line, plus the quiet zone.
         assert!(
