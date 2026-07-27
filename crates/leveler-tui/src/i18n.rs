@@ -407,6 +407,8 @@ pub struct SlashText {
     pub quit: &'static str,
     /// `/remote`
     pub remote: &'static str,
+    /// `/remote-loc`
+    pub remote_loc: &'static str,
 }
 
 /// Argument ghosts for commands that require free-text params.
@@ -578,6 +580,7 @@ static ZH: UiText = UiText {
         export: "导出对话为 markdown（默认存当前目录，可 /export <路径>）",
         web: "在浏览器打开 Web UI（loopback + token，同一会话）",
         remote: "让手机扫码连接这台机器",
+        remote_loc: "同一 Wi-Fi 下连手机（本机测试用，不需要公网 relay）",
         image: "添加图片附件",
         attach: "添加文件附件",
         paste: "粘贴剪贴板图片",
@@ -826,6 +829,7 @@ static EN: UiText = UiText {
         export: "export conversation to markdown (cwd by default; /export <path>)",
         web: "open the browser Web UI (loopback + token, same session)",
         remote: "Pair a phone with this machine by QR",
+        remote_loc: "Pair over the same Wi-Fi (local testing; no public relay)",
         image: "attach image",
         attach: "add attachment",
         paste: "paste clipboard image",

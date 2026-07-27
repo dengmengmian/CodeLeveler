@@ -950,16 +950,37 @@ mod export_tests {
     }
 
     #[test]
-    fn the_local_command_stays_out_of_the_advertised_list() {
-        // Known, so typing it is not an error; unadvertised, so nobody meets it
-        // by browsing. Both halves matter: a testing path that shows up in the
-        // command list is a testing path users will try.
+    fn the_local_command_can_be_found_by_typing_it() {
+        // It used to be hidden — a testing path that shows up while browsing is
+        // a testing path users will try. That was the wrong trade: the person
+        // who needs this command is told to type it, types it, sees no
+        // completion and nothing in the list, and concludes it does not exist.
+        // A command nobody can confirm is real is worse than one a stranger
+        // might try; the description says plainly what it is for.
         assert!(is_known_slash("remote-loc"));
+
         for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
+            let text = locale.text();
+            let listed = crate::screen::slash_commands(text);
             assert!(
-                !locale.text().slash.remote.contains("remote-loc"),
-                "the local path must not be described in the command list"
+                listed.iter().any(|(name, _)| *name == "/remote-loc"),
+                "typing /remote- must offer it"
             );
+
+            // Enter submits a fully typed command instead of completing to the
+            // highlighted suggestion, and that turns on this list. Without the
+            // entry, `/remote-loc` + Enter would run `/remote` — the one
+            // command it must never be mistaken for.
+            assert!(crate::screen::SLASH_NAMES.contains(&"/remote-loc"));
+
+            // And it says which one is which, rather than leaving two
+            // near-identical names to be told apart by guessing.
+            let (_, description) = listed
+                .iter()
+                .find(|(name, _)| *name == "/remote-loc")
+                .expect("just asserted it is there");
+            assert!(!description.is_empty());
+            assert_ne!(*description, text.slash.remote);
         }
     }
 

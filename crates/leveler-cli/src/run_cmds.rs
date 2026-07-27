@@ -594,10 +594,29 @@ pub(crate) async fn cmd_tui(
             locale: leveler_tui::Locale::resolve(global.lang.as_deref()),
             untrusted_config: crate::trust_cmds::untrusted_config_display(&layout.repo_root),
         };
+        // A phone can be served over this connection.
+        //
+        // `/remote` used to refuse here on the grounds that the TUI does not own
+        // a runtime. It does not need to own one: the daemon on the other end of
+        // this socket *is* a `LocalRuntimeService`, and it is on this machine —
+        // the socket is a file in this repository's state directory. Refusing
+        // meant that opening a TUI in a repository where `leveler serve` was
+        // already running made the whole feature unreachable, with a message
+        // about a "remote daemon" that named the one case this is not.
+        let remote_launcher = crate::remote_invite::launcher(
+            client.clone() as Arc<dyn leveler_local_transport::LocalRuntimeService>,
+            layout.repo_root.clone(),
+            leveler_remote_agent::RemoteHome::new(
+                leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".leveler"))
+                    .join("remote"),
+            ),
+        );
         let client: Arc<dyn InteractiveRuntimeClient> = client;
-        // Daemon-attached TUI: no local runtime to bind a Web UI onto. `/web`
-        // reports this and points at `leveler web --connect`.
-        leveler_tui::run(client, None, None, boot).await?;
+        // `/web` still has nothing to bind: it needs to *serve* HTTP from this
+        // process, which is a different thing from reaching a runtime. It
+        // reports that and points at `leveler web --connect`.
+        leveler_tui::run(client, None, Some(remote_launcher), boot).await?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
