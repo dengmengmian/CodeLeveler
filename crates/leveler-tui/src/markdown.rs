@@ -416,7 +416,14 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                 out.extend(wrap_spans(&heading, width, theme, style));
             }
             MdBlock::Paragraph(spans) => {
-                out.extend(wrap_spans(spans, width, theme, Style::default()));
+                // Explicit body fg so bare-URL accent always contrasts (do not
+                // rely on terminal default, which can match accent in some themes).
+                out.extend(wrap_spans(
+                    spans,
+                    width,
+                    theme,
+                    Style::default().fg(theme.text),
+                ));
             }
             MdBlock::Quote(spans) => {
                 let inner = width.saturating_sub(2).max(1);
@@ -435,7 +442,12 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     };
                     let indent = " ".repeat(marker.width());
                     let inner = width.saturating_sub(marker.width()).max(1);
-                    let wrapped = wrap_spans(item, inner, theme, Style::default());
+                    let wrapped = wrap_spans(
+                        item,
+                        inner,
+                        theme,
+                        Style::default().fg(theme.text),
+                    );
                     for (li, line) in wrapped.into_iter().enumerate() {
                         let lead = if li == 0 {
                             marker.clone()
@@ -881,7 +893,15 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
             style = Style::default().fg(theme.code);
         }
         if s.link.is_some() {
-            style = style.fg(theme.accent).add_modifier(Modifier::UNDERLINED);
+            // Match bare-URL treatment so markdown links and bare URLs look
+            // the same (accent + bold + underline).
+            style = crate::url_link::link_style(theme.accent);
+            if s.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if s.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
         }
         style
     };
@@ -1653,15 +1673,51 @@ mod tests {
 
     #[test]
     fn bare_http_url_in_prose_is_underlined() {
+        let theme = Theme::dark();
         let doc = MdDoc::parse("Local: http://localhost:3000 ready");
-        let lines = doc.to_lines(80, &Theme::dark());
-        let has = lines.iter().any(|l| {
-            l.spans.iter().any(|s| {
-                s.content.contains("localhost:3000")
-                    && s.style.add_modifier.contains(Modifier::UNDERLINED)
-            })
-        });
-        assert!(has, "bare http URL must look like a link: {lines:?}");
+        let lines = doc.to_lines(80, &theme);
+        let url = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("localhost:3000"))
+            .expect("url span");
+        assert!(
+            url.style.add_modifier.contains(Modifier::UNDERLINED)
+                && url.style.add_modifier.contains(Modifier::BOLD),
+            "bare http URL must look like a link: {lines:?}"
+        );
+        assert_eq!(url.style.fg, Some(theme.accent));
+    }
+
+    /// Real admin-status copy from gitcode-assist-service (CJK colon, fullwidth
+    /// parens, free-standing URL in the closing sentence).
+    #[test]
+    fn admin_status_list_urls_are_accent_bold_underline() {
+        let md = "\
+管理后台已经在运行了，一切正常：
+
+- 后端地址：http://localhost:8081（PID 87963，已运行中）
+- 直接用浏览器打开 http://localhost:8081 就行了。
+";
+        let theme = Theme::dark();
+        let lines = MdDoc::parse(md).to_lines(100, &theme);
+        let urls: Vec<_> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.content.contains("localhost:8081"))
+            .collect();
+        assert!(
+            urls.len() >= 2,
+            "expected glued + free-standing URLs: {lines:?}"
+        );
+        for s in urls {
+            assert_eq!(s.style.fg, Some(theme.accent), "span={s:?}");
+            assert!(
+                s.style.add_modifier.contains(Modifier::UNDERLINED)
+                    && s.style.add_modifier.contains(Modifier::BOLD),
+                "span={s:?}"
+            );
+        }
     }
 
     #[test]

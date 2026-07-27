@@ -94,11 +94,14 @@ pub(crate) fn spans_with_bare_urls(text: &str, base: Style, link: Style) -> Vec<
     out
 }
 
-/// Accent + underline style used for bare and markdown links.
+/// Accent + bold + underline style used for bare and markdown links.
+///
+/// Bold is intentional: on many terminals underline alone is easy to miss
+/// next to light body text, so the link must also read as a different weight.
 pub(crate) fn link_style(accent: ratatui::style::Color) -> Style {
     Style::default()
         .fg(accent)
-        .add_modifier(Modifier::UNDERLINED)
+        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
 }
 
 fn chars_start_with(chars: &[char], i: usize, pat: &str) -> bool {
@@ -243,6 +246,10 @@ mod tests {
             .find(|s| s.content.contains("localhost"))
             .expect("url span");
         assert!(url_span.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(
+            url_span.style.add_modifier.contains(Modifier::BOLD),
+            "links must be bold so they read as interactive, not plain prose"
+        );
         assert_eq!(url_span.style.fg, Some(Color::Cyan));
         let plain = spans
             .iter()
