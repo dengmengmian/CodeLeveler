@@ -242,6 +242,36 @@ mod unix {
         }
     }
 
+    impl ProjectRouter {
+        /// Attach, and check that an attachment we already hold still works.
+        ///
+        /// [`Self::attach`] hands back a cached connection without asking, which
+        /// is right on the path a frame takes — the frame itself will fail if
+        /// the daemon is gone. It is wrong when the question *is* the status:
+        /// a project whose daemon was stopped after the first attach went on
+        /// being reported online for as long as the agent lived, so a phone
+        /// offered a project it could not enter.
+        ///
+        /// The check is one `LocalWaiters` round trip, which the socket client
+        /// already implements and which no daemon answers once it is dead.
+        async fn attach_live(
+            &self,
+            repo: &Path,
+            project_id: &str,
+        ) -> Result<Arc<dyn LocalRuntimeService>, RouteError> {
+            let cached = self.attached.lock().unwrap().get(project_id).cloned();
+            if let Some(runtime) = cached {
+                if runtime.local_waiter_count().await.is_ok() {
+                    return Ok(runtime);
+                }
+                // Drop it before reconnecting, or the stale handle would be
+                // handed straight back by `attach`.
+                self.attached.lock().unwrap().remove(project_id);
+            }
+            self.attach(repo, project_id).await
+        }
+    }
+
     #[async_trait]
     impl ProjectRoutes for ProjectRouter {
         async fn projects(&self) -> Vec<ProjectInfo> {
@@ -249,7 +279,7 @@ mod unix {
             for (project_id, repo, path_display) in self.entries() {
                 // Status is what attaching actually finds, not what a registry
                 // file claims: a daemon that died leaves its entry behind.
-                let status = match self.attach(&repo, &project_id).await {
+                let status = match self.attach_live(&repo, &project_id).await {
                     Ok(_) => ProjectStatus::Online,
                     Err(_) => ProjectStatus::Offline,
                 };

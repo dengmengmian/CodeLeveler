@@ -100,6 +100,7 @@ Future<void> until(
   bool Function() done, {
   Duration limit = const Duration(seconds: 45),
   required String what,
+  AppController? controller,
 }) async {
   final deadline = DateTime.now().add(limit);
   while (DateTime.now().isBefore(deadline)) {
@@ -107,7 +108,13 @@ Future<void> until(
     await tester.pump(const Duration(milliseconds: 200));
     await Future<void>.delayed(const Duration(milliseconds: 200));
   }
-  fail('等了 ${limit.inSeconds} 秒也没等到：$what；屏幕上是：${visibleText(tester)}');
+  // A timeout is nearly always a message that went nowhere, so say what the
+  // controller thinks happened rather than only what the screen shows.
+  final state = controller == null
+      ? ''
+      : '；连接=${controller.connection}，错误=${controller.lastError}'
+          '，会话状态=${controller.session?.status}';
+  fail('等了 ${limit.inSeconds} 秒也没等到：$what$state；屏幕上是：${visibleText(tester)}');
 }
 
 /// Type into the composer and send.

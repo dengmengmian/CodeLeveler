@@ -213,10 +213,11 @@ def main():
             raise SystemExit(f"没有提示怎么接受：\n{tui.tail()}")
         phone = re.search(r"手机指纹：([0-9a-f ]{16,})", asked)
         print(f"== 手机来了，指纹 {phone.group(1).strip() if phone else '?'} ==", flush=True)
-        # Hold longer than the app spends checking that it is *not* yet paired.
-        # Accepting inside that window makes the phone look like it promoted
-        # itself, which is the one thing that test is watching for.
-        time.sleep(8)
+        # Hold comfortably longer than the app spends checking that it is
+        # *not* yet paired (four ~2s pumps). Accepting inside that window makes
+        # the phone look like it promoted itself, which is the one thing that
+        # test is watching for.
+        time.sleep(15)
         tui.type("y")
 
         tui.wait_for(r"已配对|配对完成|已接受", 60, "确认结果")

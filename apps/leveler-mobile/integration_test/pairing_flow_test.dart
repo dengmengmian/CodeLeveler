@@ -19,6 +19,7 @@
 /// `scripts/tui_remote_pairing.py`; it needs a live host.
 library;
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:leveler_mobile/crypto/store.dart';
@@ -100,6 +101,59 @@ void main() {
     // reply that should follow it never arrives.
     await until(tester, () => renderedText(tester).contains('任务完成'),
         limit: const Duration(seconds: 120), what: '批准后的收尾回答');
+
+    // ---- Cancelling a turn that is still going. ----
+    //
+    // In a session of its own. Sending this into the session that just ran an
+    // approval reproduced something else entirely: the message arrives, the
+    // bubble appears, and no turn ever starts — see the note in
+    // `docs/design/remote-app-control.md`. Cancelling deserves a test about
+    // cancelling.
+    await tester.tap(find.byIcon(Icons.arrow_back));
+    await tester.pumpAndSettle();
+    await until(tester, () => controller.session == null, what: '退回会话列表');
+    await startSession(tester, controller, '验收：取消回合');
+
+    // The host is asked for a deliberately slow answer, because a reply that
+    // lands before the finger leaves the screen leaves nothing to cancel.
+    await sendMessage(tester, '慢慢讲一下这个项目');
+    expect(controller.lastError, isNull, reason: '发这一条就出错了：${controller.lastError}');
+    await until(tester, () => controller.session!.status == 'running',
+        limit: const Duration(seconds: 60), what: '回合开始', controller: controller);
+    await until(tester, () => renderedText(tester).contains('这是一段很长的回答'),
+        limit: const Duration(seconds: 60), what: '慢回答开始流下来', controller: controller);
+    await tester.pumpAndSettle();
+
+    // The assistant's own text, not the whole screen: the app bar changes from
+    // 「运行中…」 to 「会话」 when the turn ends, and a screen-wide comparison
+    // would be measuring that.
+    final partial = assistantSource(tester);
+    expect(find.byTooltip('取消当前回合'), findsOneWidget,
+        reason: '运行中应当能取消，屏幕上是：${visibleText(tester)}');
+    await tester.tap(find.byTooltip('取消当前回合'));
+    await tester.pump();
+
+    await until(tester, () => controller.session!.status != 'running',
+        limit: const Duration(seconds: 60), what: '回合停下来', controller: controller);
+
+    // Cancelling is cooperative: deltas already on the wire still land, so the
+    // test settles first and only then asks whether it has stopped. Asserting
+    // "not one more character" the instant the status flips would be a test of
+    // network timing.
+    await tester.pump(const Duration(seconds: 2));
+    await Future<void>.delayed(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+    final atStop = assistantSource(tester);
+    await tester.pump(const Duration(seconds: 4));
+    await Future<void>.delayed(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+    expect(assistantSource(tester), atStop, reason: '取消之后还在继续输出');
+
+    // And it really was cut short: the scripted answer runs to 第39句, which a
+    // turn that was merely slow would have reached by now.
+    expect(atStop, isNot(contains('第39句')), reason: '回合没有被真正打断');
+    expect(atStop.length, greaterThanOrEqualTo(partial.length),
+        reason: '取消不该抹掉已经说出来的部分');
 
     expect(controller.lastError, isNull, reason: '整段流程不该报错：${controller.lastError}');
     expect(controller.session!.needsResync, isFalse,

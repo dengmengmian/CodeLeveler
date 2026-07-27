@@ -86,6 +86,9 @@
 | **`/remote loc` 用户路径** | ✅ | `scripts/tui_remote_pairing.py`：pty 里跑真 TUI，输入 `/remote loc` → 屏幕上真画出二维码 → 手机读载荷 → TUI 显示手机指纹并等按键 → `y` → 上面那整段会话再走一遍。指纹由载荷里的公钥现算，不是从同一块屏幕上抄的 |
 | **APP 内切换项目不串台** | ✅ | `multi_project_test.dart`：电脑上开两个仓库，A 建会话发消息 → 退出 → 进 B，断言 A 的会话不在 B 的列表里、B 的对话里没有 A 的消息 |
 | **杀 APP 后 resync** | ✅ | 同一用例：整棵 widget 树拆掉、换一个 `AppController`、新 socket，只有存储留下来；重开会话后之前说的话由**快照**带回。进程本身没真杀（集成测试会一起死），所以「iOS 冷启动后还给不给 keychain」这一层没验 |
+| **取消当前回合** | ✅ | `pairing_flow_test.dart`：让模型给一段慢回答，流到一半按停止；provider 端看到连接被切断，文本停止增长且没跑到最后一句 |
+| **项目离线时 APP 的显示** | ✅ | `offline_and_revoke_test.dart`：停掉一个 daemon，列表里它仍在、标为「离线（电脑上未运行）」，另一个照常可用 |
+| **撤销后 APP 的表现** | ✅ | 同一用例：电脑撤销后，手机下一次取列表即失败并显示「已被撤销…请重新配对」；配对**不**自动清除——一次失败不该把网络抖动变成重新配对 |
 | **待批审批 + 进程重启** | ✅ | `leveler-app/tests/pending_approval_restart.rs`：重启后待批审批**不**重建——按下去解决不了任何东西的按钮不该出现；APP 侧对应地会在快照里没有它时清掉卡片 |
 | Android 构建 | ⛔ | 无 Android SDK |
 | iOS TestFlight 包 | ⛔ | 缺签名证书（平台目录、CocoaPods、模拟器 runtime 均已就位） |

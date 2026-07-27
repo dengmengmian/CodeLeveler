@@ -18,6 +18,7 @@ with the tool result appended, and position alone cannot tell those apart.
 import json
 import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Markdown on purpose: the phone renders assistant text as markdown, and a
@@ -42,6 +43,11 @@ APPROVAL_ARGS = json.dumps(
 )
 
 DONE_AFTER_TOOL = "命令已执行完毕，任务完成。"
+
+# A reply slow enough to be interrupted. Cancelling a turn cannot be tested
+# against an answer that arrives before the finger leaves the screen, so one
+# prompt asks for a long one and gets it delivered a piece at a time.
+SLOW_ANSWER = "这是一段很长的回答，" + "".join(f"第{n}句。" for n in range(1, 40))
 
 
 def last_user_text(body):
@@ -106,6 +112,9 @@ class Handler(BaseHTTPRequestHandler):
         if has_tool_result(body):
             print(f"[provider] 工具结果回来了 -> 收尾", flush=True)
             self.stream_text(DONE_AFTER_TOOL)
+        elif "慢慢" in prompt:
+            print(f"[provider] {prompt[:40]!r} -> 慢回答（可被取消）", flush=True)
+            self.stream_text(SLOW_ANSWER, delay=0.6)
         elif "删除" in prompt or "delete" in prompt.lower():
             print(f"[provider] {prompt[:40]!r} -> 请求审批", flush=True)
             self.stream_tool_call()
@@ -120,9 +129,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
         self.wfile.flush()
 
-    def stream_text(self, text):
+    def stream_text(self, text, delay=0.0):
         for chunk in text_chunks(text):
-            self.send_event({"choices": [{"index": 0, "delta": {"content": chunk}}]})
+            try:
+                self.send_event({"choices": [{"index": 0, "delta": {"content": chunk}}]})
+            except (BrokenPipeError, ConnectionResetError):
+                # A cancelled turn closes the connection under us. That is the
+                # success case for the cancel test, not an error worth a
+                # traceback in the middle of the run's output.
+                print("[provider] 对端断开（大概率是取消）", flush=True)
+                return
+            if delay:
+                time.sleep(delay)
         self.finish_stream("stop")
 
     def stream_tool_call(self):

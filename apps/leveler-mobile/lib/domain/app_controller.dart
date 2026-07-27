@@ -623,7 +623,12 @@ class AppController extends ChangeNotifier {
   String _explain(RelayException error) => switch (error.code) {
         'runtime_offline' => '开发机当前不在线。稍后重试。',
         'project_offline' => '这个项目在电脑上没有运行。',
-        'revoked' => '这台设备的配对已在电脑上被撤销。',
+        // Two spellings for one fact, from two layers: the relay says
+        // `revoked` when it refuses a token, the host says `device_revoked`
+        // when it refuses a frame. A user meeting the second one used to get
+        // the raw code.
+        'revoked' || 'device_revoked' =>
+          '这台设备的配对已在电脑上被撤销。要继续使用，请在设置里清除配对后重新配对。',
         'unauthorized' => '授权已失效，请重新配对。',
         'rate_limited' => '请求太频繁，请稍候。',
         _ => '${error.code}：${error.message}',

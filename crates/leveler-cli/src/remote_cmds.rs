@@ -33,7 +33,7 @@ pub(crate) async fn cmd_remote(cmd: RemoteCommand) -> anyhow::Result<std::proces
         RemoteCommand::Agent => agent().await,
         RemoteCommand::Status => status(),
         RemoteCommand::Devices => devices(),
-        RemoteCommand::Revoke { device_id } => revoke(&device_id),
+        RemoteCommand::Revoke { device_id } => revoke(&device_id).await,
     }
 }
 
@@ -563,17 +563,56 @@ fn devices() -> anyhow::Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-fn revoke(device_id: &str) -> anyhow::Result<std::process::ExitCode> {
+/// Withdraw trust in a device, locally and on the relay.
+///
+/// Local first, and unconditionally: that file is what the agent consults on
+/// every frame, so writing it is what actually stops the device. The relay call
+/// is what ends the *stream* it is already holding and invalidates its tokens —
+/// without it a revoked phone keeps a live socket and collects a refusal per
+/// frame instead of a clean close. A relay that cannot be reached therefore
+/// downgrades the result rather than failing it: the device is stopped either
+/// way, and saying "revoke failed" would invite the user to try again as if it
+/// had not worked.
+async fn revoke(device_id: &str) -> anyhow::Result<std::process::ExitCode> {
     let path = devices_path();
     let mut store = TrustedDevices::load(&path)?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    if store.revoke(device_id, &now)? {
-        println!("已撤销设备 {device_id}。");
-        println!("该设备的后续帧将被拒绝（下一帧即生效，无需等待重连）。");
-        Ok(std::process::ExitCode::SUCCESS)
-    } else {
+    if !store.revoke(device_id, &now)? {
         eprintln!("找不到设备 {device_id}。用 `leveler remote devices` 查看已配对设备。");
-        Ok(std::process::ExitCode::FAILURE)
+        return Ok(std::process::ExitCode::FAILURE);
     }
+    println!("已撤销设备 {device_id}。");
+    println!("该设备的后续帧将被拒绝（下一帧即生效，无需等待重连）。");
+
+    let (config, key, _home) = match require_enabled() {
+        Ok(parts) => parts,
+        Err(_) => return Ok(std::process::ExitCode::SUCCESS),
+    };
+    let response = reqwest::Client::new()
+        .delete(format!("{}/v1/devices/{device_id}", config.relay_url))
+        .query(&[("runtime_id", config.runtime_id.as_str())])
+        .header(
+            RUNTIME_AUTH_HEADER,
+            auth_header(&key, runtime_action::DEVICE_REVOKE, &config.runtime_id),
+        )
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => {
+            println!("relay 也已撤销：该设备的 token 立即失效，在途连接已关闭。");
+        }
+        Ok(response) => {
+            println!(
+                "本机已撤销，但 relay 没有接受（HTTP {}）。该设备发不出有效指令，\n                 但它与 relay 的连接可能还开着；relay 恢复后可重跑本命令。",
+                response.status()
+            );
+        }
+        Err(error) => {
+            println!(
+                "本机已撤销，但联系不上 relay（{error}）。该设备发不出有效指令，\n                 但它与 relay 的连接可能还开着；网络恢复后可重跑本命令。"
+            );
+        }
+    }
+    Ok(std::process::ExitCode::SUCCESS)
 }

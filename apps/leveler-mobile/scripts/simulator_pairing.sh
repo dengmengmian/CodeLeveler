@@ -36,6 +36,21 @@ PORT="${PORT:-18443}"
 PROVIDER_PORT="${PROVIDER_PORT:-18500}"
 
 cleanup() {
+  # Printed here rather than at the end of the happy path: the logs are most
+  # wanted exactly when the run did not get there.
+  if [[ -n "${WORK:-}" ]]; then
+    echo
+    echo "== 模型日志 =="
+    tail -12 "$WORK/provider.log" 2>/dev/null || true
+    echo "== agent 日志 =="
+    tail -6 "$WORK/agent.log" 2>/dev/null || true
+    echo "== 项目 A daemon =="
+    tail -6 "$WORK/serve.log" 2>/dev/null || true
+    # Per-frame record of what the agent admitted or refused: when a phone's
+    # message seems to vanish, this is the only place that says which.
+    echo "== 远程审计 =="
+    tail -12 "$LEVELER_HOME"/remote/audit/*.jsonl 2>/dev/null || true
+  fi
   for pid in "${SERVE_PID:-}" "${SERVE_B_PID:-}" "${AGENT_PID:-}" "${RELAY_PID:-}" "${PROVIDER_PID:-}"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
   done
@@ -140,6 +155,26 @@ fi
 # One watcher per pairing, because each `flutter test` run starts from an
 # unpaired app: the store is in memory, so the second journey pairs again from
 # scratch rather than inheriting the first one's trust.
+# Revoke the device that was just accepted, after a pause.
+#
+# "Just accepted" is the last entry the store lists: `accept` appends, so the
+# newest pairing is at the end. Tying this to the confirmation rather than
+# diffing device lists keeps it to one fact — each journey pairs once, and this
+# is that one.
+revoke_newest_after() {
+  local pause="$1"
+  sleep "$pause"
+  local newest
+  newest="$("$LEVELER" remote devices 2>/dev/null |
+    sed -n 's/.*(\(dev_[A-Za-z0-9_.:-]*\)).*/\1/p' | sed -n '$p')"
+  if [[ -z "$newest" ]]; then
+    echo "== 没有已配对设备可撤销 ==" >&2
+    return 1
+  fi
+  echo "== 撤销刚配对的设备 $newest =="
+  "$LEVELER" remote revoke "$newest" || true
+}
+
 watch_for_pairing() {
   # Wait for the phone to claim the secret, then pause before accepting. The
   # pause is measured from the claim, not from this script's start, so the
@@ -147,10 +182,18 @@ watch_for_pairing() {
   # is the window the test uses to prove a device cannot promote itself.
   for _ in $(seq 1 120); do
     if "$LEVELER" remote pending >/dev/null 2>&1; then
-      echo "== 手机已提交，8 秒后再确认 =="
-      sleep 8
+      # Comfortably longer than the app spends checking that it is *not*
+      # yet paired (four ~2s pumps). At 8 seconds the two ended in a photo
+      # finish and the app occasionally saw itself paired inside its own
+      # guard window — a real race in the test, not in the product.
+      echo "== 手机已提交，15 秒后再确认 =="
+      sleep 15
       CONFIRMED="$("$LEVELER" remote confirm --yes)"
       grep -q "配对完成" <<<"$CONFIRMED" && echo "== 已在电脑上确认 =="
+      # Some journeys need the pairing taken away again while the app watches.
+      if [[ -n "${REVOKE_AFTER:-}" ]]; then
+        revoke_newest_after "$REVOKE_AFTER"
+      fi
       return 0
     fi
     sleep 1
@@ -159,9 +202,8 @@ watch_for_pairing() {
   return 1
 }
 
-cd "$REPO/apps/leveler-mobile"
-RESULT=0
-for journey in pairing_flow_test multi_project_test; do
+run_journey() {
+  local journey="$1"
   echo "== 配对载荷（${journey}）=="
   PAYLOAD="$("$LEVELER" remote pair | grep '^{')"
   echo "$PAYLOAD"
@@ -169,20 +211,46 @@ for journey in pairing_flow_test multi_project_test; do
   watch_for_pairing &
   CONFIRM_PID=$!
 
-  echo "== 在模拟器上跑 $journey =="
+  echo "== 在模拟器上跑 ${journey} =="
   set +e
-  flutter test "integration_test/$journey.dart" \
+  flutter test "integration_test/${journey}.dart" \
     -d "$DEVICE" \
     --dart-define="PAIRING_PAYLOAD=$PAYLOAD" \
     --dart-define="HOST_FINGERPRINT=$HOST_FINGERPRINT"
-  STEP=$?
+  local step=$?
   set -e
   wait "$CONFIRM_PID" 2>/dev/null || true
+  return $step
+}
+
+cd "$REPO/apps/leveler-mobile"
+RESULT=0
+for journey in pairing_flow_test multi_project_test; do
+  set +e
+  run_journey "$journey"
+  STEP=$?
+  set -e
   if [[ $STEP -ne 0 ]]; then
     RESULT=$STEP
     break
   fi
 done
+
+# The last journey needs the far end to go away: one project's daemon stopped
+# before it starts, and this device revoked while it is watching.
+if [[ $RESULT -eq 0 ]]; then
+  echo "== 停掉第二个项目的 daemon =="
+  kill "$SERVE_B_PID" 2>/dev/null || true
+  SERVE_B_PID=""
+  sleep 3
+
+  # Revoke this journey's device 25 seconds after the host accepts it — past
+  # the point where the app has reached the project list and started looking.
+  set +e
+  REVOKE_AFTER=25 run_journey offline_and_revoke_test
+  RESULT=$?
+  set -e
+fi
 
 # The approval was for a real `rm`. If the file survived, the phone's "allow"
 # never reached a process that could act on it — which every screen-level
@@ -196,9 +264,4 @@ if [[ $RESULT -eq 0 ]]; then
   fi
 fi
 
-echo
-echo "== 模型日志 =="
-tail -8 "$WORK/provider.log"
-echo "== agent 日志 =="
-tail -5 "$WORK/agent.log"
 exit $RESULT

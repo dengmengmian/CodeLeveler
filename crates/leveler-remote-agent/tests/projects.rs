@@ -504,7 +504,27 @@ async fn the_router_attaches_to_live_daemons_and_reports_the_rest_offline() {
         "three open projects means the caller must say which"
     );
 
+    // A daemon that stops *after* the router attached to it must stop being
+    // reported online. The attachment is cached — deliberately, so a frame does
+    // not pay for a reconnect — and a cached handle was answering the status
+    // question too, so a project the user had closed went on being offered by
+    // the phone for as long as the agent lived.
     shutdown.cancel();
+    for _ in 0..50 {
+        if router
+            .projects()
+            .await
+            .iter()
+            .all(|project| project.status == ProjectStatus::Offline)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!(
+        "daemons stopped, but the router still calls them online: {:?}",
+        router.projects().await
+    );
 }
 
 /// A repository the user removed must not come back through the remote door.
