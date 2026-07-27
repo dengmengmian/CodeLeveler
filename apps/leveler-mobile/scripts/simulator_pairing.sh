@@ -39,6 +39,8 @@ done
 WORK="$(mktemp -d)"
 export LEVELER_HOME="$WORK/.leveler"
 mkdir -p "$LEVELER_HOME"
+XCCONFIG_BACKUP="$WORK/Generated.xcconfig.orig"
+cp "$REPO/apps/leveler-mobile/ios/Flutter/Generated.xcconfig" "$XCCONFIG_BACKUP" 2>/dev/null || true
 export LEVELER_RELAY_ENROLLMENT_SECRET="simulator-acceptance-secret"
 PORT="${PORT:-18443}"
 PROVIDER_PORT="${PROVIDER_PORT:-18500}"
@@ -75,10 +77,13 @@ cleanup() {
   # `flutter test` rewrites ios/Flutter/Generated.xcconfig to point FLUTTER_TARGET
   # at a temporary test entrypoint, and leaves it there. That temp file is gone
   # by the time anyone opens Xcode, and the build then fails with a
-  # PhaseScriptExecution error that says nothing about why. Put it back.
-  if grep -q "flutter_test_listener" "$REPO/apps/leveler-mobile/ios/Flutter/Generated.xcconfig" 2>/dev/null; then
-    echo "== 还原 Generated.xcconfig（集成测试改过它）=="
-    (cd "$REPO/apps/leveler-mobile" && flutter build ios --simulator --debug >/dev/null 2>&1) || true
+  # PhaseScriptExecution error that says nothing about why.
+  #
+  # Restored from the copy taken before the tests ran, rather than by rebuilding:
+  # a copy is instant and works even when this script is dying for some unrelated
+  # reason, which is exactly when a fifteen-second rebuild gets skipped.
+  if [[ -f "${XCCONFIG_BACKUP:-}" ]]; then
+    cp "$XCCONFIG_BACKUP" "$REPO/apps/leveler-mobile/ios/Flutter/Generated.xcconfig"
   fi
 }
 trap cleanup EXIT

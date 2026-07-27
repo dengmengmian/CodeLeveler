@@ -30,6 +30,8 @@ mkdir -p "$OUT"
 WORK="$(mktemp -d)"
 export LEVELER_HOME="$WORK/.leveler"
 mkdir -p "$LEVELER_HOME"
+XCCONFIG_BACKUP="$WORK/Generated.xcconfig.orig"
+cp "$REPO/apps/leveler-mobile/ios/Flutter/Generated.xcconfig" "$XCCONFIG_BACKUP" 2>/dev/null || true
 export LEVELER_RELAY_ENROLLMENT_SECRET="screenshot-secret"
 PORT="${PORT:-18443}"
 PROVIDER_PORT="${PROVIDER_PORT:-18500}"
@@ -38,8 +40,10 @@ cleanup() {
   for pid in "${SNAP_PID:-}" "${SERVE_PID:-}" "${AGENT_PID:-}" "${RELAY_PID:-}" "${PROVIDER_PID:-}"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
   done
-  if grep -q "flutter_test_listener" "$REPO/apps/leveler-mobile/ios/Flutter/Generated.xcconfig" 2>/dev/null; then
-    (cd "$REPO/apps/leveler-mobile" && flutter build ios --simulator --debug >/dev/null 2>&1) || true
+  # See simulator_pairing.sh: an integration test leaves FLUTTER_TARGET pointing
+  # at a deleted temp file, and Xcode then fails with a message about nothing.
+  if [[ -f "${XCCONFIG_BACKUP:-}" ]]; then
+    cp "$XCCONFIG_BACKUP" "$REPO/apps/leveler-mobile/ios/Flutter/Generated.xcconfig"
   fi
   echo "截图在 $OUT"
 }
