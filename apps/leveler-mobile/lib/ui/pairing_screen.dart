@@ -298,24 +298,84 @@ class _ScannerScreen extends StatefulWidget {
 class _ScannerScreenState extends State<_ScannerScreen> {
   bool _handled = false;
 
+  /// What went wrong with the camera, if anything did.
+  ///
+  /// The plugin's default handler for a detection error does nothing at all,
+  /// and without an `errorBuilder` a camera that cannot start takes the screen
+  /// with it. On a phone that means the app appears to die the moment the user
+  /// taps 扫码 — with nothing said about a permission, a busy camera, or a
+  /// device that has none.
+  String? _failure;
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('扫描电脑上的二维码')),
-      body: MobileScanner(
-        onDetect: (capture) {
-          // One result only: the camera fires repeatedly, and popping twice
-          // would tear down the screen underneath as well.
-          if (_handled) return;
-          for (final barcode in capture.barcodes) {
-            final value = barcode.rawValue;
-            if (value != null && value.isNotEmpty) {
-              _handled = true;
-              Navigator.of(context).pop(value);
-              return;
-            }
-          }
-        },
+      body: _failure != null
+          ? _ScannerProblem(message: _failure!)
+          : MobileScanner(
+              errorBuilder: (context, error) =>
+                  _ScannerProblem(message: '打不开相机：${error.errorCode.name}'),
+              onDetectError: (error, stack) {
+                // Reading a frame failed. Say so rather than leave a live
+                // preview that will never produce a result.
+                if (mounted && _failure == null) {
+                  setState(() => _failure = '识别出错：$error');
+                }
+              },
+              onDetect: (capture) {
+                // One result only: the camera fires repeatedly, and popping
+                // twice would tear down the screen underneath as well.
+                if (_handled || !mounted) return;
+                for (final barcode in capture.barcodes) {
+                  final value = barcode.rawValue;
+                  if (value != null && value.isNotEmpty) {
+                    _handled = true;
+                    Navigator.of(context).pop(value);
+                    return;
+                  }
+                }
+              },
+            ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(
+            '对准电脑上 /remote-loc 显示的那个码。扫不了就返回，用粘贴。',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodySmall,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A camera that will not work, explained rather than crashed.
+class _ScannerProblem extends StatelessWidget {
+  const _ScannerProblem({required this.message});
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.no_photography_outlined, size: 40, color: theme.colorScheme.outline),
+            const SizedBox(height: 16),
+            Text(message, textAlign: TextAlign.center, style: theme.textTheme.bodyMedium),
+            const SizedBox(height: 20),
+            OutlinedButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('返回，改用粘贴'),
+            ),
+          ],
+        ),
       ),
     );
   }
