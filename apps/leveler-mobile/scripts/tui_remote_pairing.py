@@ -12,6 +12,10 @@ and the y/n prompt are all rendered, not printed. `loc` is the local-testing
 form — it starts a relay on this machine so nothing leaves the LAN.
 
     python3 tui_remote_pairing.py <simulator-udid>
+
+Set `LEVELER_BIN` to check an installed binary instead of the debug build —
+after `cargo build --release`, that is the difference between testing what was
+built and testing what a user actually runs.
 """
 
 import os
@@ -26,7 +30,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-LEVELER = os.path.join(REPO, "target", "debug", "leveler")
+LEVELER = os.environ.get("LEVELER_BIN") or os.path.join(REPO, "target", "debug", "leveler")
 
 # Wide enough that the payload line under the QR is not clipped: the app needs
 # every character of it, and a Paragraph clips rather than wraps.
