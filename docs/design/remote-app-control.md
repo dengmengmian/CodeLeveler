@@ -1406,7 +1406,7 @@ pub enum ClientOrigin {
 - **结论：不得宣称生产就绪。** 三条理由：Phase 1 完成定义含真机 APP（K23）而 APP 未开始；机密性只到 TLS，托管 relay 下「运营方看不到你的对话」这句话不成立；已知问题里还有 3 条可被利用的粗糙面（RPC 重放窗口、配对无 per-runtime 锁定、rpc 无限流）。
 - **未做：** 结构化 fuzz（`cargo-fuzz`）。现有负例是针对设计点名攻击的手写向量，不能替代对解析器的随机输入测试。
 
-> **PR11a–f 总状态：⚠️ 能编译、协议层已验证，但从未真机跑起来。** 装上 Flutter 3.44.8 后实跑：`pub get` 通过、`analyze` **No issues found**、`flutter test` **16 条全绿**（含跨语言 golden，牙口已验：互换 canonical 字段即红）。**仍未做**：平台目录未生成，无 Android SDK / iOS 模拟器 runtime / CocoaPods / 真机，所以 `flutter build` 与真机闭环都没跑过。`analyze` + `test` 证明的是「能编译、协议逻辑对」，不是「这个 APP 能用」——Phase 1 出门要的真机路径（K23）**仍未满足**。
+> **PR11a–f 总状态：⚠️ iOS 模拟器上整条链已跑通，真机与 Android 仍未跑过。** Flutter 3.44.8 / CocoaPods 1.17.0 / iOS 26.5 模拟器就位后：`analyze` **No issues found**、`flutter test` **24 条全绿**（含两份跨语言 golden：信封与 *会话事件*）、`flutter build ios --simulator` 通过，并在 iPhone 17 Pro 模拟器上由 `scripts/tui_remote_pairing.py` 驱动真 TUI 走完 `/remote loc` → 扫码 → 电脑确认 → 新建会话 → 中英文对话（Markdown 真渲染）→ 审批 → `rm` 真执行。**仍未做**：Android 构建（无 SDK）、真机蜂窝闭环与内测包（无设备与签名证书）、APP 侧的「≥2 项目切换不串台」与「杀进程 resync」（Rust e2e 验过，APP 上没验——模拟器那条链只有一个项目）。Phase 1 出门要的真机路径（K23）**仍未满足**。
 
 ### PR11a — APP 工程脚手架 + 契约接入
 
@@ -1477,10 +1477,10 @@ pub enum ClientOrigin {
 | `leveler-session-wire` | crate | 是 | ✅ PR0 已落地 |
 | `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
-| `leveler-remote-agent` + ProjectRouter | **lib（尚无二进制入口）** | 是 | ⚠️ 准入 + 隧道 + RPC + ProjectRouter + 事件下行 + 审批超时已落地；**缺 `leveler remote-agent` 可执行入口与配置读取（PR7）**、`upload_attachment` |
+| `leveler-remote-agent` + ProjectRouter | lib + `leveler remote agent` 入口 | 是 | ⚠️ 准入 + 隧道 + RPC + ProjectRouter + 事件下行 + 审批超时 + CLI 入口已落地；**缺 `upload_attachment`** |
 | `leveler-relay` self-host | docker | 是 | ✅ 控制面（含 enroll/断言认证）+ WSS 转发 + RPC 代理 + Dockerfile |
-| `leveler remote` CLI | CLI | 是 | ⚠️ status/devices/revoke 可用；pair/confirm 待 relay |
-| **leveler-mobile** | iOS + Android 内测包 | **是** | ⚠️ 源码 + 16 条测试全绿、analyze 干净；**未在真机/模拟器跑过**，无平台目录、无内测包 |
+| `leveler remote` CLI | CLI | 是 | ✅ enable/enroll/pair/pending/confirm/projects/agent/status/devices/revoke 全部可用并实跑过；另有 TUI 内的 `/remote`（扫码路径） |
+| **leveler-mobile** | iOS + Android 内测包 | **是** | ⚠️ iOS 模拟器上整链跑通（配对→会话→中英文→审批→执行）；**无 Android 构建、无真机、无内测包** |
 | Security gate 记录 | 文档 | 是 | ✅ `docs/design/remote-security-gate.md`（结论：未通过生产宣传门禁） |
 
 ---
