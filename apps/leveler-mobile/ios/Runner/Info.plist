@@ -4,6 +4,24 @@
 <dict>
 	<key>NSCameraUsageDescription</key>
 	<string>扫描电脑上显示的配对二维码</string>
+	<!-- iOS 14 and later blocks connections to the local network until the user
+	     has been asked, and it will not ask without this string. A phone paired
+	     with a Mac over Wi-Fi reaches nothing at all without it, silently. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>连接同一 Wi-Fi 下的开发机</string>
+	<!-- The self-hosted relay on a LAN is plain HTTP: there is no certificate a
+	     192.168.x.x address could present, and inventing one would mean shipping
+	     a trust anchor. The traffic inside it is signed end to end and verified
+	     against the key this phone anchored at pairing, so what TLS would add
+	     here is confidentiality from the local network, not authenticity.
+	     `NSAllowsLocalNetworking` is the narrow form of that exception — it does
+	     not permit cleartext to the public internet, which a hosted relay must
+	     still use HTTPS for. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>

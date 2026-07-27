@@ -11,8 +11,16 @@
 # should be on screen; the scratch repository means the command the test
 # approves really runs and really deletes a file, without touching this one.
 #
-# Usage:  ./scripts/simulator_pairing.sh <simulator-udid>
+# Usage:  ./scripts/simulator_pairing.sh <device-udid>
 #         (build the host binaries first: cargo build -p leveler-cli -p leveler-relay)
+#
+# Works against a real iPhone too, with one difference that matters: a phone is
+# not this machine, so it cannot reach 127.0.0.1. Give it the address the phone
+# can dial and make sure both are on the same Wi-Fi:
+#
+#     RELAY_HOST=192.168.1.23 ./scripts/simulator_pairing.sh <iphone-udid>
+#
+# `ipconfig getifaddr en0` prints that address on a Mac.
 set -euo pipefail
 
 DEVICE="${1:-}"
@@ -34,6 +42,16 @@ mkdir -p "$LEVELER_HOME"
 export LEVELER_RELAY_ENROLLMENT_SECRET="simulator-acceptance-secret"
 PORT="${PORT:-18443}"
 PROVIDER_PORT="${PROVIDER_PORT:-18500}"
+# Where the *phone* should look for the relay. Loopback is right for a
+# simulator, which shares this machine's network stack, and useless for a real
+# device.
+RELAY_HOST="${RELAY_HOST:-127.0.0.1}"
+# Bind wider than loopback when the phone is elsewhere, or nothing off this
+# machine can connect however right the address is.
+RELAY_BIND="127.0.0.1"
+if [[ "$RELAY_HOST" != "127.0.0.1" ]]; then
+  RELAY_BIND="0.0.0.0"
+fi
 
 cleanup() {
   # Printed here rather than at the end of the happy path: the logs are most
@@ -100,7 +118,7 @@ tool_calling = true
 EOF
 
 echo "== relay =="
-LEVELER_RELAY_BIND="127.0.0.1:$PORT" "$RELAY" > "$WORK/relay.log" 2>&1 &
+LEVELER_RELAY_BIND="$RELAY_BIND:$PORT" "$RELAY" > "$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
 sleep 1
 
@@ -115,7 +133,7 @@ if ! kill -0 "$RELAY_PID" 2>/dev/null; then
 fi
 
 echo "== 启用并注册本机 =="
-"$LEVELER" remote enable --relay-url "http://127.0.0.1:$PORT" --name "模拟器验收"
+"$LEVELER" remote enable --relay-url "http://$RELAY_HOST:$PORT" --name "验收"
 "$LEVELER" remote enroll
 
 # The fingerprint the app must display for this host: it is anchored from the
