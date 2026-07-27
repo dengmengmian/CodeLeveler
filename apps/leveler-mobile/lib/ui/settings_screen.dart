@@ -27,7 +27,13 @@ class SettingsScreen extends StatelessWidget {
           if (pairing != null) ...[
             ListTile(
               title: const Text('开发机'),
-              subtitle: Text(pairing.runtimeId),
+              // The name if the relay gave one, with the id under it — the id
+              // is what everything else is keyed by, so it stays visible.
+              subtitle: Text(
+                controller.hostName.isEmpty
+                    ? pairing.runtimeId
+                    : '${controller.hostName}\n${pairing.runtimeId}',
+              ),
             ),
             ListTile(
               title: const Text('relay'),

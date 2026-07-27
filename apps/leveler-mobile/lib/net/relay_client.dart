@@ -178,6 +178,25 @@ class RelayClient {
     );
   }
 
+  /// The machines this device is paired with, as the *relay* names them.
+  ///
+  /// Cosmetic only, and deliberately so: the name is unsigned, so a relay could
+  /// call a host anything it liked. What identifies a machine is the key the
+  /// pairing anchored, which is why the fingerprint — not this — is what the
+  /// settings screen shows and what a user is asked to compare.
+  Future<Map<String, String>> hosts({required String accessToken}) async {
+    final response = await _http.get(
+      _url('/v1/hosts'),
+      headers: {'authorization': 'Bearer $accessToken'},
+    );
+    if (response.statusCode >= 400) _fail(response);
+    final listed = jsonDecode(response.body) as List<dynamic>;
+    return {
+      for (final raw in listed.cast<Map<String, dynamic>>())
+        (raw['host_id'] as String? ?? ''): (raw['display_name'] as String? ?? ''),
+    };
+  }
+
   /// Post one device-signed RPC and return the runtime's answer, still sealed.
   ///
   /// Returning the envelope rather than its contents is deliberate: the caller

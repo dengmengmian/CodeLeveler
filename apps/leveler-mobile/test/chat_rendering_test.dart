@@ -77,8 +77,11 @@ void main() {
     await tester.pumpWidget(_app(_controllerWith(session)));
     await tester.pumpAndSettle();
 
+    // The goal names the session in the app bar, so it is on screen exactly
+    // once; the body says what to do next rather than repeating it.
     expect(find.text('把登录页的报错文案改掉'), findsOneWidget);
-    expect(find.textContaining('开始这次会话'), findsOneWidget);
+    expect(find.textContaining('说点什么'), findsWidgets);
+    expect(find.text('会话已经建好了'), findsOneWidget);
   });
 
   testWidgets('a short conversation sits against the composer', (tester) async {

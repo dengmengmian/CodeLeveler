@@ -57,8 +57,31 @@ class SessionsScreen extends StatelessWidget {
           Expanded(
             child: controller.sessions.isEmpty
                 ? Center(
-                    child: Text(
-                      controller.sessionsLoading ? '正在读取会话…' : '这个项目还没有会话',
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          controller.sessionsLoading
+                              ? Icons.hourglass_empty
+                              : Icons.chat_bubble_outline,
+                          size: 40,
+                          color: Theme.of(context).colorScheme.outline,
+                        ),
+                        const SizedBox(height: 14),
+                        Text(
+                          controller.sessionsLoading ? '正在读取会话…' : '这个项目还没有会话',
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                        if (!controller.sessionsLoading && !controller.isObserveOnly) ...[
+                          const SizedBox(height: 6),
+                          Text(
+                            '点右下角开一个',
+                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                                ),
+                          ),
+                        ],
+                      ],
                     ),
                   )
                 : ListView.separated(
@@ -66,14 +89,45 @@ class SessionsScreen extends StatelessWidget {
                     separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (context, index) {
                       final session = controller.sessions[index];
+                      final theme = Theme.of(context);
+                      final running = session.status == 'running';
                       return ListTile(
                         title: Text(
                           session.goal.isEmpty ? '(无目标)' : session.goal,
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyLarge,
                         ),
-                        subtitle: Text('${session.status} · ${session.updatedAt}'),
-                        trailing: const Icon(Icons.chevron_right),
+                        subtitle: Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Row(
+                            children: [
+                              if (running) ...[
+                                SizedBox(
+                                  width: 10,
+                                  height: 10,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 1.6,
+                                    color: theme.colorScheme.primary,
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                              ],
+                              Flexible(
+                                child: Text(
+                                  running ? '运行中' : _when(session.updatedAt),
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: running
+                                        ? theme.colorScheme.primary
+                                        : theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        trailing: Icon(Icons.chevron_right,
+                            size: 20, color: theme.colorScheme.outline),
                         onTap: () => controller.openSession(
                           controller.currentProjectId!,
                           session.id,
@@ -86,6 +140,22 @@ class SessionsScreen extends StatelessWidget {
       ),
     );
   }
+}
+
+/// A timestamp a person can read at a glance.
+///
+/// The host sends RFC3339; showing that raw made the list a wall of
+/// `2026-07-27T03:57:29Z`, which is precise and unreadable.
+String _when(String isoTimestamp) {
+  final at = DateTime.tryParse(isoTimestamp)?.toLocal();
+  if (at == null) return isoTimestamp;
+  final gap = DateTime.now().difference(at);
+  if (gap.inMinutes < 1) return '刚刚';
+  if (gap.inMinutes < 60) return '${gap.inMinutes} 分钟前';
+  if (gap.inHours < 24) return '${gap.inHours} 小时前';
+  if (gap.inDays < 7) return '${gap.inDays} 天前';
+  return '${at.year}-${at.month.toString().padLeft(2, '0')}-'
+      '${at.day.toString().padLeft(2, '0')}';
 }
 
 class _GoalDialog extends StatefulWidget {

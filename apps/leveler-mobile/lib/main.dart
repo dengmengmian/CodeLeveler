@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'crypto/store.dart';
 import 'domain/app_controller.dart';
 import 'ui/chat_screen.dart';
+import 'ui/theme.dart';
 import 'ui/pairing_screen.dart';
 import 'ui/projects_screen.dart';
 import 'ui/sessions_screen.dart';
@@ -33,12 +34,8 @@ class _LevelerAppState extends State<LevelerApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'CodeLeveler',
-      theme: ThemeData(colorSchemeSeed: const Color(0xFF2F6FEB), useMaterial3: true),
-      darkTheme: ThemeData(
-        colorSchemeSeed: const Color(0xFF2F6FEB),
-        brightness: Brightness.dark,
-        useMaterial3: true,
-      ),
+      theme: levelerTheme(Brightness.light),
+      darkTheme: levelerTheme(Brightness.dark),
       home: FutureBuilder<void>(
         future: _restored,
         builder: (context, snapshot) {

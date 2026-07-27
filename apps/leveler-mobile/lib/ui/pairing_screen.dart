@@ -100,46 +100,50 @@ class _PairingScreenState extends State<PairingScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text('配对开发机')),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
         children: [
-          Text('在电脑的 CodeLeveler 里输入 /remote，屏幕上会出现一个二维码，用下面的「扫码」扫它。',
-              style: theme.textTheme.bodyMedium),
-          const SizedBox(height: 4),
-          Text('（扫不了的时候，二维码下面那一行也可以直接粘贴过来。）',
-              style: theme.textTheme.bodySmall),
-          const SizedBox(height: 16),
-          TextField(
-            controller: _payload,
-            minLines: 3,
-            maxLines: 6,
-            decoration: InputDecoration(
-              labelText: '配对载荷',
-              border: const OutlineInputBorder(),
-              suffixIcon: IconButton(
-                icon: const Icon(Icons.content_paste),
-                tooltip: '粘贴',
-                onPressed: () async {
-                  final data = await Clipboard.getData(Clipboard.kTextPlain);
-                  if (data?.text != null) _payload.text = data!.text!;
-                },
-              ),
+          // The instruction is the whole screen for a first-time user, so it
+          // gets the weight of one rather than sitting as a paragraph above a
+          // pile of fields.
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.qr_code_2, size: 28, color: theme.colorScheme.primary),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('在电脑上输入 /remote', style: theme.textTheme.titleSmall),
+                      const SizedBox(height: 6),
+                      Text(
+                        '屏幕上会出现一个二维码，用下面的「扫码」扫它。',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '扫不了的时候，二维码下面那一行也可以直接粘贴过来。',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _name,
-            decoration: const InputDecoration(
-              labelText: '这台设备的名字（电脑上会显示）',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          SwitchListTile(
-            value: _observeOnly,
-            onChanged: (value) => setState(() => _observeOnly = value),
-            title: const Text('只读配对'),
-            subtitle: const Text('可以看会话与事件，不能发送任何指令'),
-          ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 20),
+          // Scanning is the path; pasting is the fallback. The buttons now say
+          // so by sitting above the field they are an alternative to.
           Row(
             children: [
               Expanded(
@@ -149,11 +153,45 @@ class _PairingScreenState extends State<PairingScreen> {
                   label: const Text('扫码'),
                 ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 10),
               Expanded(
                 child: OutlinedButton(onPressed: _read, child: const Text('读取粘贴的载荷')),
               ),
             ],
+          ),
+          const SizedBox(height: 20),
+          if (_confirmation == null)
+            TextField(
+              controller: _payload,
+              minLines: 3,
+              maxLines: 6,
+              decoration: InputDecoration(
+                labelText: '配对载荷',
+                alignLabelWithHint: true,
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.content_paste),
+                  tooltip: '粘贴',
+                  onPressed: () async {
+                    final data = await Clipboard.getData(Clipboard.kTextPlain);
+                    if (data?.text != null) _payload.text = data!.text!;
+                  },
+                ),
+              ),
+            ),
+          if (_confirmation == null) const SizedBox(height: 12),
+          TextField(
+            controller: _name,
+            decoration: const InputDecoration(
+              labelText: '这台设备的名字（电脑上会显示）',
+            ),
+          ),
+          const SizedBox(height: 4),
+          SwitchListTile(
+            value: _observeOnly,
+            onChanged: (value) => setState(() => _observeOnly = value),
+            title: const Text('只读配对'),
+            subtitle: const Text('可以看会话与事件，不能发送任何指令'),
+            contentPadding: EdgeInsets.zero,
           ),
           if (_error != null) ...[
             const SizedBox(height: 16),

@@ -86,6 +86,11 @@ class AppController extends ChangeNotifier {
   SeqCounter _seq = SeqCounter();
 
   List<ProjectSummary> projects = [];
+
+  /// What the relay calls the paired machine. Cosmetic — see [RelayClient.hosts]
+  /// — but a phone paired with two machines otherwise gives no sign of which one
+  /// it is looking at.
+  String hostName = '';
   String? currentProjectId;
   SessionState? session;
 
@@ -335,6 +340,13 @@ class AppController extends ChangeNotifier {
           .map((raw) => ProjectSummary.fromJson(raw as Map<String, dynamic>))
           .toList(growable: false);
       connection = LinkState.online;
+      // A label, not a fact: failing to fetch it must not fail the screen.
+      try {
+        final named = await _relay!.hosts(accessToken: token);
+        hostName = named[pairing!.runtimeId] ?? hostName;
+      } catch (_) {
+        // Leave whatever name we already had.
+      }
     } on RelayException catch (error) {
       connection = error.isTransient ? LinkState.offline : LinkState.idle;
       lastError = _explain(error);

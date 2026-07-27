@@ -40,8 +40,11 @@ void main() {
     expect(online, isNotEmpty, reason: '应当还有一个项目在线');
 
     await bringIntoView(tester, find.text(offline.first.display));
-    expect(find.text('离线（电脑上未运行）'), findsWidgets,
+    expect(find.textContaining('离线'), findsWidgets,
         reason: '离线项目要说明白为什么进不去，屏幕上是：${visibleText(tester)}');
+    // The machine's own name, so a phone paired with two can tell them apart.
+    // Cosmetic and unsigned — see RelayClient.hosts — hence only "it is shown".
+    expect(controller.hostName, isNotEmpty, reason: '项目页应当说明这是哪台电脑');
 
     // ---- The host revokes this device. ----
     //

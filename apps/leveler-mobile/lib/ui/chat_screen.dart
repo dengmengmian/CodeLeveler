@@ -84,7 +84,23 @@ class _ChatScreenState extends State<ChatScreen> {
               icon: const Icon(Icons.arrow_back),
               onPressed: () => controller.closeSession(),
             ),
-            title: Text(session.status == 'running' ? '运行中…' : '会话'),
+            title: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  session.goal.isEmpty ? '会话' : session.goal,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (session.status == 'running')
+                  Text(
+                    '运行中…',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                  ),
+              ],
+            ),
             actions: [
               if (session.status == 'running')
                 IconButton(
@@ -129,13 +145,26 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               if (session.activity != null)
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  padding: const EdgeInsets.fromLTRB(20, 2, 20, 6),
                   child: Row(
                     children: [
-                      const SizedBox(
-                        width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(session.activity!, style: const TextStyle(fontSize: 12))),
+                      SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          session.activity!,
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                              ),
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -166,6 +195,10 @@ class _ChatScreenState extends State<ChatScreen> {
 /// session rather than a failure.
 class _EmptySession extends StatelessWidget {
   const _EmptySession({required this.goal});
+
+  /// Only to decide whether there is anything to say about *why* this session
+  /// exists. The goal itself is in the app bar; printing it here as well made a
+  /// nearly empty screen repeat itself.
   final String goal;
 
   @override
@@ -173,20 +206,23 @@ class _EmptySession extends StatelessWidget {
     final theme = Theme.of(context);
     return Center(
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 32),
+        padding: const EdgeInsets.symmetric(horizontal: 40),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            if (goal.isNotEmpty) ...[
-              Text('这次要做的', style: theme.textTheme.labelMedium),
-              const SizedBox(height: 6),
-              Text(goal, textAlign: TextAlign.center, style: theme.textTheme.titleMedium),
-              const SizedBox(height: 20),
-            ],
+            Icon(Icons.chat_bubble_outline, size: 36, color: theme.colorScheme.outline),
+            const SizedBox(height: 16),
             Text(
-              '在下面说点什么，开始这次会话。',
+              goal.isEmpty ? '还没有开始' : '会话已经建好了',
+              style: theme.textTheme.titleSmall,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '在下面说点什么，电脑就会开始做。',
               textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
@@ -207,14 +243,21 @@ class _Bubble extends StatelessWidget {
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: EdgeInsets.symmetric(horizontal: 14, vertical: mine ? 10 : 2),
+        margin: const EdgeInsets.symmetric(vertical: 5),
+        padding: EdgeInsets.symmetric(horizontal: 15, vertical: mine ? 11 : 9),
         constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.82),
         decoration: BoxDecoration(
           color: mine
               ? theme.colorScheme.primaryContainer
               : theme.colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(14),
+          // A squared-off corner on the speaker's side, which is what makes a
+          // bubble look anchored to whoever said it rather than floating.
+          borderRadius: BorderRadius.only(
+            topLeft: const Radius.circular(16),
+            topRight: const Radius.circular(16),
+            bottomLeft: Radius.circular(mine ? 16 : 4),
+            bottomRight: Radius.circular(mine ? 4 : 16),
+          ),
         ),
         // The assistant answers in Markdown — headings, bold, fenced code — and
         // showing the source of that is showing the wrong thing. What the user
@@ -286,22 +329,48 @@ class _ApprovalCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('需要你批准', style: theme.textTheme.titleMedium),
-            const SizedBox(height: 8),
-            Text(approval.summary),
+            Row(
+              children: [
+                Icon(Icons.pan_tool_outlined, size: 18, color: theme.colorScheme.onErrorContainer),
+                const SizedBox(width: 8),
+                Text('需要你批准', style: theme.textTheme.titleMedium),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(approval.ask, style: theme.textTheme.bodyLarge),
             if (approval.command != null) ...[
-              const SizedBox(height: 8),
-              SelectableText(
-                approval.command!,
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surface,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: SelectableText(
+                  approval.command!,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                ),
               ),
+            ],
+            if (approval.hostNote != null) ...[
+              const SizedBox(height: 10),
+              Text(approval.hostNote!, style: theme.textTheme.bodySmall),
             ],
             for (final risk in approval.risks)
               Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Text('• $risk', style: theme.textTheme.bodySmall),
+                padding: const EdgeInsets.only(top: 6),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.warning_amber_rounded,
+                        size: 15, color: theme.colorScheme.onErrorContainer),
+                    const SizedBox(width: 6),
+                    Expanded(child: Text(risk, style: theme.textTheme.bodySmall)),
+                  ],
+                ),
               ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 14),
             // Weight follows how much each answer gives away, not how likely
             // it is to be tapped. Two filled buttons for "allow" against a
             // ghost "deny" made the wide answer the easy one on the screen
@@ -414,9 +483,15 @@ class _Composer extends StatelessWidget {
         child: Text('只读配对：可以查看，不能发送指令。', style: TextStyle(fontSize: 12)),
       );
     }
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        border: Border(top: BorderSide(color: theme.colorScheme.outlineVariant, width: 0.5)),
+      ),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           Expanded(
             child: TextField(
@@ -425,17 +500,13 @@ class _Composer extends StatelessWidget {
               maxLines: 5,
               textInputAction: TextInputAction.send,
               onSubmitted: (_) => onSend(),
-              decoration: const InputDecoration(
-                hintText: '说点什么…',
-                border: OutlineInputBorder(),
-                isDense: true,
-              ),
+              decoration: const InputDecoration(hintText: '说点什么…', isDense: true),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 10),
           IconButton.filled(
             onPressed: onSend,
-            icon: const Icon(Icons.arrow_upward),
+            icon: const Icon(Icons.arrow_upward, size: 20),
             tooltip: '发送',
           ),
         ],

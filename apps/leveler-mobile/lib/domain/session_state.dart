@@ -35,6 +35,29 @@ class PendingApproval {
   final String? command;
   final List<String> risks;
 
+  /// What the host is asking for, in this app's own words.
+  ///
+  /// The `summary` the runtime sends is one English sentence written for every
+  /// front-end at once — most often just `<tool> requested by the model`, which
+  /// says nothing the tool name does not, in a language this UI is not in.
+  /// The structured fields are data rather than prose, so the sentence is built
+  /// here where the language is known.
+  String get ask => switch (tool) {
+        'run_command' || 'shell_command' => '电脑要运行一条命令',
+        'apply_patch' || 'replace' || 'write_file' => '电脑要修改文件',
+        'checkpoint' => '电脑要创建一个检查点',
+        '' => '电脑要执行一个操作',
+        _ => '电脑要使用工具 $tool',
+      };
+
+  /// The host's own sentence, when it carries more than its default phrasing.
+  String? get hostNote {
+    final trimmed = summary.trim();
+    if (trimmed.isEmpty) return null;
+    if (trimmed == '$tool requested by the model') return null;
+    return trimmed;
+  }
+
   static PendingApproval fromJson(Map<String, dynamic> json) => PendingApproval(
         id: json['id'] as String? ?? '',
         tool: json['tool'] as String? ?? '',
@@ -232,18 +255,22 @@ class SessionState extends ChangeNotifier {
   /// which asked the host for a fresh snapshot — after *every* token-usage
   /// event — and left the phone permanently displaying "resynchronising".
   ///
-  /// Several deserve a place in the UI eventually (tool activity, plans, diffs).
+  /// Several deserve a place in the UI eventually (plans, diffs, attachments).
   /// Until they have one, being ignored on purpose is the honest state.
+  ///
+  /// Anything handled by the switch above does *not* belong here — a kind that
+  /// is both rendered and listed as ignored is a comment that lies.
   static const Set<String> _ignored = {
     'runtime_ready',
+    // Per-turn progress counters. The settings screen was listing these as
+    // "unrecognised" on every ordinary turn, which is a claim that something is
+    // wrong when nothing is.
+    'turn_progress',
+    'command_progress',
     'reasoning_delta',
     'token_usage',
     'context_updated',
-    'command_progress',
-    'notification',
     'project_rules_loaded',
-    'tool_call_started',
-    'tool_call_completed',
     'plan_updated',
     'verification_updated',
     'diff_updated',
