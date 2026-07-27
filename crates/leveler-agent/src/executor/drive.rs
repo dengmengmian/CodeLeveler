@@ -196,6 +196,11 @@ impl Executor {
         // Closeout thrash nudge (once): plan complete / delivery closeout.
         let mut post_plan_closeout_nudged = false;
         let mut no_progress_nudge_sent = false;
+        // Observe thrash second chance: once the no-progress cap is hit, give
+        // the model one forced "answer from findings" round instead of dying
+        // with Incomplete and an empty reply (common on pure Q&A / investigate
+        // turns). A second thrash after that still hard-stops (AC3).
+        let mut observe_thrash_answer_forced = false;
         // Tools seen this round for pure-observe streak detection.
         #[allow(unused_assignments)]
         let mut observe_only_tools_this_round = 0u32;
@@ -1280,6 +1285,20 @@ impl Executor {
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
+                // Post-thrash force-answer: refuse further pure observes so the
+                // model must synthesize from results already in the transcript.
+                if observe_thrash_answer_forced
+                    && is_pure_observe_call(&call.name, &call.arguments)
+                {
+                    observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
+                    let msg = "Observation thrash was detected. Do not re-list, re-search, or \
+                         re-read — answer the user's question from the tool results already \
+                         in this conversation, then stop calling tools."
+                        .to_string();
+                    denied_calls_this_round += 1;
+                    results[index] = Some(deny_call(observer, call, msg));
+                    continue;
+                }
                 if is_pure_observe_call(&call.name, &call.arguments) {
                     observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
                 }
@@ -2083,45 +2102,66 @@ impl Executor {
                         ));
                     }
                     // Sub-agents may legitimately re-list; only top-level turns
-                    // full-stop on observe thrash (AC3).
+                    // full-stop on observe thrash (AC3). Before hard-stop, give
+                    // one forced answer-from-findings round so Q&A / investigate
+                    // turns do not end Incomplete with nothing useful on screen.
                     if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
-                        progress.enter_terminal();
-                        observer(AgentEvent::ProgressUpdated {
-                            ledger: progress.clone(),
-                        });
-                        let final_text = if last_text.trim().is_empty() {
-                            "Stopped: no progress (observe-only thrash).".to_string()
+                        if !observe_thrash_answer_forced {
+                            observe_thrash_answer_forced = true;
+                            messages.push(Message::text(
+                                Role::User,
+                                format!(
+                                    "Repeated identical observations made no progress toward:\n\
+                                     <objective>\n{original_task}\n</objective>\n\
+                                     You already have tool results above. Your next message must \
+                                     be the final answer based on those results — do not call \
+                                     list/search/read tools again. If the evidence is incomplete, \
+                                     say what is known and what is still unknown."
+                                ),
+                            ));
+                            // Continue the drive so the model can synthesize.
                         } else {
-                            last_text.clone()
-                        };
-                        observer(AgentEvent::Finished(final_text.clone()));
-                        sync_epoch_progress(
-                            &mut progress,
-                            &mut metrics,
-                            epoch_rounds_at_start,
-                            epoch_tokens_at_start,
-                            epoch_duration_at_start,
-                            run_started,
-                            round,
-                            model_tokens_spent,
-                            commands_run,
-                            cost_spent_micros,
-                            &modified_files,
-                        );
-                        observer(AgentEvent::ProgressUpdated {
-                            ledger: progress.clone(),
-                        });
+                            progress.enter_terminal();
+                            observer(AgentEvent::ProgressUpdated {
+                                ledger: progress.clone(),
+                            });
+                            let final_text = if last_text.trim().is_empty() {
+                                "Stopped: no progress (observe-only thrash).".to_string()
+                            } else {
+                                last_text.clone()
+                            };
+                            observer(AgentEvent::Finished(final_text.clone()));
+                            sync_epoch_progress(
+                                &mut progress,
+                                &mut metrics,
+                                epoch_rounds_at_start,
+                                epoch_tokens_at_start,
+                                epoch_duration_at_start,
+                                run_started,
+                                round,
+                                model_tokens_spent,
+                                commands_run,
+                                cost_spent_micros,
+                                &modified_files,
+                            );
+                            observer(AgentEvent::ProgressUpdated {
+                                ledger: progress.clone(),
+                            });
 
-                        return Ok(AgentOutcome::drive_result(
-                            final_text,
-                            round,
-                            modified_files,
-                            StopReason::Incomplete,
-                            Some("no-progress streak; observe thrash short-circuited".to_string()),
-                            &metrics,
-                            &progress,
-                            &objective,
-                        ));
+                            return Ok(AgentOutcome::drive_result(
+                                final_text,
+                                round,
+                                modified_files,
+                                StopReason::Incomplete,
+                                Some(
+                                    "no-progress streak; observe thrash short-circuited"
+                                        .to_string(),
+                                ),
+                                &metrics,
+                                &progress,
+                                &objective,
+                            ));
+                        }
                     }
                 }
             } else if plan_repair_required

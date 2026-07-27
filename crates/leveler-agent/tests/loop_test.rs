@@ -5007,6 +5007,8 @@ async fn chat_second_message_rebinds_objective() {
 }
 
 /// No plan: pure list_files thrash ends via no-progress streak hard-stop (AC3).
+/// After the streak cap the executor gives one forced "answer from findings"
+/// round; if the model keeps thrashing, hard-stop still fires (AC3 preserved).
 #[tokio::test]
 async fn no_plan_observe_streak_hard_stops() {
     let dir = std::env::temp_dir().join(format!(
@@ -5018,9 +5020,10 @@ async fn no_plan_observe_streak_hard_stops() {
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
-    // Enough identical list_files rounds to hit LOOP_GUARD_THRESHOLD then
-    // ProgressCaps::no_progress_rounds hard-stop; final text must not run.
-    let mut responses: Vec<ModelResponse> = (0..6)
+    // Enough identical list_files rounds to hit LOOP_GUARD_THRESHOLD, then
+    // ProgressCaps::no_progress_rounds, then the forced-answer second chance,
+    // then hard-stop. Final text must not run.
+    let mut responses: Vec<ModelResponse> = (0..8)
         .map(|i| {
             assistant_tool_call(
                 &format!("l{i}"),
@@ -5069,7 +5072,7 @@ async fn no_plan_observe_streak_hard_stops() {
     );
     // Model rounds bounded: hard-stop before burning all scripted responses.
     assert!(
-        runtime.recorded_requests().len() < 7,
+        runtime.recorded_requests().len() < 9,
         "expected bounded model requests, got {}",
         runtime.recorded_requests().len()
     );
@@ -5077,6 +5080,65 @@ async fn no_plan_observe_streak_hard_stops() {
     assert!(
         !outcome.final_text.contains("should not reach"),
         "must not reach post-thrash assistant text: {}",
+        outcome.final_text
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// After observe thrash hits the no-progress cap, a forced synthesis round that
+/// answers quietly must complete as Answered — not Incomplete with empty text.
+#[tokio::test]
+async fn observe_thrash_force_answer_then_quiet_is_answered() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-othrash-ans-{}",
+        std::process::id() as u64 * 23 + 5
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn skill_loader() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    // Round 1: list (n=1, no thrash). Round 2: list (n=2, streak=1).
+    // Round 3: list denied by loop guard (streak=2) → force-answer chance.
+    // Round 4: quiet final answer → Answered.
+    let mut responses: Vec<ModelResponse> = (0..3)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("ol{i}"),
+                "list_files",
+                serde_json::json!({"path": "."}),
+            )
+        })
+        .collect();
+    responses.push(assistant_text(
+        "Projects load skills from the configured skill_dir when SkillDir is set.",
+    ));
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let outcome = executor
+        .run(
+            "what project loads skill?",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Answered,
+        "forced synthesis after thrash must Answered, got {:?}",
+        outcome.stop_reason
+    );
+    assert!(
+        outcome.final_text.contains("skill_dir") || outcome.final_text.contains("SkillDir"),
+        "expected answer from findings: {}",
         outcome.final_text
     );
     std::fs::remove_dir_all(&dir).ok();
