@@ -12,7 +12,7 @@
 //!   holds. No second process, no service to install, no daemon that outlives
 //!   the window someone closed. It is reachable exactly as long as the session
 //!   they are looking at.
-//! - **`/xremote-loc` binds the relay to this machine's own address.** A phone on
+//! - **`/remote-loc` binds the relay to this machine's own address.** A phone on
 //!   the same Wi-Fi reaches it directly, so the whole thing works with no server
 //!   anywhere. Without it, remote control needs a relay someone has to run.
 
@@ -88,7 +88,7 @@ fn qr_rows(payload: &str) -> anyhow::Result<Vec<String>> {
     Ok(rows)
 }
 
-/// This machine's address on the local network, for `/xremote-loc`.
+/// This machine's address on the local network, for `/remote-loc`.
 ///
 /// Loopback is useless here: the phone is a different machine, and `127.0.0.1`
 /// on a phone is the phone.

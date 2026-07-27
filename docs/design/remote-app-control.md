@@ -1419,7 +1419,7 @@ pub enum ClientOrigin {
 - **牙口已验：** 把签名校验短路 → 第 17 轮即报「a mutated frame verified with a different payload」。
 - **这不是结构化 fuzz。** `cargo-fuzz` 有覆盖率反馈，能走到盲变异到不了的路径，但它要 nightly 工具链，而本仓库不要求任何人装 nightly。用一个每次提交都真跑的弱工具，换掉一个没人跑的强工具。
 
-> **PR11a–f 总状态：⚠️ iOS 模拟器上整条链已跑通，真机与 Android 仍未跑过。** Flutter 3.44.8 / CocoaPods 1.17.0 / iOS 26.5 模拟器就位后：`analyze` **No issues found**、`flutter test` **24 条全绿**（含两份跨语言 golden：信封与 *会话事件*）、`flutter build ios --simulator` 通过，并在 iPhone 17 Pro 模拟器上由 `scripts/tui_remote_pairing.py` 驱动真 TUI 走完 `/xremote-loc` → 扫码 → 电脑确认 → 新建会话 → 中英文对话（Markdown 真渲染）→ 审批 → `rm` 真执行。**仍未做**：Android 构建（无 SDK）、真机蜂窝闭环与内测包（无设备与签名证书）、APP 侧的「≥2 项目切换不串台」与「杀进程 resync」（Rust e2e 验过，APP 上没验——模拟器那条链只有一个项目）。Phase 1 出门要的真机路径（K23）**仍未满足**。
+> **PR11a–f 总状态：⚠️ iOS 模拟器上整条链已跑通，真机与 Android 仍未跑过。** Flutter 3.44.8 / CocoaPods 1.17.0 / iOS 26.5 模拟器就位后：`analyze` **No issues found**、`flutter test` **24 条全绿**（含两份跨语言 golden：信封与 *会话事件*）、`flutter build ios --simulator` 通过，并在 iPhone 17 Pro 模拟器上由 `scripts/tui_remote_pairing.py` 驱动真 TUI 走完 `/remote-loc` → 扫码 → 电脑确认 → 新建会话 → 中英文对话（Markdown 真渲染）→ 审批 → `rm` 真执行。**仍未做**：Android 构建（无 SDK）、真机蜂窝闭环与内测包（无设备与签名证书）、APP 侧的「≥2 项目切换不串台」与「杀进程 resync」（Rust e2e 验过，APP 上没验——模拟器那条链只有一个项目）。Phase 1 出门要的真机路径（K23）**仍未满足**。
 
 ### PR11a — APP 工程脚手架 + 契约接入 ✅ 已完成
 

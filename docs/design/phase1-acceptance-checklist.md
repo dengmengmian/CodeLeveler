@@ -83,7 +83,7 @@
 | **APP 在 iOS 模拟器上跑起来** | ✅ | iPhone 17 Pro / iOS 26.5；两条集成用例由脚本一条命令跑完 |
 | **模拟器端到端配对验收** | ✅ | `scripts/simulator_pairing.sh` 一条命令：真 relay + 真 agent + 真确认 |
 | **模拟器上跑完一整段会话** | ✅ | 同一脚本续跑：新建会话 → 中文提问（Markdown 渲染，标题/列表/代码块）→ 英文提问 → 审批卡片 → 允许一次 → `rm` 真的执行（脚本核对 scratch.txt 已消失）→ 收尾回答。模型由 `scripts/scripted_provider.py` 固定，所以断言的是「屏幕该显示什么」而不是「模型这次说了什么」 |
-| **`/xremote-loc` 用户路径** | ✅ | `scripts/tui_remote_pairing.py`：pty 里跑真 TUI，输入 `/xremote-loc` → 屏幕上真画出二维码 → 手机读载荷 → TUI 显示手机指纹并等按键 → `y` → 上面那整段会话再走一遍。指纹由载荷里的公钥现算，不是从同一块屏幕上抄的 |
+| **`/remote-loc` 用户路径** | ✅ | `scripts/tui_remote_pairing.py`：pty 里跑真 TUI，输入 `/remote-loc` → 屏幕上真画出二维码 → 手机读载荷 → TUI 显示手机指纹并等按键 → `y` → 上面那整段会话再走一遍。指纹由载荷里的公钥现算，不是从同一块屏幕上抄的 |
 | **APP 内切换项目不串台** | ✅ | `multi_project_test.dart`：电脑上开两个仓库，A 建会话发消息 → 退出 → 进 B，断言 A 的会话不在 B 的列表里、B 的对话里没有 A 的消息 |
 | **杀 APP 后 resync** | ✅ | 同一用例：整棵 widget 树拆掉、换一个 `AppController`、新 socket，只有存储留下来；重开会话后之前说的话由**快照**带回。进程本身没真杀（集成测试会一起死），所以「iOS 冷启动后还给不给 keychain」这一层没验 |
 | **取消当前回合** | ✅ | `pairing_flow_test.dart`：让模型给一段慢回答，流到一半按停止；provider 端看到连接被切断，文本停止增长且没跑到最后一句 |
@@ -101,6 +101,6 @@
 
 **可以说：** host + relay + CLI 这条链在完整性上自证，验收路径的**后端部分**已自动化（`phase1_acceptance.rs` 一次走完），CLI 全流程手工实跑通过。
 
-**不能说：** Phase 1 完成。iOS 模拟器上这条链已经从 `/xremote-loc` 一路走到审批执行，但 Android 与真机（签名、蜂窝网络、真 relay）仍然一次都没跑过。中文**输入法**也只验到了「文本进得去、显示得出来」这一层：模拟器上的 enterText 走的是文本输入通道，不是拼音候选框。
+**不能说：** Phase 1 完成。iOS 模拟器上这条链已经从 `/remote-loc` 一路走到审批执行，但 Android 与真机（签名、蜂窝网络、真 relay）仍然一次都没跑过。中文**输入法**也只验到了「文本进得去、显示得出来」这一层：模拟器上的 enterText 走的是文本输入通道，不是拼音候选框。
 
 **下一步最短路径：** 一台真 iPhone + 开发者签名，把 `tui_remote_pairing.py` 的同一套流程在真机蜂窝网络下跑一遍；以及装 Android SDK 补上另一端。

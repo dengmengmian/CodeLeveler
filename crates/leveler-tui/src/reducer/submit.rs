@@ -199,16 +199,16 @@ fn start_web(state: &mut AppState) -> Vec<Effect> {
 
 /// `/remote` — make this machine reachable from a phone.
 ///
-/// `/xremote-loc` is the same thing with the relay bound to this machine's own
+/// `/remote-loc` is the same thing with the relay bound to this machine's own
 /// network address instead of one on the internet, so a phone on the same
 /// Wi-Fi can reach it — the difference between "works once you rent a server"
 /// and "works now".
 ///
-/// A separate name rather than `/remote loc`, and an `x` in front of it: an
-/// argument on the real command is one typo away from being taken for the real
-/// command, and a name nobody would type by accident is a name nobody reaches
-/// by accident. It stays out of the command list for the same reason — it is a
-/// testing and same-network path, not the shape the product is aiming at.
+/// A separate name rather than an argument to `/remote`: as `/remote loc` the
+/// local path was one typo away from being taken for the real command, on a
+/// command whose whole job is to open this machine to a network. It stays out
+/// of the command list — it is a testing and same-network path, not the shape
+/// the product is aiming at.
 fn start_remote(state: &mut AppState, local: bool) -> Vec<Effect> {
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
@@ -259,7 +259,7 @@ fn is_known_slash(name: &str) -> bool {
             | "skill"
             | "web"
             | "remote"
-            | "xremote-loc"
+            | "remote-loc"
             | "clear"
             | "new"
             | "quit"
@@ -294,7 +294,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "skill" => skill_slash(state, command),
         "web" => start_web(state),
         "remote" => start_remote(state, false),
-        "xremote-loc" => start_remote(state, true),
+        "remote-loc" => start_remote(state, true),
         "verify" => toggle_screen(state, Screen::Verification),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
@@ -944,7 +944,7 @@ mod export_tests {
         );
 
         assert_eq!(
-            handle_slash(&mut s, "xremote-loc"),
+            handle_slash(&mut s, "remote-loc"),
             vec![Effect::StartRemote { local: true }]
         );
     }
@@ -954,10 +954,10 @@ mod export_tests {
         // Known, so typing it is not an error; unadvertised, so nobody meets it
         // by browsing. Both halves matter: a testing path that shows up in the
         // command list is a testing path users will try.
-        assert!(is_known_slash("xremote-loc"));
+        assert!(is_known_slash("remote-loc"));
         for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
             assert!(
-                !locale.text().slash.remote.contains("xremote"),
+                !locale.text().slash.remote.contains("remote-loc"),
                 "the local path must not be described in the command list"
             );
         }
