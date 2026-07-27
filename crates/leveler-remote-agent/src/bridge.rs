@@ -31,6 +31,7 @@ use leveler_remote_protocol::{
 };
 use leveler_session_wire::UpstreamMessage;
 
+use crate::attachments::{ChunkOutcome, UploadChunk, UploadError, Uploads};
 use crate::audit::{AuditEvent, AuditLog, hashed};
 use crate::devices::{TrustError, TrustedDevices};
 use crate::projects::{ProjectRoutes, RouteError};
@@ -53,6 +54,8 @@ pub enum AdmissionError {
     },
     #[error("runtime rejected the command: {0}")]
     Runtime(String),
+    #[error("{0}")]
+    Upload(#[from] UploadError),
 }
 
 impl AdmissionError {
@@ -64,6 +67,7 @@ impl AdmissionError {
             AdmissionError::MalformedPayload => "invalid_frame",
             AdmissionError::Refused { code, .. } => code,
             AdmissionError::Runtime(_) => "runtime_error",
+            AdmissionError::Upload(error) => error.code(),
         }
     }
 }
@@ -96,6 +100,8 @@ pub struct AgentBridge {
     /// Where remote activity is written down. Absent in tests that are not
     /// about the record.
     audit: Option<Arc<AuditLog>>,
+    /// Attachments arriving in pieces, and what each session has accepted.
+    uploads: Uploads,
 }
 
 impl AgentBridge {
@@ -113,6 +119,7 @@ impl AgentBridge {
             runtime_key,
             allow_full_access,
             audit: None,
+            uploads: Uploads::new(),
         }
     }
 
@@ -237,14 +244,37 @@ impl AgentBridge {
                     .map_err(|error| AdmissionError::Runtime(error.to_string()))?;
                 serde_json::to_vec(&snapshot).map_err(|_| AdmissionError::MalformedPayload)?
             }
-            // The upload path exists in the protocol but has no agent-side
-            // implementation yet; refusing is honest, and silently accepting
-            // would let an APP believe an attachment was stored.
             RpcMethod::UploadAttachment => {
-                return Err(AdmissionError::Refused {
-                    code: "command_not_allowed_remote",
-                    reason: "attachment upload is not implemented on this host yet",
-                });
+                // Adding a file to a session is a mutation.
+                if scope == PairingScope::Observe {
+                    return Err(AdmissionError::Refused {
+                        code: "command_not_allowed_remote",
+                        reason: "this device is paired for observation only",
+                    });
+                }
+                let runtime = self.runtime_for(request.project_id.as_deref()).await?;
+                let chunk: UploadChunk = serde_json::from_value(request.body)
+                    .map_err(|_| AdmissionError::MalformedPayload)?;
+                match self.uploads.accept(&device_id, &chunk)? {
+                    ChunkOutcome::Incomplete => {
+                        serde_json::to_vec(&serde_json::json!({"status": "chunk_received",
+                                            "chunk_index": chunk.chunk_index}))
+                        .map_err(|_| AdmissionError::MalformedPayload)?
+                    }
+                    ChunkOutcome::Complete(bytes) => {
+                        let attachment = self
+                            .store_attachment(
+                                runtime,
+                                &frame.stream_id,
+                                &chunk.session_id,
+                                &chunk.name,
+                                bytes,
+                            )
+                            .await?;
+                        serde_json::to_vec(&attachment)
+                            .map_err(|_| AdmissionError::MalformedPayload)?
+                    }
+                }
             }
         };
 
@@ -275,6 +305,79 @@ impl AgentBridge {
     }
 
     /// The runtime for a named project, or for the only open one.
+    /// Hand a reassembled file to the runtime and wait for what it made of it.
+    ///
+    /// The bytes go in as `AddAttachmentData`, the same command a local client
+    /// sends, so processing and content addressing have one implementation.
+    /// The answer comes back as an *event*, which is why this subscribes first
+    /// and delivers second: subscribing afterwards would race a fast runtime
+    /// and lose the very event it is waiting for.
+    async fn store_attachment(
+        &self,
+        runtime: Arc<dyn LocalRuntimeService>,
+        command_id: &str,
+        session_id: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<leveler_client_protocol::AttachmentRef, AdmissionError> {
+        use base64::Engine as _;
+        use leveler_client_protocol::RuntimeEvent;
+
+        let session = SessionId::new(session_id);
+        let mut events = runtime.subscribe_session(&session);
+
+        // The RPC's stream id is unique per request and already inside the
+        // device's signature, so a retried upload carries the same command id
+        // and the runtime's receipt store treats it as one command, not two.
+        let command_id = CommandId::new(command_id.to_string());
+        runtime
+            .deliver_protocol(ProtocolEnvelope::wrap(CommandEnvelope {
+                command_id,
+                session_id: session.clone(),
+                expected_version: None,
+                issued_at: chrono::Utc::now().to_rfc3339(),
+                command: ClientCommand::AddAttachmentData {
+                    session_id: session.clone(),
+                    name: name.to_string(),
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                },
+            }))
+            .await
+            .map_err(|error| AdmissionError::Runtime(error.to_string()))?;
+
+        // Bounded: a runtime that never answers must not leave the phone's RPC
+        // hanging until its own timeout, with no way to tell apart "still
+        // processing" from "this will never finish".
+        let deadline = tokio::time::Duration::from_secs(60);
+        let waited = tokio::time::timeout(deadline, async {
+            loop {
+                match events.recv().await {
+                    Ok(RuntimeEvent::AttachmentAdded { attachment }) if attachment.name == name => {
+                        return Ok(attachment);
+                    }
+                    Ok(RuntimeEvent::AttachmentProcessingFailed { error }) => {
+                        return Err(AdmissionError::Runtime(error));
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(AdmissionError::Runtime(
+                            "runtime event stream closed".to_string(),
+                        ));
+                    }
+                }
+            }
+        })
+        .await;
+
+        match waited {
+            Ok(result) => result,
+            Err(_) => Err(AdmissionError::Runtime(
+                "runtime did not report the attachment in time".to_string(),
+            )),
+        }
+    }
+
     async fn runtime_for(
         &self,
         project_id: Option<&str>,

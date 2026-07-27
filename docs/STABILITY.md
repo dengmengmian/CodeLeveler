@@ -22,7 +22,7 @@ API. They need different promises.
 
 ## 1. CLI surface
 
-Nineteen top-level subcommands exist today (`crates/leveler-cli/src/cli.rs`,
+Twenty-one top-level subcommands exist today (`crates/leveler-cli/src/cli.rs`,
 `enum Command`). Proposed tiers:
 
 | Tier | Subcommands | Promise |
@@ -31,10 +31,14 @@ Nineteen top-level subcommands exist today (`crates/leveler-cli/src/cli.rs`,
 | **Frozen** | `doctor`, `init`, `upgrade`, `config`, `models`, `model`, `sessions`, `memory`, `permissions` | Same promise. These are what setup scripts and CI call. |
 | **Provisional** | `serve`, `web`, `lsp`, `mcp` | Semantics may change while the daemon/transport story settles (see the Windows gap in `README.md`). Breaking changes require a `CHANGELOG.md` entry under a `### Changed` heading. |
 | **Unstable** | `eval` | Internal evaluation harness. No promise; may change or disappear without notice. Should say so in its own `--help` text. |
+| **Unstable** | `remote` | Remote control from a paired phone, and the TUI's `/remote`. The wire protocol, the pairing payload and the on-disk `~/.leveler/remote/` layout may all change; a change that invalidates existing pairings means re-pairing every device, and will say so in `CHANGELOG.md`. Not to be described as production-ready until the security gate passes (`docs/design/remote-security-gate.md`). |
 
 Rationale for the split: the first two tiers are what a user types or scripts
 by hand. `eval` is development tooling that happens to ship in the same binary
-— freezing it would constrain the harness for no user-facing benefit.
+— freezing it would constrain the harness for no user-facing benefit. `remote`
+is newer than any of them and its trust model is still being reviewed; a tier
+that promised anything would be promising it about code whose own gate document
+says do not ship this yet.
 
 **Global flags** (`--repo`, `--config-dir`, `--readonly-root`, `--verbose`)
 apply to every subcommand and should be frozen with the same promise as tier 1.

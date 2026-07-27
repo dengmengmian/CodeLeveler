@@ -37,7 +37,7 @@
 | `leveler remote projects` 列出状态 | 🖐️ | 实跑（空注册表场景） |
 | 真注册表 + 两个活 daemon | ✅ | `projects.rs::the_router_attaches_to_live_daemons_and_reports_the_rest_offline` |
 | 配对后进入项目页（含签名 RPC 验签） | ✅ | 同上，测试末尾断言到达项目页且连接未进入 `untrusted` |
-| **手机上切换项目，界面不串台** | ⏳ | 代码已写，模拟器上未验（需要两个在线项目） |
+| **手机上切换项目，界面不串台** | ✅ | `multi_project_test.dart` 在模拟器上真跑：两个在线项目，A 的会话与消息都不出现在 B |
 
 ## 三、对话与流式
 
@@ -47,7 +47,7 @@
 | 回程 ack 可用 QR 锚定的 runtime_pubkey 验签 | ✅ | 同上（`recv_verified`） |
 | 助手输出下行 | ✅ | `end_to_end.rs::runtime_events_reach_the_phone_signed` |
 | 订阅 lag → `resync_required` 并关流 | ✅ | `end_to_end.rs::a_lagged_subscriber_is_told_to_resync_and_the_stream_ends` |
-| 杀 APP 进程后重连 + snapshot | ✅ | `phase1_acceptance.rs` 第 6 步 |
+| 杀 APP 进程后重连 + snapshot | ✅ | `phase1_acceptance.rs` 第 6 步；APP 侧 `multi_project_test.dart` 末段（重建控制器与 socket，只留存储） |
 | `command_id` 重试有界 | ⚠️ | APP 里已写（上限 16、重连原 id 重发），能编译，**没有单测** |
 | **真机蜂窝网络下的流式体验** | ⏳ | 需要真机 |
 
@@ -59,9 +59,9 @@
 | remote-only 审批 120s 自动拒绝 | ✅ | `approval_timeout.rs` 7 条 + `phase1_acceptance.rs` 第 5 步 |
 | 本机有人时不超时 | ✅ | `approval_timeout.rs::a_local_ui_keeps_the_approval_alive` / `both_attached_means_no_countdown` |
 | 本机 UI 离开后重新武装计时 | ✅ | `approval_timeout.rs::the_countdown_starts_when_the_last_local_ui_leaves` |
-| **APP 审批界面无「始终允许」** | ⏳ | 代码里已确保（`ApprovalChoice` 只有三项），未在真机上看过 |
+| **APP 审批界面无「始终允许」** | ✅ | `pairing_flow_test.dart` 在模拟器上断言该按钮不存在，且屏幕上有解释 |
 | 澄清空答=跳过 | ⏳ | 代码里已写，未验 |
-| 审批 pending + runtime 重启后恢复 | ⛔ | 属 `leveler-app` 行为，远程侧测不出；见 PR9 说明 |
+| 审批 pending + runtime 重启后**不**恢复 | ✅ | `leveler-app/tests/pending_approval_restart.rs`：重启后不重建待批审批（按下去解决不了任何东西），且未批准的命令确实没执行；APP 侧在快照没有它时清掉卡片 |
 
 ## 五、撤销与离线
 
@@ -78,14 +78,17 @@
 
 | 验收项 | 档 | 依据 |
 | --- | --- | --- |
-| `flutter pub get` / `analyze` / `test` 通过 | 🖐️ | Flutter 3.44.8 实跑：依赖解析通过、`analyze` 无问题、**16 条测试全绿** |
+| `flutter pub get` / `analyze` / `test` 通过 | 🖐️ | Flutter 3.44.8 实跑：依赖解析通过、`analyze` 无问题、**25 条测试全绿** |
 | golden 向量跨语言一致 | 🖐️ | `envelope_golden_test.dart` 读 Rust 同一份 `testdata/signed_envelope.golden.json`；牙口已验（互换 canonical 字段即红） |
-| **APP 在 iOS 模拟器上跑起来** | 🖐️ | iPhone 17 Pro / iOS 26.5，构建 → 安装 → 启动 → 截图确认渲染正常 |
+| **APP 在 iOS 模拟器上跑起来** | ✅ | iPhone 17 Pro / iOS 26.5；两条集成用例由脚本一条命令跑完 |
 | **模拟器端到端配对验收** | ✅ | `scripts/simulator_pairing.sh` 一条命令：真 relay + 真 agent + 真确认 |
 | **模拟器上跑完一整段会话** | ✅ | 同一脚本续跑：新建会话 → 中文提问（Markdown 渲染，标题/列表/代码块）→ 英文提问 → 审批卡片 → 允许一次 → `rm` 真的执行（脚本核对 scratch.txt 已消失）→ 收尾回答。模型由 `scripts/scripted_provider.py` 固定，所以断言的是「屏幕该显示什么」而不是「模型这次说了什么」 |
 | **`/remote loc` 用户路径** | ✅ | `scripts/tui_remote_pairing.py`：pty 里跑真 TUI，输入 `/remote loc` → 屏幕上真画出二维码 → 手机读载荷 → TUI 显示手机指纹并等按键 → `y` → 上面那整段会话再走一遍。指纹由载荷里的公钥现算，不是从同一块屏幕上抄的 |
+| **APP 内切换项目不串台** | ✅ | `multi_project_test.dart`：电脑上开两个仓库，A 建会话发消息 → 退出 → 进 B，断言 A 的会话不在 B 的列表里、B 的对话里没有 A 的消息 |
+| **杀 APP 后 resync** | ✅ | 同一用例：整棵 widget 树拆掉、换一个 `AppController`、新 socket，只有存储留下来；重开会话后之前说的话由**快照**带回。进程本身没真杀（集成测试会一起死），所以「iOS 冷启动后还给不给 keychain」这一层没验 |
+| **待批审批 + 进程重启** | ✅ | `leveler-app/tests/pending_approval_restart.rs`：重启后待批审批**不**重建——按下去解决不了任何东西的按钮不该出现；APP 侧对应地会在快照里没有它时清掉卡片 |
 | Android 构建 | ⛔ | 无 Android SDK |
-| iOS TestFlight 包 | ⛔ | Xcode 26.6 在，但缺平台目录、CocoaPods、模拟器 runtime 与签名证书 |
+| iOS TestFlight 包 | ⛔ | 缺签名证书（平台目录、CocoaPods、模拟器 runtime 均已就位） |
 | Android 内测 APK | ⛔ | 无 Android SDK |
 | 真机蜂窝闭环 | ⛔ | 无设备 |
 

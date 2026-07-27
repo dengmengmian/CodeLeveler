@@ -28,3 +28,9 @@ policy = ["dep:leveler-client-protocol"]
 [dev-dependencies]
 serde_json = { workspace = true }
 base64 = { workspace = true }
+# Dev only, and only for `frame_fuzz`: the inner session message is the one
+# relay-facing parser this crate does not own, and leaving it out of the
+# mutation pass would leave a hole exactly where the payload is attacker-chosen.
+# The dependency stays out of the built library, so the rule that this crate
+# does not carry session framing is unchanged.
+leveler-session-wire = { path = "../leveler-session-wire" }

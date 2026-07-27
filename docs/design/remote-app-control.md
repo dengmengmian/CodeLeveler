@@ -1030,7 +1030,7 @@ APP 推送审批、生物识别锁、产物按需下载、AEAD、可选 `serve -
 | POST | `/v1/hosts/{host_id}/rpc` | access + **device 签名的 rpc_request 信封（请求体）** | **SignedEnvelope**（`rpc_response`：`ProjectInfo[]` / `SessionBootstrap` / `UiSessionSnapshot` / `AttachmentRef`） | 503 `runtime_offline`（含 Retry-After）、502 + routing 错误码（无 body）、401 |
 | GET | `/v1/hosts/{host_id}/session` | access Bearer WSS；`?project_id=` 绑定项目 | - | protocol / auth |
 
-> **实现与本表原稿的偏差（已定）：** 原稿为 `projects` / `leveler-sessions` / `snapshot` / `attachments` 各开一条 REST 路径。实际收敛为**单一 `POST /rpc`**：method、`project_id` 与 body 全都在**设备签名内**，URL 若再复述一遍就是一份未签名的副本，relay 迟早会拿它去「校验」并与签名分歧。URL 只保留 `host_id`——那是 token audience 要比对的东西。附件分块上传仍走同一入口（`upload_attachment`，agent 侧未实现）。
+> **实现与本表原稿的偏差（已定）：** 原稿为 `projects` / `leveler-sessions` / `snapshot` / `attachments` 各开一条 REST 路径。实际收敛为**单一 `POST /rpc`**：method、`project_id` 与 body 全都在**设备签名内**，URL 若再复述一遍就是一份未签名的副本，relay 迟早会拿它去「校验」并与签名分歧。URL 只保留 `host_id`——那是 token audience 要比对的东西。附件分块上传仍走同一入口（`upload_attachment`，agent 侧已实现）。
 
 > 兼容：实现期可将旧路径 `/v1/runtimes/{id}/…` 映射为「单 project 的 host」，但 **APP 契约以 hosts/projects 为准**。
 
@@ -1270,7 +1270,7 @@ pub enum ClientOrigin {
   - **`ClientOrigin::RemoteTimeout` 目前只进审计行**，因为 `CommandEnvelope` 没有 origin 字段；把 origin 贯通进 runtime 是另一次独立改动。**这是明说的缺口，不是已完成项。** `leveler-app` 的 `PendingApprovals` 仍未改动。
   - **牙口已验：** 把 local waiter 计数强制为 0 → `a_local_ui_keeps_the_approval_alive` 与 `both_attached_means_no_countdown` 转红，其余 5 条绿。
 
-### PR5 — remote-agent：验签 + policy + **单 project** 桥 + mock relay ⚠️ 部分完成（准入管道已落地，隧道未接）
+### PR5 — remote-agent：验签 + policy + **单 project** 桥 + mock relay ✅ 已完成
 
 - **Title:** `leveler-remote-agent: signed frames, policy, mock tunnel (single project first)`
 - **Affects:** 新 crate、PR0 wire、PR3 policy、PR4 origin
@@ -1280,7 +1280,7 @@ pub enum ClientOrigin {
   - 伪造签名 ✅ / **relay 换钥负例** ✅（relay 提供密钥仅作**比对**，永不用于验签，不符即 `pubkey_mismatch`）/ TOFU `devices.json` ✅（原子写 + 0600 + 重复 accept 替换旧行，不留可用的陈旧密钥）/ 未配对 ✅ / 已撤销 ✅ / 跨 runtime 重放 ✅ / policy 拒绝（`ApproveAlways`、`FullAccess`、observe）✅
   - **不依赖 `leveler-web`** ✅，session framing 取自 PR0 的 `leveler-session-wire`。
 - **牙口已验：** 本 PR 我是实现与测试同写、**未观察到红**，故补做验证——把实现改成「relay 给了密钥就用它」，`a_relay_supplied_key_is_never_used_to_verify` 单条转红、其余 10 条仍绿，随后还原。
-- **signed `rpc_response` 与假 relay 端到端已补齐（追加 6 测试，共 17 绿）：** `create_session` / `snapshot` 返回 **runtime 签名**信封，APP 用 QR 锚定的 `runtime_pubkey` 验签。负例覆盖：relay 自撰响应、relay 篡改响应体、以及**响应错配**（响应复用请求的 `rpc:{uuid}` stream_id，该值在签名内，故 relay 无法拿另一请求的合法响应来顶替）。`upload_attachment` 显式返回未实现而非静默成功——否则 APP 会以为附件已入库。
+- **signed `rpc_response` 与假 relay 端到端已补齐（追加 6 测试，共 17 绿）：** `create_session` / `snapshot` 返回 **runtime 签名**信封，APP 用 QR 锚定的 `runtime_pubkey` 验签。负例覆盖：relay 自撰响应、relay 篡改响应体、以及**响应错配**（响应复用请求的 `rpc:{uuid}` stream_id，该值在签名内，故 relay 无法拿另一请求的合法响应来顶替）。`upload_attachment` 当时显式返回未实现而非静默成功——否则 APP 会以为附件已入库；现已实现，见下。
 - **隧道客户端已补齐（PR5 收尾）：** `run_tunnel` 出站连 relay，处理 `open_stream` / `forward_upstream` / `rpc_request` / `close_stream`，回送 runtime 签名的 `forward_downstream` 与 `rpc_response`。拒绝也会**签名回送**给设备（带 `command_id` 关联）——手机若什么都收不到，无法区分"被拒"与"丢了"。
 - **端到端首次真正跑通（5 测试绿，`tests/end_to_end.rs`）：** 真 `leveler-relay` router + 真 agent 隧道 + 真 Ed25519 签名的假手机，只有 runtime 是假的（否则无法断言"什么没到达"）。
   - 手机 `SubmitMessage` 穿过不受信 relay 抵达 runtime，回程 ack 被手机用 QR 锚定的 `runtime_pubkey` 验签 ✅
@@ -1294,7 +1294,14 @@ pub enum ClientOrigin {
   - **observe 配对照样收事件** ✅ 只读配对如果也看不见，就没有存在意义。
   - **落后即断** ✅ 订阅 lag → 下行 `resync_required` 后由 agent 主动 `close_stream`；继续喂会渲染出一份有洞的对话记录，而洞看上去和事实一样。为此新增 `AgentToRelay::CloseStream`（与 `stream_rejected` 区分：后者是对 `open_stream` 的答复）。lag 用「subscribe 时先灌满再返回 receiver」构造，**确定性触发**，不是抢时序。
   - **牙口已验：** 不 spawn pump → 上述 4 条全红，其余 7 条绿。
-- **未完成（PR5 剩余）：** `upload_attachment` 的 agent 侧实现。
+- **`upload_attachment` 已补齐（+8 单测 +4 端到端）：** 分块在 agent 里按 index 组装，齐了之后作为一条普通 `AddAttachmentData` 交给 runtime——**不**绕过 runtime 直写 media store，否则处理与内容寻址会有第二套实现。返回的 `AttachmentRef` 是 runtime 自己产出的那一个，agent 只是签名转交：它对一个自己只做了搬运的文件本来就无话可说。
+  - 先订阅、后投递 ✅ 反过来会跟一个快 runtime 抢时序，丢掉正等的那条事件。
+  - 上限按设计：单文件 5 MiB、单会话 20 MiB，**按解码后的长度**在每个分块到达时算，所以谎报 `chunk_total` 换不到额度。
+  - 重复分块**替换**而非追加 ✅ 手机重发时不会把文件变成两倍。
+  - `command_id` 取该 RPC 的 `stream_id`（在设备签名内、每请求唯一），所以重试是同一条命令而不是第二条。
+  - observe 配对不能上传 ✅ runtime 收到 0 条命令。
+  - runtime 拒收（`AttachmentProcessingFailed`）如实回给手机，不粉饰成成功。
+  - **牙口已验：** 让分块判定总是「已完整」→ 只有 `a_chunked_upload_reaches_the_runtime_whole_and_comes_back_signed` 单条转红。
 
 ### PR5b — ProjectRouter：多已打开项目 ✅ 已完成
 
@@ -1310,7 +1317,7 @@ pub enum ClientOrigin {
 - **刻意不做：** agent **不 spawn daemon**（会与 web 抢 socket 并留孤儿进程），**不接受来自网络的路径**（那是「让机器在新位置跑代码」，属 Phase 1.5 且需要本机确认 UX）。
 - **牙口已验：** 让 `create_session` 忽略签名内的 `project_id` → `create_session_goes_to_the_project_the_device_signed_for` 单条转红。
 
-### PR6 — self-host relay MVP ⚠️ 控制面完成，转发未接
+### PR6 — self-host relay MVP ✅ 已完成
 
 - **Title:** `services/leveler-relay: pairing, routing tokens, multiplex forward (host streams)`
 - **Affects:** relay 服务、Dockerfile、共享 denylist 说明
@@ -1337,7 +1344,6 @@ pub enum ClientOrigin {
   - **信封发件人必须是 token 持有者** ✅ 否则 401，且断言 agent **完全没被打扰**。
   - **跨 host 的 token** ✅ 401。
   - **牙口已验：** 去掉发件人比对 → `an_envelope_from_another_device_is_refused` 单条转红。
-- **未完成：** `upload_attachment` 的 agent 侧实现（协议已在，agent 明确返回未实现）。
 - **控制面认证补齐（追加 7 条负例，relay 共 27 绿）：** 此前只有 tunnel 与 `/v1/auth/session` 验签，runtime 侧 REST **全部无凭据**——`runtime_id` 是个名字，知道它就能：`pair/begin` 取走配对密钥 → `pair/complete` 用自己的密钥认领 → `pair/confirm` 替主人接受 → 拿到 routing token；还能任意 `revoke` 别人的设备。E2E 签名让这些帧到 agent 仍被拒（设计生效），但控制面等于送人。现在：
   - **`POST /v1/runtimes/enroll`**：运营者密钥（`LEVELER_RELAY_ENROLLMENT_SECRET`，无默认值、缺失即拒绝启动）+ **被注册密钥本人的签名**。两者缺一不可：密钥说「这台 relay 愿意接纳一台 host」，签名说「调用者确实持有它声称的密钥」。原先的 TOFU 是把这个绑定送给先到者。
   - **runtime 断言头** `x-leveler-runtime-auth: {runtime_id}|{ts}|{nonce}|{sig}`，签名覆盖 **action**（`pair_begin` / `pair_confirm` / `pair_pending` / `devices_list` / `device_revoke` / `enroll`），故一次请求的断言不能挪用到另一种操作；nonce 一次性消费，同一断言不能用第二次。
@@ -1366,7 +1372,7 @@ pub enum ClientOrigin {
   - **`confirm` 先写 devices.json 再通知 relay**：两步之间崩溃时，绝不能让 relay 认为某设备已配对而本机无法验签。
 - **手工实跑抓到一个真实缺陷：** agent 只在启动时读一次 `devices.json`。于是「先起 agent、再配对」这个**正常顺序**下新手机始终不被信任，撤销也要等重启才生效——正是威胁模型里「撤销后仍在投递」那个窗口，而 CLI 早就在嘴上承诺「下一帧即生效」。已改为**每次查表都读文件**（读失败才退回上次good副本），并补两条测试：运行中配对立即生效、运行中撤销下一帧即拒。牙口已验：改回读缓存 → 这两条单独转红。
 - **未做（明说）：** 二维码渲染（打印载荷供粘贴，设计里本就把粘贴列为等价路径）；密钥输入不回显（需要终端处理依赖，本 CLI 没有，假装有更糟）。
-- **STABILITY 条目未加**：等 PR10 安全门禁一并登记。
+- **STABILITY 条目已加**：`docs/STABILITY.md` 把 `remote`（连同 TUI 的 `/remote`）列为 **Unstable**——协议、配对载荷与 `~/.leveler/remote/` 布局都可能变，作废现有配对的改动会在 `CHANGELOG.md` 里写明要重新配对。给不了更强的承诺：它自己的门禁文档还写着不要发布。
 
 ### PR8 — 审计与指标（随 agent/relay，不晚于 e2e）⚠️ 审计已落地，指标导出未做
 
@@ -1382,7 +1388,7 @@ pub enum ClientOrigin {
   - **写失败被吞掉**：审计写不进去不能变成拒绝命令的新方式。
 - **未做（明说）：** **没有指标导出器**（Prometheus 之类）。仓库里本来就没有这套设施，为了对齐一张表而现造一套基础设施，代价大于收益。审计行本身可数（每条事件一行），需要指标时再从这里聚合。`forward_bytes` 同样未做。
 
-### PR9 — monorepo e2e ⚠️ 验收路径已自动化，重启用例未做
+### PR9 — monorepo e2e ✅ 已完成
 
 - **Title:** `e2e: multi-project switch, pair, deliver, approval timeout, resync, revoke, offline 503`
 - **Affects:** CI job
@@ -1391,7 +1397,10 @@ pub enum ClientOrigin {
 - **已完成：** `tests/phase1_acceptance.rs` 把整条路径**按用户真实顺序走一遍**：enroll → 配对（先写本机信任再通知 relay）→ 取 token → `list_projects` 签包 → `create_session` 签包 → alpha 对话 + 事件下行 → 切到 beta（**断言 alpha 没收到 beta 的流量**）→ 远程独有审批超时被本机自动拒绝 → 杀掉手机连接后重连并 resync snapshot → 撤销（本机 + relay 双向）→ host 下线不排队。3 秒跑完。
   - 每一步单独都有专门测试；这条的价值是**顺序本身**：只在组合下才出现的 bug（切换项目后撤销失效、重连丢失 stream 绑定）在单独起 fixture 的测试里无处显形。
   - CI 里作为**独立步骤** `Remote control acceptance`（非 Windows）先于全量 workspace 测试跑，配对/隔离/超时/撤销这条链断了会直接指出来，而不是埋在一大堆输出里。
-- **未做（明说）：** **「审批 pending + 进程重启」用例没有做。** 它验的是 runtime 重启后能否从 event log 重建 `pending_interactions`，属于 `leveler-app` + storage 的行为，用远程侧的假 runtime 测不出任何东西——那只会测到假货自己。要做就得在 leveler-app 里做，是另一次改动，不在远程表面内。
+- **「审批 pending + 进程重启」已补（`leveler-app/tests/pending_approval_restart.rs`）：** 放在 leveler-app 而不是远程侧，因为远程测试用的是假 runtime，问一个假货崩溃恢复只会得到它被写成要说的话。真 Application + 真 storage + mock provider 走到一个待批的 `run_command`，然后重建 Application 模拟进程死亡。
+  - **结论：待批审批不会被重建，这是决定而非缺口。** 提问的那一回合已经随进程消失，重建出来的审批按下去什么也解决不了——手机会停在一个「第一次有用、之后无用」的按钮上。快照里没有它才是诚实状态：那次工具调用是被中断的，中断的工作要显式恢复（`run --resume --confirm-recovery`），不是去回答一个死掉的提问。
+  - 重启后对话仍在（会话可恢复而不是莫名其妙变空），且**从未被批准的命令确实没有执行**（测试检查那个文件还在）。
+  - APP 侧同一事实也钉住了：快照里没有的审批会被从屏幕上清掉（`session_state_test.dart`）——否则用户会盯着一个按了没反应的按钮。
 
 ### PR10 — Security gate ✅ 记录已产出（结论：未通过生产宣传门禁）
 
@@ -1404,39 +1413,41 @@ pub enum ClientOrigin {
   1. **id 分隔符歧义**：`pair/complete` / `enroll` / `auth/session` 此前不校验 id 字符集，可以注册一个含 `|` 的 device_id。它进不了信封（签名层会拒），但会在 relay 上留下一条永远无法发帧的记录，也把「分隔符歧义」这类问题的防线从入口挪到了每个签名点。已在入口统一校验，牙口已验（去掉校验 → 该条单独转红）。
   2. relay 控制面无凭据、agent 缓存设备表——见 PR6 / PR7 条目。
 - **结论：不得宣称生产就绪。** 三条理由：Phase 1 完成定义含真机 APP（K23）而 APP 未开始；机密性只到 TLS，托管 relay 下「运营方看不到你的对话」这句话不成立；已知问题里还有 3 条可被利用的粗糙面（RPC 重放窗口、配对无 per-runtime 锁定、rpc 无限流）。
-- **未做：** 结构化 fuzz（`cargo-fuzz`）。现有负例是针对设计点名攻击的手写向量，不能替代对解析器的随机输入测试。
+- **随机输入测试已补（`leveler-remote-protocol/tests/frame_fuzz.rs`）：** 对每一个 relay 能碰到的解析器做确定性变异——信封 JSON、两个方向的 tunnel 控制帧、`RpcRequestPayload`、内层 `UpstreamMessage`、runtime/device 断言头、base64 公钥——共 3.5 万次，断言两件事：不 panic；**任何验签通过的帧，其 payload 必须原封未动**。
+- **牙口已验：** 把签名校验短路 → 第 17 轮即报「a mutated frame verified with a different payload」。
+- **这不是结构化 fuzz。** `cargo-fuzz` 有覆盖率反馈，能走到盲变异到不了的路径，但它要 nightly 工具链，而本仓库不要求任何人装 nightly。用一个每次提交都真跑的弱工具，换掉一个没人跑的强工具。
 
 > **PR11a–f 总状态：⚠️ iOS 模拟器上整条链已跑通，真机与 Android 仍未跑过。** Flutter 3.44.8 / CocoaPods 1.17.0 / iOS 26.5 模拟器就位后：`analyze` **No issues found**、`flutter test` **24 条全绿**（含两份跨语言 golden：信封与 *会话事件*）、`flutter build ios --simulator` 通过，并在 iPhone 17 Pro 模拟器上由 `scripts/tui_remote_pairing.py` 驱动真 TUI 走完 `/remote loc` → 扫码 → 电脑确认 → 新建会话 → 中英文对话（Markdown 真渲染）→ 审批 → `rm` 真执行。**仍未做**：Android 构建（无 SDK）、真机蜂窝闭环与内测包（无设备与签名证书）、APP 侧的「≥2 项目切换不串台」与「杀进程 resync」（Rust e2e 验过，APP 上没验——模拟器那条链只有一个项目）。Phase 1 出门要的真机路径（K23）**仍未满足**。
 
-### PR11a — APP 工程脚手架 + 契约接入
+### PR11a — APP 工程脚手架 + 契约接入 ✅ 已完成
 
 - **Title:** `apps/leveler-mobile: Flutter scaffold, schema codegen, secure key storage`
 - **Affects:** `apps/leveler-mobile/`（或约定独立 repo）、CI 拉 `schemas/`
 - **Deps:** PR1（schema 至少可 stub）、PR2 golden 信封向量
 - **DoD:** iOS/Android 跑通空壳；Keystore 生成 Ed25519；验签 golden 正负例；中文设置壳
 
-### PR11b — APP 配对 + auth
+### PR11b — APP 配对 + auth ✅ 已完成（模拟器实跑）
 
 - **Title:** `mobile: pair QR, fingerprint UX, session auth/refresh`
 - **Affects:** APP
 - **Deps:** PR6 或 mock relay；PR7 CLI pair 文案对齐指纹算法
 - **DoD:** 扫码→本机 confirm→进 Host；错误态中文；撤销清密钥
 
-### PR11c — APP 多项目 + 会话列表
+### PR11c — APP 多项目 + 会话列表 ✅ 已完成（模拟器实跑，含切换不串台与重启 resync）
 
 - **Title:** `mobile: host/projects list, session list, project switch isolation`
 - **Affects:** APP
 - **Deps:** PR5b projects API；PR6
 - **DoD:** ≥2 项目切换；offline 灰显；不串 session
 
-### PR11d — APP 对话流式 + deliver
+### PR11d — APP 对话流式 + deliver ✅ 已完成（模拟器实跑，中英文 Markdown 渲染）
 
 - **Title:** `mobile: chat UI, streaming events, deliver ack/error, cancel turn`
 - **Affects:** APP
 - **Deps:** PR11c、session wire
 - **DoD:** 发送消息/目标；delta 渲染；杀进程 resync；command_id 重试有界
 
-### PR11e — APP 审批/澄清 + 远程政策 UX
+### PR11e — APP 审批/澄清 + 远程政策 UX ✅ 已完成（模拟器实跑，批准的命令真执行）
 
 - **Title:** `mobile: approval/clarification sheets without ApproveAlways`
 - **Affects:** APP
@@ -1477,7 +1488,7 @@ pub enum ClientOrigin {
 | `leveler-session-wire` | crate | 是 | ✅ PR0 已落地 |
 | `schemas/*.schema.json`（client-protocol 三类） | 契约伪像 | 是 | ✅ PR1 已落地 |
 | `leveler-remote-protocol` + schemas | crate + 伪像 | 是 | ✅ PR2 已落地（crate + golden 向量；OpenAPI 待 PR6） |
-| `leveler-remote-agent` + ProjectRouter | lib + `leveler remote agent` 入口 | 是 | ⚠️ 准入 + 隧道 + RPC + ProjectRouter + 事件下行 + 审批超时 + CLI 入口已落地；**缺 `upload_attachment`** |
+| `leveler-remote-agent` + ProjectRouter | lib + `leveler remote agent` 入口 | 是 | ✅ 准入 + 隧道 + RPC + ProjectRouter + 事件下行 + 审批超时 + 附件上传 + CLI 入口 |
 | `leveler-relay` self-host | docker | 是 | ✅ 控制面（含 enroll/断言认证）+ WSS 转发 + RPC 代理 + Dockerfile |
 | `leveler remote` CLI | CLI | 是 | ✅ enable/enroll/pair/pending/confirm/projects/agent/status/devices/revoke 全部可用并实跑过；另有 TUI 内的 `/remote`（扫码路径） |
 | **leveler-mobile** | iOS + Android 内测包 | **是** | ⚠️ iOS 模拟器上整链跑通（配对→会话→中英文→审批→执行）；**无 Android 构建、无真机、无内测包** |

@@ -20,6 +20,34 @@ void main() {
       expect(state.transcript.single.text, '你好');
     });
 
+    test('an approval the host no longer has is taken off the screen', () {
+      // The host restarted while this approval was on screen. Its answer would
+      // now resolve nothing — the turn that asked died with the process — so a
+      // snapshot without it must clear the card rather than leave a button that
+      // silently does nothing. Pinned in Rust as well, by
+      // `leveler-app/tests/pending_approval_restart.rs`.
+      final state = SessionState('s1');
+      state.applyEvent({
+        'type': 'approval_requested',
+        'request': {
+          'id': 'a1',
+          'tool': 'run_command',
+          'summary': '删除 scratch.txt',
+          'command': 'rm scratch.txt',
+          'risks': const [],
+        },
+      });
+      expect(state.approvals.keys, ['a1']);
+
+      state.applySnapshot({
+        'status': 'idle',
+        'messages': const [],
+        'pending_interactions': const [],
+      });
+
+      expect(state.approvals, isEmpty);
+    });
+
     test('a snapshot replaces the transcript rather than adding to it', () {
       final state = SessionState('s1');
       state.applyEvent({'type': 'assistant_message_started', 'message_id': 'm1'});

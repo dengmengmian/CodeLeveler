@@ -25,7 +25,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 LEVELER="$REPO/target/debug/leveler"
 RELAY="$REPO/target/debug/leveler-relay"
 for binary in "$LEVELER" "$RELAY"; do
-  [[ -x "$binary" ]] || { echo "缺少 $binary，先跑 cargo build -p leveler-cli -p leveler-relay" >&2; exit 1; }
+  [[ -x "$binary" ]] || { echo "缺少 ${binary}，先跑 cargo build -p leveler-cli -p leveler-relay" >&2; exit 1; }
 done
 
 WORK="$(mktemp -d)"
@@ -36,7 +36,7 @@ PORT="${PORT:-18443}"
 PROVIDER_PORT="${PROVIDER_PORT:-18500}"
 
 cleanup() {
-  for pid in "${SERVE_PID:-}" "${AGENT_PID:-}" "${RELAY_PID:-}" "${PROVIDER_PID:-}"; do
+  for pid in "${SERVE_PID:-}" "${SERVE_B_PID:-}" "${AGENT_PID:-}" "${RELAY_PID:-}" "${PROVIDER_PID:-}"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
   done
   # `flutter test` rewrites ios/Flutter/Generated.xcconfig to point FLUTTER_TARGET
@@ -50,14 +50,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# A repository of its own. The approval step really executes `rm`, and pointing
+# Two repositories of their own. Two, because the acceptance list asks that
+# switching projects on the phone not cross wires, and one project cannot show
+# that. Their own, because the approval step really executes `rm`, and pointing
 # that at this checkout would make a passing test destructive.
-SCRATCH="$WORK/scratch-repo"
-mkdir -p "$SCRATCH"
-git -C "$SCRATCH" init -q .
-echo "临时文件，供验收删除" > "$SCRATCH/scratch.txt"
-git -C "$SCRATCH" add -A
-git -C "$SCRATCH" -c user.email=acceptance@local -c user.name=acceptance commit -qm "scratch"
+SCRATCH="$WORK/scratch-alpha"
+SCRATCH_B="$WORK/scratch-beta"
+for repo in "$SCRATCH" "$SCRATCH_B"; do
+  mkdir -p "$repo"
+  git -C "$repo" init -q .
+  echo "临时文件，供验收删除" > "$repo/scratch.txt"
+  git -C "$repo" add -A
+  git -C "$repo" -c user.email=acceptance@local -c user.name=acceptance commit -qm "scratch"
+done
 
 echo "== 脚本化模型 =="
 python3 "$REPO/apps/leveler-mobile/scripts/scripted_provider.py" "$PROVIDER_PORT" > "$WORK/provider.log" 2>&1 &
@@ -103,13 +108,16 @@ echo "== 启用并注册本机 =="
 HOST_FINGERPRINT="$("$LEVELER" remote status | sed -n 's/.*公钥指纹：//p')"
 echo "本机指纹: $HOST_FINGERPRINT"
 
-# A project for the phone to enter. Without one the run stops at the project
+# Projects for the phone to enter. Without one the run stops at the project
 # list, which leaves the session stream — the part that needs an authorized
 # WebSocket — untested; it was broken that way once already.
-echo "== 打开一个项目（scratch 仓库）=="
-printf '{"projects":["%s"],"aliases":{},"ignored":[]}' "$SCRATCH" > "$LEVELER_HOME/web-projects.json"
+echo "== 打开两个项目 =="
+printf '{"projects":["%s","%s"],"aliases":{},"ignored":[]}' "$SCRATCH" "$SCRATCH_B" \
+  > "$LEVELER_HOME/web-projects.json"
 "$LEVELER" --repo "$SCRATCH" serve > "$WORK/serve.log" 2>&1 &
 SERVE_PID=$!
+"$LEVELER" --repo "$SCRATCH_B" serve > "$WORK/serve-b.log" 2>&1 &
+SERVE_B_PID=$!
 
 echo "== agent =="
 "$LEVELER" remote agent > "$WORK/agent.log" 2>&1 &
@@ -120,49 +128,61 @@ sleep 4
 # the first match, `leveler` die of a broken pipe, and `pipefail` report the
 # whole thing as a failure — precisely when the check succeeded.
 PROJECTS="$("$LEVELER" remote projects)"
-if ! grep -q 在线 <<<"$PROJECTS"; then
-  echo "项目没有上线，agent 会看到空列表：" >&2
+if [[ "$(grep -c 在线 <<<"$PROJECTS")" -lt 2 ]]; then
+  echo "两个项目没有都上线，切换用例会跳过：" >&2
   echo "$PROJECTS" >&2
-  tail -5 "$WORK/serve.log" >&2
+  tail -5 "$WORK/serve.log" "$WORK/serve-b.log" >&2
   exit 1
 fi
 
-echo "== 配对载荷 =="
-PAYLOAD="$("$LEVELER" remote pair | grep '^{')"
-echo "$PAYLOAD"
-
-# Accept from the terminal as soon as the app has claimed the secret. The app is
-# waiting for exactly this, so it runs in parallel with the test.
-(
+# Accept from the terminal as soon as the app has claimed a secret.
+#
+# One watcher per pairing, because each `flutter test` run starts from an
+# unpaired app: the store is in memory, so the second journey pairs again from
+# scratch rather than inheriting the first one's trust.
+watch_for_pairing() {
   # Wait for the phone to claim the secret, then pause before accepting. The
   # pause is measured from the claim, not from this script's start, so the
   # window in which the phone is claimed-but-not-accepted really exists — that
   # is the window the test uses to prove a device cannot promote itself.
-  for _ in $(seq 1 90); do
+  for _ in $(seq 1 120); do
     if "$LEVELER" remote pending >/dev/null 2>&1; then
       echo "== 手机已提交，8 秒后再确认 =="
       sleep 8
       CONFIRMED="$("$LEVELER" remote confirm --yes)"
       grep -q "配对完成" <<<"$CONFIRMED" && echo "== 已在电脑上确认 =="
-      exit 0
+      return 0
     fi
     sleep 1
   done
   echo "== 一直没有等到手机提交配对 ==" >&2
-) &
-CONFIRM_PID=$!
+  return 1
+}
 
-echo "== 在模拟器上跑集成测试 =="
 cd "$REPO/apps/leveler-mobile"
-set +e
-flutter test integration_test/pairing_flow_test.dart \
-  -d "$DEVICE" \
-  --dart-define="PAIRING_PAYLOAD=$PAYLOAD" \
-  --dart-define="HOST_FINGERPRINT=$HOST_FINGERPRINT"
-RESULT=$?
-set -e
+RESULT=0
+for journey in pairing_flow_test multi_project_test; do
+  echo "== 配对载荷（${journey}）=="
+  PAYLOAD="$("$LEVELER" remote pair | grep '^{')"
+  echo "$PAYLOAD"
 
-wait "$CONFIRM_PID" 2>/dev/null || true
+  watch_for_pairing &
+  CONFIRM_PID=$!
+
+  echo "== 在模拟器上跑 $journey =="
+  set +e
+  flutter test "integration_test/$journey.dart" \
+    -d "$DEVICE" \
+    --dart-define="PAIRING_PAYLOAD=$PAYLOAD" \
+    --dart-define="HOST_FINGERPRINT=$HOST_FINGERPRINT"
+  STEP=$?
+  set -e
+  wait "$CONFIRM_PID" 2>/dev/null || true
+  if [[ $STEP -ne 0 ]]; then
+    RESULT=$STEP
+    break
+  fi
+done
 
 # The approval was for a real `rm`. If the file survived, the phone's "allow"
 # never reached a process that could act on it — which every screen-level

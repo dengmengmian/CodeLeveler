@@ -484,7 +484,7 @@ fn dispatch_effects(
                 run_remote(
                     remote_launcher.as_ref(),
                     crate::action::RemoteRequest::Invite { local },
-                    &completion_tx,
+                    completion_tx,
                 );
                 // A phone claims the invite seconds later and then waits for a
                 // person. Nothing pushes that fact here, so ask — a user who
@@ -511,7 +511,7 @@ fn dispatch_effects(
                 } else {
                     crate::action::RemoteRequest::Reject
                 };
-                run_remote(remote_launcher.as_ref(), request, &completion_tx);
+                run_remote(remote_launcher.as_ref(), request, completion_tx);
             }
             Effect::OpenWebUrl(url) => open_in_browser(&url),
             Effect::Quit => state.running = false,

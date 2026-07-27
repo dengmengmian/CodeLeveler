@@ -2171,6 +2171,7 @@ dependencies = [
  "base64",
  "chrono",
  "leveler-client-protocol",
+ "leveler-session-wire",
  "ring",
  "serde",
  "serde_json",
