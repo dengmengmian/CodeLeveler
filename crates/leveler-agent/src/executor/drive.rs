@@ -1287,8 +1287,7 @@ impl Executor {
                 }
                 // Post-thrash force-answer: refuse further pure observes so the
                 // model must synthesize from results already in the transcript.
-                if observe_thrash_answer_forced
-                    && is_pure_observe_call(&call.name, &call.arguments)
+                if observe_thrash_answer_forced && is_pure_observe_call(&call.name, &call.arguments)
                 {
                     observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
                     let msg = "Observation thrash was detected. Do not re-list, re-search, or \

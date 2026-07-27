@@ -868,7 +868,9 @@ mod tests {
             "must ban prose-only waiting as a substitute for a real gate"
         );
         assert!(
-            prompt.contains("mutually exclusive") || prompt.contains("2–4") || prompt.contains("2-4"),
+            prompt.contains("mutually exclusive")
+                || prompt.contains("2–4")
+                || prompt.contains("2-4"),
             "must specify option shape for choice forks"
         );
     }

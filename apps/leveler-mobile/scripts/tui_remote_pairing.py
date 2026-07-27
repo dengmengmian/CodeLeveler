@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pair a simulator with the TUI the way a person would: `/remote loc`.
+"""Pair a simulator with the TUI the way a person would: `/xremote-loc`.
 
 `simulator_pairing.sh` drives the same chain through the `leveler remote …`
 subcommands, which is the operator's path. This one drives the path a user
@@ -148,8 +148,8 @@ def main():
     flutter = None
     try:
         tui.read(3.0)
-        print("== 在 TUI 里输入 /remote loc ==", flush=True)
-        tui.type("/remote loc\r")
+        print("== 在 TUI 里输入 /xremote-loc ==", flush=True)
+        tui.type("/xremote-loc\r")
 
         # The QR itself: half-block rows. Its presence is the point of the
         # command — a payload with no code to scan is the old flow with extra
@@ -229,7 +229,7 @@ def main():
             raise SystemExit(f"app 端集成测试失败（{code}）")
         if os.path.exists(os.path.join(scratch, "scratch.txt")):
             raise SystemExit("批准之后 scratch.txt 还在：审批没有真正执行")
-        print("== 全通过：/remote loc → 扫码 → 接受 → 对话 → 审批 ==", flush=True)
+        print("== 全通过：/xremote-loc → 扫码 → 接受 → 对话 → 审批 ==", flush=True)
     finally:
         if flutter and flutter.poll() is None:
             flutter.kill()

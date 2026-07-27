@@ -442,12 +442,7 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     };
                     let indent = " ".repeat(marker.width());
                     let inner = width.saturating_sub(marker.width()).max(1);
-                    let wrapped = wrap_spans(
-                        item,
-                        inner,
-                        theme,
-                        Style::default().fg(theme.text),
-                    );
+                    let wrapped = wrap_spans(item, inner, theme, Style::default().fg(theme.text));
                     for (li, line) in wrapped.into_iter().enumerate() {
                         let lead = if li == 0 {
                             marker.clone()
@@ -1740,10 +1735,7 @@ mod tests {
         let prefix_underlined = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
             s.content.contains('地') && s.style.add_modifier.contains(Modifier::UNDERLINED)
         });
-        assert!(
-            !prefix_underlined,
-            "CJK prefix must stay plain: {lines:?}"
-        );
+        assert!(!prefix_underlined, "CJK prefix must stay plain: {lines:?}");
     }
 
     #[test]

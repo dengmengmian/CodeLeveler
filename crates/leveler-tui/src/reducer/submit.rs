@@ -199,16 +199,17 @@ fn start_web(state: &mut AppState) -> Vec<Effect> {
 
 /// `/remote` — make this machine reachable from a phone.
 ///
-/// `/remote loc` binds the relay to this machine's own network address instead
-/// of expecting one on the internet. A phone on the same Wi-Fi can reach that,
-/// which is the difference between "works once you rent a server" and "works
-/// now". It is not advertised in the command list because it is a testing and
-/// same-network path, not the shape the product is aiming at.
-fn start_remote(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let local = command
-        .split_whitespace()
-        .nth(1)
-        .is_some_and(|arg| matches!(arg, "loc" | "local" | "lan"));
+/// `/xremote-loc` is the same thing with the relay bound to this machine's own
+/// network address instead of one on the internet, so a phone on the same
+/// Wi-Fi can reach it — the difference between "works once you rent a server"
+/// and "works now".
+///
+/// A separate name rather than `/remote loc`, and an `x` in front of it: an
+/// argument on the real command is one typo away from being taken for the real
+/// command, and a name nobody would type by accident is a name nobody reaches
+/// by accident. It stays out of the command list for the same reason — it is a
+/// testing and same-network path, not the shape the product is aiming at.
+fn start_remote(state: &mut AppState, local: bool) -> Vec<Effect> {
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
         message: if local {
@@ -258,6 +259,7 @@ fn is_known_slash(name: &str) -> bool {
             | "skill"
             | "web"
             | "remote"
+            | "xremote-loc"
             | "clear"
             | "new"
             | "quit"
@@ -291,7 +293,8 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "memory" => memory_slash(state, command),
         "skill" => skill_slash(state, command),
         "web" => start_web(state),
-        "remote" => start_remote(state, command),
+        "remote" => start_remote(state, false),
+        "xremote-loc" => start_remote(state, true),
         "verify" => toggle_screen(state, Screen::Verification),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
@@ -921,6 +924,43 @@ mod export_tests {
             matches!(&s.notification, Some(n) if n.message.contains("没有可导出的内容")),
             "empty transcript should report nothing to export"
         );
+    }
+
+    #[test]
+    fn the_local_relay_needs_its_own_command_not_an_argument() {
+        let mut s = state_with_dialogue();
+
+        // The real command never binds a local relay, whatever follows it. As
+        // an argument this was one typo from being taken for `/remote` itself,
+        // on a command whose whole job is to open this machine to a network.
+        assert_eq!(
+            handle_slash(&mut s, "remote"),
+            vec![Effect::StartRemote { local: false }]
+        );
+        assert_eq!(
+            handle_slash(&mut s, "remote loc"),
+            vec![Effect::StartRemote { local: false }],
+            "a trailing word must not change what /remote does"
+        );
+
+        assert_eq!(
+            handle_slash(&mut s, "xremote-loc"),
+            vec![Effect::StartRemote { local: true }]
+        );
+    }
+
+    #[test]
+    fn the_local_command_stays_out_of_the_advertised_list() {
+        // Known, so typing it is not an error; unadvertised, so nobody meets it
+        // by browsing. Both halves matter: a testing path that shows up in the
+        // command list is a testing path users will try.
+        assert!(is_known_slash("xremote-loc"));
+        for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
+            assert!(
+                !locale.text().slash.remote.contains("xremote"),
+                "the local path must not be described in the command list"
+            );
+        }
     }
 
     #[test]
