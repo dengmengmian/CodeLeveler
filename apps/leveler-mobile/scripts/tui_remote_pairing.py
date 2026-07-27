@@ -18,6 +18,7 @@ after `cargo build --release`, that is the difference between testing what was
 built and testing what a user actually runs.
 """
 
+import contextlib
 import os
 import pty
 import re
@@ -104,6 +105,35 @@ class Tui:
         os.close(self.master)
 
 
+@contextlib.contextmanager
+def xcode_target_preserved():
+    """Put `ios/Flutter/Generated.xcconfig` back the way it was found.
+
+    `flutter test integration_test/…` repoints FLUTTER_TARGET at a temporary
+    listener entrypoint and leaves it there. The temp file is deleted, and the
+    next Xcode build dies with "Command PhaseScriptExecution failed with a
+    nonzero exit code" — a message naming neither the file nor the reason.
+
+    The shell scripts learned this already; this driver had not, so running it
+    broke the build for whoever opened Xcode next. A copy restored in `finally`
+    survives every way this can end, including the interruption that is exactly
+    when it matters.
+    """
+    config = os.path.join(REPO, "apps", "leveler-mobile", "ios", "Flutter",
+                          "Generated.xcconfig")
+    original = None
+    with contextlib.suppress(OSError):
+        with open(config, "rb") as handle:
+            original = handle.read()
+    try:
+        yield
+    finally:
+        if original is not None:
+            with contextlib.suppress(OSError):
+                with open(config, "wb") as handle:
+                    handle.write(original)
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit("用法: tui_remote_pairing.py <simulator-udid>")
@@ -150,6 +180,7 @@ def main():
     env = dict(os.environ, LEVELER_HOME=home, TERM="xterm-256color", COLUMNS=str(COLUMNS), LINES=str(ROWS))
     tui = Tui(env, scratch)
     flutter = None
+    stack = contextlib.ExitStack()
     try:
         tui.read(3.0)
         print("== 在 TUI 里输入 /xremote-loc ==", flush=True)
@@ -195,6 +226,7 @@ def main():
         print(f"== 本机指纹 {fingerprint} ==", flush=True)
 
         print("== 让模拟器上的 app 扫这个载荷 ==", flush=True)
+        stack.enter_context(xcode_target_preserved())
         flutter = subprocess.Popen(
             [
                 shutil.which("flutter") or "/opt/homebrew/bin/flutter",
@@ -237,6 +269,7 @@ def main():
     finally:
         if flutter and flutter.poll() is None:
             flutter.kill()
+        stack.close()
         tui.stop()
         provider.kill()
 

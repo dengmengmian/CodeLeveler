@@ -32,7 +32,12 @@ fi
 CACHES=(~/Library/Developer/Xcode/DerivedData/Runner-*)
 if [[ -e "${CACHES[0]}" ]]; then
   echo "== 清掉 Xcode 对 Runner 的构建缓存 =="
-  rm -rf "${CACHES[@]}"
+  # A running Xcode keeps writing into this directory, so parts of it come back
+  # as fast as they go. Repairing the config is the part that matters and has
+  # already happened; failing here would report the whole fix as failed.
+  if ! rm -rf "${CACHES[@]}" 2>/dev/null; then
+    echo "   （Xcode 正开着，缓存没清干净——如果 Xcode 里仍失败，退出 Xcode 后再跑一次本脚本）"
+  fi
 fi
 
 echo "已修好：FLUTTER_TARGET=$(sed -n 's/^FLUTTER_TARGET=//p' "$CONFIG")"
