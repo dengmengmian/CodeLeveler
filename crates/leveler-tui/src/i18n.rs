@@ -230,6 +230,32 @@ pub struct UiText {
     pub screen_diff: &'static str,
     pub screen_verify: &'static str,
     pub screen_agents: &'static str,
+    /// Full-screen `/remote` invite title.
+    pub screen_remote: &'static str,
+    /// Lead line above the QR.
+    pub remote_scan_heading: &'static str,
+    /// One-line subtitle under the heading.
+    pub remote_scan_sub: &'static str,
+    /// Label before the relay URL.
+    pub remote_label_address: &'static str,
+    /// Label before this machine's fingerprint.
+    pub remote_label_host_fp: &'static str,
+    /// Idle state: no phone has claimed the invite yet.
+    pub remote_waiting: &'static str,
+    /// Hint above the pasteable payload.
+    pub remote_paste_hint: &'static str,
+    /// "「{name}」（{platform}）想要连接" / "“{name}” ({platform}) wants to connect".
+    pub remote_wants_connect: &'static str,
+    /// Label before the phone's fingerprint.
+    pub remote_label_phone_fp: &'static str,
+    /// Security copy: compare fingerprints, not device names.
+    pub remote_compare_hint: &'static str,
+    /// y/n actions while a device is pending.
+    pub remote_yn: &'static str,
+    /// Footer: scroll + Esc back to conversation.
+    pub remote_footer: &'static str,
+    /// Placeholder while the invite is still loading.
+    pub remote_preparing: &'static str,
     pub no_sessions: &'static str,
     pub no_context: &'static str,
     pub no_plan: &'static str,
@@ -533,6 +559,19 @@ static ZH: UiText = UiText {
     screen_diff: "改动",
     screen_verify: "验证结果",
     screen_agents: "Agent 状态",
+    screen_remote: "配对手机",
+    remote_scan_heading: "用手机扫这个码",
+    remote_scan_sub: "扫码后在本机核对指纹，确认后手机即可连接",
+    remote_label_address: "地址",
+    remote_label_host_fp: "本机指纹",
+    remote_waiting: "等待扫码… 手机出现后会在这里显示指纹供你确认",
+    remote_paste_hint: "扫不了码时，把下面这一行粘贴到手机：",
+    remote_wants_connect: "「{}」（{}）想要连接",
+    remote_label_phone_fp: "手机指纹",
+    remote_compare_hint: "请与手机上的那一行逐字比对——你确认的是这把密钥，不是设备名字。",
+    remote_yn: "y 接受      n 拒绝",
+    remote_footer: "↑↓/PgUp/PgDn 滚动 · Esc 返回对话（可继续等扫码，不会取消配对）",
+    remote_preparing: "正在准备配对…",
     no_sessions: "暂无会话",
     no_context: "暂无上下文信息（/workflow 编排工作流运行后生成）",
     no_plan: "暂无任务步骤（/workflow 开启后运行任务会生成）",
@@ -782,6 +821,19 @@ static EN: UiText = UiText {
     screen_diff: "Diff",
     screen_verify: "Verification",
     screen_agents: "Agents",
+    screen_remote: "Pair a phone",
+    remote_scan_heading: "Scan this code with your phone",
+    remote_scan_sub: "Then confirm the fingerprint here so the phone can connect",
+    remote_label_address: "Address",
+    remote_label_host_fp: "This machine",
+    remote_waiting: "Waiting for a scan… the phone's fingerprint will show here to confirm",
+    remote_paste_hint: "Can't scan? Paste this line into the phone app:",
+    remote_wants_connect: "“{}” ({}) wants to connect",
+    remote_label_phone_fp: "Phone fingerprint",
+    remote_compare_hint: "Compare character-by-character with the phone — you are confirming the key, not the device name.",
+    remote_yn: "y accept      n decline",
+    remote_footer: "↑↓/PgUp/PgDn scroll · Esc back to chat (pairing keeps waiting)",
+    remote_preparing: "Preparing invite…",
     no_sessions: "No sessions",
     no_context: "No context yet (appears after /workflow runs)",
     no_plan: "No task steps yet (enable /workflow, then run a task)",

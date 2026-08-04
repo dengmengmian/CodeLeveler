@@ -1604,70 +1604,303 @@ mod tests {
             "list content: {text:?}"
         );
     }
+
+    fn sample_remote() -> crate::state::RemoteState {
+        crate::state::RemoteState {
+            invite: crate::action::RemoteInvite {
+                qr: vec![
+                    "█▀▀█".into(),
+                    "█  █".into(),
+                    "▀▀▀▀".into(),
+                ],
+                payload: "LV1|rt_test|payload".into(),
+                host_fingerprint: "af0f 3032 701b de9e".into(),
+                relay_url: "http://172.20.54.97:18443".into(),
+            },
+            pending: None,
+            outcome: None,
+        }
+    }
+
+    #[test]
+    fn remote_screen_shows_title_qr_meta_and_esc_footer() {
+        let theme = Theme::dark();
+        let t = crate::i18n::Locale::Zh.text();
+        let lines = super::remote_screen_lines(&sample_remote(), 72, &theme, t);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains(t.screen_remote), "title: {text}");
+        assert!(text.contains(t.remote_scan_heading), "heading: {text}");
+        assert!(text.contains("http://172.20.54.97:18443"), "address: {text}");
+        assert!(text.contains("af0f 3032 701b de9e"), "host fp: {text}");
+        assert!(text.contains("LV1|rt_test|payload"), "paste payload: {text}");
+        assert!(text.contains("Esc"), "Esc footer required: {text}");
+        assert!(
+            text.contains(t.remote_footer) || text.contains("返回对话"),
+            "footer must tell the user Esc returns to chat: {text}"
+        );
+        // QR card frame
+        assert!(text.contains('┌') && text.contains('└'), "QR frame: {text}");
+    }
+
+    #[test]
+    fn remote_screen_pending_prompts_yn() {
+        let theme = Theme::dark();
+        let t = crate::i18n::Locale::Zh.text();
+        let mut remote = sample_remote();
+        remote.pending = Some(crate::action::PairingRequest {
+            device_name: "iPhone".into(),
+            platform: "iOS".into(),
+            fingerprint: "bb11 cc22".into(),
+        });
+        let lines = super::remote_screen_lines(&remote, 72, &theme, t);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("iPhone") && text.contains("iOS"), "{text}");
+        assert!(text.contains("bb11 cc22"), "{text}");
+        assert!(text.contains("y ") || text.contains("y接受") || text.contains(t.remote_yn), "{text}");
+        assert!(text.contains("Esc"), "{text}");
+    }
 }
 
 /// The `/remote` invite.
 ///
-/// A QR, the address it points at, and the fingerprint the user must compare
-/// with the phone. The comparison is the whole security of pairing, so it is
-/// not a footnote here — it is the thing the screen is about once a device
-/// shows up.
+/// Title + subtitle, a centered QR, labeled address/fingerprint, then either
+/// the waiting/paste copy or the pending y/n decision. Footer always reminds
+/// Esc returns to the conversation without cancelling the invite.
 fn render_remote_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    let t = state.t();
+    let width = area.width as usize;
+
     let Some(remote) = &state.remote else {
-        frame.render_widget(Paragraph::new("正在准备…"), area);
+        let lines = vec![
+            screens::screen_title(t.screen_remote, theme),
+            Line::from(""),
+            Line::from(Span::styled(
+                t.remote_preparing.to_string(),
+                Style::default().fg(theme.muted),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                t.remote_footer.to_string(),
+                Style::default().fg(theme.dim),
+            )),
+        ];
+        render_scrolled(frame, area, state, lines);
         return;
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        "用手机扫这个码",
-        Style::default().add_modifier(Modifier::BOLD),
-    )]));
+    let lines = remote_screen_lines(remote, width, theme, t);
+    render_scrolled(frame, area, state, lines);
+}
+
+/// Build the `/remote` screen content (testable without a Frame).
+fn remote_screen_lines(
+    remote: &crate::state::RemoteState,
+    width: usize,
+    theme: &crate::theme::Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let accent = Style::default().fg(theme.accent);
+    let muted = Style::default().fg(theme.muted);
+    let dim = Style::default().fg(theme.dim);
+    let text = Style::default().fg(theme.text);
+    let bold_accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let bold_text = Style::default()
+        .fg(theme.text)
+        .add_modifier(Modifier::BOLD);
+    let success = Style::default()
+        .fg(theme.success)
+        .add_modifier(Modifier::BOLD);
+    let warning = Style::default()
+        .fg(theme.warning)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(screens::screen_title(t.screen_remote, theme));
     lines.push(Line::from(""));
-    for row in &remote.invite.qr {
-        lines.push(Line::from(row.clone()));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("地址：{}", remote.invite.relay_url)));
-    lines.push(Line::from(format!(
-        "本机指纹：{}",
-        remote.invite.host_fingerprint
+    lines.push(Line::from(Span::styled(
+        t.remote_scan_heading.to_string(),
+        bold_text,
     )));
+    lines.push(Line::from(Span::styled(
+        t.remote_scan_sub.to_string(),
+        muted,
+    )));
+    lines.push(Line::from(""));
+
+    // Quiet frame around the QR so it reads as a card, not a wall of blocks.
+    let qr_inner = remote
+        .invite
+        .qr
+        .iter()
+        .map(|r| unicode_width::UnicodeWidthStr::width(r.as_str()))
+        .max()
+        .unwrap_or(0);
+    let frame_w = (qr_inner + 4).min(width.saturating_sub(2).max(1));
+    let top = format!("┌{}┐", "─".repeat(frame_w.saturating_sub(2)));
+    let bot = format!("└{}┘", "─".repeat(frame_w.saturating_sub(2)));
+    lines.push(Line::from(Span::styled(
+        center_display(&top, width),
+        dim,
+    )));
+    for row in &remote.invite.qr {
+        let padded = format!("│ {} │", pad_to_width(row, qr_inner));
+        lines.push(Line::from(Span::styled(
+            center_display(&padded, width),
+            text,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        center_display(&bot, width),
+        dim,
+    )));
+    lines.push(Line::from(""));
+
+    lines.push(labeled_row(
+        t.remote_label_address,
+        &remote.invite.relay_url,
+        accent,
+        crate::url_link::link_style(theme.accent),
+        width,
+    ));
+    lines.push(labeled_row(
+        t.remote_label_host_fp,
+        &remote.invite.host_fingerprint,
+        accent,
+        text,
+        width,
+    ));
     lines.push(Line::from(""));
 
     match (&remote.pending, &remote.outcome) {
         (Some(pending), _) => {
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "「{}」（{}）想要连接",
-                    pending.device_name, pending.platform
-                ),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]));
-            lines.push(Line::from(format!("手机指纹：{}", pending.fingerprint)));
-            lines.push(Line::from(
-                "请与手机上显示的那一行逐字比对——你确认的是这把密钥，不是设备名字。",
+            let title = t
+                .remote_wants_connect
+                .replacen("{}", &pending.device_name, 1)
+                .replacen("{}", &pending.platform, 1);
+            lines.push(Line::from(Span::styled(title, warning)));
+            lines.push(labeled_row(
+                t.remote_label_phone_fp,
+                &pending.fingerprint,
+                accent,
+                bold_text,
+                width,
             ));
+            lines.push(Line::from(Span::styled(
+                t.remote_compare_hint.to_string(),
+                muted,
+            )));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(
-                "y 接受    n 拒绝",
-                Style::default().add_modifier(Modifier::BOLD),
-            )]));
+            lines.push(Line::from(Span::styled(t.remote_yn.to_string(), bold_accent)));
         }
-        (None, Some(outcome)) => lines.push(Line::from(outcome.clone())),
+        (None, Some(outcome)) => {
+            let style = if outcome.contains("拒绝") || outcome.to_ascii_lowercase().contains("reject")
+            {
+                warning
+            } else {
+                success
+            };
+            lines.push(Line::from(Span::styled(outcome.clone(), style)));
+        }
         (None, None) => {
-            lines.push(Line::from("扫码后，这里会显示手机的指纹等你确认。"));
-            lines.push(Line::from("扫不了码时，可以让手机粘贴下面这一行："));
+            lines.push(Line::from(Span::styled(
+                t.remote_waiting.to_string(),
+                muted,
+            )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                remote.invite.payload.clone(),
-                Style::default().add_modifier(Modifier::DIM),
+                t.remote_paste_hint.to_string(),
+                muted,
             )));
+            // Payload can be very long — wrap by display width, keep dim so it
+            // does not compete with the QR.
+            for chunk in wrap_display(&remote.invite.payload, width.saturating_sub(2).max(8)) {
+                lines.push(Line::from(Span::styled(format!("  {chunk}"), dim)));
+            }
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).scroll((state.screen_scroll as u16, 0)),
-        area,
-    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(width.min(48).max(8)),
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        t.remote_footer.to_string(),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines
+}
+
+fn labeled_row(
+    label: &str,
+    value: &str,
+    label_style: Style,
+    value_style: Style,
+    width: usize,
+) -> Line<'static> {
+    // Fixed label column so address / fingerprints align.
+    let col = 10usize;
+    let label_w = unicode_width::UnicodeWidthStr::width(label);
+    let pad = " ".repeat(col.saturating_sub(label_w));
+    let avail = width.saturating_sub(col + 1).max(8);
+    let val = truncate_display(value, avail);
+    Line::from(vec![
+        Span::styled(format!("{label}{pad}"), label_style),
+        Span::styled(format!(" {val}"), value_style),
+    ])
+}
+
+fn center_display(s: &str, width: usize) -> String {
+    let w = unicode_width::UnicodeWidthStr::width(s);
+    if w >= width || width == 0 {
+        return s.to_string();
+    }
+    let pad = (width - w) / 2;
+    format!("{}{s}", " ".repeat(pad))
+}
+
+fn pad_to_width(s: &str, width: usize) -> String {
+    let w = unicode_width::UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
+}
+
+/// Greedy wrap on display columns (not bytes) for long paste payloads.
+fn wrap_display(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+        if cur_w + cw > width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += cw;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
