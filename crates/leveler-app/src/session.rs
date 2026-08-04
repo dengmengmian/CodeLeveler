@@ -384,7 +384,6 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         EngineError::Agent(e) => AppError::Agent(e),
         EngineError::Storage(e) => AppError::Storage(e),
         EngineError::Serde(e) => AppError::Serde(e.to_string()),
-        EngineError::Planner(e) => AppError::Orchestrator(e),
         EngineError::Config(m) | EngineError::Corrupt(m) => AppError::Engine(m),
         EngineError::EventBufferOverloaded => {
             AppError::Engine("engine event buffer overloaded".to_string())
@@ -476,7 +475,7 @@ impl Application {
             kind: ExecutionKind::Direct,
             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
             limits: self.top_level_limits(),
-            verification: crate::orchestrate::verification_plan_for_root(&self.layout.repo_root),
+            verification: leveler_verifier::discover::plan_for_repo(&self.layout.repo_root),
             base_commit: None,
         }
     }
@@ -507,6 +506,8 @@ impl Application {
             approver,
             Arc::new(AutoClarify),
             sandbox,
+            // Headless: nobody is at a keyboard to steer.
+            None,
             observer,
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
@@ -518,6 +519,7 @@ impl Application {
     /// Like [`Self::run_in_session`] but with an injectable clarifier (TUI waits;
     /// CLI may pass AutoClarify for unattended runs).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_in_session_with_clarifier(
         &self,
         session_id: &leveler_core::SessionId,
@@ -527,6 +529,8 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
+        // Mid-turn user input; `None` disables steering for this run.
+        steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         observer: &mut dyn FnMut(AgentEvent),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
@@ -538,6 +542,7 @@ impl Application {
             approver,
             clarifier,
             sandbox,
+            steering,
             observer,
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
@@ -569,6 +574,8 @@ impl Application {
             approver,
             Arc::new(AutoClarify),
             sandbox,
+            // Eval runs are unattended.
+            None,
             observer,
             cancellation,
             leveler_agent::ContinuationPolicy::bounded(max_rounds),
@@ -587,6 +594,7 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
+        steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         observer: &mut dyn FnMut(AgentEvent),
         cancellation: CancellationToken,
         continuation: leveler_agent::ContinuationPolicy,
@@ -628,7 +636,8 @@ impl Application {
                 work_profile,
                 read_only,
             )
-            .await?;
+            .await?
+            .with_steering(steering);
         // System-side memory candidates (explicit intent + package-manager
         // signals). Never writes active memory; user accept is separate (K36).
         self.enqueue_memory_candidates(goal);

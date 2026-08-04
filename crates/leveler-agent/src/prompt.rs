@@ -987,6 +987,68 @@ mod tests {
         assert!(a.contains("current step k/n") || a.contains("Progress narration"));
     }
 
+    /// Regression lock on `base.md`'s proactive-memory section: it must reach
+    /// the model even with an empty store, or a fresh project can never record
+    /// its first memory. Only the index segment is conditional.
+    #[test]
+    fn memory_guidance_ships_even_with_an_empty_store() {
+        let prompt = PromptBuilder::new().build();
+        assert!(
+            prompt.contains("remember"),
+            "an empty store must still tell the model how to record one"
+        );
+    }
+
+    /// Regression lock: the "what earns a memory / what does not" list is the
+    /// only thing standing between a useful store and a pile of trivia.
+    #[test]
+    fn memory_guidance_says_what_is_worth_keeping_and_what_is_not() {
+        let prompt = PromptBuilder::new().build();
+        let lowered = prompt.to_lowercase();
+        assert!(
+            lowered.contains("preference") || lowered.contains("constraint"),
+            "must name what earns a memory"
+        );
+        assert!(
+            lowered.contains("git history") || lowered.contains("code structure"),
+            "must name what does NOT (anything re-derivable from the repo)"
+        );
+    }
+
+    /// A memory is a snapshot of what was true when written. Recall without a
+    /// correction duty turns a stale note into a confident wrong answer.
+    #[test]
+    fn memory_guidance_requires_correcting_what_went_stale() {
+        let prompt = PromptBuilder::new().build();
+        let lowered = prompt.to_lowercase();
+        assert!(
+            lowered.contains("out of date") || lowered.contains("stale"),
+            "must tell the model recalled memory can be stale"
+        );
+        assert!(
+            lowered.contains("forget"),
+            "correcting a stale memory needs the tool that removes it"
+        );
+    }
+
+    /// `remember` is not an upsert: re-proposing a title with new content
+    /// stores `<id>-2` and both compete in recall. The prompt must not tell the
+    /// model otherwise — that instruction would manufacture the contradiction
+    /// it claims to prevent. See `MemoryStore::remember_deduplicated`.
+    #[test]
+    fn memory_guidance_never_calls_remember_an_upsert() {
+        let lowered = PromptBuilder::new().build().to_lowercase();
+        assert!(
+            !lowered.contains("upsert"),
+            "remember replaces nothing; correcting a memory is forget-then-remember"
+        );
+    }
+
+    #[test]
+    fn memory_guidance_is_cache_stable() {
+        assert_eq!(PromptBuilder::new().build(), PromptBuilder::new().build());
+    }
+
     #[test]
     fn memory_index_is_stable_and_excludes_bodies() {
         let index = "1. [pref] Prefer workspace-write\n2. [style] Use tables in reviews";

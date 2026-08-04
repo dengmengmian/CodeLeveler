@@ -7,6 +7,8 @@
 
 pub mod catalog;
 pub mod config;
+pub mod discovery;
+pub mod presets;
 pub mod probe;
 pub mod registry;
 mod transport;

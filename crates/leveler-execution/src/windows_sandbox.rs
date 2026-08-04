@@ -183,6 +183,10 @@ pub fn probe_sandbox_capabilities() -> SandboxCapabilities {
     }
     #[cfg(not(windows))]
     {
+        // Unix/macOS: process-group kill is available; seatbelt/bwrap can confine
+        // writes when the runner wraps a request. Capability labels describe what
+        // the host *can* enforce — they must not claim a Windows AppContainer
+        // backend or a blanket "sandbox=yes" (see `doctor_sandbox_line`).
         SandboxCapabilities {
             process_tree: ProcessTreeCapability::Job,
             read: FsCapability::PreflightOnly,
@@ -299,6 +303,32 @@ mod tests {
         let line = doctor_sandbox_line();
         assert!(!line.to_lowercase().contains("sandbox=yes"), "{line}");
         assert!(!line.to_lowercase().contains("sandbox=yes"));
+        // Honesty: never advertise full unrestricted FS as a sandbox product claim.
+        assert!(!line.to_lowercase().contains("full_fs"), "{line}");
+        assert!(!line.to_lowercase().contains("fullfs"), "{line}");
+    }
+
+    #[test]
+    fn non_windows_probe_does_not_claim_appcontainer_backend() {
+        let caps = probe_sandbox_capabilities();
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                caps.backend,
+                SandboxBackend::None,
+                "Unix/macOS must not claim AppContainer"
+            );
+            assert_ne!(
+                caps.write,
+                FsCapability::FullFs,
+                "must not claim full FS write allowlist"
+            );
+            assert_ne!(caps.write, FsCapability::Unsupported);
+        }
+        #[cfg(windows)]
+        {
+            let _ = caps;
+        }
     }
 
     #[test]

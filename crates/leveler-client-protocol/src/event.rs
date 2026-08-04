@@ -202,6 +202,11 @@ pub enum RuntimeEvent {
         memory_dir: String,
         active: Vec<UiMemoryEntry>,
         archived: Vec<UiMemoryEntry>,
+        /// Candidates awaiting the user's consent (K36). Without these in the
+        /// listing the TUI cannot show that anything is waiting, and the only
+        /// way to adopt a memory is the CLI — the last mile of the feature.
+        #[serde(default)]
+        pending: Vec<UiMemoryEntry>,
     },
     /// Side-question (`/btw`) started; not persisted to session history.
     BtwStarted { question: String },

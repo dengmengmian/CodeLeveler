@@ -21,28 +21,39 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
         t.help_commands.to_string(),
         Style::default().fg(theme.muted),
     )));
-    for (name, desc) in crate::screen::slash_commands(t) {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {name:<12}"), Style::default().fg(theme.accent)),
-            Span::raw(desc.to_string()),
-        ]));
+    for (cat, cmds) in crate::screen::slash_commands_grouped(t) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", crate::screen::category_label(cat, t)),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (name, desc) in cmds {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {name:<14}"), Style::default().fg(theme.accent)),
+                Span::raw(desc.to_string()),
+            ]));
+        }
     }
     lines.push(Line::from(""));
 
-    // Sticky footer never lists these — Help / Ctrl+? is the learning surface.
+    // The composer hint row carries only the few keys that matter in the
+    // moment; this table is the complete list.
     let keys = [
         ("Enter", t.key_submit),
         ("Ctrl+J / Alt+Enter", t.key_newline),
-        ("Tab", "Input ↔ Conversation focus"),
-        ("↑/↓ (Input)", "command history"),
-        ("↑/↓ (Conversation)", "scroll messages"),
-        ("PageUp/PageDown", "scroll Conversation"),
+        ("Ctrl+X Ctrl+E", t.key_editor),
+        ("Shift+Tab", t.key_permission),
+        ("Tab", t.key_tab_focus),
+        ("↑/↓ (Input)", t.key_history),
+        ("↑/↓ (Conversation)", t.key_scroll_messages),
+        ("PageUp/PageDown", t.key_scroll_page),
         ("Ctrl+C", t.key_cancel_quit),
         ("Ctrl+M", t.key_model),
-        ("Ctrl+Q", "Queue"),
         ("Ctrl+O", t.key_expand),
         ("Ctrl+?", t.help_title),
-        ("Ctrl+P/D/R/T/S/G", t.key_screens),
+        ("Ctrl+D/T/S", t.key_screens),
         ("Ctrl+End / Ctrl+↓", t.key_jump),
         ("End", t.key_end),
         ("Esc", t.key_esc),
@@ -264,7 +275,7 @@ pub(super) fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppSt
     let mut lines: Vec<Line> = vec![screen_title("上下文", theme), Line::from("")];
     if state.context_tokens == 0 && state.context_files.is_empty() {
         lines.push(Line::from(Span::styled(
-            "暂无上下文信息（/workflow 编排工作流运行后生成）",
+            "暂无上下文信息",
             Style::default().fg(theme.muted),
         )));
     } else {

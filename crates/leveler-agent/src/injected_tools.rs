@@ -166,7 +166,12 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
             role='explorer' gives a read-only agent for investigation/Q&A; \
             role='worker' writes code and MUST be given `files` it exclusively owns \
             (assign disjoint files to parallel workers so they never edit the same \
-            file)."
+            file). \
+            agent='<name>' runs a reusable named persona (see the project's agent \
+            list, e.g. code-explorer / code-architect / code-reviewer); its \
+            instructions are prepended to your `task`, and it supplies the role \
+            unless you override it. Prefer a named agent over pasting the same \
+            persona into `task` every time."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -181,6 +186,10 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "For role='worker': the files this agent exclusively owns and may edit. Edits outside them are rejected."
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Name of a reusable agent persona to run (project `.leveler/agents/<name>.md`, user-level, or built-in). Its instructions are prepended to `task`."
                 }
             },
             "required": ["task"]

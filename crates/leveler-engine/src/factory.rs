@@ -1,10 +1,9 @@
 //! The single source of `Executor` construction (plan B2).
 //!
-//! Every path (direct, chat, orchestrated node) builds its executor here, so
-//! there is exactly ONE derivation of the execution configuration — since the
-//! model-tier retirement that derivation is `resolve_execution_policy`,
-//! fed by model facts and the eval-only ablation seam instead of a bound
-//! `ModelPolicy`.
+//! Every path (direct goal, chat, node) builds its executor here, so there is
+//! exactly ONE derivation of the execution configuration — since the model-tier
+//! retirement that derivation is `resolve_execution_policy`, fed by model facts
+//! and the eval-only ablation seam instead of a bound `ModelPolicy`.
 
 use std::sync::Arc;
 
@@ -32,12 +31,17 @@ pub enum TurnProfile {
         continuation: ContinuationPolicy,
         limits: StepLimits,
     },
-    /// One orchestrated node: caller-selected continuation/limits/paths, goal mode off.
+    /// Scoped worker turn: caller-selected continuation/limits/paths, goal mode off.
     Node {
         continuation: ContinuationPolicy,
         limits: StepLimits,
         write_allowlist: Option<Vec<String>>,
     },
+}
+
+/// Host-handled `update_goal(complete|blocked)` is required only for Goal turns.
+pub fn profile_enables_goal_mode(profile: &TurnProfile) -> bool {
+    matches!(profile, TurnProfile::Goal { .. })
 }
 
 /// The policy/profile-derived executor shape, factored out as a pure function
@@ -74,6 +78,9 @@ pub struct ExecutorFactory {
     pub hook_runner: leveler_execution::HookRunner,
     /// SEC-2 durable grants directory under project state.
     pub grants_state_dir: Option<std::path::PathBuf>,
+    /// Mid-turn user input for the main turn, when the host supplies any.
+    /// Sub-agents deliberately do not inherit it (see `Executor::child_for_role_on`).
+    pub steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
     /// When false, top-level executors do not advertise `spawn_agent`.
     pub allow_delegation: bool,
 }
@@ -105,7 +112,6 @@ impl ExecutorFactory {
             let policy =
                 resolve_execution_policy(&model_profile, role, &profile, self.overrides.as_ref());
             SubAgentExecutionPolicy {
-                step_summary_every: policy.step_summary_every,
                 max_search_calls_per_step: policy.max_search_calls_per_step,
                 max_parallel_tools: policy.max_parallel_tools,
                 require_explicit_plan: policy.explicit_plan,
@@ -145,9 +151,9 @@ impl ExecutorFactory {
         .with_permission_rules_path(self.permission_rules_path.clone())
         .with_hook_runner(self.hook_runner.clone())
         .with_grants_state_dir_opt(self.grants_state_dir.clone())
+        .with_steering_opt(self.steering.clone())
         .with_commit_co_author(self.commit_co_author)
         .with_execution_controls(
-            resolved.step_summary_every,
             resolved.max_search_calls_per_step,
             resolved.max_parallel_tools,
         )
@@ -161,14 +167,17 @@ impl ExecutorFactory {
             .with_work_profile(self.work_profile)
             .with_memory_index(self.memory_index.clone());
 
-        executor = match profile {
-            TurnProfile::Goal { .. } => executor.with_goal_mode(true),
-            TurnProfile::Chat { .. } => executor.with_goal_mode(false),
-            TurnProfile::Node {
-                write_allowlist, ..
-            } => executor
-                .with_goal_mode(false)
-                .with_write_allowlist(write_allowlist),
+        executor = if profile_enables_goal_mode(&profile) {
+            executor.with_goal_mode(true)
+        } else {
+            match profile {
+                TurnProfile::Node {
+                    write_allowlist, ..
+                } => executor.with_write_allowlist(write_allowlist),
+                TurnProfile::Goal { .. } | TurnProfile::Chat { .. } => {
+                    executor.with_goal_mode(false)
+                }
+            }
         };
         Ok(executor)
     }
@@ -204,6 +213,26 @@ mod tests {
                 "interactive runs do not cap modified files"
             );
         }
+    }
+
+    #[test]
+    fn only_goal_profile_enables_goal_mode() {
+        let goal = TurnProfile::Goal {
+            continuation: ContinuationPolicy::UntilTerminal,
+            limits: StepLimits::default(),
+        };
+        let chat = TurnProfile::Chat {
+            continuation: ContinuationPolicy::UntilTerminal,
+            limits: StepLimits::default(),
+        };
+        let node = TurnProfile::Node {
+            continuation: ContinuationPolicy::UntilTerminal,
+            limits: StepLimits::default(),
+            write_allowlist: None,
+        };
+        assert!(profile_enables_goal_mode(&goal));
+        assert!(!profile_enables_goal_mode(&chat));
+        assert!(!profile_enables_goal_mode(&node));
     }
 
     #[test]

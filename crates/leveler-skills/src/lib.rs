@@ -27,6 +27,10 @@ pub enum SkillSource {
     Project,
     /// `~/.leveler/skills/<name>/`
     Global,
+    /// Shipped with the binary. Overridable by a project or user skill of the
+    /// same name, so a repository can adapt a shipped procedure without
+    /// forking it.
+    Builtin,
 }
 
 impl SkillSource {
@@ -34,6 +38,7 @@ impl SkillSource {
         match self {
             Self::Project => "project",
             Self::Global => "global",
+            Self::Builtin => "builtin",
         }
     }
 }
@@ -85,6 +90,51 @@ struct Frontmatter {
     description: Option<String>,
 }
 
+/// Skills shipped with the binary, as `(name, SKILL.md)`.
+///
+/// These are product capabilities rather than per-repository conventions, so
+/// they travel with the binary instead of asking every project to copy a file
+/// and keep it in sync.
+const BUILTIN: &[(&str, &str)] = &[(
+    "feature-dev",
+    include_str!("../builtin/feature-dev/SKILL.md"),
+)];
+
+/// Parse a built-in skill's markdown into a summary.
+fn builtin_summary(name: &str, content: &str) -> SkillSummary {
+    let (fm, _) = split_frontmatter(content);
+    SkillSummary {
+        name: fm
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| name.to_string()),
+        description: fm.description.unwrap_or_default(),
+        source: SkillSource::Builtin,
+    }
+}
+
+/// Parse a built-in skill's markdown into a full detail record.
+///
+/// Built-ins have no package directory; `dir` is a marker rather than a path.
+/// That is safe because `scripts` / `references` are empty, and those are the
+/// only fields [`render_skill_package`] joins onto `dir`.
+fn builtin_detail(name: &str, content: &str) -> SkillDetail {
+    let (fm, body) = split_frontmatter(content);
+    SkillDetail {
+        name: fm
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| name.to_string()),
+        description: fm.description.unwrap_or_default(),
+        body,
+        source: SkillSource::Builtin,
+        dir: PathBuf::from("(built-in)"),
+        scripts: Vec::new(),
+        references: Vec::new(),
+        other_files: Vec::new(),
+    }
+}
+
 /// The project skills directory for a repo root.
 pub fn project_skills_dir(root: &Path) -> PathBuf {
     root.join(".leveler").join("skills")
@@ -122,6 +172,15 @@ pub fn discover(root: &Path) -> Vec<SkillSummary> {
             }
             seen.push(s.name.clone());
             out.push(s);
+        }
+    }
+    // Built-ins last: a project or user skill of the same name has already
+    // claimed it above and must win.
+    for (name, content) in BUILTIN {
+        let summary = builtin_summary(name, content);
+        if !seen.contains(&summary.name) {
+            seen.push(summary.name.clone());
+            out.push(summary);
         }
     }
     out
@@ -170,7 +229,10 @@ pub fn load(root: &Path, name: &str) -> Option<SkillDetail> {
             other_files,
         });
     }
-    None
+    BUILTIN
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(n, content)| builtin_detail(n, content))
 }
 
 /// Walk a skill package directory and classify relative paths.
@@ -479,11 +541,15 @@ mod tests {
         )
         .unwrap();
 
+        // The index also carries built-in skills, so assert on this one rather
+        // than on the total.
         let index = discover(&root);
-        assert_eq!(index.len(), 1);
-        assert_eq!(index[0].name, "deploy");
-        assert_eq!(index[0].description, "Deploy the service safely.");
-        assert_eq!(index[0].source, SkillSource::Project);
+        let found = index
+            .iter()
+            .find(|s| s.name == "deploy")
+            .expect("the project skill must be discovered");
+        assert_eq!(found.description, "Deploy the service safely.");
+        assert_eq!(found.source, SkillSource::Project);
 
         let detail = load(&root, "deploy").unwrap();
         assert!(detail.body.contains("Run make deploy."));
@@ -510,8 +576,11 @@ mod tests {
         assert!(dir.join("SKILL.md").is_file());
 
         let index = discover(&root);
-        assert_eq!(index.len(), 1);
-        assert_eq!(index[0].description, "Apply DB migrations.");
+        let found = index
+            .iter()
+            .find(|s| s.name == "run-migrations")
+            .expect("the created skill must be discovered");
+        assert_eq!(found.description, "Apply DB migrations.");
         let detail = load(&root, "run-migrations").unwrap();
         assert!(detail.body.contains("Use sqlx."));
 
@@ -621,5 +690,92 @@ mod tests {
         assert!(idx.contains("scripts/"));
         assert!(idx.contains("sub-agent") || idx.contains("subagent"));
         assert!(idx.contains("load_skill"));
+    }
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "leveler-builtin-skill-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The point of shipping it: a fresh checkout has `/feature-dev` with no
+    /// setup and nothing to copy.
+    #[test]
+    fn feature_dev_ships_with_the_binary() {
+        let root = tmp_root("ships");
+        let detail = load(&root, "feature-dev").expect("feature-dev must ship");
+        assert_eq!(detail.source, SkillSource::Builtin);
+        assert!(!detail.description.is_empty(), "needs a description");
+        assert!(detail.body.len() > 500, "body looks truncated");
+        assert!(
+            discover(&root).iter().any(|s| s.name == "feature-dev"),
+            "it must show up in the index, or nobody can find it"
+        );
+    }
+
+    /// The skill instructs the model to use named agents; if those names drift
+    /// apart the instructions send it to agents that do not exist.
+    #[test]
+    fn it_references_agents_that_actually_exist() {
+        let detail = load(&tmp_root("agents"), "feature-dev").unwrap();
+        for agent in ["code-explorer", "code-architect", "code-reviewer"] {
+            assert!(
+                detail.body.contains(agent),
+                "feature-dev must drive {agent}"
+            );
+        }
+        assert!(
+            detail.body.contains("spawn_agent"),
+            "it must name the tool that runs them"
+        );
+    }
+
+    #[test]
+    fn a_project_skill_of_the_same_name_overrides_the_builtin() {
+        let root = tmp_root("override");
+        let dir = project_skills_dir(&root).join("feature-dev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: feature-dev\ndescription: 本仓库口径\n---\n只做三步。\n",
+        )
+        .unwrap();
+
+        let detail = load(&root, "feature-dev").unwrap();
+        assert_eq!(detail.source, SkillSource::Project);
+        assert_eq!(detail.body.trim(), "只做三步。");
+
+        let listed: Vec<_> = discover(&root)
+            .into_iter()
+            .filter(|s| s.name == "feature-dev")
+            .collect();
+        assert_eq!(listed.len(), 1, "an override must not double-list");
+        assert_eq!(listed[0].source, SkillSource::Project);
+    }
+
+    /// Built-ins have no package directory; rendering must not produce a path
+    /// that looks real and cannot be read.
+    #[test]
+    fn rendering_a_builtin_offers_no_fake_paths() {
+        let detail = load(&tmp_root("render"), "feature-dev").unwrap();
+        let rendered = render_skill_package(&detail);
+        assert!(rendered.contains("# Skill: feature-dev"));
+        assert!(rendered.contains("builtin"));
+        assert!(
+            !rendered.contains("## Scripts") && !rendered.contains("## References"),
+            "a built-in bundles no files, so it must not advertise any"
+        );
     }
 }

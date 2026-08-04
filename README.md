@@ -172,10 +172,10 @@ discard.
 | --- | --- |
 | Work interactively | `leveler` |
 | Run one task | `leveler run "add validation to the order endpoint"` |
-| Compare several perspectives | `leveler discuss "why is this test flaky?"` |
-| Investigate read-only and produce a plan | `leveler plan "replace the cache implementation"` |
 | Resume previous work | `leveler resume <session-id>` |
-| Coordinate a larger task | `leveler run "fix the failing tests" --orchestrate` |
+| Long task until done | TUI `/goal …`, or `leveler run "…" --collaboration goal` |
+| Stricter delivery gates | `--work-mode delivery` or TUI `/work-mode delivery` |
+| Parallel multi-agent edits | `leveler run "…" --parallel 3` (worktrees) |
 
 On macOS/Linux, a long-running interactive session can use `leveler serve` in
 one terminal and `leveler` in another. The TUI reconnects to the

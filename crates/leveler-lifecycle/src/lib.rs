@@ -1,11 +1,11 @@
 //! The execution lifecycle vocabulary.
 //!
 //! Session status, agent state, and task outcome are persisted by
-//! `leveler-storage`, produced by `leveler-engine`, driven by
-//! `leveler-orchestrator`, projected by clients, and mapped by the app. They
-//! are one shared, typed vocabulary rather than strings passed across layer
-//! boundaries — so every layer speaks the same language and the low-level
-//! storage crate can persist them without a back-edge to a high-level crate.
+//! `leveler-storage`, produced by `leveler-engine`, projected by clients, and
+//! mapped by the app. They are one shared, typed vocabulary rather than strings
+//! passed across layer boundaries — so every layer speaks the same language and
+//! the low-level storage crate can persist them without a back-edge to a
+//! high-level crate.
 //!
 //! Three axes are kept deliberately distinct (see the M1A ADR):
 //! - [`SessionStatus`] — the *operational* position in the lifecycle.

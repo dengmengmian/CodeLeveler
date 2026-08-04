@@ -24,6 +24,17 @@ pub enum ClientCommand {
         #[serde(default)]
         attachments: Vec<AttachmentRef>,
     },
+    /// Steer the turn that is already running: the text is injected at the top
+    /// of the next round instead of waiting for the turn to end.
+    ///
+    /// Distinct from queuing a follow-up (which `SubmitMessage` does while
+    /// busy): a correction like "actually use the other module" is worthless
+    /// once the work is finished. Ignored when no turn is running — the caller
+    /// should submit normally in that case.
+    SteerCurrentTurn {
+        session_id: SessionId,
+        content: String,
+    },
     /// Run an explicit goal task. Unlike ordinary chat messages, this enables
     /// goal-mode completion (`update_goal`) in the agent loop.
     RunGoal {
@@ -88,12 +99,9 @@ pub enum ClientCommand {
     },
     /// Archive (forget) one active memory id — user-authoritative (no model).
     ForgetMemory { session_id: SessionId, id: String },
-    /// Choose whether turns run the direct tool loop or the full orchestrated
-    /// state machine (Understand to Plan to Execute to Verify to Review).
-    SetAgentMode {
-        session_id: SessionId,
-        orchestrate: bool,
-    },
+    /// Promote one pending candidate to durable memory. User-authoritative:
+    /// this IS the consent K36 requires, so it is never model-callable.
+    AcceptMemory { session_id: SessionId, id: String },
     /// Recompute and push the working-tree diff.
     RequestDiff { session_id: SessionId },
     /// Summarize and compact the conversation history (spec §28, §53).
@@ -155,6 +163,7 @@ impl ClientCommand {
     pub fn session_id(&self) -> Option<&SessionId> {
         match self {
             ClientCommand::SubmitMessage { session_id, .. }
+            | ClientCommand::SteerCurrentTurn { session_id, .. }
             | ClientCommand::RunGoal { session_id, .. }
             | ClientCommand::AddAttachment { session_id, .. }
             | ClientCommand::AddAttachmentData { session_id, .. }
@@ -163,10 +172,10 @@ impl ClientCommand {
             | ClientCommand::ForceCancelCurrentTurn { session_id }
             | ClientCommand::SelectModel { session_id, .. }
             | ClientCommand::SetPermissionProfile { session_id, .. }
-            | ClientCommand::SetAgentMode { session_id, .. }
             | ClientCommand::SetProductAxes { session_id, .. }
             | ClientCommand::ConfirmPlanToGoal { session_id, .. }
             | ClientCommand::ListMemory { session_id, .. }
+            | ClientCommand::AcceptMemory { session_id, .. }
             | ClientCommand::ForgetMemory { session_id, .. }
             | ClientCommand::RequestDiff { session_id }
             | ClientCommand::CompactContext { session_id }
@@ -357,17 +366,6 @@ mod tests {
                 mode: PermissionProfile::FullAccess,
             },
             "set_permission_profile",
-        );
-    }
-
-    #[test]
-    fn set_agent_mode_roundtrips() {
-        roundtrip(
-            ClientCommand::SetAgentMode {
-                session_id: SessionId::new("s1"),
-                orchestrate: true,
-            },
-            "set_agent_mode",
         );
     }
 

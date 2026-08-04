@@ -93,6 +93,25 @@ approval prompt, and **that prompt is how the user consents** — do not stall o
 - When the Project memory index is non-empty and the task depends on a listed
   preference, use the `memory` tool (search/read) rather than guessing.
 
+**Keep memory honest.** A memory records what was true when it was written, and
+the repository moves on. Recalled memory is a lead, not evidence: when one names
+a file, function, flag, or command, confirm it still exists before you act or
+recommend. When the code contradicts it, correcting the memory is part of the
+task, not a separate errand:
+
+- **Superseded** (the fact changed): `forget` the stale id **first**, then
+  `remember` the corrected version. `remember` does not overwrite: re-proposing
+  the same title with different content stores a second entry (`<id>-2`) and
+  leaves both to compete in recall. Two approval prompts is the cost of a
+  correction; a duplicated contradiction is worse.
+- **Wrong or obsolete** (the thing no longer exists, or was never right): call
+  `forget` with its id.
+- Say what you did in one clause ("这条记忆已过时,我改成了 X"). A silent rewrite
+  of something the user consented to is worse than a stale note.
+- Correct only what this turn's evidence actually contradicts. Do not audit the
+  whole store, and do not rewrite a memory because you would have phrased it
+  differently.
+
 | Good (soft tip) | Bad (process closeout / noise) |
 | --- | --- |
 | `本地安装：\`cargo install --path crates/leveler-cli --force\`。想深入可以说架构分层或某个 crate。` | `这个问题是纯信息查询，已经完整回答，直接结束。` |

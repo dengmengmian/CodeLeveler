@@ -1,7 +1,7 @@
 use leveler_client_protocol::{ClientCommand, NotificationLevel, PermissionProfile};
 
 use crate::action::Effect;
-use crate::screen::Screen;
+use crate::screen::{BusyPolicy, Screen};
 use crate::state::{AppState, Notification};
 
 use super::overlay_keys::{
@@ -15,6 +15,9 @@ use super::screen_nav::{open_diff_screen, open_sessions_screen, toggle_screen};
 pub(super) fn touch_slash_filter(state: &mut AppState) {
     state.slash_selected = 0;
     state.slash_popup_dismissed = false;
+    if state.composer.text().starts_with('/') {
+        refresh_skill_catalog(state);
+    }
 }
 
 pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
@@ -29,10 +32,23 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         && !text.contains('\n')
     {
         let name = rest.split_whitespace().next().unwrap_or("");
-        if is_known_slash(name) {
+        refresh_skill_catalog(state);
+        if crate::screen::is_known_slash_token(name) {
+            // /clear confirm arming is handled inside; other commands disarm.
+            if name != "clear" && name != "new" {
+                state.clear_confirm_armed = false;
+            }
             state.composer.take();
             return handle_slash(state, rest.trim());
         }
+        // Project/user skills are first-class: `/code-review` ≡ `/skill code-review`.
+        if crate::screen::is_skill_slash_token(state, name) {
+            state.clear_confirm_armed = false;
+            state.composer.take();
+            let task = rest.strip_prefix(name).unwrap_or("").trim().to_string();
+            return run_named_skill(state, name, &task);
+        }
+        state.clear_confirm_armed = false;
         // Reserve unknown-command feedback for command-shaped typos such as
         // `/hlep`. Absolute paths (`/Users/...`), file names, and other
         // slash-prefixed prose are ordinary messages.
@@ -44,24 +60,28 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             return Vec::new();
         }
     }
+    state.clear_confirm_armed = false;
     if state.is_busy() {
-        // Queue the input instead of rejecting it; queued items run in order when
-        // the current turn finishes.
+        // Steer the running turn instead of queuing behind it: a correction
+        // ("actually use the other module") is worthless once the work is
+        // finished. The runtime injects it at the top of the next round, and
+        // falls back to an ordinary submission if the turn ended in the
+        // meantime — so nothing typed is ever lost.
         let text = state.composer.text().trim().to_string();
         state.composer.take();
-        if !text.is_empty() {
-            state.input_queues.push_queued(text);
-            crate::footer_queue::on_queue_changed(state);
+        if text.is_empty() {
+            return Vec::new();
         }
+        // The user typed it, so it belongs in the transcript like any message.
+        state.transcript.push_user_if_new(text.clone());
         state.notification = Some(Notification {
             level: NotificationLevel::Info,
-            message: state.t().queued_n.replacen(
-                "{}",
-                &state.input_queues.waiting_len().to_string(),
-                1,
-            ),
+            message: state.t().steering_sent.to_string(),
         });
-        return Vec::new();
+        return vec![Effect::Send(ClientCommand::SteerCurrentTurn {
+            session_id: state.session_id.clone(),
+            content: text,
+        })];
     }
     // Vision gate: block sending images to a non-vision model until the user
     // chooses how to proceed (spec §42). Handled before the request is built.
@@ -100,39 +120,6 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     })]
 }
 
-/// Run any input that was queued while the previous turn was busy. Called by
-/// the event loop once the runtime goes idle; a no-op otherwise.
-pub fn drain_queued(state: &mut AppState) -> Vec<Effect> {
-    if state.is_busy() || !state.input_queues.pending.is_empty() {
-        return Vec::new();
-    }
-    let Some(text) = state.input_queues.pop_next_waiting() else {
-        return Vec::new();
-    };
-    if text.trim().is_empty() {
-        return Vec::new();
-    }
-    // Submit via the composer, but preserve any draft the user has started
-    // typing since queuing: stash it, and restore it once the queued text has
-    // actually been taken (the vision gate can leave the buffer occupied).
-    let draft = state.composer.text().to_string();
-    state.input_queues.mark_pending(text.clone());
-    state.composer.replace(text);
-    crate::footer_queue::on_queue_changed(state);
-    // Drop the "queued" notice once the last queued item starts running.
-    if state.input_queues.waiting_len() == 0 {
-        state.notification = None;
-    }
-    let effects = submit(state);
-    if effects.is_empty() {
-        state.input_queues.reject_pending();
-    }
-    if state.composer.is_empty() && !draft.is_empty() {
-        state.composer.replace(draft);
-    }
-    effects
-}
-
 /// Complete a partial slash command to the highlighted match (Tab/Enter, §29).
 pub(super) fn complete_slash(state: &mut AppState) {
     let matches = crate::screen::visible_slash_popup(state);
@@ -140,7 +127,7 @@ pub(super) fn complete_slash(state: &mut AppState) {
         return;
     }
     let idx = state.slash_selected.min(matches.len() - 1);
-    let (name, _) = matches[idx];
+    let name = matches[idx].0.clone();
     state.composer.replace(format!("{name} "));
     touch_slash_filter(state);
 }
@@ -221,96 +208,69 @@ fn start_remote(state: &mut AppState, local: bool) -> Vec<Effect> {
     vec![Effect::StartRemote { local }]
 }
 
-/// Whether `name` (without the leading `/`) is a command `handle_slash` accepts.
-fn is_known_slash(name: &str) -> bool {
-    matches!(
-        name,
-        "model"
-            | "mode"
-            | "tools"
-            | "goal"
-            | "btw"
-            | "steps"
-            | "plan" // legacy alias of /steps
-            | "verify"
-            | "diff"
-            | "sessions"
-            | "context"
-            | "agents"
-            | "restore"
-            | "checkpoint"
-            | "compact"
-            | "export"
-            | "save" // alias of /export
-            | "paste"
-            | "theme"
-            | "image"
-            | "attach"
-            | "workflow"
-            | "wf"
-            | "orchestrate" // legacy alias of /workflow
-            | "orch"
-            | "work-mode"
-            | "work_mode"
-            | "collab"
-            | "confirm-plan"
-            | "confirm_plan"
-            | "memory"
-            | "skill"
-            | "web"
-            | "remote"
-            | "remote-loc"
-            | "clear"
-            | "new"
-            | "quit"
-            | "q"
-            | "help"
-            | ""
-    )
-}
-
 /// Handle a `/command` typed in the composer.
 fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let name = command.split_whitespace().next().unwrap_or("");
-    match name {
+    // Busy gate from the registry (IdleOnly refuses while a turn is running).
+    if state.is_busy()
+        && let Some(def) = crate::screen::slash_def(name)
+        && def.busy == BusyPolicy::IdleOnly
+    {
+        let primary = def.name.trim_start_matches('/');
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().idle_only_cmd.replacen("{}", primary, 1),
+        });
+        return Vec::new();
+    }
+
+    // Canonical primary without leading `/` (aliases collapse here).
+    let primary = crate::screen::slash_primary(name)
+        .map(|p| p.trim_start_matches('/'))
+        .unwrap_or(name);
+
+    match primary {
         "model" => {
             open_model_picker(state);
             Vec::new()
         }
-        "mode" => {
+        "permission" => {
             open_mode_picker(state);
             Vec::new()
         }
         "goal" => run_goal(state, command),
         "btw" => run_btw(state, command),
         "tools" => toggle_screen(state, Screen::Tools),
-        // /steps = task plan screen. /plan alone = collaboration Plan mode.
-        "steps" => toggle_screen(state, Screen::Plan),
+        // /plan = collaboration Plan mode (read-only planning).
         "plan" => set_collab(state, "plan"),
-        "work-mode" | "work_mode" => set_work_mode(state, command),
+        "work-mode" => set_work_mode(state, command),
         "collab" => set_collab_cmd(state, command),
-        "confirm-plan" | "confirm_plan" => confirm_plan_to_goal(state),
         "memory" => memory_slash(state, command),
         "skill" => skill_slash(state, command),
         "web" => start_web(state),
         "remote" => start_remote(state, false),
         "remote-loc" => start_remote(state, true),
-        "verify" => toggle_screen(state, Screen::Verification),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
-        "context" => toggle_screen(state, Screen::Context),
-        "agents" => toggle_screen(state, Screen::Agents),
-        "restore" | "checkpoint" => {
+        "restore" => {
             open_checkpoint_picker(state);
             Vec::new()
         }
+        // The runtime copies record + transcript into a fresh session and
+        // leaves this one open, so there is nothing to confirm here.
+        "fork" => vec![Effect::Send(ClientCommand::ForkSession {
+            session_id: state.session_id.clone(),
+        })],
         "compact" => vec![Effect::Send(ClientCommand::CompactContext {
             session_id: state.session_id.clone(),
         })],
-        "export" | "save" => export_conversation(state, command),
+        "export" => export_conversation(state, command),
         "paste" => vec![Effect::Send(ClientCommand::AddClipboardImage {
             session_id: state.session_id.clone(),
         })],
+        // The composer was already taken above, so this opens on an empty
+        // buffer — the command itself is never carried into the editor.
+        "editor" => super::open_external_editor(state),
         "theme" => {
             let arg = command.split_whitespace().nth(1).unwrap_or("").trim();
             if arg.is_empty() {
@@ -320,12 +280,12 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             }
             Vec::new()
         }
-        "image" | "attach" => {
-            let path = command.split_whitespace().nth(1).unwrap_or("");
+        "attach" => {
+            let path = command.split_whitespace().nth(1).unwrap_or("").trim();
             if path.is_empty() {
                 state.notification = Some(Notification {
                     level: NotificationLevel::Warning,
-                    message: format!("用法: /{name} <文件路径>"),
+                    message: "用法: /attach <文件路径>".to_string(),
                 });
                 Vec::new()
             } else {
@@ -335,38 +295,10 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 })]
             }
         }
-        // /workflow is the real name; /wf is short. /orchestrate|/orch kept as
-        // transitional aliases (not listed in the slash menu).
-        "workflow" | "wf" | "orchestrate" | "orch" => {
-            state.orchestrate = !state.orchestrate;
-            let t = state.t();
-            state.notification = Some(Notification {
-                level: NotificationLevel::Info,
-                message: if state.orchestrate {
-                    t.mode_workflow_on.to_string()
-                } else {
-                    t.mode_workflow_off.to_string()
-                },
-            });
-            vec![Effect::Send(ClientCommand::SetAgentMode {
-                session_id: state.session_id.clone(),
-                orchestrate: state.orchestrate,
-            })]
-        }
-        "clear" | "new" => {
-            // New conversation: clear the display AND drop the model-side history
-            // so the next message starts with no prior context.
-            state.transcript.clear();
-            state.context_tokens = 0;
-            state.token_input = 0;
-            state.token_output = 0;
-            state.turn_tool_calls = 0;
-            vec![Effect::Send(ClientCommand::ClearConversation {
-                session_id: state.session_id.clone(),
-            })]
-        }
-        "quit" | "q" => vec![Effect::Quit],
-        "help" | "" => toggle_screen(state, Screen::Help),
+        "clear" => clear_conversation(state),
+        "doctor" => doctor_slash(state),
+        "quit" => vec![Effect::Quit],
+        "help" => toggle_screen(state, Screen::Help),
         other => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
@@ -375,6 +307,31 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             Vec::new()
         }
     }
+}
+
+/// `/clear` requires a second confirmation so a fat-finger does not wipe history.
+fn clear_conversation(state: &mut AppState) -> Vec<Effect> {
+    if !state.clear_confirm_armed {
+        state.clear_confirm_armed = true;
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().clear_confirm.to_string(),
+        });
+        return Vec::new();
+    }
+    state.clear_confirm_armed = false;
+    state.transcript.clear();
+    state.context_tokens = 0;
+    state.token_input = 0;
+    state.token_output = 0;
+    state.turn_tool_calls = 0;
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: state.t().clear_done.to_string(),
+    });
+    vec![Effect::Send(ClientCommand::ClearConversation {
+        session_id: state.session_id.clone(),
+    })]
 }
 
 /// `/export [path]`: write the visible conversation to a markdown file. Default
@@ -510,13 +467,6 @@ fn run_btw(state: &mut AppState, command: &str) -> Vec<Effect> {
 }
 
 fn set_work_mode(state: &mut AppState, command: &str) -> Vec<Effect> {
-    if state.is_busy() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: "idle only: wait for the turn to finish before /work-mode".into(),
-        });
-        return Vec::new();
-    }
     let arg = command
         .split_whitespace()
         .nth(1)
@@ -525,7 +475,7 @@ fn set_work_mode(state: &mut AppState, command: &str) -> Vec<Effect> {
     if !matches!(arg.as_str(), "economy" | "balanced" | "delivery") {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "用法: /work-mode economy|balanced|delivery".into(),
+            message: state.t().work_mode_usage.to_string(),
         });
         return Vec::new();
     }
@@ -550,7 +500,7 @@ fn set_collab_cmd(state: &mut AppState, command: &str) -> Vec<Effect> {
     if arg.is_empty() {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "用法: /collab chat|plan|goal".into(),
+            message: state.t().collab_usage.to_string(),
         });
         return Vec::new();
     }
@@ -558,17 +508,10 @@ fn set_collab_cmd(state: &mut AppState, command: &str) -> Vec<Effect> {
 }
 
 fn set_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
-    if state.is_busy() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: "idle only: wait for the turn to finish before /collab".into(),
-        });
-        return Vec::new();
-    }
     if !matches!(collab, "chat" | "plan" | "goal") {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "用法: /collab chat|plan|goal".into(),
+            message: state.t().collab_usage.to_string(),
         });
         return Vec::new();
     }
@@ -577,7 +520,7 @@ fn set_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
         state.mode = PermissionProfile::RequestApproval;
         state.notification = Some(Notification {
             level: NotificationLevel::Info,
-            message: "协作=计划（只读）。确认方案后输入 /confirm-plan 自动进入 goal".into(),
+            message: "协作=计划（只读）。确认后用 /collab goal 或 /goal <任务> 开始执行".into(),
         });
     } else {
         state.notification = Some(Notification {
@@ -592,46 +535,64 @@ fn set_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
     })]
 }
 
+/// Expand `~/…` repository display paths for filesystem discovery.
+fn skill_root(state: &AppState) -> std::path::PathBuf {
+    if state.repository.is_empty() {
+        return leveler_core::environment().current_dir().to_path_buf();
+    }
+    let raw = state.repository.as_str();
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = leveler_core::environment()
+            .var_os("HOME")
+            .or_else(|| leveler_core::environment().var_os("USERPROFILE"))
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    std::path::PathBuf::from(raw)
+}
+
+/// Rescan project + user skills when the root changes (or first `/` keystroke).
+pub(super) fn refresh_skill_catalog(state: &mut AppState) {
+    let root = skill_root(state);
+    let key = root.display().to_string();
+    if state.skill_catalog_root.as_deref() == Some(key.as_str()) {
+        return;
+    }
+    state.skill_catalog = leveler_skills::discover(&root)
+        .into_iter()
+        // Builtins always win the name; keep only skill-shaped tokens.
+        .filter(|s| {
+            looks_like_unknown_slash_command(&s.name)
+                && !crate::screen::is_known_slash_token(&s.name)
+        })
+        .map(|s| (s.name, s.description))
+        .collect();
+    state.skill_catalog_root = Some(key);
+}
+
 /// `/memory` — list active (+archived); `/memory forget <id>` archives.
 /// `/skill` — list available skills, or select one (rewrites to `$name` and
 /// submits so the agent turn-injection path matches typing `$name`).
 fn skill_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let rest = command.strip_prefix("skill").unwrap_or(command).trim();
-    let root = if state.repository.is_empty() {
-        leveler_core::environment().current_dir().to_path_buf()
-    } else {
-        // repository may be display form (`~/…`); expand home for discover.
-        let raw = state.repository.as_str();
-        if let Some(rest) = raw.strip_prefix("~/") {
-            if let Some(home) = leveler_core::environment()
-                .var_os("HOME")
-                .or_else(|| leveler_core::environment().var_os("USERPROFILE"))
-            {
-                std::path::PathBuf::from(home).join(rest)
-            } else {
-                std::path::PathBuf::from(raw)
-            }
-        } else {
-            std::path::PathBuf::from(raw)
-        }
-    };
+    refresh_skill_catalog(state);
 
     if rest.is_empty() {
-        let skills = leveler_skills::discover(&root);
-        let message = if skills.is_empty() {
+        let message = if state.skill_catalog.is_empty() {
             "暂无技能。在 .leveler/skills/<name>/SKILL.md 或 ~/.leveler/skills/ 添加；\
-             用法: /skill <name> [任务]"
+             用法: /skill <name> [任务]  或直接  /<name> [任务]"
                 .to_string()
         } else {
-            let mut lines =
-                vec!["可用技能（/skill <name> [任务] ≡ 发送 $name；本轮注入全文）：".to_string()];
-            for s in &skills {
-                lines.push(format!(
-                    "  ${} [{}] — {}",
-                    s.name,
-                    s.source.as_str(),
-                    s.description
-                ));
+            let mut lines = vec![
+                "可用技能（/<name> 或 /skill <name> [任务] ≡ 发送 $name；本轮注入全文）："
+                    .to_string(),
+            ];
+            for (name, desc) in &state.skill_catalog {
+                if desc.is_empty() {
+                    lines.push(format!("  /{name}"));
+                } else {
+                    lines.push(format!("  /{name} — {desc}"));
+                }
             }
             lines.join("\n")
         };
@@ -648,25 +609,28 @@ fn skill_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     if name.is_empty() {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "用法: /skill <name> [任务说明]".into(),
+            message: "用法: /skill <name> [任务说明]  或  /<name> [任务说明]".into(),
         });
         return Vec::new();
     }
 
-    // Same inject signal as typing `$name` in free text (S1/S2 shared path).
+    run_named_skill(state, name, task)
+}
+
+/// Inject and submit a skill (same path as `$name` / `/skill name`).
+fn run_named_skill(state: &mut AppState, name: &str, task: &str) -> Vec<Effect> {
     let content = crate::screen::skill_mention_message(name, task);
     if state.is_busy() {
-        state.input_queues.push_queued(content);
-        crate::footer_queue::on_queue_changed(state);
+        // Same as an ordinary message: steer the running turn.
+        state.transcript.push_user_if_new(content.clone());
         state.notification = Some(Notification {
             level: NotificationLevel::Info,
-            message: state.t().queued_n.replacen(
-                "{}",
-                &state.input_queues.waiting_len().to_string(),
-                1,
-            ),
+            message: state.t().steering_sent.to_string(),
         });
-        return Vec::new();
+        return vec![Effect::Send(ClientCommand::SteerCurrentTurn {
+            session_id: state.session_id.clone(),
+            content,
+        })];
     }
     state.transcript.push_user_if_new(content.clone());
     start_turn(state);
@@ -685,11 +649,26 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             include_archived: true,
         })];
     }
+    // Accepting a pending candidate is the user's consent (K36) — the reason
+    // the runtime never lets the model do it.
+    if let Some(id) = rest.strip_prefix("accept").map(str::trim) {
+        if id.is_empty() {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().memory_accept_usage.to_string(),
+            });
+            return Vec::new();
+        }
+        return vec![Effect::Send(ClientCommand::AcceptMemory {
+            session_id: state.session_id.clone(),
+            id: id.to_string(),
+        })];
+    }
     if let Some(id) = rest.strip_prefix("forget").map(str::trim) {
         if id.is_empty() {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: "usage: /memory forget <id>".into(),
+                message: state.t().memory_forget_usage.to_string(),
             });
             return Vec::new();
         }
@@ -700,93 +679,178 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     }
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
-        message: "usage: /memory | /memory forget <id>".into(),
+        message: state.t().memory_usage.to_string(),
     });
     Vec::new()
 }
 
-/// K24: confirm collaboration plan → auto goal (anti-misclick: require idle + proposal).
-fn confirm_plan_to_goal(state: &mut AppState) -> Vec<Effect> {
-    if state.is_busy() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: "idle only: finish the current turn before /confirm-plan".into(),
-        });
-        return Vec::new();
-    }
-    if state.collaboration != "plan" {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: "当前不是协作 plan 模式；先 /plan 或 /collab plan".into(),
-        });
-        return Vec::new();
-    }
-    let content = state
-        .pending_plan_proposal
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            // Fall back to last assistant message as the proposed plan.
-            state
-                .transcript
-                .items()
-                .iter()
-                .rev()
-                .find_map(|item| match item {
-                    crate::transcript::TranscriptItem::Assistant(b) => Some(b.text.clone()),
-                    _ => None,
-                })
-        })
-        .unwrap_or_else(|| "Execute the confirmed plan".into());
-    state.collaboration = "goal".into();
-    state.mode = PermissionProfile::Assisted;
-    state.pending_plan_proposal = None;
-    state.goal_mode_active = true;
-    state.notification = Some(Notification {
-        level: NotificationLevel::Info,
-        message: "已确认计划 → 自动进入 goal（将开始改代码）".into(),
-    });
-    start_turn(state);
-    vec![Effect::Send(ClientCommand::ConfirmPlanToGoal {
-        session_id: state.session_id.clone(),
-        content,
-    })]
-}
-
+/// `/goal <task>` starts a goal turn; `/goal status` and `/goal clear` manage it.
 fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let goal = command
+    let rest = command
         .strip_prefix("goal")
         .unwrap_or(command)
         .trim()
         .to_string();
-    if goal.is_empty() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: "用法: /goal <任务目标>".to_string(),
-        });
-        return Vec::new();
+    let head = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match head.as_str() {
+        "" => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().goal_usage.to_string(),
+            });
+            Vec::new()
+        }
+        "status" => {
+            goal_status(state);
+            Vec::new()
+        }
+        "clear" | "cancel" | "stop" => clear_goal(state),
+        _ => {
+            if state.is_busy() {
+                // Steer the running turn, same as an ordinary message: the
+                // runtime falls back to a fresh submission if it already ended.
+                let content = format!("/goal {rest}");
+                state.transcript.push_user_if_new(content.clone());
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Info,
+                    message: state.t().steering_sent.to_string(),
+                });
+                return vec![Effect::Send(ClientCommand::SteerCurrentTurn {
+                    session_id: state.session_id.clone(),
+                    content,
+                })];
+            }
+            state.transcript.push_user_if_new(rest.clone());
+            start_turn(state);
+            state.goal_mode_active = true;
+            vec![Effect::Send(ClientCommand::RunGoal {
+                session_id: state.session_id.clone(),
+                content: rest,
+            })]
+        }
     }
-    if state.is_busy() {
-        state.input_queues.push_queued(format!("/goal {goal}"));
-        crate::footer_queue::on_queue_changed(state);
+}
+
+fn goal_status(state: &mut AppState) {
+    let t = state.t();
+    let message = if state.goal_mode_active || state.collaboration == "goal" {
+        let phase = if state.is_busy() {
+            t.goal_status_busy
+        } else {
+            t.goal_status_waiting
+        };
+        t.goal_status_active
+            .replacen("{}", &state.collaboration, 1)
+            .replacen("{}", &state.mode_label, 1)
+            .replacen("{}", phase, 1)
+    } else {
+        t.goal_status_idle
+            .replacen("{}", &state.collaboration, 1)
+            .replacen("{}", &state.mode_label, 1)
+    };
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message,
+    });
+}
+
+fn clear_goal(state: &mut AppState) -> Vec<Effect> {
+    let was_busy_goal = state.is_busy() && state.goal_mode_active;
+    let flipped_collab = state.collaboration == "goal";
+    state.goal_mode_active = false;
+    if flipped_collab {
+        state.collaboration = "chat".into();
+    }
+    let t = state.t();
+    let mut effects = Vec::new();
+    if flipped_collab {
+        effects.push(Effect::Send(ClientCommand::SetProductAxes {
+            session_id: state.session_id.clone(),
+            work_profile: state.work_profile.clone(),
+            collaboration: state.collaboration.clone(),
+        }));
+    }
+    if was_busy_goal {
         state.notification = Some(Notification {
             level: NotificationLevel::Info,
-            message: state.t().queued_n.replacen(
-                "{}",
-                &state.input_queues.waiting_len().to_string(),
-                1,
-            ),
+            message: t.goal_cleared_and_cancel.to_string(),
         });
-        return Vec::new();
+        effects.push(Effect::Send(ClientCommand::CancelCurrentTurn {
+            session_id: state.session_id.clone(),
+        }));
+    } else {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: t.goal_cleared.to_string(),
+        });
     }
-    state.transcript.push_user_if_new(goal.clone());
-    start_turn(state);
-    state.goal_mode_active = true;
-    vec![Effect::Send(ClientCommand::RunGoal {
-        session_id: state.session_id.clone(),
-        content: goal,
-    })]
+    effects
 }
+
+/// Local self-check: connection, model, permission, repo, skills, checkpoints.
+fn doctor_slash(state: &mut AppState) -> Vec<Effect> {
+    refresh_skill_catalog(state);
+    let conn = if state.runtime_connected {
+        "ok"
+    } else {
+        "断开"
+    };
+    let busy = if state.is_busy() { "busy" } else { "idle" };
+    let repo = if state.repository.is_empty() {
+        "—"
+    } else {
+        state.repository.as_str()
+    };
+    let branch = state.branch.as_deref().unwrap_or("—");
+    let lines = [
+        "Doctor".to_string(),
+        format!("session     {}", state.session_id.as_str()),
+        format!("connected   {conn}"),
+        format!("status      {busy}"),
+        format!("model       {}", state.model_label),
+        format!("vision      {}", state.vision),
+        format!("permission  {} ({:?})", state.mode_label, state.mode),
+        format!(
+            "axes        collab={} work={}",
+            state.collaboration, state.work_profile
+        ),
+        format!("goal_mode   {}", state.goal_mode_active),
+        format!("repo        {repo}"),
+        format!("branch      {branch}"),
+        format!(
+            "context     {} / {} tokens (in={} out={})",
+            state.context_tokens,
+            state.context_window_tokens,
+            state.token_input,
+            state.token_output
+        ),
+        format!("skills      {}", state.skill_catalog.len()),
+        format!("checkpoints {}", state.checkpoints.len()),
+        format!("attachments {}", state.pending_attachments.len()),
+    ];
+    let mut body = lines.join("\n");
+    if !state.untrusted_config.is_empty() {
+        body.push_str("\nuntrusted_config:\n");
+        for p in &state.untrusted_config {
+            body.push_str(&format!("  - {p}\n"));
+        }
+    }
+    state.transcript.push_note(body);
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: format!(
+            "doctor · {conn} · {} · skills={}",
+            state.model_label,
+            state.skill_catalog.len()
+        ),
+    });
+    Vec::new()
+}
+
 
 #[cfg(test)]
 mod export_tests {
@@ -957,7 +1021,7 @@ mod export_tests {
         // completion and nothing in the list, and concludes it does not exist.
         // A command nobody can confirm is real is worse than one a stranger
         // might try; the description says plainly what it is for.
-        assert!(is_known_slash("remote-loc"));
+        assert!(crate::screen::is_known_slash_token("remote-loc"));
 
         for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
             let text = locale.text();

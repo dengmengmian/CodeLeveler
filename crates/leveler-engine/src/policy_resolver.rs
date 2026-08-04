@@ -43,7 +43,6 @@ pub enum ExecutionRole {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionOverrides {
     pub explicit_plan: Option<bool>,
-    pub step_summary_every: Option<u32>,
     pub max_search_calls_per_step: Option<usize>,
     pub max_parallel_tools: Option<usize>,
     pub max_files_per_step: Option<usize>,
@@ -63,7 +62,6 @@ pub struct ResolvedExecutionPolicy {
     pub max_search_calls_per_step: usize,
     pub max_files_per_step: usize,
     pub explicit_plan: bool,
-    pub step_summary_every: u32,
     pub completion_evidence: bool,
     pub repeated_read_guard: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -120,7 +118,6 @@ pub fn resolve_execution_policy(
         // Planning is task-driven, not model-tier-driven. Enabling the gate here
         // lets the executor enforce it only when the actual request is complex.
         explicit_plan: o.explicit_plan.unwrap_or(true),
-        step_summary_every: o.step_summary_every.unwrap_or(0),
         // Safety rails: only the eval seam may lower them.
         completion_evidence: o.completion_evidence.unwrap_or(true),
         repeated_read_guard: o.repeated_read_guard.unwrap_or(true),
@@ -190,7 +187,6 @@ mod tests {
             new.explicit_plan,
             "complex tasks must have a structured-plan gate"
         );
-        assert_eq!(new.step_summary_every, 0);
         assert!(new.completion_evidence);
         assert_eq!(new.max_files_per_step, 8, "task budget, was policy field");
         assert!(new.repeated_read_guard, "safety rail is always on");
@@ -323,16 +319,17 @@ mod tests {
             plain.explicit_plan,
             "the executor decides task complexity; every model gets the gate"
         );
-        assert_eq!(plain.step_summary_every, 0);
 
+        // Overrides still reach the resolved policy — checked on a knob that
+        // is actually consulted at runtime.
         let complex_task = ExecutionOverrides {
             explicit_plan: Some(false),
-            step_summary_every: Some(6),
+            max_search_calls_per_step: Some(6),
             ..ExecutionOverrides::default()
         };
         let r =
             resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&complex_task));
         assert!(!r.explicit_plan);
-        assert_eq!(r.step_summary_every, 6);
+        assert_eq!(r.max_search_calls_per_step, 6);
     }
 }

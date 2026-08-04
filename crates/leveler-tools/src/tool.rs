@@ -46,6 +46,14 @@ pub struct ToolContext {
     pub command_previously_modified: Arc<Vec<String>>,
     /// Long-lived language-server sessions, keyed by language, reused across
     /// tool calls so servers index the workspace once (spec §26 LSP platform).
+    /// Serializes workspace-wide commands across concurrent sub-agents.
+    ///
+    /// Parallel workers own disjoint *files*, but they share one working tree
+    /// and one build directory. Without this, agent A's `cargo test` can run
+    /// against source that agent B is halfway through rewriting, and the result
+    /// looks authoritative while being meaningless. `ToolContext` is cloned into
+    /// every child, so the `Arc` makes one gate for the whole run.
+    pub command_gate: Arc<tokio::sync::Mutex<()>>,
     pub lsp_sessions:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<leveler_lsp::LspClient>>>>,
     /// Per-language startup locks. Starting a server may take seconds; these
@@ -103,6 +111,7 @@ impl ToolContext {
             command_write_allowlist: None,
             command_modified_files_remaining: None,
             command_previously_modified: Arc::new(Vec::new()),
+            command_gate: Arc::new(tokio::sync::Mutex::new(())),
             lsp_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             lsp_start_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             artifact_store: None,

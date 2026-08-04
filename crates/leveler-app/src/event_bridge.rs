@@ -5,7 +5,6 @@ use tokio::sync::broadcast;
 
 use leveler_agent::{AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, StopReason};
 use leveler_core::ToolCallId;
-use leveler_orchestrator::NodeStatus;
 
 use leveler_client_protocol::{
     CheckState, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent, UiCheck, UiPlan,
@@ -465,129 +464,6 @@ impl EventBridge {
                 passed,
             },
         });
-    }
-}
-
-/// Translates orchestrator events into plan/verification protocol events,
-/// accumulating plan and check state so each update is a full snapshot the UI
-/// can render directly. Inner `AgentEvent`s are forwarded via [`EventBridge`].
-pub(crate) struct OrchestratorBridge {
-    inner: EventBridge,
-    /// Task-node ids in plan order, to map `NodeStarted/Finished` to a step.
-    node_ids: Vec<String>,
-    plan: UiPlan,
-    checks: Vec<UiCheck>,
-}
-
-impl OrchestratorBridge {
-    pub(crate) fn new(events: broadcast::Sender<RuntimeEvent>) -> Self {
-        Self {
-            inner: EventBridge::new(events),
-            node_ids: Vec::new(),
-            plan: UiPlan { steps: Vec::new() },
-            checks: Vec::new(),
-        }
-    }
-
-    fn events(&self) -> &broadcast::Sender<RuntimeEvent> {
-        &self.inner.events
-    }
-
-    pub(crate) fn forward(&mut self, event: leveler_engine::EngineEvent) {
-        use leveler_engine::EngineEvent as E;
-        match event {
-            E::PhaseChanged { to, .. } => {
-                let _ = self.events().send(RuntimeEvent::AgentActivity {
-                    label: format!("阶段：{}", to.as_str()),
-                });
-            }
-            E::PlanReady { graph } => {
-                self.node_ids = graph.nodes.iter().map(|n| n.id.to_string()).collect();
-                self.plan = UiPlan {
-                    steps: graph
-                        .nodes
-                        .iter()
-                        .enumerate()
-                        .map(|(i, n)| UiPlanStep {
-                            index: i,
-                            description: n.description.clone(),
-                            status: map_node_status(n.status),
-                        })
-                        .collect(),
-                };
-                let _ = self.events().send(RuntimeEvent::PlanUpdated {
-                    plan: self.plan.clone(),
-                });
-            }
-            E::NodeStarted { node_id, .. } => self.set_step(&node_id, PlanStepStatus::Running),
-            E::NodeFinished { node_id, status } => self.set_step(&node_id, map_node_status(status)),
-            E::VerificationStarted => {
-                self.checks.clear();
-                self.emit_verification(None);
-            }
-            E::VerificationCheck {
-                name,
-                status,
-                evidence,
-            } => {
-                self.checks.push(UiCheck {
-                    name,
-                    status: match status.as_str() {
-                        "passed" => CheckState::Passed,
-                        "failed" => CheckState::Failed,
-                        _ => CheckState::Skipped,
-                    },
-                    evidence,
-                });
-                self.emit_verification(None);
-            }
-            E::VerificationFinished { passed } => self.emit_verification(Some(passed)),
-            E::ContextReady {
-                candidate_files,
-                estimated_tokens,
-            } => {
-                let _ = self.events().send(RuntimeEvent::ContextUpdated {
-                    candidate_files,
-                    estimated_tokens,
-                });
-            }
-            // Kernel events reuse the legacy AgentEvent bridge.
-            other => {
-                if let Some(agent_event) = crate::session::engine_event_to_agent(other) {
-                    self.inner.forward(agent_event);
-                }
-            }
-        }
-    }
-
-    fn set_step(&mut self, id: &str, status: PlanStepStatus) {
-        if let Some(i) = self.node_ids.iter().position(|x| x == id) {
-            if let Some(step) = self.plan.steps.get_mut(i) {
-                step.status = status;
-            }
-            let _ = self.events().send(RuntimeEvent::PlanUpdated {
-                plan: self.plan.clone(),
-            });
-        }
-    }
-
-    fn emit_verification(&self, passed: Option<bool>) {
-        let _ = self.events().send(RuntimeEvent::VerificationUpdated {
-            verification: UiVerification {
-                checks: self.checks.clone(),
-                passed,
-            },
-        });
-    }
-}
-
-fn map_node_status(status: NodeStatus) -> PlanStepStatus {
-    match status {
-        NodeStatus::Pending => PlanStepStatus::Pending,
-        NodeStatus::Running => PlanStepStatus::Running,
-        NodeStatus::Completed => PlanStepStatus::Done,
-        NodeStatus::Failed => PlanStepStatus::Failed,
-        NodeStatus::Skipped => PlanStepStatus::Skipped,
     }
 }
 

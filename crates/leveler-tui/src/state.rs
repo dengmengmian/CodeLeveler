@@ -74,65 +74,6 @@ pub enum WorkbenchFocus {
     Conversation,
 }
 
-/// User inputs submitted while another turn is in flight.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InputQueues {
-    /// Waiting to be submitted, oldest first.
-    pub queued: Vec<String>,
-    /// Submitted to the runtime, but no turn-start signal has arrived yet.
-    pub pending: Vec<String>,
-    /// Submitted while busy but rejected before a turn started; retry first.
-    pub rejected: Vec<String>,
-}
-
-impl InputQueues {
-    pub fn is_empty(&self) -> bool {
-        self.queued.is_empty() && self.pending.is_empty() && self.rejected.is_empty()
-    }
-
-    pub fn waiting_len(&self) -> usize {
-        self.queued.len() + self.rejected.len()
-    }
-
-    pub fn visible_len(&self) -> usize {
-        self.queued.len() + self.pending.len() + self.rejected.len()
-    }
-
-    pub fn push_queued(&mut self, text: String) {
-        self.queued.push(text);
-    }
-
-    pub fn pop_last_waiting(&mut self) -> Option<String> {
-        self.queued.pop().or_else(|| self.rejected.pop())
-    }
-
-    pub fn pop_next_waiting(&mut self) -> Option<String> {
-        if !self.rejected.is_empty() {
-            Some(self.rejected.remove(0))
-        } else if !self.queued.is_empty() {
-            Some(self.queued.remove(0))
-        } else {
-            None
-        }
-    }
-
-    pub fn mark_pending(&mut self, text: String) {
-        self.pending.push(text);
-    }
-
-    pub fn clear_pending(&mut self) {
-        self.pending.clear();
-    }
-
-    pub fn reject_pending(&mut self) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let pending = std::mem::take(&mut self.pending);
-        self.rejected.splice(0..0, pending);
-    }
-}
-
 /// The `/remote` invite, as the screen shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteState {
@@ -161,7 +102,7 @@ pub struct AppState {
     pub active_screen: Screen,
     pub tools_screen: ToolsScreenState,
 
-    /// Latest plan / verification / diff from the orchestrated run, if any.
+    /// Latest plan / verification / diff from the current run, if any.
     pub plan: Option<UiPlan>,
     /// Workspace-relative instruction sources active for the current turn.
     pub project_rule_sources: Vec<String>,
@@ -177,16 +118,12 @@ pub struct AppState {
     /// ends its thought. The thought stays on screen while the tools run; the
     /// next step's first reasoning delta clears it.
     pub reasoning_superseded: bool,
-    /// Whether turns run orchestrated (mirrors the client's agent mode).
-    pub orchestrate: bool,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
     /// Product work profile: economy | balanced | delivery.
     pub work_profile: String,
     /// Collaboration mode: chat | plan | goal.
     pub collaboration: String,
-    /// Pending plan body waiting for confirm→goal (K24).
-    pub pending_plan_proposal: Option<String>,
 
     /// Attachments staged for the next message (spec §40).
     pub pending_attachments: Vec<AttachmentRef>,
@@ -196,7 +133,7 @@ pub struct AppState {
     /// Stored sessions and cursor for the Sessions screen (spec §52).
     pub sessions: Vec<UiSessionSummary>,
     pub sessions_selected: usize,
-    /// Context package info from the last orchestrated run (spec §53).
+    /// Context package info from the last run (spec §53).
     pub context_files: Vec<String>,
     pub context_tokens: u32,
     /// Latest model-reported input/output tokens for the current conversation.
@@ -280,12 +217,6 @@ pub struct AppState {
     >,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
-    /// Prompt Queue panel collapsed to a single title row (`Ctrl+Q`).
-    pub queue_collapsed: bool,
-    /// Selected row in the expanded Queue panel (absolute index into display rows).
-    pub queue_selected: Option<usize>,
-    /// Scroll offset within the expanded Queue body when items exceed the cap.
-    pub queue_scroll: usize,
 
     /// Legacy global expand flag — no longer forces every tool group open.
     /// Kept so the workbench can render the currently focused tool group.
@@ -302,9 +233,16 @@ pub struct AppState {
     /// User pressed Esc while the slash popup was open; stay hidden until the
     /// composer text changes (so Esc can actually leave the menu).
     pub slash_popup_dismissed: bool,
+    /// Armed by the first `/clear`; a second `/clear` actually wipes context.
+    pub clear_confirm_armed: bool,
     /// Repository paths used by `@file` completion.
     pub file_candidates: Vec<String>,
     pub file_index_requested: bool,
+    /// Discovered skills as slash entries: `(name, description)`.
+    /// Refreshed when the repo changes or the user types `/`.
+    pub skill_catalog: Vec<(String, String)>,
+    /// Root path the catalog was built from (avoids re-scanning every keystroke).
+    pub skill_catalog_root: Option<String>,
 
     /// Header/welcome metadata, filled from the session snapshot.
     pub repository: String,
@@ -315,6 +253,10 @@ pub struct AppState {
     pub clock_label: String,
     /// Mutable context window for the active model (updated on model switch).
     pub context_window_tokens: u32,
+
+    /// `Ctrl+X` was pressed and is waiting for the second key of the chord
+    /// (`Ctrl+X Ctrl+E` opens `$EDITOR`). Any other key spends it.
+    pub editor_chord_armed: bool,
 
     // Ctrl+C escalation state.
     pub cancel_armed: bool,
@@ -329,8 +271,6 @@ pub struct AppState {
     pub turn_started_at: Option<std::time::Instant>,
     /// Elapsed seconds of the current busy turn (recomputed each frame).
     pub elapsed_secs: u64,
-    /// Inputs submitted while busy, grouped by retry state.
-    pub input_queues: InputQueues,
     /// Whether the dark theme is active (for `/theme` toggling).
     pub dark: bool,
 
@@ -371,11 +311,9 @@ impl AppState {
             diff_selected: 0,
             reasoning: String::new(),
             reasoning_superseded: false,
-            orchestrate: false,
             goal_mode_active: false,
             work_profile: "balanced".into(),
             collaboration: "chat".into(),
-            pending_plan_proposal: None,
             pending_attachments: Vec::new(),
             vision: false,
             sessions: Vec::new(),
@@ -415,29 +353,29 @@ impl AppState {
             conversation_plain_width: 0,
             conversation_cache: std::cell::RefCell::new(None),
             plan_collapsed: false,
-            queue_collapsed: false,
-            queue_selected: None,
-            queue_scroll: 0,
             tools_expanded: false,
             reasoning_expanded: false,
             turn_nav: None,
             slash_selected: 0,
             slash_popup_dismissed: false,
+            clear_confirm_armed: false,
             file_candidates: Vec::new(),
             file_index_requested: false,
+            skill_catalog: Vec::new(),
+            skill_catalog_root: None,
             repository: String::new(),
             branch: None,
             model_label: "—".to_string(),
             mode_label: "—".to_string(),
             clock_label: String::new(),
             context_window_tokens: boot.context_window,
+            editor_chord_armed: false,
             cancel_armed: false,
             force_cancel_armed: false,
             quit_armed: false,
             tick: 0,
             turn_started_at: None,
             elapsed_secs: 0,
-            input_queues: InputQueues::default(),
             dark: true,
             jump_to_bottom: false,
             locale: boot.locale,

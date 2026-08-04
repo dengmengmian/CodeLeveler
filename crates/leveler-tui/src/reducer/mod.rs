@@ -4,7 +4,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use leveler_client_protocol::{ClientCommand, NotificationLevel, RuntimeEvent};
+use leveler_client_protocol::{ClientCommand, NotificationLevel, PermissionProfile, RuntimeEvent};
 
 use crate::action::{Action, Effect, EffectCompletion};
 use crate::screen::Screen;
@@ -15,10 +15,10 @@ mod runtime_apply;
 mod screen_nav;
 mod submit;
 
-pub use submit::drain_queued;
 
 use overlay_keys::{handle_overlay_key, open_model_picker};
 use runtime_apply::apply_runtime;
+use runtime_apply::mode_label;
 use screen_nav::{handle_screen_key, open_diff_screen, open_sessions_screen, toggle_screen};
 use submit::{
     complete_file_mention, complete_slash, request_file_candidates, submit, touch_slash_filter,
@@ -63,6 +63,23 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                     state.notification = Some(Notification {
                         level: NotificationLevel::Warning,
                         message: format!("Web UI 启动失败：{message}"),
+                    });
+                }
+            }
+            Vec::new()
+        }
+        Action::EditorFinished(result) => {
+            match result {
+                // An empty buffer is a decision, not a failure: the user wiped
+                // the prompt in the editor and meant to start over.
+                Ok(text) => {
+                    state.composer.replace(text.trim_end_matches('\n'));
+                    touch_slash_filter(state);
+                }
+                Err(message) => {
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Warning,
+                        message: format!("外部编辑器未能打开：{message}"),
                     });
                 }
             }
@@ -481,21 +498,31 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
     // Any intentional user key disarms a pending Ctrl+C. Some terminals also
     // emit non-printing control events around Ctrl+C; those should not consume
-    // the confirmation window.
-    if should_disarm_ctrlc(&key) {
+    // the confirmation window. Esc while busy is exempt: it drives the same
+    // cancel → force-cancel escalation, so disarming would strand it on step one.
+    if should_disarm_ctrlc(&key) && !(matches!(key.code, KeyCode::Esc) && state.is_busy()) {
         state.disarm_ctrlc();
         clear_quit_confirm_notification(state);
+    }
+
+    // `Ctrl+X Ctrl+E` opens $EDITOR on the draft (readline's binding, which
+    // every other agent CLI inherited). The chord is spent by whatever key
+    // follows, so a stray Ctrl+X never swallows the next keystroke's meaning.
+    let editor_chord = std::mem::take(&mut state.editor_chord_armed);
+    if ctrl && matches!(key.code, KeyCode::Char('x')) {
+        state.editor_chord_armed = true;
+        return Vec::new();
+    }
+    if editor_chord && ctrl && matches!(key.code, KeyCode::Char('e')) {
+        return open_external_editor(state);
     }
 
     // Ctrl+<key> screen toggles work from anywhere (spec §57).
     if ctrl {
         match key.code {
             KeyCode::Char('t') => return toggle_screen(state, Screen::Tools),
-            KeyCode::Char('p') => return toggle_screen(state, Screen::Plan),
-            KeyCode::Char('r') => return toggle_screen(state, Screen::Verification),
             KeyCode::Char('d') => return open_diff_screen(state),
             KeyCode::Char('s') => return open_sessions_screen(state),
-            KeyCode::Char('g') => return toggle_screen(state, Screen::Agents),
             KeyCode::Char('o') => {
                 toggle_current_expand(state);
                 return Vec::new();
@@ -508,6 +535,15 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             }
             _ => {}
         }
+    }
+
+    // Shift+Tab cycles the permission profile from anywhere — the one binding
+    // every terminal coding agent shares, so muscle memory carries over.
+    // Some terminals report it as Tab+SHIFT rather than BackTab.
+    if matches!(key.code, KeyCode::BackTab)
+        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        return cycle_permission_profile(state);
     }
 
     // Non-conversation screens handle their own navigation.
@@ -542,22 +578,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Enter if popup_len > 0 => {
             let text = state.composer.text();
             let token = text.split_whitespace().next().unwrap_or(text);
-            let exact = crate::screen::SLASH_NAMES.contains(&token);
+            // Primary or alias counts as exact so `/mode` runs permission,
+            // not the highlighted `/model` completion.
+            let exact = crate::screen::is_exact_slash_token(token);
             if !exact {
                 complete_slash(state);
                 return Vec::new();
             }
             return submit(state);
-        }
-        // Empty composer + expanded queue: Enter starts the selected/next queued
-        // item now (interrupting any running turn).
-        KeyCode::Enter
-            if state.composer.is_empty()
-                && popup_len == 0
-                && !state.queue_collapsed
-                && state.input_queues.waiting_len() > 0 =>
-        {
-            return start_queued_now(state);
         }
         // Conversation focus while reading history: Enter = jump to live edge.
         KeyCode::Enter
@@ -611,18 +639,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('?') | KeyCode::Char('/') if ctrl => {
             return toggle_screen(state, Screen::Help);
         }
-        // Ctrl+Q: expand/collapse the Prompt Queue panel.
-        KeyCode::Char('q') if ctrl => {
-            if !state.input_queues.is_empty() {
-                state.queue_collapsed = !state.queue_collapsed;
-                if !state.queue_collapsed && state.queue_selected.is_none() {
-                    let pending_n = state.input_queues.pending.len();
-                    if state.input_queues.waiting_len() > 0 {
-                        state.queue_selected = Some(pending_n);
-                    }
-                }
-            }
-        }
         KeyCode::Tab if file_popup_len > 0 => complete_file_mention(state),
         KeyCode::Tab if popup_len > 0 => complete_slash(state),
         // No completion popup: Tab switches Input ↔ Conversation focus.
@@ -646,47 +662,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             touch_slash_filter(state);
         }
         KeyCode::Backspace | KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}') => {
-            // On an empty composer, Backspace peels off pending state: attachment
-            // chips first, then the selected/last queued message.
+            // On an empty composer, Backspace peels off the last attachment chip.
             if state.composer.is_empty() && !state.pending_attachments.is_empty() {
                 state.pending_attachments.pop();
-            } else if state.composer.is_empty() && !state.input_queues.is_empty() {
-                let pending_n = state.input_queues.pending.len();
-                let removed = if let Some(sel) = state.queue_selected {
-                    // Display index includes pending; waiting index is sel - pending_n.
-                    if sel >= pending_n {
-                        state.input_queues.remove_waiting_at(sel - pending_n)
-                    } else {
-                        state.input_queues.pop_last_waiting()
-                    }
-                } else {
-                    state.input_queues.pop_last_waiting()
-                };
-                if removed.is_some() {
-                    crate::footer_queue::on_queue_changed(state);
-                    let remaining = state.input_queues.visible_len();
-                    let t = state.t();
-                    state.notification = Some(Notification {
-                        level: NotificationLevel::Info,
-                        message: if remaining == 0 {
-                            t.cleared_queue.to_string()
-                        } else {
-                            t.deleted_queue_n.replacen("{}", &remaining.to_string(), 1)
-                        },
-                    });
-                }
             } else {
                 state.composer.backspace();
             }
-            touch_slash_filter(state);
-        }
-        // Empty composer + expanded queue: Delete cancels the selected/next item.
-        KeyCode::Delete
-            if state.composer.is_empty()
-                && !state.queue_collapsed
-                && state.input_queues.waiting_len() > 0 =>
-        {
-            cancel_selected_queued(state);
             touch_slash_filter(state);
         }
         KeyCode::Delete => {
@@ -725,32 +706,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.workbench_focus = WorkbenchFocus::Conversation;
             scroll_conversation(state, (state.size.1 as i32 / 2).max(1));
         }
-        // Alt+↑/↓: reorder selected queue item (or last waiting item).
-        KeyCode::Up if alt && !state.input_queues.is_empty() => {
-            reorder_queue(state, -1);
-        }
-        KeyCode::Down if alt && !state.input_queues.is_empty() => {
-            reorder_queue(state, 1);
-        }
-        // Empty composer + expanded queue: ↑/↓ move selection.
-        KeyCode::Up
-            if state.composer.is_empty()
-                && popup_len == 0
-                && !state.queue_collapsed
-                && state.input_queues.waiting_len() > 0
-                && state.queue_selected.is_some() =>
-        {
-            move_queue_selection(state, -1);
-        }
-        KeyCode::Down
-            if state.composer.is_empty()
-                && popup_len == 0
-                && !state.queue_collapsed
-                && state.input_queues.waiting_len() > 0
-                && state.queue_selected.is_some() =>
-        {
-            move_queue_selection(state, 1);
-        }
         // Conversation focus: ↑/↓ scroll the viewport only.
         KeyCode::Up if state.workbench_focus == WorkbenchFocus::Conversation && popup_len == 0 => {
             scroll_conversation(state, -1);
@@ -767,7 +722,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             // Toggle plan panel when not typing.
             state.plan_collapsed = !state.plan_collapsed;
         }
-        // Esc priority: slash popup → turn-nav → finished 旁问 card → notice.
+        // Esc priority: slash popup → turn-nav → interrupt → finished 旁问 card
+        // → notice. Dismissing a popup or leaving turn review is a *narrower*
+        // undo than killing the turn, so those win while they are on screen.
         KeyCode::Esc if popup_len > 0 => {
             state.slash_popup_dismissed = true;
             state.slash_selected = 0;
@@ -780,6 +737,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 message: state.t().turn_nav_live.to_string(),
             });
         }
+        // Esc is the interrupt every other coding-agent CLI uses. It escalates
+        // cancel → force-cancel like Ctrl+C does, but stops there: quitting on
+        // a keypress the user reached for to *stay* would be a trap.
+        KeyCode::Esc if state.is_busy() => return request_cancel(state),
         KeyCode::Esc if state.transcript.has_finished_btw() => {
             let _ = state.transcript.dismiss_latest_finished_btw();
             state.notification = None;
@@ -922,107 +883,6 @@ fn request_jump_to_bottom(state: &mut AppState) {
     });
 }
 
-fn move_queue_selection(state: &mut AppState, delta: i32) {
-    let pending_n = state.input_queues.pending.len();
-    let waiting_n = state.input_queues.waiting_len();
-    if waiting_n == 0 {
-        state.queue_selected = None;
-        return;
-    }
-    let min_sel = pending_n;
-    let max_sel = pending_n + waiting_n - 1;
-    let cur = state.queue_selected.unwrap_or(min_sel) as i32;
-    let next = (cur + delta).clamp(min_sel as i32, max_sel as i32) as usize;
-    state.queue_selected = Some(next);
-    // Keep selection visible inside the body window.
-    const BODY: usize = 5;
-    if next < state.queue_scroll {
-        state.queue_scroll = next;
-    } else if next >= state.queue_scroll + BODY {
-        state.queue_scroll = next + 1 - BODY;
-    }
-}
-
-fn reorder_queue(state: &mut AppState, delta: i32) {
-    let pending_n = state.input_queues.pending.len();
-    let waiting_n = state.input_queues.waiting_len();
-    if waiting_n == 0 {
-        return;
-    }
-    let sel = state
-        .queue_selected
-        .unwrap_or(pending_n + waiting_n - 1)
-        .max(pending_n);
-    let waiting_idx = sel - pending_n;
-    if let Some(new_w) = state.input_queues.move_waiting(waiting_idx, delta) {
-        state.queue_selected = Some(pending_n + new_w);
-        state.queue_collapsed = false;
-        crate::footer_queue::normalize_queue_focus(state);
-    }
-}
-
-/// Waiting flat index the queue actions target: the selected waiting row, else
-/// the first waiting item. `None` when nothing is waiting.
-fn queue_action_target(state: &AppState) -> Option<usize> {
-    if state.input_queues.waiting_len() == 0 {
-        return None;
-    }
-    let pending_n = state.input_queues.pending.len();
-    match state.queue_selected {
-        Some(sel) if sel >= pending_n => Some(sel - pending_n),
-        _ => Some(0),
-    }
-}
-
-/// "Start now": promote the targeted queued item to the front; if a turn is
-/// running, cancel it so the runtime idles and `drain_queued` submits this item
-/// next. When idle, the drain path picks it up on the following loop tick.
-fn start_queued_now(state: &mut AppState) -> Vec<Effect> {
-    let Some(waiting_idx) = queue_action_target(state) else {
-        return Vec::new();
-    };
-    if state
-        .input_queues
-        .promote_waiting_to_front(waiting_idx)
-        .is_none()
-    {
-        return Vec::new();
-    }
-    let pending_n = state.input_queues.pending.len();
-    state.queue_selected = Some(pending_n + state.input_queues.rejected.len());
-    crate::footer_queue::on_queue_changed(state);
-    if state.is_busy() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: state.t().queue_starting_now.to_string(),
-        });
-        return vec![Effect::Send(ClientCommand::CancelCurrentTurn {
-            session_id: state.session_id.clone(),
-        })];
-    }
-    Vec::new()
-}
-
-/// Cancel (remove) the targeted queued item.
-fn cancel_selected_queued(state: &mut AppState) {
-    let Some(waiting_idx) = queue_action_target(state) else {
-        return;
-    };
-    if state.input_queues.remove_waiting_at(waiting_idx).is_some() {
-        crate::footer_queue::on_queue_changed(state);
-        let remaining = state.input_queues.visible_len();
-        let t = state.t();
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: if remaining == 0 {
-                t.cleared_queue.to_string()
-            } else {
-                t.deleted_queue_n.replacen("{}", &remaining.to_string(), 1)
-            },
-        });
-    }
-}
-
 fn is_ctrl_c(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('\u{3}'))
         || (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1047,34 +907,91 @@ fn clear_quit_confirm_notification(state: &mut AppState) {
     }
 }
 
+/// Cancel the running turn, escalating cancel → force-cancel on repeat.
+///
+/// Shared by Esc and Ctrl+C. Force-cancel is needed because a tool stuck in
+/// process wait makes the runtime re-cancel the same token while the UI stays
+/// Busy forever; only Ctrl+C escalates past this into a quit.
+fn request_cancel(state: &mut AppState) -> Vec<Effect> {
+    if state.force_cancel_armed {
+        // Already forced; re-sending the same cancel adds nothing.
+        return Vec::new();
+    }
+    if state.cancel_armed {
+        state.force_cancel_armed = true;
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: "强制取消中…仍卡住按 Ctrl+C 退出，或输入 /quit".to_string(),
+        });
+        return vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
+            session_id: state.session_id.clone(),
+        })];
+    }
+    state.cancel_armed = true;
+    state.notification = Some(Notification {
+        level: NotificationLevel::Warning,
+        message: "正在取消当前任务，再按一次强制取消".to_string(),
+    });
+    vec![Effect::Send(ClientCommand::CancelCurrentTurn {
+        session_id: state.session_id.clone(),
+    })]
+}
+
+/// Hand the current draft to `$EDITOR` (Ctrl+X Ctrl+E, or `/editor`).
+pub(super) fn open_external_editor(state: &mut AppState) -> Vec<Effect> {
+    vec![Effect::OpenExternalEditor {
+        text: state.composer.text().to_string(),
+    }]
+}
+
+/// Cycle the permission profile (Shift+Tab), least → most privileged.
+fn cycle_permission_profile(state: &mut AppState) -> Vec<Effect> {
+    let next = match state.mode {
+        PermissionProfile::RequestApproval => PermissionProfile::Assisted,
+        PermissionProfile::Assisted => PermissionProfile::FullAccess,
+        PermissionProfile::FullAccess => PermissionProfile::RequestApproval,
+    };
+    state.mode = next;
+    state.mode_label = mode_label(next).to_string();
+    let t = state.t();
+    let human = match next {
+        PermissionProfile::RequestApproval => t.perm_readonly,
+        PermissionProfile::Assisted => t.perm_workspace,
+        PermissionProfile::FullAccess => t.perm_full,
+    };
+    // A permission change must never be silent — full access especially.
+    state.notification = Some(Notification {
+        level: if next == PermissionProfile::FullAccess {
+            NotificationLevel::Warning
+        } else {
+            NotificationLevel::Info
+        },
+        message: format!("{}: {human}", t.overlay_mode),
+    });
+    vec![Effect::Send(ClientCommand::SetPermissionProfile {
+        session_id: state.session_id.clone(),
+        mode: next,
+    })]
+}
+
 fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
     if state.is_busy() {
-        // Escalation: cancel → force-cancel → quit. Force-cancel alone is not
-        // enough when a tool is stuck in process wait: the runtime re-cancels
-        // the same token and the UI stays Busy forever. Third press exits.
+        // Third press: force-cancel did not free the turn, so exit rather than
+        // trap the user in cancel-only key handling.
         if state.force_cancel_armed {
             state.notification = None;
             return vec![Effect::Quit];
         }
-        if state.cancel_armed {
-            state.force_cancel_armed = true;
-            state.notification = Some(Notification {
-                level: NotificationLevel::Warning,
-                message: "强制取消中…仍卡住再按 Ctrl+C 退出，或输入 /quit".to_string(),
-            });
-            return vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
-                session_id: state.session_id.clone(),
-            })];
-        }
-        state.cancel_armed = true;
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: "正在取消当前任务，再按一次 Ctrl+C 强制取消".to_string(),
-        });
-        vec![Effect::Send(ClientCommand::CancelCurrentTurn {
-            session_id: state.session_id.clone(),
-        })]
+        request_cancel(state)
     } else {
+        // A draft on screen makes Ctrl+C "clear what I typed", not "leave" —
+        // arming a quit here turns a routine erase into a two-key exit.
+        if !state.composer.is_empty() {
+            state.composer.replace("");
+            touch_slash_filter(state);
+            state.notification = None;
+            return Vec::new();
+        }
         let quit_prompt_visible = state
             .notification
             .as_ref()

@@ -46,7 +46,7 @@
 
 - 入口：`leveler eval run|compare|ablate|quick|daily|release|trend`
 - 实现：`crates/leveler-cli/src/eval_cmd.rs` → `run_eval` / `run_eval_case`
-- 路径：orchestrated（默认）/ `--direct` / `--no-verify-gate`（消融）
+- 路径：direct tool loop；`--direct` 为兼容 flag；`--no-verify-gate` 为验证门消融
 - 工作区：临时 disposable；`SignalCollector` 折叠事件 → 工具/循环/验证信号
 - 三层门禁：
   - `quick` → `evals/smoke`
@@ -84,7 +84,7 @@
 User → Terminal → leveler (CLI/TUI)
          → leveler-app (composition)
          → leveler-engine
-         → agent loop (leveler-agent) + orchestrator + verifier
+         → agent loop (leveler-agent) + verifier
          → tools (leveler-tools) → execution (permissions, shell, FS)
          → RuntimeEvent → TUI (leveler-tui)
 ```
@@ -101,7 +101,7 @@ User → Terminal → leveler (CLI/TUI)
 
 真实用户路径（本验收采用）：
 
-1. **`leveler eval …`**：正式 binary / `cargo run` 启动的 orchestrated agent（非内部 API 注入）
+1. **`leveler eval …`**：正式 binary / `cargo run` 启动的 direct agent 工具循环（非内部 API 注入）
 2. **TUI 客户端路径测试**：`tui_path_soak`、`tui_session_e2e`（与 TUI 同协议路径；scripted provider 仅用于稳定性）
 
 交互式全键盘多小时 session 作为补充证据，不作唯一自动门禁（见 plan Risks）。

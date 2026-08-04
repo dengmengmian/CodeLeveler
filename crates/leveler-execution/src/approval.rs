@@ -51,6 +51,16 @@ pub enum ApprovalDecision {
 #[async_trait]
 pub trait Approver: Send + Sync {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision;
+
+    /// Whether a person is actually reachable behind this approver.
+    ///
+    /// A `Deny` from a headless approver means "nobody could be asked", not
+    /// "the user said no" — callers must not report the two the same way, or
+    /// the model learns that this user rejects things they never saw. Defaults
+    /// to `true`: an approver that reaches a UI or a TTY need not opt in.
+    fn has_human(&self) -> bool {
+        true
+    }
 }
 
 /// Always approves ordinary tools (non-interactive contexts, tests).
@@ -61,6 +71,10 @@ pub struct AutoApprove;
 
 #[async_trait]
 impl Approver for AutoApprove {
+    fn has_human(&self) -> bool {
+        false
+    }
+
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
         if is_memory_write_tool(&request.tool) {
             return ApprovalDecision::Deny;
@@ -717,6 +731,20 @@ mod tests {
             let back: ApprovalDecision = serde_json::from_str(&json).unwrap();
             assert_eq!(back, decision);
         }
+    }
+
+    /// A denial from a context with nobody in it is not a user decision.
+    /// Reporting it as one teaches the model that this user rejects memories,
+    /// which is exactly backwards — they were never asked.
+    #[test]
+    fn non_interactive_approvers_do_not_pose_as_a_human() {
+        assert!(
+            !AutoApprove.has_human(),
+            "AutoApprove runs where no human can be asked"
+        );
+        // AutoDeny is a decision ("no"), not an absent human — it stands in for
+        // a user refusal in tests and must keep reading as one.
+        assert!(AutoDeny.has_human());
     }
 
     #[test]

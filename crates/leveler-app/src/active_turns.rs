@@ -45,6 +45,17 @@ impl ActiveTurns {
         Ok(token)
     }
 
+    /// Whether a main turn is currently running for this session.
+    ///
+    /// Used to decide whether mid-turn input can be steered into the running
+    /// loop or should be rejected so the caller submits it normally.
+    pub(crate) fn is_running(&self, session_id: &SessionId) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(session_id)
+    }
+
     pub(crate) fn cancel(&self, session_id: &SessionId) -> bool {
         if let Some(token) = self.active.lock().unwrap().get(session_id) {
             token.cancel();

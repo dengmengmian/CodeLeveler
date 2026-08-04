@@ -11,6 +11,22 @@
 4. **确定性安全控制。** 路径检查、权限、限额、取消与校验由宿主代码执行，而不是模型指令。
 5. **可恢复的本地状态。** Session 与运行时事件可持久化并恢复，不依赖远程控制面。
 
+## 核心
+
+产品核心只有一件事：**在宿主强制的边界内，让模型用工具把仓库里的活干完，并且状态可恢复、可审计。**  
+其余（TUI/Web、slash、技能、远程配对）都是入口或扩展面，不是引擎本身。
+
+核心四块：
+
+| 块 | 职责 | 主要落点 |
+| --- | --- | --- |
+| **1. 工具循环（direct loop）** | 模型提出工具调用 → 宿主执行 → 结果回灌 → 再调用，直到本轮结束（或 goal 模式 `update_goal` complete/blocked）。 | `leveler-engine` + `leveler-agent` |
+| **2. 执行边界** | 工作区路径、权限、沙箱、取消、危险命令策略由**宿主强制**，不靠模型自觉。 | `leveler-execution`（及 `leveler-tools` 分发） |
+| **3. 会话状态** | 对话与运行时事件可持久化、可 resume，工作不绑死单一进程生命周期。 | `leveler-storage` + engine 事件日志 |
+| **4. 模型适配** | 请求、流式与工具调用帧在薄协议/provider 层之上保持厂商中立。 | `leveler-model` + `leveler-protocol` + `leveler-provider` |
+
+非核心（宜薄、可后做）：UI 装饰、命令菜单、多阶段编排栈、插件市场，以及超出循环与门闩所需的过厚产品轴。
+
 每个 crate 都 `forbid(unsafe_code)`。应用与 CLI 可用 `anyhow` 补充上下文；
 可复用的库 crate 暴露 `thiserror` 类型化错误。
 
@@ -31,7 +47,7 @@ User
                                   │
                  ┌────────────────┼─────────────────┐
                  ▼                ▼                 ▼
-          leveler-agent   leveler-orchestrator  leveler-verifier
+          leveler-agent                    leveler-verifier
                  │                │                 │
                  ├────────▶ leveler-context         │
                  └────────▶ leveler-tools ◀─────────┘
@@ -77,12 +93,15 @@ HTTP 字节流
 SSE 解码接受任意分片。Tool-call 参数拼完整后再做 JSON 解析；非法或截断的 JSON
 会报错，**不会**被“修好”成可执行调用。
 
-### 3. Turn 与编排
+### 3. Turn 与工具循环
 
-`leveler-engine` 拥有 task/turn 生命周期。直接运行驱动一条 agent 循环；编排运行
-增加需求抽取、定位、任务图与评审。生命周期词汇在 `leveler-lifecycle` 共享。
+`leveler-engine` 拥有 task/turn 生命周期。**产品侧执行只有一条路径：direct agent
+工具循环。** 长任务仍走该路径——goal 模式（`update_goal` 直到 complete 或 blocked）
+与可选的 `spawn_agent` 扇出。多阶段 orchestrate 栈（crate、CLI `plan`/`discuss`、
+双 session 模式）已移除。日志里遗留的 `orchestrate` kind 会被接受并按 direct 跑。
 
-模型可以提议动作，但状态迁移、资源预算、取消、权限决策与完成规则由宿主代码拥有。
+生命周期词汇在 `leveler-lifecycle` 共享。模型可以提议动作，但状态迁移、资源预算、
+取消、权限决策与完成规则由宿主代码拥有。
 
 ### 4. 工具与命令执行
 

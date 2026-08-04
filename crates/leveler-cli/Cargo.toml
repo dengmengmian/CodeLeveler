@@ -23,7 +23,6 @@ leveler-memory = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-agent = { workspace = true }
 leveler-verifier = { workspace = true }
-leveler-orchestrator = { workspace = true }
 leveler-engine = { workspace = true }
 leveler-eval = { workspace = true }
 leveler-lsp = { workspace = true }
@@ -38,6 +37,8 @@ leveler-session-wire = { workspace = true }
 leveler-tui = { workspace = true }
 leveler-web = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
+toml_edit = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

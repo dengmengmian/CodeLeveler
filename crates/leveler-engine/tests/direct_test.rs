@@ -195,6 +195,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             grants_state_dir: None,
+            steering: None,
             allow_delegation: true,
         },
         approver: Arc::new(AutoApprove),
@@ -907,6 +908,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             permission_rules_path: None,
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             grants_state_dir: None,
+            steering: None,
             allow_delegation: true,
         },
         approver: Arc::new(AutoApprove),
@@ -963,20 +965,6 @@ async fn resume_refuses_a_successfully_completed_session() {
     assert!(err.to_string().contains("already completed"), "{err}");
 }
 
-#[tokio::test]
-async fn resume_refuses_a_kind_mismatch() {
-    let h = harness(patch_then_resolve()).await;
-    let mut spec = spec(&h, VerificationPlan::default());
-    let session = h.engine.create_task(&spec).await.unwrap();
-    spec.kind = ExecutionKind::Orchestrate;
-    let err = h
-        .engine
-        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
-        .await
-        .expect_err("kind mismatch must be refused");
-    assert!(err.to_string().contains("is `direct`"), "{err}");
-}
-
 /// The engine's goal continuation (`continue_active_goal`) opens a whole new
 /// turn AFTER the user already saw a final answer. Without an advisory event a
 /// UI can only show a bare "waiting for model" for the entire continuation —
@@ -1019,6 +1007,49 @@ async fn goal_continuation_announces_itself_before_re_prompting() {
             EngineEvent::AdvisoryStarted { kind } if kind == "goal_continuation"
         )),
         "a goal continuation turn must announce itself: {seen:?}"
+    );
+}
+
+/// Quiet text without `update_goal` must not read as a successful task finish.
+///
+/// Headless `engine.run` always uses the Goal turn profile (direct tool loop).
+/// Going quiet exhausts closeout / continuation and must land on a non-success
+/// outcome — never Verified / CompletedUnverified "as if done".
+#[tokio::test]
+async fn quiet_without_update_goal_is_not_task_success() {
+    // Enough quiet rounds to burn goal nudge + engine continuation budget.
+    let mut responses = Vec::new();
+    for _ in 0..12 {
+        responses.push(text("看起来做完了。"));
+    }
+    let h = harness(responses).await;
+    let s = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_ne!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "quiet must never claim verified: {:?}",
+        report.outcome
+    );
+    assert_ne!(
+        report.outcome,
+        TaskOutcome::CompletedUnverified,
+        "quiet must never claim completed-unverified success: {:?}",
+        report.outcome
+    );
+    assert!(
+        matches!(
+            report.outcome,
+            TaskOutcome::Failed | TaskOutcome::BudgetLimited | TaskOutcome::Interrupted
+        ),
+        "expected non-success terminal for unresolved goal, got {:?}",
+        report.outcome
     );
 }
 

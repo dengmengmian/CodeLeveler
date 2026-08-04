@@ -15,7 +15,6 @@ leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-model = { workspace = true }
-leveler-orchestrator = { workspace = true }
 leveler-storage = { workspace = true }
 leveler-tools = { workspace = true }
 leveler-verifier = { workspace = true }

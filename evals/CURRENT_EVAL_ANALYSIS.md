@@ -35,6 +35,6 @@
 ## 本次验收执行方式（受限于环境）
 
 - 真实 Provider：`deepseek/deepseek-v4-pro`（base_url taotoken.net，非 localhost）。
-- 真实 agent 路径：`leveler eval quick|daily`（orchestrated，非内部 API mock）。
+- 真实 agent 路径：`leveler eval quick|daily`（direct tool loop，非内部 API mock）。
 - 交互 TUI：现有 soak/e2e（PTY 层）。
 - 基线：`evals/history/baseline-<commit>.json` → `ACCEPTANCE_BASELINE_REPORT.md`。

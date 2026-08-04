@@ -28,6 +28,6 @@ cargo test -p leveler-tui  --test tui_session_e2e
 
 ## 为什么不在这里造 YAML 场景
 
-`leveler eval` 的 case 执行器驱动的是 orchestrated/direct agent 循环，不是 TUI 客户端路径；
+`leveler eval` 的 case 执行器驱动的是 direct agent 工具循环，不是 TUI 客户端路径；
 把 TUI 塞进 `EvaluationCase` 需要改执行器（round 1 只扩 Eval、不改 Agent/executor）。
 现有两套测试已经在正确的层级驱动 TUI，重复造反而更差。

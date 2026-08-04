@@ -25,7 +25,7 @@ const LOGO: &[&str] = &[
 ];
 
 /// Commands surfaced in the splash tips list (must exist in the slash registry).
-const TIP_COMMANDS: &[&str] = &["/goal", "/workflow", "/model", "/help"];
+const TIP_COMMANDS: &[&str] = &["/goal", "/skill", "/model", "/help"];
 
 /// Gap between the logo column and the text column.
 const GAP: usize = 3;

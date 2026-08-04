@@ -1,10 +1,6 @@
-//! Completion-gate and goal-persistence nudges injected into the loop.
+//! Goal-persistence nudge injected into the loop.
 
 use leveler_model::{Message, Role};
-
-/// The transient progress-summary nudge injected by the step-summary control.
-pub(crate) const STEP_SUMMARY_NUDGE: &str = "Briefly summarize what you have done so far and \
-     what remains, then continue with the next concrete action.";
 
 pub(crate) fn first_user_text(messages: &[Message]) -> String {
     messages

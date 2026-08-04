@@ -41,6 +41,29 @@ impl ToolRegistry {
     /// admits side effects that break the subset's guarantee (create_checkpoint
     /// resets the rollback baseline; wait_task can restore a workspace
     /// snapshot). A newly added Safe tool stays out until listed here.
+    /// The subset named by `allowed`, intersected with what this registry
+    /// actually has.
+    ///
+    /// An empty `allowed` means "inherit everything" — a caller that wants to
+    /// hand an agent nothing must say so some other way, because an empty
+    /// allowlist is far more often a config typo than a deliberate lockout.
+    /// Names that match nothing are ignored here; the caller validates them.
+    pub fn named_subset(&self, allowed: &[String]) -> ToolRegistry {
+        let mut subset = ToolRegistry::new();
+        if allowed.is_empty() {
+            for tool in self.tools.values() {
+                subset.register(tool.clone());
+            }
+            return subset;
+        }
+        for tool in self.tools.values() {
+            if allowed.iter().any(|a| a == tool.name()) {
+                subset.register(tool.clone());
+            }
+        }
+        subset
+    }
+
     pub fn read_only_subset(&self) -> ToolRegistry {
         use leveler_execution::RiskLevel;
         const READ_ONLY_TOOLS: &[&str] = &[

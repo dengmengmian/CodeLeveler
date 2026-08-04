@@ -2,9 +2,8 @@
 //!
 //! One execution kernel: session lifecycle, turn boundaries, an append-only
 //! event log (persist-before-forward), and executor construction, with
-//! Direct/Plan strategies layered on top. `leveler-agent`'s `Executor` stays
-//! the turn-runner; this crate wraps it with persistence and unifies the
-//! previously-divergent direct and orchestrate paths.
+//! Direct strategy layered on top. `leveler-agent`'s `Executor` stays the
+//! turn-runner; this crate wraps it with persistence.
 #![forbid(unsafe_code)]
 
 mod baseline;
@@ -21,12 +20,12 @@ pub use engine::{
     TaskEngine, TaskReport, TaskSpec, acknowledge_crash_window, budget_prior_messages, mode_str,
 };
 pub use event::{
-    DataClass, EngineEvent, ExecutionKind, PublicAcceptanceStatus, PublicEvent, PublicTurnKind,
-    TurnKind,
+    DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
+    PublicTurnKind, TurnKind,
 };
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
-pub use factory::{ExecutorFactory, TurnProfile};
+pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::EventLog;
 pub use policy_resolver::{
@@ -44,8 +43,6 @@ pub enum EngineError {
     Storage(#[from] leveler_storage::StorageError),
     #[error("agent error: {0}")]
     Agent(#[from] leveler_agent::AgentError),
-    #[error("planner error: {0}")]
-    Planner(#[from] leveler_orchestrator::OrchestratorError),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("configuration error: {0}")]

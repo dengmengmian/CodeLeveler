@@ -22,7 +22,7 @@
 ## 二、既有能力（复用，未重造）
 
 - 验证驱动判定：`passed() = completed && expect_passed`，验收命令独立于模型自报。
-- 三条执行路径：orchestrated / `--direct` / `--no-verify-gate`（ablation）。
+- 执行路径：direct tool loop；`--direct` 兼容 flag；`--no-verify-gate`（ablation）。
 - 失败首因归因：`classify_failure` 9 类；`TerminationClass` 7 类结束边界。
 - 模型对比与旋钮消融：`Comparison`（model_gap/effort_gap + flip 列表 = **Regression Rate** 来源）、`Ablation`。
 - 持久化 baseline：`--json-out` → `BaselineDocument` + `BaselineMeta`（git_sha/模型/mode/引擎版本/case 组成）。

@@ -620,7 +620,6 @@ pub(crate) struct StreamRoundResult {
 /// the agent loop only consumes the already-resolved values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubAgentExecutionPolicy {
-    pub step_summary_every: u32,
     pub max_search_calls_per_step: usize,
     pub max_parallel_tools: usize,
     pub require_explicit_plan: bool,
@@ -645,8 +644,84 @@ impl SubAgentExecutionPolicies {
     }
 }
 
+/// Where mid-turn user input comes from.
+///
+/// A correction like "actually use the other module" is worthless once the work
+/// is finished, so it must reach the model at the next round rather than after
+/// the turn. The loop only asks; the host decides what (if anything) is
+/// waiting — the same shape as `Approver` and `Clarifier`.
+pub trait SteeringSource: Send + Sync {
+    /// Take everything queued since the last call. Returning empty is the
+    /// normal case and must be cheap.
+    fn take_pending(&self) -> Vec<String>;
+}
+
+/// How one turn runs.
+///
+/// Grouped as one value so a caller — or an agent definition — can carry a
+/// complete policy instead of setting a dozen independent knobs and hoping they
+/// are consistent. The loop reads it; it never derives policy of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnPolicy {
+    // ── Loop shape ──────────────────────────────────────────────────────────
+    /// Max search-tool calls allowed within a single step/round (0 = off);
+    /// excess calls are denied so the model acts on what it already gathered.
+    pub max_search_calls_per_step: usize,
+    /// Max read-only tools executed concurrently within one round's parallel
+    /// batch (0 = unbounded).
+    pub max_parallel_tools: usize,
+    /// Ask the model to write an explicit plan before acting (spec §17).
+    pub require_explicit_plan: bool,
+    /// Per-request reasoning effort selected by the execution-policy resolver.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The usable context window in tokens (0 = disabled). When the last
+    /// request's reported token count exceeds this, the in-memory transcript is
+    /// compacted before the next round so a long task never overflows.
+    pub context_budget: u32,
+
+    // ── Completion gates ────────────────────────────────────────────────────
+    /// The run ends only when the model explicitly calls
+    /// `update_goal(complete|blocked)`. Going quiet does not finish it.
+    pub goal_mode: bool,
+    /// Refuse `update_goal(complete)` while model-declared todos are open.
+    pub goal_todo_gate: bool,
+    /// Delivery process evidence gate (mutation → verify).
+    pub delivery_gate: bool,
+
+    // ── Delegation ──────────────────────────────────────────────────────────
+    /// When false, `spawn_agent` is not advertised (delegation kill-switch).
+    pub allow_delegation: bool,
+    /// Max sub-agents running at once (within a spawn batch).
+    pub max_concurrent_agents: usize,
+    /// Max sub-agents spawned across the whole top-level run.
+    pub max_total_agents: usize,
+}
+
+impl Default for TurnPolicy {
+    fn default() -> Self {
+        Self {
+            max_search_calls_per_step: 0,
+            max_parallel_tools: 0,
+            require_explicit_plan: false,
+            reasoning_effort: None,
+            context_budget: 0,
+            goal_mode: false,
+            // Matches the historical `Executor::new` default — the gate is ON.
+            goal_todo_gate: true,
+            delivery_gate: false,
+            allow_delegation: true,
+            max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
+            max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
+        }
+    }
+}
+
 /// A single-agent tool executor.
 pub struct Executor {
+    /// How this turn runs (loop shape, gates, delegation).
+    policy: TurnPolicy,
+    /// Mid-turn user input, when the host offers any.
+    steering: Option<Arc<dyn SteeringSource>>,
     runtime: Arc<dyn ModelRuntime>,
     registry: Arc<ToolRegistry>,
     tool_context: ToolContext,
@@ -658,24 +733,6 @@ pub struct Executor {
     auto_reviewer: Arc<dyn AutoReviewer>,
     approval_policy: ApprovalPolicy,
     clarifier: Arc<dyn Clarifier>,
-    /// Inject a progress-summary nudge every N rounds (0 = off).
-    step_summary_every: u32,
-    /// Max search-tool calls allowed within a single step/round (0 = off);
-    /// excess calls are denied so the model acts on what it already gathered.
-    max_search_calls_per_step: usize,
-    /// Max read-only tools executed concurrently within one round's parallel
-    /// batch (0 = unbounded).
-    max_parallel_tools: usize,
-    /// Ask the model to write an explicit plan before acting (spec §17).
-    require_explicit_plan: bool,
-    /// Refuse the first "I'm done" until the model has run a verification
-    /// command (build/tests) as evidence (spec §17).
-    /// Per-request reasoning effort selected by the execution-policy resolver.
-    reasoning_effort: Option<ReasoningEffort>,
-    /// The usable context window in tokens (0 = disabled). When the last
-    /// request's reported token count exceeds this, the in-memory transcript is
-    /// compacted before the next round so a long task never overflows.
-    context_budget: u32,
     /// Sub-agent nesting depth (0 = the top-level agent). Bounds `spawn_agent`
     /// recursion.
     depth: u32,
@@ -684,23 +741,10 @@ pub struct Executor {
     /// When `Some`, `apply_patch` may only touch these files (worker ownership).
     /// `None` = unrestricted.
     write_allowlist: Option<Vec<String>>,
-    /// Max sub-agents running at once (within a spawn batch).
-    max_concurrent_agents: usize,
-    /// Max sub-agents spawned across the whole top-level run.
-    max_total_agents: usize,
-    /// When false, `spawn_agent` is not advertised (delegation kill-switch).
-    allow_delegation: bool,
     /// Role-specific policies resolved by the engine for delegated executors.
     /// Direct library users fall back to the parent's settings, with writes
     /// serialized, so the safety invariant does not depend on the app layer.
     sub_agent_policies: Option<SubAgentExecutionPolicies>,
-    /// Goal mode: the run ends only when the model explicitly
-    /// calls `update_goal(complete|blocked)`. Going quiet does not finish — it
-    /// injects a completion-audit continuation and keeps working. Off by default
-    /// (the classic "quiet = done, after one evidence nudge" behavior).
-    goal_mode: bool,
-    /// Audit tool-backed conversational answers for missing branches before
-    /// accepting their natural end. Default off (K29); Delivery/eval may enable.
     /// Seeded plan mirror (resume / host-preseed). Local drive state starts here.
     seeded_plan: PlanState,
     /// Seeded process evidence (resume from last EvidenceLedgerUpdated).
@@ -709,10 +753,6 @@ pub struct Executor {
     seeded_progress: ProgressLedger,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
-    /// Process gate for update_goal(complete) incomplete ModelExplicit todos.
-    goal_todo_gate: bool,
-    /// Delivery process evidence gate (mutation → verify).
-    delivery_gate: bool,
     /// Short memory INDEX for cache-stable system injection (titles only).
     memory_index: String,
     /// Hard per-run limits on commands / modified files / wall-clock time,
@@ -762,26 +802,16 @@ impl Executor {
             auto_reviewer: Arc::new(NeedUserReviewer),
             approval_policy: ApprovalPolicy::default(),
             clarifier: Arc::new(AutoClarify),
-            step_summary_every: 0,
-            max_search_calls_per_step: 0,
-            max_parallel_tools: 0,
-            require_explicit_plan: false,
-            reasoning_effort: None,
-            context_budget: 0,
+            policy: TurnPolicy::default(),
+            steering: None,
             depth: 0,
             agent_role: AgentRole::Default,
             write_allowlist: None,
-            max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
-            max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
-            allow_delegation: true,
             sub_agent_policies: None,
-            goal_mode: false,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             seeded_objective: None,
-            goal_todo_gate: true,
-            delivery_gate: false,
             memory_index: String::new(),
             step_limits: StepLimits::default(),
             permission_rules: std::sync::RwLock::new(
@@ -852,15 +882,15 @@ impl Executor {
 
     /// Enable/disable the S2 goal todo gate on update_goal(complete).
     pub fn with_goal_todo_gate(mut self, on: bool) -> Self {
-        self.goal_todo_gate = on;
+        self.policy.goal_todo_gate = on;
         self
     }
 
     /// Apply work-profile process gates (Delivery enables delivery_gate + audit).
     pub fn with_work_profile(mut self, profile: WorkProfile) -> Self {
         let gate = GateConfig::for_work_profile(profile);
-        self.goal_todo_gate = gate.goal_todo_gate;
-        self.delivery_gate = gate.delivery_gate;
+        self.policy.goal_todo_gate = gate.goal_todo_gate;
+        self.policy.delivery_gate = gate.delivery_gate;
         if matches!(profile, WorkProfile::Delivery) {
             // Delivery may enable answer_audit as a tax when eval/host requests it;
             // default remains off unless explicitly re-enabled by factory.
@@ -876,7 +906,7 @@ impl Executor {
 
     /// Whether delivery process evidence is enforced on update_goal(complete).
     pub fn delivery_gate_enabled(&self) -> bool {
-        self.delivery_gate
+        self.policy.delivery_gate
     }
 
     /// Set hard per-run limits on commands, modified files, and duration.
@@ -901,15 +931,52 @@ impl Executor {
 
     /// Enable goal mode: require an explicit `update_goal(complete|blocked)` to
     /// end the run (see [`Executor::goal_mode`]).
+    /// Supply mid-turn user input for this run.
+    pub fn with_steering(mut self, source: Arc<dyn SteeringSource>) -> Self {
+        self.steering = Some(source);
+        self
+    }
+
+    /// `with_steering` for callers that may or may not have a source.
+    pub fn with_steering_opt(mut self, source: Option<Arc<dyn SteeringSource>>) -> Self {
+        self.steering = source;
+        self
+    }
+
     pub fn with_goal_mode(mut self, on: bool) -> Self {
-        self.goal_mode = on;
+        self.policy.goal_mode = on;
         self
     }
 
     /// Build a sub-agent that reuses this agent's runtime, tools, model, and
     /// permissions, but runs silently on its own fresh conversation with a
     /// wall-clock safety budget and one deeper nesting level.
-    pub(crate) fn child_for_role(&self, role: AgentRole, files: Vec<String>) -> Executor {
+    ///
+    /// The runtime routes per request by `model.provider`, so a different model
+    /// needs no different runtime. `base_instructions` is deliberately dropped
+    /// when the model changes: it is that model's tailored prompt, and handing
+    /// it to another model is worse than falling back to the shared base.
+    /// Apply a named agent definition's own policy to this (child) executor.
+    ///
+    /// `tools` empty and `max_rounds` 0 both mean "inherit" — see
+    /// [`crate::named_agent::NamedAgent`]. Narrowing only: a definition can take
+    /// capability away, never add it back, so an explorer persona cannot name a
+    /// write tool into existence.
+    pub(crate) fn apply_agent_policy(&mut self, tools: &[String], max_rounds: u32) {
+        if !tools.is_empty() {
+            self.registry = Arc::new(self.registry.named_subset(tools));
+        }
+        if max_rounds > 0 {
+            self.continuation = ContinuationPolicy::bounded(max_rounds);
+        }
+    }
+
+    pub(crate) fn child_for_role_on(
+        &self,
+        role: AgentRole,
+        files: Vec<String>,
+        model_override: Option<ModelRef>,
+    ) -> Executor {
         // Explorer gets a read-only toolset (physically no write tools); others
         // inherit the full registry. Worker is additionally pinned to `files`.
         let registry = match role {
@@ -922,25 +989,30 @@ impl Executor {
         };
         let child_policy = self.sub_agent_policies.map_or(
             SubAgentExecutionPolicy {
-                step_summary_every: self.step_summary_every,
-                max_search_calls_per_step: self.max_search_calls_per_step,
+                max_search_calls_per_step: self.policy.max_search_calls_per_step,
                 max_parallel_tools: match role {
                     AgentRole::Worker => 1,
-                    AgentRole::Default | AgentRole::Explorer => self.max_parallel_tools,
+                    AgentRole::Default | AgentRole::Explorer => self.policy.max_parallel_tools,
                 },
-                require_explicit_plan: self.require_explicit_plan,
-                reasoning_effort: self.reasoning_effort,
+                require_explicit_plan: self.policy.require_explicit_plan,
+                reasoning_effort: self.policy.reasoning_effort,
             },
             |policies| policies.for_role(role),
         );
+        let switched = model_override.is_some();
         Executor {
-            // A sub-agent runs the parent's model, so it inherits that model's prompt.
-            base_instructions: self.base_instructions.clone(),
+            // A sub-agent runs the parent's model, so it inherits that model's
+            // prompt — unless it was pinned to another one.
+            base_instructions: if switched {
+                None
+            } else {
+                self.base_instructions.clone()
+            },
             commit_co_author: self.commit_co_author,
             runtime: self.runtime.clone(),
             registry,
             tool_context: self.tool_context.clone(),
-            model: self.model.clone(),
+            model: model_override.unwrap_or_else(|| self.model.clone()),
             continuation: ContinuationPolicy::UntilTerminal,
             max_output_tokens: self.max_output_tokens,
             pricing: self.pricing,
@@ -949,29 +1021,35 @@ impl Executor {
             approval_policy: self.approval_policy,
             // A sub-agent never blocks the UI for clarifications.
             clarifier: Arc::new(AutoClarify),
-            step_summary_every: child_policy.step_summary_every,
-            max_search_calls_per_step: child_policy.max_search_calls_per_step,
-            max_parallel_tools: child_policy.max_parallel_tools,
-            require_explicit_plan: child_policy.require_explicit_plan,
-            reasoning_effort: child_policy.reasoning_effort,
-            context_budget: self.context_budget,
+            // A sub-agent runs a self-contained task; steering belongs to the
+            // top-level turn the user is watching.
+            steering: None,
+            policy: TurnPolicy {
+                // Loop shape comes from the role's resolved policy…
+                max_search_calls_per_step: child_policy.max_search_calls_per_step,
+                max_parallel_tools: child_policy.max_parallel_tools,
+                require_explicit_plan: child_policy.require_explicit_plan,
+                reasoning_effort: child_policy.reasoning_effort,
+                // …the rest is inherited or deliberately reset for a child.
+                context_budget: self.policy.context_budget,
+                max_concurrent_agents: self.policy.max_concurrent_agents,
+                max_total_agents: self.policy.max_total_agents,
+                // Children never advertise spawn_agent (depth already blocks it).
+                allow_delegation: false,
+                // A sub-agent finishes when it goes quiet; only the top-level
+                // run uses explicit goal resolution.
+                goal_mode: false,
+                goal_todo_gate: false,
+                delivery_gate: false,
+            },
             depth: self.depth + 1,
             agent_role: role,
             write_allowlist,
-            max_concurrent_agents: self.max_concurrent_agents,
-            max_total_agents: self.max_total_agents,
-            // Children never advertise spawn_agent (depth already blocks it).
-            allow_delegation: false,
             sub_agent_policies: self.sub_agent_policies,
-            // A sub-agent finishes when it goes quiet; only the top-level run
-            // uses explicit goal resolution.
-            goal_mode: false,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             seeded_objective: None,
-            goal_todo_gate: false,
-            delivery_gate: false,
             memory_index: String::new(),
             step_limits: StepLimits {
                 max_duration: Some(crate::sub_agent::SUB_AGENT_MAX_DURATION),
@@ -991,14 +1069,14 @@ impl Executor {
 
     /// Set the sub-agent concurrency and total caps (per top-level run).
     pub fn with_agents(mut self, max_concurrent: usize, max_total: usize) -> Self {
-        self.max_concurrent_agents = max_concurrent.max(1);
-        self.max_total_agents = max_total;
+        self.policy.max_concurrent_agents = max_concurrent.max(1);
+        self.policy.max_total_agents = max_total;
         self
     }
 
     /// Product kill-switch: when false, `spawn_agent` is not in the tool list.
     pub fn with_delegation(mut self, allow: bool) -> Self {
-        self.allow_delegation = allow;
+        self.policy.allow_delegation = allow;
         self
     }
 
@@ -1007,7 +1085,7 @@ impl Executor {
     /// a long autonomous task folds its transcript instead of overflowing the
     /// window. Ignored when zero.
     pub fn with_context_budget(mut self, context_budget: u32) -> Self {
-        self.context_budget = context_budget;
+        self.policy.context_budget = context_budget;
         self
     }
 
@@ -1015,7 +1093,7 @@ impl Executor {
     /// combines this with the model's reasoning style; `None` lets the profile
     /// recommendation (or provider default) stand.
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
-        self.reasoning_effort = reasoning_effort;
+        self.policy.reasoning_effort = reasoning_effort;
         self
     }
 
@@ -1025,19 +1103,16 @@ impl Executor {
         self
     }
 
-    /// Apply execution controls: inject a progress summary
-    /// every `step_summary_every` rounds (0 = off), cap search-tool calls per
-    /// step to `max_search_calls_per_step` (0 = off), and bound the round's
-    /// concurrent read-only tool batch to `max_parallel_tools` (0 = unbounded).
+    /// Apply execution controls: cap search-tool calls per step to
+    /// `max_search_calls_per_step` (0 = off), and bound the round's concurrent
+    /// read-only tool batch to `max_parallel_tools` (0 = unbounded).
     pub fn with_execution_controls(
         mut self,
-        step_summary_every: u32,
         max_search_calls_per_step: usize,
         max_parallel_tools: usize,
     ) -> Self {
-        self.step_summary_every = step_summary_every;
-        self.max_search_calls_per_step = max_search_calls_per_step;
-        self.max_parallel_tools = max_parallel_tools;
+        self.policy.max_search_calls_per_step = max_search_calls_per_step;
+        self.policy.max_parallel_tools = max_parallel_tools;
         self
     }
 
@@ -1059,7 +1134,7 @@ impl Executor {
 
     /// Ask for an explicit plan before acting (spec §17).
     pub fn with_structure(mut self, require_explicit_plan: bool) -> Self {
-        self.require_explicit_plan = require_explicit_plan;
+        self.policy.require_explicit_plan = require_explicit_plan;
         self
     }
 
@@ -1085,7 +1160,7 @@ impl Executor {
                 project_rules,
                 user_language: crate::prompt::user_language(request),
             })
-            .require_explicit_plan(self.require_explicit_plan)
+            .require_explicit_plan(self.policy.require_explicit_plan)
             .memory_index(self.memory_index.clone())
             .build();
         match self.agent_role {
@@ -1109,10 +1184,11 @@ impl Executor {
             }
             AgentRole::Default => {}
         }
-        if self.goal_mode {
+        if self.policy.goal_mode {
             prompt.push_str(
                 "\n\nGOAL MODE: this turn ends ONLY when you call the update_goal tool — going \
-                 silent does NOT finish it.\n\
+                 silent does NOT finish it. There is no separate \"orchestrate\" pipeline: you \
+                 stay in this direct tool loop for as long as the work needs.\n\
                  - **Greeting / small talk:** answer once in plain text (no trailing tip), then \
                  update_goal(status=\"complete\", summary=≤12 words). Do not call exploration \
                  tools for a bare greeting.\n\
@@ -1130,6 +1206,10 @@ impl Executor {
                  Then update_goal(complete). If genuinely stuck, update_goal(blocked). Never \
                  shrink the objective to what already exists. Use next_step for the single best \
                  follow-up action when one exists.\n\
+                 - **Large multi-part goals:** break into concrete steps; use `spawn_agent` in \
+                 the same turn for independent investigation or disjoint edits (explorer vs \
+                 worker with disjoint `files`). After children return, integrate results and \
+                 continue until the whole goal is proven — do not stop after the first sub-task.\n\
                  - **Same-session follow-ups:** use prior messages and what you already learned. \
                  Do not pretend the conversation is empty or re-scan the whole repo unless the \
                  user asks something that needs new evidence.\n\
@@ -1278,7 +1358,7 @@ impl Executor {
         let request = text_of(&content);
         // Active objective is THIS message — never the first user in `prior`.
         let objective = self.seeded_objective.clone().unwrap_or_else(|| {
-            if self.goal_mode {
+            if self.policy.goal_mode {
                 ObjectiveAnchor::from_session_goal(&request)
             } else {
                 ObjectiveAnchor::from_user_message(&request)

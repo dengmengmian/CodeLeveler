@@ -820,45 +820,6 @@ fn command_progress_heartbeat_names_the_running_command_with_elapsed() {
 }
 
 #[test]
-fn enter_on_queued_item_starts_now_and_interrupts_turn() {
-    let mut s = state();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::AgentActivity {
-            label: "run".into(),
-        }),
-    );
-    assert_eq!(s.status, RuntimeStatus::Busy);
-    s.input_queues.queued = vec!["first".into(), "second".into()];
-    s.queue_collapsed = false;
-    s.queue_selected = Some(1); // waiting index 1 = "second"
-
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    // Running turn is interrupted so the runtime idles and drains this item.
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::CancelCurrentTurn {
-            session_id: SessionId::new("s1"),
-        })]
-    );
-    // "second" jumped to the front so it runs next.
-    assert_eq!(
-        s.input_queues.queued.first().map(String::as_str),
-        Some("second")
-    );
-}
-
-#[test]
-fn delete_cancels_selected_queued_item() {
-    let mut s = state();
-    s.input_queues.queued = vec!["a".into(), "b".into()];
-    s.queue_collapsed = false;
-    s.queue_selected = Some(0); // first waiting = "a"
-    reduce(&mut s, key(KeyCode::Delete));
-    assert_eq!(s.input_queues.queued, vec!["b".to_string()]);
-}
-
-#[test]
 fn ctrl_c_busy_cancels_then_force_cancels() {
     let mut s = state();
     reduce(
@@ -1049,15 +1010,15 @@ fn model_picker_confirm_sends_select_model_and_closes() {
 fn slash_popup_down_arrow_selects_and_tab_completes() {
     let mut s = opened();
     typed(&mut s, "/"); // popup lists all commands
-    reduce(&mut s, key(KeyCode::Down)); // move highlight from /model to /mode
+    reduce(&mut s, key(KeyCode::Down)); // move highlight from /model to /permission
     assert_eq!(s.slash_selected, 1);
     reduce(&mut s, key(KeyCode::Tab)); // complete to the highlighted command
-    assert_eq!(s.composer.text(), "/mode ");
+    assert_eq!(s.composer.text(), "/permission ");
     assert_eq!(s.slash_selected, 0, "selection resets after completing");
 }
 
-/// Typing `/mode` still lists `/model` + `/mode`; ↑/↓ must move selection
-/// (regression: workbench popup rendered both rows without a highlight).
+/// Typing `/mode` still lists `/model` + `/permission` (mode is an alias);
+/// ↑/↓ must move selection (regression: popup rendered without a highlight).
 #[test]
 fn mode_prefix_popup_allows_up_down_selection() {
     let mut s = opened();
@@ -1065,22 +1026,22 @@ fn mode_prefix_popup_allows_up_down_selection() {
     let matches = leveler_tui::screen::visible_slash_popup(&s);
     assert!(
         matches.len() >= 2,
-        "expected /model and /mode under prefix /mode, got {matches:?}"
+        "expected /model and /permission under prefix /mode, got {matches:?}"
     );
     assert_eq!(matches[0].0, "/model");
-    assert_eq!(matches[1].0, "/mode");
+    assert_eq!(matches[1].0, "/permission");
     assert_eq!(s.slash_selected, 0);
 
     reduce(&mut s, key(KeyCode::Down));
-    assert_eq!(s.slash_selected, 1, "Down must highlight /mode");
+    assert_eq!(s.slash_selected, 1, "Down must highlight /permission");
     reduce(&mut s, key(KeyCode::Up));
     assert_eq!(s.slash_selected, 0, "Up must return to /model");
     reduce(&mut s, key(KeyCode::Down));
     reduce(&mut s, key(KeyCode::Tab));
     assert_eq!(
         s.composer.text(),
-        "/mode ",
-        "Tab completes the highlighted /mode row"
+        "/permission ",
+        "Tab completes the highlighted /permission row"
     );
 }
 
@@ -1504,21 +1465,6 @@ fn whitespace_only_paste_is_inserted_as_text() {
 }
 
 #[test]
-fn uncertain_async_command_fails_closed_until_snapshot_resync() {
-    let mut s = opened();
-    s.status = RuntimeStatus::Busy;
-    s.input_queues.mark_pending("retry me".into());
-    reduce(
-        &mut s,
-        Action::EffectCompleted(EffectCompletion::CommandFailed { snapshot: None }),
-    );
-    assert_eq!(s.status, RuntimeStatus::Busy);
-    assert!(!s.runtime_connected);
-    assert_eq!(s.input_queues.pending, vec!["retry me"]);
-    assert!(s.input_queues.rejected.is_empty());
-}
-
-#[test]
 fn overlay_captures_keys_away_from_composer() {
     let mut s = opened();
     typed(&mut s, "/model");
@@ -1541,9 +1487,20 @@ fn slash_clear_empties_transcript() {
         }),
     );
     assert!(!s.transcript.is_empty());
+    // First /clear only arms confirm; second actually wipes.
     typed(&mut s, "/clear");
-    reduce(&mut s, key(KeyCode::Enter));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty());
+    assert!(!s.transcript.is_empty());
+    assert!(s.clear_confirm_armed);
+    typed(&mut s, "/clear");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Send(ClientCommand::ClearConversation { .. })]
+    ));
     assert!(s.transcript.is_empty());
+    assert!(!s.clear_confirm_armed);
 }
 
 #[test]
@@ -1605,29 +1562,6 @@ fn tool_completed(s: &mut AppState, id: &str, ok: bool) {
             duration_ms: 82,
         }),
     );
-}
-
-#[test]
-fn submit_goes_busy_immediately_so_a_second_submit_queues() {
-    let mut s = opened();
-    for ch in "first".chars() {
-        reduce(&mut s, key(KeyCode::Char(ch)));
-    }
-    let e1 = reduce(&mut s, key(KeyCode::Enter));
-    // Busy the instant we submit — before any runtime event arrives.
-    assert_eq!(s.status, RuntimeStatus::Busy);
-    assert!(matches!(
-        e1.as_slice(),
-        [Effect::Send(ClientCommand::SubmitMessage { .. })]
-    ));
-
-    // A second submit in that window must QUEUE, not double-drive the runtime.
-    for ch in "second".chars() {
-        reduce(&mut s, key(KeyCode::Char(ch)));
-    }
-    let e2 = reduce(&mut s, key(KeyCode::Enter));
-    assert!(e2.is_empty(), "second submit must not send a second turn");
-    assert_eq!(s.input_queues.waiting_len(), 1, "it must be queued");
 }
 
 #[test]
@@ -2288,16 +2222,7 @@ fn clarification_esc_skips_with_empty_answer() {
     );
 }
 
-// ---- Phase 7 + 8: agents, help, theme, completion, scroll ------------------
-
-#[test]
-fn ctrl_g_toggles_agents_screen() {
-    let mut s = opened();
-    reduce(&mut s, ctrl('g'));
-    assert_eq!(s.active_screen, Screen::Agents);
-    reduce(&mut s, key(KeyCode::Esc));
-    assert_eq!(s.active_screen, Screen::Conversation);
-}
+// ---- Phase 7 + 8: help, theme, completion, scroll ------------------
 
 #[test]
 fn slash_help_opens_help_screen() {
@@ -2338,7 +2263,7 @@ fn tab_completes_slash_command() {
     let mut s = opened();
     typed(&mut s, "/mod");
     reduce(&mut s, key(KeyCode::Tab));
-    // "/mod" matches both /mode and /model; first declared is /model.
+    // "/mod" matches /model and /permission (via /mode alias); first is /model.
     assert_eq!(s.composer.text(), "/model ");
 }
 
@@ -2573,17 +2498,6 @@ fn plan_and_verification_events_update_state() {
 }
 
 #[test]
-fn ctrl_p_and_ctrl_r_toggle_screens() {
-    let mut s = opened();
-    reduce(&mut s, ctrl('p'));
-    assert_eq!(s.active_screen, Screen::Plan);
-    reduce(&mut s, ctrl('p'));
-    assert_eq!(s.active_screen, Screen::Conversation);
-    reduce(&mut s, ctrl('r'));
-    assert_eq!(s.active_screen, Screen::Verification);
-}
-
-#[test]
 fn ctrl_d_opens_diff_and_requests_it() {
     let mut s = opened();
     let effects = reduce(&mut s, ctrl('d'));
@@ -2648,36 +2562,6 @@ fn session_completed_pushes_completion_block() {
 }
 
 #[test]
-fn slash_workflow_toggles_and_sends_command() {
-    let mut s = opened();
-    typed(&mut s, "/workflow");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(s.orchestrate);
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::SetAgentMode {
-            session_id: SessionId::new("s1"),
-            orchestrate: true,
-        })]
-    );
-}
-
-#[test]
-fn slash_wf_short_alias_toggles_workflow() {
-    let mut s = opened();
-    typed(&mut s, "/wf");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(s.orchestrate);
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::SetAgentMode {
-            session_id: SessionId::new("s1"),
-            orchestrate: true,
-        })]
-    );
-}
-
-#[test]
 fn slash_memory_list_sends_list_memory_with_archived() {
     let mut s = opened();
     typed(&mut s, "/memory");
@@ -2723,6 +2607,7 @@ fn memory_list_event_pushes_multiline_transcript_note() {
                 id: "old-fact".into(),
                 title: "old".into(),
             }],
+            pending: vec![],
         }),
     );
     let note = s.transcript.items().iter().find_map(|i| match i {
@@ -2790,28 +2675,6 @@ fn slash_collab_plan_forces_readonly_mode() {
 }
 
 #[test]
-fn confirm_plan_auto_enters_goal() {
-    let mut s = opened();
-    typed(&mut s, "/collab plan");
-    reduce(&mut s, key(KeyCode::Enter));
-    // Seed an assistant plan proposal.
-    s.pending_plan_proposal = Some("1. fix bug\n2. test".into());
-    typed(&mut s, "/confirm-plan");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.collaboration, "goal");
-    assert_eq!(s.mode, PermissionProfile::Assisted);
-    assert!(s.goal_mode_active);
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Send(ClientCommand::ConfirmPlanToGoal { content, .. })
-                if content.contains("fix bug")
-        )),
-        "effects={effects:?}"
-    );
-}
-
-#[test]
 fn tools_screen_filter_narrows_to_shell() {
     let mut s = opened();
     tool_started(&mut s, "t1", "read_file", "a.rs");
@@ -2826,169 +2689,6 @@ fn tools_screen_filter_narrows_to_shell() {
     reduce(&mut s, key(KeyCode::Tab));
     use leveler_tui::screen::ToolFilter;
     assert_eq!(s.tools_screen.filter, ToolFilter::Shell);
-}
-
-#[test]
-fn input_submitted_while_busy_is_queued_then_drained_when_idle() {
-    let mut s = opened();
-    s.status = RuntimeStatus::Busy;
-    typed(&mut s, "next task");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(effects.is_empty(), "must not send while busy");
-    assert_eq!(s.input_queues.queued, vec!["next task".to_string()]);
-    assert!(s.composer.is_empty(), "composer cleared after queuing");
-
-    // The turn finishes: draining submits the queued message.
-    s.status = RuntimeStatus::Idle;
-    let effects = leveler_tui::reducer::drain_queued(&mut s);
-    assert!(
-        matches!(
-            effects.first(),
-            Some(Effect::Send(ClientCommand::SubmitMessage { .. }))
-        ),
-        "queued input should submit when idle: {effects:?}"
-    );
-    assert!(
-        s.input_queues.queued.is_empty(),
-        "queue cleared after draining"
-    );
-    assert_eq!(
-        s.input_queues.pending,
-        vec!["next task".to_string()],
-        "drained input waits for a runtime turn-start signal"
-    );
-}
-
-#[test]
-fn multiple_queued_items_are_fifo_and_backspace_deletes_last() {
-    let mut s = opened();
-    s.status = RuntimeStatus::Busy;
-    for msg in ["first", "second", "third"] {
-        typed(&mut s, msg);
-        reduce(&mut s, key(KeyCode::Enter));
-    }
-    assert_eq!(
-        s.input_queues.queued,
-        vec![
-            "first".to_string(),
-            "second".to_string(),
-            "third".to_string()
-        ]
-    );
-
-    // Backspace on an empty composer removes the MOST RECENT queued item.
-    reduce(&mut s, key(KeyCode::Backspace));
-    assert_eq!(
-        s.input_queues.queued,
-        vec!["first".to_string(), "second".to_string()]
-    );
-
-    // Draining runs them OLDEST-first (FIFO).
-    s.status = RuntimeStatus::Idle;
-    let effects = leveler_tui::reducer::drain_queued(&mut s);
-    assert!(
-        matches!(
-            effects.first(),
-            Some(Effect::Send(ClientCommand::SubmitMessage { content, .. })) if content == "first"
-        ),
-        "FIFO: oldest runs first: {effects:?}"
-    );
-    assert_eq!(s.input_queues.queued, vec!["second".to_string()]);
-    assert_eq!(s.input_queues.pending, vec!["first".to_string()]);
-}
-
-#[test]
-fn pending_input_is_cleared_when_runtime_turn_starts() {
-    let mut s = opened();
-    s.status = RuntimeStatus::Busy;
-    typed(&mut s, "next");
-    reduce(&mut s, key(KeyCode::Enter));
-    s.status = RuntimeStatus::Idle;
-    let effects = leveler_tui::reducer::drain_queued(&mut s);
-    assert!(!effects.is_empty());
-    assert_eq!(s.input_queues.pending, vec!["next".to_string()]);
-
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
-            message_id: MessageId::new("m1"),
-        }),
-    );
-
-    assert!(s.input_queues.pending.is_empty());
-}
-
-#[test]
-fn runtime_user_echo_does_not_clear_pending_input() {
-    let mut s = opened();
-    s.status = RuntimeStatus::Busy;
-    typed(&mut s, "next");
-    reduce(&mut s, key(KeyCode::Enter));
-    s.status = RuntimeStatus::Idle;
-    let effects = leveler_tui::reducer::drain_queued(&mut s);
-    assert!(!effects.is_empty());
-    assert_eq!(s.input_queues.pending, vec!["next".to_string()]);
-
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::UserMessageAdded {
-            message: UiMessage {
-                id: MessageId::new("u1"),
-                role: UiRole::User,
-                text: "next".into(),
-            },
-        }),
-    );
-
-    assert_eq!(
-        s.input_queues.pending,
-        vec!["next".to_string()],
-        "user echo is not a turn-start signal"
-    );
-}
-
-#[test]
-fn turn_failed_does_not_auto_retry_pending_input() {
-    let mut s = opened();
-    s.status = RuntimeStatus::Busy;
-    for msg in ["first", "second"] {
-        typed(&mut s, msg);
-        reduce(&mut s, key(KeyCode::Enter));
-    }
-
-    s.status = RuntimeStatus::Idle;
-    let first = leveler_tui::reducer::drain_queued(&mut s);
-    assert!(
-        matches!(
-            first.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "first"
-        ),
-        "first queued input sends: {first:?}"
-    );
-
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::TurnFailed {
-            error: "transport failed before start".into(),
-        }),
-    );
-    s.status = RuntimeStatus::Idle;
-    assert!(s.input_queues.pending.is_empty());
-    assert!(
-        s.input_queues.rejected.is_empty(),
-        "failed model turns must not auto-retry the same prompt"
-    );
-    assert_eq!(s.input_queues.queued, vec!["second".to_string()]);
-
-    let next = leveler_tui::reducer::drain_queued(&mut s);
-    assert!(
-        matches!(
-            next.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "second"
-        ),
-        "failure should not replay the failed prompt before queued input: {next:?}"
-    );
-    assert!(s.input_queues.queued.is_empty());
 }
 
 #[test]
@@ -3096,39 +2796,6 @@ fn backspace_on_empty_composer_removes_last_attachment() {
 }
 
 // ---- 修复回归锁定：排队草稿 / 未知命令 / Alt+Backspace ----------------------
-
-#[test]
-fn drain_queued_preserves_in_progress_draft() {
-    let mut s = opened();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
-            message_id: MessageId::new("m1"),
-        }),
-    );
-    assert_eq!(s.status, RuntimeStatus::Busy);
-    typed(&mut s, "queued msg");
-    reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.input_queues.queued, vec!["queued msg".to_string()]);
-
-    // The user starts typing the NEXT message while the turn is still busy.
-    typed(&mut s, "draft");
-    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
-
-    let effects = leveler_tui::reducer::drain_queued(&mut s);
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "queued msg"
-        ),
-        "queued input submits: {effects:?}"
-    );
-    assert_eq!(
-        s.composer.text(),
-        "draft",
-        "draining the queue must not clobber the draft being typed"
-    );
-}
 
 #[test]
 fn completed_turn_does_not_guess_input_suggestion_from_freeform_answer() {
@@ -4153,4 +3820,615 @@ fn mouse_click_on_url_glued_to_chinese_prose_opens_clean_host() {
             n.message
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal-agent key conventions (Esc interrupt / Shift+Tab permission cycle /
+// Ctrl+C clears the draft first). These are the bindings every other coding
+// agent CLI shares, so muscle memory has to carry over.
+// ---------------------------------------------------------------------------
+
+fn busy_state() -> AppState {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentActivity {
+            label: "run".into(),
+        }),
+    );
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    s
+}
+
+#[test]
+fn esc_interrupts_the_running_turn() {
+    let mut s = busy_state();
+    let first = reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(
+        first,
+        vec![Effect::Send(ClientCommand::CancelCurrentTurn {
+            session_id: SessionId::new("s1"),
+        })]
+    );
+    assert!(s.cancel_armed);
+}
+
+#[test]
+fn esc_escalates_to_force_cancel_but_never_quits() {
+    let mut s = busy_state();
+    reduce(&mut s, key(KeyCode::Esc));
+    let second = reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(
+        second,
+        vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
+            session_id: SessionId::new("s1"),
+        })]
+    );
+    // Quitting is Ctrl+C's job alone — Esc must never drop the session.
+    let third = reduce(&mut s, key(KeyCode::Esc));
+    assert!(
+        !third.contains(&Effect::Quit),
+        "Esc must not quit, got {third:?}"
+    );
+}
+
+#[test]
+fn esc_closes_the_slash_popup_before_it_interrupts() {
+    let mut s = busy_state();
+    reduce(&mut s, key(KeyCode::Char('/')));
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(
+        effects.is_empty(),
+        "popup dismissal must not cancel the turn: {effects:?}"
+    );
+    assert!(s.slash_popup_dismissed);
+    assert!(!s.cancel_armed);
+}
+
+#[test]
+fn esc_when_idle_only_clears_the_notice() {
+    let mut s = state();
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(!s.cancel_armed);
+}
+
+#[test]
+fn shift_tab_cycles_the_permission_profile() {
+    let mut s = state();
+    assert_eq!(s.mode, PermissionProfile::Assisted);
+
+    let effects = reduce(&mut s, key(KeyCode::BackTab));
+    assert_eq!(s.mode, PermissionProfile::FullAccess);
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::SetPermissionProfile {
+            session_id: SessionId::new("s1"),
+            mode: PermissionProfile::FullAccess,
+        })]
+    );
+    assert!(
+        s.mode_label.to_lowercase().contains("full"),
+        "header label must follow the switch: {}",
+        s.mode_label
+    );
+    assert!(
+        s.notification.is_some(),
+        "a silent permission change is unacceptable"
+    );
+
+    reduce(&mut s, key(KeyCode::BackTab));
+    assert_eq!(s.mode, PermissionProfile::RequestApproval);
+    reduce(&mut s, key(KeyCode::BackTab));
+    assert_eq!(s.mode, PermissionProfile::Assisted);
+}
+
+#[test]
+fn shift_tab_does_not_disturb_the_composer() {
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::Char('a')));
+    reduce(&mut s, key(KeyCode::BackTab));
+    assert_eq!(s.composer.text(), "a");
+}
+
+#[test]
+fn ctrl_c_clears_the_draft_before_it_offers_to_quit() {
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::Char('h')));
+    reduce(&mut s, key(KeyCode::Char('i')));
+
+    let first = reduce(&mut s, ctrl('c'));
+    assert!(first.is_empty(), "{first:?}");
+    assert!(s.composer.is_empty(), "draft must be cleared first");
+    assert!(
+        !s.quit_armed,
+        "clearing a draft must not arm quit — that is a two-key surprise exit"
+    );
+
+    // Only an empty composer means Ctrl+C is about leaving.
+    let second = reduce(&mut s, ctrl('c'));
+    assert!(second.is_empty());
+    assert!(s.quit_armed);
+    assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
+}
+
+#[test]
+fn ctrl_c_while_busy_still_cancels_even_with_a_draft() {
+    let mut s = busy_state();
+    reduce(&mut s, key(KeyCode::Char('x')));
+    let effects = reduce(&mut s, ctrl('c'));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::CancelCurrentTurn {
+            session_id: SessionId::new("s1"),
+        })]
+    );
+    assert_eq!(
+        s.composer.text(),
+        "x",
+        "cancelling a turn must not eat the draft"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// External editor (Ctrl+X Ctrl+E, as in bash/readline and every other coding
+// agent CLI). Writing a long prompt inside a one-line composer is the worst
+// part of the input box; $EDITOR is the standard escape hatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctrl_x_ctrl_e_hands_the_draft_to_the_external_editor() {
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::Char('h')));
+    reduce(&mut s, key(KeyCode::Char('i')));
+
+    let armed = reduce(&mut s, ctrl('x'));
+    assert!(armed.is_empty(), "the prefix alone does nothing: {armed:?}");
+    assert_eq!(s.composer.text(), "hi", "Ctrl+X must not edit the draft");
+
+    let effects = reduce(&mut s, ctrl('e'));
+    assert_eq!(
+        effects,
+        vec![Effect::OpenExternalEditor {
+            text: "hi".to_string()
+        }]
+    );
+}
+
+#[test]
+fn ctrl_x_then_anything_else_falls_back_to_that_key() {
+    let mut s = state();
+    reduce(&mut s, ctrl('x'));
+    reduce(&mut s, key(KeyCode::Char('a')));
+    assert_eq!(s.composer.text(), "a");
+
+    // The prefix is spent: a later Ctrl+E is the plain end-of-line motion.
+    let effects = reduce(&mut s, ctrl('e'));
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+#[test]
+fn ctrl_e_without_the_prefix_still_moves_to_end_of_line() {
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::Char('a')));
+    reduce(&mut s, key(KeyCode::Char('b')));
+    s.composer.move_to_line_start();
+    let effects = reduce(&mut s, ctrl('e'));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(s.composer.cursor(), 2, "Ctrl+E must keep its emacs meaning");
+}
+
+#[test]
+fn editor_text_comes_back_into_the_composer() {
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::Char('x')));
+    reduce(
+        &mut s,
+        Action::EditorFinished(Ok("第一行\n第二行".to_string())),
+    );
+    assert_eq!(s.composer.text(), "第一行\n第二行");
+    assert_eq!(s.composer.line_count(), 2);
+}
+
+#[test]
+fn a_failed_editor_keeps_the_draft_and_says_why() {
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::Char('x')));
+    reduce(
+        &mut s,
+        Action::EditorFinished(Err("$EDITOR 未设置".to_string())),
+    );
+    assert_eq!(
+        s.composer.text(),
+        "x",
+        "a failed edit must not eat the draft"
+    );
+    let note = s.notification.expect("a silent failure is unacceptable");
+    assert!(note.message.contains("EDITOR"), "{}", note.message);
+}
+
+#[test]
+fn an_empty_editor_buffer_clears_the_draft() {
+    // Deleting everything in the editor is how you abandon a prompt — honouring
+    // it is what makes the editor round trip trustworthy.
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::Char('x')));
+    reduce(&mut s, Action::EditorFinished(Ok(String::new())));
+    assert!(s.composer.is_empty());
+}
+
+#[test]
+fn slash_editor_opens_the_same_editor() {
+    let mut s = state();
+    s.composer.replace("/editor");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::OpenExternalEditor {
+            text: String::new()
+        }],
+        "the command itself must not be carried into the editor"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rewind. `/restore` already rolls the workspace back with the transcript
+// (checkpoint_before_turn captures a git tree per turn), so the picker has to
+// say so — a user who reads "files are not reverted" will press it expecting
+// their edits to survive.
+// ---------------------------------------------------------------------------
+
+fn checkpoint_picker_description(s: &mut AppState) -> String {
+    match s.overlay.as_ref().expect("picker must open") {
+        Overlay::CheckpointPicker(model) => model.description.clone().unwrap_or_default(),
+        other => panic!("expected the checkpoint picker, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_rewind_picker_does_not_promise_files_are_left_alone() {
+    let mut s = state();
+    s.checkpoints = vec![UiCheckpoint {
+        id: leveler_core::CheckpointId::generate(),
+        label: "修登录".into(),
+        ordinal: 2,
+    }];
+    s.composer.replace("/restore");
+    reduce(&mut s, key(KeyCode::Enter));
+
+    let description = checkpoint_picker_description(&mut s);
+    assert!(
+        !description.contains("不回退文件"),
+        "the workspace IS rolled back; claiming otherwise invites data loss: {description}"
+    );
+    assert!(
+        description.contains("文件"),
+        "the picker must state what happens to the working tree: {description}"
+    );
+}
+
+#[test]
+fn rewind_is_accepted_as_the_name_the_rest_of_the_world_uses() {
+    let mut s = state();
+    s.checkpoints = vec![UiCheckpoint {
+        id: leveler_core::CheckpointId::generate(),
+        label: "修登录".into(),
+        ordinal: 2,
+    }];
+    s.composer.replace("/rewind");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "the picker opens locally: {effects:?}");
+    assert!(
+        matches!(s.overlay, Some(Overlay::CheckpointPicker(_))),
+        "/rewind must reach the same picker as /restore"
+    );
+    assert!(
+        s.composer.is_empty(),
+        "a known command must not be left in the composer"
+    );
+}
+
+#[test]
+fn slash_fork_branches_the_session_without_leaving_it() {
+    // The runtime copies record + transcript into a fresh session and leaves
+    // this one untouched, so the command is safe to fire from the composer.
+    let mut s = state();
+    s.composer.replace("/fork");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::ForkSession {
+            session_id: SessionId::new("s1"),
+        })]
+    );
+    assert_eq!(
+        s.session_id,
+        SessionId::new("s1"),
+        "forking must not switch the user away from the conversation they are in"
+    );
+}
+
+#[test]
+fn fork_is_refused_mid_turn_rather_than_copying_half_a_transcript() {
+    let mut s = busy_state();
+    s.composer.replace("/fork");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.notification.is_some(), "the refusal must be explained");
+}
+
+// ---------------------------------------------------------------------------
+// Skill-as-slash, goal lifecycle, doctor, queue
+// ---------------------------------------------------------------------------
+
+fn write_project_skill(root: &std::path::Path, name: &str, desc: &str) {
+    let dir = root.join(".leveler").join("skills").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {desc}\n---\n\n# {name}\n\nDo the thing.\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn slash_skill_name_submits_like_skill_command() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project_skill(dir.path(), "code-review", "Review the change");
+    let mut s = opened();
+    s.repository = dir.path().display().to_string();
+
+    s.composer.replace("/code-review fix auth");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Send(ClientCommand::SubmitMessage { content, .. })
+                if content == "$code-review fix auth"
+        )),
+        "direct skill slash must inject $name: {effects:?}"
+    );
+    assert!(s.composer.is_empty());
+}
+
+#[test]
+fn skill_names_appear_in_slash_popup() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project_skill(dir.path(), "code-review", "Review the change");
+    let mut s = opened();
+    s.repository = dir.path().display().to_string();
+    typed(&mut s, "/code");
+    let matches = leveler_tui::screen::visible_slash_popup(&s);
+    assert!(
+        matches
+            .iter()
+            .any(|(n, d)| n == "/code-review" && d.contains("Review")),
+        "popup must list skill: {matches:?}"
+    );
+}
+
+#[test]
+fn builtin_slash_wins_over_skill_with_same_name() {
+    let dir = tempfile::tempdir().unwrap();
+    // Would collide with /help if we allowed it into the catalog.
+    write_project_skill(dir.path(), "help", "Fake skill");
+    let mut s = opened();
+    s.repository = dir.path().display().to_string();
+    s.composer.replace("/help");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        s.active_screen,
+        Screen::Help,
+        "builtin /help must win over a skill named help"
+    );
+}
+
+#[test]
+fn slash_goal_status_and_clear() {
+    let mut s = opened();
+    s.goal_mode_active = true;
+    s.collaboration = "goal".into();
+
+    typed(&mut s, "/goal status");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|n| n.message.contains("目标") || n.message.contains("goal")),
+        "{:?}",
+        s.notification
+    );
+
+    typed(&mut s, "/goal clear");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(!s.goal_mode_active);
+    assert_eq!(s.collaboration, "chat");
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Send(ClientCommand::SetProductAxes { collaboration, .. })
+                if collaboration == "chat"
+        )),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn slash_goal_clear_cancels_a_busy_goal_turn() {
+    let mut s = busy_state();
+    s.goal_mode_active = true;
+    s.composer.replace("/goal clear");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(!s.goal_mode_active);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Send(ClientCommand::CancelCurrentTurn { .. }))),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn slash_doctor_writes_a_self_check_note() {
+    let mut s = opened();
+    s.model_label = "test-model".into();
+    s.composer.replace("/doctor");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    let note = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            leveler_tui::transcript::TranscriptItem::Note(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .expect("doctor must leave a transcript note");
+    assert!(note.contains("Doctor"), "{note}");
+    assert!(note.contains("test-model"), "{note}");
+    assert!(note.contains("session"), "{note}");
+}
+
+
+/// `/feature-dev` is a built-in skill: it must reach the composer as a slash
+/// command with no per-project setup, or shipping it changes nothing for users.
+#[test]
+fn the_builtin_feature_dev_skill_is_reachable_as_a_slash_command() {
+    let dir = std::env::temp_dir().join(format!("leveler-featuredev-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = state();
+    s.repository = dir.display().to_string();
+
+    // Typing a `/` refreshes the catalog the same way the real composer does.
+    reduce(&mut s, key(KeyCode::Char('/')));
+    assert!(
+        s.skill_catalog.iter().any(|(n, _)| n == "feature-dev"),
+        "feature-dev must be in the skill catalog: {:?}",
+        s.skill_catalog
+    );
+
+    s.composer.replace("/feature-dev 加一个登录页");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    match effects.as_slice() {
+        [Effect::Send(ClientCommand::SubmitMessage { content, .. })] => {
+            assert!(content.contains("feature-dev"), "{content}");
+            assert!(
+                content.contains("加一个登录页"),
+                "the task must survive: {content}"
+            );
+        }
+        other => panic!("expected the skill to be submitted, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The consent gate (K36) is only usable if the UI it gates can act on it.
+/// Before this, pending candidates were invisible in the TUI and the only way
+/// to adopt one was `leveler memory accept` on the command line.
+#[test]
+fn slash_memory_accept_promotes_a_pending_candidate() {
+    let mut s = state();
+    s.composer.replace("/memory accept rust-anyhow");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::AcceptMemory {
+            session_id: SessionId::new("s1"),
+            id: "rust-anyhow".to_string(),
+        })]
+    );
+}
+
+#[test]
+fn slash_memory_accept_without_an_id_explains_itself() {
+    let mut s = state();
+    s.composer.replace("/memory accept");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    let note = s.notification.expect("must say what is missing");
+    assert!(note.message.contains("accept"), "{}", note.message);
+}
+
+/// A listing that hides what is waiting is why nobody ever accepted anything.
+#[test]
+fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryList {
+            memory_dir: "/tmp/mem".into(),
+            active: vec![],
+            archived: vec![],
+            pending: vec![leveler_client_protocol::UiMemoryEntry {
+                id: "use-pnpm".into(),
+                title: "本仓库用 pnpm".into(),
+            }],
+        }),
+    );
+    let text = format!("{:?}", s.transcript.items());
+    assert!(text.contains("pending (1)"), "{text}");
+    assert!(text.contains("use-pnpm"), "{text}");
+    assert!(
+        text.contains("/memory accept"),
+        "the way to adopt it must be shown: {text}"
+    );
+}
+
+/// Submitting while a turn runs steers it: the text reaches the model at the
+/// next round instead of waiting for the turn to end. The runtime falls back to
+/// an ordinary submission if the turn already finished, so nothing is lost.
+#[test]
+fn submitting_while_busy_steers_the_running_turn() {
+    let mut s = busy_state();
+    s.composer.replace("改用另一个模块");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::SteerCurrentTurn {
+            session_id: SessionId::new("s1"),
+            content: "改用另一个模块".to_string(),
+        })]
+    );
+    assert!(s.composer.is_empty(), "the composer must clear on send");
+}
+
+#[test]
+fn steered_text_appears_in_the_conversation() {
+    let mut s = busy_state();
+    s.composer.replace("改用另一个模块");
+    reduce(&mut s, key(KeyCode::Enter));
+    let text = format!("{:?}", s.transcript.items());
+    assert!(text.contains("改用另一个模块"), "{text}");
+}
+
+/// Several corrections in a row all reach the same next round, in order.
+#[test]
+fn several_steers_are_each_sent() {
+    let mut s = busy_state();
+    for msg in ["先改模块", "再加测试"] {
+        s.composer.replace(msg);
+        let effects = reduce(&mut s, key(KeyCode::Enter));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Send(ClientCommand::SteerCurrentTurn { content, .. })] if content == msg
+            ),
+            "{effects:?}"
+        );
+    }
+}
+
+#[test]
+fn submitting_while_idle_still_submits_normally() {
+    let mut s = state();
+    s.composer.replace("做个登录页");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SubmitMessage { .. })]
+        ),
+        "{effects:?}"
+    );
 }

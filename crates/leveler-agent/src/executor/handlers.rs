@@ -84,6 +84,14 @@ impl Executor {
                 grants,
             ));
         }
+        // 完全访问 means no prompts at all. This path calls the approver
+        // directly, so without this check it bypasses `ApprovalPolicy::evaluate`
+        // — which returns Auto for FullAccess before anything else — and
+        // interrupts a user who opted out of prompting, to grant a permission
+        // they already hold.
+        if self.tool_context.mode == leveler_execution::PermissionProfile::FullAccess {
+            return Ok((true, permission_grant_message(true, grants), grants));
+        }
         let description = permission_request_description(&action, &reason, grants);
         // Risk: filesystem elevation is at least as sensitive as network.
         let risk = if grants.unrestricted_fs {
@@ -126,11 +134,15 @@ impl Executor {
     /// semaphore bounds how many run at once. The child streams silently —
     /// only its start/finish bubbles to the parent observer (see the batch in
     /// `drive`).
-    pub(crate) async fn run_one_sub_agent(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_one_sub_agent_on(
         &self,
         id: String,
         role: AgentRole,
         files: Vec<String>,
+        model_override: Option<leveler_model::ModelRef>,
+        agent_tools: Vec<String>,
+        agent_max_rounds: u32,
         task: String,
         permit: Arc<tokio::sync::Semaphore>,
         progress: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
@@ -167,7 +179,10 @@ impl Executor {
             output_tokens: 0,
             cached_input_tokens: 0,
         });
-        let mut child = self.child_for_role(role, files);
+        let mut child = self.child_for_role_on(role, files, model_override);
+        // A definition that declares its own tools / round budget binds every
+        // spawn of it — otherwise the field is decoration.
+        child.apply_agent_policy(&agent_tools, agent_max_rounds);
         // Task-level residual budgets: child cannot spend more than its share
         // of the parent remainder (Some(0) hard-blocks that dimension).
         child.step_limits = residual_limits;

@@ -14,6 +14,7 @@ mod budget;
 mod compaction;
 mod executor;
 mod injected_tools;
+pub mod named_agent;
 mod nudges;
 mod prompt;
 mod sub_agent;
@@ -30,7 +31,7 @@ pub use executor::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
     ClarificationRequest, Clarifier, ContinuationPolicy, Executor, ModelRequestRecord, NoopSink,
     StepLimits, StopReason, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink,
-    closeout,
+    SteeringSource, TurnPolicy, closeout,
 };
 pub use leveler_lifecycle::{
     CollaborationMode, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,

@@ -137,6 +137,12 @@ impl Executor {
                         session_approved.insert(signature);
                         Ok(())
                     }
+                    ApprovalDecision::Deny if !self.approver.has_human() => {
+                        // Nobody was asked, so nobody refused. Reporting this as
+                        // a user decision teaches the model that this user
+                        // rejects memories they never saw.
+                        Err(self.park_unattended_denial(call))
+                    }
                     ApprovalDecision::Deny => Err("denied by user".to_string()),
                 }
             }
@@ -151,6 +157,64 @@ impl Executor {
     ) -> Result<(), String> {
         self.authorize_with_cancellation(call, session_approved, &CancellationToken::new())
             .await
+    }
+
+    /// Explain a denial that came from a context with no human in it, and — for
+    /// a `remember` proposal — keep the content instead of discarding it.
+    ///
+    /// `pending/` exists for exactly this: consent deferred, not refused. The
+    /// candidate never becomes active without an explicit `leveler memory
+    /// accept`, so K36 still holds.
+    fn park_unattended_denial(&self, call: &ToolCall) -> String {
+        const UNATTENDED: &str =
+            "no approver was available in this non-interactive run (nobody declined it)";
+        if call.name != "remember" {
+            return format!("{UNATTENDED}; re-run with --permission full-access to allow it");
+        }
+        let Some(root) = self.tool_context.memory_root.as_ref() else {
+            return format!("{UNATTENDED}; memory is not configured, so it could not be parked");
+        };
+        let title = call.arguments.get("title").and_then(|v| v.as_str());
+        let body = call.arguments.get("body").and_then(|v| v.as_str());
+        let (Some(title), Some(body)) = (title, body) else {
+            return format!("{UNATTENDED}; the proposal had no title/body to park");
+        };
+        let tags = call
+            .arguments
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let parked = leveler_memory::MemoryStore::open(root)
+            .map_err(|e| e.to_string())
+            .and_then(|store| {
+                let candidate = leveler_memory::MemoryCandidate::new(
+                    title,
+                    body,
+                    leveler_memory::CandidateKind::Preference,
+                    None,
+                    leveler_memory::CandidateSource::SystemPropose,
+                    tags,
+                )
+                .map_err(|e| e.to_string())?;
+                store.propose(candidate).map_err(|e| e.to_string())
+            });
+        match parked {
+            Ok(leveler_memory::ProposeOutcome::Pending(candidate)) => format!(
+                "{UNATTENDED}; kept as a pending candidate [{}] — run `leveler memory accept {}` \
+                 to make it durable",
+                candidate.id, candidate.id
+            ),
+            // Already pending or suppressed: nothing lost either way.
+            Ok(_) => format!("{UNATTENDED}; this memory is already awaiting your review"),
+            Err(error) => format!("{UNATTENDED}; parking it failed: {error}"),
+        }
     }
 
     /// Persist an `ApproveAlways` decision as project permission rules and
@@ -588,6 +652,97 @@ mod authorize_tests {
             name: "run_command".to_string(),
             arguments: serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
         }
+    }
+
+    /// A headless approver that denies, standing in for `AutoApprove` in a
+    /// non-interactive run (`leveler run`, CI, eval).
+    struct HeadlessDeny;
+
+    #[async_trait::async_trait]
+    impl Approver for HeadlessDeny {
+        fn has_human(&self) -> bool {
+            false
+        }
+        async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+    }
+
+    fn remember_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("m"),
+            name: "remember".to_string(),
+            arguments: serde_json::json!({
+                "title": "用 pnpm",
+                "body": "本仓库统一用 pnpm，不要用 npm。",
+            }),
+        }
+    }
+
+    /// The model must not be told the user rejected something the user never
+    /// saw — it reads that as a standing preference against memory.
+    #[tokio::test]
+    async fn a_headless_denial_is_not_reported_as_the_user_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .with_memory_root(dir.path().join("memory"));
+        let executor = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(Arc::new(HeadlessDeny));
+        let mut session = HashSet::new();
+
+        let err = executor
+            .authorize(&remember_call(), &mut session)
+            .await
+            .expect_err("assisted still gates memory writes");
+        assert!(
+            !err.contains("denied by user"),
+            "nobody was asked, so nobody denied it: {err}"
+        );
+    }
+
+    /// Discarding the proposal loses it for good. Parking it as a pending
+    /// candidate is what `pending/` is for — consent deferred, not refused.
+    #[tokio::test]
+    async fn a_headless_run_parks_the_memory_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_root = dir.path().join("memory");
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .with_memory_root(memory_root.clone());
+        let executor = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(Arc::new(HeadlessDeny));
+        let mut session = HashSet::new();
+
+        let err = executor
+            .authorize(&remember_call(), &mut session)
+            .await
+            .expect_err("the call itself still does not store active memory");
+        assert!(
+            err.contains("accept"),
+            "the message must point at how to adopt it later: {err}"
+        );
+
+        let store = leveler_memory::MemoryStore::open(&memory_root).unwrap();
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1, "the proposal must survive as a candidate");
+        assert!(pending[0].title.contains("pnpm"));
+        assert!(
+            store.list_active().unwrap().is_empty(),
+            "parking must never activate without consent (K36)"
+        );
     }
 
     #[tokio::test]

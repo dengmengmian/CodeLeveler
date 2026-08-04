@@ -158,6 +158,7 @@ impl RemotePolicy {
         // compile error rather than an accidental remote capability.
         match command {
             ClientCommand::SubmitMessage { .. }
+            | ClientCommand::SteerCurrentTurn { .. }
             | ClientCommand::RunGoal { .. }
             | ClientCommand::CancelCurrentTurn { .. }
             | ClientCommand::ForceCancelCurrentTurn { .. }
@@ -165,7 +166,6 @@ impl RemotePolicy {
             | ClientCommand::SelectModel { .. }
             | ClientCommand::SetProductAxes { .. }
             | ClientCommand::ConfirmPlanToGoal { .. }
-            | ClientCommand::SetAgentMode { .. }
             | ClientCommand::RequestDiff { .. }
             | ClientCommand::CompactContext { .. }
             | ClientCommand::ClearConversation { .. }
@@ -195,12 +195,14 @@ impl RemotePolicy {
             },
 
             // Memory is durable, cross-session and unreviewable from a phone.
-            ClientCommand::ListMemory { .. } | ClientCommand::ForgetMemory { .. } => {
-                RemoteVerdict::Deny {
-                    code: DENIED_COMMAND,
-                    reason: "memory is not reachable remotely",
-                }
-            }
+            // `AcceptMemory` especially: it IS the consent K36 requires, and a
+            // phone is the wrong place to give it.
+            ClientCommand::ListMemory { .. }
+            | ClientCommand::ForgetMemory { .. }
+            | ClientCommand::AcceptMemory { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "memory is not reachable remotely",
+            },
 
             // Destructive or history-rewriting, with no remote confirmation UX
             // yet to make them safe.

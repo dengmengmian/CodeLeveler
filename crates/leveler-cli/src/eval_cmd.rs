@@ -38,10 +38,10 @@ pub(crate) async fn cmd_eval(
             if cases.is_empty() {
                 anyhow::bail!("no eval cases found");
             }
-            let mode = match (direct, no_verify_gate) {
-                (true, true) => "direct-no-verify-gate",
-                (true, false) => "direct",
-                _ => "orchestrated",
+            let mode = if no_verify_gate {
+                "direct-no-verify-gate"
+            } else {
+                "direct"
             };
             println!("  mode: {mode}");
             let checkpoint = json_out.as_deref().map(checkpoint_path);
@@ -123,7 +123,7 @@ pub(crate) async fn cmd_eval(
                 let doc = leveler_eval::BaselineDocument::from_compare(
                     baseline_meta(
                         &cases_dir,
-                        "orchestrated",
+                        "direct",
                         repetitions,
                         &[a.clone(), b.clone()],
                         &cases,
@@ -152,7 +152,8 @@ pub(crate) async fn cmd_eval(
                 anyhow::bail!("no eval cases found");
             }
             let (ablated_overrides, before, after) = ablation_overrides(&knob)?;
-            let mode = if direct { "direct" } else { "orchestrated" };
+            // Eval always uses the direct tool loop; --direct is a no-op compat flag.
+            let mode = "direct";
             println!("  mode: {mode}");
             println!(
                 "  ablation: {knob} = {before} (control) vs {after} (ablated), single variable"
@@ -380,7 +381,7 @@ fn run_trend(
 }
 
 /// Shared driver for the three tiered gates (spec §2). A tier is just a fixed
-/// set of case directories run orchestrated against one model — no new runner,
+/// set of case directories run against one model — no new runner,
 /// no new result path. Cases from all dirs are concatenated; a missing dir is a
 /// hard error so a mistyped tier can't silently shrink coverage.
 async fn run_tier(
@@ -409,7 +410,7 @@ async fn run_tier(
         cases.len(),
         dirs.join(", ")
     );
-    println!("  mode: orchestrated");
+    println!("  mode: direct");
     let checkpoint = json_out.as_deref().map(checkpoint_path);
     let report = run_eval(
         config_dir,
@@ -455,10 +456,6 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
             o.explicit_plan = Some(true);
             (false, true)
         }
-        "step_summary" | "require_step_summary" => {
-            o.step_summary_every = Some(6);
-            (false, true)
-        }
         "completion_evidence" | "require_completion_evidence" => {
             o.completion_evidence = Some(false);
             (true, false)
@@ -469,7 +466,7 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
         }
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
-             step_summary, completion_evidence, repeated_read_guard"
+             completion_evidence, repeated_read_guard"
         ),
     };
     Ok((o, before, after))
@@ -895,7 +892,7 @@ async fn run_eval_case(
         let _ = git(&["commit", "-qm", "eval baseline"]);
     }
 
-    // Run the orchestrated agent in the case workspace.
+    // Run the agent (direct tool loop) in the case workspace.
     let layout = Layout::resolve(dir.clone(), Some(config_dir.to_path_buf()));
     let app = match Application::assemble(layout) {
         Ok(a) => a,
@@ -914,15 +911,13 @@ async fn run_eval_case(
     // Fold the event stream into trajectory signals for failure attribution
     // (L1 taskset doc §8); the overlay's paths proxy for "the relevant files".
     let mut collector = crate::eval_signals::SignalCollector::new(case.files.keys().cloned());
+    // Eval runs the direct tool loop only (orchestrate dual path removed).
     let (session_id, completed, rounds, mut note, termination) = if no_verify_gate {
         // Ablation: the SAME direct loop with ONE variable removed — the
-        // post-edit verification gate and the repair turn it drives. The model's
-        // own "done" is final. `expect` still decides pass/fail independently,
-        // so this measures how often verify→repair rescues a run the model
-        // would otherwise have gotten wrong.
+        // post-edit verification gate and the repair turn it drives.
         run_bare_case(&app, model, case, &mut collector).await
-    } else if direct {
-        // Ablation: the naive direct tool loop, no orchestration scaffold.
+    } else {
+        let _ = direct; // flag retained for CLI compatibility; always direct.
         match app.create_session(model, &case.task).await {
             Ok(session_id) => {
                 let outcome = app
@@ -964,37 +959,6 @@ async fn run_eval_case(
             Err(e) => {
                 let termination = termination_from_app_error(&e);
                 (None, false, 0, format!("session: {e}"), termination)
-            }
-        }
-    } else {
-        let outcome = app
-            .orchestrate_task_bounded(
-                model,
-                PermissionProfile::Assisted,
-                &case.task,
-                build_approver(true),
-                Arc::new(leveler_agent::AutoClarify),
-                false,
-                &mut |e| collector.observe_engine(e),
-                CancellationToken::new(),
-                None,
-                case.max_rounds,
-            )
-            .await;
-        match outcome {
-            Ok((session_id, report)) => {
-                let termination = termination_from_report(report.outcome, report.stop_reason);
-                (
-                    Some(session_id),
-                    report.outcome.is_success(),
-                    report.rounds,
-                    format!("{:?}", report.outcome),
-                    termination,
-                )
-            }
-            Err(e) => {
-                let termination = termination_from_app_error(&e);
-                (None, false, 0, format!("error: {e}"), termination)
             }
         }
     };
@@ -1230,7 +1194,6 @@ mod ablation_tests {
         assert!(!before && after);
         assert_eq!(o.explicit_plan, Some(true), "the named knob flipped ON");
         // The single-variable contract: nothing else moved.
-        assert_eq!(o.step_summary_every, None);
         assert_eq!(o.completion_evidence, None);
         assert_eq!(o.repeated_read_guard, None);
         assert_eq!(o.max_parallel_tools, None);
@@ -1241,8 +1204,8 @@ mod ablation_tests {
         assert_eq!(o.completion_evidence, Some(false));
 
         // Legacy knob names keep working.
-        let (legacy, ..) = super::ablation_overrides("require_step_summary").unwrap();
-        assert_eq!(legacy.step_summary_every, Some(6));
+        let (legacy, ..) = super::ablation_overrides("require_explicit_plan").unwrap();
+        assert_eq!(legacy.explicit_plan, Some(true));
 
         let err = super::ablation_overrides("not_a_knob").unwrap_err();
         assert!(

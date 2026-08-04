@@ -22,10 +22,6 @@ fn key(code: KeyCode) -> Action {
     Action::Key(KeyEvent::new(code, KeyModifiers::empty()))
 }
 
-fn ctrl(c: char) -> Action {
-    Action::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
-}
-
 fn typed(s: &mut AppState, text: &str) {
     for ch in text.chars() {
         reduce(s, key(KeyCode::Char(ch)));
@@ -148,37 +144,7 @@ fn tui_session_commands_ui_and_logic() {
     );
     pages.push(("01-idle", idle));
 
-    // --- /workflow toggle logic + notification ---
-    assert!(!s.orchestrate);
-    typed(&mut s, "/workflow");
-    let effects = enter(&mut s);
-    assert!(s.orchestrate, "workflow should enable orchestrate");
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::Send(
-                leveler_client_protocol::ClientCommand::SetAgentMode {
-                    orchestrate: true,
-                    ..
-                }
-            )]
-        ),
-        "must send SetAgentMode: {effects:?}"
-    );
-    assert!(
-        s.notification
-            .as_ref()
-            .is_some_and(|n| n.message.contains("编排") || n.message.contains("workflow")),
-        "notify: {:?}",
-        s.notification
-    );
-    pages.push(("02-workflow-on", screen(&mut s)));
-
-    typed(&mut s, "/wf");
-    enter(&mut s);
-    assert!(!s.orchestrate, "/wf toggles back to direct");
-
-    // --- /mode opens permission picker (not Plan steps) ---
+    // --- /mode opens permission picker ---
     typed(&mut s, "/mode");
     enter(&mut s);
     assert!(s.overlay.is_some(), "mode picker open");
@@ -262,7 +228,7 @@ fn tui_session_commands_ui_and_logic() {
     );
     pages.push(("06-btw-card", btw_foot));
 
-    // --- /steps (plan) screen ---
+    // Plan updates still land on state (shown in conversation chrome).
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::PlanUpdated {
@@ -282,28 +248,13 @@ fn tui_session_commands_ui_and_logic() {
             },
         }),
     );
-    typed(&mut s, "/steps");
-    enter(&mut s);
-    assert_eq!(s.active_screen, Screen::Plan);
-    let steps_ui = screen(&mut s);
     assert!(
-        steps_ui.contains("任务步骤")
-            || steps_ui.contains("Task steps")
-            || steps_ui.contains("步骤"),
-        "steps title: {steps_ui}"
+        s.plan.as_ref().is_some_and(|p| p
+            .steps
+            .iter()
+            .any(|st| st.description.contains("定位相关代码"))),
+        "plan should stay on state for chrome"
     );
-    assert!(
-        steps_ui.contains("定位相关代码") && steps_ui.contains("修复两个 bug"),
-        "steps body: {steps_ui}"
-    );
-    pages.push(("07-steps", steps_ui));
-    reduce(&mut s, key(KeyCode::Esc));
-    assert_eq!(s.active_screen, Screen::Conversation);
-
-    // Ctrl+P still opens steps
-    reduce(&mut s, ctrl('p'));
-    assert_eq!(s.active_screen, Screen::Plan);
-    reduce(&mut s, key(KeyCode::Esc));
 
     // --- /diff screen ---
     reduce(
@@ -412,21 +363,17 @@ fn tui_session_commands_ui_and_logic() {
     assert_eq!(s.active_screen, Screen::Help);
     let help = screen(&mut s);
     assert!(
-        help.contains("/workflow") || help.contains("workflow") || help.contains("编排"),
-        "help lists workflow: {help}"
+        help.contains("/goal") || help.contains("/model") || help.contains("帮助"),
+        "help lists commands: {help}"
     );
     assert!(
-        help.contains("/steps") || help.contains("步骤"),
-        "help lists steps: {help}"
+        !help.contains("/workflow")
+            && !help.contains("/steps")
+            && !help.contains("/agents")
+            && !help.contains("/confirm-plan"),
+        "removed commands must not appear in help: {help}"
     );
     pages.push(("11-help", help));
-    reduce(&mut s, key(KeyCode::Esc));
-
-    // --- /agents screen ---
-    typed(&mut s, "/agents");
-    enter(&mut s);
-    assert_eq!(s.active_screen, Screen::Agents);
-    pages.push(("12-agents", screen(&mut s)));
     reduce(&mut s, key(KeyCode::Esc));
 
     // --- permission label on status after mode Write ---
@@ -443,23 +390,28 @@ fn tui_slash_popup_lists_renamed_commands() {
     let mut s = opened();
     typed(&mut s, "/");
     let matches = leveler_tui::screen::visible_slash_popup(&s);
-    let names: Vec<_> = matches.iter().map(|(n, _)| *n).collect();
-    assert!(names.contains(&"/workflow"), "got {names:?}");
-    assert!(names.contains(&"/steps"), "got {names:?}");
+    let names: Vec<_> = matches.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(!names.contains(&"/workflow"), "removed: {names:?}");
+    assert!(!names.contains(&"/wf"), "removed alias: {names:?}");
     assert!(!names.contains(&"/agent"), "old /agent must not appear");
-    // /steps = task plan screen; /plan = collaboration Plan mode (not a legacy alias).
-    assert!(names.contains(&"/steps"));
+    assert!(!names.contains(&"/steps"), "removed: {names:?}");
+    assert!(!names.contains(&"/agents"), "removed: {names:?}");
+    assert!(!names.contains(&"/context"), "removed: {names:?}");
+    assert!(!names.contains(&"/verify"), "removed: {names:?}");
+    assert!(!names.contains(&"/confirm-plan"), "removed: {names:?}");
     assert!(
         names.contains(&"/plan"),
-        "menu should list collab /plan alongside /steps: {names:?}"
+        "menu should list collab /plan: {names:?}"
     );
     assert!(names.contains(&"/work-mode"), "got {names:?}");
     assert!(names.contains(&"/collab"), "got {names:?}");
-    assert!(names.contains(&"/confirm-plan"), "got {names:?}");
+    assert!(names.contains(&"/goal"), "got {names:?}");
+    assert!(names.contains(&"/doctor"), "got {names:?}");
+    assert!(names.contains(&"/fork"), "got {names:?}");
 
     let foot = footer_text(&s);
     assert!(
-        foot.contains("/workflow") || foot.contains("编排") || foot.contains("workflow"),
+        foot.contains("/goal") || foot.contains("/plan") || foot.contains("/help"),
         "popup in footer: {foot}"
     );
 }

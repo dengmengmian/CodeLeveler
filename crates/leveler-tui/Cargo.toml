@@ -29,6 +29,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 toml_edit = { workspace = true }
 arboard = "3"
+tempfile = "3"
 
 [dev-dependencies]
 leveler-client-protocol = { workspace = true, features = ["testing"] }

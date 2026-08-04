@@ -6,7 +6,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::footer_queue::queued_lines;
 use crate::screen::Screen;
 use crate::state::AppState;
 use crate::status_line::status_line_content;
@@ -90,13 +89,9 @@ pub(crate) fn render_slash_popup(
 
 /// Shared match list for slash / @file popups (name, description).
 fn slash_popup_match_rows(state: &AppState) -> Vec<(String, String)> {
-    let slash = crate::screen::visible_slash_popup(state);
     let files = crate::screen::visible_file_popup(state);
     if files.is_empty() {
-        slash
-            .into_iter()
-            .map(|(name, desc)| (name.to_string(), desc.to_string()))
-            .collect()
+        crate::screen::visible_slash_popup(state)
     } else {
         files
             .into_iter()
@@ -371,13 +366,24 @@ pub(crate) fn composer_box_lines(
     (lines, (cx, cy))
 }
 
-/// Compact trust label on the composer bottom border: model · permission only.
+/// Compact trust label on the composer bottom border:
+/// `model · perm · collab` plus optional `· wf` / non-default work-mode.
 ///
 /// Permission uses stable English product labels (`auto` / `approve` / `full`).
 /// Token stats and context belong on the Footer, not here.
 fn composer_trust_chip(state: &AppState) -> String {
     let perm = crate::status_line::permission_chip_label(state);
-    let base = format!("{} · {perm}", state.model_label);
+    let collab = state.collaboration.as_str();
+    let mut base = format!("{} · {perm} · {collab}", state.model_label);
+    if state.work_profile != "balanced" {
+        let short = match state.work_profile.as_str() {
+            "economy" => "eco",
+            "delivery" => "del",
+            other => other,
+        };
+        base.push_str(" · ");
+        base.push_str(short);
+    }
     if state.untrusted_config.is_empty() {
         return base;
     }
@@ -694,8 +700,11 @@ pub fn conversation_footer(
     let cy = out.len() as u16 + crow;
     out.extend(composer);
 
-    // Queued messages (submitted while busy) listed just below the composer.
-    out.extend(queued_lines(state, width));
+    // One row of key hints under the composer. It appears only when it costs
+    // nothing — while a turn runs (how to stop it) and on an untouched composer
+    // (how to start) — so it teaches without nagging mid-sentence.
+    out.extend(key_hint_line(state, width));
+
 
     // Side questions live *under* the input box (above the bottom chrome) so
     // they read as a footer note, not a second main answer mid-stream.
@@ -706,6 +715,30 @@ pub fn conversation_footer(
 
     // Trust chip lives on the composer bottom border — no second chrome strip.
     (out, Some((cx, cy)))
+}
+
+/// The single hint row under the composer, or nothing.
+///
+/// Two moments earn it: a turn in flight (the interrupt is the only key that
+/// matters, and an interrupt nobody can find is not one) and an untouched
+/// composer (the openers). Once the user starts typing, the row goes away —
+/// hints competing with a half-written sentence are noise.
+pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let t = state.t();
+    let hints = if state.is_busy() {
+        format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
+    } else if state.composer.is_empty() && state.turn_nav.is_none() {
+        format!(
+            "/ {} · @ {} · Shift+Tab {} · Ctrl+? {}",
+            t.hint_commands, t.hint_files, t.hint_permission, t.hint_shortcuts
+        )
+    } else {
+        return Vec::new();
+    };
+    vec![Line::from(Span::styled(
+        truncate_display(&hints, width.max(1)),
+        Style::default().fg(state.theme.muted),
+    ))]
 }
 
 /// The attachments strip above the composer (spec §40): compact when many.

@@ -865,7 +865,7 @@ async fn run_gauged_round(max_parallel_tools: usize) -> usize {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_execution_controls(0, 0, max_parallel_tools);
+    .with_execution_controls(0, max_parallel_tools);
 
     let outcome = executor
         .run(
@@ -939,7 +939,7 @@ async fn worker_sub_agent_serializes_parallel_safe_tools() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_execution_controls(0, 0, 4)
+    .with_execution_controls(0, 4)
     .run(
         "delegate a write task",
         &mut |_| {},
@@ -1782,4 +1782,480 @@ async fn delegation_off_hides_spawn_agent_from_tool_list() {
         "core tools should still be present: {names:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Named agents: `agent="<name>"` must actually deliver the persona to the
+/// child. A sub-agent starts a FRESH conversation, so if the instructions do
+/// not travel with the task, the child just improvises and the run still looks
+/// like it worked.
+mod named_agents {
+    use super::*;
+
+    struct CapturingRuntime {
+        parent_done: std::sync::atomic::AtomicBool,
+        /// Every prompt blob the runtime was asked to answer.
+        seen: Mutex<Vec<String>>,
+        /// Tool names advertised on each request, in the same order.
+        tools_seen: Mutex<Vec<Vec<String>>>,
+        parent_call: Mutex<Option<serde_json::Value>>,
+    }
+
+    impl CapturingRuntime {
+        fn new(spawn_args: serde_json::Value) -> Self {
+            Self {
+                parent_done: std::sync::atomic::AtomicBool::new(false),
+                seen: Mutex::new(Vec::new()),
+                tools_seen: Mutex::new(Vec::new()),
+                parent_call: Mutex::new(Some(spawn_args)),
+            }
+        }
+
+        fn response_for(&self, request: &ModelRequest) -> ModelResponse {
+            let blob: String = request
+                .messages
+                .iter()
+                .map(|m| m.text_content())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.seen.lock().unwrap().push(blob.clone());
+            self.tools_seen
+                .lock()
+                .unwrap()
+                .push(request.tools.iter().map(|t| t.name.clone()).collect());
+            if blob.contains("SUBTASK_MARKER") {
+                return assistant_text("child done");
+            }
+            if !self
+                .parent_done
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let args = self.parent_call.lock().unwrap().take().unwrap();
+                return assistant_with(vec![spawn_call("s1", args)], FinishReason::ToolCalls);
+            }
+            assistant_text("parent done")
+        }
+    }
+
+    #[async_trait]
+    impl ModelRuntime for CapturingRuntime {
+        async fn generate(
+            &self,
+            _request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            unimplemented!()
+        }
+
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            use leveler_model::ModelEvent;
+            let response = self.response_for(&request);
+            let mut events: Vec<Result<ModelEvent, ModelError>> =
+                vec![Ok(ModelEvent::MessageStarted {
+                    request_id: response.request_id.clone(),
+                })];
+            for part in &response.message.content {
+                match part {
+                    ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                        delta: text.clone(),
+                    })),
+                    ContentPart::ToolCall { call } => {
+                        events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
+                    }
+                    _ => {}
+                }
+            }
+            events.push(Ok(ModelEvent::MessageCompleted {
+                finish_reason: response.finish_reason,
+            }));
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+            unimplemented!()
+        }
+    }
+
+    /// Returns (events, prompt blobs, advertised tool names) — one entry per
+    /// model request, in order.
+    #[allow(clippy::type_complexity)]
+    async fn run_with(
+        dir: &std::path::Path,
+        args: serde_json::Value,
+    ) -> (Vec<AgentEvent>, Vec<String>, Vec<Vec<String>>) {
+        let workspace = Workspace::new(dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let runtime = Arc::new(CapturingRuntime::new(args));
+        let executor = Executor::new(
+            Arc::clone(&runtime) as Arc<dyn ModelRuntime>,
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        );
+        let mut events = Vec::new();
+        let _ = executor
+            .run(
+                "delegate",
+                &mut |e| events.push(e),
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let seen = runtime.seen.lock().unwrap().clone();
+        let tools = runtime.tools_seen.lock().unwrap().clone();
+        (events, seen, tools)
+    }
+
+    #[tokio::test]
+    async fn a_named_agent_delivers_its_persona_and_its_role() {
+        let dir = tmp("named-persona", 71);
+        let (events, seen, _) = run_with(
+            &dir,
+            serde_json::json!({"agent": "code-explorer", "task": "SUBTASK_MARKER 查登录流程"}),
+        )
+        .await;
+
+        let child = seen
+            .iter()
+            .find(|blob| blob.contains("SUBTASK_MARKER"))
+            .expect("the child must have been asked something");
+        assert!(
+            child.contains("代码探查者"),
+            "the built-in persona never reached the child: {child}"
+        );
+        assert!(
+            child.contains("查登录流程"),
+            "the concrete assignment must travel with it"
+        );
+
+        // The definition carries role: explorer, and no `role` was passed.
+        let role = events.iter().find_map(|e| match e {
+            AgentEvent::SubAgentStarted { role, .. } => Some(role.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            role.as_deref(),
+            Some("explorer"),
+            "the definition's role must apply without the caller repeating it"
+        );
+    }
+
+    /// A typo must fail loudly. Falling back to a personaless spawn would run
+    /// something subtly different while reporting success.
+    /// A declared tool list must bind the child's REAL toolset. If it only
+    /// shaped the prompt, an explorer persona could still call a write tool.
+    #[tokio::test]
+    async fn a_declared_tool_list_binds_the_child_toolset() {
+        let dir = tmp("named-tools", 73);
+        let agents = dir.join(".leveler").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("narrow.md"),
+            "---\nname: narrow\ndescription: d\nrole: explorer\ntools: [read_file, grep]\n---\n只读查。\n",
+        )
+        .unwrap();
+
+        let (_events, seen, tools) = run_with(
+            &dir,
+            serde_json::json!({"agent": "narrow", "task": "SUBTASK_MARKER 看看"}),
+        )
+        .await;
+
+        let child = seen
+            .iter()
+            .position(|b| b.contains("SUBTASK_MARKER"))
+            .expect("the child must have run");
+        let child_tools = &tools[child];
+        assert!(
+            child_tools.iter().any(|t| t == "read_file"),
+            "declared tools must be present: {child_tools:?}"
+        );
+        assert!(
+            child_tools.iter().any(|t| t == "grep"),
+            "declared tools must be present: {child_tools:?}"
+        );
+        for forbidden in ["apply_patch", "run_command", "shell_command", "replace"] {
+            assert!(
+                !child_tools.iter().any(|t| t == forbidden),
+                "`{forbidden}` was not declared and must not reach the child: {child_tools:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_agent_name_is_rejected_with_the_available_ones() {
+        let dir = tmp("named-unknown", 72);
+        let (events, _, _) = run_with(
+            &dir,
+            serde_json::json!({"agent": "code-explorerr", "task": "SUBTASK_MARKER x"}),
+        )
+        .await;
+
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult {
+                    name,
+                    is_error: true,
+                    preview,
+                    ..
+                } if name == "spawn_agent" => Some(preview.clone()),
+                _ => None,
+            })
+            .expect("an unknown agent must produce a tool error");
+        assert!(error.contains("Unknown agent"), "{error}");
+        assert!(
+            error.contains("code-explorer"),
+            "the error must list what IS available: {error}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentStarted { .. })),
+            "nothing may be spawned for an unknown name"
+        );
+    }
+}
+
+/// Full access means "no prompts at all". `handle_request_permissions` used to
+/// call the approver directly, bypassing `ApprovalPolicy::evaluate` entirely —
+/// so a user who explicitly opted out of prompting still got interrupted, to
+/// grant a permission they already had.
+mod full_access_is_silent {
+    use super::*;
+
+    struct CountingApprover {
+        asked: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl leveler_execution::Approver for CountingApprover {
+        async fn decide(
+            &self,
+            _request: &leveler_execution::ApprovalRequest,
+        ) -> leveler_execution::ApprovalDecision {
+            *self.asked.lock().unwrap() += 1;
+            leveler_execution::ApprovalDecision::Deny
+        }
+    }
+
+    fn permission_call(id: &str) -> ContentPart {
+        tool_call_part(
+            id,
+            "request_permissions",
+            serde_json::json!({"network": true, "reason": "需要下载依赖"}),
+        )
+    }
+
+    #[tokio::test]
+    async fn requesting_permissions_under_full_access_asks_nobody() {
+        let dir = tmp("fullaccess-silent", 41);
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+        let asked = Arc::new(Mutex::new(0usize));
+
+        let runtime = Arc::new(SleepyRuntime::new(
+            vec![
+                assistant_with(vec![permission_call("p1")], FinishReason::ToolCalls),
+                assistant_text("done"),
+            ],
+            Duration::from_millis(0),
+        ));
+        let executor = Executor::new(
+            runtime,
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(Arc::new(CountingApprover {
+            asked: asked.clone(),
+        }));
+
+        let mut events = Vec::new();
+        let _ = executor
+            .run(
+                "install deps",
+                &mut |e| events.push(e),
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            0,
+            "full access must not route a permission request to a human"
+        );
+        // `request_permissions` is handled inline (drive.rs) and does not emit a
+        // ToolResult event; its outcome lands in the transcript the next round
+        // carries, so assert on that.
+        let transcript = format!("{events:?}");
+        assert!(
+            transcript.contains("已获授权"),
+            "the request must be granted, not refused: {transcript}"
+        );
+    }
+
+    /// Better still: do not advertise the tool at all when there is nothing to
+    /// ask for. It costs tokens and invites a pointless round trip.
+    #[tokio::test]
+    async fn full_access_does_not_advertise_the_permission_tool() {
+        let dir = tmp("fullaccess-tools", 42);
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+        let names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CaptureTools {
+            names: Arc<Mutex<Vec<String>>>,
+            inner: SleepyRuntime,
+        }
+
+        #[async_trait]
+        impl ModelRuntime for CaptureTools {
+            async fn generate(
+                &self,
+                _request: ModelRequest,
+                _cancellation: CancellationToken,
+            ) -> Result<ModelResponse, ModelError> {
+                unimplemented!()
+            }
+            async fn stream(
+                &self,
+                request: ModelRequest,
+                cancellation: CancellationToken,
+            ) -> Result<ModelEventStream, ModelError> {
+                *self.names.lock().unwrap() =
+                    request.tools.iter().map(|t| t.name.clone()).collect();
+                self.inner.stream(request, cancellation).await
+            }
+            async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
+                self.inner.profile(m).await
+            }
+        }
+
+        let executor = Executor::new(
+            Arc::new(CaptureTools {
+                names: names.clone(),
+                inner: SleepyRuntime::new(vec![assistant_text("ok")], Duration::from_millis(0)),
+            }),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        );
+        let _ = executor
+            .run("hi", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let listed = names.lock().unwrap().clone();
+        assert!(
+            !listed.iter().any(|n| n == "request_permissions"),
+            "nothing to request under full access: {listed:?}"
+        );
+    }
+}
+
+/// Steering: user input that arrives while a turn is running must reach the
+/// model at the next round, not after the turn. Queuing it until the end makes
+/// a correction ("actually use the other module") arrive too late to matter.
+mod steering {
+    use super::*;
+    use leveler_agent::SteeringSource;
+
+    struct QueuedOnce {
+        pending: Mutex<Vec<String>>,
+        takes: Mutex<usize>,
+    }
+
+    impl SteeringSource for QueuedOnce {
+        fn take_pending(&self) -> Vec<String> {
+            *self.takes.lock().unwrap() += 1;
+            std::mem::take(&mut *self.pending.lock().unwrap())
+        }
+    }
+
+    fn runtime_seeing(marker: &'static str) -> Arc<SleepyRuntime> {
+        let _ = marker;
+        Arc::new(SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![tool_call_part("c1", "list_files", serde_json::json!({"path": "."}))],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            Duration::from_millis(0),
+        ))
+    }
+
+    #[tokio::test]
+    async fn steering_text_reaches_the_transcript_mid_turn() {
+        let dir = tmp("steering", 81);
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let source = Arc::new(QueuedOnce {
+            pending: Mutex::new(vec!["STEER_MARKER 改用另一个模块".to_string()]),
+            takes: Mutex::new(0),
+        });
+
+        let executor = Executor::new(
+            runtime_seeing("x"),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_steering(source.clone() as Arc<dyn SteeringSource>);
+
+        let mut events = Vec::new();
+        let _ = executor
+            .run("原任务", &mut |e| events.push(e), &mut NoopSink, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let blob = format!("{events:?}");
+        assert!(
+            blob.contains("STEER_MARKER"),
+            "steering text never reached the conversation: {blob}"
+        );
+        assert!(
+            *source.takes.lock().unwrap() >= 2,
+            "the loop must ask every round, not once"
+        );
+    }
+
+    /// The common case is nothing queued; it must not disturb the transcript.
+    #[tokio::test]
+    async fn an_empty_steering_source_changes_nothing() {
+        let dir = tmp("steering-empty", 82);
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let source = Arc::new(QueuedOnce {
+            pending: Mutex::new(vec![String::new(), "   ".to_string()]),
+            takes: Mutex::new(0),
+        });
+
+        let executor = Executor::new(
+            runtime_seeing("y"),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_steering(source as Arc<dyn SteeringSource>);
+
+        let outcome = executor
+            .run("原任务", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_text, "done", "blank steering must be dropped");
+    }
 }

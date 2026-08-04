@@ -407,10 +407,6 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
             if let Some(est) = streaming_output_estimate(state) {
                 parts.push(format!("↓~{}", fmt_tokens(est)));
             }
-            let waiting = state.input_queues.waiting_len();
-            if waiting > 0 {
-                parts.push(t.pending_n.replacen("{}", &waiting.to_string(), 1));
-            }
             let text = fit_status(&parts, width);
             // Give the moving spinner glyph an accent color so "still working"
             // reads at a glance; keep the rest of the line low-key.
@@ -476,8 +472,8 @@ pub(crate) fn header_line(state: &AppState, width: usize) -> Line<'static> {
     ))
 }
 
-/// Legacy trust-strip helper (tests). Production paints model · permission on
-/// the composer bottom border via `composer_trust_chip`.
+/// Legacy trust-strip helper (tests). Production paints model · permission ·
+/// collab on the composer bottom border via `composer_trust_chip`.
 #[cfg(test)]
 pub(crate) fn bottom_bar_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let theme = &state.theme;
@@ -490,6 +486,8 @@ pub(crate) fn bottom_bar_lines(state: &AppState, width: usize) -> Vec<Line<'stat
         Span::styled(state.model_label.clone(), model),
         Span::styled(" · ", sep),
         Span::styled(perm.to_string(), muted),
+        Span::styled(" · ", sep),
+        Span::styled(state.collaboration.clone(), muted),
     ];
     // Idle empty tip once — points people at the help card, not a key laundry list.
     if !state.is_busy()
@@ -678,20 +676,6 @@ mod tests {
         assert!(narrow.contains("main") || narrow.contains("⑂"), "{narrow}");
     }
 
-    #[test]
-    fn busy_status_counts_only_waiting_queue_items() {
-        let mut state = test_state();
-        state.status = RuntimeStatus::Busy;
-        state.input_queues.pending = vec!["sending now".into()];
-        let sending = status_line_content(&state, 120).to_string();
-        assert!(
-            !sending.contains("待处理"),
-            "pending item is already sending: {sending}"
-        );
-        state.input_queues.queued = vec!["next".into()];
-        let waiting = status_line_content(&state, 120).to_string();
-        assert!(waiting.contains("+1 待处理"), "waiting item: {waiting}");
-    }
 
     #[test]
     fn permission_chip_labels_are_english_product_terms() {

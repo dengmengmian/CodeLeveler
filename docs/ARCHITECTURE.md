@@ -20,6 +20,26 @@ CodeLeveler is designed around five constraints:
 5. **Recoverable local state.** Sessions and runtime events can be persisted and
    resumed without requiring a remote control plane.
 
+## Core
+
+The product core is one job: **within host-enforced boundaries, let the model
+use tools to finish work in a repository, with recoverable and auditable
+state.** Everything else (TUI/Web, slash commands, skills, remote pairing) is
+an entry or extension surface on top of that.
+
+Four pieces make up the core:
+
+| Piece | Responsibility | Where it lives |
+| --- | --- | --- |
+| **1. Tool loop (direct loop)** | Model proposes tool calls → host runs them → results return → repeat until the turn ends (or goal mode reaches `update_goal` complete/blocked). | `leveler-engine` + `leveler-agent` |
+| **2. Execution boundary** | Workspace paths, permissions, sandboxing, cancellation, and dangerous-command policy are **enforced by the host**, not by model instructions. | `leveler-execution` (+ tools dispatch in `leveler-tools`) |
+| **3. Session state** | Conversation and runtime events can be persisted and resumed; work is not tied to a single process lifetime. | `leveler-storage` + engine event log |
+| **4. Model adaptation** | Requests, streaming, and tool-call framing stay provider-neutral above a thin protocol/provider layer. | `leveler-model` + `leveler-protocol` + `leveler-provider` |
+
+Not core (keep thin, add later): UI chrome, command menus, multi-phase
+orchestration stacks, plugin marketplaces, and heavy product axes beyond what
+the loop and gates already need.
+
 Every crate forbids unsafe Rust except `leveler-execution`, which is
 `#![deny(unsafe_code)]` with a single audited exception (the Linux
 `PR_SET_PDEATHSIG` prctl call for orphan-process cleanup). The application and
@@ -43,8 +63,8 @@ User
                                   │
                  ┌────────────────┼─────────────────┐
                  ▼                ▼                 ▼
-          leveler-agent   leveler-orchestrator  leveler-verifier
-                 │                │                 │
+          leveler-agent                    leveler-verifier
+                 │                                  │
                  ├────────▶ leveler-context         │
                  └────────▶ leveler-tools ◀─────────┘
                                   │
@@ -98,14 +118,18 @@ The SSE decoder accepts arbitrary byte fragmentation. Tool-call arguments are
 joined before JSON parsing; invalid or truncated JSON produces an error and is
 never repaired into an executable call.
 
-### 3. Turns and orchestration
+### 3. Turns and tool loop
 
-`leveler-engine` owns task and turn lifecycle. A direct run drives one agent
-loop, while orchestrated runs add requirement extraction, localization, a task
-graph, and review. Lifecycle vocabulary is shared through `leveler-lifecycle`.
+`leveler-engine` owns task and turn lifecycle. **All product execution uses a
+single path: the direct agent tool loop.** Long tasks stay on that path via
+goal mode (`update_goal` until complete or blocked) and optional `spawn_agent`
+fan-out. The multi-phase orchestrate stack (crate, CLI `plan`/`discuss`, dual
+session mode) has been removed. Legacy log kinds named `orchestrate` are
+accepted and run as direct.
 
-The model may propose actions, but host code owns the state transition, resource
-budget, cancellation, permission decision, and completion rules.
+Lifecycle vocabulary is shared through `leveler-lifecycle`. The model may
+propose actions, but host code owns the state transition, resource budget,
+cancellation, permission decision, and completion rules.
 
 ### 4. Tools and command execution
 

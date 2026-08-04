@@ -466,8 +466,12 @@ mod tests {
         .unwrap();
 
         let pkg = ContextCompiler::compile(&dir, "deploy the service");
-        assert_eq!(pkg.skills.len(), 1);
-        assert_eq!(pkg.skills[0].name, "deploy");
+        // Project skill must appear; built-ins / global may also be present.
+        assert!(
+            pkg.skills.iter().any(|s| s.name == "deploy"),
+            "project skill missing: {:?}",
+            pkg.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
 
         let rendered = pkg.render();
         assert!(rendered.contains("Available skills"), "{rendered}");

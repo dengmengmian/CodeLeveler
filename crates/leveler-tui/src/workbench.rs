@@ -1,7 +1,7 @@
 //! Workbench layout: fixed Header / Plan / Input / Footer + scrollable Conversation.
 //!
 //! Layout (top → bottom):
-//! Header · Conversation (scroll) · gap · Status? · Queue · Plan · gap? · Input · gap · Footer
+//! Header · Conversation (scroll) · gap · Status? · Plan · gap? · Input · gap · Footer
 //!
 //! `/btw` is a floating card over the Conversation bottom — not main history.
 
@@ -13,7 +13,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use crate::footer_queue::{queue_panel_height, queue_panel_lines};
 use crate::i18n::UiText;
 use crate::render::{
     COMPOSER_MAX_ROWS, btw_card_lines, composer_box_lines, composer_visible_rows, item_render,
@@ -75,7 +74,7 @@ pub(crate) fn plan_current_step(plan: &UiPlan) -> Option<&UiPlanStep> {
 
 /// One-line plan chrome title. Always includes `k/n` and the current step when
 /// the plan has steps — including when the panel is collapsed — so progress is
-/// scannable without `/steps`.
+/// scannable from the conversation chrome.
 pub(crate) fn plan_chrome_title(plan: &UiPlan, collapsed: bool, t: &UiText) -> String {
     let disclosure = if collapsed { "▶" } else { "▼" };
     let (k, n) = plan_done_total(plan);
@@ -101,7 +100,6 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     } else {
         1
     };
-    let queue_rows = queue_panel_height(state);
     let plan_rows = plan_panel_height(state);
     let composer_rows =
         composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2) as u16;
@@ -128,14 +126,16 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         0
     };
     // Breathing room around the input box: blank above only when live chrome
-    // (status / queue / plan / attachments) sits on top of it — matches
+    // (status / plan / attachments) sits on top of it — matches
     // conversation_footer; blank below always so Context footer is not flush
     // on the composer border.
     let chrome_above = status_rows
-        .saturating_add(queue_rows)
         .saturating_add(plan_rows)
         .saturating_add(attach_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
+    // The hint row replaces the blank below the composer rather than adding to
+    // it, so hints appearing and disappearing never reflow the transcript.
+    let hints = crate::render::key_hint_line(state, area.width as usize);
     let post_composer_gap: u16 = 1;
 
     let chunks = Layout::vertical([
@@ -143,7 +143,6 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Min(3), // conversation viewport
         Constraint::Length(gap_rows),
         Constraint::Length(status_rows),
-        Constraint::Length(queue_rows),
         Constraint::Length(plan_rows),
         Constraint::Length(attach_rows),
         Constraint::Length(pre_composer_gap),
@@ -159,13 +158,15 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     if status_rows > 0 {
         frame.render_widget(Paragraph::new(status_line), chunks[3]);
     }
-    render_queue_panel(frame, chunks[4], state);
-    render_plan_panel(frame, chunks[5], state);
-    render_attachments(frame, chunks[6], state);
-    // chunks[7] = pre_composer_gap (leave blank)
-    render_input(frame, chunks[8], state);
-    // chunks[9] = post_composer_gap (leave blank)
-    render_footer(frame, chunks[10], state);
+    render_plan_panel(frame, chunks[4], state);
+    render_attachments(frame, chunks[5], state);
+    // chunks[6] = pre_composer_gap (leave blank)
+    render_input(frame, chunks[7], state);
+    // chunks[8]: the key hints when there are any, otherwise the blank gap.
+    if let Some(line) = hints.into_iter().next() {
+        frame.render_widget(Paragraph::new(line), chunks[8]);
+    }
+    render_footer(frame, chunks[9], state);
 
     // /btw floats over the conversation viewport (not in the scroll stream).
     render_btw_overlay(frame, chunks[1], state);
@@ -173,7 +174,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_notification_toast(frame, chunks[1], state);
 
     if state.active_screen == Screen::Conversation && state.overlay.is_none() {
-        render_slash_popup(frame, chunks[1], chunks[8], state);
+        render_slash_popup(frame, chunks[1], chunks[7], state);
     }
     if let Some(overlay) = &state.overlay {
         crate::overlay::render_overlay(frame, area, overlay, &state.theme);
@@ -673,20 +674,6 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     frame.render_widget(Paragraph::new(lines), area);
-}
-
-// ── Prompt Queue (between Conversation and Plan) ────────────────────────────
-
-fn render_queue_panel(frame: &mut Frame, area: Rect, state: &AppState) {
-    if area.height == 0 {
-        return;
-    }
-    let lines = queue_panel_lines(state, area.width as usize);
-    if lines.is_empty() {
-        return;
-    }
-    let shown: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
-    frame.render_widget(Paragraph::new(shown), area);
 }
 
 // ── Floating notification toast (over Conversation bottom) ──────────────────

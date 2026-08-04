@@ -52,6 +52,22 @@ fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalD
     }
 }
 
+/// Pending candidates as UI entries. Kept next to the listing handlers so the
+/// three places that emit `MemoryList` cannot drift on what "pending" means.
+fn pending_entries(
+    store: &leveler_memory::MemoryStore,
+) -> Vec<leveler_client_protocol::UiMemoryEntry> {
+    store
+        .list_pending()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| leveler_client_protocol::UiMemoryEntry {
+            id: c.id,
+            title: c.title,
+        })
+        .collect()
+}
+
 fn execution_mode(value: leveler_client_protocol::PermissionProfile) -> PermissionProfile {
     match value {
         leveler_client_protocol::PermissionProfile::RequestApproval => {
@@ -72,12 +88,12 @@ fn protocol_mode(value: PermissionProfile) -> leveler_client_protocol::Permissio
     }
 }
 
-use crate::event_bridge::{EventBridge, OrchestratorBridge, turn_runtime_event};
+use crate::event_bridge::{EventBridge, turn_runtime_event};
 use crate::prompt_bridge::{
     ChannelApprover, ChannelClarifier, PendingApprovals, PendingClarifications, resolve_approval,
     resolve_clarification, validate_pending_session,
 };
-use crate::workspace_view::{build_report, compute_diff, detect_branch_label};
+use crate::workspace_view::{compute_diff, detect_branch_label};
 
 /// The instruction used to summarize a conversation for compaction (spec §53).
 const COMPACT_PROMPT: &str = "Summarize the conversation so far into a concise \
@@ -138,8 +154,6 @@ pub struct InProcessRuntimeClient {
     /// When true, skip the approval overlay (AutoApprove) so unattended TUI
     /// PTY drivers and CI dogfood can run interactive turns.
     auto_approve: bool,
-    /// When true, turns run the full orchestrated state machine instead of the
-    /// direct tool loop (spec §54).
     /// Root of the content-addressed image store (`<state_dir>/media`, under the
     /// global home — not the project).
     media_root: PathBuf,
@@ -160,6 +174,26 @@ pub struct InProcessRuntimeClient {
     live_views: Arc<Mutex<HashMap<SessionId, LiveSessionView>>>,
     /// Per-session ownership and cancellation of active main turns.
     active: Arc<ActiveTurns>,
+    /// Text the user sent while a turn was already running, per session.
+    /// Drained by the agent loop at the top of each round.
+    steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+}
+
+/// Drains one session's steering queue for the agent loop.
+struct SessionSteering {
+    session_id: SessionId,
+    queues: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+}
+
+impl leveler_agent::SteeringSource for SessionSteering {
+    fn take_pending(&self) -> Vec<String> {
+        self.queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.session_id)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -167,7 +201,6 @@ struct SessionRuntimeConfig {
     model: ModelRef,
     mode: PermissionProfile,
     sandbox: bool,
-    orchestrate: bool,
     work_profile: String,
     collaboration: String,
 }
@@ -256,7 +289,6 @@ impl InProcessRuntimeClient {
                 model,
                 mode,
                 sandbox,
-                orchestrate: false,
                 work_profile: "balanced".into(),
                 // Default: plain conversation (no update_goal gate).
                 collaboration: "chat".into(),
@@ -268,6 +300,7 @@ impl InProcessRuntimeClient {
             session_events: Mutex::new(HashMap::new()),
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
+            steering: Arc::new(Mutex::new(HashMap::new())),
             checkpoints: Arc::new(Mutex::new(HashMap::new())),
             checkpoint_snapshots: Arc::new(Mutex::new(HashMap::new())),
             live_views: Arc::new(Mutex::new(HashMap::new())),
@@ -354,21 +387,22 @@ impl InProcessRuntimeClient {
                 session_id.as_str()
             ))
         })?;
-        let orchestrate = match kind.as_str() {
-            "direct" => false,
-            "orchestrate" | "orchestrated" => true,
+        // Interactive sessions always use the direct tool loop. Legacy rows
+        // stored as "orchestrate" are accepted but normalized to direct so a
+        // resume never re-enters the dual path.
+        match kind.as_str() {
+            "direct" | "orchestrate" | "orchestrated" => {}
             other => {
                 return Err(ClientError::Runtime(format!(
                     "session {} stores invalid execution kind `{other}`",
                     session_id.as_str()
                 )));
             }
-        };
+        }
         let config = SessionRuntimeConfig {
             model,
             mode,
             sandbox,
-            orchestrate,
             work_profile: record.work_profile.clone(),
             collaboration: record.collaboration.clone(),
         };
@@ -399,11 +433,7 @@ impl InProcessRuntimeClient {
                 session_id,
                 config.mode.as_str(),
                 config.sandbox,
-                if config.orchestrate {
-                    "orchestrate"
-                } else {
-                    "direct"
-                },
+                "direct",
                 leveler_core::now(),
             )
             .await
@@ -476,6 +506,15 @@ impl InProcessRuntimeClient {
         let _ = self
             .events_for(session_id)
             .send(RuntimeEvent::CheckpointCreated { checkpoint });
+    }
+
+    /// Steering for one session. Cloned into the executor, which drains it at
+    /// the top of every round.
+    fn steering_for(&self, session_id: &SessionId) -> Arc<SessionSteering> {
+        Arc::new(SessionSteering {
+            session_id: session_id.clone(),
+            queues: self.steering.clone(),
+        })
     }
 
     fn clarifier(
@@ -712,11 +751,9 @@ impl InProcessRuntimeClient {
         cancel: CancellationToken,
         config: SessionRuntimeConfig,
     ) {
-        if config.orchestrate {
-            self.spawn_orchestrated_turn(session_id, content, cancel, config);
-        } else {
-            self.spawn_direct_goal_turn(session_id, content, cancel, config);
-        }
+        // Single interactive path: direct goal loop (update_goal + tools +
+        // spawn_agent). Orchestrate is not used for sessions.
+        self.spawn_direct_goal_turn(session_id, content, cancel, config);
     }
 
     fn spawn_direct_goal_turn(
@@ -735,6 +772,9 @@ impl InProcessRuntimeClient {
         let repo = self.app.layout.repo_root.clone();
         let approver = self.approver(&session_id, cancel.clone());
         let clarifier = self.clarifier(&session_id, cancel.clone());
+        // Text the user sends while this turn runs lands here and is injected
+        // at the top of the next round.
+        let steering = self.steering_for(&session_id);
 
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
@@ -751,6 +791,7 @@ impl InProcessRuntimeClient {
                         approver,
                         clarifier,
                         sandbox,
+                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
                         &mut observer,
                         cancel,
                     )
@@ -871,74 +912,6 @@ impl InProcessRuntimeClient {
                     .await;
                 let outcome = turn_runtime_event(result);
                 let _ = events.send(outcome);
-                active.finish(&session_id);
-            });
-        });
-    }
-
-    /// Run a turn through the full orchestrator, surfacing plan, verification,
-    /// diff, and a completion report (spec §20–§23, §54).
-    fn spawn_orchestrated_turn(
-        &self,
-        session_id: SessionId,
-        content: String,
-        cancel: CancellationToken,
-        config: SessionRuntimeConfig,
-    ) {
-        let cancel_probe = cancel.clone();
-        let app = self.app.clone();
-        let events = self.events_for(&session_id);
-        let active = self.active.clone();
-        let model = config.model;
-        let mode = config.mode;
-        let sandbox = config.sandbox;
-        let approver = self.approver(&session_id, cancel.clone());
-        let clarifier = self.clarifier(&session_id, cancel.clone());
-        let repo = self.app.layout.repo_root.clone();
-
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(async move {
-                emit_project_rules(&events, &repo);
-                let mut bridge = OrchestratorBridge::new(events.clone());
-                let mut observer = |event: leveler_engine::EngineEvent| bridge.forward(event);
-                let result = app
-                    .orchestrate_task(
-                        &model,
-                        mode,
-                        &content,
-                        approver,
-                        clarifier,
-                        sandbox,
-                        &mut observer,
-                        cancel,
-                        Some(session_id.clone()),
-                    )
-                    .await;
-                match result {
-                    Ok((_session_id, report)) => {
-                        // with_patch=true: the WebUI/TUI show the actual code diff
-                        // (not just file counts) inline after each turn.
-                        let diff = compute_diff(&repo, true);
-                        let _ = events.send(RuntimeEvent::DiffUpdated { diff: diff.clone() });
-                        if cancel_probe.is_cancelled() {
-                            let _ = events.send(RuntimeEvent::TurnCancelled);
-                        } else {
-                            let _ = events.send(RuntimeEvent::SessionCompleted {
-                                report: build_report(&report, &diff),
-                            });
-                            let _ = events.send(RuntimeEvent::TurnCompleted);
-                        }
-                    }
-                    Err(_) if cancel_probe.is_cancelled() => {
-                        let _ = events.send(RuntimeEvent::TurnCancelled);
-                    }
-                    Err(e) => {
-                        let _ = events.send(RuntimeEvent::TurnFailed {
-                            error: e.to_string(),
-                        });
-                    }
-                }
                 active.finish(&session_id);
             });
         });
@@ -1306,20 +1279,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
-            ClientCommand::SetAgentMode {
-                session_id,
-                orchestrate,
-            } => {
-                let mut config = self.runtime_config(&session_id).await?;
-                config.orchestrate = orchestrate;
-                self.persist_runtime_config(&session_id, config).await?;
-                if let Ok(session) = self.snapshot(&session_id).await {
-                    let _ = self
-                        .events_for(&session_id)
-                        .send(RuntimeEvent::SessionUpdated { session });
-                }
-                Ok(())
-            }
+
             ClientCommand::SetProductAxes {
                 session_id,
                 work_profile,
@@ -1399,16 +1359,81 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         } else {
                             Vec::new()
                         };
+                        let pending = pending_entries(&store);
                         let _ = events.send(RuntimeEvent::MemoryList {
                             memory_dir: memory_dir.display().to_string(),
                             active,
                             archived,
+                            pending,
                         });
                     }
                     Err(err) => {
                         let _ = events.send(RuntimeEvent::Notification {
                             level: leveler_client_protocol::NotificationLevel::Warning,
                             message: format!("memory open failed: {err}"),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            ClientCommand::SteerCurrentTurn {
+                session_id,
+                content,
+            } => {
+                if self.active.is_running(&session_id) {
+                    self.steering
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(session_id.clone())
+                        .or_default()
+                        .push(content);
+                    return Ok(());
+                }
+                // The turn ended between the client deciding to steer and this
+                // arriving — a real race, because the client's "busy" view lags
+                // the runtime by one event. Dropping the text here would lose
+                // what the user typed, so fall through to an ordinary
+                // submission and start a new turn with it.
+                return Box::pin(self.send(ClientCommand::SubmitMessage {
+                    session_id,
+                    content,
+                    attachments: Vec::new(),
+                }))
+                .await;
+            }
+            ClientCommand::AcceptMemory { session_id, id } => {
+                // User-authoritative promotion: this call IS the consent K36
+                // requires, which is why the model can never reach it.
+                let memory_dir = self.app.layout.memory_dir();
+                let events = self.events_for(&session_id);
+                match leveler_memory::MemoryStore::open(&memory_dir).and_then(|s| s.accept(&id)) {
+                    Ok(entry) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Info,
+                            message: format!("已采纳记忆 [{}]: {}", entry.id, entry.title),
+                        });
+                        if let Ok(store) = leveler_memory::MemoryStore::open(&memory_dir) {
+                            let active = store
+                                .list_active()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|e| leveler_client_protocol::UiMemoryEntry {
+                                    id: e.id,
+                                    title: e.title,
+                                })
+                                .collect();
+                            let _ = events.send(RuntimeEvent::MemoryList {
+                                memory_dir: memory_dir.display().to_string(),
+                                active,
+                                archived: Vec::new(),
+                                pending: pending_entries(&store),
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("采纳失败 [{id}]: {err}"),
                         });
                     }
                 }
@@ -1447,6 +1472,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                                 memory_dir: memory_dir.display().to_string(),
                                 active,
                                 archived,
+                                pending: pending_entries(&store),
                             });
                         }
                     }
@@ -1968,7 +1994,6 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 model: model.clone(),
                 mode: execution_mode(request.mode),
                 sandbox: self.default_runtime.sandbox,
-                orchestrate: false,
                 work_profile: self.default_runtime.work_profile.clone(),
                 collaboration: self.default_runtime.collaboration.clone(),
             },

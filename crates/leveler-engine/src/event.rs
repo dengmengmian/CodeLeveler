@@ -28,17 +28,14 @@ use serde::{Deserialize, Serialize};
 
 use leveler_core::{ApprovalId, ClarificationId, TurnId};
 use leveler_lifecycle::{AgentState, TaskOutcome, TurnOutcome};
-use leveler_orchestrator::{NodeStatus, Requirement, ReviewFinding, TaskGraph};
 
 use crate::EngineError;
 
-/// How a session executes: single agent, plan/orchestrate state machine, or
-/// parallel worktree candidates.
+/// How a session executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionKind {
     Direct,
-    Orchestrate,
     Parallel,
 }
 
@@ -46,16 +43,14 @@ impl ExecutionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ExecutionKind::Direct => "direct",
-            ExecutionKind::Orchestrate => "orchestrate",
             ExecutionKind::Parallel => "parallel",
         }
     }
 
     pub fn parse(s: &str) -> Result<Self, EngineError> {
         match s {
-            "direct" => Ok(ExecutionKind::Direct),
-            // Canonical wire form is `orchestrate`; accept legacy `orchestrated`.
-            "orchestrate" | "orchestrated" => Ok(ExecutionKind::Orchestrate),
+            // Legacy "orchestrate"/"orchestrated" sessions run as direct.
+            "direct" | "orchestrate" | "orchestrated" => Ok(ExecutionKind::Direct),
             "parallel" => Ok(ExecutionKind::Parallel),
             other => Err(EngineError::Corrupt(format!(
                 "unknown execution kind `{other}`"
@@ -69,17 +64,28 @@ mod execution_kind_tests {
     use super::*;
 
     #[test]
-    fn orchestrated_legacy_kind_normalizes_to_orchestrate() {
+    fn legacy_orchestrate_kind_parses_as_direct() {
         assert_eq!(
             ExecutionKind::parse("orchestrated").unwrap(),
-            ExecutionKind::Orchestrate
+            ExecutionKind::Direct
         );
-        assert_eq!(ExecutionKind::Orchestrate.as_str(), "orchestrate");
         assert_eq!(
             ExecutionKind::parse("orchestrate").unwrap(),
-            ExecutionKind::Orchestrate
+            ExecutionKind::Direct
         );
+        assert_eq!(ExecutionKind::Direct.as_str(), "direct");
     }
+}
+
+/// Legacy plan-node status (kept as a plain enum for event replay only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Skipped,
 }
 
 /// What a turn is, matching `turns.kind`.
@@ -90,7 +96,7 @@ pub enum TurnKind {
     User,
     /// A conversational turn (multimodal content, goal mode off).
     Chat,
-    /// One orchestrated graph node.
+    /// Legacy plan-graph node turn (no longer produced).
     Node { node_id: String },
     /// A verification-repair attempt.
     Repair { attempt: u32 },
@@ -312,15 +318,17 @@ pub enum EngineEvent {
         from: AgentState,
         to: AgentState,
     },
+    /// Legacy orchestrate event (payload simplified for wire compatibility).
     RequirementReady {
-        requirement: Requirement,
+        goal: String,
     },
     ContextReady {
         candidate_files: Vec<String>,
         estimated_tokens: u32,
     },
+    /// Legacy orchestrate event.
     PlanReady {
-        graph: TaskGraph,
+        step_count: u32,
     },
     NodeStarted {
         node_id: String,
@@ -348,7 +356,7 @@ pub enum EngineEvent {
         lenses: usize,
     },
     ReviewFinding {
-        finding: ReviewFinding,
+        summary: String,
     },
     ReviewFailed {
         lens: String,

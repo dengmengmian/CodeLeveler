@@ -25,6 +25,21 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
     for r in &results {
         print_check(r);
     }
+
+    // Crashes are otherwise invisible: the TUI tears the screen down and the
+    // message scrolls away. Point at the records rather than reprinting them.
+    let crashes = crate::crash::recent(3);
+    if !crashes.is_empty() {
+        println!();
+        println!(
+            "{}",
+            Line::warn(&format!("{} recent crash record(s):", crashes.len()))
+        );
+        for path in &crashes {
+            println!("    {}", path.display());
+        }
+        println!("  Local only — nothing was sent anywhere.");
+    }
     println!();
     if leveler_app::doctor::has_failure(&results) {
         println!("{}", Line::warn("Some checks failed. See details above."));

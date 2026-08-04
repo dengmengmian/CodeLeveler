@@ -22,77 +22,411 @@ pub enum Screen {
     Help,
 }
 
-/// Slash command names in stable order (descriptions come from [`UiText`]).
+/// Help / popup grouping for slash commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCategory {
+    /// Model, permission, collab, goal — how the agent runs.
+    Agent,
+    /// Screens and inspection.
+    View,
+    /// History, export, memory, clear.
+    Session,
+    /// Attachments, skills, paste.
+    Input,
+    /// Theme, web, remote, help, quit.
+    System,
+}
+
+/// Whether a command may run while a turn is busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyPolicy {
+    /// Safe while busy (views, help, quit, most pickers).
+    Always,
+    /// Axes / destructive session ops — refuse with a notice while busy.
+    IdleOnly,
+}
+
+/// One slash command: single source of truth for menu, aliases, and busy rules.
+#[derive(Debug, Clone, Copy)]
+pub struct SlashDef {
+    /// Canonical name including leading `/` (shown in help and completed by Tab).
+    pub name: &'static str,
+    /// Alternate tokens including leading `/` (accepted, may be unlisted).
+    pub aliases: &'static [&'static str],
+    pub category: SlashCategory,
+    /// Shown in help and the `/` popup when listed.
+    pub listed: bool,
+    pub busy: BusyPolicy,
+}
+
+/// Registry order = help order within each category and completion sort order.
+pub const SLASH_DEFS: &[SlashDef] = &[
+    // Agent
+    SlashDef {
+        name: "/model",
+        aliases: &[],
+        category: SlashCategory::Agent,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    // Primary name is permission; /mode kept as alias for muscle memory.
+    SlashDef {
+        name: "/permission",
+        aliases: &["/mode"],
+        category: SlashCategory::Agent,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/goal",
+        aliases: &[],
+        category: SlashCategory::Agent,
+        listed: true,
+        busy: BusyPolicy::Always, // steers when busy
+    },
+    SlashDef {
+        name: "/btw",
+        aliases: &[],
+        category: SlashCategory::Agent,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/work-mode",
+        aliases: &["/work_mode"],
+        category: SlashCategory::Agent,
+        listed: true,
+        busy: BusyPolicy::IdleOnly,
+    },
+    SlashDef {
+        name: "/collab",
+        aliases: &[],
+        category: SlashCategory::Agent,
+        listed: true,
+        busy: BusyPolicy::IdleOnly,
+    },
+    SlashDef {
+        name: "/plan",
+        aliases: &[],
+        category: SlashCategory::Agent,
+        listed: true,
+        busy: BusyPolicy::IdleOnly,
+    },
+    // View
+    SlashDef {
+        name: "/diff",
+        aliases: &[],
+        category: SlashCategory::View,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/tools",
+        aliases: &[],
+        category: SlashCategory::View,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/sessions",
+        aliases: &[],
+        category: SlashCategory::View,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    // Session
+    SlashDef {
+        name: "/memory",
+        aliases: &[],
+        category: SlashCategory::Session,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        // `/rewind` is what every other agent CLI calls this, so it is accepted
+        // as a first-class alias for muscle memory.
+        name: "/restore",
+        aliases: &["/checkpoint", "/rewind"],
+        category: SlashCategory::Session,
+        listed: true,
+        busy: BusyPolicy::IdleOnly,
+    },
+    SlashDef {
+        // Copying a transcript mid-turn would capture half a turn, so this
+        // waits for idle like the other session-shaping commands.
+        name: "/fork",
+        aliases: &[],
+        category: SlashCategory::Session,
+        listed: true,
+        busy: BusyPolicy::IdleOnly,
+    },
+    SlashDef {
+        name: "/compact",
+        aliases: &[],
+        category: SlashCategory::Session,
+        listed: true,
+        busy: BusyPolicy::IdleOnly,
+    },
+    SlashDef {
+        name: "/export",
+        aliases: &["/save"],
+        category: SlashCategory::Session,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/clear",
+        aliases: &["/new"],
+        category: SlashCategory::Session,
+        listed: true,
+        busy: BusyPolicy::IdleOnly,
+    },
+    // Input
+    SlashDef {
+        name: "/skill",
+        aliases: &[],
+        category: SlashCategory::Input,
+        listed: true,
+        busy: BusyPolicy::Always, // steers when busy
+    },
+    SlashDef {
+        name: "/attach",
+        aliases: &["/image"],
+        category: SlashCategory::Input,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/paste",
+        aliases: &[],
+        category: SlashCategory::Input,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/editor",
+        aliases: &[],
+        category: SlashCategory::Input,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    // System
+    SlashDef {
+        name: "/theme",
+        aliases: &[],
+        category: SlashCategory::System,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/web",
+        aliases: &[],
+        category: SlashCategory::System,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/remote",
+        aliases: &[],
+        category: SlashCategory::System,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    // Same-network path: listed but copy marks it as local/testing.
+    SlashDef {
+        name: "/remote-loc",
+        aliases: &[],
+        category: SlashCategory::System,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/doctor",
+        aliases: &[],
+        category: SlashCategory::System,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/help",
+        aliases: &[],
+        category: SlashCategory::System,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+    SlashDef {
+        name: "/quit",
+        aliases: &["/q"],
+        category: SlashCategory::System,
+        listed: true,
+        busy: BusyPolicy::Always,
+    },
+];
+
+/// Listed primary names in registry order (completion / help / exact-Enter).
+///
+/// Prefer [`SLASH_DEFS`] + [`is_known_slash_token`] for new code. Kept so tests
+/// and Enter-exact matching stay one call away from the listed surface.
+pub fn listed_slash_names() -> impl Iterator<Item = &'static str> {
+    SLASH_DEFS.iter().filter(|d| d.listed).map(|d| d.name)
+}
+
+/// All tokens (primary + aliases) that parse as local slash commands.
+pub fn all_slash_tokens() -> Vec<&'static str> {
+    let mut out = Vec::with_capacity(SLASH_DEFS.len() * 2);
+    for d in SLASH_DEFS {
+        out.push(d.name);
+        out.extend_from_slice(d.aliases);
+    }
+    out
+}
+
+/// Stable listed names (primary only) — same role as the old `SLASH_NAMES`.
 pub const SLASH_NAMES: &[&str] = &[
     "/model",
-    "/mode",
+    "/permission",
     "/goal",
     "/btw",
-    "/workflow",
     "/work-mode",
     "/collab",
     "/plan",
-    "/confirm-plan",
-    "/memory",
-    "/skill",
-    "/steps",
     "/diff",
-    "/verify",
     "/tools",
     "/sessions",
-    "/context",
-    "/agents",
+    "/memory",
     "/restore",
+    "/fork",
     "/compact",
     "/export",
+    "/clear",
+    "/skill",
+    "/attach",
+    "/paste",
+    "/editor",
+    "/theme",
     "/web",
     "/remote",
     "/remote-loc",
-    "/image",
-    "/attach",
-    "/paste",
-    "/theme",
-    "/clear",
+    "/doctor",
     "/help",
     "/quit",
 ];
 
-/// Localized slash commands for completion and the Help screen (spec §28).
-pub fn slash_commands(t: &UiText) -> Vec<(&'static str, &'static str)> {
+/// `name` is without the leading `/`. Empty string is `/` → help.
+pub fn is_known_slash_token(name: &str) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    let token = format!("/{name}");
+    SLASH_DEFS
+        .iter()
+        .any(|d| d.name == token.as_str() || d.aliases.contains(&token.as_str()))
+}
+
+/// Canonical primary name (with `/`) for a typed token (with or without `/`).
+pub fn slash_primary(token: &str) -> Option<&'static str> {
+    // Bare `/` is help.
+    if token.is_empty() || token == "/" {
+        return Some("/help");
+    }
+    let owned;
+    let t = if token.starts_with('/') {
+        token
+    } else {
+        owned = format!("/{token}");
+        owned.as_str()
+    };
+    SLASH_DEFS
+        .iter()
+        .find(|d| d.name == t || d.aliases.contains(&t))
+        .map(|d| d.name)
+}
+
+pub fn slash_def(token: &str) -> Option<&'static SlashDef> {
+    let t = if token.starts_with('/') {
+        token.to_string()
+    } else {
+        format!("/{token}")
+    };
+    SLASH_DEFS
+        .iter()
+        .find(|d| d.name == t.as_str() || d.aliases.contains(&t.as_str()))
+}
+
+fn slash_description(name: &str, t: &UiText) -> &'static str {
     let s = &t.slash;
-    vec![
-        ("/model", s.model),
-        ("/mode", s.mode),
-        ("/goal", s.goal),
-        ("/btw", s.btw),
-        ("/workflow", s.workflow),
-        ("/work-mode", s.work_mode),
-        ("/collab", s.collab),
-        ("/plan", s.plan_collab),
-        ("/confirm-plan", s.confirm_plan),
-        ("/memory", s.memory),
-        ("/skill", s.skill),
-        ("/steps", s.steps),
-        ("/diff", s.diff),
-        ("/verify", s.verify),
-        ("/tools", s.tools),
-        ("/sessions", s.sessions),
-        ("/context", s.context),
-        ("/agents", s.agents),
-        ("/restore", s.restore),
-        ("/compact", s.compact),
-        ("/export", s.export),
-        ("/web", s.web),
-        ("/remote", s.remote),
-        ("/remote-loc", s.remote_loc),
-        ("/image", s.image),
-        ("/attach", s.attach),
-        ("/paste", s.paste),
-        ("/theme", s.theme),
-        ("/clear", s.clear),
-        ("/help", s.help),
-        ("/quit", s.quit),
-    ]
+    match name {
+        "/model" => s.model,
+        "/permission" | "/mode" => s.permission,
+        "/goal" => s.goal,
+        "/btw" => s.btw,
+        "/work-mode" | "/work_mode" => s.work_mode,
+        "/collab" => s.collab,
+        "/plan" => s.plan_collab,
+        "/memory" => s.memory,
+        "/skill" => s.skill,
+        "/diff" => s.diff,
+        "/tools" => s.tools,
+        "/sessions" => s.sessions,
+        "/restore" | "/checkpoint" | "/rewind" => s.restore,
+        "/fork" => s.fork,
+        "/compact" => s.compact,
+        "/export" | "/save" => s.export,
+        "/web" => s.web,
+        "/remote" => s.remote,
+        "/remote-loc" => s.remote_loc,
+        "/image" | "/attach" => s.attach,
+        "/paste" => s.paste,
+        "/editor" => s.editor,
+        "/theme" => s.theme,
+        "/clear" | "/new" => s.clear,
+        "/doctor" => s.doctor,
+        "/help" => s.help,
+        "/quit" | "/q" => s.quit,
+        _ => "",
+    }
+}
+
+/// Localized listed slash commands for completion and the Help screen.
+pub fn slash_commands(t: &UiText) -> Vec<(&'static str, &'static str)> {
+    SLASH_DEFS
+        .iter()
+        .filter(|d| d.listed)
+        .map(|d| (d.name, slash_description(d.name, t)))
+        .collect()
+}
+
+/// Help entries grouped by category (category label key applied by renderer).
+pub fn slash_commands_grouped(
+    t: &UiText,
+) -> Vec<(SlashCategory, Vec<(&'static str, &'static str)>)> {
+    use SlashCategory::*;
+    let order = [Agent, View, Session, Input, System];
+    order
+        .into_iter()
+        .filter_map(|cat| {
+            let items: Vec<_> = SLASH_DEFS
+                .iter()
+                .filter(|d| d.listed && d.category == cat)
+                .map(|d| (d.name, slash_description(d.name, t)))
+                .collect();
+            if items.is_empty() {
+                None
+            } else {
+                Some((cat, items))
+            }
+        })
+        .collect()
+}
+
+pub fn category_label(cat: SlashCategory, t: &UiText) -> &'static str {
+    match cat {
+        SlashCategory::Agent => t.help_group_agent,
+        SlashCategory::View => t.help_group_view,
+        SlashCategory::Session => t.help_group_session,
+        SlashCategory::Input => t.help_group_input,
+        SlashCategory::System => t.help_group_system,
+    }
 }
 
 /// Build a user message that names a skill for turn injection (same path as `$name`).
@@ -106,36 +440,82 @@ pub fn skill_mention_message(skill_name: &str, rest: &str) -> String {
     }
 }
 
-/// Slash commands whose name starts with `prefix` (including the leading `/`).
-pub fn slash_matches(prefix: &str, t: &UiText) -> Vec<(&'static str, &'static str)> {
-    slash_commands(t)
-        .into_iter()
-        .filter(|(name, _)| name.starts_with(prefix))
+/// Slash commands whose primary name or alias starts with `prefix` (with `/`).
+/// Rows always use the **primary** name so Tab completes the canonical form.
+pub fn slash_matches(prefix: &str, t: &UiText) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for d in SLASH_DEFS.iter().filter(|d| d.listed) {
+        let hit = d.name.starts_with(prefix) || d.aliases.iter().any(|a| a.starts_with(prefix));
+        if hit {
+            out.push((d.name.to_string(), slash_description(d.name, t).to_string()));
+        }
+    }
+    out
+}
+
+/// Skills that may appear as `/name` (and do not collide with builtins).
+pub fn skill_slash_matches(state: &crate::state::AppState, prefix: &str) -> Vec<(String, String)> {
+    let prefix_name = prefix.trim_start_matches('/');
+    state
+        .skill_catalog
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix_name) || format!("/{name}").starts_with(prefix))
+        .map(|(name, desc)| {
+            let label = if desc.is_empty() {
+                state.t().slash.skill_entry.to_string()
+            } else {
+                desc.clone()
+            };
+            (format!("/{name}"), label)
+        })
         .collect()
 }
 
 /// The completion popup's entries for the current composer `text`, or empty when
 /// no popup should show. Single source of truth shared by the reducer (key
 /// handling / selection) and the renderer.
-pub fn slash_popup(text: &str, t: &UiText) -> Vec<(&'static str, &'static str)> {
+///
+/// Includes discovered project/user skills as `/skill-name` so they feel like
+/// first-class commands (Claude Code / Grok-style).
+pub fn slash_popup(
+    text: &str,
+    t: &UiText,
+    state: &crate::state::AppState,
+) -> Vec<(String, String)> {
     if !text.starts_with('/') || text.contains('\n') {
         return Vec::new();
     }
     let token = text.split_whitespace().next().unwrap_or(text);
+    let mut matches = slash_matches(token, t);
+    matches.extend(skill_slash_matches(state, token));
     // Once a full command + argument is being typed, stop offering the popup.
-    if text.contains(' ') && slash_matches(token, t).len() <= 1 {
+    if text.contains(' ') && matches.len() <= 1 {
         return Vec::new();
     }
-    slash_matches(token, t)
+    matches
+}
+
+/// True when `token` (with leading `/`) is a primary name or alias.
+pub fn is_exact_slash_token(token: &str) -> bool {
+    all_slash_tokens().contains(&token)
 }
 
 /// Like [`slash_popup`], but respects a user Esc-dismiss so the menu stays
 /// hidden until the composer text changes again.
-pub fn visible_slash_popup(state: &crate::state::AppState) -> Vec<(&'static str, &'static str)> {
+pub fn visible_slash_popup(state: &crate::state::AppState) -> Vec<(String, String)> {
     if state.slash_popup_dismissed {
         return Vec::new();
     }
-    slash_popup(state.composer.text(), state.t())
+    slash_popup(state.composer.text(), state.t(), state)
+}
+
+/// Whether `name` (no leading `/`) is a skill that can be invoked as `/name`.
+pub fn is_skill_slash_token(state: &crate::state::AppState, name: &str) -> bool {
+    !is_known_slash_token(name)
+        && state
+            .skill_catalog
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(name))
 }
 
 /// Active `@file` query immediately before the composer cursor.
@@ -194,16 +574,16 @@ pub fn slash_arg_ghost(text: &str, t: &UiText) -> Option<&'static str> {
     if !rest.trim().is_empty() {
         return None;
     }
-    // Partial prefixes (`/bt`) keep the popup; only full command names get a ghost.
-    if !SLASH_NAMES.contains(&cmd) {
-        return None;
-    }
+    // Accept primary or alias; ghost uses the canonical primary.
+    let primary = slash_primary(cmd)?;
     let g = &t.slash_ghost;
-    let (bare, spaced) = match cmd {
+    let (bare, spaced) = match primary {
         "/btw" => (g.btw, g.btw_spaced),
         "/goal" => (g.goal, g.goal_spaced),
         "/skill" => (g.skill, g.skill_spaced),
-        "/image" | "/attach" => (g.path, g.path_spaced),
+        "/attach" => (g.path, g.path_spaced),
+        "/work-mode" => (g.work_mode, g.work_mode_spaced),
+        "/collab" => (g.collab, g.collab_spaced),
         _ => return None,
     };
     if text.ends_with(|c: char| c.is_whitespace()) {
@@ -254,9 +634,17 @@ mod ghost_tests {
         let zh = t();
         assert_eq!(slash_arg_ghost("/btw", zh), Some(" <问题>"));
         assert_eq!(slash_arg_ghost("/btw ", zh), Some("<问题>"));
-        assert_eq!(slash_arg_ghost("/goal", zh), Some(" <任务目标>"));
+        assert_eq!(
+            slash_arg_ghost("/goal", zh),
+            Some(" <任务目标> | status | clear")
+        );
         assert_eq!(slash_arg_ghost("/image ", zh), Some("<文件路径>"));
         assert_eq!(slash_arg_ghost("/attach", zh), Some(" <文件路径>"));
+        assert_eq!(
+            slash_arg_ghost("/work-mode", zh),
+            Some(" economy|balanced|delivery")
+        );
+        assert_eq!(slash_arg_ghost("/collab ", zh), Some("chat|plan|goal"));
     }
 
     #[test]
@@ -264,9 +652,27 @@ mod ghost_tests {
         let zh = t();
         assert_eq!(slash_arg_ghost("/btw 你好", zh), None);
         assert_eq!(slash_arg_ghost("/bt", zh), None);
-        assert_eq!(slash_arg_ghost("/workflow", zh), None);
+        assert_eq!(slash_arg_ghost("/collab chat", zh), None);
         assert_eq!(slash_arg_ghost("hello", zh), None);
         assert_eq!(slash_arg_ghost("", zh), None);
+    }
+
+    #[test]
+    fn permission_is_primary_mode_is_alias() {
+        assert_eq!(super::slash_primary("/mode"), Some("/permission"));
+        assert_eq!(super::slash_primary("permission"), Some("/permission"));
+        assert!(super::is_known_slash_token("mode"));
+        assert!(super::is_known_slash_token("permission"));
+        let names: Vec<_> = slash_commands(t()).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"/permission"));
+        assert!(
+            !names.contains(&"/mode"),
+            "alias must not double-list: {names:?}"
+        );
+        assert!(
+            !names.contains(&"/image"),
+            "image is attach alias: {names:?}"
+        );
     }
 }
 

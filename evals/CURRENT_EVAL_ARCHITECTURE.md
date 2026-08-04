@@ -31,7 +31,7 @@ leveler eval run|compare|ablate        # crates/leveler-cli/src/eval_cmd.rs
    ▼
 run_eval_case()                        # 单 case 执行器
    ├─ 建 workspace：synthetic(空仓+files) 或 repo(git clone --local + files 覆盖)
-   ├─ Application::assemble → 跑 orchestrated / direct / no_verify_gate 三种路径
+   ├─ Application::assemble → 跑 direct tool loop（可选 --no-verify-gate 消融）
    ├─ SignalCollector 折叠事件流 → TrajectorySignals（工具/循环/错误信号）
    └─ 跑 case.expect 命令 → expect_passed（独立于模型自报的 completed）
    ▼
@@ -77,8 +77,8 @@ leveler eval compare M_A M_B --cases DIR [--repetitions N] [--json-out P]
 leveler eval ablate  KNOB --model M --cases DIR [--direct] [--repetitions N] [--json-out P]
 ```
 
-- 三条执行路径：orchestrated（默认全套脚手架）/ `--direct`（裸工具循环）/
-  `--no-verify-gate`（去掉验证门+修复轮，量化 verify→repair 的救回率）。
+- 执行路径只有 direct tool loop；`--direct` 保留作兼容 flag（无效果差异）。
+  `--no-verify-gate` 去掉验证门+修复轮，用于量化 verify→repair 的救回率。
 - `--json-out` 落 `BaselineDocument`，带 `BaselineMeta`（git_sha、模型、mode、repetitions、
   引擎版本、case 组成），保证以后可复现对比。
 - checkpoint（append-only JSONL）：长跑被中断也能恢复已完成 case。

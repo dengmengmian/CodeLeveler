@@ -180,10 +180,6 @@ pub enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
-        /// Drive the task through the full state machine (Understand → Plan →
-        /// Execute) instead of the direct tool loop.
-        #[arg(long)]
-        orchestrate: bool,
         /// After a successful run, commit the changes.
         #[arg(long)]
         commit: bool,
@@ -216,27 +212,6 @@ pub enum Command {
         parallel: usize,
     },
 
-    /// Analyze a task read-only: derive a requirement and a task plan (no edits).
-    Plan {
-        /// The natural-language task.
-        task: String,
-        /// Model reference (defaults to the only configured model).
-        #[arg(long)]
-        model: Option<String>,
-    },
-
-    /// Multi-agent discussion: several perspectives debate a topic, then synthesize.
-    Discuss {
-        /// The topic / question to discuss.
-        topic: String,
-        /// Number of rounds each participant speaks.
-        #[arg(long, default_value_t = 2)]
-        rounds: u32,
-        /// Model reference (defaults to the configured default).
-        #[arg(long)]
-        model: Option<String>,
-    },
-
     /// Run the evaluation harness.
     #[command(subcommand)]
     Eval(EvalCommand),
@@ -264,6 +239,33 @@ pub enum Command {
     /// Create the global config (~/.leveler/config.toml) interactively.
     /// Refuses to overwrite an existing config; prints a template when not a TTY.
     Init,
+
+    /// Store an API key for a provider in `~/.leveler/config.toml`.
+    ///
+    /// Prompts for the key without echoing it and tightens the config to
+    /// owner-only. An exported `*_API_KEY` still takes precedence, so this
+    /// never silently shadows an environment variable.
+    Login {
+        /// Provider id. Omit to pick from the configured providers.
+        provider: Option<String>,
+    },
+
+    /// Remove a provider's stored API key (the `api_key_env` fallback stays).
+    Logout {
+        /// Provider id.
+        provider: String,
+    },
+
+    /// Print a shell completion script on stdout.
+    ///
+    /// Source it from your shell rc, e.g.
+    /// `leveler completions zsh > ~/.zfunc/_leveler` (with `~/.zfunc` on
+    /// `$fpath`), or `eval "$(leveler completions bash)"`.
+    Completions {
+        /// Target shell.
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
 
     /// Check for or install a newer CodeLeveler release from GitHub.
     ///
@@ -484,16 +486,15 @@ pub enum EvalCommand {
         /// Directory of eval case YAML files (`evals/smoke`, `evals/hard`, …).
         #[arg(long, default_value = "evals/smoke")]
         cases: PathBuf,
-        /// Use the direct tool loop instead of the orchestrated state machine
-        /// (for ablation: measures the value of the orchestration scaffold).
+        /// Accepted for backward compatibility; eval always uses the direct
+        /// tool loop (the multi-phase orchestrate path was removed).
         #[arg(long)]
         direct: bool,
         /// Ablation: run WITHOUT the post-edit verification gate and its repair
         /// loop, so the model's own "done" is final. The case still passes or
         /// fails on the independent `expect` command, so this measures how often
         /// verify→repair rescues a run the model would have gotten wrong.
-        /// Requires --direct (the orchestrated path has its own gates).
-        #[arg(long, requires = "direct")]
+        #[arg(long)]
         no_verify_gate: bool,
         /// Repeat every case to expose run-to-run variance.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -570,9 +571,8 @@ pub enum EvalCommand {
     /// (control) vs flipped (ablated) — and report what the knob is worth.
     /// Run once per model to measure whether the mechanism helps or hurts it.
     Ablate {
-        /// The resolver input to flip: explicit_plan, step_summary,
-        /// completion_evidence, or repeated_read_guard (legacy require_*
-        /// names accepted).
+        /// The resolver input to flip: explicit_plan, completion_evidence,
+        /// or repeated_read_guard (legacy require_* names accepted).
         knob: String,
         /// Model reference.
         #[arg(long)]
@@ -580,8 +580,8 @@ pub enum EvalCommand {
         /// Directory of eval case YAML files (`evals/smoke`, `evals/hard`, …).
         #[arg(long, default_value = "evals/hard")]
         cases: PathBuf,
-        /// Use the direct tool loop (recommended: fewer confounders than the
-        /// orchestrated state machine).
+        /// Accepted for backward compatibility; eval always uses the direct
+        /// tool loop.
         #[arg(long)]
         direct: bool,
         /// Repeat every case under both arms to expose run-to-run variance.
@@ -828,6 +828,20 @@ mod tests {
     fn run_rejects_unknown_mode() {
         let err = Cli::try_parse_from(["leveler", "run", "t", "--permission", "nope"]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn plan_and_discuss_are_not_product_subcommands() {
+        // Multi-phase orchestrate stack removed: these must not parse as top-level
+        // commands (they used to be frozen product surface in STABILITY drafts).
+        assert!(
+            Cli::try_parse_from(["leveler", "plan", "do something"]).is_err(),
+            "plan must not be a subcommand"
+        );
+        assert!(
+            Cli::try_parse_from(["leveler", "discuss", "topic"]).is_err(),
+            "discuss must not be a subcommand"
+        );
     }
 
     #[test]

@@ -1086,7 +1086,7 @@ async fn consecutive_search_budget_denies_the_excess_and_feeds_it_back() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_execution_controls(0, 2, 0);
+    .with_execution_controls(2, 0);
 
     let mut events = Vec::new();
     executor
@@ -4812,9 +4812,13 @@ async fn auto_approve_blocks_consolidate_memory_auto_write() {
                 preview,
                 ..
             } if name == "consolidate_memory"
-                && (preview.contains("denied") || preview.contains("user"))
+                // Blocked, and the reason names the real cause: AutoApprove is
+                // a headless context, so nobody was asked. It must NOT claim
+                // the user refused (see `park_unattended_denial`).
+                && preview.contains("not permitted")
+                && !preview.contains("denied by user")
         )),
-        "expected denial: {events:?}"
+        "expected an honest headless denial: {events:?}"
     );
     // No durable write under AutoApprove.
     if mem.join("active").exists() {

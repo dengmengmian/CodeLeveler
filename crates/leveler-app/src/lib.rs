@@ -12,7 +12,6 @@ mod event_bridge;
 pub mod global_config;
 mod interactive;
 pub mod mcp_config;
-mod orchestrate;
 mod parallel;
 mod prompt_bridge;
 mod session;
@@ -53,8 +52,6 @@ pub enum AppError {
     Workspace(#[from] leveler_execution::WorkspaceError),
     #[error("agent error: {0}")]
     Agent(#[from] leveler_agent::AgentError),
-    #[error("orchestrator error: {0}")]
-    Orchestrator(#[from] leveler_orchestrator::OrchestratorError),
     #[error("vcs error: {0}")]
     Vcs(#[from] leveler_vcs::VcsError),
     #[error("verification failed: {0}")]
@@ -462,6 +459,9 @@ impl Application {
                 permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,
                 grants_state_dir: Some(self.layout.state_dir.clone()),
+                // Per-session; attached by the caller that knows the session
+                // (see `TaskEngine::with_steering`).
+                steering: None,
                 // Project config wins over global when set; both default true.
                 allow_delegation: self.project_config().agents.delegation
                     && self.config.agents_delegation,

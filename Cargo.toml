@@ -18,7 +18,6 @@ members = [
     "crates/leveler-lsp",
     "crates/leveler-skills",
     "crates/leveler-eval",
-    "crates/leveler-orchestrator",
     "crates/leveler-engine",
     "crates/leveler-app",
     "crates/leveler-client-protocol",
@@ -61,7 +60,6 @@ leveler-vcs = { version = "0.1.4", path = "crates/leveler-vcs" }
 leveler-lsp = { version = "0.1.4", path = "crates/leveler-lsp" }
 leveler-skills = { version = "0.1.4", path = "crates/leveler-skills" }
 leveler-eval = { version = "0.1.4", path = "crates/leveler-eval" }
-leveler-orchestrator = { version = "0.1.4", path = "crates/leveler-orchestrator" }
 leveler-engine = { version = "0.1.4", path = "crates/leveler-engine" }
 leveler-app = { version = "0.1.4", path = "crates/leveler-app" }
 leveler-client-protocol = { version = "0.1.4", path = "crates/leveler-client-protocol" }
@@ -109,6 +107,7 @@ toml_edit = "0.22"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = { version = "4.5" }
 
 # Errors
 thiserror = "2"

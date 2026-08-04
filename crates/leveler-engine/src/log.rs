@@ -407,11 +407,11 @@ mod tests {
                 model: "mock/m".into(),
                 mode: "assisted".into(),
                 sandbox: false,
-                kind: crate::ExecutionKind::Orchestrate,
+                kind: crate::ExecutionKind::Direct,
             },
             EngineEvent::PhaseChanged {
-                from: leveler_orchestrator::AgentState::Understand,
-                to: leveler_orchestrator::AgentState::Localize,
+                from: leveler_lifecycle::AgentState::Understand,
+                to: leveler_lifecycle::AgentState::Localize,
             },
             EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::CompletedUnverified,

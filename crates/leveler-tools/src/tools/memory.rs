@@ -153,8 +153,15 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &'static str {
-        "Propose a durable project memory (title + body). Requires user approval \
-         before it is stored. Do not store secrets or raw transcripts."
+        "Propose a durable project memory (title + body). Use it when the user \
+         states a lasting preference, a decision or project convention, or a \
+         non-obvious fact worth carrying into later sessions. Requires user \
+         approval before it is stored; the approval prompt IS the user's \
+         consent, so propose rather than asking in prose. This does NOT \
+         overwrite: re-proposing an existing title with different content stores \
+         a second entry, so to correct a superseded memory call `forget` on the \
+         old id first. Not for one-off trivia, secrets, raw transcripts, or \
+         anything already in the code, git history, or AGENTS.md."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -202,8 +209,11 @@ impl Tool for ForgetTool {
     }
 
     fn description(&self) -> &'static str {
-        "Archive a durable memory by id (soft-delete; retained for audit). \
-         Requires user approval."
+        "Archive a durable memory by id (soft-delete; retained for audit). Use it \
+         when a stored memory is contradicted by the current code — the file, \
+         function, or flag it names is gone, or it was never right — and as the \
+         first half of correcting a superseded one (forget the old id, then \
+         `remember` the corrected version). Requires user approval."
     }
 
     fn input_schema(&self) -> serde_json::Value {

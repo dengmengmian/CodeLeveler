@@ -27,6 +27,18 @@ pub(crate) fn cmd_memory(
                     println!("  [{}] {}", e.id, e.title);
                 }
             }
+            // Pending candidates were listed nowhere, so `memory accept <id>`
+            // had no way to learn an id — the consent gate was unreachable in
+            // practice.
+            let pending = store.list_pending().unwrap_or_default();
+            if !pending.is_empty() {
+                println!();
+                println!("{}", Line::heading("Pending (awaiting your consent)"));
+                for c in &pending {
+                    println!("  [{}] {}", c.id, c.title);
+                }
+                println!("  adopt with: leveler memory accept <id>");
+            }
             if archived {
                 println!();
                 println!("{}", Line::heading("Archived memory"));
@@ -42,9 +54,10 @@ pub(crate) fn cmd_memory(
             let (a, b) = store.counts()?;
             println!();
             println!(
-                "  memory_dir={} active={} archived={}",
+                "  memory_dir={} active={} pending={} archived={}",
                 root.display(),
                 a,
+                pending.len(),
                 b
             );
             Ok(std::process::ExitCode::SUCCESS)

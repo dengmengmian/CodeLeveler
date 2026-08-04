@@ -21,7 +21,6 @@ leveler-tools = { workspace = true }
 leveler-agent = { workspace = true }
 leveler-verifier = { workspace = true }
 leveler-vcs = { workspace = true }
-leveler-orchestrator = { workspace = true }
 leveler-engine = { workspace = true }
 leveler-context = { workspace = true }
 leveler-client-protocol = { workspace = true }

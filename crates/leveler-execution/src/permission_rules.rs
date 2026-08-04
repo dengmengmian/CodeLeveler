@@ -322,6 +322,17 @@ pub fn always_rules_for(
             command_exact: None,
             path_glob: None,
         })],
+        // MCP proxy tools (`mcp__<server>__<tool>`) prompt on every confined
+        // profile and carry no command line to scope by, so the only standing
+        // grant that can be expressed is the exact tool. Without this the
+        // "always" choice silently degraded to session-only and the prompt
+        // returned in the next session — see `ApprovalPolicy::evaluate`.
+        t if t.starts_with("mcp__") => vec![allow(RuleMatch {
+            tool: Some(tool.to_string()),
+            command_prefix: None,
+            command_exact: None,
+            path_glob: None,
+        })],
         _ => Vec::new(),
     }
 }
@@ -897,5 +908,61 @@ rules:
             set.evaluate("shell_command", Some(&format!("  {cmd}  ")), &[]),
             RuleDecision::Allow
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_always_tests {
+    use super::*;
+
+    /// MCP tools prompt on every profile except full-access. The approval
+    /// dialog offers "always", and `approval.rs` tells users that is how you
+    /// grant one standing trust — but `always_rules_for` derived nothing for
+    /// them, so the choice silently degraded to session-only and the prompt
+    /// came back in the next session, forever.
+    #[test]
+    fn approve_always_on_an_mcp_tool_produces_a_durable_rule() {
+        let rules = always_rules_for("mcp__github__create_issue", None, &[]);
+        assert_eq!(rules.len(), 1, "expected one standing rule: {rules:?}");
+        assert_eq!(rules[0].effect, RuleEffect::Allow);
+        assert_eq!(
+            rules[0].match_.tool.as_deref(),
+            Some("mcp__github__create_issue"),
+            "the rule must name the exact tool, not a wildcard"
+        );
+        assert!(
+            rules[0].match_.command_prefix.is_none() && rules[0].match_.command_exact.is_none(),
+            "an MCP call has no command line to scope by"
+        );
+    }
+
+    /// Standing trust must not leak to a different server or a different tool
+    /// on the same server — each is a separate capability.
+    #[test]
+    fn the_rule_does_not_cover_a_neighbouring_mcp_tool() {
+        let rules = always_rules_for("mcp__github__create_issue", None, &[]);
+        let set = PermissionRuleSet::from_rules(rules);
+        assert_eq!(
+            set.evaluate("mcp__github__create_issue", None, &[]),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate("mcp__github__delete_repo", None, &[]),
+            RuleDecision::NoMatch,
+            "another tool on the same server must still prompt"
+        );
+        assert_eq!(
+            set.evaluate("mcp__other__create_issue", None, &[]),
+            RuleDecision::NoMatch,
+            "another server must still prompt"
+        );
+    }
+
+    /// Memory writes stay session-only by design (K36): a durable rule would
+    /// hand the model standing permission to write long-term memory.
+    #[test]
+    fn memory_writes_still_derive_no_durable_rule() {
+        assert!(always_rules_for("remember", None, &[]).is_empty());
+        assert!(always_rules_for("forget", None, &[]).is_empty());
     }
 }

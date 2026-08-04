@@ -40,7 +40,7 @@ use crate::injected_tools::{
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::{STEP_SUMMARY_NUDGE, first_user_text, goal_resolve_nudge};
+use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
     AgentRole, MAX_SUB_AGENT_DEPTH, agent_nickname, multi_agent_steer_hint,
     task_suggests_delegation,
@@ -68,16 +68,21 @@ impl Executor {
         // Primary name, plus legacy ask_user for older models and prompts.
         tools.push(request_user_input_tool_definition());
         tools.push(ask_user_tool_definition());
-        tools.push(request_permissions_tool_definition());
+        // Nothing to request under 完全访问 — the elevation it asks for is
+        // already granted, so advertising it only invites a pointless round
+        // trip and an interruption the user explicitly opted out of.
+        if self.tool_context.mode != leveler_execution::PermissionProfile::FullAccess {
+            tools.push(request_permissions_tool_definition());
+        }
         // A sub-agent shouldn't spawn its own sub-agents; product kill-switch
         // can also hide spawn_agent entirely.
-        if self.allow_delegation && self.depth < MAX_SUB_AGENT_DEPTH {
+        if self.policy.allow_delegation && self.depth < MAX_SUB_AGENT_DEPTH {
             tools.push(spawn_agent_tool_definition());
         }
         // Goal mode: the model resolves the objective explicitly.
-        if self.goal_mode {
+        if self.policy.goal_mode {
             tools.push(update_goal_tool_definition());
-            if self.delivery_gate {
+            if self.policy.delivery_gate {
                 tools.push(complete_step_tool_definition());
             }
         }
@@ -97,7 +102,7 @@ impl Executor {
             .with_objective_version(objective.version);
         progress.phase = TurnPhase::Active;
         let structured_plan_required =
-            self.require_explicit_plan && task_needs_structured_plan(&original_task);
+            self.policy.require_explicit_plan && task_needs_structured_plan(&original_task);
         // Complex tasks may use a few read-only explore rounds before plan.
         const PLAN_EXPLORE_ROUNDS: u32 = 2;
         let mut plan_explore_rounds_used = 0u32;
@@ -120,7 +125,7 @@ impl Executor {
         }
         // Product steer: when delegation is on and the task looks multi-part /
         // parallel, remind the model once that concurrent spawn_agent is OK.
-        if self.allow_delegation
+        if self.policy.allow_delegation
             && self.depth == 0
             && task_suggests_delegation(&original_task)
             && !messages.iter().any(|m| {
@@ -195,7 +200,6 @@ impl Executor {
         let round_ceiling = self.step_limits.max_rounds.unwrap_or(MAX_TURN_ROUNDS);
         // Closeout thrash nudge (once): plan complete / delivery closeout.
         let mut post_plan_closeout_nudged = false;
-        let mut no_progress_nudge_sent = false;
         // Observe thrash second chance: once the no-progress cap is hit, give
         // the model one forced "answer from findings" round instead of dying
         // with Incomplete and an empty reply (common on pure Q&A / investigate
@@ -220,7 +224,6 @@ impl Executor {
         let mut command_ran_this_round = false;
         #[allow(unused_assignments)]
         let mut command_success_this_round = false;
-        let mut stagnation_nudge_sent = false;
         // Hard step limits (spec §27): wall clock from run start, commands
         // executed so far, and the reason once a limit trips. The round that
         // trips a limit still commits its tool results (well-formed transcript)
@@ -270,6 +273,20 @@ impl Executor {
 
         let mut round = 0u32;
         loop {
+            // Mid-turn user input goes in at the top of the round, before the
+            // model is asked anything: a correction that arrives after the work
+            // is done is worthless. Empty is the normal case.
+            if let Some(source) = &self.steering {
+                for text in source.take_pending() {
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let message = Message::text(Role::User, text);
+                    sink.append(std::slice::from_ref(&message)).await?;
+                    messages.push(message);
+                }
+            }
             if let Some(max) = self.step_limits.max_model_tokens
                 && model_tokens_spent >= max
             {
@@ -486,7 +503,7 @@ impl Executor {
                 request.tool_choice = ToolChoice::Auto;
             }
             request.max_output_tokens = Some(self.max_output_tokens);
-            request.reasoning_effort = self.reasoning_effort;
+            request.reasoning_effort = self.policy.reasoning_effort;
 
             let stream_result = match self
                 .stream_round_with_retry(request, observer, &cancellation)
@@ -779,7 +796,7 @@ impl Executor {
                 };
                 let has_final_text = !last_text.trim().is_empty();
                 let action = decide(&CloseoutInput {
-                    goal_mode: self.goal_mode,
+                    goal_mode: self.policy.goal_mode,
                     has_final_text,
                     impact: &impact,
                     cancelled: cancellation.is_cancelled(),
@@ -792,7 +809,7 @@ impl Executor {
                 tracing::info!(
                     round,
                     ?action,
-                    goal_mode = self.goal_mode,
+                    goal_mode = self.policy.goal_mode,
                     has_final_text,
                     has_mutation = impact.has_mutation,
                     build_relevant = impact.build_relevant,
@@ -833,7 +850,7 @@ impl Executor {
                 // is a stall, not a proven completion. The detail carries the
                 // closeout reason so an engine continuation knows what the
                 // previous turn stalled on.
-                let (stop_reason, stop_detail) = if self.goal_mode {
+                let (stop_reason, stop_detail) = if self.policy.goal_mode {
                     // One no-progress tick per stalled drive so Engine
                     // continue_active_goal cannot open unbounded turns.
                     progress.note_no_progress_round(round);
@@ -965,14 +982,14 @@ impl Executor {
 
                 // Cap consecutive search calls so the model acts on
                 // what they have instead of searching in circles (spec §17).
-                if self.max_search_calls_per_step > 0 && is_search_tool(&call.name) {
+                if self.policy.max_search_calls_per_step > 0 && is_search_tool(&call.name) {
                     consecutive_searches += 1;
-                    if consecutive_searches > self.max_search_calls_per_step {
+                    if consecutive_searches > self.policy.max_search_calls_per_step {
                         let msg = format!(
                             "Search budget reached ({} consecutive searches). Use the results you \
                              already have and take an action (read a specific file or edit) \
                              instead of searching again.",
-                            self.max_search_calls_per_step
+                            self.policy.max_search_calls_per_step
                         );
                         denied_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
@@ -981,7 +998,10 @@ impl Executor {
                 }
 
                 // Delivery: complete_step with evidence_ref against the ledger.
-                if self.goal_mode && self.delivery_gate && call.name == COMPLETE_STEP_TOOL {
+                if self.policy.goal_mode
+                    && self.policy.delivery_gate
+                    && call.name == COMPLETE_STEP_TOOL
+                {
                     observer(AgentEvent::ToolCall {
                         id: call.id.as_str().to_string(),
                         name: COMPLETE_STEP_TOOL.to_string(),
@@ -1074,7 +1094,7 @@ impl Executor {
                 // Goal mode: the model explicitly resolves the objective. Record
                 // the resolution; the run ends after this round's results are
                 // committed (so the transcript stays well-formed).
-                if self.goal_mode && call.name == UPDATE_GOAL_TOOL {
+                if self.policy.goal_mode && call.name == UPDATE_GOAL_TOOL {
                     // Surface the resolution so the TUI/JSONL shows the goal being
                     // closed (special tools otherwise skip the ToolCall event).
                     observer(AgentEvent::ToolCall {
@@ -1117,10 +1137,10 @@ impl Executor {
                     // S2/S4 Gate: todos + (Delivery) EvidenceLedger.
                     if reason == StopReason::Completed {
                         let gate = GateConfig {
-                            goal_todo_gate: self.goal_todo_gate,
+                            goal_todo_gate: self.policy.goal_todo_gate,
                             todo_override_allowed: true,
-                            delivery_gate: self.delivery_gate,
-                            reject_unproven_no_mutation: self.delivery_gate,
+                            delivery_gate: self.policy.delivery_gate,
+                            reject_unproven_no_mutation: self.policy.delivery_gate,
                         };
                         ledger.plan = plan_state.clone();
                         // Explicit structured flag only — never attempt-count bypass.
@@ -1658,7 +1678,7 @@ impl Executor {
                 let cancellation_ref = &cancellation;
                 // Leveling knob: bound how many of the batch actually overlap
                 // (policy `max_parallel_tools`; 0 = the whole batch at once).
-                let permits = match self.max_parallel_tools {
+                let permits = match self.policy.max_parallel_tools {
                     0 => parallel_jobs.len(),
                     n => n,
                 };
@@ -1748,7 +1768,7 @@ impl Executor {
             if !spawn_jobs.is_empty() && !cancelled_mid_batch {
                 use futures::stream::{FuturesUnordered, StreamExt};
                 let sem = Arc::new(tokio::sync::Semaphore::new(
-                    self.max_concurrent_agents.max(1),
+                    self.policy.max_concurrent_agents.max(1),
                 ));
                 let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut futs = FuturesUnordered::new();
@@ -1775,6 +1795,9 @@ impl Executor {
                     String,
                     String,
                     String,
+                    Option<leveler_model::ModelRef>,
+                    Vec<String>,
+                    u32,
                 )> = Vec::new();
                 for (index, call) in spawn_jobs {
                     let task = call
@@ -1784,8 +1807,47 @@ impl Executor {
                         .unwrap_or("")
                         .trim()
                         .to_string();
-                    let role =
-                        AgentRole::parse(call.arguments.get("role").and_then(|v| v.as_str()));
+                    // A named persona supplies the instructions and, unless the
+                    // caller overrides it, the role.
+                    let agent_name = call
+                        .arguments
+                        .get("agent")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let named = agent_name.map(|name| {
+                        (
+                            name,
+                            crate::named_agent::load(self.tool_context.workspace.root(), name),
+                        )
+                    });
+                    let explicit_role = call.arguments.get("role").and_then(|v| v.as_str());
+                    let role = match &named {
+                        Some((_, Some(agent))) if explicit_role.is_none() => {
+                            AgentRole::parse(Some(agent.role.as_str()))
+                        }
+                        _ => AgentRole::parse(explicit_role),
+                    };
+                    let task = match &named {
+                        Some((_, Some(agent))) => agent.compose_task(&task),
+                        _ => task,
+                    };
+                    // A definition may pin its own model (e.g. run investigation
+                    // on a cheaper one). An unparsable ref is rejected below
+                    // rather than silently falling back to the parent's model.
+                    let pinned_model: Option<&str> = match &named {
+                        Some((_, Some(agent))) if !agent.model.trim().is_empty() => {
+                            Some(agent.model.trim())
+                        }
+                        _ => None,
+                    };
+                    let model_override = pinned_model.and_then(leveler_model::ModelRef::parse);
+                    // A definition's own policy: the tools it may hold and how
+                    // long it may run. Empty / 0 means inherit.
+                    let (agent_tools, agent_max_rounds) = match &named {
+                        Some((_, Some(agent))) => (agent.tools.clone(), agent.max_rounds),
+                        _ => (Vec::new(), 0),
+                    };
                     let files: Vec<String> = call
                         .arguments
                         .get("files")
@@ -1798,15 +1860,34 @@ impl Executor {
                         .unwrap_or_default();
 
                     // Reject (no agent started) for depth, empty task, or cap.
-                    let reject = if self.depth >= MAX_SUB_AGENT_DEPTH {
+                    let reject = if let Some((requested, None)) = &named {
+                        // Never fall back to a personaless spawn: the run would
+                        // look successful while doing something else entirely.
+                        let known =
+                            crate::named_agent::discover(self.tool_context.workspace.root())
+                                .into_iter()
+                                .map(|a| a.name)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                        Some(format!(
+                            "Unknown agent `{requested}`. Available: {known}. Omit `agent` to \
+                             spawn with an inline task instead."
+                        ))
+                    } else if self.depth >= MAX_SUB_AGENT_DEPTH {
                         Some("Sub-agents may not spawn their own sub-agents.".to_string())
+                    } else if let (Some(raw), None) = (pinned_model, &model_override) {
+                        Some(format!(
+                            "Agent `{}` pins model `{raw}`, which is not a valid `provider/model` \
+                             reference. Fix the agent definition.",
+                            agent_name.unwrap_or("?")
+                        ))
                     } else if task.is_empty() {
                         Some("spawn_agent requires a non-empty task.".to_string())
-                    } else if agents_spawned >= self.max_total_agents {
+                    } else if agents_spawned >= self.policy.max_total_agents {
                         Some(format!(
                             "Sub-agent limit reached ({} max this run). Do the remaining work \
                              directly.",
-                            self.max_total_agents
+                            self.policy.max_total_agents
                         ))
                     } else {
                         None
@@ -1837,11 +1918,35 @@ impl Executor {
                         role: role.label().to_string(),
                         task: task.clone(),
                     });
-                    accepted.push((index, call.id, role, files, task, id, nickname));
+                    accepted.push((
+                        index,
+                        call.id,
+                        role,
+                        files,
+                        task,
+                        id,
+                        nickname,
+                        model_override,
+                        agent_tools,
+                        agent_max_rounds,
+                    ));
                 }
                 let share_n = accepted.len() as u32;
-                for (share_of, (index, call_id, role, files, task, id, nickname)) in
-                    accepted.into_iter().enumerate()
+                for (
+                    share_of,
+                    (
+                        index,
+                        call_id,
+                        role,
+                        files,
+                        task,
+                        id,
+                        nickname,
+                        model_override,
+                        agent_tools,
+                        agent_max_rounds,
+                    ),
+                ) in accepted.into_iter().enumerate()
                 {
                     let sem = sem.clone();
                     let progress_ch = progress_tx.clone();
@@ -1865,10 +1970,13 @@ impl Executor {
                     };
                     futs.push(async move {
                         let result = self
-                            .run_one_sub_agent(
+                            .run_one_sub_agent_on(
                                 id.clone(),
                                 role,
                                 files,
+                                model_override,
+                                agent_tools,
+                                agent_max_rounds,
                                 task,
                                 sem,
                                 progress_ch,
@@ -2088,18 +2196,6 @@ impl Executor {
                     observer(AgentEvent::ProgressUpdated {
                         ledger: progress.clone(),
                     });
-                    if !no_progress_nudge_sent {
-                        no_progress_nudge_sent = true;
-                        messages.push(Message::text(
-                            Role::User,
-                            format!(
-                                "You are not making progress toward the active objective:\n\
-                                 <objective>\n{original_task}\n</objective>\n\
-                                 Stop re-listing/re-statusing. Either make a concrete change \
-                                 (edit/verify) or give the final answer and stop calling tools."
-                            ),
-                        ));
-                    }
                     // Sub-agents may legitimately re-list; only top-level turns
                     // full-stop on observe thrash (AC3). Before hard-stop, give
                     // one forced answer-from-findings round so Q&A / investigate
@@ -2183,19 +2279,6 @@ impl Executor {
                 observer(AgentEvent::ProgressUpdated {
                     ledger: progress.clone(),
                 });
-                if !no_progress_nudge_sent {
-                    no_progress_nudge_sent = true;
-                    messages.push(Message::text(
-                        Role::User,
-                        format!(
-                            "Every action you attempted this round was refused. Re-read the \
-                             refusal reasons and the active objective:\n\
-                             <objective>\n{original_task}\n</objective>\n\
-                             Do something different, or give the final answer and stop \
-                             calling tools."
-                        ),
-                    ));
-                }
                 if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
                     progress.enter_terminal();
                     observer(AgentEvent::ProgressUpdated {
@@ -2312,24 +2395,6 @@ impl Executor {
                 // One round before the cap: warn the model so it can change
                 // approach, work around an environment limit, or stop honestly
                 // instead of repeating the same failing edit-and-recheck.
-                if progress.stagnation_streak + 1 >= progress_caps.stagnation_rounds
-                    && !stagnation_nudge_sent
-                {
-                    stagnation_nudge_sent = true;
-                    messages.push(Message::text(
-                        Role::User,
-                        format!(
-                            "You have gone several rounds without real progress toward:\n\
-                             <objective>\n{original_task}\n</objective>\n\
-                             The same check keeps failing or the same information keeps \
-                             coming back. Do NOT repeat the same edit-and-recheck. Either \
-                             try a fundamentally different approach, treat this as a \
-                             possible environment limitation (e.g. a sandboxed command) \
-                             and work around it, or stop and report honestly what is \
-                             blocking you. One more unproductive round will end the turn."
-                        ),
-                    ));
-                }
             }
             // Per-round counters are zeroed at the top of the next model round.
 
@@ -2436,8 +2501,8 @@ impl Executor {
             // compaction would silently never fire. The persisted transcript
             // (sink) is untouched — only what we resend shrinks.
             let context_tokens = used_tokens.max(estimate_tokens(&messages));
-            if self.context_budget > 0
-                && context_tokens > self.context_budget as u64
+            if self.policy.context_budget > 0
+                && context_tokens > self.policy.context_budget as u64
                 && has_next_round
             {
                 let before = messages.len();
@@ -2445,7 +2510,7 @@ impl Executor {
                 // huge recent tool output can't keep the fold over the window;
                 // the other half leaves room for the head, summary, and next
                 // response. (context_budget > 0 is guaranteed by the guard above.)
-                let keep_recent_tokens = self.context_budget as u64 / 2;
+                let keep_recent_tokens = self.policy.context_budget as u64 / 2;
                 // Name this extra round trip so the UI shows "compacting…" instead
                 // of a bare "waiting for model" during the summary call.
                 observer(AgentEvent::AdvisoryStarted {
@@ -2472,21 +2537,6 @@ impl Executor {
                         to: messages.len(),
                     });
                 }
-            }
-
-            // Leveling: periodically make the model checkpoint its progress so a
-            // long task does not drift (spec §17). Not persisted — a transient
-            // nudge that shapes the next round only.
-            if self.step_summary_every > 0
-                && round.is_multiple_of(self.step_summary_every)
-                && has_next_round
-            {
-                messages.push(Message {
-                    role: Role::User,
-                    content: vec![ContentPart::Text {
-                        text: STEP_SUMMARY_NUDGE.to_string(),
-                    }],
-                });
             }
 
             // Persist the exact next-request context through the engine event

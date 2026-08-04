@@ -76,6 +76,7 @@ pub(crate) fn detect_branch_label(repo: &Path) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_report(
     report: &leveler_engine::TaskReport,
     diff: &UiDiff,

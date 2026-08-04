@@ -295,7 +295,7 @@ impl Executor {
         crate::compaction::summarize_with_model(
             self.runtime.as_ref(),
             &self.model,
-            self.reasoning_effort,
+            self.policy.reasoning_effort,
             messages,
             keep_recent,
             keep_recent_tokens,

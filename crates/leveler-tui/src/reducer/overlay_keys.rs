@@ -270,8 +270,12 @@ pub(super) fn open_checkpoint_picker(state: &mut AppState) {
         .rev()
         .map(|c| SelectionOption::new(c.id.to_string(), format!("#{} {}", c.ordinal, c.label)))
         .collect();
-    let model = SelectionModel::new("恢复到检查点", options, false)
-        .with_description("将对话回退到此处（不回退文件，请用 git）");
+    // The runtime captures a git tree before every turn and restores it here,
+    // so this rolls the working tree back too — including deleting files that
+    // did not exist at the checkpoint. Saying otherwise would get work lost.
+    let model = SelectionModel::new("回退到检查点", options, false).with_description(
+        "对话与工作区文件一并回退到此处；未提交的改动会丢失（非 git 仓库只回退对话）",
+    );
     state.overlay = Some(Overlay::CheckpointPicker(Box::new(model)));
 }
 

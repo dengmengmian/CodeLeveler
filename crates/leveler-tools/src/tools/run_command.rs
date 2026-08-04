@@ -289,6 +289,12 @@ pub(crate) async fn execute_program(
     }
 
     let sandboxed = request.write_root.is_some();
+    // Hold the workspace-wide gate for the command AND the mutation detection
+    // that follows: concurrent sub-agents share one working tree, so a command
+    // that observes the tree mid-edit produces an authoritative-looking wrong
+    // answer. Background commands never reach here (they return earlier), so a
+    // long-lived server cannot hold the gate.
+    let _gate = context.command_gate.clone().lock_owned().await;
     let output = context.runner.run(request, cancellation).await?;
 
     // Detect what the command changed so scope checks and budgets see
@@ -1185,5 +1191,76 @@ mod snapshot_tests {
         assert!(out.content.contains("file budget"), "{}", out.content);
         assert!(!dir.path().join("a.txt").exists());
         assert!(!dir.path().join("b.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod command_gate_tests {
+    use super::*;
+    use crate::tool::ToolContext;
+    use leveler_execution::{PermissionProfile, Workspace};
+    use std::time::Instant;
+
+    fn ctx(dir: &std::path::Path) -> ToolContext {
+        ToolContext::new(Workspace::new(dir).unwrap(), PermissionProfile::FullAccess)
+    }
+
+    /// Parallel workers own disjoint files but share one working tree and one
+    /// build directory. Two commands running at once means one agent's test can
+    /// observe another's half-finished edit — a result that looks authoritative
+    /// and is not. The gate serializes them; it is shared through the cloned
+    /// `ToolContext`, which is exactly how a sub-agent inherits it.
+    #[tokio::test]
+    async fn concurrent_commands_are_serialized_across_cloned_contexts() {
+        let dir = std::env::temp_dir().join(format!("leveler-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = ctx(&dir);
+        // A sub-agent gets a clone — the gate must still be the same gate.
+        let a = parent.clone();
+        let b = parent.clone();
+
+        let call = |c: ToolContext| async move {
+            RunCommandTool
+                .execute(
+                    serde_json::json!({"program": "sh", "args": ["-c", "sleep 0.4"]}),
+                    c,
+                    CancellationToken::new(),
+                )
+                .await
+        };
+
+        let started = Instant::now();
+        let (ra, rb) = tokio::join!(call(a), call(b));
+        let elapsed = started.elapsed();
+        ra.unwrap();
+        rb.unwrap();
+
+        assert!(
+            elapsed.as_millis() >= 800,
+            "two 0.4s commands ran concurrently ({}ms) — the gate did not hold",
+            elapsed.as_millis()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A single agent must not pay for the gate.
+    #[tokio::test]
+    async fn one_command_is_not_slowed_by_the_gate() {
+        let dir = std::env::temp_dir().join(format!("leveler-gate-solo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = Instant::now();
+        RunCommandTool
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "sleep 0.2"]}),
+                ctx(&dir),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed().as_millis() < 900,
+            "uncontended gate must be ~free"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

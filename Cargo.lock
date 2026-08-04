@@ -517,6 +517,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f84a88507dbd05c695f2cb5e8558e747179134005e9893882dec964190ed89"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1797,7 +1806,6 @@ dependencies = [
  "leveler-media",
  "leveler-memory",
  "leveler-model",
- "leveler-orchestrator",
  "leveler-project",
  "leveler-provider",
  "leveler-storage",
@@ -1827,6 +1835,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "clap_complete",
  "console",
  "futures",
  "getrandom 0.2.17",
@@ -1842,7 +1851,6 @@ dependencies = [
  "leveler-lsp",
  "leveler-memory",
  "leveler-model",
- "leveler-orchestrator",
  "leveler-project",
  "leveler-provider",
  "leveler-relay",
@@ -1862,6 +1870,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1918,7 +1927,6 @@ dependencies = [
  "leveler-execution",
  "leveler-lifecycle",
  "leveler-model",
- "leveler-orchestrator",
  "leveler-provider",
  "leveler-storage",
  "leveler-tools",
@@ -2045,28 +2053,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio-util",
-]
-
-[[package]]
-name = "leveler-orchestrator"
-version = "0.1.4"
-dependencies = [
- "async-trait",
- "futures",
- "leveler-agent",
- "leveler-context",
- "leveler-core",
- "leveler-execution",
- "leveler-lifecycle",
- "leveler-model",
- "leveler-tools",
- "leveler-verifier",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

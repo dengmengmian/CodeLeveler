@@ -106,14 +106,20 @@ fn renders_welcome_header_and_composer_at_standard_sizes() {
             "permission chip missing at {w}x{h}: {text}"
         );
         assert!(text.contains('›'), "composer prompt missing at {w}x{h}");
-        // Footer: no sticky shortcut strip — keys live in /help · Ctrl+?.
+        // The bottom strip stays a trust chip, not a shortcut bar — the full
+        // key list lives in /help · Ctrl+?. The one hint row under the composer
+        // is deliberate and transient (it vanishes as soon as you type; see
+        // `the_hints_get_out_of_the_way_once_you_type`), so the assertion is on
+        // the sticky strip rather than the whole frame.
+        // The last row is the trust strip; the hint row sits above it.
+        let bottom = sticky_chrome(&text, 1);
         assert!(
-            !text.contains("Ctrl+C")
-                && !text.contains("Ctrl+M")
-                && !text.contains("Ctrl+Q")
-                && !text.contains("Ctrl+O")
-                && !text.contains("Ctrl+?"),
-            "shortcuts must not be sticky footer chrome at {w}x{h}: {text}"
+            !bottom.contains("Ctrl+C")
+                && !bottom.contains("Ctrl+M")
+                && !bottom.contains("Ctrl+Q")
+                && !bottom.contains("Ctrl+O")
+                && !bottom.contains("Ctrl+?"),
+            "shortcuts must not be sticky footer chrome at {w}x{h}: {bottom}"
         );
         // Fresh session: no token/context dump on sticky footer/input chrome.
         // (Splash hint may mention ↑ history — only check the bottom strip.)
@@ -614,7 +620,7 @@ fn list_files_scan_stays_out_of_conversation() {
 }
 
 #[test]
-fn renders_plan_and_diff_screens() {
+fn renders_plan_chrome_and_diff_screen() {
     use leveler_client_protocol::{PlanStepStatus, UiDiff, UiDiffFile, UiPlan, UiPlanStep};
     let mut state = opened_state();
     reduce(
@@ -643,18 +649,19 @@ fn renders_plan_and_diff_screens() {
         }),
     );
 
+    // Plan has no dedicated slash/screen anymore — it lives in conversation chrome.
+    let conv = render_at(100, 24, &mut state);
+    assert!(
+        conv.contains("调整页面布局") || conv.contains("1/1") || conv.contains("计划"),
+        "plan chrome missing: {conv}"
+    );
+
     let ctrl_key = |c: char| {
         Action::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(c),
             crossterm::event::KeyModifiers::CONTROL,
         ))
     };
-    reduce(&mut state, ctrl_key('p'));
-    let plan = render_at(100, 24, &mut state);
-    assert!(plan.contains("任务步骤"), "steps title missing");
-    assert!(plan.contains("调整页面布局"), "plan step missing");
-
-    reduce(&mut state, ctrl_key('p')); // back to conversation
     reduce(&mut state, ctrl_key('d')); // open diff
     let diff = render_at(100, 24, &mut state);
     assert!(diff.contains("src/login.rs"), "diff file missing");
@@ -849,4 +856,53 @@ fn tiny_terminal_does_not_panic() {
     // Well below the 80x24 target: must degrade, not crash (§65).
     let _ = render_at(20, 5, &mut state);
     let _ = render_at(1, 1, &mut state);
+}
+
+/// An interrupt nobody can find is not an interrupt: while a turn runs, the key
+/// that stops it has to be on screen. These drive the real `render`, not the
+/// footer helper — a hint that only exists in a helper is a hint nobody sees.
+#[test]
+fn a_running_turn_shows_how_to_interrupt_it() {
+    let mut state = opened_state();
+    state.status = leveler_client_protocol::RuntimeStatus::Busy;
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains("Esc"),
+        "no way to discover the interrupt:\n{text}"
+    );
+}
+
+#[test]
+fn an_untouched_composer_points_at_the_openers() {
+    let mut state = opened_state();
+    let text = render_at(100, 24, &mut state);
+    assert!(text.contains("Shift+Tab"), "{text}");
+    assert!(text.contains('@'), "{text}");
+}
+
+#[test]
+fn the_hints_get_out_of_the_way_once_you_type() {
+    let mut state = opened_state();
+    state.composer.replace("修一下登录");
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        !text.contains("Shift+Tab"),
+        "hints must not nag while composing:\n{text}"
+    );
+}
+
+/// The layout must not jump when the hints appear and disappear: a row that
+/// steals height from the conversation on every keystroke would reflow the
+/// transcript under the user's eyes.
+#[test]
+fn showing_and_hiding_the_hints_keeps_the_conversation_the_same_height() {
+    let mut state = opened_state();
+    let empty = render_at(100, 24, &mut state);
+    state.composer.replace("修一下登录");
+    let typing = render_at(100, 24, &mut state);
+    assert_eq!(
+        empty.lines().count(),
+        typing.lines().count(),
+        "frame height changed with the hint row"
+    );
 }

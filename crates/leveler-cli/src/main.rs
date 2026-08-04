@@ -8,10 +8,13 @@
 mod approver;
 mod cli;
 mod common;
+mod completions_cmd;
+mod crash;
 mod eval_cmd;
 mod eval_signals;
 mod info_cmds;
 mod init_cmd;
+mod login_cmd;
 mod mcp_lsp_cmds;
 mod memory_cmds;
 mod output;
@@ -37,8 +40,7 @@ use mcp_lsp_cmds::{cmd_lsp, cmd_mcp};
 use memory_cmds::cmd_memory;
 use permissions_cmds::cmd_permissions;
 use run_cmds::{
-    cmd_discuss, cmd_plan, cmd_resume, cmd_run, cmd_run_orchestrated, cmd_run_parallel,
-    cmd_run_resume, cmd_serve, cmd_tui, cmd_web,
+    cmd_resume, cmd_run, cmd_run_parallel, cmd_run_resume, cmd_serve, cmd_tui, cmd_web,
 };
 use sessions_cmd::cmd_sessions;
 
@@ -49,6 +51,9 @@ async fn main() -> std::process::ExitCode {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         std::env::temp_dir(),
     ));
+    // Record panics before anything else can install a hook — the TUI's
+    // terminal-restore hook chains to this one.
+    crash::install(env!("CARGO_PKG_VERSION"));
     let args = Cli::parse();
     // No subcommand or `tui` takes over the terminal (ratatui alternate
     // screen). Logs written to stderr there paint straight over the UI and
@@ -255,7 +260,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             auto_approve,
             confirm_recovery,
             output,
-            orchestrate,
             commit,
             branch,
             push,
@@ -288,18 +292,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             };
             if parallel > 1 {
                 cmd_run_parallel(layout, task, model, mode, parallel).await
-            } else if orchestrate {
-                cmd_run_orchestrated(
-                    layout,
-                    task,
-                    model,
-                    mode,
-                    auto_approve,
-                    ship,
-                    sandbox,
-                    work_profile,
-                )
-                .await
             } else {
                 cmd_run(
                     layout,
@@ -316,17 +308,14 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                 .await
             }
         }
-        Command::Plan { task, model } => cmd_plan(layout, task, model).await,
-        Command::Discuss {
-            topic,
-            rounds,
-            model,
-        } => cmd_discuss(layout, topic, rounds, model).await,
         Command::Eval(ec) => cmd_eval(layout, ec).await,
         Command::Lsp { file, diagnostics } => cmd_lsp(layout, file, diagnostics).await,
         Command::Mcp(mc) => cmd_mcp(mc),
         Command::Resume { id } => cmd_resume(layout, id, config_overridden).await,
         Command::Init => init_cmd::cmd_init(),
+        Command::Completions { shell } => completions_cmd::cmd_completions(shell),
+        Command::Login { provider } => login_cmd::cmd_login(provider).await,
+        Command::Logout { provider } => login_cmd::cmd_logout(provider),
         Command::Upgrade {
             check,
             force,

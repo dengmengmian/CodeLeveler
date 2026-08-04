@@ -134,20 +134,25 @@ impl Application {
             async move {
                 let layout = Layout::resolve(path.clone(), Some(config_dir));
                 let app = Application::assemble(layout).ok()?;
-                let result = app
-                    .orchestrate_task(
-                        &model,
-                        mode,
-                        &task,
-                        Arc::new(AutoApprove),
-                        Arc::new(leveler_agent::AutoClarify),
-                        false,
-                        &mut |_| {},
-                        cancellation.clone(),
-                        None, // one-shot parallel run: a fresh session per worker
-                    )
-                    .await
-                    .ok();
+                // Direct tool loop only — no orchestrate dual path.
+                let result = async {
+                    let session_id = app.create_session(&model, &task).await.ok()?;
+                    let outcome = app
+                        .run_in_session(
+                            &session_id,
+                            &model,
+                            mode,
+                            &task,
+                            Arc::new(AutoApprove),
+                            false,
+                            &mut |_| {},
+                            cancellation.clone(),
+                        )
+                        .await
+                        .ok()?;
+                    Some((session_id, outcome))
+                }
+                .await;
 
                 // Commit the candidate's changes (never .leveler/).
                 let git = GitWorkflow::with_environment(&path, app.environment.clone());
@@ -156,9 +161,14 @@ impl Application {
                     .ok()?;
 
                 let (child_session, verified) = match result {
-                    Some((session_id, report)) => {
-                        (session_id.to_string(), report.outcome.is_success())
-                    }
+                    Some((session_id, outcome)) => (
+                        session_id.to_string(),
+                        matches!(
+                            outcome.stop_reason,
+                            leveler_agent::StopReason::Completed
+                                | leveler_agent::StopReason::Answered
+                        ),
+                    ),
                     None => (String::new(), false),
                 };
                 Some((MergeCandidate { branch, verified }, child_session))

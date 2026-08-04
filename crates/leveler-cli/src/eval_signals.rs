@@ -175,21 +175,20 @@ impl SignalCollector {
         }
     }
 
-    /// Orchestrated runs emit engine events; node outcomes feed the planning
-    /// signal and everything else reuses the agent-event logic via the shim.
+    /// Engine events (session lifecycle, heartbeats) feed trajectory signals
+    /// via the agent-event shim where applicable.
     pub(crate) fn observe_engine(&mut self, event: EngineEvent) {
         if let EngineEvent::NodeFinished { status, .. } = &event {
             self.signals.node_total += 1;
-            if *status == leveler_orchestrator::NodeStatus::Failed {
+            if *status == leveler_engine::NodeStatus::Failed {
                 self.signals.node_failures += 1;
             }
-            // Node lifecycle is user-visible progress in the plan UI.
             self.note_feedback();
             return;
         }
-        // TaskStarted / phase / plan lifecycle / command heartbeats are the
-        // earliest host-side signals — must count toward TTFF so the metric
-        // reflects user-visible progress, not first LLM token alone.
+        // TaskStarted / phase / command heartbeats are the earliest host-side
+        // signals — must count toward TTFF so the metric reflects user-visible
+        // progress, not first LLM token alone.
         if matches!(
             &event,
             EngineEvent::TaskStarted { .. }
@@ -416,7 +415,7 @@ mod tests {
             model: "m".into(),
             mode: "assisted".into(),
             sandbox: false,
-            kind: leveler_engine::ExecutionKind::Orchestrate,
+            kind: leveler_engine::ExecutionKind::Direct,
         });
         let s = c.finish(false);
         assert!(s.ttff_ms.is_some());

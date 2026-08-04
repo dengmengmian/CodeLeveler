@@ -63,6 +63,10 @@ pub enum Action {
     /// The embedded Web UI server finished starting: `Ok(url)` with the
     /// token-carrying URL, or `Err(message)` if it could not start.
     WebLaunched(Result<String, String>),
+    /// `$EDITOR` exited: `Ok(text)` is whatever was left in the buffer (empty
+    /// means the user deleted everything and meant it), `Err(message)` is why
+    /// it could not run.
+    EditorFinished(Result<String, String>),
 }
 
 /// A side effect for the event loop to carry out.
@@ -95,6 +99,10 @@ pub enum Effect {
     StartRemote { local: bool },
     /// Accept or reject the device waiting to pair, from the invite screen.
     AnswerPairing { accept: bool },
+    /// Suspend the TUI, open `$VISUAL`/`$EDITOR` on the current draft, and fold
+    /// the result back as [`Action::EditorFinished`]. The composer is a poor
+    /// place to write a long prompt; this is the standard way out of it.
+    OpenExternalEditor { text: String },
     /// Tear down the UI and exit.
     Quit,
 }

@@ -75,7 +75,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::AssistantMessageStarted { message_id } => {
             mark_turn_busy(state);
-            state.input_queues.clear_pending();
             reset_reasoning(state);
             state.transcript.begin_assistant(message_id);
         }
@@ -87,7 +86,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::AssistantTextDelta { message_id, delta } => {
             mark_turn_busy(state);
-            state.input_queues.clear_pending();
             state.transcript.append_assistant(&message_id, &delta);
         }
         RuntimeEvent::ReasoningDelta { delta } => {
@@ -105,7 +103,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::AgentActivity { label } => {
             mark_turn_busy(state);
-            state.input_queues.clear_pending();
             state.activity = Some(label);
         }
         RuntimeEvent::CommandProgress { label, elapsed_ms } => {
@@ -113,7 +110,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // elapsed so the status line reads "运行 cargo test · 02:31" instead
             // of a bare "等待模型". Reuses the activity slot (single source).
             mark_turn_busy(state);
-            state.input_queues.clear_pending();
             let secs = elapsed_ms / 1000;
             state.activity = Some(format!(
                 "运行 {label} · {}",
@@ -132,7 +128,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         } => {
             mark_turn_busy(state);
             state.turn_tool_calls = state.turn_tool_calls.saturating_add(1);
-            state.input_queues.clear_pending();
             // Acting on the thought ends it. It stays on screen while the tool
             // runs; the next step's first reasoning delta replaces it.
             state.reasoning_superseded = true;
@@ -270,7 +265,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.status = RuntimeStatus::Error;
             state.activity = None;
             state.goal_mode_active = false;
-            state.input_queues.clear_pending();
             state.transcript.finalize_in_flight();
             state.cancel_armed = false;
             state.force_cancel_armed = false;
@@ -288,11 +282,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             );
         }
         RuntimeEvent::TurnCancelled => {
-            // Reject in-flight submits so they can be retried, then mark the turn.
             state.status = RuntimeStatus::Idle;
             state.activity = None;
             state.goal_mode_active = false;
-            state.input_queues.reject_pending();
             state.transcript.finalize_in_flight();
             state.cancel_armed = false;
             state.force_cancel_armed = false;
@@ -364,6 +356,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             memory_dir,
             active,
             archived,
+            pending,
         } => {
             // Multi-line list must live in the transcript (status line is 1 row +
             // Info TTL ~4s). Users need to see every entry and forget ids.
@@ -387,13 +380,29 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     lines.push(format!("  [{}] {}", e.id, e.title));
                 }
             }
-            lines.push("hint: /memory forget <id>".into());
+            // Pending candidates were previously invisible here, so the only
+            // way to adopt one was the CLI. Listing them is what makes the
+            // consent gate usable from the UI it gates.
+            lines.push(format!("pending ({})", pending.len()));
+            if pending.is_empty() {
+                lines.push("  (none)".into());
+            } else {
+                for e in &pending {
+                    lines.push(format!("  [{}] {}", e.id, e.title));
+                }
+            }
+            lines.push(if pending.is_empty() {
+                "hint: /memory forget <id>".into()
+            } else {
+                "hint: /memory accept <id> · /memory forget <id>".to_string()
+            });
             state.transcript.push_note(lines.join("\n"));
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
                 message: format!(
-                    "memory · active={} archived={}",
+                    "memory · active={} pending={} archived={}",
                     active.len(),
+                    pending.len(),
                     archived.len()
                 ),
             });
@@ -474,7 +483,6 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     state.status = RuntimeStatus::Idle;
     state.activity = None;
     state.goal_mode_active = false;
-    state.input_queues.clear_pending();
     state.transcript.finalize_in_flight();
     state.cancel_armed = false;
     state.force_cancel_armed = false;
@@ -514,7 +522,6 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     }
     if status != TurnEndStatus::Cancelled
         && state.composer.is_empty()
-        && state.input_queues.is_empty()
         && let Some(suggestion) = suggestion
     {
         state.composer.replace_suggestion(suggestion);
@@ -644,6 +651,10 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     if state.repository != session.repository {
         state.file_candidates.clear();
         state.file_index_requested = false;
+        // Skill slash catalog is rooted on the repo; drop cache so the next
+        // `/` rescans project + user skills for the new workspace.
+        state.skill_catalog.clear();
+        state.skill_catalog_root = None;
     }
     state.session_id = session.id.clone();
     state.repository = session.repository.clone();

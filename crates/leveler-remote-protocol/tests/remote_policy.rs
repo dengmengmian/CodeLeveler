@@ -152,10 +152,18 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         (
-            "set_agent_mode",
-            ClientCommand::SetAgentMode {
+            "accept_memory",
+            ClientCommand::AcceptMemory {
                 session_id: session(),
-                orchestrate: true,
+                id: "m1".to_string(),
+            },
+            false,
+        ),
+        (
+            "steer_current_turn",
+            ClientCommand::SteerCurrentTurn {
+                session_id: session(),
+                content: "prefer tests".to_string(),
             },
             true,
         ),

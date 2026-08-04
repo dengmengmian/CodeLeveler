@@ -17,7 +17,7 @@ mod activity_stream;
 mod code_block;
 pub mod composer;
 mod diff_view;
-mod footer_queue;
+pub mod external_editor;
 pub mod i18n;
 pub mod markdown;
 pub mod overlay;

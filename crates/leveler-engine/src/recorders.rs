@@ -88,6 +88,12 @@ pub struct RecordingApprover {
 
 #[async_trait]
 impl Approver for RecordingApprover {
+    /// Delegate: this only records: wrapping a headless approver must not make
+    /// the run look attended, or its denials get reported as user refusals.
+    fn has_human(&self) -> bool {
+        self.inner.has_human()
+    }
+
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
         let mut request = request.clone();
         request.turn_id = Some(self.turn_id.clone());
@@ -182,5 +188,29 @@ mod tests {
             state.take_overflow(),
             Some(EngineEvent::VerificationStarted)
         ));
+    }
+}
+
+#[cfg(test)]
+mod approver_delegation_tests {
+    use super::*;
+    use leveler_execution::AutoApprove;
+
+    /// A decorator that answers `has_human()` for itself re-labels a headless
+    /// run as an attended one, and every denial downstream then reads as "the
+    /// user refused" — for something no user ever saw.
+    #[tokio::test]
+    async fn recording_approver_reports_the_inner_approver_s_humanity() {
+        let (events, _rx, _state) =
+            EventEmitter::channel(4, tokio_util::sync::CancellationToken::new());
+        let recorder = RecordingApprover {
+            inner: Arc::new(AutoApprove),
+            events,
+            turn_id: TurnId::new("t1"),
+        };
+        assert!(
+            !recorder.has_human(),
+            "wrapping AutoApprove must not conjure a human"
+        );
     }
 }

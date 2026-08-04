@@ -21,6 +21,18 @@ pub fn task_suggests_delegation(task: &str) -> bool {
         "separately investigate",
         "divide and",
         "split the work",
+        "end-to-end",
+        "e2e",
+        "across the stack",
+        "full stack",
+        "multi-step",
+        "multi step",
+        "several components",
+        "multiple packages",
+        "多个模块",
+        "多个包",
+        "端到端",
+        "全栈",
         "分头",
         "并行",
         "多 agent",
@@ -32,6 +44,8 @@ pub fn task_suggests_delegation(task: &str) -> bool {
         "分两路",
         "分别调查",
         "分别审查",
+        "分别改",
+        "分模块",
     ];
     if MARKERS.iter().any(|m| t.contains(m)) {
         return true;
@@ -43,9 +57,23 @@ pub fn task_suggests_delegation(task: &str) -> bool {
         "stability",
         "tools",
         "performance",
+        "frontend",
+        "backend",
+        "cli",
+        "tui",
+        "api",
     ];
     let facet_hits = facets.iter().filter(|f| t.contains(*f)).count();
-    if facet_hits >= 2 && (t.contains("review") || t.contains("investigate") || t.contains("audit"))
+    if facet_hits >= 2
+        && (t.contains("review")
+            || t.contains("investigate")
+            || t.contains("audit")
+            || t.contains("refactor")
+            || t.contains("implement")
+            || t.contains("fix")
+            || t.contains("审查")
+            || t.contains("重构")
+            || t.contains("实现"))
     {
         return true;
     }
@@ -58,14 +86,20 @@ pub fn multi_agent_steer_hint() -> String {
      This request looks multi-part or parallel. Prefer emitting several \
      `spawn_agent` calls **in the same assistant turn** so they run concurrently \
      (explorer for investigation, worker + disjoint `files` for edits). Put a \
-     complete self-contained `task` in each spawn. Do not spawn for trivial \
-     single-step work; synthesize the child reports yourself afterward."
+     complete self-contained `task` in each spawn — children do not see parent \
+     tool history. After children return, synthesize one answer yourself; do not \
+     re-run the same investigation. Do not spawn for trivial single-step work.\n\
+     Long work stays in this direct tool loop: keep calling tools / spawn_agent \
+     until the goal is proven; do not stop early with a plan-only summary."
         .to_string()
 }
+
 /// A delegated unit must eventually return control to its parent even if a
 /// provider or tool keeps making progress without reaching a terminal answer.
+/// Parent goal turns are not capped here; only children are, so a hung sub-agent
+/// cannot strand the parent forever.
 pub(crate) const SUB_AGENT_MAX_DURATION: std::time::Duration =
-    std::time::Duration::from_secs(15 * 60);
+    std::time::Duration::from_secs(20 * 60);
 /// Default cap on concurrently-running sub-agents (including within one batch).
 pub(crate) const DEFAULT_MAX_CONCURRENT_AGENTS: usize = 4;
 /// Default cap on total sub-agents spawned across one top-level run.
@@ -133,6 +167,10 @@ mod tests {
         assert!(task_suggests_delegation(
             "review architecture and performance audit of the stack"
         ));
+        assert!(task_suggests_delegation("端到端实现下单与支付"));
+        assert!(task_suggests_delegation(
+            "refactor frontend and backend validation"
+        ));
         assert!(!task_suggests_delegation("fix the typo in main.rs"));
         assert!(!task_suggests_delegation("你好"));
     }
@@ -142,5 +180,12 @@ mod tests {
         let h = multi_agent_steer_hint();
         assert!(h.contains("## Multi-agent delegation"));
         assert!(h.contains("spawn_agent"));
+        assert!(h.contains("direct tool loop"));
+    }
+
+    #[test]
+    fn nicknames_cycle() {
+        assert_eq!(agent_nickname(1), "Euclid");
+        assert_eq!(agent_nickname(AGENT_NICKNAMES.len() + 1), "Euclid #2");
     }
 }

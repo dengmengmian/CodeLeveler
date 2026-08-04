@@ -295,9 +295,11 @@ pub async fn run(
             &delivery_tx,
             &web_launcher,
             &remote_launcher,
+            &mut alt,
+            &mut stdout,
         );
 
-        // Busy spinner + elapsed clock, and draining queued input when idle.
+        // Busy spinner + elapsed clock.
         state.tick = state.tick.wrapping_add(1);
         if state.is_busy() {
             let start = *state.turn_started_at.get_or_insert_with(Instant::now);
@@ -305,15 +307,6 @@ pub async fn run(
         } else {
             state.turn_started_at = None;
             state.elapsed_secs = 0;
-            let queued = crate::reducer::drain_queued(&mut state);
-            dispatch_effects(
-                &mut state,
-                queued,
-                &completion_tx,
-                &delivery_tx,
-                &web_launcher,
-                &remote_launcher,
-            );
         }
 
         // Wall clock in the header — repaint when the minute rolls over.
@@ -402,6 +395,7 @@ fn session_exit_hint(session_id: &str) -> String {
 
 /// Carry out the reducer's effects. A failed send means the runtime side is
 /// gone — surface that instead of pretending the action happened.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_effects(
     state: &mut AppState,
     effects: Vec<Effect>,
@@ -409,6 +403,10 @@ fn dispatch_effects(
     delivery_tx: &mpsc::UnboundedSender<DeliveryJob>,
     web_launcher: &Option<WebLauncher>,
     remote_launcher: &Option<crate::action::RemoteLauncher>,
+    // `$EDITOR` takes the terminal over, so it needs the alternate-screen
+    // handle (dropped for the duration) and stdout to restore modes on.
+    alt: &mut Option<Terminal<CrosstermBackend<Stdout>>>,
+    stdout: &mut Stdout,
 ) {
     for effect in effects {
         match effect {
@@ -514,9 +512,37 @@ fn dispatch_effects(
                 run_remote(remote_launcher.as_ref(), request, completion_tx);
             }
             Effect::OpenWebUrl(url) => open_in_browser(&url),
+            Effect::OpenExternalEditor { text } => {
+                // Block the event loop while $EDITOR runs: the user is away from
+                // the TUI, and painting over an active editor would corrupt both.
+                let result = run_external_editor(alt, stdout, &text);
+                let _ = completion_tx.send(Action::EditorFinished(result));
+            }
             Effect::Quit => state.running = false,
         }
     }
+}
+
+/// Hand the terminal to `$EDITOR` and take it back.
+///
+/// Every mode the TUI turned on is undone first and restored after — leaving
+/// mouse capture or bracketed paste on would feed escape sequences straight
+/// into the editor. The alternate screen is dropped entirely so the next paint
+/// rebuilds it, rather than restoring a frame drawn before the edit.
+fn run_external_editor(
+    alt: &mut Option<Terminal<CrosstermBackend<Stdout>>>,
+    stdout: &mut Stdout,
+    text: &str,
+) -> Result<String, String> {
+    *alt = None;
+    crate::external_editor::suspend_terminal(stdout).map_err(|e| format!("无法让出终端：{e}"))?;
+    let result = crate::external_editor::edit_text(text);
+    // Restore even when the edit failed: the alternative is a terminal left in
+    // cooked mode with the UI still running.
+    if let Err(e) = crate::external_editor::resume_terminal(stdout) {
+        return Err(format!("终端未能恢复：{e}"));
+    }
+    result
 }
 
 /// Open `url` in the platform default browser (best-effort, non-blocking).
@@ -728,6 +754,31 @@ fn plain_text_char(key: &KeyEvent) -> Option<char> {
     }
 }
 
+/// Ask the host side to do one remote thing and fold the answer back.
+///
+/// Absent launcher means this TUI is attached to someone else's daemon, where
+/// "make *this* machine reachable" is not a question this process can answer.
+fn run_remote(
+    launcher: Option<&crate::action::RemoteLauncher>,
+    request: crate::action::RemoteRequest,
+    completion_tx: &tokio::sync::mpsc::UnboundedSender<Action>,
+) {
+    match launcher {
+        Some(launcher) => {
+            let launcher = Arc::clone(launcher);
+            let tx = completion_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(Action::Remote(launcher(request).await));
+            });
+        }
+        None => {
+            let _ = completion_tx.send(Action::Remote(crate::action::RemoteOutcome::Failed(
+                "当前 TUI 连接的是远程 daemon，不能把这台机器开放给手机".to_string(),
+            )));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,30 +892,5 @@ mod tests {
             s.notification.as_ref().map(|n| n.message.as_str()),
             Some("boom")
         );
-    }
-}
-
-/// Ask the host side to do one remote thing and fold the answer back.
-///
-/// Absent launcher means this TUI is attached to someone else's daemon, where
-/// "make *this* machine reachable" is not a question this process can answer.
-fn run_remote(
-    launcher: Option<&crate::action::RemoteLauncher>,
-    request: crate::action::RemoteRequest,
-    completion_tx: &tokio::sync::mpsc::UnboundedSender<Action>,
-) {
-    match launcher {
-        Some(launcher) => {
-            let launcher = Arc::clone(launcher);
-            let tx = completion_tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(Action::Remote(launcher(request).await));
-            });
-        }
-        None => {
-            let _ = completion_tx.send(Action::Remote(crate::action::RemoteOutcome::Failed(
-                "当前 TUI 连接的是远程 daemon，不能把这台机器开放给手机".to_string(),
-            )));
-        }
     }
 }

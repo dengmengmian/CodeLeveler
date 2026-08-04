@@ -824,7 +824,7 @@ impl Comparison {
 /// inferred or assigned.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ablation {
-    /// The flipped knob, e.g. `require_step_summary`.
+    /// The flipped knob, e.g. `explicit_plan`.
     pub knob: String,
     pub control_rate: f32,
     pub ablated_rate: f32,
@@ -1144,7 +1144,7 @@ mod tests {
                 result("c", true, true),
             ],
         };
-        let ab = Ablation::of("require_step_summary", &control, &ablated);
+        let ab = Ablation::of("explicit_plan", &control, &ablated);
         assert_eq!(ab.discarded_cases, vec!["c#1".to_string()]);
         assert_eq!(ab.control_rate, 1.0, "2/2 over the comparable cases");
         assert_eq!(ab.ablated_rate, 1.0, "c is dropped from this arm too");
@@ -1174,8 +1174,8 @@ mod tests {
                 result("c", true, true),
             ],
         };
-        let ab = Ablation::of("require_step_summary", &control, &ablated);
-        assert_eq!(ab.knob, "require_step_summary");
+        let ab = Ablation::of("explicit_plan", &control, &ablated);
+        assert_eq!(ab.knob, "explicit_plan");
         assert_eq!(ab.saved_by_knob, vec!["b#1".to_string()]);
         assert_eq!(ab.hurt_by_knob, vec!["c#1".to_string()]);
         assert!((ab.rate_delta - 0.0).abs() < f32::EPSILON, "2/3 vs 2/3");
