@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 // The credential-name policy lives in `leveler-core` (next to the environment
 // snapshot it filters); re-exported here so existing callers keep working.
-pub use leveler_core::is_credential_env_name;
 use leveler_core::environment::SECRET_ENV_DENYLIST;
+pub use leveler_core::is_credential_env_name;
 
 /// Credential-like variables currently present in the parent environment,
 /// plus caller-declared names. External subprocess adapters use this one policy

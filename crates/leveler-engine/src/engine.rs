@@ -242,10 +242,7 @@ impl TaskEngine {
     ///
     /// Set by the caller that knows which session is running, since the factory
     /// is built before that is decided.
-    pub fn with_steering(
-        mut self,
-        source: Option<Arc<dyn leveler_agent::SteeringSource>>,
-    ) -> Self {
+    pub fn with_steering(mut self, source: Option<Arc<dyn leveler_agent::SteeringSource>>) -> Self {
         self.factory.steering = source;
         self
     }

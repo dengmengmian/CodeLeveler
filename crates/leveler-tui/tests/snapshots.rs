@@ -1058,7 +1058,10 @@ fn a_narrow_terminal_keeps_the_answer_and_the_composer() {
             }),
         );
         let text = render_at(width, 24, &mut state);
-        assert!(text.contains("这是答案"), "answer lost at {width} cols:\n{text}");
+        assert!(
+            text.contains("这是答案"),
+            "answer lost at {width} cols:\n{text}"
+        );
         assert!(text.contains('›'), "composer lost at {width} cols:\n{text}");
     }
 }

@@ -1576,9 +1576,7 @@ impl Executor {
                         &plan_state,
                         observer,
                     );
-                    if self.registry.mutates_files(&call.name)
-                        && !structured_plan_started
-                    {
+                    if self.registry.mutates_files(&call.name) && !structured_plan_started {
                         metrics.first_write_before_plan = true;
                     }
                 }
@@ -2284,7 +2282,10 @@ impl Executor {
                     self.hook_runner
                         .run_lifecycle(
                             leveler_execution::LifecycleEvent::PostCompact,
-                            &format!(r#"{{"messages_before":{before},"messages_after":{}}}"#, messages.len()),
+                            &format!(
+                                r#"{{"messages_before":{before},"messages_after":{}}}"#,
+                                messages.len()
+                            ),
                             &cancellation,
                         )
                         .await;

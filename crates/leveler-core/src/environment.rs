@@ -249,7 +249,10 @@ mod tests {
             PathBuf::new(),
             PathBuf::new(),
         );
-        let kept: Vec<_> = snapshot.scrubbed_vars_os().map(|(n, _)| n.clone()).collect();
+        let kept: Vec<_> = snapshot
+            .scrubbed_vars_os()
+            .map(|(n, _)| n.clone())
+            .collect();
         assert_eq!(kept, vec![OsString::from("HOME")]);
     }
 

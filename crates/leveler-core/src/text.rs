@@ -633,7 +633,10 @@ mod tests {
     #[test]
     fn head_truncation_marker_longer_than_budget_is_kept_whole() {
         // The marker is on top of max_bytes by contract, never trimmed.
-        assert_eq!(truncate_head_bytes("abcdef", 2, "[truncated]"), "ab[truncated]");
+        assert_eq!(
+            truncate_head_bytes("abcdef", 2, "[truncated]"),
+            "ab[truncated]"
+        );
     }
 
     #[test]

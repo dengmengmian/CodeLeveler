@@ -102,7 +102,11 @@ fn wrap_to_width(
             .first()
             .map(|s| s.content.chars().take_while(|c| *c == ' ').collect())
             .unwrap_or_default();
-        let indent = if indent.len() + 8 < width { indent } else { String::new() };
+        let indent = if indent.len() + 8 < width {
+            indent
+        } else {
+            String::new()
+        };
         // Flatten to styled characters so a break can be chosen by looking at
         // the whole row rather than one span at a time.
         let cells: Vec<(char, Style)> = line
@@ -273,7 +277,6 @@ fn clarification_content(
     ));
     (lines, Some((input_row, input_col)))
 }
-
 
 fn selection_content(
     model: &SelectionModel,
@@ -450,7 +453,9 @@ mod layout_tests {
             id: ApprovalId::new("r1"),
             tool: "shell_command".into(),
             summary: summary.into(),
-            command: Some("rm -rf src/main.rs && ls src/ && git status --short && echo done".into()),
+            command: Some(
+                "rm -rf src/main.rs && ls src/ && git status --short && echo done".into(),
+            ),
             risks: vec!["可能造成破坏性变更".into()],
         })))
     }

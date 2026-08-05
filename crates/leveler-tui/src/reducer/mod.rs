@@ -15,7 +15,6 @@ mod runtime_apply;
 mod screen_nav;
 mod submit;
 
-
 use overlay_keys::{handle_overlay_key, open_model_picker};
 use runtime_apply::apply_runtime;
 use runtime_apply::mode_label;
@@ -467,7 +466,7 @@ fn mouse_to_text_pos_clamped(
     // `render_conversation`), so the first `pad` screen rows are blank filler,
     // not content. Without this the mouse selects a line above the one under
     // the cursor by exactly that many rows.
-    let pad = (height as usize).saturating_sub(total);
+    let pad = height.saturating_sub(total);
     let abs_row = (scroll + viewport_row.saturating_sub(pad)).min(total.saturating_sub(1));
     let abs_col = (clamped_col - rx) as usize;
     Some(crate::selection::TextPos {

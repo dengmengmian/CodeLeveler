@@ -851,7 +851,6 @@ fn doctor_slash(state: &mut AppState) -> Vec<Effect> {
     Vec::new()
 }
 
-
 #[cfg(test)]
 mod export_tests {
     use super::*;

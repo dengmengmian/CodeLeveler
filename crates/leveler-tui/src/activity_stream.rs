@@ -851,7 +851,11 @@ mod tests {
             "a finished batch should be one row, got:\n{}",
             lines.join("\n")
         );
-        assert!(lines[0].contains('8'), "row must say how many: {:?}", lines[0]);
+        assert!(
+            lines[0].contains('8'),
+            "row must say how many: {:?}",
+            lines[0]
+        );
     }
 
     #[test]
@@ -891,7 +895,11 @@ mod tests {
 
     #[test]
     fn a_finished_single_tool_drops_its_preview_row() {
-        let g = group(vec![call("read_file", r#"{"path":"go.mod"}"#, ToolStatus::Ok)]);
+        let g = group(vec![call(
+            "read_file",
+            r#"{"path":"go.mod"}"#,
+            ToolStatus::Ok,
+        )]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert_eq!(
             lines.len(),

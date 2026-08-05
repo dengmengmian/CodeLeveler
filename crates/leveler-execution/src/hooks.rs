@@ -487,7 +487,10 @@ mod lifecycle_hook_tests {
             .await;
         let seen = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(seen.contains("pre_compact"), "{seen:?}");
-        assert!(seen.contains("120000"), "payload must reach the hook: {seen:?}");
+        assert!(
+            seen.contains("120000"),
+            "payload must reach the hook: {seen:?}"
+        );
     }
 
     /// Sub-agents run concurrently and silently; without an event here there is
@@ -534,7 +537,11 @@ mod lifecycle_hook_tests {
         };
         // Returns unit: there is no failure channel by construction.
         runner
-            .run_lifecycle(LifecycleEvent::SessionStart, "{}", &CancellationToken::new())
+            .run_lifecycle(
+                LifecycleEvent::SessionStart,
+                "{}",
+                &CancellationToken::new(),
+            )
             .await;
     }
 

@@ -1019,7 +1019,10 @@ mod authorize_tests {
             arguments: serde_json::json!({"cmd": "rm -rf src/main.rs && ls src/"}),
         };
         executor.authorize(&call, &mut session).await.unwrap();
-        assert_eq!(approver.last_request().unwrap().risk, RiskLevel::Destructive);
+        assert_eq!(
+            approver.last_request().unwrap().risk,
+            RiskLevel::Destructive
+        );
     }
 
     #[tokio::test]
@@ -1038,7 +1041,10 @@ mod authorize_tests {
             arguments: serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
         };
         executor.authorize(&call, &mut session).await.unwrap();
-        assert_eq!(approver.last_request().unwrap().risk, RiskLevel::Destructive);
+        assert_eq!(
+            approver.last_request().unwrap().risk,
+            RiskLevel::Destructive
+        );
     }
 
     #[tokio::test]

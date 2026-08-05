@@ -31,10 +31,11 @@ use leveler_verifier::{VerificationPlan, VerificationReport, Verifier};
 /// stays the true "before" state even if the agent commits mid-task.
 pub(crate) async fn capture_head(repo: &Path) -> Option<String> {
     let repo = repo.to_path_buf();
-    let stdout =
-        tokio::task::spawn_blocking(move || leveler_core::git_stdout(&repo, &["rev-parse", "HEAD"]))
-            .await
-            .ok()??;
+    let stdout = tokio::task::spawn_blocking(move || {
+        leveler_core::git_stdout(&repo, &["rev-parse", "HEAD"])
+    })
+    .await
+    .ok()??;
     let hash = stdout.trim().to_string();
     (!hash.is_empty()).then_some(hash)
 }

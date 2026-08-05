@@ -1370,7 +1370,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn composer_window_follows_cursor_above_the_fold() {
         let mut s = test_state();

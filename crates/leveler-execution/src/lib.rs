@@ -47,7 +47,7 @@ pub use command::{
     credential_env_names, first_absolute_arg_outside_roots, is_credential_env_name,
     looks_like_absolute_path_arg, process_request_for_verify_check,
 };
-pub use hooks::{HookRunner, PreHookResult, LifecycleEvent};
+pub use hooks::{HookRunner, LifecycleEvent, PreHookResult};
 pub use permission_grants::{
     GrantFile, grants_path, load_grants, remember_project_grant, signatures_from_file,
 };

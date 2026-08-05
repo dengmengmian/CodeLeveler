@@ -371,7 +371,7 @@ pub fn command_is_destructive(cmd: &CommandView) -> bool {
         return true;
     }
     match shell_c_script(cmd.args) {
-        Some(script) if is_shell_wrapper_program(cmd.program) => script_is_destructive(&script),
+        Some(script) if is_shell_wrapper_program(cmd.program) => script_is_destructive(script),
         _ => false,
     }
 }

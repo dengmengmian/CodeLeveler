@@ -642,7 +642,10 @@ mod tests {
         }
         for name in ["run_command", "shell_command"] {
             assert!(reg.runs_command(name), "{name} must declare runs_command");
-            assert!(!reg.mutates_files(name), "{name} does not edit files itself");
+            assert!(
+                !reg.mutates_files(name),
+                "{name} does not edit files itself"
+            );
         }
         for name in ["read_file", "grep", "list_files", "update_plan"] {
             assert!(!reg.mutates_files(name), "{name} must not claim mutation");

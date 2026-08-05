@@ -77,7 +77,6 @@ impl PermissionProfile {
     pub fn confines_workspace(self) -> bool {
         !matches!(self, Self::FullAccess)
     }
-
 }
 
 impl std::fmt::Display for PermissionProfile {

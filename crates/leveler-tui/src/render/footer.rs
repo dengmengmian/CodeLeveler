@@ -389,7 +389,6 @@ fn composer_trust_chip(state: &AppState) -> String {
     format!("{base} · {}", state.t().untrusted_config_chip)
 }
 
-
 /// The single hint row under the composer, or nothing.
 ///
 /// Two moments earn it: a turn in flight (the interrupt is the only key that
@@ -458,7 +457,6 @@ pub(crate) fn render_composer(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
-
 /// `(ordinal_1based, preview_text)` for every user message in the transcript.
 pub(crate) fn user_turn_summaries(state: &AppState) -> Vec<(usize, String)> {
     state
@@ -524,7 +522,6 @@ mod p1_tests {
             "the model/permission chip must survive: {chip}"
         );
     }
-
 
     #[test]
     fn user_turn_summaries_lists_only_user_messages() {

@@ -582,7 +582,8 @@ fn sub_agent_lines(
             out.push(Line::from(Span::styled(
                 format!(
                     "  {}",
-                    t.fold_more_lines.replace("{}", &(rows.len() - shown).to_string())
+                    t.fold_more_lines
+                        .replace("{}", &(rows.len() - shown).to_string())
                 ),
                 Style::default().fg(theme.dim),
             )));
@@ -1110,7 +1111,10 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
-        assert!(text.contains("Ctrl+O"), "the cut must offer a way back: {text}");
+        assert!(
+            text.contains("Ctrl+O"),
+            "the cut must offer a way back: {text}"
+        );
     }
 
     #[test]
@@ -1128,7 +1132,10 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
-        assert!(text.contains("结论第 20 条"), "expanded must be complete: {text}");
+        assert!(
+            text.contains("结论第 20 条"),
+            "expanded must be complete: {text}"
+        );
     }
 
     #[test]

@@ -108,8 +108,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Some(ov) => crate::overlay::overlay_height(ov, &state.theme, area.width, state.locale)
             .min(area.height.saturating_sub(8))
             .max(3),
-        None => composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2)
-            as u16,
+        None => {
+            composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2) as u16
+        }
     };
     // Header: blank breathing row + status line + hairline separator (3 rows)
     // so the brand strip is not flush against the terminal's top edge. Footer 1.
@@ -169,13 +170,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_attachments(frame, chunks[5], state);
     // chunks[6] = pre_composer_gap (leave blank)
     match &state.overlay {
-        Some(overlay) => crate::overlay::render_overlay(
-            frame,
-            chunks[7],
-            overlay,
-            &state.theme,
-            state.locale,
-        ),
+        Some(overlay) => {
+            crate::overlay::render_overlay(frame, chunks[7], overlay, &state.theme, state.locale)
+        }
         None => render_input(frame, chunks[7], state),
     }
     // chunks[8]: the key hints when there are any, otherwise the blank gap.

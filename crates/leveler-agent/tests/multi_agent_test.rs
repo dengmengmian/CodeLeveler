@@ -1043,14 +1043,8 @@ async fn parallel_children_do_not_oversell_command_budget() {
         vec![
             assistant_with(
                 vec![
-                    spawn_call(
-                        "s1",
-                        serde_json::json!({"task": "run two echoes A"}),
-                    ),
-                    spawn_call(
-                        "s2",
-                        serde_json::json!({"task": "run two echoes B"}),
-                    ),
+                    spawn_call("s1", serde_json::json!({"task": "run two echoes A"})),
+                    spawn_call("s2", serde_json::json!({"task": "run two echoes B"})),
                 ],
                 FinishReason::ToolCalls,
             ),
@@ -1224,10 +1218,7 @@ async fn mixed_parent_command_and_child_both_count_in_same_batch() {
                         "run_command",
                         serde_json::json!({"program": "echo", "args": ["parent"]}),
                     ),
-                    spawn_call(
-                        "s1",
-                        serde_json::json!({"task": "run one command"}),
-                    ),
+                    spawn_call("s1", serde_json::json!({"task": "run one command"})),
                 ],
                 FinishReason::ToolCalls,
             ),
@@ -2194,7 +2185,11 @@ mod steering {
         Arc::new(SleepyRuntime::new(
             vec![
                 assistant_with(
-                    vec![tool_call_part("c1", "list_files", serde_json::json!({"path": "."}))],
+                    vec![tool_call_part(
+                        "c1",
+                        "list_files",
+                        serde_json::json!({"path": "."}),
+                    )],
                     FinishReason::ToolCalls,
                 ),
                 assistant_text("done"),
@@ -2224,7 +2219,12 @@ mod steering {
 
         let mut events = Vec::new();
         let _ = executor
-            .run("原任务", &mut |e| events.push(e), &mut NoopSink, CancellationToken::new())
+            .run(
+                "原任务",
+                &mut |e| events.push(e),
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -2260,7 +2260,12 @@ mod steering {
         .with_steering(source as Arc<dyn SteeringSource>);
 
         let outcome = executor
-            .run("原任务", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+            .run(
+                "原任务",
+                &mut |_| {},
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.final_text, "done", "blank steering must be dropped");

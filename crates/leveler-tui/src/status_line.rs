@@ -162,7 +162,6 @@ pub(crate) fn footer_status_line(state: &AppState) -> Option<String> {
     }
 }
 
-
 fn truncate_to_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -181,7 +180,6 @@ fn truncate_to_width(s: &str, width: usize) -> String {
     }
     acc
 }
-
 
 fn fit_status(parts: &[String], width: usize) -> String {
     let mut out = String::new();
@@ -270,10 +268,7 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
                 // Interrupting overlays: static waiting copy, no spinner.
                 // Pickers return None and fall through to the normal strip.
                 if let Some(hint) = overlay.status_hint(state.t()) {
-                    return Line::from(Span::styled(
-                        hint,
-                        Style::default().fg(theme.warning),
-                    ));
+                    return Line::from(Span::styled(hint, Style::default().fg(theme.warning)));
                 }
             }
         }
@@ -377,7 +372,6 @@ pub(crate) fn header_line(state: &AppState, width: usize) -> Line<'static> {
     ))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +402,6 @@ mod tests {
         assert_eq!(estimate_tokens("abcd"), 1);
     }
 
-
     #[test]
     fn header_is_branch_and_path_only() {
         let mut state = test_state();
@@ -427,7 +420,6 @@ mod tests {
             "model/perm belong near prompt, not header: {header}"
         );
     }
-
 
     #[test]
     fn compact_token_and_footer_ctx_chip() {
@@ -452,7 +444,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn goal_mode_is_visible_in_status() {
         let mut state = test_state();
@@ -471,7 +462,6 @@ mod tests {
         let narrow = header_line(&state, 12).to_string();
         assert!(narrow.contains("main") || narrow.contains("⑂"), "{narrow}");
     }
-
 
     #[test]
     fn permission_chip_labels_are_english_product_terms() {
@@ -569,7 +559,6 @@ mod tests {
             assert!(!text.contains(frame), "no spinner: {text}");
         }
     }
-
 
     /// A reasoning model can spend 90+ seconds and thousands of tokens on a
     /// single round while emitting almost no visible text (measured: 95s,

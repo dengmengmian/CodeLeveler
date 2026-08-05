@@ -4287,7 +4287,6 @@ fn slash_doctor_writes_a_self_check_note() {
     assert!(note.contains("session"), "{note}");
 }
 
-
 /// `/feature-dev` is a built-in skill: it must reach the composer as a slash
 /// command with no per-project setup, or shipping it changes nothing for users.
 #[test]

@@ -204,10 +204,7 @@ fn tui_session_commands_ui_and_logic() {
         btw_ui.contains("临时提问") || btw_ui.contains("btw"),
         "btw card title: {btw_ui}"
     );
-    assert!(
-        btw_ui.contains("没有明显问题"),
-        "btw answer text: {btw_ui}"
-    );
+    assert!(btw_ui.contains("没有明显问题"), "btw answer text: {btw_ui}");
     assert!(
         !btw_ui.contains("**"),
         "btw must render markdown, not raw **: {btw_ui}"
