@@ -5851,3 +5851,181 @@ async fn round_limit_exit_publishes_the_final_epoch_spend() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── phase 5: product policy is switchable; safety is not ─────────────────────
+
+#[tokio::test]
+async fn minimal_policy_disables_the_identical_result_loop_guard() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-minimal-{}",
+        std::process::id() as u64 * 13 + 7
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // The model re-reads the same file four rounds in a row. The loop guard
+    // (a product heuristic) would deny the third; the minimal policy runs
+    // them all. Termination still holds via the safety round ceiling.
+    let same_read =
+        || assistant_tool_call("c", "read_file", serde_json::json!({"path": "src/lib.rs"}));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        same_read(),
+        same_read(),
+        same_read(),
+        same_read(),
+        assistant_text("the file has not changed"),
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_turn_policy(leveler_agent::TurnPolicy::minimal());
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "watch the file",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    let guard_denials = events
+        .iter()
+        .filter(|e| {
+            matches!(e, leveler_agent::AgentEvent::ToolResult { is_error, preview, .. }
+                if *is_error && preview.contains("with the same result"))
+        })
+        .count();
+    assert_eq!(
+        guard_denials, 0,
+        "the minimal policy must not run the loop-guard heuristic: {events:?}"
+    );
+    let ok_reads = events
+        .iter()
+        .filter(|e| {
+            matches!(e, leveler_agent::AgentEvent::ToolResult { name, is_error, .. }
+                if name == "read_file" && !*is_error)
+        })
+        .count();
+    assert_eq!(ok_reads, 4, "all four identical reads must actually run");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same script under the DEFAULT policy: the guard fires. Locks that
+/// switching the policy — not editing the loop — is what changed above.
+#[tokio::test]
+async fn default_policy_still_denies_identical_result_loops() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-defaultguard-{}",
+        std::process::id() as u64 * 13 + 8
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let same_read =
+        || assistant_tool_call("c", "read_file", serde_json::json!({"path": "src/lib.rs"}));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        same_read(),
+        same_read(),
+        same_read(),
+        same_read(),
+        assistant_text("done"),
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+
+    let mut events = Vec::new();
+    executor
+        .run(
+            "watch the file",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, leveler_agent::AgentEvent::ToolResult { is_error, preview, .. }
+                if *is_error && preview.contains("with the same result"))
+        }),
+        "the default policy keeps the loop guard: {events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Switching to the minimal policy must not loosen the host safety boundary:
+/// a dangerous command still needs approval and a denial still blocks it.
+#[tokio::test]
+async fn minimal_policy_keeps_the_admission_boundary() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-minimal-admit-{}",
+        std::process::id() as u64 * 13 + 9
+    ));
+    std::fs::create_dir_all(dir.join("scratch")).unwrap();
+    std::fs::write(dir.join("scratch/f.txt"), "x").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+        ),
+        assistant_text("understood"),
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_turn_policy(leveler_agent::TurnPolicy::minimal())
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
+
+    let mut events = Vec::new();
+    executor
+        .run(
+            "clean up",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        dir.join("scratch").exists(),
+        "policy switches must never bypass approval: the deletion ran"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

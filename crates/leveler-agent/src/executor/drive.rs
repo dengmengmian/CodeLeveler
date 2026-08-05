@@ -1257,7 +1257,9 @@ impl Executor {
                 // produced an identical result LOOP_GUARD_THRESHOLD times.
                 let loop_key = observe_class(&call.name, &call.arguments)
                     .unwrap_or_else(|| format!("{}\0{}", call.name, compact_json(&call.arguments)));
-                if call_history.get(&loop_key).map(|(_, n)| *n).unwrap_or(0) >= LOOP_GUARD_THRESHOLD
+                if self.policy.progress_guards
+                    && call_history.get(&loop_key).map(|(_, n)| *n).unwrap_or(0)
+                        >= LOOP_GUARD_THRESHOLD
                 {
                     let msg = format!(
                         "This exact `{}` call already ran {} times with the same result and made \
@@ -2017,18 +2019,28 @@ impl Executor {
             let pure_observe_round = observe_only_tools_this_round > 0
                 && non_observe_success_this_round == 0
                 && !verification_ran;
-            let verdict = round_verdict::classify(&round_verdict::RoundInput {
-                closing: progress.closing,
-                substantive: substantive_round,
-                pure_observe: pure_observe_round,
-                // Repeated output is fingerprinted by the loop guard's history.
-                repeated_observation: call_history
-                    .values()
-                    .any(|(_, n)| *n >= LOOP_GUARD_THRESHOLD),
-                had_calls: !call_snapshot.is_empty(),
-                all_denied: denied_calls_this_round == call_snapshot.len(),
-                plan_repair: plan_repair_required,
-            });
+            // Product heuristic (policy-gated): with guards off no round is
+            // ever classified as thrash and no streak accumulates. The safety
+            // boundary (round ceiling, step limits, cancellation) is elsewhere
+            // and unconditional.
+            let verdict = if !self.policy.progress_guards {
+                // Guards off: neither penalty nor reset — the streak machinery
+                // simply never engages.
+                RoundVerdict::ObserveExploring
+            } else {
+                round_verdict::classify(&round_verdict::RoundInput {
+                    closing: progress.closing,
+                    substantive: substantive_round,
+                    pure_observe: pure_observe_round,
+                    // Repeated output is fingerprinted by the loop guard's history.
+                    repeated_observation: call_history
+                        .values()
+                        .any(|(_, n)| *n >= LOOP_GUARD_THRESHOLD),
+                    had_calls: !call_snapshot.is_empty(),
+                    all_denied: denied_calls_this_round == call_snapshot.len(),
+                    plan_repair: plan_repair_required,
+                })
+            };
             if verdict == RoundVerdict::CloseoutThrash {
                 // Plan complete, but the model kept doing substantive work
                 // (re-running builds/tests/curl, or re-inspecting files). That

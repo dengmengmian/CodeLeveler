@@ -47,7 +47,7 @@
 | 2 | 唯一 ToolHost 调用边界 | 完成（见阶段 2 状态注记） |
 | 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
 | 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
-| 5 | 产品策略移出 direct loop | 待开始 |
+| 5 | 产品策略移出 direct loop | 完成（开关化+分类；协议化迁移与旧策略删除待 eval 数据，见阶段 5 状态注记） |
 | 6 | 收紧模型与 provider 边界 | 待开始 |
 | 7 | 稳定性与开源发布门槛 | 待开始 |
 
@@ -239,6 +239,39 @@
 ### 阶段 5：把产品策略移出 direct loop
 
 **目的：** 精简循环，同时保留复杂任务能力。
+
+> **状态：完成（策略开关化 + 分类；事件驱动 policy 协议与旧策略删除
+> 留待真实任务数据，见下）。**
+>
+> **逐项分类结论**（工作项 1）：
+>
+> | 机制 | 分类 | 开关 |
+> | --- | --- | --- |
+> | admission（hooks/规则/审批）、副作用屏障、路径约束、沙箱 | **安全** | 无条件 |
+> | StepLimits（命令/文件/token/成本/墙钟）、绝对轮次上限、取消 | **安全** | 无条件 |
+> | 事件/消息持久化、恢复协议 | **安全** | 无条件 |
+> | goal 终止语义（update_goal / quiet-nudge / Stalled 判定） | **安全**（termination） | `goal_mode` 随 profile |
+> | plan-before-write 强制 | 产品 | `TurnPolicy::require_explicit_plan` |
+> | 连续搜索预算 | 产品 | `max_search_calls_per_step`（0=关） |
+> | todo 完成门 | 产品 | `goal_todo_gate` |
+> | Delivery 证据门（complete_step / EvidenceLedger 门禁） | 产品 | `delivery_gate` |
+> | 同参同果 loop guard、observe/closeout/all-refused 轮次裁决与强停 | 产品 | **新增 `progress_guards`**（默认开） |
+>
+> **实现方式**：产品策略全部经 `TurnPolicy` 可开关；`TurnPolicy::minimal()`
+> 是最小 direct 模式（全部产品门关闭）。默认策略保持现有行为不变
+> （全套既有测试零改动通过 = 能力不低于基线）。子 Agent 继承父的
+> guard 取向。验收测试：
+> `loop_test::minimal_policy_disables_the_identical_result_loop_guard`
+> （最小模式不装载停滞机制）、`default_policy_still_denies_identical_result_loops`
+> （默认不变）、`minimal_policy_keeps_the_admission_boundary`
+> （切换 policy 不动摇审批/沙箱/取消边界）。
+>
+> **刻意保留待做**（需真实复杂任务 eval 数据，非本环境可完成）：
+> 把策略实现从 drive.rs 迁到独立 policy 模块并定义
+> 「规范事件输入 → 受限控制信号输出」协议；以及基于 eval 对照决定
+> 删除哪些旧启发式。当前每个策略已可独立关断，为该迁移提供了
+> 行为等价的对照面。engine 侧续跑（continue/extend）同属产品策略，
+> 与此一并迁移。
 
 工作：
 

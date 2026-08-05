@@ -696,6 +696,12 @@ pub struct TurnPolicy {
     pub goal_todo_gate: bool,
     /// Delivery process evidence gate (mutation → verify).
     pub delivery_gate: bool,
+    /// Product progress heuristics: the identical-result loop guard and the
+    /// round-verdict machinery (observe-only streaks, closeout-thrash forcing,
+    /// all-refused streaks). OFF disables the heuristics but never the safety
+    /// boundary — the absolute round ceiling, step limits, wall clock, and
+    /// cancellation are host safety and remain unconditional.
+    pub progress_guards: bool,
 
     // ── Delegation ──────────────────────────────────────────────────────────
     /// When false, `spawn_agent` is not advertised (delegation kill-switch).
@@ -718,9 +724,25 @@ impl Default for TurnPolicy {
             // Matches the historical `Executor::new` default — the gate is ON.
             goal_todo_gate: true,
             delivery_gate: false,
+            progress_guards: true,
             allow_delegation: true,
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
+        }
+    }
+}
+
+impl TurnPolicy {
+    /// The minimal direct policy (convergence plan phase 5): every PRODUCT
+    /// heuristic off — no plan gate, no search cap, no todo/delivery
+    /// completion gates, no progress guards. Safety is untouched: admission
+    /// (hooks/rules/approval), the side-effect barrier, step limits, the
+    /// absolute round ceiling, and cancellation apply exactly as always.
+    pub fn minimal() -> Self {
+        Self {
+            goal_todo_gate: false,
+            progress_guards: false,
+            ..Self::default()
         }
     }
 }
@@ -1055,6 +1077,8 @@ impl Executor {
                 goal_mode: false,
                 goal_todo_gate: false,
                 delivery_gate: false,
+                // A child inherits the parent's product-guard stance.
+                progress_guards: self.policy.progress_guards,
             },
             depth: self.depth + 1,
             agent_role: role,
@@ -1153,6 +1177,21 @@ impl Executor {
     /// Ask for an explicit plan before acting (spec §17).
     pub fn with_structure(mut self, require_explicit_plan: bool) -> Self {
         self.policy.require_explicit_plan = require_explicit_plan;
+        self
+    }
+
+    /// Toggle the product progress heuristics (loop guard, observe/closeout
+    /// round verdicts). Safety limits are unaffected. See
+    /// [`TurnPolicy::progress_guards`].
+    pub fn with_progress_guards(mut self, on: bool) -> Self {
+        self.policy.progress_guards = on;
+        self
+    }
+
+    /// Replace the entire turn policy (minimal direct mode / custom hosts).
+    /// Prefer the narrow builders unless a host really owns the whole policy.
+    pub fn with_turn_policy(mut self, policy: TurnPolicy) -> Self {
+        self.policy = policy;
         self
     }
 
