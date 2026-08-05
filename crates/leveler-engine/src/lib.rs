@@ -14,6 +14,7 @@ mod log;
 mod policy_resolver;
 mod reaper;
 mod recorders;
+mod session_context;
 mod turn;
 
 pub use engine::{
@@ -27,12 +28,13 @@ pub use event::{
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
 pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
-pub use log::EventLog;
+pub use log::{EventLog, SnapshotView};
 pub use policy_resolver::{
     ExecutionOverrides, ExecutionRole, ResolvedExecutionPolicy, resolve_execution_policy,
     resolve_tool_limits,
 };
 pub use reaper::reap_running_turns;
+pub use session_context::{RawTranscript, SessionContext};
 pub use turn::{TurnInput, TurnRecordedOutcome, TurnRunner};
 
 /// Engine-level errors. Persistence and replay failures are hard errors —

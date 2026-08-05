@@ -22,7 +22,7 @@ use leveler_verifier::{
 };
 
 use crate::factory::{ExecutorFactory, TurnProfile};
-use crate::log::{DanglingCall, EventLog};
+use crate::log::{DanglingCall, EventLog, SnapshotView};
 use crate::turn::{TurnInput, TurnRunner};
 use crate::{EngineError, EngineEvent, ExecutionKind, TaskOutcome, TurnKind};
 
@@ -84,13 +84,15 @@ fn chat_profile(spec: &TaskSpec) -> TurnProfile {
 /// **Under threshold:** always use full `raw` from MessageRepository — a
 /// ContextSnapshot is never a permanent replacement for later turns.
 /// **Over threshold:** merge snapshot (compact base) with the raw tail that
-/// arrived after the snapshot was taken, then fold if still oversized.
+/// arrived after the snapshot was taken, then fold if still oversized. A
+/// snapshot with a `through_ordinal` watermark appends exactly `raw[n..]`;
+/// only watermark-less legacy snapshots use suffix-overlap inference.
 ///
 /// Returns `(messages_for_model, wrote_compact)` — `wrote_compact` means the
 /// caller should persist a new ContextSnapshot.
 pub fn budget_prior_messages(
     raw: Vec<leveler_model::Message>,
-    snapshot: Option<Vec<leveler_model::Message>>,
+    snapshot: Option<SnapshotView>,
     summary: Option<&str>,
     active_objective: Option<&str>,
     threshold: u64,
@@ -101,7 +103,30 @@ pub fn budget_prior_messages(
     }
 
     let base = match snapshot {
-        Some(snap) if !snap.is_empty() => merge_snapshot_with_raw_tail(snap, &raw),
+        Some(view) if !view.messages.is_empty() => match view.through_ordinal {
+            Some(n) if (n as usize) <= raw.len() => {
+                // Exact watermark: everything after the first `n` transcript
+                // messages post-dates the snapshot. No inference, so rounds
+                // that repeat earlier text verbatim are never mistaken for
+                // the snapshot's own tail and dropped.
+                let mut out = view.messages;
+                out.extend_from_slice(&raw[n as usize..]);
+                out
+            }
+            Some(n) => {
+                // A watermark beyond the live transcript means the transcript
+                // was truncated after the snapshot (context ops normally
+                // rewrite the snapshot too). Never guess a slice: fall back
+                // to the legacy overlap merge and say so.
+                tracing::warn!(
+                    through_ordinal = n,
+                    raw_len = raw.len(),
+                    "context snapshot watermark exceeds transcript; using overlap merge"
+                );
+                merge_snapshot_with_raw_tail(view.messages, &raw)
+            }
+            None => merge_snapshot_with_raw_tail(view.messages, &raw),
+        },
         _ => raw,
     };
     let tokens = leveler_agent::estimate_tokens(&base);
@@ -418,19 +443,11 @@ impl TaskEngine {
         } else {
             spec
         };
-        let payloads = leveler_storage::MessageRepository::new(&self.db)
-            .load(session_id)
-            .await?;
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
-        let raw_prior: Vec<leveler_model::Message> = payloads
-            .iter()
-            .filter_map(|p| serde_json::from_str(p).ok())
-            .collect();
-
+        let raw = crate::RawTranscript::load_lossy(&self.db, session_id).await?;
         let log = EventLog::new(&self.db, session_id.clone());
-        let snapshot = log.latest_context_snapshot(None).await?;
-        let summary = self.summarize_if_over(&raw_prior, &cancellation).await;
+        let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
         let objective_hint = content
             .iter()
             .filter_map(|p| match p {
@@ -438,23 +455,18 @@ impl TaskEngine {
                 _ => None,
             })
             .next();
-        let (prior, compacted) = budget_prior_messages(
-            raw_prior,
-            snapshot,
-            summary.as_deref(),
-            objective_hint,
-            leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
-        );
-        if compacted {
-            log.append(
-                None,
-                EngineEvent::ContextSnapshot {
-                    messages: prior.clone(),
-                },
-                observer,
+        let context = raw
+            .assemble(
+                &log,
+                summary.as_deref(),
+                objective_hint,
+                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
             )
             .await?;
+        if context.compacted {
+            log.append(None, context.snapshot_event(), observer).await?;
         }
+        let prior = context.prior;
         let runner = TurnRunner {
             db: &self.db,
             session_id: session_id.clone(),
@@ -542,42 +554,28 @@ impl TaskEngine {
                 outcome.map(|o| o.as_str()).unwrap_or_default()
             )));
         }
-        let payloads = leveler_storage::MessageRepository::new(&self.db)
-            .load(session_id)
-            .await?;
-        if payloads.is_empty() {
+        let raw = crate::RawTranscript::load_strict(&self.db, session_id, "transcript").await?;
+        if raw.is_empty() {
             return Err(EngineError::Config(format!(
                 "session {session_id} has no transcript to resume; \
                  for interactive chat reopen with: leveler tui --session {session_id}"
             )));
         }
-        let raw_prior: Vec<leveler_model::Message> = payloads
-            .iter()
-            .map(|p| serde_json::from_str(p))
-            .collect::<Result<_, _>>()
-            .map_err(|e| EngineError::Corrupt(format!("unreplayable transcript: {e}")))?;
-
         let log = EventLog::new(&self.db, session_id.clone());
-        let snapshot = log.latest_context_snapshot(None).await?;
-        let summary = self.summarize_if_over(&raw_prior, &cancellation).await;
+        let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
         // Same merge rules as chat: never drop post-snapshot transcript rows.
-        let (prior, compacted) = budget_prior_messages(
-            raw_prior,
-            snapshot,
-            summary.as_deref(),
-            Some(spec.goal.as_str()),
-            leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
-        );
-        if compacted {
-            log.append(
-                None,
-                EngineEvent::ContextSnapshot {
-                    messages: prior.clone(),
-                },
-                observer,
+        let context = raw
+            .assemble(
+                &log,
+                summary.as_deref(),
+                Some(spec.goal.as_str()),
+                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
             )
             .await?;
+        if context.compacted {
+            log.append(None, context.snapshot_event(), observer).await?;
         }
+        let prior = context.prior;
         let runner = TurnRunner {
             db: &self.db,
             session_id: session_id.clone(),
@@ -862,25 +860,19 @@ impl TaskEngine {
         goal: &str,
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
         const GOAL_HISTORY_MAX: usize = 24;
-        let payloads = leveler_storage::MessageRepository::new(&self.db)
-            .load(session_id)
-            .await?;
-        let raw: Vec<leveler_model::Message> = payloads
-            .iter()
-            .filter_map(|p| serde_json::from_str(p).ok())
-            .collect();
+        let raw = crate::RawTranscript::load_lossy(&self.db, session_id).await?;
         if raw.is_empty() {
             return Ok(Vec::new());
         }
-        let snapshot = log.latest_context_snapshot(None).await?;
-        let (budgeted, _) = budget_prior_messages(
-            raw,
-            snapshot,
-            None,
-            Some(goal),
-            leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
-        );
-        Ok(bound_goal_history(budgeted, GOAL_HISTORY_MAX))
+        let context = raw
+            .assemble(
+                log,
+                None,
+                Some(goal),
+                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
+            )
+            .await?;
+        Ok(bound_goal_history(context.prior, GOAL_HISTORY_MAX))
     }
 
     /// Goal continuity: a quiet turn does not end an unbounded
@@ -935,37 +927,25 @@ impl TaskEngine {
                     .as_key()
                     .to_string(),
             });
-            let payloads = leveler_storage::MessageRepository::new(&self.db)
-                .load(&runner.session_id)
-                .await?;
-            let raw_prior = payloads
-                .iter()
-                .map(|payload| serde_json::from_str(payload))
-                .collect::<Result<Vec<leveler_model::Message>, _>>()
-                .map_err(|error| {
-                    EngineError::Corrupt(format!(
-                        "unreplayable goal transcript during continuation: {error}"
-                    ))
-                })?;
-            let snapshot = log.latest_context_snapshot(None).await?;
-            let summary = self.summarize_if_over(&raw_prior, &cancellation).await;
-            let (prior, compacted) = budget_prior_messages(
-                raw_prior,
-                snapshot,
-                summary.as_deref(),
-                Some(spec.goal.as_str()),
-                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
-            );
-            if compacted {
-                log.append(
-                    None,
-                    EngineEvent::ContextSnapshot {
-                        messages: prior.clone(),
-                    },
-                    observer,
+            let raw = crate::RawTranscript::load_strict(
+                &self.db,
+                &runner.session_id,
+                "goal transcript during continuation",
+            )
+            .await?;
+            let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
+            let context = raw
+                .assemble(
+                    log,
+                    summary.as_deref(),
+                    Some(spec.goal.as_str()),
+                    leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
                 )
                 .await?;
+            if context.compacted {
+                log.append(None, context.snapshot_event(), observer).await?;
             }
+            let prior = context.prior;
             // Full objective restatement — not a vague “Continue…” only. When
             // the previous drive recorded WHY its closeout stalled, name that
             // gap so the continuation addresses it instead of repeating the
@@ -1065,21 +1045,16 @@ impl TaskEngine {
                     exhaustion.dimension.as_str()
                 ),
             });
-            let payloads = leveler_storage::MessageRepository::new(&self.db)
-                .load(&runner.session_id)
-                .await?;
-            let prior = payloads
-                .iter()
-                .map(|payload| serde_json::from_str(payload))
-                .collect::<Result<Vec<leveler_model::Message>, _>>()
-                .map_err(|error| {
-                    EngineError::Corrupt(format!(
-                        "unreplayable transcript during budget extension: {error}"
-                    ))
-                })?;
-            if prior.is_empty() {
+            let raw = crate::RawTranscript::load_strict(
+                &self.db,
+                &runner.session_id,
+                "transcript during budget extension",
+            )
+            .await?;
+            if raw.is_empty() {
                 break;
             }
+            let prior = raw.messages;
             let continued = runner
                 .run_turn(
                     TurnKind::User,
@@ -1699,7 +1674,16 @@ mod multi_turn_session_tests {
             msg(Role::Assistant, "second answer"),
         ];
         let snap = vec![msg(Role::User, "stale snapshot only")];
-        let (out, compacted) = budget_prior_messages(raw.clone(), Some(snap), None, None, 100_000);
+        let (out, compacted) = budget_prior_messages(
+            raw.clone(),
+            Some(SnapshotView {
+                messages: snap,
+                through_ordinal: None,
+            }),
+            None,
+            None,
+            100_000,
+        );
         assert!(!compacted);
         assert_eq!(out.len(), raw.len());
         assert!(
@@ -1724,7 +1708,16 @@ mod multi_turn_session_tests {
         ];
         let tokens = leveler_agent::estimate_tokens(&raw);
         assert!(tokens > 200, "need over-threshold raw: {tokens}");
-        let (out, compacted) = budget_prior_messages(raw, Some(snap), None, Some("fix login"), 200);
+        let (out, compacted) = budget_prior_messages(
+            raw,
+            Some(SnapshotView {
+                messages: snap,
+                through_ordinal: None,
+            }),
+            None,
+            Some("fix login"),
+            200,
+        );
         assert!(compacted);
         let joined: String = out
             .iter()
@@ -1736,6 +1729,50 @@ mod multi_turn_session_tests {
                 || joined.contains("shared recent window")
                 || joined.contains("login"),
             "over-threshold merge/compact must not drop the active topic: {joined}"
+        );
+    }
+
+    #[test]
+    fn watermark_merge_survives_duplicate_rounds() {
+        // Two textually IDENTICAL user/assistant rounds; the snapshot was
+        // taken after the first (message watermark = 2). Suffix-overlap
+        // inference matches the snapshot tail against the MOST RECENT
+        // occurrence in raw and silently drops one whole round; the explicit
+        // watermark appends exactly raw[2..] and keeps both.
+        let pad = "padding so the token estimate clears the tiny threshold xxxxxxxxxxxxxxxx";
+        let round = [
+            msg(Role::User, &format!("run the tests {pad}")),
+            msg(Role::Assistant, &format!("all green {pad}")),
+        ];
+        let mut raw = round.to_vec();
+        raw.extend(round.to_vec());
+        raw.push(msg(
+            Role::User,
+            &format!("what changed between runs? {pad}"),
+        ));
+        let snap = vec![
+            msg(Role::User, "[compact summary]"),
+            round[0].clone(),
+            round[1].clone(),
+        ];
+        let tokens = leveler_agent::estimate_tokens(&raw);
+        assert!(tokens > 50, "raw must exceed the threshold: {tokens}");
+
+        let (out, _) = budget_prior_messages(
+            raw,
+            Some(SnapshotView {
+                messages: snap,
+                through_ordinal: Some(2),
+            }),
+            None,
+            None,
+            50,
+        );
+        assert_eq!(
+            out.len(),
+            6,
+            "snapshot(3) + raw[2..](3): the duplicate round after the \
+             watermark must survive the merge: {out:?}"
         );
     }
 

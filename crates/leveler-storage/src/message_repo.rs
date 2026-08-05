@@ -128,6 +128,16 @@ impl<'a> MessageRepository<'a> {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
+    /// Number of persisted messages for a session (the next append ordinal).
+    pub async fn count(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM session_messages WHERE session_id = ?1")
+                .bind(session_id.as_str())
+                .fetch_one(self.db.pool())
+                .await?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Load all message payloads for a session, in order.
     pub async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
         let rows: Vec<(String,)> = sqlx::query_as(

@@ -819,24 +819,23 @@ impl InProcessRuntimeClient {
 
                 let result: Result<String, String> = async {
                     let db = app.open_database().await.map_err(|e| e.to_string())?;
-                    let payloads = MessageRepository::new(&db)
-                        .load(&session_id)
+                    // Same budgeted path as main turns — never dump unbounded
+                    // raw history. Advisory side-question: bare fold, no model
+                    // summary call, and no snapshot persisted.
+                    let raw = leveler_engine::RawTranscript::load_lossy(&db, &session_id)
                         .await
                         .map_err(|e| e.to_string())?;
-                    let raw: Vec<Message> = payloads
-                        .iter()
-                        .filter_map(|p| serde_json::from_str(p).ok())
-                        .collect();
-                    // Same budgeted path as main turns — never dump unbounded raw history.
-                    let snapshot = load_latest_context_snapshot(&db, &session_id).await;
-                    // Advisory side-question: bare fold, no model summary call.
-                    let (mut messages, _) = leveler_engine::budget_prior_messages(
-                        raw,
-                        snapshot,
-                        None,
-                        Some(question.as_str()),
-                        leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
-                    );
+                    let log = leveler_engine::EventLog::new(&db, session_id.clone());
+                    let context = raw
+                        .assemble(
+                            &log,
+                            None,
+                            Some(question.as_str()),
+                            leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let mut messages = context.prior;
                     messages.push(Message::text(
                         Role::User,
                         format!(
@@ -2223,11 +2222,16 @@ async fn reset_session_task_epoch_db(
 ) -> Result<(), anyhow::Error> {
     let repo = leveler_storage::EventRepository::new(db);
     let now = leveler_core::now();
+    // The epoch-cut snapshot supersedes the WHOLE post-cut transcript, so its
+    // watermark is the live message count (all callers mutate messages before
+    // resetting: compact replaced them, clear/restore truncated them).
+    let through_ordinal = MessageRepository::new(db).count(session_id).await?;
     // Order: invalidate snapshot first so a partial failure cannot leave a
     // fresh Progress with a stale ContextSnapshot still "latest".
     let events = [
         leveler_engine::EngineEvent::ContextSnapshot {
             messages: model_visible,
+            through_ordinal: Some(through_ordinal),
         },
         leveler_engine::EngineEvent::ProgressUpdated {
             ledger: leveler_lifecycle::ProgressLedger::new_context_epoch(),
@@ -2242,26 +2246,6 @@ async fn reset_session_task_epoch_db(
         repo.append(session_id, None, &tag, &payload, now).await?;
     }
     Ok(())
-}
-
-/// Latest ContextSnapshot from the event log (same source engine turns use).
-async fn load_latest_context_snapshot(
-    db: &leveler_storage::Database,
-    session_id: &SessionId,
-) -> Option<Vec<Message>> {
-    let rows = leveler_storage::EventRepository::new(db)
-        .load(session_id)
-        .await
-        .ok()?;
-    let mut last = None;
-    for row in rows {
-        if let Ok(leveler_engine::EngineEvent::ContextSnapshot { messages }) =
-            leveler_engine::EngineEvent::from_payload(&row.payload)
-        {
-            last = Some(messages);
-        }
-    }
-    last
 }
 
 /// Deserialize a persisted `Message` payload into a `UiMessage`, or `None` for
@@ -2398,6 +2382,7 @@ mod context_ops_tests {
         // Pre-cut snapshot must not remain latest after epoch reset.
         let (tag, payload) = leveler_engine::EngineEvent::ContextSnapshot {
             messages: vec![Message::text(Role::User, "old bulky history line")],
+            through_ordinal: None,
         }
         .to_row()
         .unwrap();
@@ -2419,7 +2404,7 @@ mod context_ops_tests {
                 Ok(leveler_engine::EngineEvent::ProgressUpdated { ledger }) => {
                     last_progress = Some(ledger);
                 }
-                Ok(leveler_engine::EngineEvent::ContextSnapshot { messages }) => {
+                Ok(leveler_engine::EngineEvent::ContextSnapshot { messages, .. }) => {
                     last_snapshot = Some(messages);
                 }
                 _ => {}
@@ -2446,6 +2431,7 @@ mod context_ops_tests {
         let id = SessionId::new(session.id.clone());
         let (tag, payload) = leveler_engine::EngineEvent::ContextSnapshot {
             messages: vec![Message::text(Role::User, "pre-compact long history")],
+            through_ordinal: None,
         }
         .to_row()
         .unwrap();
@@ -2460,7 +2446,7 @@ mod context_ops_tests {
         let rows = EventRepository::new(&db).load(&id).await.unwrap();
         let mut last_snapshot = None;
         for row in rows {
-            if let Ok(leveler_engine::EngineEvent::ContextSnapshot { messages }) =
+            if let Ok(leveler_engine::EngineEvent::ContextSnapshot { messages, .. }) =
                 leveler_engine::EngineEvent::from_payload(&row.payload)
             {
                 last_snapshot = Some(messages);

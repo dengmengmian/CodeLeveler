@@ -77,7 +77,7 @@ impl<'a> EventLog<'a> {
     pub async fn latest_context_snapshot(
         &self,
         turn_id: Option<&TurnId>,
-    ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
+    ) -> Result<Option<SnapshotView>, EngineError> {
         let Some(row) = self
             .store
             .load_last_by_type(&self.session_id, "context_snapshot", turn_id)
@@ -87,7 +87,13 @@ impl<'a> EventLog<'a> {
         };
         check_version(&row)?;
         match EngineEvent::from_payload(&row.payload)? {
-            EngineEvent::ContextSnapshot { messages } => Ok(Some(messages)),
+            EngineEvent::ContextSnapshot {
+                messages,
+                through_ordinal,
+            } => Ok(Some(SnapshotView {
+                messages,
+                through_ordinal,
+            })),
             _ => Err(EngineError::Corrupt(
                 "context_snapshot row carried a different event".into(),
             )),
@@ -142,6 +148,16 @@ impl<'a> EventLog<'a> {
         }
         Ok(open)
     }
+}
+
+/// A persisted context snapshot plus the transcript watermark it supersedes.
+/// `through_ordinal: Some(n)` means restore appends exactly the transcript
+/// messages after the first `n`; `None` (legacy / executor in-loop snapshots)
+/// falls back to the suffix-overlap merge heuristic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotView {
+    pub messages: Vec<leveler_model::Message>,
+    pub through_ordinal: Option<u64>,
 }
 
 /// A tool call started but never finished — the crash window M5 reconciles.
@@ -373,6 +389,7 @@ mod tests {
             Some(&a),
             EngineEvent::ContextSnapshot {
                 messages: vec![message("a")],
+                through_ordinal: Some(1),
             },
             &mut |_| {},
         )
@@ -382,6 +399,7 @@ mod tests {
             Some(&b),
             EngineEvent::ContextSnapshot {
                 messages: vec![message("b")],
+                through_ordinal: Some(2),
             },
             &mut |_| {},
         )
@@ -393,7 +411,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(restored[0].text_content(), "a");
+        assert_eq!(restored.messages[0].text_content(), "a");
+        assert_eq!(restored.through_ordinal, Some(1));
     }
 
     #[tokio::test]

@@ -231,6 +231,15 @@ pub enum EngineEvent {
     /// this includes compaction and transient continuation nudges.
     ContextSnapshot {
         messages: Vec<leveler_model::Message>,
+        /// Transcript watermark: how many leading transcript messages this
+        /// snapshot supersedes. Restore appends exactly the messages after it
+        /// — no suffix-overlap inference. `None` marks a legacy snapshot or
+        /// an executor in-loop snapshot (no durable ordinal in scope); those
+        /// merge via the legacy overlap heuristic. Equal to the DB message
+        /// ordinal whenever the transcript has no unparsable rows (guaranteed
+        /// on the strict resume/continuation paths).
+        #[serde(default)]
+        through_ordinal: Option<u64>,
     },
     SubAgentStarted {
         id: String,
@@ -799,7 +808,12 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
             A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
             A::EvidenceLedgerUpdated { ledger } => EngineEvent::EvidenceLedgerUpdated { ledger },
             A::ProgressUpdated { ledger } => EngineEvent::ProgressUpdated { ledger },
-            A::ContextSnapshot { messages } => EngineEvent::ContextSnapshot { messages },
+            A::ContextSnapshot { messages } => EngineEvent::ContextSnapshot {
+                messages,
+                // Executor in-loop snapshots carry no durable ordinal; they
+                // merge via the legacy overlap heuristic on restore.
+                through_ordinal: None,
+            },
             A::VerificationStarted => EngineEvent::VerificationStarted,
             A::VerificationCheck {
                 name,
@@ -898,7 +912,11 @@ mod contract_tests {
         // The full conversation, model output, and tool output must never enter
         // a syncable projection.
         assert_eq!(
-            EngineEvent::ContextSnapshot { messages: vec![] }.data_class(),
+            EngineEvent::ContextSnapshot {
+                messages: vec![],
+                through_ordinal: None,
+            }
+            .data_class(),
             DataClass::LocalOnly
         );
         assert_eq!(
@@ -1022,7 +1040,10 @@ mod contract_tests {
                 parallel: false,
                 risk: None,
             },
-            EngineEvent::ContextSnapshot { messages: vec![] },
+            EngineEvent::ContextSnapshot {
+                messages: vec![],
+                through_ordinal: None,
+            },
         ] {
             assert!(event.public_projection().is_none());
         }

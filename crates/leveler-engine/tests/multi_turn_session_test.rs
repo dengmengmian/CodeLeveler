@@ -261,7 +261,7 @@ async fn chat_compacts_when_history_oversized_and_persists_snapshot() {
     let snapshot_messages: Vec<String> = events
         .iter()
         .find_map(|e| match e {
-            EngineEvent::ContextSnapshot { messages } => Some(
+            EngineEvent::ContextSnapshot { messages, .. } => Some(
                 messages
                     .iter()
                     .map(|m| m.text_content())
