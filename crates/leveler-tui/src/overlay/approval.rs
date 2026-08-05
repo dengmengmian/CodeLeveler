@@ -40,6 +40,8 @@ pub enum ApprovalOutcome {
 pub struct ApprovalOverlay {
     pub request: UiApprovalRequest,
     cursor: usize,
+    /// Show the command in full instead of elided to one line.
+    expanded: bool,
 }
 
 impl ApprovalOverlay {
@@ -48,7 +50,12 @@ impl ApprovalOverlay {
         Self {
             request,
             cursor: DENY_INDEX,
+            expanded: false,
         }
+    }
+
+    pub fn expanded(&self) -> bool {
+        self.expanded
     }
 
     /// Rows for rendering: `(label, is_cursor)`.
@@ -62,6 +69,11 @@ impl ApprovalOverlay {
 
     pub fn on_key(&mut self, key: KeyEvent) -> ApprovalOutcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            // The headline elides the command to keep the prompt one line;
+            // Ctrl+O is how you read the rest before deciding on it.
+            if matches!(key.code, KeyCode::Char('o')) {
+                self.expanded = !self.expanded;
+            }
             return ApprovalOutcome::None;
         }
         match key.code {
@@ -84,6 +96,12 @@ impl ApprovalOverlay {
                 self.cursor = (self.cursor + 1).min(OPTIONS.len() - 1);
                 ApprovalOutcome::None
             }
+            // Numbered rows are the fastest path when the prompt reads as a
+            // question with answers rather than a dialog to arrow through.
+            KeyCode::Char(c @ '1'..='9') => match c.to_digit(10).map(|d| d as usize - 1) {
+                Some(i) if i < OPTIONS.len() => ApprovalOutcome::Decide(OPTIONS[i].1),
+                _ => ApprovalOutcome::None,
+            },
             KeyCode::Enter => ApprovalOutcome::Decide(OPTIONS[self.cursor].1),
             _ => ApprovalOutcome::None,
         }
@@ -107,6 +125,46 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn ctrl_o_toggles_the_full_command() {
+        // The headline elides so the prompt stays one line, which means there
+        // has to be a way to read the rest before approving it.
+        let mut ov = ApprovalOverlay::new(request());
+        assert!(!ov.expanded());
+        assert_eq!(
+            ov.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            ApprovalOutcome::None
+        );
+        assert!(ov.expanded());
+        ov.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!ov.expanded());
+    }
+
+    #[test]
+    fn other_ctrl_keys_still_decide_nothing() {
+        let mut ov = ApprovalOverlay::new(request());
+        assert_eq!(
+            ov.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            ApprovalOutcome::None
+        );
+        assert!(!ov.expanded());
+    }
+
+    #[test]
+    fn number_keys_pick_the_matching_option() {
+        let mut ov = ApprovalOverlay::new(request());
+        assert_eq!(
+            ov.on_key(key(KeyCode::Char('1'))),
+            ApprovalOutcome::Decide(ApprovalDecision::ApproveOnce)
+        );
+        assert_eq!(
+            ov.on_key(key(KeyCode::Char('4'))),
+            ApprovalOutcome::Decide(ApprovalDecision::Deny)
+        );
+        // Out of range is inert, never a stray decision.
+        assert_eq!(ov.on_key(key(KeyCode::Char('9'))), ApprovalOutcome::None);
     }
 
     #[test]

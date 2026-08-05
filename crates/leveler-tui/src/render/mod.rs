@@ -19,7 +19,7 @@ pub(crate) use crate::tool_cell::tool_summary;
 mod footer;
 mod panes;
 mod screens;
-mod text;
+pub(crate) mod text;
 mod transcript_lines;
 
 pub use footer::conversation_footer;

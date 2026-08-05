@@ -333,7 +333,9 @@ fn renders_approval_overlay_with_deny_visible() {
         }),
     );
     let text = render_at(100, 24, &mut state);
-    assert!(text.contains("需要权限"), "approval title missing");
+    // The prompt leads with the action in the transcript's own words, not with
+    // a dialog title.
+    assert!(text.contains("允许"), "approval headline missing: {text}");
     assert!(text.contains("git push"), "command missing");
     assert!(text.contains("拒绝"), "deny option missing");
     assert!(
@@ -1125,7 +1127,7 @@ fn the_approval_overlay_sits_where_the_composer_was() {
         .expect("the prompt must stay visible while deciding");
     let overlay = lines
         .iter()
-        .position(|l| l.contains("需要权限"))
+        .position(|l| l.contains("允许 执行命令"))
         .expect("the approval must be on screen");
     assert!(
         overlay > prompt,

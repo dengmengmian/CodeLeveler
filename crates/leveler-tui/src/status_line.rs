@@ -365,11 +365,14 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
                         state,
                     );
                 }
-                // Approval and other decision overlays: static waiting copy, no spinner.
-                return Line::from(Span::styled(
-                    overlay.status_hint(state.t()),
-                    Style::default().fg(theme.warning),
-                ));
+                // Interrupting overlays: static waiting copy, no spinner.
+                // Pickers return None and fall through to the normal strip.
+                if let Some(hint) = overlay.status_hint(state.t()) {
+                    return Line::from(Span::styled(
+                        hint,
+                        Style::default().fg(theme.warning),
+                    ));
+                }
             }
         }
         StatusPhase::Busy | StatusPhase::Idle => {}
