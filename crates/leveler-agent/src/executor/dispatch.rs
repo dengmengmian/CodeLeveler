@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_core::ApprovalId;
 use leveler_execution::{
     ApprovalDecision, ApprovalRequest, CommandView, Requirement, ReviewVerdict, RiskLevel,
+    command_is_destructive,
 };
 use leveler_lifecycle::{EvidenceLedger, PlanState, PlanStep};
 use leveler_model::{ContentPart, ImageSource, ToolCall, ToolResultContent};
@@ -53,6 +54,14 @@ impl Executor {
         });
         let command_line = command_line_for_match(call, program.as_deref(), &args);
 
+        // A tool's declared risk is static: `run_command` carries the same level
+        // whether it runs `ls` or `rm -rf`. Name the deletion in the prompt, so
+        // it does not read as harmless as a listing.
+        let risk = match command_view.as_ref().map(command_is_destructive) {
+            Some(true) if risk < RiskLevel::Destructive => RiskLevel::Destructive,
+            _ => risk,
+        };
+
         // Paths the call touches, for `path_glob` rules, the approval prompt,
         // and deriving `ApproveAlways` path rules.
         let mut scoped_paths: Vec<String> = Vec::new();
@@ -88,13 +97,13 @@ impl Executor {
                 if session_approved.contains(&signature) {
                     return Ok(());
                 }
+                // Only say something the tool name and command do not already
+                // say. "<tool> requested by the model" is filler, and filler in
+                // a decision prompt trains people to stop reading it.
                 let description = if call_needs_host_escape(call) {
-                    format!(
-                        "{} opens a host app/file outside the workspace sandbox — needs your OK",
-                        call.name
-                    )
+                    format!("{} 会打开工作区之外的应用或文件", call.name)
                 } else {
-                    format!("{} requested by the model", call.name)
+                    String::new()
                 };
                 let request = ApprovalRequest {
                     id: ApprovalId::generate(),
@@ -972,5 +981,105 @@ mod authorize_tests {
         let request = approver.last_request().unwrap();
         assert_eq!(request.command.as_deref(), Some("rm -rf x"));
         assert_eq!(request.paths, vec![std::path::PathBuf::from("src")]);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_command_is_not_called_destructive() {
+        // `CommandClass::Dangerous` means "a human should look at this" — a
+        // redirect outside the workspace trips it just as `rm` does. Rendering
+        // that as "可能造成破坏性变更" tells the user something untrue about a
+        // listing, and a risk line people learn to disbelieve is worse than no
+        // risk line at all.
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let executor = executor_for(dir.path(), approver.clone());
+        let mut session = HashSet::new();
+
+        let call = ToolCall {
+            id: ToolCallId::new("c"),
+            name: "shell_command".to_string(),
+            arguments: serde_json::json!({"cmd": "ls -la src/ 2>/dev/null; git ls-files"}),
+        };
+        executor.authorize(&call, &mut session).await.unwrap();
+        if let Some(req) = approver.last_request() {
+            assert_ne!(req.risk, RiskLevel::Destructive, "cmd: {:?}", req.command);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_destructive_shell_script_is_labelled_destructive() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let executor = executor_for(dir.path(), approver.clone());
+        let mut session = HashSet::new();
+
+        let call = ToolCall {
+            id: ToolCallId::new("c"),
+            name: "shell_command".to_string(),
+            arguments: serde_json::json!({"cmd": "rm -rf src/main.rs && ls src/"}),
+        };
+        executor.authorize(&call, &mut session).await.unwrap();
+        assert_eq!(approver.last_request().unwrap().risk, RiskLevel::Destructive);
+    }
+
+    #[tokio::test]
+    async fn a_destructive_command_is_labelled_destructive() {
+        // The policy already classifies `rm -rf` as dangerous to decide that it
+        // needs asking. The prompt the user reads must say so too, otherwise a
+        // file deletion looks exactly as harmless as `ls`.
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let executor = executor_for(dir.path(), approver.clone());
+        let mut session = HashSet::new();
+
+        let call = ToolCall {
+            id: ToolCallId::new("c"),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+        };
+        executor.authorize(&call, &mut session).await.unwrap();
+        assert_eq!(approver.last_request().unwrap().risk, RiskLevel::Destructive);
+    }
+
+    #[tokio::test]
+    async fn a_harmless_command_is_not_labelled_destructive() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let executor = executor_for(dir.path(), approver.clone());
+        let mut session = HashSet::new();
+
+        let call = ToolCall {
+            id: ToolCallId::new("c"),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"program": "ls", "args": ["-l"]}),
+        };
+        executor.authorize(&call, &mut session).await.unwrap();
+        // `ls` may be auto-allowed outright; either way it must never be
+        // labelled destructive.
+        if let Some(req) = approver.last_request() {
+            assert_ne!(req.risk, RiskLevel::Destructive);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prompt_summary_is_not_english_filler() {
+        // "shell_command requested by the model" tells the user nothing the
+        // tool row above it did not already say, in the wrong language.
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let executor = executor_for(dir.path(), approver.clone());
+        let mut session = HashSet::new();
+
+        let call = ToolCall {
+            id: ToolCallId::new("c"),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+        };
+        executor.authorize(&call, &mut session).await.unwrap();
+        let summary = approver.last_request().unwrap().description;
+        assert!(
+            !summary.contains("requested by the model"),
+            "description is filler: {summary}"
+        );
     }
 }

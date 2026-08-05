@@ -350,11 +350,45 @@ fn is_remote_publish_program(program: &str, first_arg: Option<&str>) -> bool {
 /// and publish/push (`git push`, `cargo publish`, …) auto-run under Assisted —
 /// the OS workspace sandbox still confines writes. Users who want a prompt on
 /// every network/shell action should use RequestApproval.
+/// Irreversible / host-wide destructive tools — the main Assisted prompt gate.
+const DESTRUCTIVE: &[&str] = &[
+    "rm", "rmdir", "dd", "mkfs", "shutdown", "reboot", "halt", "poweroff",
+];
+
+/// Whether the command actually deletes or wipes something, as opposed to
+/// merely needing a human's eyes.
+///
+/// [`classify_command`] answers "should we ask?", and many harmless things
+/// reach `Dangerous` there — an unparseable script, a redirect outside the
+/// workspace. That verdict is right for gating and wrong as a label: telling
+/// someone a directory listing "may cause destructive changes" teaches them to
+/// ignore the risk line. This answers the narrower question the prompt shows,
+/// and deliberately under-reports: it walks literal segments only, so a
+/// deletion hidden inside `$(…)` goes unlabelled — still gated by
+/// [`classify_command`], just not named.
+pub fn command_is_destructive(cmd: &CommandView) -> bool {
+    if DESTRUCTIVE.contains(&basename(cmd.program)) {
+        return true;
+    }
+    match shell_c_script(cmd.args) {
+        Some(script) if is_shell_wrapper_program(cmd.program) => script_is_destructive(&script),
+        _ => false,
+    }
+}
+
+fn script_is_destructive(script: &str) -> bool {
+    split_shell_segments(script).into_iter().any(|segment| {
+        let tokens = shell_tokens(&segment);
+        if let Some(inner) = nested_shell_c_body(&tokens) {
+            return script_is_destructive(&inner);
+        }
+        tokens
+            .first()
+            .is_some_and(|prog| DESTRUCTIVE.contains(&basename(prog)))
+    })
+}
+
 pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> CommandClass {
-    // Irreversible / host-wide destructive tools — the main Assisted prompt gate.
-    const DESTRUCTIVE: &[&str] = &[
-        "rm", "rmdir", "dd", "mkfs", "shutdown", "reboot", "halt", "poweroff",
-    ];
     // Privilege escalation.
     const PRIVILEGED: &[&str] = &["sudo", "su", "doas"];
 

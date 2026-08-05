@@ -33,7 +33,8 @@ pub mod workspace;
 pub use approval::{
     ApprovalDecision, ApprovalPolicy, ApprovalRequest, Approver, AutoApprove, AutoDeny,
     AutoReviewer, CommandClass, CommandView, NeedUserReviewer, Requirement, ReviewVerdict,
-    classify_command, command_needs_host_escape, is_comment_only_acceptance_command,
+    classify_command, command_is_destructive, command_needs_host_escape,
+    is_comment_only_acceptance_command,
     is_host_escape_program, is_memory_write_tool, is_remote_publish_command, is_shell_c_flag,
     is_shell_wrapper_program, is_trivial_acceptance_command, shell_c_script,
 };
@@ -47,7 +48,7 @@ pub use command::{
     credential_env_names, first_absolute_arg_outside_roots, is_credential_env_name,
     looks_like_absolute_path_arg, process_request_for_verify_check,
 };
-pub use hooks::{HookRunner, PreHookResult};
+pub use hooks::{HookRunner, PreHookResult, LifecycleEvent};
 pub use permission_grants::{
     GrantFile, grants_path, load_grants, remember_project_grant, signatures_from_file,
 };

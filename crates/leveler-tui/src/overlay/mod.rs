@@ -62,6 +62,101 @@ impl Overlay {
 pub fn content_lines(
     overlay: &Overlay,
     theme: &Theme,
+    inner_width: usize,
+) -> (String, Vec<Line<'static>>, Option<(usize, usize)>) {
+    let (title, lines, cursor) = build_content(overlay, theme);
+    let (lines, cursor) = wrap_to_width(lines, cursor, inner_width);
+    (title, lines, cursor)
+}
+
+/// Re-flow `lines` so none is wider than `width`, keeping each span's style.
+///
+/// Overlays carry things the user must read in full — a command they are about
+/// to approve, the key that confirms it. Clipping those to the border turns a
+/// decision prompt into a guess. Breaking is by display width rather than at
+/// word boundaries so a long command wraps exactly where the box ends.
+fn wrap_to_width(
+    lines: Vec<Line<'static>>,
+    cursor: Option<(usize, usize)>,
+    width: usize,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    if width == 0 {
+        return (lines, cursor);
+    }
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    let mut cursor_out = cursor;
+    for (idx, line) in lines.into_iter().enumerate() {
+        let start = out.len();
+        // Flatten to styled characters so a break can be chosen by looking at
+        // the whole row rather than one span at a time.
+        let cells: Vec<(char, Style)> = line
+            .spans
+            .iter()
+            .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+            .collect();
+
+        let mut row_start = 0usize;
+        while row_start < cells.len() {
+            let mut used = 0usize;
+            let mut end = row_start;
+            let mut last_space: Option<usize> = None;
+            while end < cells.len() {
+                let w = unicode_width::UnicodeWidthChar::width(cells[end].0).unwrap_or(0);
+                if used + w > width {
+                    break;
+                }
+                used += w;
+                end += 1;
+                if cells[end - 1].0 == ' ' {
+                    last_space = Some(end);
+                }
+            }
+            // Prefer breaking after a space: splitting "Enter" into "En"/"ter"
+            // is technically lossless and practically unreadable. A token
+            // longer than the box still breaks hard — losing it is worse.
+            if end < cells.len()
+                && cells[end].0 != ' '
+                && let Some(sp) = last_space
+                && sp > row_start
+            {
+                end = sp;
+            }
+            out.push(spans_of(&cells[row_start..end]));
+            row_start = end.max(row_start + 1);
+            // Leading spaces from a word break would indent the next row.
+            while row_start < cells.len() && cells[row_start].0 == ' ' && used >= width {
+                row_start += 1;
+            }
+        }
+        if out.len() == start {
+            out.push(Line::from(""));
+        }
+        // The cursor is addressed by source row; move it onto the wrapped row
+        // that now holds it.
+        if let Some((crow, ccol)) = cursor
+            && crow == idx
+        {
+            cursor_out = Some((start + ccol / width, ccol % width));
+        }
+    }
+    (out, cursor_out)
+}
+
+/// Rebuild spans from styled characters, merging runs that share a style.
+fn spans_of(cells: &[(char, Style)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (ch, style) in cells {
+        match spans.last_mut() {
+            Some(last) if last.style == *style => last.content.to_mut().push(*ch),
+            _ => spans.push(Span::styled(ch.to_string(), *style)),
+        }
+    }
+    Line::from(spans)
+}
+
+fn build_content(
+    overlay: &Overlay,
+    theme: &Theme,
 ) -> (String, Vec<Line<'static>>, Option<(usize, usize)>) {
     match overlay {
         Overlay::ModelPicker(model)
@@ -80,15 +175,32 @@ pub fn content_lines(
     }
 }
 
-/// Draw the active overlay centered over `area` (modal form, used on
-/// non-conversation screens).
-pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
-    let (title, lines, _) = content_lines(overlay, theme);
+/// How many rows the overlay needs, including its border.
+///
+/// The workbench reserves this instead of drawing the overlay on top: a
+/// decision belongs where the input box was, and painting over the transcript
+/// hides the very message the user is judging.
+pub fn overlay_height(overlay: &Overlay, theme: &Theme, width: u16) -> u16 {
+    let inner = modal_width(overlay, width).saturating_sub(2);
+    let (_, lines, _) = content_lines(overlay, theme, inner as usize);
+    (lines.len() as u16).saturating_add(2)
+}
+
+/// The modal's outer width for a given available width.
+fn modal_width(overlay: &Overlay, available: u16) -> u16 {
     let max_w = match overlay {
         Overlay::Approval(_) | Overlay::Clarification(_) => 68,
         _ => 64,
     };
-    render_modal(frame, area, &title, lines, theme, max_w);
+    max_w.min(available.saturating_sub(4)).max(20)
+}
+
+/// Draw the active overlay centered over `area` (modal form, used on
+/// non-conversation screens).
+pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
+    let w = modal_width(overlay, area.width);
+    let (title, lines, _) = content_lines(overlay, theme, w.saturating_sub(2) as usize);
+    render_modal(frame, area, &title, lines, theme, w);
 }
 
 fn clarification_content(
@@ -122,11 +234,14 @@ fn clarification_content(
 }
 
 /// A centered modal rect, at most `max_w` wide and `content_h`+chrome tall.
-fn modal_rect(area: Rect, max_w: u16, content_h: u16) -> Rect {
-    let w = max_w.min(area.width.saturating_sub(4)).max(20);
-    let h = (content_h + 2).min(area.height.saturating_sub(2)).max(3);
+fn modal_rect(area: Rect, w: u16, content_h: u16) -> Rect {
+    // Fill the height it was given. The workbench reserves exactly this box's
+    // rows in the composer's slot, so any flex here would leave a gap between
+    // the transcript and the decision. On other screens `area` is the whole
+    // frame and the box still grows only to its content.
+    let h = (content_h + 2).min(area.height).max(3);
     let [row] = Layout::vertical([Constraint::Length(h)])
-        .flex(Flex::Center)
+        .flex(Flex::End)
         .areas(area);
     let [col] = Layout::horizontal([Constraint::Length(w)])
         .flex(Flex::Center)
@@ -208,7 +323,10 @@ fn approval_content(ov: &ApprovalOverlay, theme: &Theme) -> Vec<Line<'static>> {
     let req = &ov.request;
     let mut lines: Vec<Line> = Vec::new();
     lines.push(section(theme, "工具", &req.tool));
-    lines.push(section(theme, "说明", &req.summary));
+    // A label with nothing after it is noise in a prompt people must read.
+    if !req.summary.trim().is_empty() {
+        lines.push(section(theme, "说明", &req.summary));
+    }
     if let Some(cmd) = &req.command {
         lines.push(section(theme, "命令", cmd));
     }
@@ -250,9 +368,9 @@ fn render_modal(
     title: &str,
     lines: Vec<Line>,
     theme: &Theme,
-    max_w: u16,
+    width: u16,
 ) {
-    let rect = modal_rect(area, max_w, lines.len() as u16);
+    let rect = modal_rect(area, width, lines.len() as u16);
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -280,4 +398,96 @@ fn help_line(theme: &Theme, text: &str) -> Line<'static> {
         text.to_string(),
         Style::default().fg(theme.muted),
     ))
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::overlay::approval::ApprovalOverlay;
+    use leveler_client_protocol::{ApprovalId, UiApprovalRequest};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn overlay(summary: &str) -> Overlay {
+        Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
+            id: ApprovalId::new("r1"),
+            tool: "shell_command".into(),
+            summary: summary.into(),
+            command: Some("rm -rf src/main.rs && ls src/".into()),
+            risks: vec!["可能造成破坏性变更".into()],
+        })))
+    }
+
+    fn frame_of(ov: &Overlay, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let theme = Theme::default();
+        term.draw(|f| render_overlay(f, f.area(), ov, &theme))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut out = Vec::new();
+        for y in 0..h {
+            let mut line = String::new();
+            let mut x = 0;
+            while x < w {
+                let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+                line.push_str(sym);
+                // A double-width grapheme owns the next cell; skip it.
+                x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
+            }
+            out.push(line.trim_end().to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn no_overlay_line_is_cut_off_by_the_border() {
+        // A hint that ends in "↑↓/En" is worse than no hint: the user cannot
+        // tell whether the key is Enter or something else. Long content must
+        // wrap inside the box, never get clipped by it.
+        let lines = frame_of(&overlay(""), 110, 32);
+        let screen = lines.join("\n");
+        assert!(
+            screen.contains("默认拒绝") && screen.contains("Enter"),
+            "the key hint is clipped:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_long_command_is_never_clipped() {
+        // Approving a command you cannot fully see is approving blind.
+        let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(4) + "target";
+        let ov = Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
+            id: ApprovalId::new("r1"),
+            tool: "shell_command".into(),
+            summary: String::new(),
+            command: Some(long.clone()),
+            risks: vec![],
+        })));
+        let screen = frame_of(&ov, 110, 40).join("\n");
+        let flat: String = screen
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect();
+        let want: String = long.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains(&want), "command was clipped:\n{screen}");
+    }
+
+    #[test]
+    fn an_empty_summary_leaves_no_empty_row() {
+        let lines = frame_of(&overlay(""), 110, 32);
+        assert!(
+            !lines.iter().any(|l| l.contains("说明")),
+            "an empty summary must not render a label with nothing after it"
+        );
+    }
+
+    #[test]
+    fn a_real_summary_still_shows() {
+        let lines = frame_of(&overlay("删除源文件"), 110, 32);
+        assert!(
+            lines.iter().any(|l| l.contains("说明") && l.contains("删除源文件")),
+            "frame:\n{}",
+            lines.join("\n")
+        );
+    }
 }

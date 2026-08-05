@@ -463,7 +463,12 @@ fn mouse_to_text_pos_clamped(
         state.conversation_scroll.min(max_scroll)
     };
     let viewport_row = (clamped_row - ry) as usize;
-    let abs_row = (scroll + viewport_row).min(total.saturating_sub(1));
+    // A transcript shorter than the viewport is bottom-aligned (see
+    // `render_conversation`), so the first `pad` screen rows are blank filler,
+    // not content. Without this the mouse selects a line above the one under
+    // the cursor by exactly that many rows.
+    let pad = (height as usize).saturating_sub(total);
+    let abs_row = (scroll + viewport_row.saturating_sub(pad)).min(total.saturating_sub(1));
     let abs_col = (clamped_col - rx) as usize;
     Some(crate::selection::TextPos {
         row: abs_row,

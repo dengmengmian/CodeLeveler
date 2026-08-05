@@ -489,9 +489,9 @@ fn overlay_box_lines(
         return (Vec::new(), None);
     };
     let theme = &state.theme;
-    let (title, content, cursor) = crate::overlay::content_lines(overlay, theme);
     let border = Style::default().fg(theme.accent);
     let inner_w = width.saturating_sub(4).max(1);
+    let (title, content, cursor) = crate::overlay::content_lines(overlay, theme, inner_w);
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(content.len() + 2);
     let tw = UnicodeWidthStr::width(title.as_str()).min(inner_w);

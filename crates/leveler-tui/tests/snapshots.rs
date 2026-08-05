@@ -7,8 +7,8 @@ use ratatui::backend::TestBackend;
 use unicode_width::UnicodeWidthStr;
 
 use leveler_client_protocol::{
-    ApprovalId, PermissionProfile, RuntimeEvent, SessionId, ToolCallId, UiApprovalRequest,
-    UiSessionSnapshot,
+    ApprovalId, MessageId, PermissionProfile, RuntimeEvent, SessionId, ToolCallId,
+    UiApprovalRequest, UiMessage, UiRole, UiSessionSnapshot,
 };
 use leveler_tui::action::Action;
 use leveler_tui::reducer::reduce;
@@ -904,5 +904,276 @@ fn showing_and_hiding_the_hints_keeps_the_conversation_the_same_height() {
         empty.lines().count(),
         typing.lines().count(),
         "frame height changed with the hint row"
+    );
+}
+
+/// A short conversation must sit against the composer, the way terminal output
+/// does — not pin to the top of the viewport and leave a band of dead space
+/// between the last line and the input box.
+#[test]
+fn a_short_conversation_sits_against_the_composer() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "改个字".into(),
+            },
+        }),
+    );
+
+    let text = render_at(100, 30, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+    let content = lines
+        .iter()
+        .position(|l| l.contains("改个字"))
+        .expect("the message must be on screen");
+    let composer = lines
+        .iter()
+        .position(|l| l.contains('›'))
+        .expect("composer must be on screen");
+
+    // The filler belongs ABOVE the content: several blank rows between the
+    // header rule and the first message, and none of consequence below it.
+    let blank_above = lines[..content]
+        .iter()
+        .rev()
+        .take_while(|l| l.trim().is_empty())
+        .count();
+    let blank_below = lines[content + 1..composer]
+        .iter()
+        .filter(|l| l.trim().is_empty())
+        .count();
+    assert!(
+        blank_above >= 3,
+        "a short transcript must be pushed down by filler, got {blank_above} blank rows above\n{text}"
+    );
+    assert!(
+        blank_below <= 2,
+        "content must sit against the composer, got {blank_below} blank rows below\n{text}"
+    );
+}
+
+/// A tool group whose tools are all Silent (probe runs like `ls`) renders
+/// nothing — and must not leave the separator behind either. Otherwise the
+/// reader sees an unexplained hole between their prompt and the answer.
+#[test]
+fn a_silent_tool_group_leaves_no_hole() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "看看有多少文件".into(),
+            },
+        }),
+    );
+    // A probe run: Silent by taxonomy, so it contributes no visible line.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"ls","args":["-la"]}"#.into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "924 entries".into(),
+            duration_ms: 120,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("a1"),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: MessageId::new("a1"),
+            delta: "924 个文件".into(),
+        }),
+    );
+
+    let text = render_at(100, 30, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+    let prompt = lines
+        .iter()
+        .position(|l| l.contains("看看有多少文件"))
+        .expect("prompt on screen");
+    let answer = lines
+        .iter()
+        .position(|l| l.contains("924 个文件"))
+        .expect("answer on screen");
+    let blanks = lines[prompt + 1..answer]
+        .iter()
+        .filter(|l| l.trim().is_empty())
+        .count();
+    assert!(
+        blanks <= 1,
+        "a silent tool must not leave {blanks} blank rows between prompt and answer\n{text}"
+    );
+}
+
+/// Narrow terminals must stay *usable*, not merely survive. A split pane at 60
+/// columns is normal; if the answer or the composer is gone at that width the
+/// pane is useless even though nothing crashed.
+#[test]
+fn a_narrow_terminal_keeps_the_answer_and_the_composer() {
+    for width in [60u16, 70, 80] {
+        let mut state = opened_state();
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::UserMessageAdded {
+                message: UiMessage {
+                    id: MessageId::new("u1"),
+                    role: UiRole::User,
+                    text: "问题".into(),
+                },
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                message_id: MessageId::new("a1"),
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                message_id: MessageId::new("a1"),
+                delta: "这是答案".into(),
+            }),
+        );
+        let text = render_at(width, 24, &mut state);
+        assert!(text.contains("这是答案"), "answer lost at {width} cols:\n{text}");
+        assert!(text.contains('›'), "composer lost at {width} cols:\n{text}");
+    }
+}
+
+/// Nothing may print past the terminal edge: an over-wide line wraps in the
+/// user's terminal and shears the whole frame.
+#[test]
+fn no_rendered_line_exceeds_the_terminal_width() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                // No spaces: a naive wrapper has nowhere to break.
+                text: "验证一个非常长的不带空格的中文串".repeat(6),
+            },
+        }),
+    );
+    for (w, h) in [(60u16, 24u16), (100, 30), (120, 40)] {
+        let text = render_at(w, h, &mut state);
+        for (i, line) in text.lines().enumerate() {
+            let printed = UnicodeWidthStr::width(line.trim_end());
+            assert!(
+                printed <= w as usize,
+                "row {i} is {printed} cols wide at {w}x{h}:\n{line}"
+            );
+        }
+    }
+}
+
+/// The approval overlay replaces the composer, so it must not also leave the
+/// conversation stranded at the top with dead space — the decision should sit
+/// where the input box was, right under the work that prompted it.
+#[test]
+fn the_approval_overlay_sits_where_the_composer_was() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "推一下代码".into(),
+            },
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ApprovalRequested {
+            request: UiApprovalRequest {
+                id: ApprovalId::new("r1"),
+                tool: "run_command".into(),
+                summary: "run git push".into(),
+                command: Some("git push".into()),
+                risks: vec!["将访问网络".into()],
+            },
+        }),
+    );
+    let text = render_at(100, 30, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+    let prompt = lines
+        .iter()
+        .position(|l| l.contains("推一下代码"))
+        .expect("the prompt must stay visible while deciding");
+    let overlay = lines
+        .iter()
+        .position(|l| l.contains("需要权限"))
+        .expect("the approval must be on screen");
+    assert!(
+        overlay > prompt,
+        "the decision belongs below the work — prompt at {prompt}, overlay at {overlay}:\n{text}"
+    );
+    let blanks = lines[prompt + 1..overlay]
+        .iter()
+        .filter(|l| l.trim().is_empty())
+        .count();
+    assert!(
+        blanks <= 3,
+        "{blanks} blank rows between the prompt and the approval:\n{text}"
+    );
+}
+
+#[test]
+fn the_splash_sits_in_the_middle_of_an_empty_session() {
+    // Bottom-aligning a transcript is right: output grows upward from the
+    // composer. An empty session has no transcript — it has a title card, and a
+    // title card shoved against the input box with a screenful of void above it
+    // reads as a layout bug, not a welcome.
+    let mut state = opened_state();
+    let text = render_at(120, 40, &mut state);
+    let lines: Vec<&str> = text.lines().collect();
+
+    // The composer box starts at column 0; the splash card is indented.
+    let composer = lines
+        .iter()
+        .position(|l| l.starts_with('╭'))
+        .expect("composer must be on screen");
+    // The conversation area begins under the header rule.
+    let rule = lines
+        .iter()
+        .position(|l| l.starts_with('─'))
+        .expect("header rule must be on screen");
+
+    let card_top = (rule + 1..composer)
+        .find(|&i| !lines[i].trim().is_empty())
+        .expect("splash card must be on screen");
+    let card_bottom = (rule + 1..composer)
+        .rev()
+        .find(|&i| !lines[i].trim().is_empty())
+        .unwrap();
+
+    let above = card_top - (rule + 1);
+    let below = composer - (card_bottom + 1);
+    assert!(
+        above.abs_diff(below) <= 2,
+        "splash is not centred: {above} rows above, {below} below\n{text}"
     );
 }

@@ -101,8 +101,16 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         1
     };
     let plan_rows = plan_panel_height(state);
-    let composer_rows =
-        composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2) as u16;
+    // An open overlay takes the composer's slot rather than floating over the
+    // transcript, so the conversation shrinks by exactly what the decision box
+    // needs and the message that raised it stays visible right above it.
+    let composer_rows = match &state.overlay {
+        Some(ov) => crate::overlay::overlay_height(ov, &state.theme, area.width)
+            .min(area.height.saturating_sub(8))
+            .max(3),
+        None => composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2)
+            as u16,
+    };
     // Header: blank breathing row + status line + hairline separator (3 rows)
     // so the brand strip is not flush against the terminal's top edge. Footer 1.
     let header_rows: u16 = 3;
@@ -161,7 +169,12 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_plan_panel(frame, chunks[4], state);
     render_attachments(frame, chunks[5], state);
     // chunks[6] = pre_composer_gap (leave blank)
-    render_input(frame, chunks[7], state);
+    match &state.overlay {
+        Some(overlay) => {
+            crate::overlay::render_overlay(frame, chunks[7], overlay, &state.theme)
+        }
+        None => render_input(frame, chunks[7], state),
+    }
     // chunks[8]: the key hints when there are any, otherwise the blank gap.
     if let Some(line) = hints.into_iter().next() {
         frame.render_widget(Paragraph::new(line), chunks[8]);
@@ -175,9 +188,6 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
 
     if state.active_screen == Screen::Conversation && state.overlay.is_none() {
         render_slash_popup(frame, chunks[1], chunks[7], state);
-    }
-    if let Some(overlay) = &state.overlay {
-        crate::overlay::render_overlay(frame, area, overlay, &state.theme);
     }
 }
 
@@ -384,9 +394,26 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
         })
         .collect();
 
-    // Pad with blanks so the viewport stays stable height.
-    while lines.len() < height {
-        lines.push(Line::from(""));
+    // Pad ABOVE, not below: a short conversation should sit against the
+    // composer the way terminal output does, instead of pinning to the top of
+    // the viewport and leaving a band of dead space between the last line and
+    // the input box. Once the transcript is taller than the viewport this pad
+    // is empty and scrolling behaves exactly as before.
+    //
+    // An empty session is the exception. It has no output to grow upward from —
+    // it has a title card, and a title card pressed against the input box under
+    // a screenful of void reads as a bug rather than a welcome, so centre it.
+    if lines.len() < height {
+        let pad = height - lines.len();
+        let above = if crate::splash::conversation_is_empty(state) {
+            pad / 2
+        } else {
+            pad
+        };
+        let mut padded = vec![Line::from(""); above];
+        padded.append(&mut lines);
+        padded.resize(height, Line::from(""));
+        lines = padded;
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -498,9 +525,16 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
             idx += 1;
             continue;
         }
-        if idx > 0 && items_need_gap(&items[idx - 1], item) {
+        // Remember where this item starts: a group whose tools are all Silent
+        // (ls / probe runs) renders nothing, and a separator emitted before it
+        // would leave a blank gap with no content — the reader sees a hole
+        // between their prompt and the answer. The gap is undone below if the
+        // item turned out to be invisible.
+        let gap_at = (idx > 0 && items_need_gap(&items[idx - 1], item)).then(|| {
             out.push(Line::from(""));
-        }
+            out.len() - 1
+        });
+        let before_item = out.len();
         // Message types are distinguished by shape, not role headings:
         // `▌` user prompt, `●` agent prose, status glyphs for tool activity.
         match item {
@@ -556,6 +590,13 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
             _ => {
                 out.extend(item_render(item, theme, width, state.tools_expanded, t));
             }
+        }
+        // The item produced nothing (an all-Silent tool group): take the
+        // separator back so no hole is left behind.
+        if out.len() == before_item
+            && let Some(at) = gap_at
+        {
+            out.remove(at);
         }
         idx += 1;
     }
