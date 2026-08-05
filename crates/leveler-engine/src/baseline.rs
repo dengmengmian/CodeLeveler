@@ -30,18 +30,12 @@ use leveler_verifier::{VerificationPlan, VerificationReport, Verifier};
 /// unavailable. Capture this ONCE at task start, before the agent edits, so it
 /// stays the true "before" state even if the agent commits mid-task.
 pub(crate) async fn capture_head(repo: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let hash = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    let repo = repo.to_path_buf();
+    let stdout =
+        tokio::task::spawn_blocking(move || leveler_core::git_stdout(&repo, &["rev-parse", "HEAD"]))
+            .await
+            .ok()??;
+    let hash = stdout.trim().to_string();
     (!hash.is_empty()).then_some(hash)
 }
 
@@ -195,26 +189,17 @@ mod tests {
     use super::*;
     use leveler_verifier::{CheckKind, VerificationCommand};
 
-    async fn git(repo: &Path, args: &[&str]) {
-        assert!(
-            git_ok(repo, args, &CancellationToken::new()).await,
-            "git {args:?} failed"
-        );
-    }
-
     /// A committed git repo whose `marker.txt` holds `committed`, with the
     /// working tree overwritten to `working` (uncommitted).
-    async fn repo_with_marker(committed: &str, working: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
-        git(p, &["init", "-q"]).await;
-        git(p, &["config", "user.email", "t@t"]).await;
-        git(p, &["config", "user.name", "t"]).await;
+    fn repo_with_marker(committed: &str, working: &str) -> leveler_test_support::git::ScratchRepo {
+        use leveler_test_support::git::{run, scratch_repo};
+        let repo = scratch_repo();
+        let p = repo.path();
         std::fs::write(p.join("marker.txt"), committed).unwrap();
-        git(p, &["add", "."]).await;
-        git(p, &["commit", "-qm", "base"]).await;
+        run(p, &["add", "."]);
+        run(p, &["commit", "-qm", "base"]);
         std::fs::write(p.join("marker.txt"), working).unwrap();
-        dir
+        repo
     }
 
     /// A gating check that passes iff `marker.txt` reads `OK`.
@@ -260,7 +245,7 @@ mod tests {
     async fn baseline_failure_is_attributed_and_stops_gating() {
         // Broken on the baseline AND still broken now (the change didn't touch
         // it) → pre-existing → must not gate.
-        let dir = repo_with_marker("BROKEN", "BROKEN").await;
+        let dir = repo_with_marker("BROKEN", "BROKEN");
         let base = capture_head(dir.path()).await.expect("has HEAD");
         let plan = marker_plan();
         let mut report = working_report(dir.path(), &plan).await;
@@ -287,7 +272,7 @@ mod tests {
     async fn new_failure_absent_from_baseline_still_gates() {
         // Fine on the baseline (marker=OK), broken only in the working tree →
         // this change's fault → must gate.
-        let dir = repo_with_marker("OK", "BROKEN").await;
+        let dir = repo_with_marker("OK", "BROKEN");
         let base = capture_head(dir.path()).await.expect("has HEAD");
         let plan = marker_plan();
         let mut report = working_report(dir.path(), &plan).await;

@@ -69,6 +69,10 @@ impl Tool for RunCommandTool {
         RiskLevel::WorkspaceWrite
     }
 
+    fn runs_command(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -642,8 +646,8 @@ fn truncate_or_spill(s: &str, store: Option<&leveler_execution::ArtifactStore>) 
     if s.len() <= MAX_OUTPUT {
         return s.to_string();
     }
-    let head = crate::registry::floor_boundary(s, MAX_OUTPUT / 2);
-    let tail = crate::registry::ceil_boundary(s, s.len() - MAX_OUTPUT / 4);
+    let head = leveler_core::floor_char_boundary(s, MAX_OUTPUT / 2);
+    let tail = leveler_core::ceil_char_boundary(s, s.len() - MAX_OUTPUT / 4);
     let elided_tokens = crate::registry::approx_tokens(tail - head);
     let artifact = store.and_then(|store| store.write_text(s).ok());
     let marker = format!(
@@ -1039,38 +1043,24 @@ mod tests {
 mod snapshot_tests {
     use super::*;
     use crate::tool::Tool;
-    use leveler_execution::{PermissionProfile, Workspace};
+    use leveler_execution::PermissionProfile;
+    #[cfg(unix)]
+    use leveler_test_support::git::{run, scratch_repo};
     use tokio_util::sync::CancellationToken;
 
-    // POSIX-shell fixture driver; the git/coreutils rollback assertions below
-    // exercise Unix-shell-driven mutations. Windows rollback is not driven
-    // through `sh -c` here.
-    #[cfg(unix)]
-    async fn sh_in(dir: &std::path::Path, script: &str) {
-        let out = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .current_dir(dir)
-            .output()
-            .await
-            .unwrap();
-        assert!(out.status.success(), "{script} failed");
-    }
-
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext::new(Workspace::new(dir).unwrap(), PermissionProfile::Assisted)
+        super::super::test_ctx_in(dir, PermissionProfile::Assisted)
     }
 
+    // The git/coreutils rollback assertions below exercise Unix-shell-driven
+    // mutations; Windows rollback is not driven through `sh -c` here.
     #[cfg(unix)]
     #[tokio::test]
     async fn command_mutations_are_reported_as_modified_files() {
-        let dir = tempfile::tempdir().unwrap();
-        sh_in(
-            dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t \
-             && echo hi > a.txt && git add -A && git commit -qm init",
-        )
-        .await;
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
 
         let out = RunCommandTool
             .execute(
@@ -1132,13 +1122,11 @@ mod snapshot_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn out_of_scope_command_mutations_are_rolled_back() {
-        let dir = tempfile::tempdir().unwrap();
-        sh_in(
-            dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t \
-             && mkdir src && echo original > src/lib.rs && git add -A && git commit -qm init",
-        )
-        .await;
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
         let constrained = ctx(dir.path()).with_command_write_constraints(
             Some(vec!["src".to_string()]),
             None,
@@ -1169,13 +1157,10 @@ mod snapshot_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn command_file_budget_violation_is_rolled_back() {
-        let dir = tempfile::tempdir().unwrap();
-        sh_in(
-            dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t \
-             && echo original > base.txt && git add -A && git commit -qm init",
-        )
-        .await;
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("base.txt"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
         let constrained = ctx(dir.path()).with_command_write_constraints(None, Some(1), Vec::new());
 
         let out = RunCommandTool
@@ -1198,11 +1183,11 @@ mod snapshot_tests {
 mod command_gate_tests {
     use super::*;
     use crate::tool::ToolContext;
-    use leveler_execution::{PermissionProfile, Workspace};
+    use leveler_execution::PermissionProfile;
     use std::time::Instant;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext::new(Workspace::new(dir).unwrap(), PermissionProfile::FullAccess)
+        super::super::test_ctx_in(dir, PermissionProfile::FullAccess)
     }
 
     /// Parallel workers own disjoint files but share one working tree and one

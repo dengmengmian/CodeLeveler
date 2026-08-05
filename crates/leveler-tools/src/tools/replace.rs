@@ -53,6 +53,10 @@ impl Tool for ReplaceTool {
         RiskLevel::WorkspaceWrite
     }
 
+    fn mutates_files(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -972,14 +976,9 @@ mod tests {
     use super::*;
 
     fn ctx(contents: &str) -> (ToolContext, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("leveler-replace-{}", super::super::test_ordinal()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/lib.rs"), contents).unwrap();
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        (
-            ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted),
-            dir,
+        super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("src/lib.rs", contents)],
         )
     }
 
@@ -1148,10 +1147,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_replaces_cannot_both_commit_from_the_same_version() {
         let (first, dir) = ctx("value = old\n");
-        let second = ToolContext::new(
-            leveler_execution::Workspace::new(&dir).unwrap(),
-            leveler_execution::PermissionProfile::Assisted,
-        );
+        let second =
+            super::super::test_ctx_in(&dir, leveler_execution::PermissionProfile::Assisted);
         let gate = std::sync::Arc::new(tokio::sync::Barrier::new(3));
         let launch = |context: ToolContext,
                       replacement: &'static str,

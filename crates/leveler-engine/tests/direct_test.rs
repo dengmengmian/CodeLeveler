@@ -301,12 +301,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
         .await
         .unwrap();
 
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "ledger: {:?}",
-        report.acceptance
-    );
+    assert_eq!(report.outcome, TaskOutcome::Verified);
     assert_eq!(report.modified_files, vec!["src/lib.rs".to_string()]);
 
     // Session row: execution config + terminal outcome.
@@ -446,20 +441,12 @@ async fn impl_with_mutations_and_green_gates_is_verified() {
         .await
         .unwrap();
 
-    assert_eq!(
-        report.outcome,
-        TaskOutcome::Verified,
-        "ledger: {:?}",
-        report.acceptance
-    );
+    assert_eq!(report.outcome, TaskOutcome::Verified);
     assert!(
         !report.modified_files.is_empty(),
         "impl path requires observed mutation"
     );
     assert!(report.verification.is_some());
-    // Direct no longer spends a model call inventing acceptance criteria; the
-    // project's gating checks are the verdict.
-    assert!(report.acceptance.is_none());
     assert!(report.outcome.is_success());
 }
 
@@ -537,7 +524,6 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
         "modified_files should track delete: {:?}",
         report.modified_files
     );
-    assert!(report.acceptance.is_none());
     assert!(report.outcome.is_success());
 }
 
@@ -1071,8 +1057,4 @@ async fn direct_spends_no_extra_model_call_on_acceptance() {
         .unwrap();
 
     assert_eq!(report.outcome, TaskOutcome::Verified);
-    assert!(
-        report.acceptance.is_none(),
-        "Direct no longer produces an acceptance ledger"
-    );
 }

@@ -201,20 +201,6 @@ impl ProgressLedger {
         format!("{:016x}:{}", hash, content.len())
     }
 
-    pub fn record_observe_hit(&mut self, class: &str, content: &str) -> u32 {
-        let fp = Self::fingerprint_content(content);
-        match self.observe_hits.get_mut(class) {
-            Some(entry) if entry.0 == fp => {
-                entry.1 = entry.1.saturating_add(1);
-                entry.1
-            }
-            _ => {
-                self.observe_hits.insert(class.to_string(), (fp, 1));
-                1
-            }
-        }
-    }
-
     pub fn should_refuse_observe_in_closing(&self) -> bool {
         self.closing
     }

@@ -90,6 +90,74 @@ impl EnvSnapshot {
     }
 }
 
+/// Provider credential variables scrubbed from every spawned process even when
+/// the name alone would not look credential-shaped.
+pub const SECRET_ENV_DENYLIST: &[&str] = &[
+    "DEEPSEEK_API_KEY",
+    "BIGMODEL_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GROQ_API_KEY",
+];
+
+/// Whether an environment variable name looks like a credential. Applied to
+/// every spawned child in addition to the explicit denylists.
+pub fn is_credential_env_name(name: &str) -> bool {
+    const SECRET_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL"];
+    let normalized = name.to_ascii_uppercase();
+    SECRET_ENV_DENYLIST.contains(&normalized.as_str())
+        || SECRET_SUFFIXES.iter().any(|s| normalized.ends_with(s))
+        || matches!(
+            normalized.as_str(),
+            "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN"
+        )
+}
+
+impl EnvSnapshot {
+    /// [`Self::vars_os`] with credential-named variables
+    /// ([`is_credential_env_name`]) removed. Feed this to a child process
+    /// after `env_clear()` so it never inherits provider secrets.
+    pub fn scrubbed_vars_os(&self) -> impl Iterator<Item = (&OsString, &OsString)> {
+        self.vars_os()
+            .filter(|(name, _)| !name.to_str().is_some_and(is_credential_env_name))
+    }
+}
+
+/// The installed [`environment`] snapshot with credential variables removed —
+/// the one way to build a child-process environment.
+///
+/// Use as `cmd.env_clear(); cmd.envs(scrubbed_environment());` (works for both
+/// `std` and `tokio` commands). Clearing first and rebuilding from the
+/// immutable snapshot matters: removing only known names from the live parent
+/// environment is racy — a credential exported after startup would still be
+/// inherited by children (git hooks, clean/smudge filters, LSP/MCP servers,
+/// user tool hooks) and could be exfiltrated by any code they run.
+pub fn scrubbed_environment() -> impl Iterator<Item = (OsString, OsString)> {
+    environment()
+        .scrubbed_vars_os()
+        .map(|(name, value)| (name.clone(), value.clone()))
+}
+
+/// Run `git <args>` in `repo` with a credential-scrubbed environment and
+/// return its stdout. `None` when git cannot be spawned or exits non-zero;
+/// stderr is discarded — callers that need it should run git themselves
+/// (still via [`scrubbed_environment`]).
+pub fn git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .args(args)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .env_clear()
+        .envs(scrubbed_environment());
+    let out = command.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 static ENVIRONMENT: OnceLock<EnvSnapshot> = OnceLock::new();
 
 /// Install the process-wide snapshot. The composition root calls this once,
@@ -164,6 +232,57 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| OsString::from(*v))
         }
+    }
+
+    #[test]
+    fn credential_names_are_recognized_and_scrubbed_from_snapshots() {
+        assert!(is_credential_env_name("OPENAI_API_KEY"));
+        assert!(is_credential_env_name("my_service_token"));
+        assert!(is_credential_env_name("AWS_SECRET_ACCESS_KEY"));
+        assert!(!is_credential_env_name("PATH"));
+
+        let snapshot = EnvSnapshot::new(
+            [
+                (OsString::from("HOME"), OsString::from("/h")),
+                (OsString::from("FOO_API_KEY"), OsString::from("s3cret")),
+            ],
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+        let kept: Vec<_> = snapshot.scrubbed_vars_os().map(|(n, _)| n.clone()).collect();
+        assert_eq!(kept, vec![OsString::from("HOME")]);
+    }
+
+    /// `git_stdout` against a real repository: stdout on success, `None` on a
+    /// non-zero exit (bad ref) and on a non-repository directory.
+    #[test]
+    fn git_stdout_returns_stdout_on_success_and_none_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+
+        let head = git_stdout(repo, &["rev-parse", "HEAD"]).expect("HEAD exists");
+        assert_eq!(head.trim().len(), 40, "full sha, got {head:?}");
+
+        // Non-zero exit → None.
+        assert_eq!(git_stdout(repo, &["rev-parse", "no-such-ref-xyz"]), None);
+
+        // Not a repository → None.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(git_stdout(empty.path(), &["rev-parse", "HEAD"]), None);
     }
 
     #[test]

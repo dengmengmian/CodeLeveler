@@ -603,6 +603,8 @@ async fn run_git(root: &Path, args: &[&str]) -> Option<Output> {
         .args(args)
         .current_dir(root)
         .stdin(std::process::Stdio::null())
+        .env_clear()
+        .envs(leveler_core::scrubbed_environment())
         .output()
         .await
         .ok()

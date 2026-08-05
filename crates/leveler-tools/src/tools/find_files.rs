@@ -306,10 +306,7 @@ mod tests {
     use super::*;
 
     fn context(dir: &std::path::Path) -> ToolContext {
-        ToolContext::new(
-            leveler_execution::Workspace::new(dir).unwrap(),
-            leveler_execution::PermissionProfile::RequestApproval,
-        )
+        super::super::test_ctx_in(dir, leveler_execution::PermissionProfile::RequestApproval)
     }
 
     #[test]

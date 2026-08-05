@@ -104,7 +104,7 @@ seams that should stay free to change.
 | `ProtocolAdapter` | `leveler-model` | Add a vendor wire protocol |
 | `Tool` | `leveler-tools` | Add a tool the model can call |
 | `EventStore` | `leveler-storage` | Swap session persistence |
-| `ModelRuntime`, `CompatibilityMiddleware` | `leveler-model` | Model invocation + per-model quirk shims |
+| `ModelRuntime` | `leveler-model` | Model invocation |
 | `Approver`, `AutoReviewer` | `leveler-execution` | Permission decisions |
 | `InteractiveRuntimeClient` | `leveler-client-protocol` | Drive a session from another front-end |
 | `LocalRuntimeService` | `leveler-local-transport` | Daemon transport |

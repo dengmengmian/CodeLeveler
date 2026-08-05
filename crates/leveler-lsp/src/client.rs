@@ -103,15 +103,10 @@ impl LspClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        // Scrub the caller-supplied snapshot (not the global one): tests and
+        // embedders pass their own environment here.
         command.env_clear();
-        for (name, value) in environment.vars_os() {
-            if !name
-                .to_str()
-                .is_some_and(leveler_execution::is_credential_env_name)
-            {
-                command.env(name, value);
-            }
-        }
+        command.envs(environment.scrubbed_vars_os());
         let mut child = command
             .spawn()
             .map_err(|_| LspError::Spawn(program.to_string()))?;

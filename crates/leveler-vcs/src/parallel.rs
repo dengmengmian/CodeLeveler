@@ -107,53 +107,15 @@ pub fn worktree_path(base_name: &str, index: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{run_git, tmp};
 
-    fn run_git(dir: &Path, args: &[&str]) {
-        // Under the very high concurrency of `cargo test --workspace` (dozens of
-        // test binaries at once) a git subprocess can transiently fail on
-        // resource contention. Silently ignoring it would leave the repo
-        // half-built and surface later as a mysterious merge assertion, so retry
-        // a few times, then fail loud with the git error.
-        for attempt in 1..=3 {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .unwrap();
-            if output.status.success() {
-                return;
-            }
-            assert!(
-                attempt < 3,
-                "git {args:?} failed after {attempt} attempts: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-
+    /// Shared init plus the two-file base commit these merge tests build on.
     fn init_repo(dir: &Path) {
-        run_git(dir, &["init", "-q", "-b", "main"]);
-        run_git(dir, &["config", "user.email", "t@t"]);
-        run_git(dir, &["config", "user.name", "t"]);
+        crate::test_util::init_repo(dir);
         std::fs::write(dir.join("a.txt"), "line1\nline2\nline3\n").unwrap();
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
         run_git(dir, &["add", "-A"]);
         run_git(dir, &["commit", "-qm", "base"]);
-    }
-
-    fn tmp(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let d = leveler_core::environment()
-            .temp_dir()
-            .to_path_buf()
-            .join(format!(
-                "leveler-par-{tag}-{}",
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
     }
 
     /// Two candidates editing disjoint files → both integrate (union).

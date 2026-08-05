@@ -14,7 +14,9 @@ use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelRequest, Role, ToolCall, ToolChoice,
     ToolResultContent,
 };
-use leveler_tools::ToolContext;
+use leveler_tools::{ToolContext, ToolRegistry};
+
+use super::round_verdict::{self, RoundVerdict};
 
 use super::closeout::{
     CLOSEOUT_NUDGE_BUDGET, CloseoutAction, CloseoutBudget, CloseoutInput, CloseoutReason, decide,
@@ -205,25 +207,6 @@ impl Executor {
         // with Incomplete and an empty reply (common on pure Q&A / investigate
         // turns). A second thrash after that still hard-stops (AC3).
         let mut observe_thrash_answer_forced = false;
-        // Tools seen this round for pure-observe streak detection.
-        #[allow(unused_assignments)]
-        let mut observe_only_tools_this_round = 0u32;
-        #[allow(unused_assignments)]
-        let mut non_observe_success_this_round = 0u32;
-        // Stagnation guard signals. A "failing-command" round (a run/shell
-        // command executed and every one failed, with no other progress) is the
-        // stuck pattern the observe-only guard misses. Progress that clears it:
-        // a passing verification, a novel read/search, a succeeding command, or a
-        // newly-touched file. Rounds with no command at all are neutral (goal /
-        // plan / edit work is not penalized), so this never fires on them.
-        #[allow(unused_assignments)]
-        let mut verify_passed_this_round = false;
-        #[allow(unused_assignments)]
-        let mut novel_observe_this_round = false;
-        #[allow(unused_assignments)]
-        let mut command_ran_this_round = false;
-        #[allow(unused_assignments)]
-        let mut command_success_this_round = false;
         // Hard step limits (spec §27): wall clock from run start, commands
         // executed so far, and the reason once a limit trips. The round that
         // trips a limit still commits its tool results (well-formed transcript)
@@ -271,7 +254,65 @@ impl Executor {
             ));
         }
 
+        // Every exit from this drive — and every round boundary — must fold the
+        // round's spend into the epoch ledger and publish it, or resume and the
+        // TUI footer fall behind what the outcome reports. Seventeen call sites
+        // used to repeat the same eleven arguments by hand; a macro (not a
+        // closure — these are all live `&mut` borrows) keeps them in lockstep.
+        macro_rules! flush_epoch {
+            ($rounds:expr) => {{
+                sync_epoch_progress(
+                    &mut progress,
+                    &mut metrics,
+                    epoch_rounds_at_start,
+                    epoch_tokens_at_start,
+                    epoch_duration_at_start,
+                    run_started,
+                    $rounds,
+                    model_tokens_spent,
+                    commands_run,
+                    cost_spent_micros,
+                    &modified_files,
+                );
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+            }};
+        }
+
         let mut round = 0u32;
+
+        // A progress watchdog giving up: mark the ledger terminal, publish it,
+        // report the model's own last words (or `$fallback` when it went quiet),
+        // and flush the epoch before returning. Defined after `round` so the
+        // macro body resolves it; the watchdogs below each used to spell out all
+        // six steps, and one of them drifted into a hand-built `AgentOutcome`.
+        macro_rules! stop_now {
+            ($stop:expr, $detail:expr, $fallback:expr) => {{
+                progress.enter_terminal();
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+                let final_text = if last_text.trim().is_empty() {
+                    $fallback.to_string()
+                } else {
+                    last_text.clone()
+                };
+                observer(AgentEvent::Finished(final_text.clone()));
+                flush_epoch!(round);
+                return Ok(AgentOutcome::drive_result(
+                    final_text,
+                    round,
+                    modified_files,
+                    $stop,
+                    Some($detail.to_string()),
+                    &metrics,
+                    &progress,
+                    &objective,
+                ));
+            }};
+        }
+
         loop {
             // Mid-turn user input goes in at the top of the round, before the
             // model is asked anything: a correction that arrives after the work
@@ -294,22 +335,7 @@ impl Executor {
                     "Stopped: the {max}-token model budget was exhausted after {round} round(s)."
                 );
                 observer(AgentEvent::Finished(reason.clone()));
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
 
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
@@ -332,22 +358,7 @@ impl Executor {
                     "Stopped: the {max}-micro-USD model cost budget was exhausted after {round} round(s)."
                 );
                 observer(AgentEvent::Finished(reason.clone()));
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
 
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
@@ -370,22 +381,7 @@ impl Executor {
                     "Stopped: reached the {round_ceiling}-round ceiling for a single turn."
                 );
                 observer(AgentEvent::Finished(reason.clone()));
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
                 return Ok(AgentOutcome::drive_result(
                     reason,
                     round,
@@ -409,22 +405,7 @@ impl Executor {
             if cancellation.is_cancelled() && !deadline_expired.load(Ordering::Acquire) {
                 // Flush epoch spend before Cancelled so resume/event-log keep
                 // command/file/token totals (including any absorbed children).
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
                 return Err(AgentError::Cancelled);
             }
             if let Some(max) = self.step_limits.max_duration {
@@ -437,22 +418,7 @@ impl Executor {
                         round.saturating_sub(1)
                     );
                     observer(AgentEvent::Finished(reason.clone()));
-                    sync_epoch_progress(
-                        &mut progress,
-                        &mut metrics,
-                        epoch_rounds_at_start,
-                        epoch_tokens_at_start,
-                        epoch_duration_at_start,
-                        run_started,
-                        round,
-                        model_tokens_spent,
-                        commands_run,
-                        cost_spent_micros,
-                        &modified_files,
-                    );
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
+                    flush_epoch!(round);
 
                     return Ok(AgentOutcome::drive_budget_exhausted(
                         reason,
@@ -592,22 +558,7 @@ impl Executor {
             // resume see the same ledger (event log is SoT, not in-memory only).
             // Tool-phase increments are re-synced on every exit via
             // `sync_epoch_progress` so resume never under-counts commands/files.
-            sync_epoch_progress(
-                &mut progress,
-                &mut metrics,
-                epoch_rounds_at_start,
-                epoch_tokens_at_start,
-                epoch_duration_at_start,
-                run_started,
-                round,
-                model_tokens_spent,
-                commands_run,
-                cost_spent_micros,
-                &modified_files,
-            );
-            observer(AgentEvent::ProgressUpdated {
-                ledger: progress.clone(),
-            });
+            flush_epoch!(round);
 
             let assistant = stream_result.message;
             let used_tokens = stream_result.usage.total();
@@ -735,22 +686,7 @@ impl Executor {
             {
                 sink.append(&[assistant]).await?;
                 observer(AgentEvent::Finished(reason.clone()));
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
@@ -874,22 +810,7 @@ impl Executor {
                 } else {
                     (StopReason::Answered, None)
                 };
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
 
                 return Ok(AgentOutcome::drive_result(
                     last_text,
@@ -924,8 +845,9 @@ impl Executor {
             let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
             // spawn_agent calls deferred to run concurrently after this pass.
             let mut spawn_jobs: Vec<(usize, ToolCall)> = Vec::new();
-            observe_only_tools_this_round = 0;
-            non_observe_success_this_round = 0;
+            // Tools seen this round for pure-observe streak detection.
+            let mut observe_only_tools_this_round = 0u32;
+            let mut non_observe_success_this_round = 0u32;
             // Calls a guard refused before they ran (loop guard, plan gate,
             // budgets, allowlist, permission). A round consisting solely of
             // refusals is no progress — it must not reset the AC3 streak.
@@ -937,10 +859,17 @@ impl Executor {
             // Ids/names survive the consuming loop below so calls the cancel
             // cut short can still be refused in place (transcript pairing).
             let call_snapshot: Vec<ToolCall> = calls.clone();
-            verify_passed_this_round = false;
-            novel_observe_this_round = false;
-            command_ran_this_round = false;
-            command_success_this_round = false;
+            // Stagnation guard signals. A "failing-command" round (a run/shell
+            // command executed and every one failed, with no other progress) is
+            // the stuck pattern the observe-only guard misses. Progress that
+            // clears it: a passing verification, a novel read/search, a
+            // succeeding command, or a newly-touched file. Rounds with no
+            // command at all are neutral (goal / plan / edit work is not
+            // penalized), so this never fires on them.
+            let mut verify_passed_this_round = false;
+            let mut novel_observe_this_round = false;
+            let mut command_ran_this_round = false;
+            let mut command_success_this_round = false;
             // Distinct files touched before this round — a growth means the round
             // reached a new file (real progress), not just re-editing the same one.
             let modified_before = modified_files.len();
@@ -1263,7 +1192,7 @@ impl Executor {
                 // directly. Refuse that first edit and inject the scoped rules
                 // on the next round; otherwise the edit lands before the model
                 // ever sees the rules governing it.
-                if matches!(call.name.as_str(), "apply_patch" | "replace") {
+                if self.registry.mutates_files(&call.name) {
                     let mut target_paths = scoped_paths.clone();
                     collect_scoped_paths_from_call(&call, &mut target_paths);
                     let fresh = load_scoped_rules(
@@ -1346,26 +1275,25 @@ impl Executor {
                 // that would cross the remaining task-level cap (not only when
                 // already exhausted).
                 let epoch_file_count = projected_epoch_file_count(&progress, &modified_files);
-                let over_budget = match call.name.as_str() {
+                let over_budget = if self.registry.runs_command(&call.name)
+                    && self
+                        .step_limits
+                        .max_commands
+                        .is_some_and(|max| commands_run >= max)
+                {
                     // All shell paths count (including verify/acceptance-class runs).
                     // Some(0) = hard exhausted (not unlimited).
-                    "run_command" | "shell_command"
-                        if self
-                            .step_limits
-                            .max_commands
-                            .is_some_and(|max| commands_run >= max) =>
-                    {
-                        let cap = u64::from(self.step_limits.max_commands.unwrap_or(0));
-                        Some((
-                            format!("the {cap}-command budget is exhausted"),
-                            crate::budget::BudgetExhaustion::new(
-                                crate::budget::BudgetDimension::Commands,
-                                u64::from(commands_run),
-                                cap,
-                            ),
-                        ))
-                    }
-                    "apply_patch" | "replace" => file_budget_refusal(
+                    let cap = u64::from(self.step_limits.max_commands.unwrap_or(0));
+                    Some((
+                        format!("the {cap}-command budget is exhausted"),
+                        crate::budget::BudgetExhaustion::new(
+                            crate::budget::BudgetDimension::Commands,
+                            u64::from(commands_run),
+                            cap,
+                        ),
+                    ))
+                } else if self.registry.mutates_files(&call.name) {
+                    file_budget_refusal(
                         self.step_limits.max_modified_files,
                         epoch_file_count,
                         &call,
@@ -1382,8 +1310,9 @@ impl Executor {
                                 cap,
                             ),
                         )
-                    }),
-                    _ => None,
+                    })
+                } else {
+                    None
                 };
                 if let Some((which, exhaustion)) = over_budget {
                     let msg = format!("Refused: {which}. The run stops here.");
@@ -1395,7 +1324,7 @@ impl Executor {
                 // Write allowlist (worker sub-agents, orchestrated nodes):
                 // reject an edit that reaches outside the allowed paths BEFORE
                 // it runs, feeding the reason back so the model stays in scope.
-                if matches!(call.name.as_str(), "apply_patch" | "replace")
+                if self.registry.mutates_files(&call.name)
                     && let Some(allow) = &self.write_allowlist
                 {
                     let outside = write_targets_outside_allowlist(&call, allow);
@@ -1452,7 +1381,7 @@ impl Executor {
                         .await
                     {
                         Ok(()) if parallel => {
-                            if matches!(call.name.as_str(), "run_command" | "shell_command") {
+                            if self.registry.runs_command(&call.name) {
                                 commands_run += 1;
                             }
                             // Host openers (`open`/`xdg-open`) only work outside
@@ -1470,7 +1399,7 @@ impl Executor {
                             continue;
                         }
                         Ok(()) => {
-                            if matches!(call.name.as_str(), "run_command" | "shell_command") {
+                            if self.registry.runs_command(&call.name) {
                                 commands_run += 1;
                             }
                             let mut ctx = ctx;
@@ -1483,7 +1412,7 @@ impl Executor {
                             // "运行 cargo test · <elapsed>" instead of a bare
                             // "等待模型". select! keeps this in the same task, so
                             // calling `observer` from the ticker branch is sound.
-                            let progress_label = command_progress_label(&call);
+                            let progress_label = command_progress_label(&self.registry, &call);
                             let (content, is_error, image, workspace_snapshot, plan) = {
                                 let started = std::time::Instant::now();
                                 let dispatch_fut =
@@ -1543,7 +1472,7 @@ impl Executor {
                 }
                 // Track command execution for the stagnation guard: a command
                 // that keeps failing (test/build/script) is the stuck signal.
-                if matches!(call.name.as_str(), "run_command" | "shell_command") {
+                if self.registry.runs_command(&call.name) {
                     command_ran_this_round = true;
                     if !is_error {
                         command_success_this_round = true;
@@ -1634,7 +1563,7 @@ impl Executor {
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.
                 if !is_error && !newly_modified.is_empty() {
-                    if matches!(call.name.as_str(), "apply_patch" | "replace") {
+                    if self.registry.mutates_files(&call.name) {
                         non_observe_success_this_round =
                             non_observe_success_this_round.saturating_add(1);
                     }
@@ -1647,7 +1576,7 @@ impl Executor {
                         &plan_state,
                         observer,
                     );
-                    if matches!(call.name.as_str(), "apply_patch" | "replace")
+                    if self.registry.mutates_files(&call.name)
                         && !structured_plan_started
                     {
                         metrics.first_write_before_plan = true;
@@ -2035,22 +1964,7 @@ impl Executor {
                 drop(futs);
                 // Always flush after sub-agent batch so absorbed spend is durable
                 // even when the parent is about to cancel.
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
                 if cancellation.is_cancelled() && !deadline_expired.load(Ordering::Acquire) {
                     // All sub-agent results are folded in by now; commit them
                     // with the round below before surfacing Cancelled.
@@ -2084,22 +1998,7 @@ impl Executor {
             messages.push(tool_message.clone());
             // Flush spend BEFORE transcript persistence: tools already ran, so
             // a sink I/O failure must not drop this batch's command/file totals.
-            sync_epoch_progress(
-                &mut progress,
-                &mut metrics,
-                epoch_rounds_at_start,
-                epoch_tokens_at_start,
-                epoch_duration_at_start,
-                run_started,
-                round,
-                model_tokens_spent,
-                commands_run,
-                cost_spent_micros,
-                &modified_files,
-            );
-            observer(AgentEvent::ProgressUpdated {
-                ledger: progress.clone(),
-            });
+            flush_epoch!(round);
             sink.append(&[assistant, tool_message]).await?;
             // Batch was cancelled: the round is durable (results paired, spend
             // flushed above) — exit now instead of starting another model round.
@@ -2118,7 +2017,19 @@ impl Executor {
             let pure_observe_round = observe_only_tools_this_round > 0
                 && non_observe_success_this_round == 0
                 && !verification_ran;
-            if progress.closing && substantive_round {
+            let verdict = round_verdict::classify(&round_verdict::RoundInput {
+                closing: progress.closing,
+                substantive: substantive_round,
+                pure_observe: pure_observe_round,
+                // Repeated output is fingerprinted by the loop guard's history.
+                repeated_observation: call_history
+                    .values()
+                    .any(|(_, n)| *n >= LOOP_GUARD_THRESHOLD),
+                had_calls: !call_snapshot.is_empty(),
+                all_denied: denied_calls_this_round == call_snapshot.len(),
+                plan_repair: plan_repair_required,
+            });
+            if verdict == RoundVerdict::CloseoutThrash {
                 // Plan complete, but the model kept doing substantive work
                 // (re-running builds/tests/curl, or re-inspecting files). That
                 // is redundant closeout thrash, not new progress — it is what
@@ -2145,130 +2056,47 @@ impl Executor {
                     ));
                 }
                 if progress.should_hard_stop_closeout(progress_caps) {
-                    progress.enter_terminal();
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
-                    let final_text = if last_text.trim().is_empty() {
-                        "Stopped: plan complete; ended redundant re-verification.".to_string()
-                    } else {
-                        last_text.clone()
-                    };
-                    observer(AgentEvent::Finished(final_text.clone()));
-                    sync_epoch_progress(
-                        &mut progress,
-                        &mut metrics,
-                        epoch_rounds_at_start,
-                        epoch_tokens_at_start,
-                        epoch_duration_at_start,
-                        run_started,
-                        round,
-                        model_tokens_spent,
-                        commands_run,
-                        cost_spent_micros,
-                        &modified_files,
-                    );
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
-
-                    return Ok(AgentOutcome::drive_result(
-                        final_text,
-                        round,
-                        modified_files,
+                    stop_now!(
                         StopReason::CloseoutForced,
-                        Some("plan complete; closeout thrash short-circuited".to_string()),
-                        &metrics,
-                        &progress,
-                        &objective,
-                    ));
+                        "plan complete; closeout thrash short-circuited",
+                        "Stopped: plan complete; ended redundant re-verification."
+                    );
                 }
-            } else if pure_observe_round {
-                // Only count as thrash when observe output is *repeated*
-                // (same content fingerprint). Fresh greps with new hits explore.
+            } else if verdict == RoundVerdict::ObserveThrash {
                 // After ProgressCaps::no_progress_rounds of identical thrash,
                 // hard-stop the turn (AC3) so UntilTerminal cannot spin forever.
-                let identical_observe_thrash = call_history
-                    .values()
-                    .any(|(_, n)| *n >= LOOP_GUARD_THRESHOLD);
-                if identical_observe_thrash {
-                    progress.note_no_progress_round(round);
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
-                    // Sub-agents may legitimately re-list; only top-level turns
-                    // full-stop on observe thrash (AC3). Before hard-stop, give
-                    // one forced answer-from-findings round so Q&A / investigate
-                    // turns do not end Incomplete with nothing useful on screen.
-                    if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
-                        if !observe_thrash_answer_forced {
-                            observe_thrash_answer_forced = true;
-                            messages.push(Message::text(
-                                Role::User,
-                                format!(
-                                    "Repeated identical observations made no progress toward:\n\
-                                     <objective>\n{original_task}\n</objective>\n\
-                                     You already have tool results above. Your next message must \
-                                     be the final answer based on those results — do not call \
-                                     list/search/read tools again. If the evidence is incomplete, \
-                                     say what is known and what is still unknown."
-                                ),
-                            ));
-                            // Continue the drive so the model can synthesize.
-                        } else {
-                            progress.enter_terminal();
-                            observer(AgentEvent::ProgressUpdated {
-                                ledger: progress.clone(),
-                            });
-                            let final_text = if last_text.trim().is_empty() {
-                                "Stopped: no progress (observe-only thrash).".to_string()
-                            } else {
-                                last_text.clone()
-                            };
-                            observer(AgentEvent::Finished(final_text.clone()));
-                            sync_epoch_progress(
-                                &mut progress,
-                                &mut metrics,
-                                epoch_rounds_at_start,
-                                epoch_tokens_at_start,
-                                epoch_duration_at_start,
-                                run_started,
-                                round,
-                                model_tokens_spent,
-                                commands_run,
-                                cost_spent_micros,
-                                &modified_files,
-                            );
-                            observer(AgentEvent::ProgressUpdated {
-                                ledger: progress.clone(),
-                            });
-
-                            return Ok(AgentOutcome::drive_result(
-                                final_text,
-                                round,
-                                modified_files,
-                                StopReason::Incomplete,
-                                Some(
-                                    "no-progress streak; observe thrash short-circuited"
-                                        .to_string(),
-                                ),
-                                &metrics,
-                                &progress,
-                                &objective,
-                            ));
-                        }
+                progress.note_no_progress_round(round);
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+                // Sub-agents may legitimately re-list; only top-level turns
+                // full-stop on observe thrash (AC3). Before hard-stop, give
+                // one forced answer-from-findings round so Q&A / investigate
+                // turns do not end Incomplete with nothing useful on screen.
+                if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
+                    if !observe_thrash_answer_forced {
+                        observe_thrash_answer_forced = true;
+                        messages.push(Message::text(
+                            Role::User,
+                            format!(
+                                "Repeated identical observations made no progress toward:\n\
+                                 <objective>\n{original_task}\n</objective>\n\
+                                 You already have tool results above. Your next message must \
+                                 be the final answer based on those results — do not call \
+                                 list/search/read tools again. If the evidence is incomplete, \
+                                 say what is known and what is still unknown."
+                            ),
+                        ));
+                        // Continue the drive so the model can synthesize.
+                    } else {
+                        stop_now!(
+                            StopReason::Incomplete,
+                            "no-progress streak; observe thrash short-circuited",
+                            "Stopped: no progress (observe-only thrash)."
+                        );
                     }
                 }
-            } else if plan_repair_required
-                && !call_snapshot.is_empty()
-                && denied_calls_this_round == call_snapshot.len()
-            {
-                // A provider may ignore the forced update_plan choice and emit
-                // a tool hidden from this repair request. The plan gate already
-                // denied it. Keep this neutral so the generic two-round
-                // all-refused watchdog does not preempt a later valid plan;
-                // absolute round and resource budgets still bound retries.
-            } else if !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len() {
+            } else if verdict == RoundVerdict::AllRefused {
                 // Every call this round was refused before it ran — that is
                 // not progress. Feed the AC3 streak so an UntilTerminal run
                 // cannot spin forever re-issuing guarded actions. (Rounds with
@@ -2280,50 +2108,17 @@ impl Executor {
                     ledger: progress.clone(),
                 });
                 if self.depth == 0 && progress.should_hard_stop_no_progress(progress_caps) {
-                    progress.enter_terminal();
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
-                    let final_text = if last_text.trim().is_empty() {
-                        "Stopped: no progress (every attempted action was refused).".to_string()
-                    } else {
-                        last_text.clone()
-                    };
-                    observer(AgentEvent::Finished(final_text.clone()));
-                    sync_epoch_progress(
-                        &mut progress,
-                        &mut metrics,
-                        epoch_rounds_at_start,
-                        epoch_tokens_at_start,
-                        epoch_duration_at_start,
-                        run_started,
-                        round,
-                        model_tokens_spent,
-                        commands_run,
-                        cost_spent_micros,
-                        &modified_files,
+                    // Not Answered/Completed — refusals are incomplete progress.
+                    stop_now!(
+                        StopReason::Incomplete,
+                        "no-progress streak; all-refused rounds short-circuited",
+                        "Stopped: no progress (every attempted action was refused)."
                     );
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
-
-                    return Ok(AgentOutcome {
-                        final_text,
-                        rounds: round,
-                        modified_files,
-                        // Not Answered/Completed — refusals are incomplete progress.
-                        stop_reason: StopReason::Incomplete,
-                        stop_detail: Some(
-                            "no-progress streak; all-refused rounds short-circuited".to_string(),
-                        ),
-                        budget_exhaustion: None,
-                        metrics: metrics.clone(),
-                        progress: progress.clone(),
-                        objective: objective.clone(),
-                    });
                 }
-            } else {
-                // Successful non-observe work resets the streak.
+            } else if !verdict.is_neutral() {
+                // Successful non-observe work resets the streak. Exploration and
+                // plan-repair refusals are neutral: they neither grow it nor
+                // clear one that earlier rounds earned.
                 progress.note_progress(round);
             }
 
@@ -2335,11 +2130,12 @@ impl Executor {
             // none of those signals grows it. Rounds with no command are neutral
             // (goal/plan/edit work is never penalized), so this only bites a
             // genuinely stuck "the check keeps failing" loop.
-            let new_file_this_round = modified_files.len() > modified_before;
-            let made_progress = verify_passed_this_round
-                || novel_observe_this_round
-                || command_success_this_round
-                || new_file_this_round;
+            let made_progress = round_verdict::made_progress(
+                verify_passed_this_round,
+                novel_observe_this_round,
+                command_success_this_round,
+                modified_files.len() > modified_before,
+            );
             if made_progress {
                 progress.note_round_outcome(true);
                 observer(AgentEvent::ProgressUpdated {
@@ -2351,46 +2147,14 @@ impl Executor {
                     ledger: progress.clone(),
                 });
                 if progress.should_hard_stop_stagnation(progress_caps) {
-                    progress.enter_terminal();
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
-                    let final_text = if last_text.trim().is_empty() {
+                    stop_now!(
+                        StopReason::Incomplete,
+                        "no-progress stagnation; force-stopped",
                         "Stopped: no progress across several rounds — the check kept \
                          failing or the same information kept coming back. This is \
                          likely an environment limit or an unsolvable request, so I am \
                          not looping further."
-                            .to_string()
-                    } else {
-                        last_text.clone()
-                    };
-                    observer(AgentEvent::Finished(final_text.clone()));
-                    sync_epoch_progress(
-                        &mut progress,
-                        &mut metrics,
-                        epoch_rounds_at_start,
-                        epoch_tokens_at_start,
-                        epoch_duration_at_start,
-                        run_started,
-                        round,
-                        model_tokens_spent,
-                        commands_run,
-                        cost_spent_micros,
-                        &modified_files,
                     );
-                    observer(AgentEvent::ProgressUpdated {
-                        ledger: progress.clone(),
-                    });
-                    return Ok(AgentOutcome::drive_result(
-                        final_text,
-                        round,
-                        modified_files,
-                        StopReason::Incomplete,
-                        Some("no-progress stagnation; force-stopped".to_string()),
-                        &metrics,
-                        &progress,
-                        &objective,
-                    ));
                 }
                 // One round before the cap: warn the model so it can change
                 // approach, work around an environment limit, or stop honestly
@@ -2421,22 +2185,7 @@ impl Executor {
                     });
                 }
                 observer(AgentEvent::Finished(final_text.clone()));
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
 
                 return Ok(AgentOutcome::drive_result(
                     final_text,
@@ -2453,22 +2202,7 @@ impl Executor {
             // A step limit tripped this round: results are committed, stop now.
             if let Some((reason, exhaustion)) = budget_exceeded {
                 observer(AgentEvent::Finished(reason.clone()));
-                sync_epoch_progress(
-                    &mut progress,
-                    &mut metrics,
-                    epoch_rounds_at_start,
-                    epoch_tokens_at_start,
-                    epoch_duration_at_start,
-                    run_started,
-                    round,
-                    model_tokens_spent,
-                    commands_run,
-                    cost_spent_micros,
-                    &modified_files,
-                );
-                observer(AgentEvent::ProgressUpdated {
-                    ledger: progress.clone(),
-                });
+                flush_epoch!(round);
 
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
@@ -2516,6 +2250,21 @@ impl Executor {
                 observer(AgentEvent::AdvisoryStarted {
                     kind: AdvisoryKind::ContextCompaction,
                 });
+                // Compaction discards detail by design; this is the only moment
+                // a project can keep something first (export it, push it to
+                // memory) without the loop guessing what matters.
+                if self.hook_runner.has_lifecycle() {
+                    self.hook_runner
+                        .run_lifecycle(
+                            leveler_execution::LifecycleEvent::PreCompact,
+                            &format!(
+                                r#"{{"context_tokens":{context_tokens},"budget":{}}}"#,
+                                self.policy.context_budget
+                            ),
+                            &cancellation,
+                        )
+                        .await;
+                }
                 let summary = self
                     .summarize_for_compaction(
                         &messages,
@@ -2531,6 +2280,15 @@ impl Executor {
                     summary.as_deref(),
                     Some(objective.text()),
                 );
+                if self.hook_runner.has_lifecycle() {
+                    self.hook_runner
+                        .run_lifecycle(
+                            leveler_execution::LifecycleEvent::PostCompact,
+                            &format!(r#"{{"messages_before":{before},"messages_after":{}}}"#, messages.len()),
+                            &cancellation,
+                        )
+                        .await;
+                }
                 if messages.len() < before {
                     observer(AgentEvent::Compacted {
                         from: before,
@@ -2568,19 +2326,7 @@ impl Executor {
             }
             s
         };
-        sync_epoch_progress(
-            &mut progress,
-            &mut metrics,
-            epoch_rounds_at_start,
-            epoch_tokens_at_start,
-            epoch_duration_at_start,
-            run_started,
-            round_limit,
-            model_tokens_spent,
-            commands_run,
-            cost_spent_micros,
-            &modified_files,
-        );
+        flush_epoch!(round_limit);
         Ok(AgentOutcome::drive_result(
             summary,
             round_limit,
@@ -2714,8 +2460,8 @@ const COMMAND_HEARTBEAT_SECS: u64 = 3;
 /// The command line a heartbeat should name, or `None` if this call is not a
 /// long-running command tool (only those get a heartbeat). Reads the `cmd`
 /// argument the command tools take; falls back to the tool name.
-fn command_progress_label(call: &ToolCall) -> Option<String> {
-    if !matches!(call.name.as_str(), "run_command" | "shell_command") {
+fn command_progress_label(registry: &ToolRegistry, call: &ToolCall) -> Option<String> {
+    if !registry.runs_command(&call.name) {
         return None;
     }
     let cmd = call

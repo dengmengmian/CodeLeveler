@@ -565,19 +565,11 @@ fn collect_project_files(repository: &str) -> Vec<String> {
     if !root.is_dir() {
         return Vec::new();
     }
-    if let Ok(output) = std::process::Command::new("git")
-        .args([
-            "-C",
-            repository,
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .output()
-        && output.status.success()
-    {
-        let mut files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+    if let Some(stdout) = leveler_core::git_stdout(
+        root,
+        &["ls-files", "--cached", "--others", "--exclude-standard"],
+    ) {
+        let mut files: Vec<String> = stdout
             .lines()
             .filter(|line| !line.is_empty())
             .take(20_000)

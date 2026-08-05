@@ -179,6 +179,17 @@ impl Executor {
             output_tokens: 0,
             cached_input_tokens: 0,
         });
+        // Sub-agents run concurrently and silently; without an event here there
+        // is no way to observe what a fleet of them is doing.
+        if self.hook_runner.has_lifecycle() {
+            self.hook_runner
+                .run_lifecycle(
+                    leveler_execution::LifecycleEvent::SubagentStart,
+                    &format!(r#"{{"id":"{id}","role":"{}"}}"#, role.label()),
+                    &cancellation,
+                )
+                .await;
+        }
         let mut child = self.child_for_role_on(role, files, model_override);
         // A definition that declares its own tools / round budget binds every
         // spawn of it — otherwise the field is decoration.
@@ -229,8 +240,20 @@ impl Executor {
         let mut sink = SubAgentProgressSink::new(id, progress);
         // Box the recursive future (agent → spawn_agent → agent) so its size is
         // finite.
+        let hook_token = cancellation.clone();
         let run = child.run(&task, &mut capture, &mut sink, cancellation);
-        match Box::pin(run).await {
+        let outcome = Box::pin(run).await;
+        if self.hook_runner.has_lifecycle() {
+            let ok = outcome.is_ok();
+            self.hook_runner
+                .run_lifecycle(
+                    leveler_execution::LifecycleEvent::SubagentStop,
+                    &format!(r#"{{"ok":{ok}}}"#),
+                    &hook_token,
+                )
+                .await;
+        }
+        match outcome {
             Ok(outcome) => {
                 let ok = matches!(
                     outcome.stop_reason,
@@ -284,15 +307,7 @@ pub(crate) struct SubAgentRunResult {
 /// Cap UI previews so concurrent sub-agent activity cannot flood the event bus.
 fn cap_activity_preview(s: &str) -> String {
     const MAX: usize = 160;
-    let s = s.trim();
-    if s.len() <= MAX {
-        return s.to_string();
-    }
-    let mut end = MAX;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    leveler_core::truncate_head_bytes(s.trim(), MAX, "…")
 }
 
 /// Parent wall-clock budget context for refreshing a child's residual duration

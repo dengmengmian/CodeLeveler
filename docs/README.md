@@ -4,6 +4,7 @@
 | --- | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | Stable crate boundaries and runtime flows |
 | [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md) | Contributors (中文) | Chinese architecture guide |
+| [design/core-runtime-convergence-plan.md](design/core-runtime-convergence-plan.md) | Maintainers | Staged core refactor and acceptance gates |
 | [leveler-config-example.yaml](leveler-config-example.yaml) | Users | Project `.leveler/config.yaml` schema |
 | [permissions.example.yaml](permissions.example.yaml) | Users | Permission rules file |
 | [hooks.example.yaml](hooks.example.yaml) | Users | Pre/post tool hooks |

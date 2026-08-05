@@ -653,26 +653,9 @@ async fn engine_chat_command_spend_forces_budget_on_next_request() {
 async fn chat_anchors_a_baseline_for_pre_existing_failures() {
     let h = harness(vec![text("ok")]).await;
     // Make the fixture a real git repo with a commit, so HEAD resolves.
-    for args in [
-        vec!["init", "-q"],
-        vec!["add", "-A"],
-        vec![
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-qm",
-            "base",
-        ],
-    ] {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(h.dir.path())
-            .args(&args)
-            .output()
-            .expect("git available");
-    }
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "base"]);
 
     let spec = spec(&h, "explain this repo");
     assert!(spec.base_commit.is_none(), "spec starts without an anchor");

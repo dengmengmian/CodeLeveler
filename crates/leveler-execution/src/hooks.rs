@@ -28,6 +28,11 @@ pub struct HooksSection {
     pub pre_tool_use: Vec<HookCommand>,
     #[serde(default)]
     pub post_tool_use: Vec<HookCommand>,
+    /// Observational lifecycle hooks; see [`LifecycleEvent`]. One list for all
+    /// of them — the hook reads `$LEVELER_HOOK` to tell which fired, so adding
+    /// an event never needs a config migration.
+    #[serde(default)]
+    pub lifecycle: Vec<HookCommand>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -42,11 +47,49 @@ pub use crate::trust::UntrustedConfig;
 pub struct HookRunner {
     pre: Vec<HookCommand>,
     post: Vec<HookCommand>,
+    lifecycle: Vec<HookCommand>,
     cwd: PathBuf,
     untrusted: Vec<UntrustedConfig>,
 }
 
 // Clone is derived above.
+
+/// Lifecycle moments a hook can observe.
+///
+/// Distinct from `pre_tool_use`, which is a *gate* (exit 2 denies). These are
+/// observational: they report that something happened so a project can react —
+/// export a transcript before it is compacted, track a fleet of sub-agents,
+/// audit refused actions — without us guessing what each project needs or
+/// paying for it in the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleEvent {
+    SessionStart,
+    SessionEnd,
+    /// Fires before the transcript is folded; the payload carries the token
+    /// count that triggered it. Compaction discards detail by design, so this
+    /// is the only moment a project can keep something first.
+    PreCompact,
+    PostCompact,
+    SubagentStart,
+    SubagentStop,
+    /// An action was refused — by policy, by a permission rule, or by the user.
+    PermissionDenied,
+}
+
+impl LifecycleEvent {
+    /// Stable wire name, seen by hooks as `$LEVELER_HOOK`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::SessionEnd => "session_end",
+            Self::PreCompact => "pre_compact",
+            Self::PostCompact => "post_compact",
+            Self::SubagentStart => "subagent_start",
+            Self::SubagentStop => "subagent_stop",
+            Self::PermissionDenied => "permission_denied",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreHookResult {
@@ -59,15 +102,7 @@ impl HookRunner {
         Self {
             pre: Vec::new(),
             post: Vec::new(),
-            cwd,
-            untrusted: Vec::new(),
-        }
-    }
-
-    pub fn from_file(file: HooksFile, cwd: PathBuf) -> Self {
-        Self {
-            pre: file.hooks.pre_tool_use,
-            post: file.hooks.post_tool_use,
+            lifecycle: Vec::new(),
             cwd,
             untrusted: Vec::new(),
         }
@@ -87,12 +122,14 @@ impl HookRunner {
     pub fn load(global_home: &Path, repo_root: &Path) -> Self {
         let mut pre = Vec::new();
         let mut post = Vec::new();
+        let mut lifecycle = Vec::new();
         let mut untrusted = Vec::new();
 
         let mut absorb = |raw: &str| {
             if let Ok(file) = serde_yaml::from_str::<HooksFile>(raw) {
                 pre.extend(file.hooks.pre_tool_use);
                 post.extend(file.hooks.post_tool_use);
+                lifecycle.extend(file.hooks.lifecycle);
             }
         };
 
@@ -114,13 +151,14 @@ impl HookRunner {
         Self {
             pre,
             post,
+            lifecycle,
             cwd: repo_root.to_path_buf(),
             untrusted,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pre.is_empty() && self.post.is_empty()
+        self.pre.is_empty() && self.post.is_empty() && self.lifecycle.is_empty()
     }
 
     pub async fn run_pre(
@@ -187,6 +225,38 @@ impl HookRunner {
     }
 }
 
+impl HookRunner {
+    /// Fire the observational hooks for `event`.
+    ///
+    /// Returns nothing on purpose: a lifecycle hook reports, it does not decide.
+    /// A failing or slow hook must never take the turn with it — that is what
+    /// `pre_tool_use` is for.
+    pub async fn run_lifecycle(
+        &self,
+        event: LifecycleEvent,
+        payload_json: &str,
+        cancellation: &CancellationToken,
+    ) {
+        for hook in &self.lifecycle {
+            let _ = run_one(
+                hook,
+                event.as_str(),
+                "",
+                payload_json,
+                &self.cwd,
+                cancellation,
+            )
+            .await;
+        }
+    }
+
+    /// Whether any lifecycle hook is configured — callers skip building a
+    /// payload when nobody is listening.
+    pub fn has_lifecycle(&self) -> bool {
+        !self.lifecycle.is_empty()
+    }
+}
+
 async fn run_one(
     hook: &HookCommand,
     phase: &str,
@@ -212,16 +282,18 @@ async fn run_one(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .env("LEVELER_HOOK", phase)
-        .env("LEVELER_TOOL", tool)
-        .env("LEVELER_TOOL_ARGS_JSON", capped);
+        .kill_on_drop(true);
+    // Clear FIRST, then populate: `env_clear` wipes everything set before it,
+    // so setting the hook's own variables earlier left every hook running
+    // blind — no event name, no tool, no arguments.
     cmd.env_clear();
-    for (name, value) in leveler_core::environment().vars_os() {
-        if !name.to_str().is_some_and(crate::is_credential_env_name) {
-            cmd.env(name, value);
-        }
-    }
+    cmd.envs(leveler_core::scrubbed_environment());
+    cmd.env("LEVELER_HOOK", phase)
+        .env("LEVELER_TOOL", tool)
+        .env("LEVELER_TOOL_ARGS_JSON", capped)
+        // Lifecycle events carry a payload rather than tool arguments; the same
+        // bytes under a name that does not lie about what they are.
+        .env("LEVELER_HOOK_PAYLOAD", capped);
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
     let result = tokio::select! {
@@ -240,14 +312,6 @@ async fn run_one(
             Err("hook timed out".into())
         }
     }
-}
-
-pub fn load_hooks_file(path: &Path) -> Result<HooksFile, String> {
-    if !path.is_file() {
-        return Ok(HooksFile::default());
-    }
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_yaml::from_str(&raw).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -337,7 +401,7 @@ mod tests {
 
     /// Hook fixture shell exiting with `code`: `/bin/sh` on Unix, `cmd` on
     /// Windows (`/bin/sh` does not exist there and would fail at spawn).
-    fn shell_exit(code: u32) -> Vec<String> {
+    pub(super) fn shell_exit(code: u32) -> Vec<String> {
         if cfg!(windows) {
             vec!["cmd".into(), "/c".into(), format!("exit {code}")]
         } else {
@@ -353,6 +417,7 @@ mod tests {
                 command: shell_exit(2),
             }],
             post: vec![],
+            lifecycle: Vec::new(),
             cwd: dir.path().to_path_buf(),
             untrusted: Vec::new(),
         };
@@ -370,6 +435,7 @@ mod tests {
                 command: shell_exit(0),
             }],
             post: vec![],
+            lifecycle: Vec::new(),
             cwd: dir.path().to_path_buf(),
             untrusted: Vec::new(),
         };
@@ -377,5 +443,113 @@ mod tests {
             .run_pre("run_command", "{}", &CancellationToken::new())
             .await;
         assert_eq!(r, PreHookResult::Allow);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_hook_tests {
+    use super::tests::shell_exit;
+    use super::*;
+
+    /// A hook fixture that records the event it saw into `path`.
+    fn record_to(path: &Path) -> Vec<String> {
+        let p = path.display().to_string();
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("printf '%s|%s\\n' \"$LEVELER_HOOK\" \"$LEVELER_HOOK_PAYLOAD\" >> {p}"),
+        ]
+    }
+
+    /// Compaction throws away detail by design. A hook here is what lets a user
+    /// keep what matters (export it, push it to memory) without us guessing
+    /// what "matters" means or paying for an extra model call on every compact.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_compaction_hook_sees_the_event_and_its_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("seen.txt");
+        let runner = HookRunner {
+            pre: vec![],
+            post: vec![],
+            lifecycle: vec![HookCommand {
+                command: record_to(&log),
+            }],
+            cwd: dir.path().to_path_buf(),
+            untrusted: Vec::new(),
+        };
+        runner
+            .run_lifecycle(
+                LifecycleEvent::PreCompact,
+                r#"{"tokens":120000}"#,
+                &CancellationToken::new(),
+            )
+            .await;
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(seen.contains("pre_compact"), "{seen:?}");
+        assert!(seen.contains("120000"), "payload must reach the hook: {seen:?}");
+    }
+
+    /// Sub-agents run concurrently and silently; without an event here there is
+    /// no way to observe what a fleet of them is doing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn subagent_lifecycle_events_are_distinguishable() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("seen.txt");
+        let runner = HookRunner {
+            pre: vec![],
+            post: vec![],
+            lifecycle: vec![HookCommand {
+                command: record_to(&log),
+            }],
+            cwd: dir.path().to_path_buf(),
+            untrusted: Vec::new(),
+        };
+        let token = CancellationToken::new();
+        runner
+            .run_lifecycle(LifecycleEvent::SubagentStart, "{}", &token)
+            .await;
+        runner
+            .run_lifecycle(LifecycleEvent::SubagentStop, "{}", &token)
+            .await;
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(seen.contains("subagent_start"), "{seen:?}");
+        assert!(seen.contains("subagent_stop"), "{seen:?}");
+    }
+
+    /// Lifecycle hooks are observational: a failing one must not take the turn
+    /// with it, unlike `pre_tool_use` which is a gate.
+    #[tokio::test]
+    async fn a_failing_lifecycle_hook_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = HookRunner {
+            pre: vec![],
+            post: vec![],
+            lifecycle: vec![HookCommand {
+                command: shell_exit(3),
+            }],
+            cwd: dir.path().to_path_buf(),
+            untrusted: Vec::new(),
+        };
+        // Returns unit: there is no failure channel by construction.
+        runner
+            .run_lifecycle(LifecycleEvent::SessionStart, "{}", &CancellationToken::new())
+            .await;
+    }
+
+    #[test]
+    fn every_event_has_a_stable_wire_name() {
+        for (event, name) in [
+            (LifecycleEvent::SessionStart, "session_start"),
+            (LifecycleEvent::SessionEnd, "session_end"),
+            (LifecycleEvent::PreCompact, "pre_compact"),
+            (LifecycleEvent::PostCompact, "post_compact"),
+            (LifecycleEvent::SubagentStart, "subagent_start"),
+            (LifecycleEvent::SubagentStop, "subagent_stop"),
+            (LifecycleEvent::PermissionDenied, "permission_denied"),
+        ] {
+            assert_eq!(event.as_str(), name);
+        }
     }
 }

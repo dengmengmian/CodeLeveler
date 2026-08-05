@@ -11,7 +11,7 @@ use leveler_client_protocol::{
 };
 use leveler_tui::action::{Action, Effect};
 use leveler_tui::reducer::reduce;
-use leveler_tui::render::{conversation_footer, render};
+use leveler_tui::render::render;
 use leveler_tui::screen::Screen;
 use leveler_tui::state::{AppState, Boot};
 use leveler_tui::theme::Theme;
@@ -102,20 +102,6 @@ fn screen(state: &mut AppState) -> String {
     out
 }
 
-fn footer_text(state: &AppState) -> String {
-    let (lines, _) = conversation_footer(state, state.size.0 as usize, 0, 0, false);
-    lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Write a multi-screen dump for human review.
 fn dump_all(path: &str, pages: &[(&str, String)]) {
     let mut body = String::new();
@@ -175,25 +161,25 @@ fn tui_session_commands_ui_and_logic() {
     pages.push(("04-model-picker", model_ui));
     reduce(&mut s, key(KeyCode::Esc));
 
-    // --- slash arg ghost (footer / conversation path) ---
+    // --- slash arg ghost (composer on the workbench screen) ---
     typed(&mut s, "/btw ");
-    let foot = footer_text(&s);
+    let ghost_ui = screen(&mut s);
     assert!(
-        foot.contains("<问题>") || foot.contains("<question>"),
-        "ghost missing in footer: {foot}"
+        ghost_ui.contains("<问题>") || ghost_ui.contains("<question>"),
+        "ghost missing in composer: {ghost_ui}"
     );
     assert_eq!(s.composer.text(), "/btw ", "ghost must not enter buffer");
-    pages.push(("05-btw-ghost-footer", foot));
+    pages.push(("05-btw-ghost-composer", ghost_ui));
     // clear composer
     while !s.composer.is_empty() {
         reduce(&mut s, key(KeyCode::Backspace));
     }
 
     typed(&mut s, "/goal ");
-    let foot = footer_text(&s);
+    let ghost_ui = screen(&mut s);
     assert!(
-        foot.contains("<任务") || foot.contains("<goal>"),
-        "goal ghost: {foot}"
+        ghost_ui.contains("<任务") || ghost_ui.contains("<goal>"),
+        "goal ghost: {ghost_ui}"
     );
     while !s.composer.is_empty() {
         reduce(&mut s, key(KeyCode::Backspace));
@@ -213,20 +199,22 @@ fn tui_session_commands_ui_and_logic() {
         }),
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
-    let btw_foot = footer_text(&s);
+    let btw_ui = screen(&mut s);
     assert!(
-        btw_foot.contains("临时提问") || btw_foot.contains("btw"),
-        "btw card title: {btw_foot}"
+        btw_ui.contains("临时提问") || btw_ui.contains("btw"),
+        "btw card title: {btw_ui}"
     );
     assert!(
-        btw_foot.contains("没有明显问题"),
-        "btw answer text: {btw_foot}"
+        btw_ui.contains("没有明显问题"),
+        "btw answer text: {btw_ui}"
     );
     assert!(
-        !btw_foot.contains("**"),
-        "btw must render markdown, not raw **: {btw_foot}"
+        !btw_ui.contains("**"),
+        "btw must render markdown, not raw **: {btw_ui}"
     );
-    pages.push(("06-btw-card", btw_foot));
+    pages.push(("06-btw-card", btw_ui));
+    // Dismiss the floating card so it stops covering the conversation viewport.
+    reduce(&mut s, key(KeyCode::Esc));
 
     // Plan updates still land on state (shown in conversation chrome).
     reduce(
@@ -350,12 +338,14 @@ fn tui_session_commands_ui_and_logic() {
             reason: "轮次或资源预算已耗尽".into(),
         }),
     );
-    let foot = footer_text(&s);
+    let incomplete_ui = screen(&mut s);
     assert!(
-        foot.contains("未完成") || foot.contains("incomplete") || foot.contains("预算"),
-        "incomplete marker: {foot}"
+        incomplete_ui.contains("未完成")
+            || incomplete_ui.contains("incomplete")
+            || incomplete_ui.contains("预算"),
+        "incomplete marker: {incomplete_ui}"
     );
-    pages.push(("10-incomplete", foot));
+    pages.push(("10-incomplete", incomplete_ui));
 
     // --- /help ---
     typed(&mut s, "/help");
@@ -409,10 +399,10 @@ fn tui_slash_popup_lists_renamed_commands() {
     assert!(names.contains(&"/doctor"), "got {names:?}");
     assert!(names.contains(&"/fork"), "got {names:?}");
 
-    let foot = footer_text(&s);
+    let popup_ui = screen(&mut s);
     assert!(
-        foot.contains("/goal") || foot.contains("/plan") || foot.contains("/help"),
-        "popup in footer: {foot}"
+        popup_ui.contains("/goal") || popup_ui.contains("/plan") || popup_ui.contains("/help"),
+        "popup on screen: {popup_ui}"
     );
 }
 

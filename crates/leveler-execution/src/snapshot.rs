@@ -215,16 +215,8 @@ async fn git(root: &Path, args: &[&str], index: Option<&Path>) -> Result<String,
 }
 
 fn scrub_credentials(command: &mut tokio::process::Command) {
-    // Rebuild from the immutable application snapshot. Removing only known
-    // names from the live parent is racy: a credential added after startup
-    // would otherwise be inherited by git hooks and clean/smudge filters.
     command.env_clear();
-    for (name, value) in leveler_core::environment().vars_os() {
-        let is_credential = name.to_str().is_some_and(crate::is_credential_env_name);
-        if !is_credential {
-            command.env(name, value);
-        }
-    }
+    command.envs(leveler_core::scrubbed_environment());
 }
 
 /// Whether `path` (relative to `root`) lies inside a directory marked with
@@ -285,23 +277,11 @@ mod tests {
         );
     }
 
-    async fn git_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        // No autocrlf: the runner's global config must not smudge file content
-        // on checkout/restore (CRLF breaks byte-exact assertions).
-        sh(
-            dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t && git config core.autocrlf false",
-        )
-        .await;
-        dir
-    }
-
     #[tokio::test]
     async fn capture_uses_a_persistent_index_and_stays_correct_on_reuse() {
         // The persistent index (git's stat cache) is the performance fix; this
         // guards that reusing it does not corrupt capture results.
-        let dir = git_repo().await;
+        let dir = leveler_test_support::git::scratch_repo();
         sh(
             dir.path(),
             "echo one > a.txt && git add -A && git commit -qm init",
@@ -336,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_and_restore_recovers_deletes_and_creates() {
-        let dir = git_repo().await;
+        let dir = leveler_test_support::git::scratch_repo();
         sh(
             dir.path(),
             "echo original > file.txt && git add -A && git commit -qm init",
@@ -373,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn changed_since_reports_command_mutations() {
-        let dir = git_repo().await;
+        let dir = leveler_test_support::git::scratch_repo();
         sh(
             dir.path(),
             "echo one > a.txt && git add -A && git commit -qm init",
@@ -398,7 +378,7 @@ mod tests {
         // target/, restic, etc.). A command that runs `cargo test` must not
         // pollute modified_files with hundreds of artifacts — they break
         // scope checks and file budgets.
-        let dir = git_repo().await;
+        let dir = leveler_test_support::git::scratch_repo();
         sh(
             dir.path(),
             "echo one > a.txt && git add -A && git commit -qm init",
@@ -426,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn unchanged_tree_reports_nothing() {
-        let dir = git_repo().await;
+        let dir = leveler_test_support::git::scratch_repo();
         sh(
             dir.path(),
             "echo one > a.txt && git add -A && git commit -qm init",
@@ -451,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_last_writes_under_git_dir() {
-        let dir = git_repo().await;
+        let dir = leveler_test_support::git::scratch_repo();
         sh(
             dir.path(),
             "echo one > a.txt && git add -A && git commit -qm init",
@@ -475,7 +455,7 @@ mod tests {
     /// (restore could then delete files far outside the workspace).
     #[tokio::test]
     async fn subdirectory_of_an_outer_repo_is_not_treated_as_a_git_workspace() {
-        let outer = git_repo().await;
+        let outer = leveler_test_support::git::scratch_repo();
         let sub = outer.path().join("nested/workdir");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("f.txt"), "x").unwrap();

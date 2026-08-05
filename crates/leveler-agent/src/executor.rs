@@ -4,6 +4,7 @@ pub mod closeout;
 mod dispatch;
 mod drive;
 mod handlers;
+pub mod round_verdict;
 mod stream;
 
 use std::sync::Arc;
@@ -368,17 +369,6 @@ pub struct StepLimits {
     /// This is an unconditional circuit breaker — independent of progress
     /// heuristics — so an `UntilTerminal` turn always terminates.
     pub max_rounds: Option<u32>,
-}
-
-impl StepLimits {
-    /// Construct from legacy u32 caps where `0` meant unlimited.
-    pub fn from_legacy_caps(max_commands: u32, max_modified_files: usize) -> Self {
-        Self {
-            max_commands: (max_commands > 0).then_some(max_commands),
-            max_modified_files: (max_modified_files > 0).then_some(max_modified_files),
-            ..Self::default()
-        }
-    }
 }
 
 /// Why the loop stopped.
@@ -1250,12 +1240,6 @@ impl Executor {
         self
     }
 
-    /// Set the approval policy (e.g. whether network access is granted).
-    pub fn with_approval_policy(mut self, policy: ApprovalPolicy) -> Self {
-        self.approval_policy = policy;
-        self
-    }
-
     /// Start a fresh run for `goal`.
     pub async fn run(
         &self,
@@ -1278,24 +1262,6 @@ impl Executor {
             cancellation,
         )
         .await
-    }
-
-    /// Start a fresh run whose first user message carries arbitrary content
-    /// parts (text and images), for multimodal input (spec §43).
-    pub async fn run_with_content(
-        &self,
-        content: Vec<ContentPart>,
-        observer: &mut dyn FnMut(AgentEvent),
-        sink: &mut dyn TranscriptSink,
-        cancellation: CancellationToken,
-    ) -> Result<AgentOutcome, AgentError> {
-        let request = text_of(&content);
-        let objective = self
-            .seeded_objective
-            .clone()
-            .unwrap_or_else(|| ObjectiveAnchor::from_user_message(request));
-        self.run_with_content_and_objective(content, objective, observer, sink, cancellation)
-            .await
     }
 
     async fn run_with_content_and_objective(

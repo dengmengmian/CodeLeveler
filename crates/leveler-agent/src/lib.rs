@@ -35,8 +35,7 @@ pub use executor::{
 };
 pub use leveler_lifecycle::{
     CollaborationMode, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,
-    ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProcessEvidence,
-    ProgressCaps, ProgressLedger, TaskContract, ToolSurface, TurnPhase, WorkProfile, check,
-    check_goal_complete, task_looks_like_implementation,
+    ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps,
+    ProgressLedger, TaskContract, TurnPhase, WorkProfile, check, task_looks_like_implementation,
 };
 pub use sub_agent::{multi_agent_steer_hint, task_suggests_delegation};

@@ -267,6 +267,7 @@ mod tests {
     use crate::tool::{Tool, ToolContext};
     use crate::tools::RunCommandTool;
     use leveler_execution::{BackgroundTaskRegistry, PermissionProfile, Workspace};
+    use leveler_test_support::git::{run, scratch_repo};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -278,21 +279,6 @@ mod tests {
         assert_eq!(WaitTaskTool.risk(), RiskLevel::WorkspaceWrite);
         // get_task stays a pure status read.
         assert_eq!(GetTaskTool.risk(), RiskLevel::Safe);
-    }
-
-    async fn sh_in(dir: &std::path::Path, script: &str) {
-        let out = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .current_dir(dir)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{script} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
     fn ctx_with_reg(dir: &std::path::Path) -> (ToolContext, Arc<BackgroundTaskRegistry>) {
@@ -318,13 +304,10 @@ mod tests {
     async fn wait_accounts_modified_files_without_restoring_when_no_allowlist() {
         // Default Goal background (dev server / watcher): account diffs, never
         // auto-restore intentional long-lived mutations (K17 / PR-3b).
-        let dir = tempfile::tempdir().unwrap();
-        sh_in(
-            dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t \
-             && echo original > keep.txt && git add -A && git commit -qm init",
-        )
-        .await;
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("keep.txt"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
 
         let (ctx, _reg) = ctx_with_reg(dir.path());
         let start = RunCommandTool
@@ -387,13 +370,11 @@ mod tests {
 
     #[tokio::test]
     async fn wait_restores_out_of_allowlist_mutations() {
-        let dir = tempfile::tempdir().unwrap();
-        sh_in(
-            dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t \
-             && mkdir src && echo original > src/lib.rs && git add -A && git commit -qm init",
-        )
-        .await;
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
 
         let (ctx, _reg) = ctx_with_reg(dir.path());
         let constrained =
@@ -459,13 +440,11 @@ mod tests {
 
     #[tokio::test]
     async fn wait_keeps_in_allowlist_mutations() {
-        let dir = tempfile::tempdir().unwrap();
-        sh_in(
-            dir.path(),
-            "git init -q && git config user.email t@t && git config user.name t \
-             && mkdir src && echo original > src/lib.rs && git add -A && git commit -qm init",
-        )
-        .await;
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
 
         let (ctx, _reg) = ctx_with_reg(dir.path());
         let constrained =

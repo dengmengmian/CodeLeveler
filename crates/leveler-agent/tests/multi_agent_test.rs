@@ -1026,6 +1026,13 @@ async fn exhausted_parent_command_budget_hard_blocks_child() {
 
 /// Blocker 2: two parallel children must not each receive the full residual
 /// (oversell). Parent max_commands=2 → each child gets 1; total ≤ 2.
+///
+/// The children here — and in the three command-budget tests below — must NOT
+/// take `role: "explorer"`. An explorer runs on `read_only_subset()`, which has
+/// no `run_command`, so its calls resolve to "unknown tool" and never charge the
+/// command budget. A real model cannot make that call either (the tool is absent
+/// from the definitions it is shown), so scripting one tests nothing about
+/// budget sharing.
 #[tokio::test]
 async fn parallel_children_do_not_oversell_command_budget() {
     let dir = tmp("parallel-budget", 202);
@@ -1038,11 +1045,11 @@ async fn parallel_children_do_not_oversell_command_budget() {
                 vec![
                     spawn_call(
                         "s1",
-                        serde_json::json!({"task": "run two echoes A", "role": "explorer"}),
+                        serde_json::json!({"task": "run two echoes A"}),
                     ),
                     spawn_call(
                         "s2",
-                        serde_json::json!({"task": "run two echoes B", "role": "explorer"}),
+                        serde_json::json!({"task": "run two echoes B"}),
                     ),
                 ],
                 FinishReason::ToolCalls,
@@ -1136,7 +1143,7 @@ async fn cancel_after_child_spend_still_flushes_ledger() {
                 assistant_with(
                     vec![spawn_call(
                         "s1",
-                        serde_json::json!({"task": "run then hang", "role": "explorer"}),
+                        serde_json::json!({"task": "run then hang"}),
                     )],
                     FinishReason::ToolCalls,
                 ),
@@ -1219,7 +1226,7 @@ async fn mixed_parent_command_and_child_both_count_in_same_batch() {
                     ),
                     spawn_call(
                         "s1",
-                        serde_json::json!({"task": "run one command", "role": "explorer"}),
+                        serde_json::json!({"task": "run one command"}),
                     ),
                 ],
                 FinishReason::ToolCalls,
@@ -1371,7 +1378,7 @@ async fn child_cancelled_mid_run_rolls_up_partial_command_spend() {
             assistant_with(
                 vec![spawn_call(
                     "s1",
-                    serde_json::json!({"task": "spend then hang", "role": "explorer"}),
+                    serde_json::json!({"task": "spend then hang"}),
                 )],
                 FinishReason::ToolCalls,
             ),

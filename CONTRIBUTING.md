@@ -10,7 +10,7 @@ review and maintain.
 - Do not include credentials, local runtime state, generated evaluation output,
   or external fixture repositories in a commit.
 - Keep provider-specific behavior in provider configuration, protocol adapters,
-  or compatibility middleware rather than the agent runtime.
+  or compatibility quirk flags rather than the agent runtime.
 
 ## Development setup
 

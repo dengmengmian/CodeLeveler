@@ -76,12 +76,7 @@ fn commit_title(goal: &str) -> String {
         .trim();
     let mut title = first.to_string();
     if title.len() > 72 {
-        let mut end = 69;
-        while !title.is_char_boundary(end) {
-            end -= 1;
-        }
-        title.truncate(end);
-        title.push('…');
+        title = leveler_core::truncate_head_bytes(&title, 69, "…");
     }
     title
 }

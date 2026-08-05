@@ -22,7 +22,6 @@ mod screens;
 pub(crate) mod text;
 mod transcript_lines;
 
-pub use footer::conversation_footer;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
 pub use transcript_lines::{
@@ -102,7 +101,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     render_composer(frame, chunks[4], state);
 
     if let Some(overlay) = &state.overlay {
-        crate::overlay::render_overlay(frame, area, overlay, &state.theme);
+        crate::overlay::render_overlay(frame, area, overlay, &state.theme, state.locale);
     }
 }
 
@@ -290,7 +289,7 @@ fn labeled_row(
     ])
 }
 
-fn center_display(s: &str, width: usize) -> String {
+pub(crate) fn center_display(s: &str, width: usize) -> String {
     let w = unicode_width::UnicodeWidthStr::width(s);
     if w >= width || width == 0 {
         return s.to_string();
@@ -299,7 +298,7 @@ fn center_display(s: &str, width: usize) -> String {
     format!("{}{s}", " ".repeat(pad))
 }
 
-fn pad_to_width(s: &str, width: usize) -> String {
+pub(crate) fn pad_to_width(s: &str, width: usize) -> String {
     let w = unicode_width::UnicodeWidthStr::width(s);
     if w >= width {
         s.to_string()
@@ -837,6 +836,7 @@ mod tests {
     fn sub_agent_block_without_role_has_no_empty_brackets() {
         use crate::transcript::SubAgentBlock;
         let item = TranscriptItem::SubAgent(SubAgentBlock {
+            expanded: false,
             id: "a1".into(),
             nickname: "Newton".into(),
             role: String::new(),
@@ -867,6 +867,7 @@ mod tests {
     fn explorer_failure_is_named_and_explained_for_the_user() {
         use crate::transcript::SubAgentBlock;
         let item = TranscriptItem::SubAgent(SubAgentBlock {
+            expanded: false,
             id: "agent-1".into(),
             nickname: "Euclid".into(),
             role: "explorer".into(),
@@ -902,6 +903,7 @@ mod tests {
     fn running_explorer_has_a_clear_execution_label() {
         use crate::transcript::SubAgentBlock;
         let item = TranscriptItem::SubAgent(SubAgentBlock {
+            expanded: false,
             id: "agent-1".into(),
             nickname: "Euclid".into(),
             role: "explorer".into(),
@@ -1097,39 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_bar_has_no_fabricated_info() {
-        let mut s = test_state();
-        s.model_label = "deepseek/v3".into();
-        s.mode_label = "Assisted".into();
-        let text: String = crate::status_line::bottom_bar_lines(&s, 120)
-            .iter()
-            .map(line_str)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!text.contains("1 shell"), "hardcoded shell count: {text:?}");
-        assert!(
-            !text.contains("shift+enter"),
-            "shift+enter is not handled and must not be advertised: {text:?}"
-        );
-        // Trust strip: model · auto only — keys live in /help · Ctrl+?.
-        assert!(text.contains("deepseek/v3"), "{text:?}");
-        assert!(text.contains("auto"), "{text:?}");
-        assert!(
-            !text.contains("ctrl+j")
-                && !text.contains("Ctrl+O")
-                && !text.contains('↑')
-                && !text.contains("替我审批"),
-            "no key/token spam on trust strip: {text:?}"
-        );
-        assert_eq!(
-            crate::status_line::bottom_bar_lines(&s, 120).len(),
-            1,
-            "single trust strip"
-        );
-    }
-
-    #[test]
-    fn footer_renders_open_overlay_inline_instead_of_composer() {
+    fn workbench_renders_open_overlay_inline_instead_of_composer() {
         let mut s = test_state();
         s.overlay = Some(crate::overlay::Overlay::Approval(Box::new(
             crate::overlay::ApprovalOverlay::new(leveler_client_protocol::UiApprovalRequest {
@@ -1140,23 +1110,23 @@ mod tests {
                 risks: vec!["将访问网络".into()],
             }),
         )));
-        let (lines, _) = super::conversation_footer(&s, 80, 0, 0, false);
-        let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(joined.contains("需要权限"), "{joined}");
-        assert!(joined.contains("拒绝"), "{joined}");
-        assert!(joined.contains("git push"), "{joined}");
-        // The overlay replaces the composer: exactly one box in the footer.
-        assert_eq!(
-            joined.matches('╭').count(),
-            1,
-            "composer must be hidden while an overlay is open: {joined}"
+        // A user turn suppresses the splash card so only overlay chrome remains.
+        s.transcript.push_user("推送一下".into());
+        let text = render_text(&mut s, 80, 30);
+        assert!(text.contains("等待授权"), "{text}");
+        assert!(text.contains("拒绝"), "{text}");
+        assert!(text.contains("git push"), "{text}");
+        // The overlay takes the composer's slot: no composer prompt on screen.
+        assert!(
+            !text.contains('›'),
+            "composer must be hidden while an overlay is open: {text}"
         );
     }
 
     #[test]
-    fn footer_clarification_overlay_places_cursor_on_its_input() {
-        let mut s = test_state();
-        s.overlay = Some(crate::overlay::Overlay::Clarification(Box::new(
+    fn clarification_overlay_places_cursor_on_its_input() {
+        let s = test_state();
+        let overlay = crate::overlay::Overlay::Clarification(Box::new(
             crate::overlay::ClarificationOverlay::new(
                 leveler_client_protocol::UiClarificationRequest {
                     id: leveler_client_protocol::ClarificationId::new("c1"),
@@ -1164,22 +1134,26 @@ mod tests {
                     options: vec!["A".into()],
                 },
             ),
-        )));
-        let (lines, cursor) = super::conversation_footer(&s, 80, 0, 0, false);
+        ));
+        // The shared overlay content builder feeds both the workbench inline
+        // box and the modal path; the cursor must land on the text input.
+        let (title, lines, cursor) =
+            crate::overlay::content_lines(&overlay, &s.theme, 76, s.locale);
         let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(joined.contains("选哪个？"), "{joined}");
+        assert!(
+            title.contains("选哪个？") || joined.contains("选哪个？"),
+            "{title} / {joined}"
+        );
         assert!(
             cursor.is_some(),
             "clarification input needs a visible cursor"
         );
-        assert!(
-            joined.contains("等待你的回复"),
-            "clarification must make the waiting state explicit: {joined}"
-        );
+        // The explicit waiting-state copy is asserted on the live status line in
+        // status_line::tests::clarification_overlay_is_awaiting_user.
     }
 
     #[test]
-    fn completed_turn_renders_a_summary_divider_with_space_before_composer() {
+    fn completed_turn_renders_a_summary_divider() {
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.elapsed_secs = 261;
@@ -1213,8 +1187,10 @@ mod tests {
             crate::action::Action::Runtime(leveler_client_protocol::RuntimeEvent::TurnCompleted),
         );
 
-        let (lines, _) = super::conversation_footer(&s, 80, 0, 0, false);
-        let rendered = lines.iter().map(line_str).collect::<Vec<_>>();
+        let rendered: Vec<String> = crate::workbench::build_conversation_lines(&s, 80)
+            .iter()
+            .map(line_str)
+            .collect();
         let marker = rendered
             .iter()
             .position(|line| line.contains("已完成"))
@@ -1228,16 +1204,6 @@ mod tests {
             rendered[marker].contains("4m 21s"),
             "{:?}",
             rendered[marker]
-        );
-        assert_eq!(rendered.get(marker + 1).map(String::as_str), Some(""));
-        // Composer box (╭) or prompt line (›) follows the blank; metrics/bottom
-        // chrome may sit below the box.
-        assert!(
-            rendered.get(marker + 2).is_some_and(|line| {
-                line.starts_with('╭') || line.starts_with('›') || line.contains('›')
-            }),
-            "blank then composer after turn marker: {}",
-            rendered.join("\n")
         );
 
         s.transcript.push_user("继续".into());
@@ -1258,8 +1224,11 @@ mod tests {
                 error: "boom".into(),
             }),
         );
-        let (lines, _) = super::conversation_footer(&s, 80, 0, 0, false);
-        let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
+        let joined: String = crate::workbench::build_conversation_lines(&s, 80)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("✗ 失败"), "{joined}");
     }
 
@@ -1291,36 +1260,49 @@ mod tests {
         s.transcript
             .complete_tool(&second, false, "grep failed loudly".into(), 20);
 
-        // Product activity stream: the successful read renders its own compact
-        // unit; the failed grep keeps an honest result line with its error.
-        let (auto, _) = super::conversation_footer(&s, 100, 0, 0, false);
-        let auto = auto.iter().map(line_str).collect::<Vec<_>>().join("\n");
+        // A finished batch states that it happened and names its failures; the
+        // error text itself is one Ctrl+O away, so a run full of broken calls
+        // stays readable.
+        let auto: String = crate::workbench::build_conversation_lines(&s, 100)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            auto.contains("读取") || auto.contains("检查") || auto.contains("找到"),
-            "successful read renders its own unit: {auto}"
-        );
-        assert!(
-            auto.contains("搜索") && auto.contains("grep failed loudly"),
-            "collapsed failed call must expose its error: {auto}"
+            auto.contains("失败"),
+            "a batch that broke must say so: {auto}"
         );
         if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items().last() {
             assert!(!group.expanded, "failed groups must not auto-expand");
         }
         assert!(
-            auto.contains("README contents"),
-            "collapsed unit shows the bounded first content line: {auto}"
-        );
-        assert!(
             !auto.contains("rest of the readme body"),
-            "collapsed group must not leak output beyond the first line: {auto}"
+            "collapsed group must not leak tool output: {auto}"
+        );
+
+        // Opened, both calls and the error come back.
+        if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items_mut().last_mut() {
+            group.expanded = true;
+        }
+        let open: String = crate::workbench::build_conversation_lines(&s, 100)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            open.contains("grep failed loudly"),
+            "expanding must expose the error: {open}"
         );
 
         // Expand the current (only) group via its own flag — not a global blast.
         if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items_mut().last_mut() {
             group.expanded = true;
         }
-        let (expanded, _) = super::conversation_footer(&s, 100, 0, 0, false);
-        let expanded = expanded.iter().map(line_str).collect::<Vec<_>>().join("\n");
+        let expanded: String = crate::workbench::build_conversation_lines(&s, 100)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             expanded.contains("README") || expanded.contains("读取") || expanded.contains("检查"),
             "{expanded}"
@@ -1333,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn active_structured_plan_is_visible_in_the_conversation_footer() {
+    fn active_structured_plan_is_visible_in_the_plan_panel() {
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.plan = Some(leveler_client_protocol::UiPlan {
@@ -1351,15 +1333,17 @@ mod tests {
             ],
         });
 
-        let (lines, _) = super::conversation_footer(&s, 100, 0, 0, false);
-        let text = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
+        let text = render_text(&mut s, 100, 32);
         assert!(text.contains("计划"), "{text}");
         assert!(text.contains("读取约束与现状"), "{text}");
         assert!(text.contains("修复运行链"), "{text}");
     }
 
     #[test]
-    fn structured_plan_does_not_truncate_after_six_steps() {
+    fn long_plan_panel_caps_at_six_rows_showing_leading_steps() {
+        // The workbench plan panel is chrome, not a scroll surface: it takes at
+        // most 6 rows (title + 5 steps) so a long plan never squeezes out the
+        // conversation. Leading steps stay visible; the title carries progress.
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.plan = Some(leveler_client_protocol::UiPlan {
@@ -1376,29 +1360,14 @@ mod tests {
                 .collect(),
         });
 
-        let (lines, _) = super::conversation_footer(&s, 100, 0, 0, false);
-        let text = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        for index in 1..=8 {
+        let text = render_text(&mut s, 100, 40);
+        for index in 1..=5 {
             assert!(text.contains(&format!("计划步骤{index}")), "{text}");
         }
-    }
-
-    #[test]
-    fn loaded_project_rules_are_visible_during_the_turn() {
-        let mut s = test_state();
-        s.status = leveler_client_protocol::RuntimeStatus::Busy;
-        let event: leveler_client_protocol::RuntimeEvent =
-            serde_json::from_value(serde_json::json!({
-                "type": "project_rules_loaded",
-                "sources": ["AGENTS.md", "src/AGENTS.md"]
-            }))
-            .expect("the runtime protocol must carry loaded rule provenance");
-        crate::reducer::reduce(&mut s, crate::action::Action::Runtime(event));
-
-        let (lines, _) = super::conversation_footer(&s, 100, 0, 0, false);
-        let text = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("AGENTS.md"), "{text}");
-        assert!(text.contains("src/AGENTS.md"), "{text}");
+        assert!(
+            !text.contains("计划步骤8"),
+            "panel is capped chrome, trailing steps stay off-screen: {text}"
+        );
     }
 
 

@@ -171,15 +171,7 @@ pub(crate) fn response_to_byte_stream(response: reqwest::Response) -> RawByteStr
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &s[..end])
-    }
+    leveler_core::truncate_head_bytes(s, max, "…")
 }
 
 #[cfg(test)]

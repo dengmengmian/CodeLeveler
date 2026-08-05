@@ -33,10 +33,9 @@ pub mod workspace;
 pub use approval::{
     ApprovalDecision, ApprovalPolicy, ApprovalRequest, Approver, AutoApprove, AutoDeny,
     AutoReviewer, CommandClass, CommandView, NeedUserReviewer, Requirement, ReviewVerdict,
-    classify_command, command_is_destructive, command_needs_host_escape,
-    is_comment_only_acceptance_command,
-    is_host_escape_program, is_memory_write_tool, is_remote_publish_command, is_shell_c_flag,
-    is_shell_wrapper_program, is_trivial_acceptance_command, shell_c_script,
+    classify_command, command_is_destructive, command_needs_host_escape, is_host_escape_program,
+    is_memory_write_tool, is_remote_publish_command, is_shell_c_flag, is_shell_wrapper_program,
+    shell_c_script,
 };
 pub use artifact::{ArtifactRef, ArtifactStore};
 pub use background::{

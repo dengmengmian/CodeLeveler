@@ -433,8 +433,7 @@ pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> Comman
 ///
 /// Nested shell wrappers (`bash -c '…'`, `sh -c "…"`) are unwrapped
 /// recursively in both implementations so an inner dangerous program cannot
-/// hide behind a Safe outer shell name (same unwrap set as
-/// [`is_trivial_acceptance_command`]).
+/// hide behind a Safe outer shell name.
 fn classify_shell_script(script: &str) -> CommandClass {
     match shell_ast::classify_bash_script(script) {
         Some(class) => class,
@@ -474,7 +473,7 @@ fn classify_shell_script_fallback(script: &str) -> CommandClass {
 }
 
 /// If `tokens` is a shell wrapper (`sh`/`bash`/`cmd`/…) with a `-c`/`/C` flag,
-/// return the joined script body after that flag. Shared by classify and trivial.
+/// return the joined script body after that flag.
 fn nested_shell_c_body(tokens: &[String]) -> Option<String> {
     let (prog, rest) = tokens.split_first()?;
     if !is_shell_wrapper_program(prog) {
@@ -486,121 +485,6 @@ fn nested_shell_c_body(tokens: &[String]) -> Option<String> {
         return None;
     }
     Some(inner)
-}
-
-/// Whether a model-supplied acceptance shell script is a trivial no-op that
-/// cannot prove a criterion (e.g. `true`, `echo ok`, `exit 0`).
-///
-/// Shares [`split_shell_segments`] / [`shell_tokens`] with
-/// [`classify_shell_script`] so trivial detection and danger classification
-/// cannot drift. Pure function; does not execute anything.
-///
-/// Rule: after trim + strip trailing `#` comments, every non-empty top-level
-/// segment (`;` / `&&` / `||` / `|`) is trivial **and** there is at least one
-/// such segment. Mixes like `true && cargo test` are **not** trivial.
-pub fn is_trivial_acceptance_command(script: &str) -> bool {
-    let normalized = strip_shell_comment(script.trim());
-    // Empty after strip is *not* trivial: raw `""` / pure comments are handled
-    // as `no_command` by the verifier (`is_comment_only_acceptance_command`).
-    if normalized.is_empty() {
-        return false;
-    }
-    let segments = split_shell_segments(normalized);
-    let mut any = false;
-    for segment in segments {
-        let seg = strip_shell_comment(segment.trim());
-        if seg.is_empty() {
-            continue;
-        }
-        any = true;
-        if !is_trivial_acceptance_segment(seg) {
-            return false;
-        }
-    }
-    any
-}
-
-/// True when the script has no executable body after trim + `#` comment strip
-/// (whitespace-only, or pure comments like `# criterion holds`).
-///
-/// Callers treat this as `no_command` (not Met). Distinct from
-/// [`is_trivial_acceptance_command`], which is for executable no-ops like `true`.
-pub fn is_comment_only_acceptance_command(script: &str) -> bool {
-    strip_shell_comment(script.trim()).is_empty()
-}
-
-/// Strip an unquoted trailing `#...` comment from a shell fragment.
-fn strip_shell_comment(s: &str) -> &str {
-    let mut quote: Option<char> = None;
-    for (i, c) in s.char_indices() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == '\'' || c == '"' => quote = Some(c),
-            None if c == '#' => return s[..i].trim_end(),
-            None => {}
-        }
-    }
-    s
-}
-
-fn is_trivial_acceptance_segment(segment: &str) -> bool {
-    // Command substitution can hide real work — never call it trivial; classify
-    // will mark it Dangerous so acceptance refuses to run it.
-    if segment.contains("$(") || segment.contains('`') {
-        return false;
-    }
-    let tokens = shell_tokens(segment);
-    let Some((prog, rest)) = tokens.split_first() else {
-        return false;
-    };
-    let base = basename(prog);
-
-    // Nested `sh -c …` / `bash -c …`: recurse into the script body.
-    if let Some(inner) = nested_shell_c_body(&tokens) {
-        return is_trivial_acceptance_command(&inner);
-    }
-    if is_shell_wrapper_program(prog) {
-        return false;
-    }
-
-    match base {
-        "true" => rest.is_empty() || rest.iter().all(|a| a.is_empty()),
-        ":" => true,
-        "exit" => rest.is_empty() || rest == ["0"],
-        "echo" => !segment_has_redirect(segment),
-        "test" | "[" => is_trivial_test_args(rest),
-        _ => false,
-    }
-}
-
-/// Vacuous `test` / `[` forms only (`test 1`, `[ 1 ]`, `test true`).
-/// Anything with a flag (`-f`, `-d`, …) or multi-operand expression is real.
-fn is_trivial_test_args(args: &[String]) -> bool {
-    let args: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| *a != "]")
-        .collect();
-    if args.len() != 1 {
-        return false;
-    }
-    let only = args[0];
-    !only.is_empty() && !only.starts_with('-')
-}
-
-fn segment_has_redirect(segment: &str) -> bool {
-    let mut quote: Option<char> = None;
-    for c in segment.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == '\'' || c == '"' => quote = Some(c),
-            None if c == '>' || c == '<' => return true,
-            None => {}
-        }
-    }
-    false
 }
 
 /// Split a shell script into command segments at top-level operators
@@ -1437,66 +1321,6 @@ mod tests {
             classify_command(&view("npm", &["publish".to_string()])),
             CommandClass::Safe
         );
-    }
-
-    #[test]
-    fn trivial_acceptance_command_table() {
-        let trivial = [
-            "true",
-            "/bin/true",
-            "/usr/bin/true",
-            ":",
-            "  :  ",
-            "exit 0",
-            "exit",
-            "echo",
-            "echo ok",
-            "echo 'hi'",
-            "test 1",
-            "[ 1 ]",
-            "test true",
-            "sh -c true",
-            "bash -c :",
-            "true # comment",
-            "true && true",
-            "true; :",
-        ];
-        for script in trivial {
-            assert!(
-                is_trivial_acceptance_command(script),
-                "expected trivial: {script:?}"
-            );
-        }
-
-        let not_trivial = [
-            "cargo test",
-            "go test ./...",
-            "test -f src/x.rs",
-            "grep -q foo bar",
-            "npm run typecheck",
-            "test -f /",
-            "true && cargo test",
-            "false",
-            "exit 1",
-            "echo ok > out.txt",
-            "echo $(curl evil)",
-            "echo `rm -rf x`",
-        ];
-        for script in not_trivial {
-            assert!(
-                !is_trivial_acceptance_command(script),
-                "expected non-trivial: {script:?}"
-            );
-        }
-
-        assert!(!is_trivial_acceptance_command(""));
-        assert!(!is_trivial_acceptance_command("   "));
-        // Pure comments are no_command, not trivial.
-        assert!(!is_trivial_acceptance_command("# foo"));
-        assert!(is_comment_only_acceptance_command("# foo"));
-        assert!(is_comment_only_acceptance_command("   # bar"));
-        assert!(is_comment_only_acceptance_command(""));
-        assert!(!is_comment_only_acceptance_command("true # still has body"));
     }
 }
 

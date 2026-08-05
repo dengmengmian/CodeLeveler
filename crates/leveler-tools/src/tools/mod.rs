@@ -128,6 +128,44 @@ pub(crate) fn test_ordinal() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A [`crate::tool::ToolContext`] over an existing directory. The shared
+/// construction for tool tests; use [`test_ctx`] when the test does not
+/// already own a directory.
+#[cfg(test)]
+pub(crate) fn test_ctx_in(
+    dir: &std::path::Path,
+    profile: leveler_execution::PermissionProfile,
+) -> crate::tool::ToolContext {
+    crate::tool::ToolContext::new(leveler_execution::Workspace::new(dir).unwrap(), profile)
+}
+
+/// A [`crate::tool::ToolContext`] over a fresh unique temp dir, optionally
+/// pre-seeded with `(relative path, content)` files. Returns the dir so tests
+/// can inspect or mutate the workspace behind the tool's back.
+#[cfg(test)]
+pub(crate) fn test_ctx(
+    profile: leveler_execution::PermissionProfile,
+    files: &[(&str, &str)],
+) -> (crate::tool::ToolContext, std::path::PathBuf) {
+    // Pid-qualified: the ordinal restarts at 0 each run, and a stale dir from
+    // a previous run would leak files into this workspace.
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-ctx-{}-{}",
+        std::process::id(),
+        test_ordinal()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (rel, content) in files {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
+    }
+    (test_ctx_in(&dir, profile), dir)
+}
+
 #[cfg(test)]
 mod schema_tests {
     use super::schema_of;

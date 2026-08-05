@@ -162,74 +162,6 @@ pub(crate) fn footer_status_line(state: &AppState) -> Option<String> {
     }
 }
 
-/// Visual context usage: bar + percent when window is known.
-/// Used by tests and the legacy bottom-bar helper; the workbench footer uses a
-/// simpler `Context used/window` form.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn context_progress(state: &AppState) -> Option<(String, f32)> {
-    let used = state.context_tokens;
-    let window = state.context_window();
-    if used == 0 && window == 0 {
-        return None;
-    }
-    let t = state.t();
-    if window == 0 {
-        return Some((
-            t.context_tokens_only.replacen("{}", &fmt_tokens(used), 1),
-            0.0,
-        ));
-    }
-    if used == 0 {
-        return Some((
-            t.context_empty_window
-                .replacen("{}", &fmt_tokens(window), 1),
-            0.0,
-        ));
-    }
-    let pct = (used as f32 / window as f32 * 100.0).min(999.0);
-    let filled = ((pct / 10.0).round() as usize).min(10);
-    let bar = format!(
-        "[{}{}] {:.0}%",
-        "█".repeat(filled),
-        "░".repeat(10usize.saturating_sub(filled)),
-        pct
-    );
-    let s = t
-        .context_with_bar
-        .replacen("{}", &bar, 1)
-        .replacen("{}", &fmt_tokens(used), 1)
-        .replacen("{}", &fmt_tokens(window), 1);
-    Some((s, pct))
-}
-
-#[cfg(test)]
-fn token_context_gauge(state: &AppState) -> String {
-    let Some((ctx, pct)) = context_progress(state) else {
-        return String::new();
-    };
-    let t = state.t();
-    let mut parts = Vec::new();
-    if state.token_input > 0 || state.token_output > 0 {
-        let cached = if state.token_cached > 0 && state.token_input > 0 {
-            let cache_pct = (state.token_cached as u64 * 100) / state.token_input as u64;
-            t.cached_pct.replacen("{}", &cache_pct.to_string(), 1)
-        } else {
-            String::new()
-        };
-        parts.push(format!(
-            "↑ {}{cached} · ↓ {}",
-            fmt_tokens(state.token_input),
-            fmt_tokens(state.token_output)
-        ));
-    }
-    parts.push(ctx);
-    if pct >= 90.0 {
-        parts.push(t.suggest_compact.to_string());
-    } else if pct >= 70.0 {
-        parts.push(t.compact_hint.to_string());
-    }
-    parts.join(" · ")
-}
 
 fn truncate_to_width(s: &str, width: usize) -> String {
     if width == 0 {
@@ -250,36 +182,6 @@ fn truncate_to_width(s: &str, width: usize) -> String {
     acc
 }
 
-#[cfg(test)]
-fn truncate_styled_spans(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    if width == 0 {
-        return Line::from("");
-    }
-    let total: usize = spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
-    if total <= width {
-        return Line::from(spans);
-    }
-    let mut out = Vec::new();
-    let mut used = 0usize;
-    for span in spans {
-        let w = UnicodeWidthStr::width(span.content.as_ref());
-        if used + w <= width {
-            used += w;
-            out.push(span);
-            continue;
-        }
-        let room = width.saturating_sub(used);
-        if room > 1 {
-            let cut = truncate_to_width(span.content.as_ref(), room);
-            out.push(Span::styled(cut, span.style));
-        }
-        break;
-    }
-    Line::from(out)
-}
 
 fn fit_status(parts: &[String], width: usize) -> String {
     let mut out = String::new();
@@ -475,36 +377,6 @@ pub(crate) fn header_line(state: &AppState, width: usize) -> Line<'static> {
     ))
 }
 
-/// Legacy trust-strip helper (tests). Production paints model · permission ·
-/// collab on the composer bottom border via `composer_trust_chip`.
-#[cfg(test)]
-pub(crate) fn bottom_bar_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
-    let theme = &state.theme;
-    let perm = permission_chip_label(state);
-    let muted = Style::default().fg(theme.muted);
-    let model = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
-    let sep = Style::default().fg(theme.border);
-
-    let mut spans = vec![
-        Span::styled(state.model_label.clone(), model),
-        Span::styled(" · ", sep),
-        Span::styled(perm.to_string(), muted),
-        Span::styled(" · ", sep),
-        Span::styled(state.collaboration.clone(), muted),
-    ];
-    // Idle empty tip once — points people at the help card, not a key laundry list.
-    if !state.is_busy()
-        && state.composer.is_empty()
-        && state.notification.is_none()
-        && state.token_input == 0
-        && state.context_tokens == 0
-    {
-        spans.push(Span::styled(" · ", sep));
-        spans.push(Span::styled("/help", muted));
-    }
-
-    vec![truncate_styled_spans(spans, width)]
-}
 
 #[cfg(test)]
 mod tests {
@@ -536,33 +408,6 @@ mod tests {
         assert_eq!(estimate_tokens("abcd"), 1);
     }
 
-    #[test]
-    fn gauge_reports_prefix_cache_hit_rate() {
-        let mut state = test_state();
-        state.context_tokens = 1000;
-        state.token_input = 1000;
-        state.token_output = 50;
-        state.token_cached = 900;
-        let gauge = token_context_gauge(&state);
-        assert!(
-            gauge.contains("90%") && (gauge.contains("缓存") || gauge.contains("cached")),
-            "gauge: {gauge}"
-        );
-    }
-
-    #[test]
-    fn gauge_omits_cache_when_provider_reports_none() {
-        let mut state = test_state();
-        state.context_tokens = 1000;
-        state.token_input = 1000;
-        state.token_output = 50;
-        state.token_cached = 0;
-        let gauge = token_context_gauge(&state);
-        assert!(
-            !gauge.contains("缓存") && !gauge.contains("cached"),
-            "gauge: {gauge}"
-        );
-    }
 
     #[test]
     fn header_is_branch_and_path_only() {
@@ -583,31 +428,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bottom_bar_is_model_perm_not_token_spam() {
-        let mut state = test_state();
-        state.model_label = "deepseek/v3".into();
-        state.mode_label = "Assisted".into();
-        state.context_tokens = 8_000;
-        state.context_window_tokens = 100_000;
-        let text: String = bottom_bar_lines(&state, 120)
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("deepseek/v3"), "{text}");
-        assert!(text.contains("auto"), "{text}");
-        assert!(
-            !text.contains("↑")
-                && !text.contains("Context ")
-                && !text.contains("Ctrl+O")
-                && !text.contains("⇧↑")
-                && !text.contains("ctrl+j")
-                && !text.contains("ctrl+c")
-                && !text.contains("发送"),
-            "chip is model · permission only: {text}"
-        );
-    }
 
     #[test]
     fn compact_token_and_footer_ctx_chip() {
@@ -632,33 +452,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn context_progress_shows_bar() {
-        let mut state = test_state();
-        state.context_tokens = 8000;
-        state.context_window_tokens = 10000;
-        let (label, pct) = context_progress(&state).unwrap();
-        assert!((pct - 80.0).abs() < 0.1);
-        assert!(label.contains('%'));
-    }
-
-    #[test]
-    fn high_context_suggests_compact() {
-        let mut state = test_state();
-        state.context_tokens = 95_000;
-        state.context_window_tokens = 100_000;
-        let gauge = token_context_gauge(&state);
-        assert!(gauge.contains("/compact"), "gauge: {gauge}");
-    }
-
-    #[test]
-    fn known_window_shows_before_first_usage() {
-        let mut state = test_state();
-        state.context_window_tokens = 128_000;
-        let gauge = token_context_gauge(&state);
-        assert!(gauge.contains("128,000"), "gauge: {gauge}");
-        assert!(!gauge.contains('%'), "no fake usage bar: {gauge}");
-    }
 
     #[test]
     fn goal_mode_is_visible_in_status() {
@@ -777,18 +570,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bottom_bar_renders_english_permission_chip() {
-        let mut state = test_state();
-        state.mode_label = "Assisted".into();
-        state.model_label = "m".into();
-        let text: String = bottom_bar_lines(&state, 80)
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("m · auto") || text.contains("auto"), "{text}");
-    }
 
     /// A reasoning model can spend 90+ seconds and thousands of tokens on a
     /// single round while emitting almost no visible text (measured: 95s,

@@ -170,7 +170,8 @@ impl Tool for ReadFileTool {
                 clipped = true;
                 continue;
             }
-            let shown = crate::registry::floor_boundary(&rendered, rendered.len().min(remaining));
+            let shown =
+                leveler_core::floor_char_boundary(&rendered, rendered.len().min(remaining));
             first_shown.get_or_insert(lineno);
             last_shown = lineno;
             out.push_str(&prefix);

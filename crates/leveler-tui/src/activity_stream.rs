@@ -31,6 +31,30 @@ pub(crate) fn render_group(
     now_elapsed_secs: u64,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    // Tool activity earns its rows while it is happening — which call is still
+    // running, what a command printed — and stops earning them the moment it
+    // finishes, because the answer below carries the result. So a finished
+    // group states that it happened and gets out of the way; Ctrl+O reopens it.
+    //
+    // Edits are the exception, handled inside the loop: a diff is not a step
+    // toward the result, it IS the result.
+    // A batch earns its rows while it is happening — which call is still
+    // running, what a command printed — and stops earning them the moment it
+    // finishes, because the answer below carries the result. A single call is
+    // already one row after its detail is folded in, so only batches collapse.
+    //
+    // Edits are the exception: a diff is not a step toward the result, it IS
+    // the result, and folding it would erase the only record of what changed.
+    let visible: Vec<&ToolCallBlock> = group
+        .calls
+        .iter()
+        .filter(|c| is_conversation_visible(c))
+        .collect();
+    if !group.expanded && visible.len() >= 2 && group_is_finished(group) && !group_has_edits(group)
+    {
+        out.push(collapsed_group_line(&visible, theme, width, t));
+        return out;
+    }
     // A concurrent batch gets one quiet dim header so the user sees these
     // calls ran together rather than one after another.
     let parallel_n = group.calls.iter().filter(|c| c.parallel).count();
@@ -96,6 +120,67 @@ pub(crate) fn render_group(
         }
     }
     out
+}
+
+fn group_is_finished(group: &ToolGroupBlock) -> bool {
+    !group.calls.is_empty() && group.calls.iter().all(|c| c.status != ToolStatus::Running)
+}
+
+/// Edits render as a diff, which stays visible whatever the group's state.
+fn group_has_edits(group: &ToolGroupBlock) -> bool {
+    group
+        .calls
+        .iter()
+        .any(|c| matches!(c.name.as_str(), "apply_patch" | "replace" | "write_file"))
+}
+
+/// The one row a finished group leaves behind.
+///
+/// Failures are named on it rather than expanded: hiding them would be worse
+/// than the noise, and expanding them is how a run with many broken calls
+/// becomes a screen you cannot read past.
+fn collapsed_group_line(
+    visible: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+) -> Line<'static> {
+    let failed = visible
+        .iter()
+        .filter(|c| c.status == ToolStatus::Failed)
+        .count();
+    let parallel = visible.iter().filter(|c| c.parallel).count() >= 2;
+    let (glyph, color) = if failed > 0 {
+        ("⚠", theme.warning)
+    } else {
+        ("✓", theme.success)
+    };
+    let n = visible.len().to_string();
+    let body = if parallel {
+        t.parallel_header.replace("{}", &n)
+    } else {
+        t.batch_done.replace("{}", &n)
+    };
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            truncate_display(&body, width.saturating_sub(24)),
+            // Dim once it is only history; a batch that broke keeps normal
+            // weight so a failure is not something you have to go looking for.
+            Style::default().fg(if failed > 0 { theme.text } else { theme.dim }),
+        ),
+    ];
+    if failed > 0 {
+        spans.push(Span::styled(
+            format!(" · {}", t.batch_failed.replace("{}", &failed.to_string())),
+            Style::default().fg(theme.warning),
+        ));
+    }
+    spans.push(Span::styled(
+        "  Ctrl+O".to_string(),
+        Style::default().fg(theme.dim),
+    ));
+    Line::from(spans)
 }
 
 /// Whether a completed/running call may appear as its own Conversation unit.
@@ -305,6 +390,21 @@ fn unit_lines(
     if !tail.is_empty() {
         head.push(Span::styled(tail, Style::default().fg(theme.dim)));
     }
+    // Collapsed, a finished success is one row: the size of what came back
+    // rides on the head instead of claiming a row of its own. Failures keep
+    // their second row — the error text is why you are reading this at all.
+    let fold_result = !expanded && call.status == ToolStatus::Ok;
+    if fold_result {
+        let n = content_line_count(call);
+        if n > 0 {
+            let (pre, post) = split_placeholder(t.tool_output_lines);
+            head.push(Span::styled(
+                format!(" · {pre}{n}{post}"),
+                Style::default().fg(theme.dim),
+            ));
+        }
+        return vec![Line::from(head)];
+    }
     let mut out = vec![Line::from(head)];
 
     // Line 2: result summary.
@@ -398,15 +498,16 @@ fn result_lines_for(
     if call.status == ToolStatus::Running {
         return Vec::new();
     }
-    // Ok: lead with the first content line so a successful read shows WHAT was
-    // read, not just how much; the quiet count keeps the unit honest. Shell
-    // output stays count-only (its first line is usually noise).
     let n = content_line_count(call);
     if n == 0 {
         return Vec::new();
     }
     let (pre, post) = split_placeholder(t.tool_output_lines);
-    let first = if is_shell_call(call) {
+    // Collapsed, a success is worth one fact: how much came back. The first
+    // content line is `package main` or a title comment often enough that
+    // spending a whole row on it, for every read, forever, is not worth it —
+    // Ctrl+O still has it. Shell output was already count-only here.
+    let first = if is_shell_call(call) || !expanded {
         None
     } else {
         first_content_line(call)
@@ -727,6 +828,113 @@ mod tests {
         )
     }
 
+    fn running(mut c: ToolCallBlock) -> ToolCallBlock {
+        c.status = ToolStatus::Running;
+        c.duration_ms = None;
+        c
+    }
+
+    #[test]
+    fn a_finished_parallel_batch_collapses_to_one_row() {
+        // Eight parallel reads cost sixteen rows while they were interesting
+        // and sixteen rows forever after. Once they are done the answer below
+        // carries their result; the batch only needs to say it happened.
+        let g = group(
+            (0..8)
+                .map(|i| parallel_call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#)))
+                .collect(),
+        );
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(
+            lines.len(),
+            1,
+            "a finished batch should be one row, got:\n{}",
+            lines.join("\n")
+        );
+        assert!(lines[0].contains('8'), "row must say how many: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn a_running_parallel_batch_stays_open() {
+        // While it runs, which call is still going is exactly what you want.
+        let mut calls: Vec<ToolCallBlock> = (0..4)
+            .map(|i| parallel_call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#)))
+            .collect();
+        calls[2] = running(calls[2].clone());
+        let g = group(calls);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines.len() >= 5,
+            "a running batch must stay expanded, got:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_batch_with_failures_reports_them_on_its_row() {
+        // Collapsing must not hide that something broke — but eight rows of
+        // error output is how a screen full of failures becomes unreadable.
+        let mut calls: Vec<ToolCallBlock> = (0..6)
+            .map(|i| parallel_call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#)))
+            .collect();
+        calls[1].status = ToolStatus::Failed;
+        calls[4].status = ToolStatus::Failed;
+        let g = group(calls);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(lines.len(), 1, "still one row:\n{}", lines.join("\n"));
+        assert!(
+            lines[0].contains('2') && lines[0].contains("失败"),
+            "the row must name the failures: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_finished_single_tool_drops_its_preview_row() {
+        let g = group(vec![call("read_file", r#"{"path":"go.mod"}"#, ToolStatus::Ok)]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(
+            lines.len(),
+            1,
+            "a finished tool is one row:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_finished_edit_keeps_its_diff() {
+        // Edits are the exception. A read is a step on the way to an answer and
+        // its result lands in that answer; a diff IS the result — collapsing it
+        // would hide the only record of what changed.
+        let g = group(vec![
+            patch_call("a.rs", "old", "new"),
+            patch_call("b.rs", "old", "new"),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines.iter().any(|l| l.contains("new")),
+            "the diff body must survive:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn ctrl_o_still_opens_a_collapsed_group() {
+        // Collapsing is the default, not a wall: the detail is one key away.
+        let mut g = group(
+            (0..4)
+                .map(|i| parallel_call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#)))
+                .collect(),
+        );
+        g.expanded = true;
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines.len() > 1,
+            "expanding must show the calls:\n{}",
+            lines.join("\n")
+        );
+    }
+
     #[test]
     fn parallel_batch_gets_a_concurrency_header() {
         let g = group(vec![
@@ -823,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_calls_render_as_individual_units() {
+    fn exploration_calls_collapse_into_one_row() {
         let g = group(vec![
             call(
                 "read_file",
@@ -839,56 +1047,62 @@ mod tests {
             ),
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        // No aggregation: each call is its own three-line unit.
+        assert_eq!(lines.len(), 1, "a finished batch is one row: {lines:?}");
+        assert!(lines[0].contains('4'), "{lines:?}");
+
+        // And each call comes back intact when asked for.
+        let mut open = g;
+        open.expanded = true;
+        let opened = render_group_text(&open, 80, Locale::Zh);
         assert_eq!(
-            lines.iter().filter(|l| l.contains("读取文件")).count(),
+            opened.iter().filter(|l| l.contains("读取文件")).count(),
             2,
-            "{lines:?}"
-        );
-        assert_eq!(
-            lines.iter().filter(|l| l.contains("搜索代码")).count(),
-            2,
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("PROJECT_RULES.md"))
-                && lines.iter().any(|l| l.contains("Makefile")),
-            "each unit shows its own target: {lines:?}"
+            "{opened:?}"
         );
     }
 
     #[test]
-    fn single_read_renders_a_two_line_unit() {
+    fn single_read_renders_one_row() {
         let g = group(vec![call(
             "read_file",
             r#"{"path":"src/auth.go"}"#,
             ToolStatus::Ok,
         )]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].starts_with('✓')
                 && lines[0].contains("读取文件")
                 && lines[0].contains("auth.go"),
-            "head carries glyph + action + inline target: {lines:?}"
+            "the row carries glyph + action + target: {lines:?}"
         );
-        assert!(lines[1].starts_with("  └ "), "{lines:?}");
     }
 
     #[test]
-    fn ok_read_result_shows_first_content_line_and_count() {
+    fn ok_read_result_reports_its_size_on_one_row() {
         let mut c = call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok);
         c.preview = Some("     1\t# GitCode AI 中间件服务\n     2\t\n     3\tbody".into());
         let g = group(vec![c]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("3 行"), "size must survive: {lines:?}");
         assert!(
-            lines[1].contains("# GitCode AI 中间件服务") && lines[1].contains("3 行"),
-            "first content line (gutter stripped) + line count: {lines:?}"
+            !lines[0].contains("1\t"),
+            "line-number gutter must never leak: {lines:?}"
         );
+    }
+
+    #[test]
+    fn expanding_a_read_brings_back_its_first_line() {
+        // The preview is folded away, not thrown away.
+        let mut c = call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok);
+        c.preview = Some("     1\t# GitCode AI 中间件服务\n     2\t\n     3\tbody".into());
+        let mut g = group(vec![c]);
+        g.expanded = true;
+        let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            !lines[1].contains("1\t"),
-            "line-number gutter must be stripped: {lines:?}"
+            lines.iter().any(|l| l.contains("# GitCode AI 中间件服务")),
+            "Ctrl+O must show what was read: {lines:?}"
         );
     }
 
@@ -903,10 +1117,13 @@ mod tests {
         let g = group(vec![c]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines[1].starts_with("  └ ") && lines[1].contains("1 行"),
-            "shell result keeps the quiet count, no first-line dump: {lines:?}"
+            lines[0].contains("1 行"),
+            "shell result keeps the quiet count: {lines:?}"
         );
-        assert!(!lines[1].contains("unused import"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("unused import")),
+            "no first-line dump: {lines:?}"
+        );
     }
 
     #[test]
@@ -1012,7 +1229,7 @@ mod tests {
             format!(r#"{{"cmd":"cd {home}/Develop/app/codeleveler && cargo test --workspace"}}"#);
         let g = group(vec![call("shell_command", &args, ToolStatus::Ok)]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].contains("执行命令")
                 && lines[0].contains("$ ")

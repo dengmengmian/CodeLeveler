@@ -105,7 +105,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // transcript, so the conversation shrinks by exactly what the decision box
     // needs and the message that raised it stays visible right above it.
     let composer_rows = match &state.overlay {
-        Some(ov) => crate::overlay::overlay_height(ov, &state.theme, area.width)
+        Some(ov) => crate::overlay::overlay_height(ov, &state.theme, area.width, state.locale)
             .min(area.height.saturating_sub(8))
             .max(3),
         None => composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2)
@@ -116,9 +116,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let header_rows: u16 = 3;
     let footer_rows: u16 = 1;
     // One blank row between transcript and bottom chrome so the last answer /
-    // turn-end marker does not sit flush on the composer border (parity with
-    // conversation_footer). Status only takes a row when it has content so we
-    // do not stack two empty strips when idle.
+    // turn-end marker does not sit flush on the composer border. Status only
+    // takes a row when it has content so we do not stack two empty strips
+    // when idle.
     let gap_rows: u16 = 1;
     // Notifications are painted as a floating toast (see
     // `render_notification_toast`) so they never grow this strip and reflow
@@ -134,9 +134,8 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         0
     };
     // Breathing room around the input box: blank above only when live chrome
-    // (status / plan / attachments) sits on top of it — matches
-    // conversation_footer; blank below always so Context footer is not flush
-    // on the composer border.
+    // (status / plan / attachments) sits on top of it; blank below always so
+    // Context footer is not flush on the composer border.
     let chrome_above = status_rows
         .saturating_add(plan_rows)
         .saturating_add(attach_rows);
@@ -170,9 +169,13 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_attachments(frame, chunks[5], state);
     // chunks[6] = pre_composer_gap (leave blank)
     match &state.overlay {
-        Some(overlay) => {
-            crate::overlay::render_overlay(frame, chunks[7], overlay, &state.theme)
-        }
+        Some(overlay) => crate::overlay::render_overlay(
+            frame,
+            chunks[7],
+            overlay,
+            &state.theme,
+            state.locale,
+        ),
         None => render_input(frame, chunks[7], state),
     }
     // chunks[8]: the key hints when there are any, otherwise the blank gap.
@@ -520,8 +523,8 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
     let mut idx = 0;
     while idx < items.len() {
         let item = &items[idx];
-        // Welcome card is retired; /btw is a floating overlay, not scroll content.
-        if matches!(item, TranscriptItem::Welcome(_) | TranscriptItem::Btw(_)) {
+        // /btw is a floating overlay, not scroll content.
+        if matches!(item, TranscriptItem::Btw(_)) {
             idx += 1;
             continue;
         }

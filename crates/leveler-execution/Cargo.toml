@@ -43,5 +43,6 @@ rappct = { version = "0.13", default-features = false }
 libc = { workspace = true }
 
 [dev-dependencies]
+leveler-test-support = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

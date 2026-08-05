@@ -60,6 +60,10 @@ impl Tool for ShellCommandTool {
         RiskLevel::WorkspaceWrite
     }
 
+    fn runs_command(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,

@@ -154,8 +154,7 @@ mod tests {
     use super::*;
 
     fn ctx() -> ToolContext {
-        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
-        ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval)
+        super::super::test_ctx(leveler_execution::PermissionProfile::RequestApproval, &[]).0
     }
 
     #[tokio::test]

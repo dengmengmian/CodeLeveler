@@ -6,19 +6,36 @@ can remain useful as the workspace evolves.
 
 ## Design goals
 
-CodeLeveler is designed around five constraints:
+CodeLeveler is not optimizing for the fewest crates or lines of code. It is an
+agent core intended to remain dependable as long-lived workflow infrastructure:
 
-1. **Model-independent runtime.** Provider and wire-protocol differences do not
-   leak into orchestration, tools, or the terminal UI.
-2. **Single-direction dependencies.** User-facing layers compose lower-level
-   libraries; foundational crates never depend back on applications.
-3. **Typed failure boundaries.** Library crates preserve provider, protocol,
-   tool, execution, storage, and verification errors as distinct types.
-4. **Deterministic safety controls.** Path checks, permissions, limits,
-   cancellation, and verification are enforced by host code rather than model
-   instructions.
-5. **Recoverable local state.** Sessions and runtime events can be persisted and
-   resumed without requiring a remote control plane.
+1. **Single ownership.** Every state transition, completion decision, and side
+   effect has one clear owner instead of being reimplemented by the engine,
+   agent, and tool layers.
+2. **Predictable behavior.** Safety, budgets, cancellation, retry, recovery,
+   and termination are host semantics rather than model discretion.
+3. **Long-running reliability.** After a crash, disconnect, cancellation,
+   timeout, or restart, the runtime can determine what happened and whether it
+   is safe to continue.
+4. **Composable capabilities.** Planning, evidence, verification, delegation,
+   and NPC behavior are policies layered above the direct loop, not hard-coded
+   into it.
+5. **Model-independent runtime.** Provider and wire-protocol differences do not
+   leak into orchestration, tools, or user interfaces.
+6. **Unbypassable safety boundary.** Paths, permissions, sandboxing, limits,
+   cancellation, and dangerous-command policy are enforced by host code.
+7. **Recoverable and auditable state.** Sessions, tool side-effect boundaries,
+   and runtime events can be persisted and resumed independently of a process
+   lifetime or remote control plane.
+8. **Evolvable interfaces.** Internals remain free to simplify while public
+   CLI, configuration, storage, and extension surfaces follow explicit
+   compatibility and migration rules.
+9. **Single-direction dependencies and typed errors.** Applications compose
+   lower-level libraries; foundational crates never depend back on applications,
+   and library boundaries preserve distinguishable failure types.
+10. **Consistent multi-client behavior.** TUI, Web, and mobile are first-class
+    clients of one runtime and share command, event, snapshot, approval, and
+    cancellation semantics.
 
 ## Core
 
@@ -27,18 +44,89 @@ use tools to finish work in a repository, with recoverable and auditable
 state.** Everything else (TUI/Web, slash commands, skills, remote pairing) is
 an entry or extension surface on top of that.
 
-Four pieces make up the core:
+The core still consists of four pieces. Crate count does not define a boundary;
+responsibility and data ownership do:
 
-| Piece | Responsibility | Where it lives |
-| --- | --- | --- |
-| **1. Tool loop (direct loop)** | Model proposes tool calls → host runs them → results return → repeat until the turn ends (or goal mode reaches `update_goal` complete/blocked). | `leveler-engine` + `leveler-agent` |
-| **2. Execution boundary** | Workspace paths, permissions, sandboxing, cancellation, and dangerous-command policy are **enforced by the host**, not by model instructions. | `leveler-execution` (+ tools dispatch in `leveler-tools`) |
-| **3. Session state** | Conversation and runtime events can be persisted and resumed; work is not tied to a single process lifetime. | `leveler-storage` + engine event log |
-| **4. Model adaptation** | Requests, streaming, and tool-call framing stay provider-neutral above a thin protocol/provider layer. | `leveler-model` + `leveler-protocol` + `leveler-provider` |
+| Piece | Sole responsibility | Must not own | Where it lives |
+| --- | --- | --- | --- |
+| **1. Engine + direct loop** | The engine supervises task/turn lifecycle, recovery, and explicit termination. The agent loop only performs model → tool → result feedback. | Concrete tool behavior, duplicate continuation state machines, or hard-coded product planning policy. | `leveler-engine` + `leveler-agent` |
+| **2. ToolHost / execution boundary** | Schema validation, risk and approval, path constraints, durable tool start/finish records, execution, and cancellation. | Conversation orchestration, task completion decisions, or UI state. | `leveler-tools` + `leveler-execution` |
+| **3. Session state** | Persist messages, canonical events, snapshots, and migrations as ordered, auditable facts for recovery. | Agent policy or implicit product decisions. | `leveler-storage` + engine event log |
+| **4. Model adaptation** | Provider-neutral request, streaming, and tool-call semantics above a thin provider/wire boundary. | Session state, tool permissions, or workflow decisions. | `leveler-model` + provider-internal protocol adapters |
 
-Not core (keep thin, add later): UI chrome, command menus, multi-phase
+The engine is a supervisor for long-running work, not merely a wrapper around
+the loop. It must answer what is durable, which tool may already have produced
+a side effect, whether retry is safe, where recovery resumes, and why execution
+stopped. Canonical tool-event persistence is part of the side-effect protocol:
+tool start is durably recorded before an external side effect, and completion
+is durably recorded afterward. Display-only stream deltas may use a lossy path.
+
+Not core implementation (keep thin and evolve independently): UI chrome, command menus, multi-phase
 orchestration stacks, plugin marketplaces, and heavy product axes beyond what
-the loop and gates already need.
+the loop and gates already need. **Although TUI, Web, and mobile do not own core
+execution logic, they are first-class supported product entry points and release
+acceptance surfaces, not optional accessories.**
+
+## Multi-client runtime contract
+
+TUI, Web, and mobile connect through `leveler-client-protocol` and transports
+to one engine; they do not implement separate task lifecycles. The client
+contract covers:
+
+- creating, continuing, and cancelling work, plus approval and clarification responses;
+- subscribing to canonical runtime events and resyncing from a snapshot plus watermark;
+- reconnecting and handing a session between clients without duplicate execution or lost progress;
+- isolating sessions and projects so no client observes another project's events;
+- protocol versioning, capability negotiation, authentication, and explicit incompatibility errors.
+
+Closing or disconnecting any client does not cancel work already accepted by
+the runtime. A client may persist view state, but task facts, permission
+decisions, and execution state come only from canonical engine events and
+snapshots. Mobile additionally enforces pairing, device revocation, and remote
+approval restrictions at the host boundary; hiding a UI control is not an
+authorization mechanism.
+
+## Policies and complex work
+
+Complex work does not justify growing the direct loop. The core supplies
+durable lifecycle, safe execution, and explicit termination. Replaceable
+workflow policies compose planning, evidence collection, stage checks, repair,
+and delegation. A default policy may preserve today's product behavior, but no
+policy may be required for execution safety or correct recovery.
+
+```text
+Complex task / NPC
+    ↓
+Workflow / Policy       planning, decomposition, checks, and retry
+    ↓
+Engine                  lifecycle, supervision, persistence, recovery, stop
+    ↓
+Agent Loop              one model-tool-result loop
+    ├── Model Runtime    provider-neutral model calls
+    └── ToolHost         approval, safe execution, durable side-effect records
+```
+
+Long-lived NPCs build on the same engine. Identity, long-term memory, wake-up
+schedules, inboxes, world state, and character policy belong to an NPC runtime;
+they neither duplicate the direct loop nor bypass ToolHost. Adding an NPC or a
+workflow therefore cannot introduce a second session, permission, or recovery
+model.
+
+## Non-negotiable core invariants
+
+- Every repository mutation and process execution crosses ToolHost/execution.
+- Each lifecycle state has one writer; projections and UIs consume canonical events.
+- Accepted work does not disappear because one UI disconnects.
+- Recovery never blindly replays a tool that may already have caused an external side effect.
+- Every stop has a typed reason: completed, blocked, cancelled, budget exhausted, or failed.
+- Policies are replaceable; safety, persistence, and cancellation boundaries are not.
+- Old configuration, databases, and events use explicit compatibility windows and migrations, never guessed repairs.
+- Disconnecting TUI, Web, or mobile does not alter task facts; reconnect uses canonical snapshot/resync only.
+
+The staged implementation and acceptance gates are defined in
+[`design/core-runtime-convergence-plan.md`](design/core-runtime-convergence-plan.md).
+Until that plan is complete, this section is the normative target; gaps must
+remain visible in the plan and must not be presented as implemented behavior.
 
 Every crate forbids unsafe Rust except `leveler-execution`, which is
 `#![deny(unsafe_code)]` with a single audited exception (the Linux

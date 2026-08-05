@@ -33,14 +33,6 @@ pub enum ReadinessFailure {
     AcceptanceCommandsUnmet { commands: Vec<String> },
 }
 
-/// Process evidence snapshot for simple callers (maps into ledger rules).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProcessEvidence {
-    pub mutation_count: u32,
-    pub verification_passed_after_mutation: bool,
-    pub task_looks_like_implementation: bool,
-}
-
 /// Gate knobs for update_goal(complete).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateConfig {
@@ -168,29 +160,6 @@ pub fn check(
     Ok(())
 }
 
-/// Convenience wrapper from ProcessEvidence (legacy simple path).
-pub fn check_goal_complete(
-    plan: &PlanState,
-    config: GateConfig,
-    evidence: Option<&ProcessEvidence>,
-) -> Result<(), ReadinessFailure> {
-    let mut ledger = EvidenceLedger {
-        plan: plan.clone(),
-        ..Default::default()
-    };
-    let mut impl_like = false;
-    if let Some(ev) = evidence {
-        impl_like = ev.task_looks_like_implementation;
-        for i in 0..ev.mutation_count {
-            ledger.record_mutation(format!("m{i}"), "apply_patch", vec![]);
-        }
-        if ev.verification_passed_after_mutation && ev.mutation_count > 0 {
-            ledger.record_verify("v-legacy", "cargo\u{1f}test", 0);
-        }
-    }
-    check(plan, &ledger, None, &config, false, impl_like)
-}
-
 fn normalize_acceptance(cmd: &str) -> String {
     let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
     if parts.is_empty() {
@@ -262,19 +231,6 @@ mod tests {
     use crate::plan::{PlanOrigin, PlanStep};
 
     #[test]
-    fn blocks_incomplete_model_explicit() {
-        let plan = PlanState {
-            steps: vec![PlanStep {
-                step: "a".into(),
-                status: "pending".into(),
-                id: None,
-                origin: PlanOrigin::ModelExplicit,
-            }],
-        };
-        assert!(check_goal_complete(&plan, GateConfig::default(), None).is_err());
-    }
-
-    #[test]
     fn todo_override_requires_explicit_flag_not_attempt_count() {
         let plan = PlanState {
             steps: vec![PlanStep {
@@ -316,13 +272,15 @@ mod tests {
     #[test]
     fn delivery_blocks_implementation_without_mutation() {
         let cfg = GateConfig::for_work_profile(WorkProfile::Delivery);
-        let ev = ProcessEvidence {
-            mutation_count: 0,
-            verification_passed_after_mutation: false,
-            task_looks_like_implementation: true,
-        };
         assert!(matches!(
-            check_goal_complete(&PlanState::default(), cfg, Some(&ev)),
+            check(
+                &PlanState::default(),
+                &EvidenceLedger::default(),
+                None,
+                &cfg,
+                false,
+                true
+            ),
             Err(ReadinessFailure::UnprovenNoMutation)
         ));
     }

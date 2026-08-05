@@ -69,8 +69,9 @@ pub fn content_lines(
     overlay: &Overlay,
     theme: &Theme,
     inner_width: usize,
+    locale: crate::i18n::Locale,
 ) -> (String, Vec<Line<'static>>, Option<(usize, usize)>) {
-    let (title, lines, cursor) = build_content(overlay, theme, inner_width);
+    let (title, lines, cursor) = build_content(overlay, theme, inner_width, locale);
     let (lines, cursor) = wrap_to_width(lines, cursor, inner_width);
     (title, lines, cursor)
 }
@@ -177,6 +178,7 @@ fn build_content(
     overlay: &Overlay,
     theme: &Theme,
     width: usize,
+    locale: crate::i18n::Locale,
 ) -> (String, Vec<Line<'static>>, Option<(usize, usize)>) {
     match overlay {
         Overlay::ModelPicker(model)
@@ -187,7 +189,11 @@ fn build_content(
             let (lines, cursor) = selection_content(model, theme);
             (model.title.clone(), lines, cursor)
         }
-        Overlay::Approval(ov) => ("需要权限".to_string(), approval_content(ov, theme, width), None),
+        Overlay::Approval(ov) => (
+            "需要权限".to_string(),
+            approval_content(ov, theme, width, locale),
+            None,
+        ),
         Overlay::Clarification(ov) => {
             let (lines, cursor) = clarification_content(ov, theme);
             ("需要澄清".to_string(), lines, cursor)
@@ -200,19 +206,30 @@ fn build_content(
 /// The workbench reserves this instead of drawing the overlay on top: a
 /// decision belongs where the input box was, and painting over the transcript
 /// hides the very message the user is judging.
-pub fn overlay_height(overlay: &Overlay, theme: &Theme, width: u16) -> u16 {
-    let (_, lines, _) = content_lines(overlay, theme, width as usize);
+pub fn overlay_height(
+    overlay: &Overlay,
+    theme: &Theme,
+    width: u16,
+    locale: crate::i18n::Locale,
+) -> u16 {
+    let (_, lines, _) = content_lines(overlay, theme, width as usize, locale);
     lines.len() as u16
 }
 
 /// Draw the active overlay centered over `area` (modal form, used on
 /// non-conversation screens).
-pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
+pub fn render_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    overlay: &Overlay,
+    theme: &Theme,
+    locale: crate::i18n::Locale,
+) {
     // No frame, for any of them. These surfaces sit in the composer's slot with
     // the conversation directly above; a box around them adds a border to
     // parse and a column of padding to nothing, and having some framed and
     // some bare made the same keys feel like different modes.
-    let (_, lines, _) = content_lines(overlay, theme, area.width as usize);
+    let (_, lines, _) = content_lines(overlay, theme, area.width as usize, locale);
     let h = (lines.len() as u16).min(area.height);
     let [row] = Layout::vertical([Constraint::Length(h)])
         .flex(Flex::End)
@@ -336,10 +353,18 @@ fn selection_content(
     (lines, cursor)
 }
 
-fn approval_content(ov: &ApprovalOverlay, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+fn approval_content(
+    ov: &ApprovalOverlay,
+    theme: &Theme,
+    width: usize,
+    locale: crate::i18n::Locale,
+) -> Vec<Line<'static>> {
     let req = &ov.request;
     let mut lines: Vec<Line> = Vec::new();
-    let action = tool_action(&req.tool);
+    // The tool's name in the words the transcript already uses (the taxonomy's
+    // presentation label), so the prompt reads as part of the conversation
+    // rather than as an internal identifier.
+    let action = crate::tool_taxonomy::presentation_label(&req.tool, locale);
     let head = format!("允许 {action}");
     // The command shares the headline and is elided rather than wrapped: this
     // prompt appears many times a session, and a growing block of shell text
@@ -405,20 +430,6 @@ fn approval_content(ov: &ApprovalOverlay, theme: &Theme, width: usize) -> Vec<Li
     lines
 }
 
-/// The tool's name in the words the transcript already uses, so the prompt
-/// reads as part of the conversation rather than as an internal identifier.
-fn tool_action(tool: &str) -> &str {
-    match tool {
-        "run_command" | "shell_command" => "执行命令",
-        "apply_patch" | "write_file" => "修改文件",
-        "read_file" => "读取文件",
-        "remember" => "写入记忆",
-        other => other,
-    }
-}
-
-
-
 fn help_line(theme: &Theme, text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
@@ -447,7 +458,7 @@ mod layout_tests {
     fn frame_of(ov: &Overlay, w: u16, h: u16) -> Vec<String> {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let theme = Theme::default();
-        term.draw(|f| render_overlay(f, f.area(), ov, &theme))
+        term.draw(|f| render_overlay(f, f.area(), ov, &theme, crate::i18n::Locale::Zh))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let mut out = Vec::new();

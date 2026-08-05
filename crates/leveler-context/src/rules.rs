@@ -141,14 +141,7 @@ fn push_if_present(root: &Path, rel: &str, out: &mut Vec<ProjectInstruction>) {
 }
 
 fn truncate(s: &str) -> String {
-    if s.len() <= MAX_RULE_BYTES {
-        return s.to_string();
-    }
-    let mut end = MAX_RULE_BYTES;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n… [rule truncated]", &s[..end])
+    leveler_core::truncate_head_bytes(s, MAX_RULE_BYTES, "\n… [rule truncated]")
 }
 
 /// Render instructions into a prompt block.

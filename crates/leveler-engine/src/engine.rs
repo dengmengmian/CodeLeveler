@@ -179,13 +179,11 @@ pub struct TaskReport {
     pub rounds: u32,
     /// Legacy review findings (unused; kept for report shape stability).
     pub review: Option<Vec<String>>,
-    /// Command-backed acceptance-criteria evidence (unused after orchestrate removal).
-    pub acceptance: Option<leveler_verifier::AcceptanceLedger>,
 }
 
 impl TaskReport {
     /// A report with the always-present fields set and the orchestration-only
-    /// extras (`verification`/`review`/`acceptance`) defaulted to `None`.
+    /// extras (`verification`/`review`) defaulted to `None`.
     /// Sites that produce those set them via `TaskReport { field: Some(..),
     /// ..TaskReport::new(..) }`, so a new optional field defaults in one place.
     pub(crate) fn new(
@@ -204,7 +202,6 @@ impl TaskReport {
             stop_detail: None,
             rounds,
             review: None,
-            acceptance: None,
         }
     }
 
@@ -1244,7 +1241,6 @@ impl TaskEngine {
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
             verification: Some(report),
-            acceptance: None,
             ..base
         })
     }

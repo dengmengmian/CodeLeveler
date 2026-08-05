@@ -518,27 +518,14 @@ fn utc_now_rfc3339() -> String {
 
 /// Best-effort `git rev-parse HEAD` from the process CWD (empty tree → None).
 fn git_head_sha() -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    command.args(["rev-parse", "HEAD"]);
-    scrub_command_env(&mut command);
-    let out = command.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let out = leveler_core::git_stdout(std::path::Path::new("."), &["rev-parse", "HEAD"])?;
+    let s = out.trim().to_string();
     if s.is_empty() { None } else { Some(s) }
 }
 
 fn scrub_command_env(command: &mut std::process::Command) {
     command.env_clear();
-    for (name, value) in leveler_core::environment().vars_os() {
-        if !name
-            .to_str()
-            .is_some_and(leveler_execution::is_credential_env_name)
-        {
-            command.env(name, value);
-        }
-    }
+    command.envs(leveler_core::scrubbed_environment());
 }
 
 /// Run every case against one model in an isolated temp repo.

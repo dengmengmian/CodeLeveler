@@ -356,40 +356,8 @@ pub fn slugify(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
-
-    async fn init_repo(dir: &Path) {
-        for args in [
-            vec!["init", "-q", "-b", "main"],
-            vec!["config", "user.email", "t@t"],
-            vec!["config", "user.name", "t"],
-        ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(dir)
-                .output()
-                .unwrap();
-        }
-    }
-
-    fn tmp(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        // Include the pid: the counter resets to 0 each run, so without it a
-        // panicked test's leftover dir (its cleanup is skipped) is reused by the
-        // next run — a stale git repo with a pre-existing branch/origin made
-        // `git push` flaky. Also clear any residue before use.
-        let d = std::env::temp_dir().join(format!(
-            "leveler-vcs-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
+    use crate::test_util::{init_repo, tmp};
 
     #[test]
     fn slugify_makes_branch_safe() {
@@ -403,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn branch_and_commit() {
         let dir = tmp("commit");
-        init_repo(&dir).await;
+        init_repo(&dir);
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         // initial commit so HEAD exists
         std::process::Command::new("git")
@@ -435,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn commits_only_specified_paths() {
         let dir = tmp("scoped");
-        init_repo(&dir).await;
+        init_repo(&dir);
         std::fs::write(dir.join("keep.txt"), "1").unwrap();
         std::process::Command::new("git")
             .args(["add", "-A"])
@@ -491,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn leveler_state_dir_is_never_committed() {
         let dir = tmp("exclude");
-        init_repo(&dir).await;
+        init_repo(&dir);
         std::fs::write(dir.join("code.rs"), "fn main() {}").unwrap();
         std::fs::create_dir_all(dir.join(".leveler")).unwrap();
         std::fs::write(dir.join(".leveler/state.db"), "internal").unwrap();
@@ -520,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn switching_to_an_existing_branch_does_not_recreate_it() {
         let dir = tmp("switch");
-        init_repo(&dir).await;
+        init_repo(&dir);
         std::fs::write(dir.join("a.txt"), "1").unwrap();
         for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
             std::process::Command::new("git")
@@ -561,7 +529,7 @@ mod tests {
             .unwrap();
 
         let dir = tmp("push");
-        init_repo(&dir).await;
+        init_repo(&dir);
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         std::process::Command::new("git")
             .args(["add", "-A"])

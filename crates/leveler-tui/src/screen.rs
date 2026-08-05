@@ -263,14 +263,6 @@ pub const SLASH_DEFS: &[SlashDef] = &[
     },
 ];
 
-/// Listed primary names in registry order (completion / help / exact-Enter).
-///
-/// Prefer [`SLASH_DEFS`] + [`is_known_slash_token`] for new code. Kept so tests
-/// and Enter-exact matching stay one call away from the listed surface.
-pub fn listed_slash_names() -> impl Iterator<Item = &'static str> {
-    SLASH_DEFS.iter().filter(|d| d.listed).map(|d| d.name)
-}
-
 /// All tokens (primary + aliases) that parse as local slash commands.
 pub fn all_slash_tokens() -> Vec<&'static str> {
     let mut out = Vec::with_capacity(SLASH_DEFS.len() * 2);

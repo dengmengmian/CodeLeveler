@@ -237,6 +237,10 @@ impl Tool for ApplyPatchTool {
         RiskLevel::WorkspaceWrite
     }
 
+    fn mutates_files(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -497,14 +501,9 @@ mod tests {
     }
 
     fn ctx() -> (ToolContext, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("leveler-patch-{}", super::super::test_ordinal()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        (
-            ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted),
-            dir,
+        super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("src/lib.rs", "fn a() {}\nfn b() {}\n")],
         )
     }
 
@@ -616,10 +615,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_patches_cannot_both_commit_from_the_same_version() {
         let (first, dir) = ctx();
-        let second = ToolContext::new(
-            leveler_execution::Workspace::new(&dir).unwrap(),
-            leveler_execution::PermissionProfile::Assisted,
-        );
+        let second =
+            super::super::test_ctx_in(&dir, leveler_execution::PermissionProfile::Assisted);
         // Both contexts read the file, so neither trips the in-process staleness
         // guard — the only thing that can reject a writer is the commit-time CAS.
         for c in [&first, &second] {
@@ -960,14 +957,11 @@ mod tests {
         // tolerances at once: an indented `*** Update File:` header and a
         // context-less pure addition (append at EOF) on a file that has NO
         // trailing newline. The result must be written correctly and normalized.
-        let dir = std::env::temp_dir().join(format!(
-            "leveler-patch-e2e-{}",
-            super::super::test_ordinal()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("notes.txt"), "alpha").unwrap(); // no trailing newline
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        let context = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        // "alpha" carries no trailing newline on purpose.
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("notes.txt", "alpha")],
+        );
 
         let patch =
             "*** Begin Patch\n  *** Update File: notes.txt\n@@\n+beta\n+gamma\n*** End Patch";

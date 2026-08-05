@@ -93,12 +93,9 @@ pub struct ReasoningConfig {
     pub effort: Option<ReasoningEffort>,
 }
 
-/// Provider-quirk configuration consumed by the compatibility middleware.
+/// Provider-quirk configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatibilityConfig {
-    /// Middleware names to apply, in order.
-    #[serde(default)]
-    pub middleware: Vec<String>,
     /// Synthesize stable tool-call ids when the provider omits them.
     #[serde(default)]
     pub synthesize_tool_call_ids: bool,
@@ -122,7 +119,6 @@ fn default_true() -> bool {
 impl Default for CompatibilityConfig {
     fn default() -> Self {
         Self {
-            middleware: Vec::new(),
             synthesize_tool_call_ids: false,
             drop_unsupported_fields: false,
             supports_temperature: true,
@@ -277,7 +273,6 @@ mod tests {
                 effort: Some(ReasoningEffort::High),
             },
             compatibility: CompatibilityConfig {
-                middleware: vec!["drop_temperature".to_string()],
                 synthesize_tool_call_ids: true,
                 drop_unsupported_fields: false,
                 // Non-default on purpose: a roundtrip that only ever sees the
@@ -316,7 +311,6 @@ mod tests {
     #[test]
     fn compatibility_config_defaults_are_empty() {
         let config: CompatibilityConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(config.middleware.is_empty());
         assert!(!config.synthesize_tool_call_ids);
         assert!(!config.drop_unsupported_fields);
     }

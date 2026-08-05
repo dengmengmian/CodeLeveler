@@ -132,35 +132,18 @@ impl Tool for GitDiffTool {
 mod tests {
     use super::*;
 
-    async fn git_repo() -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("leveler-git-{}", super::super::test_ordinal()));
-        std::fs::create_dir_all(&dir).unwrap();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "t@t"],
-            vec!["config", "user.name", "t"],
-        ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-        }
-        dir
-    }
-
     #[tokio::test]
     async fn status_reports_untracked() {
-        let dir = git_repo().await;
-        std::fs::write(dir.join("new.txt"), "x").unwrap();
-        let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let repo = leveler_test_support::git::scratch_repo();
+        std::fs::write(repo.path().join("new.txt"), "x").unwrap();
+        let ctx = super::super::test_ctx_in(
+            repo.path(),
+            leveler_execution::PermissionProfile::RequestApproval,
+        );
         let out = GitStatusTool
             .execute(serde_json::json!({}), ctx, CancellationToken::new())
             .await
             .unwrap();
         assert!(out.content.contains("new.txt"), "got: {}", out.content);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

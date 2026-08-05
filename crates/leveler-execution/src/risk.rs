@@ -78,10 +78,6 @@ impl PermissionProfile {
         !matches!(self, Self::FullAccess)
     }
 
-    /// Whether network is treated as freely allowed without a sandbox flag.
-    pub fn network_unrestricted(self) -> bool {
-        matches!(self, Self::FullAccess)
-    }
 }
 
 impl std::fmt::Display for PermissionProfile {

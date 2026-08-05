@@ -5,18 +5,16 @@
 //! [`ModelError`]. No crate that consumes these types is ever allowed to know
 //! which vendor produced them (spec §2.2).
 //!
-//! The three central traits also live here so they sit next to the types they
+//! The two central traits also live here so they sit next to the types they
 //! reference:
 //! - [`ModelRuntime`] — what the agent calls to talk to a model.
 //! - [`ProtocolAdapter`] — encodes/decodes a specific wire protocol (impl in
 //!   `leveler-protocol`).
-//! - [`CompatibilityMiddleware`] — patches per-provider quirks.
 #![forbid(unsafe_code)]
 
 pub mod error;
 pub mod event;
 pub mod message;
-pub mod middleware;
 pub mod profile;
 pub mod protocol;
 pub mod request;
@@ -30,7 +28,6 @@ pub use message::{
     ContentPart, ImageSource, Message, Role, ToolCall, ToolChoice, ToolDefinition,
     ToolResultContent,
 };
-pub use middleware::{CompatibilityContext, CompatibilityError, CompatibilityMiddleware};
 pub use profile::{
     CompatibilityConfig, ModelCapabilities, ModelLimits, ModelPricing, ModelProfile, ProtocolKind,
     ReasoningConfig, ReasoningEffort, ReasoningStyle,

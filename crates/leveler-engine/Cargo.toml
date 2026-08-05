@@ -30,3 +30,4 @@ tempfile = "3"
 
 [dev-dependencies]
 leveler-provider = { workspace = true }
+leveler-test-support = { workspace = true }

@@ -138,12 +138,6 @@ impl ToolContext {
         self
     }
 
-    /// Turn-scoped OS write confinement off (after approved `request_permissions`).
-    pub fn with_turn_unrestricted_fs(mut self, on: bool) -> Self {
-        self.turn_unrestricted_fs = on;
-        self
-    }
-
     /// Project memory store directory (active/ + archive/).
     pub fn with_memory_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.memory_root = Some(root.into());
@@ -187,13 +181,6 @@ impl ToolContext {
         self.command_write_allowlist = allowlist.map(Arc::new);
         self.command_modified_files_remaining = modified_files_remaining;
         self.command_previously_modified = Arc::new(previously_modified);
-        self
-    }
-
-    /// Build a context sharing an existing checkpoint (so a whole session's
-    /// writes accumulate into one rollback point).
-    pub fn with_checkpoint(mut self, checkpoint: Arc<Checkpoint>) -> Self {
-        self.checkpoint = checkpoint;
         self
     }
 
@@ -297,6 +284,26 @@ pub trait Tool: Send + Sync {
     /// commands, plan updates, checkpoints — MUST leave this `false` so the
     /// executor keeps running it in order.
     fn supports_parallel(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool edits workspace files through its own arguments (a
+    /// patch, a replacement), as opposed to a command that happens to write.
+    ///
+    /// The agent loop reads this instead of matching on tool names, so it
+    /// charges the per-step file budget, records a mutation on the evidence
+    /// ledger, and re-fingerprints touched files for any such tool — including
+    /// ones registered outside this crate.
+    fn mutates_files(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool executes a shell command.
+    ///
+    /// The agent loop reads this instead of matching on tool names, so command
+    /// budgets, verification detection, and the failing-command stagnation
+    /// signal apply to any command-executing tool.
+    fn runs_command(&self) -> bool {
         false
     }
 

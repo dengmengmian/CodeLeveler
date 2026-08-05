@@ -62,14 +62,7 @@ impl McpClient {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         cmd.env_clear();
-        for (name, value) in leveler_core::environment().vars_os() {
-            if !name
-                .to_str()
-                .is_some_and(leveler_execution::is_credential_env_name)
-            {
-                cmd.env(name, value);
-            }
-        }
+        cmd.envs(leveler_core::scrubbed_environment());
         // Explicit MCP configuration is the only way to grant a credential to
         // the server; apply it after removing inherited secrets.
         for (k, v) in &cfg.env {

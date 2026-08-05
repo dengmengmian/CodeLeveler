@@ -340,14 +340,6 @@ impl Application {
         top_level_limits_from_config(&self.project_config().limits)
     }
 
-    /// Look up the provider config backing a model reference.
-    pub fn provider_for(&self, model: &ModelRef) -> Option<&ProviderConfig> {
-        self.config
-            .providers
-            .iter()
-            .find(|p| p.id == model.provider)
-    }
-
     /// Connect to the configured MCP servers once and cache their tools, so
     /// every turn reuses the same connections instead of respawning processes.
     async fn mcp_tools(&self) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {

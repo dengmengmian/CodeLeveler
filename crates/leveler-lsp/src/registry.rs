@@ -59,14 +59,7 @@ fn resolve_rust_analyzer() -> String {
     let mut command = std::process::Command::new("rustc");
     command.args(["--print", "sysroot"]);
     command.env_clear();
-    for (name, value) in leveler_core::environment().vars_os() {
-        if !name
-            .to_str()
-            .is_some_and(leveler_execution::is_credential_env_name)
-        {
-            command.env(name, value);
-        }
-    }
+    command.envs(leveler_core::scrubbed_environment());
     if let Ok(out) = command.output()
         && out.status.success()
     {

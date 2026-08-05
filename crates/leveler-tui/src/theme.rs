@@ -236,12 +236,6 @@ impl Theme {
         leveler_core::environment().var_os("NO_COLOR").is_some()
     }
 
-    /// Pick the theme from the environment only: `NO_COLOR` forces monochrome,
-    /// otherwise Ion.
-    pub fn from_env() -> Self {
-        Self::resolve(ThemeId::Ion, Self::env_no_color())
-    }
-
     /// Whether this palette is monochrome (no meaningful color).
     pub fn is_monochrome(&self) -> bool {
         self.monochrome

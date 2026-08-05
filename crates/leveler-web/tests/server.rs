@@ -685,42 +685,20 @@ async fn git_status_is_empty_outside_a_git_repo() {
     assert_eq!(body, serde_json::json!({ "branch": null, "files": [] }));
 }
 
-/// Run one git command during test setup; false when git is unavailable.
-fn git(repo: &Path, args: &[&str]) -> bool {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
 #[tokio::test]
 async fn git_status_summarizes_changes_in_a_git_repo() {
+    use leveler_test_support::git::{run, try_run};
+
     let probe = tempfile::tempdir().unwrap();
-    if !git(probe.path(), &["init"]) {
+    if !try_run(probe.path(), &["init", "-q"]) {
         eprintln!("git is not available; skipping the git-repo case");
         return;
     }
     let server = TestServer::start().await;
-    let repo = tempfile::tempdir().unwrap();
-    assert!(git(repo.path(), &["init"]));
+    let repo = leveler_test_support::git::scratch_repo();
     std::fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
-    assert!(git(repo.path(), &["add", "tracked.txt"]));
-    assert!(git(
-        repo.path(),
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ]
-    ));
+    run(repo.path(), &["add", "tracked.txt"]);
+    run(repo.path(), &["commit", "-qm", "init"]);
     std::fs::write(repo.path().join("tracked.txt"), "one\ntwo\n").unwrap();
     std::fs::write(repo.path().join("fresh.rs"), "fn fresh() {}\n").unwrap();
     use_repository(&server, repo.path()).await;

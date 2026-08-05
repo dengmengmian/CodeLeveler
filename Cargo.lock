@@ -1911,6 +1911,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "uuid",
 ]
@@ -1929,6 +1930,7 @@ dependencies = [
  "leveler-model",
  "leveler-provider",
  "leveler-storage",
+ "leveler-test-support",
  "leveler-tools",
  "leveler-verifier",
  "serde",
@@ -1958,6 +1960,7 @@ dependencies = [
  "async-trait",
  "cap-std",
  "leveler-core",
+ "leveler-test-support",
  "libc",
  "nix 0.29.0",
  "process-wrap",
@@ -2006,7 +2009,6 @@ name = "leveler-lsp"
 version = "0.1.4"
 dependencies = [
  "leveler-core",
- "leveler-execution",
  "leveler-project",
  "serde",
  "serde_json",
@@ -2224,6 +2226,7 @@ dependencies = [
  "leveler-model",
  "leveler-project",
  "leveler-skills",
+ "leveler-test-support",
  "reqwest",
  "rustix 1.1.4",
  "schemars",
@@ -2311,6 +2314,7 @@ dependencies = [
  "leveler-project",
  "leveler-session-wire",
  "leveler-storage",
+ "leveler-test-support",
  "mime_guess",
  "reqwest",
  "rust-embed",

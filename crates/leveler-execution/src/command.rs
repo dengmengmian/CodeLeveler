@@ -14,29 +14,10 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-/// Environment variables scrubbed from every spawned process so provider
-/// credentials never leak into tool subprocesses.
-const SECRET_ENV_DENYLIST: &[&str] = &[
-    "DEEPSEEK_API_KEY",
-    "BIGMODEL_API_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
-    "GROQ_API_KEY",
-];
-
-/// Whether an environment variable name looks like a credential. Applied to
-/// every spawned child in addition to the explicit denylists.
-pub fn is_credential_env_name(name: &str) -> bool {
-    const SECRET_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL"];
-    let normalized = name.to_ascii_uppercase();
-    SECRET_ENV_DENYLIST.contains(&normalized.as_str())
-        || SECRET_SUFFIXES.iter().any(|s| normalized.ends_with(s))
-        || matches!(
-            normalized.as_str(),
-            "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN"
-        )
-}
+// The credential-name policy lives in `leveler-core` (next to the environment
+// snapshot it filters); re-exported here so existing callers keep working.
+pub use leveler_core::is_credential_env_name;
+use leveler_core::environment::SECRET_ENV_DENYLIST;
 
 /// Credential-like variables currently present in the parent environment,
 /// plus caller-declared names. External subprocess adapters use this one policy

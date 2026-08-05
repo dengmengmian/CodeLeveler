@@ -40,14 +40,6 @@ impl ObjectiveAnchor {
         Self::new(text, ObjectiveSource::SessionGoal)
     }
 
-    pub fn for_continue(text: impl Into<String>, version: u32) -> Self {
-        Self {
-            text: text.into(),
-            version: version.max(1),
-            source: ObjectiveSource::ContinueActive,
-        }
-    }
-
     pub fn text(&self) -> &str {
         self.text.as_str()
     }

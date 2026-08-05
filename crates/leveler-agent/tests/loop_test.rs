@@ -5793,3 +5793,61 @@ async fn plan_complete_then_repeated_execute_stops() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The round-limit exit is the last thing a drive does; it must still publish
+/// the epoch spend it just synced. The final round's tool phase (its edits and
+/// commands) lands in the ledger only on that exit, so skipping the
+/// `ProgressUpdated` leaves every observer — TUI footer, event log, the next
+/// turn's resume seed — one tool phase behind what the outcome reports.
+#[tokio::test]
+async fn round_limit_exit_publishes_the_final_epoch_spend() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-round-limit-progress-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
+    // One round only: the edit happens in the final round's tool phase, after
+    // the in-loop sync, so only the exit sync can account for it.
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
+        "c1",
+        "apply_patch",
+        serde_json::json!({ "patch": patch }),
+    )]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        1,
+    );
+
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let outcome = executor
+        .run(
+            "edit the file",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let last_published = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::ProgressUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .expect("the drive must publish at least one ProgressUpdated");
+
+    assert_eq!(
+        last_published.cumulative_modified_files, outcome.progress.cumulative_modified_files,
+        "the last published ledger must match the returned outcome; the exit \
+         sync_epoch_progress was not followed by a ProgressUpdated"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -10,7 +10,6 @@ description = "A Language Server Protocol client: symbols, definitions, and diag
 
 [dependencies]
 leveler-core = { workspace = true }
-leveler-execution = { workspace = true }
 leveler-project = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

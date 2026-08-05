@@ -16,6 +16,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 schemars = { workspace = true, optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 # Derives `JsonSchema` on the shared id types so the client protocol can export
 # JSON Schema artifacts. Off by default: shipped binaries never pay for it.

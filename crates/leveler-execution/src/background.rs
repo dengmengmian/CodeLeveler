@@ -586,12 +586,11 @@ async fn append_log(reg: &Arc<Mutex<RegistryState>>, id: &str, bytes: &[u8]) {
 
 fn truncate_log(log: &mut String) {
     if log.len() > MAX_LOG_BYTES {
-        let overflow = log.len() - MAX_LOG_BYTES;
-        let mut keep_from = overflow;
-        while !log.is_char_boundary(keep_from) {
-            keep_from += 1;
-        }
-        *log = format!("…[truncated {keep_from} bytes]…{}", &log[keep_from..]);
+        // The marker embeds the dropped byte count, which depends on the
+        // boundary-adjusted cut point — compute it first, then truncate.
+        let dropped = leveler_core::ceil_char_boundary(log, log.len() - MAX_LOG_BYTES);
+        let marker = format!("…[truncated {dropped} bytes]…");
+        *log = leveler_core::truncate_tail_bytes(log, MAX_LOG_BYTES, &marker);
     }
 }
 
@@ -773,16 +772,11 @@ mod tests {
     async fn mutation_baseline_is_taken_once() {
         use crate::snapshot::WorkspaceSnapshot;
 
-        let dir = tempfile::tempdir().expect("tempdir");
         // git repo so we can capture a real SnapshotId
-        let out = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("git init -q && git config user.email t@t && git config user.name t && echo x > a && git add -A && git commit -qm i")
-            .current_dir(dir.path())
-            .output()
-            .await
-            .expect("git init");
-        assert!(out.status.success(), "git init failed");
+        let dir = leveler_test_support::git::scratch_repo();
+        std::fs::write(dir.path().join("a"), "x\n").expect("seed file");
+        leveler_test_support::git::run(dir.path(), &["add", "-A"]);
+        leveler_test_support::git::run(dir.path(), &["commit", "-qm", "i"]);
         let snap = WorkspaceSnapshot::capture(dir.path())
             .await
             .expect("capture")

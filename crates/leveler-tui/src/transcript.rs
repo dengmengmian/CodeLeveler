@@ -8,17 +8,6 @@ use leveler_client_protocol::{MessageId, ToolCallId, UiCompletionReport};
 
 use crate::markdown::MdDoc;
 
-/// The welcome header, shown once at the top of a new session .
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WelcomeBlock {
-    pub version: String,
-    pub user: String,
-    pub model: String,
-    pub mode: String,
-    pub repository: String,
-    pub branch: Option<String>,
-}
-
 /// A streaming assistant message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantBlock {
@@ -116,6 +105,8 @@ pub struct SubAgentProgress {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubAgentBlock {
     pub id: String,
+    /// Show the full result instead of the first few lines (Ctrl+O).
+    pub expanded: bool,
     pub nickname: String,
     pub role: String,
     pub status: ToolStatus,
@@ -143,7 +134,6 @@ pub struct BtwBlock {
 /// One block in the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
-    Welcome(WelcomeBlock),
     User(String),
     Assistant(AssistantBlock),
     ToolGroup(ToolGroupBlock),
@@ -200,19 +190,6 @@ impl TranscriptState {
 
     pub fn len(&self) -> usize {
         self.items.len()
-    }
-
-    /// Insert the welcome block at the top, once.
-    pub fn push_welcome(&mut self, block: WelcomeBlock) {
-        self.bump();
-        if self
-            .items
-            .iter()
-            .any(|i| matches!(i, TranscriptItem::Welcome(_)))
-        {
-            return;
-        }
-        self.items.insert(0, TranscriptItem::Welcome(block));
     }
 
     pub fn push_user(&mut self, text: String) {
@@ -493,32 +470,27 @@ impl TranscriptState {
         }
     }
 
-    /// Toggle expand/collapse on the latest tool group only.
+    /// Toggle expand/collapse on whichever collapsible block came last.
     ///
-    /// Returns the new expanded state of that group, or `None` when there is
-    /// no tool group to toggle.
+    /// Tool groups and sub-agents both fold their detail away once finished, so
+    /// one key opens whichever one you are looking at. Returns the new expanded
+    /// state, or `None` when there is nothing collapsible.
     pub fn toggle_last_tool_group(&mut self) -> Option<bool> {
         self.bump();
         for item in self.items.iter_mut().rev() {
-            if let TranscriptItem::ToolGroup(group) = item {
-                group.expanded = !group.expanded;
-                return Some(group.expanded);
+            match item {
+                TranscriptItem::ToolGroup(group) => {
+                    group.expanded = !group.expanded;
+                    return Some(group.expanded);
+                }
+                TranscriptItem::SubAgent(block) => {
+                    block.expanded = !block.expanded;
+                    return Some(block.expanded);
+                }
+                _ => {}
             }
         }
         None
-    }
-
-    /// Apply expand/collapse to every tool group.
-    ///
-    /// Not used by the Ctrl+O binding (that toggles only the latest group via
-    /// [`Self::toggle_last_tool_group`]); kept for bulk UI actions / tests.
-    pub fn set_all_tool_groups_expanded(&mut self, expanded: bool) {
-        self.bump();
-        for item in &mut self.items {
-            if let TranscriptItem::ToolGroup(group) = item {
-                group.expanded = expanded;
-            }
-        }
     }
 
     /// Dismiss the latest finished `/btw` card (done or failed). Returns true
@@ -588,6 +560,7 @@ impl TranscriptState {
         }
         self.close_tool_group();
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
+            expanded: false,
             id,
             nickname,
             role,
@@ -617,6 +590,7 @@ impl TranscriptState {
         }
         self.close_tool_group();
         self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
+            expanded: false,
             id: id.to_string(),
             nickname: nickname.to_string(),
             role: String::new(),

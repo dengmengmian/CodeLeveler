@@ -251,15 +251,11 @@ fn fallback_centered(
     out
 }
 
+// Width helpers are the shared render ones (see `crate::render`); the wrappers
+// below only keep splash call sites short. `truncate_display` also flattens
+// control chars, so a pathological path name can no longer corrupt the box.
 fn center_line(s: &str, width: usize, style: Style) -> Line<'static> {
-    let w = disp_w(s);
-    let pad = width.saturating_sub(w) / 2;
-    let mut spans = Vec::new();
-    if pad > 0 {
-        spans.push(Span::raw(" ".repeat(pad)));
-    }
-    spans.push(Span::styled(s.to_string(), style));
-    Line::from(spans)
+    Line::from(Span::styled(crate::render::center_display(s, width), style))
 }
 
 fn disp_w(s: &str) -> usize {
@@ -268,35 +264,12 @@ fn disp_w(s: &str) -> usize {
 
 /// Pad `s` on the right with spaces to reach `target` display columns.
 fn pad_to(s: &str, target: usize) -> String {
-    let w = disp_w(s);
-    if w >= target {
-        s.to_string()
-    } else {
-        format!("{s}{}", " ".repeat(target - w))
-    }
+    crate::render::pad_to_width(s, target)
 }
 
 /// Truncate `s` to at most `max` display columns, adding `…` when clipped.
 fn truncate_w(s: &str, max: usize) -> String {
-    if disp_w(s) <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
-        if w + cw > budget {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out.push('…');
-    out
+    crate::render::truncate_display(s, max)
 }
 
 #[cfg(test)]

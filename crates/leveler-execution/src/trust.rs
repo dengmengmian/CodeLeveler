@@ -150,15 +150,6 @@ impl TrustStore {
         self.file.repos.remove(&repo_key(repo_root)).is_some()
     }
 
-    /// Digest recorded for `relative`, if any (for `leveler trust` output).
-    pub fn recorded_digest(&self, repo_root: &Path, relative: &str) -> Option<&str> {
-        self.file
-            .repos
-            .get(&repo_key(repo_root))
-            .and_then(|files| files.get(relative))
-            .map(String::as_str)
-    }
-
     pub fn save(&self) -> Result<(), TrustError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;

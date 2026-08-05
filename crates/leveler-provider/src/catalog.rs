@@ -80,7 +80,6 @@ limits:
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 1
 compatibility:
-  middleware: []
   synthesize_tool_call_ids: true
   drop_unsupported_fields: true
 "#;
@@ -116,7 +115,6 @@ limits:
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 4
 compatibility:
-  middleware: []
   synthesize_tool_call_ids: true
   drop_unsupported_fields: true
 "#;

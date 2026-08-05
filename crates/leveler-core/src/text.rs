@@ -95,6 +95,60 @@ fn neutralize_controls(input: &str) -> String {
         .collect()
 }
 
+/// Largest char-boundary index `<= i` (clamped to `s.len()`).
+///
+/// Stable stand-in for the unstable `str::floor_char_boundary`.
+pub fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest char-boundary index `>= i` (clamped to `s.len()`).
+///
+/// Stable stand-in for the unstable `str::ceil_char_boundary`.
+pub fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(s.len())
+}
+
+/// Keep the head of `s`, budgeted by bytes, and append `marker` when truncated.
+///
+/// - Returns `s` unchanged (no marker) when `s.len() <= max_bytes`.
+/// - The cut point backs off to a char boundary, so at most `max_bytes` bytes
+///   of content are kept; the marker is appended *on top of* the budget.
+/// - `max_bytes == 0` yields the marker alone (for non-empty `s`).
+pub fn truncate_head_bytes(s: &str, max_bytes: usize, marker: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let end = floor_char_boundary(s, max_bytes);
+    format!("{}{marker}", &s[..end])
+}
+
+/// Keep the tail of `s`, budgeted by bytes, and prepend `marker` when truncated
+/// (for output whose interesting part is at the end, e.g. compiler errors).
+///
+/// - Returns `s` unchanged (no marker) when `s.len() <= max_bytes`.
+/// - The cut point advances to a char boundary, so at most `max_bytes` bytes
+///   of content are kept; the marker is prepended *on top of* the budget.
+/// - `max_bytes == 0` yields the marker alone (for non-empty `s`).
+pub fn truncate_tail_bytes(s: &str, max_bytes: usize, marker: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let start = ceil_char_boundary(s, s.len() - max_bytes);
+    format!("{marker}{}", &s[start..])
+}
+
 /// Redact common secret shapes before persistence (messages, events, artifacts).
 ///
 /// Heuristic and deliberately conservative: prefer over-redacting known key
@@ -530,5 +584,81 @@ mod tests {
     fn leaves_ordinary_text_alone() {
         let raw = "run cargo test in src/lib.rs";
         assert_eq!(redact_secrets(raw), raw);
+    }
+
+    #[test]
+    fn floor_boundary_clamps_down_and_ceil_clamps_up() {
+        let s = "aé"; // 'a' at 0, 'é' occupies bytes 1..3.
+        assert_eq!(floor_char_boundary(s, 2), 1);
+        assert_eq!(ceil_char_boundary(s, 2), 3);
+        // Already on a boundary: unchanged.
+        assert_eq!(floor_char_boundary(s, 1), 1);
+        assert_eq!(ceil_char_boundary(s, 1), 1);
+        // Past the end: clamp to len.
+        assert_eq!(floor_char_boundary(s, 10), 3);
+        assert_eq!(ceil_char_boundary(s, 10), 3);
+        // Empty string.
+        assert_eq!(floor_char_boundary("", 0), 0);
+        assert_eq!(ceil_char_boundary("", 5), 0);
+    }
+
+    #[test]
+    fn head_truncation_keeps_prefix_and_appends_marker() {
+        assert_eq!(truncate_head_bytes("abcdef", 3, "…"), "abc…");
+    }
+
+    #[test]
+    fn head_truncation_leaves_short_input_alone() {
+        assert_eq!(truncate_head_bytes("abc", 3, "…"), "abc");
+        assert_eq!(truncate_head_bytes("abc", 10, "…"), "abc");
+        assert_eq!(truncate_head_bytes("", 0, "…"), "");
+    }
+
+    #[test]
+    fn head_truncation_backs_off_to_char_boundary() {
+        // 'é' is 2 bytes; cutting at 3 lands mid-'é' (bytes 2..4).
+        let s = "aéé";
+        let out = truncate_head_bytes(s, 3, "…");
+        assert_eq!(out, "aé…");
+        // First char multibyte, cut inside it: keep nothing, marker only.
+        let out = truncate_head_bytes("é9", 1, "…");
+        assert_eq!(out, "…");
+    }
+
+    #[test]
+    fn head_truncation_with_zero_budget_yields_marker_only() {
+        assert_eq!(truncate_head_bytes("abc", 0, "[cut]"), "[cut]");
+    }
+
+    #[test]
+    fn head_truncation_marker_longer_than_budget_is_kept_whole() {
+        // The marker is on top of max_bytes by contract, never trimmed.
+        assert_eq!(truncate_head_bytes("abcdef", 2, "[truncated]"), "ab[truncated]");
+    }
+
+    #[test]
+    fn tail_truncation_keeps_suffix_and_prepends_marker() {
+        assert_eq!(truncate_tail_bytes("abcdef", 3, "…"), "…def");
+    }
+
+    #[test]
+    fn tail_truncation_leaves_short_input_alone() {
+        assert_eq!(truncate_tail_bytes("abc", 3, "…"), "abc");
+        assert_eq!(truncate_tail_bytes("abc", 10, "…"), "abc");
+        assert_eq!(truncate_tail_bytes("", 0, "…"), "");
+    }
+
+    #[test]
+    fn tail_truncation_advances_to_char_boundary() {
+        // "ééa": bytes 0..2, 2..4, 4..5. max=3 → cut at 2, already a boundary.
+        assert_eq!(truncate_tail_bytes("ééa", 3, "…"), "…éa");
+        // max=2 on "aé9": cut at 1 lands mid-'é'? No — 'é' is 1..3, cut = 3-2 = 1
+        // is a boundary. Use "éé": max=3 → cut at 1, mid first 'é', advance to 2.
+        assert_eq!(truncate_tail_bytes("éé", 3, "…"), "…é");
+    }
+
+    #[test]
+    fn tail_truncation_with_zero_budget_yields_marker_only() {
+        assert_eq!(truncate_tail_bytes("abc", 0, "[cut]"), "[cut]");
     }
 }

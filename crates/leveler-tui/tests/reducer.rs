@@ -108,11 +108,8 @@ fn session_opened_sets_labels_without_welcome_card() {
     assert_eq!(s.mode_label, "Assisted");
     assert_eq!(s.branch.as_deref(), Some("main"));
     assert!(
-        !s.transcript
-            .items()
-            .iter()
-            .any(|i| matches!(i, TranscriptItem::Welcome(_))),
-        "welcome card must not be injected"
+        s.transcript.is_empty(),
+        "no welcome card or other blocks may be injected on open"
     );
 }
 

@@ -94,43 +94,6 @@ impl FromStr for WorkProfile {
     }
 }
 
-/// Which tool definitions the model sees each round.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolSurface {
-    /// Core tools only; expand_tools can grow the surface mid-session.
-    Core,
-    /// Full built-in registry (historical default).
-    #[default]
-    Full,
-}
-
-impl ToolSurface {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Core => "core",
-            Self::Full => "full",
-        }
-    }
-}
-
-impl FromStr for ToolSurface {
-    type Err = UnknownVariant;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "core" => Self::Core,
-            "full" => Self::Full,
-            other => {
-                return Err(UnknownVariant {
-                    kind: "tool surface",
-                    value: other.to_string(),
-                });
-            }
-        })
-    }
-}
-
 /// Counters for continuous-use / latency hard gates (S0/S3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepthUseMetrics {
@@ -149,13 +112,6 @@ pub struct DepthUseMetrics {
     pub model_tokens: u64,
 }
 
-impl DepthUseMetrics {
-    /// Hint for epoch accumulation when detailed usage is sparse.
-    pub fn model_tokens_hint(&self) -> u64 {
-        self.model_tokens
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,7 +120,6 @@ mod tests {
     fn defaults_are_balanced_chat() {
         assert_eq!(WorkProfile::default(), WorkProfile::Balanced);
         assert_eq!(CollaborationMode::default(), CollaborationMode::Chat);
-        assert_eq!(ToolSurface::default(), ToolSurface::Full);
     }
 
     #[test]

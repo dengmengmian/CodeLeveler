@@ -58,8 +58,6 @@ pub fn item_render(
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     match item {
-        // Welcome card retired — workbench Header + Input replace it.
-        TranscriptItem::Welcome(_) => {}
         TranscriptItem::User(text) => {
             // A continuous heading left-bar + bold text marks a user turn clearly
             // apart from the assistant's "●" bullet + normal-weight prose.
@@ -566,11 +564,28 @@ fn sub_agent_lines(
     let detail = displayed_detail.trim();
     if !detail.is_empty() {
         let inner = wrap_width.saturating_sub(2).max(1);
-        for line in wrap(detail, inner) {
+        let rows = wrap(detail, inner);
+        // The runtime hands back whatever the agent wrote. Rendering all of it
+        // lets one delegated task push the conversation off screen; dropping it
+        // silently would be worse. Bound it, mark the cut, and let Ctrl+O read
+        // the rest.
+        const MAX_ROWS: usize = 4;
+        let cut = !block.expanded && rows.len() > MAX_ROWS;
+        let shown = if cut { MAX_ROWS } else { rows.len() };
+        for line in rows.iter().take(shown) {
             out.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(line, Style::default().fg(theme.muted)),
+                Span::styled(line.clone(), Style::default().fg(theme.muted)),
             ]));
+        }
+        if cut {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    t.fold_more_lines.replace("{}", &(rows.len() - shown).to_string())
+                ),
+                Style::default().fg(theme.dim),
+            )));
         }
     }
 }
@@ -1069,7 +1084,64 @@ mod tests {
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            expanded: false,
         }
+    }
+
+    #[test]
+    fn a_long_sub_agent_result_is_bounded_and_says_so() {
+        // The runtime hands back whatever the agent wrote. Rendering all of it
+        // lets one delegated task push the conversation off screen; dropping it
+        // silently would be worse. Bound it and mark the cut.
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+        a.detail = (1..=20)
+            .map(|i| format!("结论第 {i} 条，这一行足够长以至于会占满整行宽度不会被合并"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = sub_agent_tree_lines(&[&a], &theme, 80, t, 0);
+        assert!(
+            lines.len() <= 6,
+            "a finished sub-agent must not flood the transcript, got {} rows",
+            lines.len()
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("Ctrl+O"), "the cut must offer a way back: {text}");
+    }
+
+    #[test]
+    fn expanding_a_sub_agent_shows_its_whole_result() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+        a.detail = (1..=20)
+            .map(|i| format!("结论第 {i} 条"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        a.expanded = true;
+        let lines = sub_agent_tree_lines(&[&a], &theme, 80, t, 0);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("结论第 20 条"), "expanded must be complete: {text}");
+    }
+
+    #[test]
+    fn a_short_sub_agent_result_is_untouched() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+        let lines = sub_agent_tree_lines(&[&a], &theme, 80, t, 0);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(!text.contains("Ctrl+O"), "no cut, no hint: {text}");
     }
 
     #[test]

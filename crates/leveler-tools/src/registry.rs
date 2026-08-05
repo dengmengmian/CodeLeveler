@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use leveler_core::{ceil_char_boundary, floor_char_boundary};
 use leveler_execution::RiskLevel;
 use leveler_model::ToolDefinition;
 
@@ -29,6 +30,19 @@ impl ToolRegistry {
     /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
+    }
+
+    /// Whether `name` is a registered tool that edits workspace files.
+    /// See [`Tool::mutates_files`]. Unknown names are `false` — an unroutable
+    /// call is refused before it could mutate anything.
+    pub fn mutates_files(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.mutates_files())
+    }
+
+    /// Whether `name` is a registered tool that executes a shell command.
+    /// See [`Tool::runs_command`]. Unknown names are `false`.
+    pub fn runs_command(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.runs_command())
     }
 
     /// A registry containing only pure read-only tools — search, read, symbol
@@ -183,14 +197,14 @@ pub fn cap_output_with(s: &str, budget: usize) -> String {
     );
     let framing = largest_marker.len() + 2;
     if framing >= budget {
-        return s[..floor_boundary(s, budget)].to_string();
+        return s[..floor_char_boundary(s, budget)].to_string();
     }
 
     let keep = budget - framing;
     let head_budget = keep * 2 / 3;
     let tail_budget = keep - head_budget;
-    let head = floor_boundary(s, head_budget);
-    let tail = ceil_boundary(s, s.len() - tail_budget);
+    let head = floor_char_boundary(s, head_budget);
+    let tail = ceil_char_boundary(s, s.len() - tail_budget);
     let marker = format!(
         "… [{} bytes (~{} tokens) elided to fit the context] …",
         tail - head,
@@ -202,30 +216,13 @@ pub fn cap_output_with(s: &str, budget: usize) -> String {
     } else {
         // UTF-8 boundary rounding and a changing digit count should only save
         // space, but keep the hard invariant even if the marker format evolves.
-        s[..floor_boundary(s, budget)].to_string()
+        s[..floor_char_boundary(s, budget)].to_string()
     }
 }
 
 /// ~4 bytes/token heuristic — enough for "is it worth re-reading" decisions.
 pub(crate) fn approx_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4)
-}
-
-pub(crate) fn floor_boundary(s: &str, mut i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
-    }
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-pub(crate) fn ceil_boundary(s: &str, mut i: usize) -> usize {
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }
 
 /// Validate `instance` against `schema`, returning a readable error listing the
@@ -629,5 +626,30 @@ mod tests {
         assert!(reg.get("read_file").is_some());
         reg.register(tool);
         assert_eq!(reg.definitions().len(), 1);
+    }
+
+    /// The agent loop classifies calls through these two predicates instead of
+    /// matching tool names, so this registry is the single source of truth for
+    /// "does this call edit files / run a command". A built-in that silently
+    /// stops declaring its class would quietly drop out of the file and command
+    /// budgets, so pin both directions.
+    #[test]
+    fn builtin_tools_declare_their_effect_class() {
+        let reg = default_registry();
+        for name in ["apply_patch", "replace"] {
+            assert!(reg.mutates_files(name), "{name} must declare mutates_files");
+            assert!(!reg.runs_command(name), "{name} does not run a command");
+        }
+        for name in ["run_command", "shell_command"] {
+            assert!(reg.runs_command(name), "{name} must declare runs_command");
+            assert!(!reg.mutates_files(name), "{name} does not edit files itself");
+        }
+        for name in ["read_file", "grep", "list_files", "update_plan"] {
+            assert!(!reg.mutates_files(name), "{name} must not claim mutation");
+            assert!(!reg.runs_command(name), "{name} must not claim command");
+        }
+        // An unroutable name is refused before it can do anything.
+        assert!(!reg.mutates_files("no_such_tool"));
+        assert!(!reg.runs_command("no_such_tool"));
     }
 }

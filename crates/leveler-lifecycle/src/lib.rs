@@ -29,7 +29,7 @@ mod plan;
 mod progress;
 mod readiness;
 
-pub use axes::{CollaborationMode, DepthUseMetrics, ToolSurface, WorkProfile};
+pub use axes::{CollaborationMode, DepthUseMetrics, WorkProfile};
 pub use contract::TaskContract;
 pub use impact::{ChangeImpact, is_build_relevant};
 pub use ledger::{
@@ -39,8 +39,7 @@ pub use objective::{ObjectiveAnchor, ObjectiveSource};
 pub use plan::{PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 pub use readiness::{
-    GateConfig, ProcessEvidence, ReadinessFailure, TaskClass, check, check_goal_complete,
-    classify_task, task_looks_like_implementation,
+    GateConfig, ReadinessFailure, TaskClass, check, classify_task, task_looks_like_implementation,
 };
 
 use std::str::FromStr;

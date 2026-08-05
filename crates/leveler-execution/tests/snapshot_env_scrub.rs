@@ -1,17 +1,5 @@
 use leveler_execution::WorkspaceSnapshot;
-
-fn git(root: &std::path::Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+use leveler_test_support::git::run;
 
 #[tokio::test]
 async fn snapshot_git_does_not_pass_credentials_to_clean_filter() {
@@ -23,11 +11,8 @@ async fn snapshot_git_does_not_pass_credentials_to_clean_filter() {
         std::env::current_dir().unwrap_or_default(),
         std::env::temp_dir(),
     ));
-    let dir = tempfile::tempdir().unwrap();
+    let dir = leveler_test_support::git::scratch_repo();
     let captured = dir.path().join("captured.txt");
-    git(dir.path(), &["init", "-q"]);
-    git(dir.path(), &["config", "user.email", "t@t"]);
-    git(dir.path(), &["config", "user.name", "t"]);
     std::fs::write(dir.path().join("data.txt"), "value\n").unwrap();
     std::fs::write(dir.path().join(".gitattributes"), "*.txt filter=capture\n").unwrap();
     let filter = format!(
@@ -41,7 +26,7 @@ async fn snapshot_git_does_not_pass_credentials_to_clean_filter() {
     // var was properly scrubbed it also stays empty. The only way it gets
     // content is a credential leak.
     std::fs::write(&captured, "").unwrap();
-    git(dir.path(), &["config", "filter.capture.clean", &filter]);
+    run(dir.path(), &["config", "filter.capture.clean", &filter]);
     unsafe {
         std::env::set_var("LVTEST_SNAPSHOT_API_KEY", "must-not-leak");
     }

@@ -398,24 +398,6 @@ fn update_goal_is_blocked(arguments: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether this call is pure workspace exploration that should not clutter Conversation.
-pub fn is_exploration_tool(name: &str) -> bool {
-    matches!(
-        lookup(name).map(|e| e.kind),
-        Some(
-            ToolKind::Read
-                | ToolKind::ListDir
-                | ToolKind::Search
-                | ToolKind::Lsp
-                | ToolKind::WebSearch
-                | ToolKind::Media
-        )
-    ) || name == "read_file"
-        || name == "list_files"
-        || name == "grep"
-        || name == "find_files"
-}
-
 fn is_silent_shell_probe(name: &str, arguments: &str) -> bool {
     if name != "run_command" && name != "shell_command" {
         return false;
