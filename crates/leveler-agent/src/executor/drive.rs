@@ -1355,6 +1355,14 @@ impl Executor {
                     arguments: compact_json(&call.arguments),
                     parallel,
                 });
+                // Side-effect barrier, first wait: the announcing
+                // `ToolCallStarted` must be durable before ANYTHING can act on
+                // this call — authorize runs pre-tool hooks, which are external
+                // side effects themselves. A flush failure aborts the run
+                // before the tool executes (never a fake success).
+                if let Some(barrier) = &self.event_barrier {
+                    barrier.flush().await?;
+                }
                 collect_scoped_paths_from_call(&call, &mut scoped_paths);
 
                 // Build the effective context: apply turn grants from
@@ -1405,6 +1413,17 @@ impl Executor {
                             let mut ctx = ctx;
                             if call_needs_host_escape(&call) {
                                 ctx.turn_unrestricted_fs = true;
+                            }
+                            // Side-effect barrier, second wait: authorization
+                            // may have produced ApprovalRequested/Resolved —
+                            // the decision must be durable before the tool it
+                            // authorized can produce a side effect (else a
+                            // crash leaves an approved side effect that resume
+                            // sees as still pending approval). Parallel-batch
+                            // tools skip this: they are read-only and
+                            // side-effect-free by declaration.
+                            if let Some(barrier) = &self.event_barrier {
+                                barrier.flush().await?;
                             }
                             let files_before = modified_files.clone();
                             // Heartbeat: while a long command runs, emit a

@@ -29,9 +29,9 @@ pub use compaction::{
 };
 pub use executor::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
-    ClarificationRequest, Clarifier, ContinuationPolicy, Executor, ModelRequestRecord, NoopSink,
-    SteeringSource, StepLimits, StopReason, SubAgentExecutionPolicies, SubAgentExecutionPolicy,
-    TranscriptSink, TurnPolicy, closeout,
+    ClarificationRequest, Clarifier, ContinuationPolicy, EventBarrier, Executor,
+    ModelRequestRecord, NoopSink, SteeringSource, StepLimits, StopReason,
+    SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink, TurnPolicy, closeout,
 };
 pub use leveler_lifecycle::{
     CollaborationMode, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,

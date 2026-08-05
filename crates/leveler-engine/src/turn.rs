@@ -192,6 +192,11 @@ impl TurnRunner<'_> {
                     inner: self.clarifier.clone(),
                     events: events.clone(),
                     turn_id: turn_id.clone(),
+                }))
+                // Side-effect barrier: tool dispatch waits until the announcing
+                // canonical events are durable in this turn's event log.
+                .with_event_barrier(Arc::new(crate::recorders::PumpBarrier {
+                    events: events.clone(),
                 }));
             // Resume / same unfinished task: seed Plan/Ledger/Progress so
             // Delivery and closeout stay consistent. Fresh Content turns must
@@ -276,10 +281,23 @@ impl TurnRunner<'_> {
 
         // Persist-then-forward each pumped event, in emission order. A
         // persistence failure stops persisting but keeps draining so the
-        // executor never blocks; the error aborts the turn afterwards.
+        // executor never blocks; the error aborts the turn afterwards. Flush
+        // markers (the side-effect barrier) are acknowledged with the current
+        // persistence state: after a failed append the barrier reports the
+        // failure, so the executor refuses to run the tool it was announcing.
         let pump = async {
             let mut result: Result<(), EngineError> = Ok(());
-            while let Some(mut event) = rx.recv().await {
+            while let Some(item) = rx.recv().await {
+                let mut event = match item {
+                    crate::recorders::PumpItem::Event(event) => event,
+                    crate::recorders::PumpItem::Flush(ack) => {
+                        let _ = ack.send(match &result {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(error.to_string()),
+                        });
+                        continue;
+                    }
+                };
                 if let EngineEvent::ToolCallStarted { name, risk, .. } = &mut event {
                     *risk = self.factory.registry.get(name).map(|tool| tool.risk());
                 }

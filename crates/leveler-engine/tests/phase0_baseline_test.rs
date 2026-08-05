@@ -1,15 +1,12 @@
-//! Phase 0 baseline characterization tests (core-runtime-convergence-plan).
+//! Phase 0/1 baseline characterization tests (core-runtime-convergence-plan).
 //!
-//! These tests LOCK today's observable semantics before any architecture
-//! change. Two of them intentionally document a known gap:
-//!
-//! 1. `tool_side_effect_can_precede_durable_tool_call_started` proves the
-//!    crash window that phase 1 will close: the executor announces a tool
-//!    call through a fire-and-forget observer and dispatches the tool
-//!    without waiting for the `ToolCallStarted` event to become durable.
-//!    When phase 1 lands, the assertion in this test must be INVERTED —
-//!    a failing run of this test is the expected signal that the barrier
-//!    now exists.
+//! 1. `tool_side_effect_cannot_precede_durable_tool_call_started` is the
+//!    phase 1 side-effect barrier contract: the executor must not dispatch
+//!    a tool until the announcing `ToolCallStarted` event is durable. In
+//!    phase 0 this test was the inverse — it deterministically PROVED the
+//!    crash window (side effect observable while the started row was held
+//!    un-durable). Phase 1 closed the window, so the assertions flipped,
+//!    exactly as the phase 0 version said they must.
 //!
 //! 2. `blocked_goal_collapses_to_failed_at_the_task_level` documents that
 //!    `update_goal(blocked)` is only discriminable from failure via the
@@ -168,12 +165,12 @@ impl EventStore for GatedStartedStore {
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         if event_type == "tool_call_started" {
-            // Hold the durable write open and watch the workspace. If the
-            // side-effect barrier existed, the executor could not reach the
-            // tool until this append returned, so the marker could never
-            // appear while we wait here.
+            // Hold the durable write open and watch the workspace. The
+            // side-effect barrier means the executor cannot reach the tool
+            // until this append returns, so the marker must never appear
+            // while we wait here.
             let mut observed = false;
-            for _ in 0..2000 {
+            for _ in 0..300 {
                 let content = std::fs::read_to_string(&self.watched).unwrap_or_default();
                 if content.contains(self.marker) {
                     observed = true;
@@ -294,15 +291,17 @@ fn patch_response() -> ModelResponse {
 }
 
 // ---------------------------------------------------------------------------
-// 1. The phase-1 crash window, reproduced deterministically.
+// 1. The phase-1 side-effect barrier, verified deterministically.
 // ---------------------------------------------------------------------------
 
-/// CURRENT behavior (phase 0 baseline): the tool's side effect lands in the
-/// workspace while the `ToolCallStarted` row is still un-durable. A process
-/// crash in that window leaves a side effect with NO dangling-call record,
-/// so resume reconciliation cannot see it. Phase 1 must invert this test.
+/// Phase 1 contract: the tool's side effect must NOT be observable while the
+/// `ToolCallStarted` row is still un-durable. A process crash before the
+/// started row commits therefore leaves no unrecorded side effect, and every
+/// side effect that did happen has a dangling-call record for reconciliation.
+/// (The phase 0 version of this test proved the opposite — the crash window —
+/// with the same gated store.)
 #[tokio::test]
-async fn tool_side_effect_can_precede_durable_tool_call_started() {
+async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
     let h = harness(vec![patch_response(), text("done")]).await;
     let store = GatedStartedStore {
         inner: h.db.clone(),
@@ -342,15 +341,14 @@ async fn tool_side_effect_can_precede_durable_tool_call_started() {
     );
 
     assert!(
-        !store.poll_timed_out.load(Ordering::SeqCst),
-        "the tool never ran while the started-event write was held open — \
-         either the side-effect barrier now exists (good: invert this test \
-         as phase 1 evidence) or the harness broke"
+        !store.side_effect_before_durable.load(Ordering::SeqCst),
+        "side-effect barrier violated: the workspace mutation became \
+         observable while ToolCallStarted was still un-durable"
     );
     assert!(
-        store.side_effect_before_durable.load(Ordering::SeqCst),
-        "phase 0 baseline: the workspace mutation is observable before \
-         ToolCallStarted is durable (the phase-1 crash window)"
+        store.poll_timed_out.load(Ordering::SeqCst),
+        "the gated append never saw the executor waiting — the tool either \
+         never ran or the started event was not appended at all"
     );
 
     // The event ordering itself is still correct on the happy path:

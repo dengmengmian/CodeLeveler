@@ -229,8 +229,8 @@ ApprovalResolved 落盘与 dispatch 的竞态。
 
 | # | 风险 | 类别 | 证据 | 归属阶段 |
 | --- | --- | --- | --- | --- |
-| R1 | 副作用先于 `ToolCallStarted` 落盘（崩溃窗口） | 恢复 | §四，确定性测试 | 阶段 1 |
-| R2 | 审批 resolved 落盘与 dispatch 竞态（pending_approval 判定保守但存在盲区） | 恢复 | engine.rs:681 注释 + `pending_approval_dangling_call_blocks_without_replay` | 阶段 1 |
+| R1 | ~~副作用先于 `ToolCallStarted` 落盘（崩溃窗口）~~ **已修**（阶段 1 flush 屏障） | 恢复 | §四；`side_effect_barrier_test.rs` + 反转后的窗口测试 | 阶段 1 ✅ |
+| R2 | ~~审批 resolved 落盘与 dispatch 竞态~~ **已修**（dispatch 前第二次 flush） | 恢复 | `side_effect_barrier_test::approval_resolution_is_durable_before_dispatch` | 阶段 1 ✅ |
 | R3 | 交互 chat 路径不做崩溃窗口 reconciliation | 恢复 | §一.5，代码搜索：`recover_crash_window` 仅 resume 调用 | 阶段 3 |
 | R4 | `sessions.status`（app 写）与 `sessions.outcome`（engine 写）双表示，可分叉 | 正确性 | §二 | 阶段 4 |
 | R5 | blocked 在 task 层塌缩为 failed；turn stop_reason 为 Debug 字符串 | 正确性 | §五 | 阶段 4 |

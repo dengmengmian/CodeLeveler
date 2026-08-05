@@ -43,7 +43,7 @@
 | 阶段 | 主题 | 当前状态 |
 | --- | --- | --- |
 | 0 | 冻结基线与可观测语义 | 完成（验收证据：[`phase0-baseline.md`](phase0-baseline.md)） |
-| 1 | 可靠的工具副作用屏障 | 待开始 |
+| 1 | 可靠的工具副作用屏障 | 完成（见阶段 1 状态注记） |
 | 2 | 唯一 ToolHost 调用边界 | 待开始 |
 | 3 | 统一会话恢复与上下文装载 | 待开始 |
 | 4 | 统一生命周期与 goal 续跑所有权 | 待开始 |
@@ -80,6 +80,23 @@
 ### 阶段 1：建立可靠的工具副作用屏障
 
 **目的：** 消除“工具已经执行，但开始事件尚未可靠落盘”的崩溃窗口。
+
+> **状态：完成。** 实现为 `EventBarrier` flush 屏障（`leveler-agent` 定义、
+> `leveler-engine` 实现）：flush 标记与事件走同一条有序 pump 队列，因此
+> 屏障永远不会与它等待的事件竞态（直写 EventLog 的替代方案会让
+> `ApprovalRequested` 与 `ToolCallStarted` 在持久化顺序上乱序，破坏
+> dangling 归因，已否决）。两个等待点：宣布 `ToolCallStarted` 之后、
+> authorize 之前（pre-tool hooks 也是外部副作用）；authorize 之后、
+> dispatch 之前（审批结论先于其授权的副作用落盘，关闭基线风险 R2）。
+> 并行批只含声明为只读无副作用的工具，不设屏障；子 Agent 工具调用本无
+> canonical 事件，屏障不适用（既有缺口，见 phase0-baseline §一.6）。
+> flush 失败（含 pump 过载、落盘失败）→ 工具**不执行**、turn 显式失败。
+> 验收证据：`crates/leveler-engine/tests/side_effect_barrier_test.rs`
+> （落盘失败不执行、审批结论先于副作用）、
+> `phase0_baseline_test::tool_side_effect_cannot_precede_durable_tool_call_started`
+> （阶段 0 崩溃窗口测试按约定反转）、`crash_recovery_test` 8 例不变，
+> engine/agent/app 三 crate 测试全绿。dangling call 的分类恢复语义
+> （可重试/需 idempotency/人工裁决）不变，仍由 M5 恢复链处理。
 
 工作：
 

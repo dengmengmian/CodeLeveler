@@ -507,6 +507,22 @@ pub enum AgentError {
     Persistence(String),
 }
 
+/// Awaitable durability barrier for canonical tool events (side-effect
+/// barrier, convergence plan phase 1). `flush` resolves once every canonical
+/// event emitted through the observer so far is durable. The loop awaits it
+/// after announcing a tool call (before hooks/approval can act) and again
+/// after authorization (before dispatch), so a crash can never leave a side
+/// effect whose `ToolCallStarted` — or whose approval outcome — was lost.
+/// A flush failure aborts the run: the tool is NOT executed, because an
+/// unexecuted tool is recoverable but an unrecorded side effect is not.
+///
+/// Hosts without durable persistence (sub-agents, standalone library use)
+/// leave the barrier unset; the loop then proceeds without waiting.
+#[async_trait]
+pub trait EventBarrier: Send + Sync {
+    async fn flush(&self) -> Result<(), AgentError>;
+}
+
 /// A sink that persists the transcript as the loop advances, enabling resume.
 /// Called with the messages appended in each step (seed, then per round).
 #[async_trait]
@@ -764,6 +780,10 @@ pub struct Executor {
     hook_runner: leveler_execution::HookRunner,
     /// Project state dir for durable permission grants (SEC-2); None disables.
     grants_state_dir: Option<std::path::PathBuf>,
+    /// Side-effect barrier: canonical tool events must be durable before a
+    /// tool with possible side effects is dispatched. `None` = no durable
+    /// host (sub-agents, standalone use); the loop proceeds without waiting.
+    event_barrier: Option<Arc<dyn EventBarrier>>,
 }
 
 impl Executor {
@@ -812,6 +832,7 @@ impl Executor {
                 leveler_core::environment().current_dir().to_path_buf(),
             ),
             grants_state_dir: None,
+            event_barrier: None,
         }
     }
 
@@ -1054,6 +1075,10 @@ impl Executor {
             permission_rules_path: self.permission_rules_path.clone(),
             hook_runner: self.hook_runner.clone(),
             grants_state_dir: self.grants_state_dir.clone(),
+            // A child's tool starts/finishes are transient activity, not
+            // canonical events — there is nothing durable to wait for. (Child
+            // side-effect recording is a known gap; see phase0-baseline §一.6.)
+            event_barrier: None,
         }
     }
 
@@ -1225,6 +1250,12 @@ impl Executor {
     /// Use a specific approver (e.g. an interactive CLI prompt).
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = approver;
+        self
+    }
+
+    /// Install the host's side-effect barrier (see [`EventBarrier`]).
+    pub fn with_event_barrier(mut self, barrier: Arc<dyn EventBarrier>) -> Self {
+        self.event_barrier = Some(barrier);
         self
     }
 

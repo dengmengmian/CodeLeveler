@@ -18,11 +18,23 @@ use crate::EngineEvent;
 /// log pump. Transient deltas may be dropped under pressure. The first
 /// canonical event that cannot enter the queue is retained separately and
 /// turns the run into an explicit overload failure.
+///
+/// The channel carries both events and flush markers, so a [`Self::flush`]
+/// resolves exactly when the pump has durably appended everything emitted
+/// before it — the side-effect barrier rides the same ordered queue and can
+/// never race the events it waits for.
 #[derive(Clone)]
 pub(crate) struct EventEmitter {
-    tx: Sender<EngineEvent>,
+    tx: Sender<PumpItem>,
     state: EventPumpState,
     cancel: CancellationToken,
+}
+
+/// One unit of pump work: an event to persist-then-forward, or a flush marker
+/// to acknowledge once every item before it has been handled.
+pub(crate) enum PumpItem {
+    Event(EngineEvent),
+    Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Clone)]
@@ -35,7 +47,7 @@ impl EventEmitter {
     pub(crate) fn channel(
         capacity: usize,
         cancel: CancellationToken,
-    ) -> (Self, Receiver<EngineEvent>, EventPumpState) {
+    ) -> (Self, Receiver<PumpItem>, EventPumpState) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let state = EventPumpState {
             overloaded: Arc::new(AtomicBool::new(false)),
@@ -56,17 +68,45 @@ impl EventEmitter {
         if self.state.is_overloaded() {
             return;
         }
-        match self.tx.try_send(event) {
+        match self.tx.try_send(PumpItem::Event(event)) {
             Ok(()) => {}
-            Err(TrySendError::Full(event) | TrySendError::Closed(event))
-                if event.is_transient() => {}
-            Err(TrySendError::Full(event) | TrySendError::Closed(event)) => {
+            Err(
+                TrySendError::Full(PumpItem::Event(event))
+                | TrySendError::Closed(PumpItem::Event(event)),
+            ) if event.is_transient() => {}
+            Err(
+                TrySendError::Full(PumpItem::Event(event))
+                | TrySendError::Closed(PumpItem::Event(event)),
+            ) => {
                 if !self.state.overloaded.swap(true, Ordering::AcqRel) {
                     *self.state.overflow.lock().unwrap() = Some(event);
                     self.cancel.cancel();
                 }
             }
+            // try_send returns what we sent; we only send Event here.
+            Err(
+                TrySendError::Full(PumpItem::Flush(_)) | TrySendError::Closed(PumpItem::Flush(_)),
+            ) => {
+                unreachable!("emit only sends PumpItem::Event")
+            }
         }
+    }
+
+    /// Resolve once the pump has durably appended every event emitted before
+    /// this call, or report why it cannot. Uses an awaiting send (never drops
+    /// the marker): the barrier must not silently degrade under load.
+    pub(crate) async fn flush(&self) -> Result<(), String> {
+        if self.state.is_overloaded() {
+            return Err("event pump overloaded; canonical event was dropped".into());
+        }
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(PumpItem::Flush(ack_tx))
+            .await
+            .map_err(|_| "event pump closed before flush".to_string())?;
+        ack_rx
+            .await
+            .map_err(|_| "event pump dropped the flush ack".to_string())?
     }
 }
 
@@ -77,6 +117,23 @@ impl EventPumpState {
 
     pub(crate) fn take_overflow(&self) -> Option<EngineEvent> {
         self.overflow.lock().unwrap().take()
+    }
+}
+
+/// The engine's side-effect barrier: flushing the turn's event pump makes
+/// every canonical event emitted so far durable (see `EventLog`). Handed to
+/// the executor via [`leveler_agent::Executor::with_event_barrier`].
+pub(crate) struct PumpBarrier {
+    pub(crate) events: EventEmitter,
+}
+
+#[async_trait]
+impl leveler_agent::EventBarrier for PumpBarrier {
+    async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
+        self.events
+            .flush()
+            .await
+            .map_err(leveler_agent::AgentError::Persistence)
     }
 }
 
@@ -159,9 +216,10 @@ mod tests {
         });
         drop(emitter);
 
-        assert!(
-            matches!(rx.recv().await, Some(EngineEvent::AssistantDelta { text }) if text == "first")
-        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(PumpItem::Event(EngineEvent::AssistantDelta { text })) if text == "first"
+        ));
         assert!(rx.recv().await.is_none());
         assert!(!state.is_overloaded());
         assert!(state.take_overflow().is_none());
@@ -181,13 +239,30 @@ mod tests {
         assert!(state.is_overloaded());
         assert!(matches!(
             rx.recv().await,
-            Some(EngineEvent::AssistantDelta { .. })
+            Some(PumpItem::Event(EngineEvent::AssistantDelta { .. }))
         ));
         assert!(rx.recv().await.is_none());
         assert!(matches!(
             state.take_overflow(),
             Some(EngineEvent::VerificationStarted)
         ));
+    }
+
+    /// A flush marker is acknowledged only after the pump has consumed every
+    /// item queued before it, and an overloaded pump refuses the flush — the
+    /// barrier never resolves optimistically.
+    #[tokio::test]
+    async fn flush_after_overload_reports_the_failure() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (emitter, _rx, state) = EventEmitter::channel(1, cancel.clone());
+        emitter.emit(EngineEvent::AssistantDelta { text: "a".into() });
+        emitter.emit(EngineEvent::VerificationStarted); // overflows: canonical
+        assert!(state.is_overloaded());
+        let err = emitter
+            .flush()
+            .await
+            .expect_err("overloaded flush must fail");
+        assert!(err.contains("overloaded"), "unexpected error: {err}");
     }
 }
 
