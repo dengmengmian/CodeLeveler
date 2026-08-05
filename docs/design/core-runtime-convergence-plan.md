@@ -45,7 +45,7 @@
 | 0 | 冻结基线与可观测语义 | 完成（验收证据：[`phase0-baseline.md`](phase0-baseline.md)） |
 | 1 | 可靠的工具副作用屏障 | 完成（见阶段 1 状态注记） |
 | 2 | 唯一 ToolHost 调用边界 | 完成（见阶段 2 状态注记） |
-| 3 | 统一会话恢复与上下文装载 | 待开始 |
+| 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
 | 4 | 统一生命周期与 goal 续跑所有权 | 待开始 |
 | 5 | 产品策略移出 direct loop | 待开始 |
 | 6 | 收紧模型与 provider 边界 | 待开始 |
@@ -150,6 +150,30 @@
 ### 阶段 3：统一会话恢复与上下文装载
 
 **目的：** 用有序事实代替字符串重叠推断，形成唯一恢复入口。
+
+> **状态：完成。** 两笔提交：
+>
+> 1. **水位 + 唯一装载入口。** `ContextSnapshot` 事件新增
+>    `through_ordinal`（该快照取代的 transcript 前缀长度，serde default，
+>    旧行读出 `None`）。恢复时 `raw[n..]` 精确追加；重叠推断只作为旧
+>    快照与 executor 环内快照的兼容回退，水位不一致（截断后遗留）时
+>    显式 warn 并回退，不猜测切片。驱动它的红灯：两轮文本完全相同的
+>    对话在 overlap 推断下整轮丢失（4 条 vs 应有 6 条），已由
+>    `watermark_merge_survives_duplicate_rounds` 锁定。装载统一进
+>    `session_context.rs` 的 `RawTranscript::{load_strict,load_lossy}` +
+>    `assemble()`——chat、resume、goal 续跑、预算扩展、goal 历史注入、
+>    app `/btw` 全部走同一实现（顺带删除 app 里 O(n) 全日志扫描的
+>    快照查找）。epoch 切换快照（compact/clear/restore）盖当前消息数
+>    水位。
+> 2. **交互路径补崩溃 reconciliation（基线风险 R3）。** `chat()` 与
+>    `resume()` 一样先 `recover_crash_window`：安全只读 dangling 自动
+>    重放并补记 finish；可变/未知风险 dangling 返回
+>    `RecoveryConfirmationRequired` 硬停，等显式
+>    `acknowledge_crash_window`。**迁移影响（行为变化）**：崩溃会话在
+>    TUI/Web 重开后首个 chat 可能报确认错误而不是静默继续——这是把
+>    原本被隐藏的工作区不确定性暴露给用户，属计划要求的语义修复。
+>    证据：`crash_recovery_test` 新增 2 例（chat 阻断至确认、chat 自动
+>    重放安全读），全套 10 例绿。
 
 工作：
 

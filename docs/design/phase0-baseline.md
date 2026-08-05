@@ -231,7 +231,7 @@ ApprovalResolved 落盘与 dispatch 的竞态。
 | --- | --- | --- | --- | --- |
 | R1 | ~~副作用先于 `ToolCallStarted` 落盘（崩溃窗口）~~ **已修**（阶段 1 flush 屏障） | 恢复 | §四；`side_effect_barrier_test.rs` + 反转后的窗口测试 | 阶段 1 ✅ |
 | R2 | ~~审批 resolved 落盘与 dispatch 竞态~~ **已修**（dispatch 前第二次 flush） | 恢复 | `side_effect_barrier_test::approval_resolution_is_durable_before_dispatch` | 阶段 1 ✅ |
-| R3 | 交互 chat 路径不做崩溃窗口 reconciliation | 恢复 | §一.5，代码搜索：`recover_crash_window` 仅 resume 调用 | 阶段 3 |
+| R3 | ~~交互 chat 路径不做崩溃窗口 reconciliation~~ **已修**（chat 与 resume 同链） | 恢复 | `crash_recovery_test::chat_blocks_on_a_mutating_dangling_call_until_acknowledged` | 阶段 3 ✅ |
 | R4 | `sessions.status`（app 写）与 `sessions.outcome`（engine 写）双表示，可分叉 | 正确性 | §二 | 阶段 4 |
 | R5 | blocked 在 task 层塌缩为 failed；turn stop_reason 为 Debug 字符串 | 正确性 | §五 | 阶段 4 |
 | R6 | engine 两处 outcome 合并逻辑重复（continue vs 预算扩展） | 正确性 | engine.rs:902/1041 | 阶段 4 |

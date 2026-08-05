@@ -120,6 +120,16 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     }
 }
 
+/// A plain text assistant reply (chat turns are goal-mode-off and end on it).
+fn text(value: &str) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message::text(Role::Assistant, value),
+        finish_reason: FinishReason::Stop,
+        usage: TokenUsage::default(),
+    }
+}
+
 /// The one scripted response the resume turn needs to end cleanly: declare the
 /// goal complete so the goal-mode turn finishes without further work.
 fn resume_to_completion() -> Vec<ModelResponse> {
@@ -621,4 +631,112 @@ async fn acknowledged_crash_window_unblocks_resume() {
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .expect("resume must proceed after explicit acknowledgement");
+}
+
+// ── phase 3: the interactive chat path reconciles the crash window too ───────
+
+/// Reopening a crashed session in the TUI/Web continues via `chat`, not
+/// `resume`. A dangling MUTATING call must stop that path exactly like resume:
+/// its side effect may already exist, and silently chatting on top of it hides
+/// the workspace uncertainty from the user.
+#[tokio::test]
+async fn chat_blocks_on_a_mutating_dangling_call_until_acknowledged() {
+    let (engine, dir) = harness(
+        Arc::new(AutoApprove),
+        vec![text("好的，已确认工作区状态。")],
+    )
+    .await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&engine, &session).await;
+    seed_dangling_call(
+        &engine,
+        &session,
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+        })
+        .to_string(),
+    )
+    .await;
+
+    let err = engine
+        .chat(
+            &session,
+            &spec,
+            vec![leveler_model::ContentPart::Text {
+                text: "继续刚才的工作".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a mutating dangling call must block interactive chat");
+    assert!(
+        matches!(
+            &err,
+            leveler_engine::EngineError::RecoveryConfirmationRequired { call_id, tool }
+                if call_id == "c1" && tool == "apply_patch"
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\n",
+        "the uncertain patch must not be replayed"
+    );
+
+    // After explicit acknowledgement the same chat proceeds.
+    engine.acknowledge_crash_window(&session).await.unwrap();
+    engine
+        .chat(
+            &session,
+            &spec,
+            vec![leveler_model::ContentPart::Text {
+                text: "继续刚才的工作".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat proceeds after acknowledgement");
+}
+
+/// A dangling READ-ONLY call is idempotent: interactive chat reconciles it in
+/// place (recorded finish, no prompt, no block) — same policy as resume.
+#[tokio::test]
+async fn chat_auto_replays_a_safe_dangling_read_tool() {
+    let (engine, dir) = harness(Arc::new(AutoApprove), vec![text("继续。")]).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&engine, &session).await;
+    seed_dangling_call(
+        &engine,
+        &session,
+        "read_file",
+        serde_json::json!({"path": "README.md"}).to_string(),
+    )
+    .await;
+
+    engine
+        .chat(
+            &session,
+            &spec,
+            vec![leveler_model::ContentPart::Text {
+                text: "继续".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a safe dangling read must not block chat");
+
+    let events = recorded_events(&engine, &session).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EngineEvent::ToolCallFinished { call_id, is_error: false, .. } if call_id == "c1"
+        )),
+        "the dangling read must be reconciled with a recorded finish: {events:?}"
+    );
 }

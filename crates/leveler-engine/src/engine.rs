@@ -447,6 +447,13 @@ impl TaskEngine {
         // context), unlike resume which must reconstruct exactly.
         let raw = crate::RawTranscript::load_lossy(&self.db, session_id).await?;
         let log = EventLog::new(&self.db, session_id.clone());
+        // Reconcile the crash window before continuing — the interactive path
+        // is how a crashed session normally gets reopened (TUI/Web), and a
+        // dangling mutating call means the workspace may already carry a side
+        // effect the user has not seen. Same classification as resume: safe
+        // reads replay, everything else stops for explicit acknowledgement.
+        self.recover_crash_window(&log, observer, &cancellation)
+            .await?;
         let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
         let objective_hint = content
             .iter()
