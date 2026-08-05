@@ -49,7 +49,7 @@
 | 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
 | 5 | 产品策略移出 direct loop | 完成（开关化+分类；协议化迁移与旧策略删除待 eval 数据，见阶段 5 状态注记） |
 | 6 | 收紧模型与 provider 边界 | 完成（见阶段 6 状态注记） |
-| 7 | 稳定性与开源发布门槛 | 待开始 |
+| 7 | 稳定性与开源发布门槛 | 进行中（决策/文档/故障测试盘点已完成；24h soak 与真机验收为环境受限项，见阶段 7 状态注记） |
 
 状态只能在对应验收证据已链接到本文后改为“完成”；代码已经存在但尚未经过本阶段
 验收时，应标记为“进行中”，不能按完成计算。
@@ -332,6 +332,35 @@
 ### 阶段 7：稳定性与开源发布门槛
 
 **目的：** 证明核心能长期运行，并为外部贡献建立可维护契约。
+
+> **状态：进行中（可在本环境完成的部分已完成）。**
+>
+> **已完成：**
+>
+> - `docs/STABILITY.md` 三项开放决策已按业内 pre-1.0 惯例落定并生效
+>   （D1=保留 deny_unknown_fields 并文档化前向不兼容；D2=Rust API 在
+>   1.0 前不作公开承诺；D3=serve/web 等保持 Provisional），含弃用周期
+>   （N 弃用 → ≥N+2 移除）；CONTRIBUTING 已链接。
+> - 存储迁移 + 备份/恢复说明入库（STABILITY「Storage」节 +
+>   migrations/README）；规范事件已带 `schema_version` 且新于本构建的
+>   行是命名硬错误（阶段 0 既有测试）。
+> - client protocol 已有版本（1.3）与兼容性校验（`version.rs`），
+>   握手不兼容显式报错；Web/手机 transport 复用同一协议。
+> - **故障测试盘点**（现有自动化）：崩溃窗口全分类
+>   （`crash_recovery_test` 10 例 + 副作用屏障 4 例）；SQLite busy/full/
+>   投影回滚（`terminal_repo` 4 例）；provider 断流/畸形分片
+>   （protocol 流式错误用例）；审批超时与本机在场豁免（remote
+>   `approval_timeout` 7 例）；取消（engine/TUI/手机各层）；孤儿进程
+>   （`zombie_turns`、reaper、Linux PDEATHSIG）；事件缓冲过载显式失败
+>   （recorders 3 例）；确定性短 soak（`tui_path_soak`）在 CI 每次运行。
+>
+> **环境受限，未完成（发布前必须补，不得以本清单替代）：**
+>
+> - ≥24 小时确定性长稳 soak（墙钟不可压缩；资源增长阈值待 soak 数据）。
+> - 手机端真机验收（iOS 签名/Android SDK/蜂窝网络，见
+>   [`phase1-acceptance-checklist.md`](phase1-acceptance-checklist.md)）。
+> - TUI→Web→手机同 session 跨端接力的单场景自动化（基线 R8）。
+> - Windows/Linux 全平台矩阵在 CI 之外的实机复核。
 
 工作：
 

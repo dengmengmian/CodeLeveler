@@ -7,6 +7,9 @@ review and maintain.
 
 - Search existing issues and pull requests for related work.
 - Open an issue before a large behavioral change or public API redesign.
+- Check [`docs/STABILITY.md`](docs/STABILITY.md) before touching CLI
+  subcommands, flags, or configuration keys — frozen surfaces need a
+  `CHANGELOG.md` entry.
 - Do not include credentials, local runtime state, generated evaluation output,
   or external fixture repositories in a commit.
 - Keep provider-specific behavior in provider configuration, protocol adapters,

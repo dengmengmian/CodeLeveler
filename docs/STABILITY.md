@@ -1,10 +1,9 @@
 # Interface stability
 
-> **Status: DRAFT — not yet a commitment.** This file records what a 1.0
-> compatibility promise *would* cover, derived from the code as it stands.
-> Every "Frozen" mark below is a proposal until a maintainer signs off. Once
-> signed off, drop this banner and link the file from `README.md` and
-> `CONTRIBUTING.md`.
+> **Status: ADOPTED (pre-1.0).** The open decisions below are resolved as
+> recorded in "Decisions" — following common pre-1.0 practice, chosen during
+> convergence-plan phase 7. Revisit each at the 1.0 cut; a PR that touches a
+> frozen surface needs a `CHANGELOG.md` entry.
 
 ## Why this exists
 
@@ -130,10 +129,32 @@ Once D1 and D2 are settled, `CHANGELOG.md` gains a `## Compatibility` section
 listing the frozen surfaces, and any PR touching them needs a changelog entry.
 Without that enforcement point, this document goes stale within two releases.
 
-## Open decisions summary
+## Decisions
 
-| Id | Decision | Blocking |
+Resolved (convergence-plan phase 7), following common pre-1.0 practice:
+
+| Id | Decision | Rationale |
 | --- | --- | --- |
-| D1 | Config forward-compatibility strategy (`deny_unknown_fields`) | Freezing the config schema |
-| D2 | Whether the Rust API is a public surface | Freezing any trait |
-| D3 | Whether `serve`/`web` stay provisional through 1.0 | CLI tier assignment |
+| D1 | **Option 1**: keep `deny_unknown_fields`; config is forward-incompatible and that is documented ("downgrading may require removing newly added config keys", noted in the config examples). | Typo-catching is a real usability win today; a `schema_version` key (option 3) is the 1.0-time upgrade if the downgrade complaint materializes. Existing keys keep name/type/meaning through 1.0; removal or retyping requires a major version; adding keys is always allowed. |
+| D2 | **The Rust API is not a public surface before 1.0.** No trait is frozen; the supported surface is the CLI + configuration. `ProtocolAdapter` / `Tool` / `EventStore` are the designated candidates for an additive-only promise at 1.0. | Nobody outside the workspace depends on these crates; a promise nobody needs is pure maintenance cost. |
+| D3 | **`serve` / `web` (and `lsp`/`mcp`/`login`/`logout`/`completions`/`trust`) stay Provisional through 1.0.** Breaking changes require a `### Changed` changelog entry. | The daemon/transport/auth story is still settling (see the Windows gap in `README.md`). |
+
+Deprecation cycle for Frozen surfaces: deprecate in release N with a
+changelog entry and a runtime warning where feasible; remove no earlier
+than N+2 (or 1.0, whichever is later).
+
+## Storage: migrations and backup
+
+- Schema migrations are append-only and applied automatically at startup
+  (`migrations/README.md` has the authoring rules). Canonical events carry a
+  `schema_version`; a newer row than the binary understands is a hard, named
+  replay error — never a guessed repair.
+- The state to back up is the global Leveler home (default `~/.leveler`):
+  `sessions.db` (+ its `-wal`/`-shm` siblings) holds sessions, transcripts,
+  and the canonical event log; `config.toml`, `permissions.yaml`, and
+  `memory/` hold user configuration and memory. Back up with the runtime
+  stopped, or use `sqlite3 sessions.db ".backup backup.db"` on a live
+  database — copying only the `.db` file while a daemon is writing loses the
+  WAL tail. Restoring an older database into a newer binary is supported
+  (migrations re-run); the reverse follows the same rule as config: not
+  supported before 1.0.

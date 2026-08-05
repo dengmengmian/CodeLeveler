@@ -11,7 +11,7 @@ file is not.
 | --- | --- |
 | `CONTRIBUTING.md` | PR expectations, the exact check commands, error-type and dependency-direction rules |
 | `docs/ARCHITECTURE.md` | Crate layout and how a turn flows through the system (`docs/ARCHITECTURE.zh-CN.md` is the Chinese version) |
-| `docs/STABILITY.md` | Draft compatibility proposal (not frozen yet) — read before touching CLI flags or config schema |
+| `docs/STABILITY.md` | Adopted pre-1.0 compatibility tiers and decisions — read before touching CLI flags or config schema |
 | `evals/README.md` | Required before adding evaluation cases |
 
 `CONTRIBUTING.md` already states the three rules most often gotten wrong:
