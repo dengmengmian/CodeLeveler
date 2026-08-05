@@ -202,6 +202,7 @@ mod tests {
             EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::Verified,
                 reason: None,
+                stop: None,
             },
             &mut |_| {},
         )
@@ -214,6 +215,7 @@ mod tests {
             vec![EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::Verified,
                 reason: None,
+                stop: None,
             }],
             "transient delta is skipped; the canonical event replays"
         );
@@ -435,6 +437,7 @@ mod tests {
             EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::CompletedUnverified,
                 reason: Some("no gating checks".into()),
+                stop: None,
             },
         ];
         for e in &events {
@@ -453,6 +456,7 @@ mod tests {
         let event = EngineEvent::TaskFinished {
             outcome: crate::TaskOutcome::Verified,
             reason: None,
+            stop: None,
         };
         let (event_type, payload) = event.to_row().unwrap();
         store.seed(leveler_storage::EventRecord {
@@ -485,6 +489,7 @@ mod tests {
             EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::CompletedUnverified,
                 reason: None,
+                stop: None,
             },
             &mut |_| {},
         )

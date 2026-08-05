@@ -326,25 +326,28 @@ impl TurnRunner<'_> {
         };
         // The terminal event and query projection commit atomically. Forwarding
         // happens only after commit, so observers never see an uncommitted fact.
-        let (terminal, stop_reason, rounds, modified_files) = match &run_result {
+        let (terminal, stop_reason, stop, rounds, modified_files) = match &run_result {
             Ok(outcome) => (
                 TurnOutcome::Completed,
                 format!("{:?}", outcome.stop_reason),
+                Some(outcome.stop_reason),
                 outcome.rounds,
                 outcome.modified_files.clone(),
             ),
             Err(EngineError::Agent(AgentError::Cancelled)) => (
                 TurnOutcome::Interrupted,
                 "cancelled".to_string(),
+                None,
                 0,
                 Vec::new(),
             ),
-            Err(error) => (TurnOutcome::Failed, error.to_string(), 0, Vec::new()),
+            Err(error) => (TurnOutcome::Failed, error.to_string(), None, 0, Vec::new()),
         };
         let event = EngineEvent::TurnFinished {
             turn_id: turn_id.clone(),
             outcome: terminal,
             stop_reason,
+            stop,
             rounds,
             modified_files,
         };

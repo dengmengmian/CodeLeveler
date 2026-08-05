@@ -1,7 +1,7 @@
 //! Atomic terminal transitions for the execution aggregate.
 
 use leveler_core::{SessionId, Timestamp, TurnId};
-use leveler_lifecycle::{TaskOutcome, TurnOutcome};
+use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
 
 use crate::event_repo::EVENT_SCHEMA_VERSION;
 use crate::{Database, EventRecord, StorageError};
@@ -19,8 +19,11 @@ impl<'a> TerminalRepository<'a> {
         Self { db }
     }
 
-    /// Append the session's terminal event and record `outcome` on the session
-    /// row, atomically. Returns the appended event with its assigned sequence.
+    /// Append the session's terminal event and record the WHOLE terminal
+    /// lifecycle (`outcome`, `status`, `state`) on the session row, atomically.
+    /// Returns the appended event with its assigned sequence. One writer, one
+    /// transaction: a crash can never leave the outcome and the user-facing
+    /// status disagreeing.
     ///
     /// # Errors
     ///
@@ -33,17 +36,23 @@ impl<'a> TerminalRepository<'a> {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
+        status: SessionStatus,
+        state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         let mut tx = self.db.pool().begin().await?;
         let event = append_event(&mut tx, session_id, None, event_type, payload, &now).await?;
-        let updated =
-            sqlx::query("UPDATE sessions SET outcome = ?2, updated_at = ?3 WHERE id = ?1")
-                .bind(session_id.as_str())
-                .bind(outcome.as_str())
-                .bind(now.to_rfc3339())
-                .execute(&mut *tx)
-                .await;
+        let updated = sqlx::query(
+            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5 \
+             WHERE id = ?1",
+        )
+        .bind(session_id.as_str())
+        .bind(outcome.as_str())
+        .bind(status.as_str())
+        .bind(state.as_str())
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await;
         let updated = match updated {
             Ok(updated) => updated,
             Err(error) => {
@@ -181,6 +190,8 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"failed","reason":null}}"#,
                 TaskOutcome::Failed,
+                SessionStatus::Failed,
+                AgentState::Failed,
                 leveler_core::now(),
             )
             .await;
@@ -259,6 +270,8 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"failed","reason":null}}"#,
                 TaskOutcome::Failed,
+                SessionStatus::Failed,
+                AgentState::Failed,
                 leveler_core::now(),
             )
             .await;
@@ -306,6 +319,8 @@ mod tests {
                 "task_finished",
                 &oversized_payload,
                 TaskOutcome::Failed,
+                SessionStatus::Failed,
+                AgentState::Failed,
                 leveler_core::now(),
             )
             .await;
@@ -337,6 +352,8 @@ mod tests {
                 "task_finished",
                 r#"{"api_key":"terminal-secret-value"}"#,
                 TaskOutcome::CompletedUnverified,
+                SessionStatus::Completed,
+                AgentState::Complete,
                 leveler_core::now(),
             )
             .await

@@ -230,6 +230,7 @@ impl Application {
         log.append(
             None,
             EngineEvent::TaskFinished {
+                stop: None,
                 outcome,
                 reason: (outcome != TaskOutcome::Verified).then(|| {
                     format!(

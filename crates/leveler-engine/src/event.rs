@@ -138,14 +138,25 @@ pub enum EngineEvent {
         /// as `Completed`; new failed/interrupted paths must persist it.
         #[serde(default)]
         outcome: TurnOutcome,
-        /// Debug repr of the executor's StopReason (completed | blocked | …).
+        /// Human-oriented stop text (historically the Debug repr of
+        /// [`leveler_agent::StopReason`], or an error message). Kept for
+        /// display compatibility; machine consumers use `stop`.
         stop_reason: String,
+        /// Typed executor stop reason. `None` on legacy rows and on turns
+        /// that ended in an error instead of an executor outcome.
+        #[serde(default)]
+        stop: Option<leveler_agent::StopReason>,
         rounds: u32,
         modified_files: Vec<String>,
     },
     TaskFinished {
         outcome: TaskOutcome,
         reason: Option<String>,
+        /// Typed executor stop reason for the whole task (raw, not the
+        /// product reinterpretation). `None` on legacy rows and on tasks that
+        /// ended in cancellation or an engine error.
+        #[serde(default)]
+        stop: Option<leveler_agent::StopReason>,
     },
 
     // ── kernel: model / tools (1:1 from AgentEvent) ──────────────────────
@@ -950,6 +961,7 @@ mod contract_tests {
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Verified,
                 reason: None,
+                stop: None,
             }
             .data_class(),
             DataClass::Projectable
@@ -996,10 +1008,12 @@ mod contract_tests {
                 stop_reason: secret.into(),
                 rounds: 2,
                 modified_files: vec![secret.into()],
+                stop: None,
             },
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
                 reason: Some(secret.into()),
+                stop: None,
             },
             EngineEvent::ApprovalRequested {
                 id: ApprovalId::new("approval-safe"),
@@ -1070,6 +1084,7 @@ mod contract_tests {
             !EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
                 reason: None,
+                stop: None,
             }
             .is_transient()
         );

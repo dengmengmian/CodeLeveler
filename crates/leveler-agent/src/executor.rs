@@ -372,8 +372,10 @@ pub struct StepLimits {
     pub max_rounds: Option<u32>,
 }
 
-/// Why the loop stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why the loop stopped. Serialized (snake_case) into terminal engine events
+/// so blocked/budget/complete stay machine-discriminable after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The task has explicit completion evidence, rather than merely a natural
     /// end to one model response.

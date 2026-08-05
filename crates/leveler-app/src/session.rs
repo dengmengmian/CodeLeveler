@@ -11,14 +11,13 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
-    Clarifier, StopReason,
+    AdvisoryKind, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify, Clarifier,
+    StopReason,
 };
 use leveler_engine::{
     EngineError, EngineEvent, ExecutionKind, TaskOutcome, TaskReport, TaskSpec, mode_str,
 };
 use leveler_execution::{Approver, PermissionProfile};
-use leveler_lifecycle::{AgentState, SessionStatus};
 use leveler_model::{ContentPart, ModelRef};
 use leveler_storage::{SessionRecord, SessionRepository};
 use leveler_verifier::{Verdict, VerificationReport};
@@ -27,29 +26,6 @@ use crate::{AppError, Application};
 
 /// Map a run result to the legacy persisted session status/state columns.
 /// (The engine additionally stamps the `outcome` column.)
-fn status_for_app(result: &Result<AgentOutcome, AppError>) -> (SessionStatus, AgentState) {
-    match result {
-        Ok(o) => match o.stop_reason {
-            StopReason::Completed => (SessionStatus::Completed, AgentState::Complete),
-            StopReason::Answered => (SessionStatus::Completed, AgentState::Complete),
-            // Plan finished; a forced closeout stop is an abnormal *end*, not an
-            // unfinished *task* — it must NOT fall back to Execute.
-            StopReason::CloseoutForced => (SessionStatus::Completed, AgentState::Complete),
-            StopReason::Incomplete => (SessionStatus::Incomplete, AgentState::Execute),
-            StopReason::BudgetExhausted => (SessionStatus::Incomplete, AgentState::Execute),
-            // Same outcome as a spent budget — work so far is real, task unfinished.
-            StopReason::TurnLimitReached => (SessionStatus::Incomplete, AgentState::Execute),
-            StopReason::Blocked => (SessionStatus::Blocked, AgentState::Execute),
-            StopReason::Stalled => (SessionStatus::Incomplete, AgentState::Execute),
-            StopReason::CompletedUnverified => (SessionStatus::Completed, AgentState::Complete),
-        },
-        Err(AppError::Agent(AgentError::Cancelled)) => {
-            (SessionStatus::Interrupted, AgentState::Execute)
-        }
-        Err(_) => (SessionStatus::Failed, AgentState::Failed),
-    }
-}
-
 fn verification_failure_summary(report: &VerificationReport) -> String {
     if !report.scope_ok {
         return format!(
@@ -533,13 +509,8 @@ impl Application {
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
         let repo = SessionRepository::new(&db);
-        repo.update_status(
-            session_id,
-            SessionStatus::Running,
-            AgentState::Execute,
-            leveler_core::now(),
-        )
-        .await?;
+        // Lifecycle (Running/terminal status+state) is stamped by the engine —
+        // the single writer — atomically with outcome and TaskFinished.
         // Persist the execution config so resume never guesses (plan B4).
         repo.set_execution(
             session_id,
@@ -583,16 +554,10 @@ impl Application {
                 cancellation,
             )
             .await;
-        let result = match result {
+        match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
-        };
-
-        let (status, state) = status_for_app(&result);
-        SessionRepository::new(&db)
-            .update_status(session_id, status, state, leveler_core::now())
-            .await?;
-        result
+        }
     }
 
     /// Like [`Application::run_in_session`], but the first user message carries
@@ -612,13 +577,7 @@ impl Application {
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
         let repo = SessionRepository::new(&db);
-        repo.update_status(
-            session_id,
-            SessionStatus::Running,
-            AgentState::Execute,
-            leveler_core::now(),
-        )
-        .await?;
+        // Lifecycle is stamped by the engine (single writer).
         repo.set_execution(
             session_id,
             mode_str(mode),
@@ -657,16 +616,10 @@ impl Application {
                 cancellation,
             )
             .await;
-        let result = match result {
+        match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
-        };
-
-        let (status, state) = status_for_app(&result);
-        SessionRepository::new(&db)
-            .update_status(session_id, status, state, leveler_core::now())
-            .await?;
-        result
+        }
     }
 
     /// Resume an interrupted session from its persisted transcript AND its
@@ -713,14 +666,6 @@ impl Application {
         let (work_profile, collaboration) = crate::axes_from_session_record(&record);
         let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
 
-        repo.update_status(
-            session_id,
-            SessionStatus::Running,
-            AgentState::Execute,
-            leveler_core::now(),
-        )
-        .await?;
-
         let engine = self
             .engine_for_with_profile(
                 &model,
@@ -743,16 +688,10 @@ impl Application {
                 cancellation,
             )
             .await;
-        let result = match result {
+        match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
-        };
-
-        let (status, state) = status_for_app(&result);
-        SessionRepository::new(&db)
-            .update_status(session_id, status, state, leveler_core::now())
-            .await?;
-        result
+        }
     }
 }
 

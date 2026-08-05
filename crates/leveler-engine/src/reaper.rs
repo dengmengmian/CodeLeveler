@@ -17,6 +17,7 @@ pub async fn reap_running_turns(
         let session_id = SessionId::new(turn.session_id.clone());
         let turn_id = TurnId::new(turn.id.clone());
         let event = EngineEvent::TurnFinished {
+            stop: None,
             turn_id: turn_id.clone(),
             outcome: TurnOutcome::Interrupted,
             stop_reason: "unclean process exit".to_string(),

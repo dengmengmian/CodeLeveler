@@ -15,6 +15,7 @@ use leveler_agent::{
 };
 use leveler_core::{SessionId, TurnId};
 use leveler_execution::{Approver, PermissionProfile, RiskLevel};
+use leveler_lifecycle::{AgentState, SessionStatus};
 use leveler_storage::{Database, SessionRecord, SessionRepository, TerminalRepository};
 use leveler_verifier::{
     CompletionVerdict, ExpectedEvidence, Verdict, VerificationPlan, VerificationReport, Verifier,
@@ -69,6 +70,67 @@ fn goal_profile(spec: &TaskSpec) -> TurnProfile {
     TurnProfile::Goal {
         continuation: spec.continuation,
         limits: spec.limits,
+    }
+}
+
+/// Fold a continuation turn's outcome into the running aggregate — the ONE
+/// merge that both goal continuation and budget extension use. Rounds, token
+/// spend, and modified files accumulate; the latest turn's text, stop reason,
+/// stop detail, budget exhaustion, and progress ledger replace the previous
+/// ones (epoch spend inside `progress` is already absolute after seeding).
+fn merge_continued_outcome(
+    outcome: &mut leveler_agent::AgentOutcome,
+    continued: leveler_agent::AgentOutcome,
+) {
+    outcome.rounds = outcome.rounds.saturating_add(continued.rounds);
+    outcome.final_text = continued.final_text;
+    outcome.stop_reason = continued.stop_reason;
+    outcome.stop_detail = continued.stop_detail;
+    outcome.budget_exhaustion = continued.budget_exhaustion;
+    outcome.progress = continued.progress;
+    outcome.metrics.model_tokens = outcome
+        .metrics
+        .model_tokens
+        .saturating_add(continued.metrics.model_tokens);
+    outcome.metrics.extra_model_calls = outcome
+        .metrics
+        .extra_model_calls
+        .saturating_add(continued.metrics.extra_model_calls);
+    for path in continued.modified_files {
+        if !outcome.modified_files.contains(&path) {
+            outcome.modified_files.push(path);
+        }
+    }
+}
+
+/// The user-facing terminal lifecycle columns for a finished task. This is
+/// the product interpretation of the report (a passing gate upgrades a mere
+/// "answered" to completed; a failed verification reads as incomplete), moved
+/// here from the app layer so the engine is the single lifecycle writer.
+pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentState) {
+    use StopReason as S;
+    let verification_failed = report
+        .verification
+        .as_ref()
+        .is_some_and(|verification| verification.verdict() == Verdict::Failed);
+    let did_work = report.stop_reason == S::Completed || !report.modified_files.is_empty();
+    let effective = if verification_failed {
+        S::Incomplete
+    } else {
+        match report.outcome {
+            TaskOutcome::Verified if did_work => S::Completed,
+            TaskOutcome::CompletedUnverified if did_work => S::CompletedUnverified,
+            _ => report.stop_reason,
+        }
+    };
+    match effective {
+        S::Completed | S::Answered | S::CloseoutForced | S::CompletedUnverified => {
+            (SessionStatus::Completed, AgentState::Complete)
+        }
+        S::Incomplete | S::BudgetExhausted | S::TurnLimitReached | S::Stalled => {
+            (SessionStatus::Incomplete, AgentState::Execute)
+        }
+        S::Blocked => (SessionStatus::Blocked, AgentState::Execute),
     }
 }
 
@@ -272,16 +334,25 @@ impl TaskEngine {
         self
     }
 
-    /// Commit the canonical terminal event and query projection atomically,
-    /// then forward the event. An observer can never see an uncommitted fact.
+    /// Commit the canonical terminal event and every session lifecycle column
+    /// (outcome + status + state) atomically, then forward the event. The
+    /// engine is the ONE writer of the session lifecycle — no app layer stamps
+    /// a second copy — and an observer can never see an uncommitted fact.
     async fn finish_task(
         &self,
         session_id: &SessionId,
         outcome: TaskOutcome,
         reason: Option<String>,
+        stop: Option<StopReason>,
+        status: SessionStatus,
+        state: AgentState,
         observer: &mut dyn FnMut(EngineEvent),
     ) -> Result<(), EngineError> {
-        let event = EngineEvent::TaskFinished { outcome, reason };
+        let event = EngineEvent::TaskFinished {
+            outcome,
+            reason,
+            stop,
+        };
         let (event_type, payload) = event.to_row()?;
         TerminalRepository::new(&self.db)
             .finish_task(
@@ -289,10 +360,75 @@ impl TaskEngine {
                 &event_type,
                 &payload,
                 outcome,
+                status,
+                state,
                 leveler_core::now(),
             )
             .await?;
         observer(event);
+        Ok(())
+    }
+
+    /// Shared terminal handling for run/chat/resume: derive the lifecycle
+    /// columns from the result and commit them with the TaskFinished event.
+    async fn finish_from_result(
+        &self,
+        session_id: &SessionId,
+        result: &Result<TaskReport, EngineError>,
+        observer: &mut dyn FnMut(EngineEvent),
+    ) -> Result<(), EngineError> {
+        match result {
+            Ok(report) => {
+                let (status, state) = terminal_status_for(report);
+                self.finish_task(
+                    session_id,
+                    report.outcome,
+                    (report.outcome != TaskOutcome::Verified).then(|| report.final_text.clone()),
+                    Some(report.stop_reason),
+                    status,
+                    state,
+                    observer,
+                )
+                .await
+            }
+            Err(EngineError::Agent(leveler_agent::AgentError::Cancelled)) => {
+                self.finish_task(
+                    session_id,
+                    TaskOutcome::Interrupted,
+                    None,
+                    None,
+                    SessionStatus::Interrupted,
+                    AgentState::Execute,
+                    observer,
+                )
+                .await
+            }
+            Err(error) => {
+                self.finish_task(
+                    session_id,
+                    TaskOutcome::Failed,
+                    Some(error.to_string()),
+                    None,
+                    SessionStatus::Failed,
+                    AgentState::Failed,
+                    observer,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Mark the session running before the first turn. The engine owns this
+    /// transition too — clients observe lifecycle, they never write it.
+    async fn mark_running(&self, session_id: &SessionId) -> Result<(), EngineError> {
+        SessionRepository::new(&self.db)
+            .update_status(
+                session_id,
+                SessionStatus::Running,
+                AgentState::Execute,
+                leveler_core::now(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -336,6 +472,7 @@ impl TaskEngine {
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
         };
+        self.mark_running(session_id).await?;
         log.append(
             None,
             EngineEvent::TaskStarted {
@@ -382,30 +519,8 @@ impl TaskEngine {
 
         // Stamp the terminal outcome (interrupted on cancellation) and emit
         // TaskFinished before returning.
-        match &result {
-            Ok(report) => {
-                self.finish_task(
-                    session_id,
-                    report.outcome,
-                    (report.outcome != TaskOutcome::Verified).then(|| report.final_text.clone()),
-                    observer,
-                )
-                .await?;
-            }
-            Err(EngineError::Agent(leveler_agent::AgentError::Cancelled)) => {
-                self.finish_task(session_id, TaskOutcome::Interrupted, None, observer)
-                    .await?;
-            }
-            Err(error) => {
-                self.finish_task(
-                    session_id,
-                    TaskOutcome::Failed,
-                    Some(error.to_string()),
-                    observer,
-                )
-                .await?;
-            }
-        }
+        self.finish_from_result(session_id, &result, observer)
+            .await?;
         result
     }
 
@@ -447,6 +562,7 @@ impl TaskEngine {
         // context), unlike resume which must reconstruct exactly.
         let raw = crate::RawTranscript::load_lossy(&self.db, session_id).await?;
         let log = EventLog::new(&self.db, session_id.clone());
+        self.mark_running(session_id).await?;
         // Reconcile the crash window before continuing — the interactive path
         // is how a crashed session normally gets reopened (TUI/Web), and a
         // dangling mutating call means the workspace may already carry a side
@@ -503,30 +619,8 @@ impl TaskEngine {
             .await
         }
         .await;
-        match &result {
-            Ok(report) => {
-                self.finish_task(
-                    session_id,
-                    report.outcome,
-                    (report.outcome != TaskOutcome::Verified).then(|| report.final_text.clone()),
-                    observer,
-                )
-                .await?;
-            }
-            Err(EngineError::Agent(leveler_agent::AgentError::Cancelled)) => {
-                self.finish_task(session_id, TaskOutcome::Interrupted, None, observer)
-                    .await?;
-            }
-            Err(error) => {
-                self.finish_task(
-                    session_id,
-                    TaskOutcome::Failed,
-                    Some(error.to_string()),
-                    observer,
-                )
-                .await?;
-            }
-        }
+        self.finish_from_result(session_id, &result, observer)
+            .await?;
         result
     }
 
@@ -569,6 +663,7 @@ impl TaskEngine {
             )));
         }
         let log = EventLog::new(&self.db, session_id.clone());
+        self.mark_running(session_id).await?;
         let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
         // Same merge rules as chat: never drop post-snapshot transcript rows.
         let context = raw
@@ -601,30 +696,8 @@ impl TaskEngine {
         let result = self
             .resume_direct(&log, &runner, spec, prior, observer, cancellation)
             .await;
-        match &result {
-            Ok(report) => {
-                self.finish_task(
-                    session_id,
-                    report.outcome,
-                    (report.outcome != TaskOutcome::Verified).then(|| report.final_text.clone()),
-                    observer,
-                )
-                .await?;
-            }
-            Err(EngineError::Agent(leveler_agent::AgentError::Cancelled)) => {
-                self.finish_task(session_id, TaskOutcome::Interrupted, None, observer)
-                    .await?;
-            }
-            Err(error) => {
-                self.finish_task(
-                    session_id,
-                    TaskOutcome::Failed,
-                    Some(error.to_string()),
-                    observer,
-                )
-                .await?;
-            }
-        }
+        self.finish_from_result(session_id, &result, observer)
+            .await?;
         result
     }
 
@@ -992,28 +1065,7 @@ impl TaskEngine {
                     cancellation.clone(),
                 )
                 .await?;
-            let cont_rounds = continued.outcome.rounds;
-            outcome.rounds = outcome.rounds.saturating_add(cont_rounds);
-            outcome.final_text = continued.outcome.final_text;
-            outcome.stop_reason = continued.outcome.stop_reason;
-            outcome.stop_detail = continued.outcome.stop_detail;
-            // Carry progress ledger across continues. Epoch spend
-            // (cumulative_rounds / cumulative_model_tokens) is already absolute
-            // inside the drive after seeding the prior ledger from the event log.
-            outcome.progress = continued.outcome.progress;
-            outcome.metrics.model_tokens = outcome
-                .metrics
-                .model_tokens
-                .saturating_add(continued.outcome.metrics.model_tokens);
-            outcome.metrics.extra_model_calls = outcome
-                .metrics
-                .extra_model_calls
-                .saturating_add(continued.outcome.metrics.extra_model_calls);
-            for path in continued.outcome.modified_files {
-                if !outcome.modified_files.contains(&path) {
-                    outcome.modified_files.push(path);
-                }
-            }
+            merge_continued_outcome(&mut outcome, continued.outcome);
         }
         Ok(outcome)
     }
@@ -1074,25 +1126,7 @@ impl TaskEngine {
                     cancellation.clone(),
                 )
                 .await?;
-            outcome.rounds = outcome.rounds.saturating_add(continued.outcome.rounds);
-            outcome.final_text = continued.outcome.final_text;
-            outcome.stop_reason = continued.outcome.stop_reason;
-            outcome.stop_detail = continued.outcome.stop_detail;
-            outcome.budget_exhaustion = continued.outcome.budget_exhaustion;
-            outcome.progress = continued.outcome.progress;
-            outcome.metrics.model_tokens = outcome
-                .metrics
-                .model_tokens
-                .saturating_add(continued.outcome.metrics.model_tokens);
-            outcome.metrics.extra_model_calls = outcome
-                .metrics
-                .extra_model_calls
-                .saturating_add(continued.outcome.metrics.extra_model_calls);
-            for path in continued.outcome.modified_files {
-                if !outcome.modified_files.contains(&path) {
-                    outcome.modified_files.push(path);
-                }
-            }
+            merge_continued_outcome(&mut outcome, continued.outcome);
         }
         Ok(outcome)
     }

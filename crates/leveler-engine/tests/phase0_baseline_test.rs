@@ -369,15 +369,17 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Stop-reason discriminability at the task level (phase 0, task 7).
+// 2. Stop-reason discriminability at the task level (phase 4 contract).
 // ---------------------------------------------------------------------------
 
-/// CURRENT behavior: `update_goal(blocked)` maps to `TaskOutcome::Failed` at
-/// the session level; "blocked" survives only in the turn event's
-/// Debug-formatted `stop_reason` string. This locks where the information
-/// lives today so phase 4 (typed stop reasons) has a baseline to diff.
+/// Phase 4 contract: `update_goal(blocked)` is machine-discriminable at every
+/// durable level — the typed `stop` field on both terminal events and the
+/// session's `Blocked` status column, written by the engine as the single
+/// lifecycle writer. (`TaskOutcome::Failed` remains the coarse outcome for
+/// non-success, as before; the phase 0 version of this test proved "blocked"
+/// only survived as a Debug string.)
 #[tokio::test]
-async fn blocked_goal_collapses_to_failed_at_the_task_level() {
+async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
     use leveler_engine::{ExecutionKind, TaskEngine, TaskOutcome, TaskSpec};
 
     let h = harness(vec![tool_call(
@@ -404,25 +406,91 @@ async fn blocked_goal_collapses_to_failed_at_the_task_level() {
         base_commit: None,
     };
     let session = engine.create_task(&spec).await.unwrap();
-    let mut turn_stop_reasons: Vec<String> = Vec::new();
+    let mut turn_stops: Vec<Option<leveler_agent::StopReason>> = Vec::new();
+    let mut task_stop: Option<Option<leveler_agent::StopReason>> = None;
     let report = engine
         .run(
             &session,
             &spec,
-            &mut |e| {
-                if let EngineEvent::TurnFinished { stop_reason, .. } = &e {
-                    turn_stop_reasons.push(stop_reason.clone());
-                }
+            &mut |e| match &e {
+                EngineEvent::TurnFinished { stop, .. } => turn_stops.push(*stop),
+                EngineEvent::TaskFinished { stop, .. } => task_stop = Some(*stop),
+                _ => {}
             },
             CancellationToken::new(),
         )
         .await
         .unwrap();
 
-    // Typed at the agent layer…
+    // Typed in the report, in both terminal events, and in the session row.
     assert_eq!(report.stop_reason, leveler_agent::StopReason::Blocked);
-    // …collapsed at the session layer…
     assert_eq!(report.outcome, TaskOutcome::Failed);
-    // …and stringly-typed in the durable turn event.
-    assert_eq!(turn_stop_reasons, vec!["Blocked".to_string()]);
+    assert_eq!(turn_stops, vec![Some(leveler_agent::StopReason::Blocked)]);
+    assert_eq!(
+        task_stop,
+        Some(Some(leveler_agent::StopReason::Blocked)),
+        "TaskFinished must carry the typed stop reason"
+    );
+    let record = SessionRepository::new(&engine.db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.status,
+        leveler_lifecycle::SessionStatus::Blocked,
+        "the engine must be the writer of the terminal session status"
+    );
+}
+
+/// The engine — not the app layer — owns the session lifecycle columns:
+/// Running while a task executes, terminal status/state stamped atomically
+/// with the outcome.
+#[tokio::test]
+async fn engine_stamps_running_and_terminal_session_status_itself() {
+    use leveler_engine::{ExecutionKind, TaskEngine, TaskSpec};
+
+    let h = harness(vec![
+        patch_response(),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+    ])
+    .await;
+    let engine = TaskEngine {
+        db: h.db,
+        factory: h.factory,
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+    };
+    let spec = TaskSpec {
+        repository: h.dir.path().to_path_buf(),
+        goal: "add a function".to_string(),
+        mode: PermissionProfile::Assisted,
+        sandbox: false,
+        kind: ExecutionKind::Direct,
+        continuation: ContinuationPolicy::UntilTerminal,
+        limits: StepLimits::default(),
+        verification: leveler_verifier::VerificationPlan::default(),
+        base_commit: None,
+    };
+    let session = engine.create_task(&spec).await.unwrap();
+    engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let record = SessionRepository::new(&engine.db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.status,
+        leveler_lifecycle::SessionStatus::Completed,
+        "terminal status must come from the engine, with no app-layer writer"
+    );
+    assert_eq!(record.state, leveler_lifecycle::AgentState::Complete);
 }

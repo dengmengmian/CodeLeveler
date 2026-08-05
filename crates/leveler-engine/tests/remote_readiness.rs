@@ -81,6 +81,7 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
         EngineEvent::TaskFinished {
             outcome: TaskOutcome::Verified,
             reason: None,
+            stop: None,
         },
         &mut |_| {},
     )
@@ -93,6 +94,7 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
         vec![EngineEvent::TaskFinished {
             outcome: TaskOutcome::Verified,
             reason: None,
+            stop: None,
         }],
         "transient delta dropped; canonical completion recovered"
     );

@@ -232,9 +232,9 @@ ApprovalResolved 落盘与 dispatch 的竞态。
 | R1 | ~~副作用先于 `ToolCallStarted` 落盘（崩溃窗口）~~ **已修**（阶段 1 flush 屏障） | 恢复 | §四；`side_effect_barrier_test.rs` + 反转后的窗口测试 | 阶段 1 ✅ |
 | R2 | ~~审批 resolved 落盘与 dispatch 竞态~~ **已修**（dispatch 前第二次 flush） | 恢复 | `side_effect_barrier_test::approval_resolution_is_durable_before_dispatch` | 阶段 1 ✅ |
 | R3 | ~~交互 chat 路径不做崩溃窗口 reconciliation~~ **已修**（chat 与 resume 同链） | 恢复 | `crash_recovery_test::chat_blocks_on_a_mutating_dangling_call_until_acknowledged` | 阶段 3 ✅ |
-| R4 | `sessions.status`（app 写）与 `sessions.outcome`（engine 写）双表示，可分叉 | 正确性 | §二 | 阶段 4 |
-| R5 | blocked 在 task 层塌缩为 failed；turn stop_reason 为 Debug 字符串 | 正确性 | §五 | 阶段 4 |
-| R6 | engine 两处 outcome 合并逻辑重复（continue vs 预算扩展） | 正确性 | engine.rs:902/1041 | 阶段 4 |
+| R4 | ~~status/outcome 双写入者可分叉~~ **已修**（finish_task 单事务盖全列;app 不再写） | 正确性 | `engine_stamps_running_and_terminal_session_status_itself` | 阶段 4 ✅ |
+| R5 | ~~blocked 不可判别;stop_reason 为 Debug 字符串~~ **已修**（typed `stop` 字段+`status=Blocked`） | 正确性 | `blocked_goal_is_typed_in_terminal_events_and_session_status` | 阶段 4 ✅ |
+| R6 | ~~两处 outcome 合并重复~~ **已修**（`merge_continued_outcome` 唯一实现） | 正确性 | engine.rs | 阶段 4 ✅ |
 | R7 | 真机（iOS/Android/蜂窝）路径未验证 | 多端 | phase1-acceptance-checklist | 阶段 7 |
 | R8 | 跨端单场景接力（TUI→Web→手机）无自动化 | 多端 | §三 | 阶段 7 |
 

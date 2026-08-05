@@ -46,7 +46,7 @@
 | 1 | 可靠的工具副作用屏障 | 完成（见阶段 1 状态注记） |
 | 2 | 唯一 ToolHost 调用边界 | 完成（见阶段 2 状态注记） |
 | 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
-| 4 | 统一生命周期与 goal 续跑所有权 | 待开始 |
+| 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
 | 5 | 产品策略移出 direct loop | 待开始 |
 | 6 | 收紧模型与 provider 边界 | 待开始 |
 | 7 | 稳定性与开源发布门槛 | 待开始 |
@@ -193,6 +193,35 @@
 ### 阶段 4：统一生命周期与 goal 续跑所有权
 
 **目的：** 删除 engine 与 agent 之间重复的 continuation、budget 和完成判断。
+
+> **状态：完成（本阶段范围内）。**
+>
+> - **唯一生命周期写入者（基线 R4）。** 会话 `status`/`state` 不再由
+>   app 层第二次书写：`TerminalRepository::finish_task` 在**一个事务**里
+>   同时提交 `outcome + status + state + task_finished 事件`；Running
+>   由 engine 在 run/chat/resume 起步时盖章（`mark_running`）。
+>   `status_for_app` 从 app 删除，其产品映射移入 engine
+>   （`terminal_status_for`）。并行 worktree 驱动器（app/parallel.rs）
+>   自己驱动父会话、不经 engine，因此仍是并行类会话的合法生命周期
+>   写入者——按执行类型各自唯一，记录在案。
+>   **迁移影响**：resume 的早期校验错误（会话已完成/类型不符）不再把
+>   status 误写成 Failed（原 app 无条件后写导致）。
+> - **类型化停止原因（基线 R5）。** `StopReason` 获得 serde（snake_case）；
+>   `TurnFinished`/`TaskFinished` 事件新增 `stop: Option<StopReason>`
+>   （serde default，旧行读出 `None`，旧展示字符串字段保留）。blocked
+>   现在在 turn 事件、task 事件、会话 `status=Blocked` 三层全部
+>   机器可判别；completed/cancelled/budget/failed 分别对应
+>   Completed/Interrupted/BudgetLimited/Failed + typed stop。
+>   证据：`phase0_baseline_test::blocked_goal_is_typed_in_terminal_events_and_session_status`、
+>   `engine_stamps_running_and_terminal_session_status_itself`。
+> - **唯一 outcome 合并（基线 R6）。** goal 续跑与预算扩展共用
+>   `merge_continued_outcome`。**迁移影响**：stalled-continue 现在与预算
+>   扩展一样传递 `budget_exhaustion`——续跑后耗尽预算的 goal 从此可以
+>   进入有界扩展（此前被静默丢弃，永远无法扩展）。
+> - **刻意不做（转阶段 5）**：engine 的 `continue_active_goal` 与
+>   `extend_budget_exhausted` 本身未删除。续跑何时发生是产品策略
+>   （TurnPolicy 方向），随阶段 5 的策略外移一并迁移；现有行为由
+>   `direct_test` 续跑/预算用例锁定，本阶段先consolidate其状态写入。
 
 工作：
 
