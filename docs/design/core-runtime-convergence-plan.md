@@ -44,7 +44,7 @@
 | --- | --- | --- |
 | 0 | 冻结基线与可观测语义 | 完成（验收证据：[`phase0-baseline.md`](phase0-baseline.md)） |
 | 1 | 可靠的工具副作用屏障 | 完成（见阶段 1 状态注记） |
-| 2 | 唯一 ToolHost 调用边界 | 待开始 |
+| 2 | 唯一 ToolHost 调用边界 | 完成（见阶段 2 状态注记） |
 | 3 | 统一会话恢复与上下文装载 | 待开始 |
 | 4 | 统一生命周期与 goal 续跑所有权 | 待开始 |
 | 5 | 产品策略移出 direct loop | 待开始 |
@@ -114,6 +114,25 @@
 ### 阶段 2：收敛为唯一 ToolHost 调用边界
 
 **目的：** 让所有工具共享一条不可绕过的安全与执行路径。
+
+> **状态：完成。** ToolHost 管线收拢在
+> `crates/leveler-agent/src/executor/host.rs`：
+> `admit()`（副作用屏障 → pre-hooks → 权限规则 → profile 策略 → 审批 →
+> 屏障）返回 `AdmittedCall`——`dispatch`/`dispatch_raw` 只接受该类型，
+> 且其构造器私有于 host.rs，**未经准入的执行无法通过编译**。宿主逃逸
+> 提升（`open`/`xdg-open` 的 turn_unrestricted_fs）也移入准入管线，
+> 不再散落在循环里。drive.rs 只保留计划分配给 Agent Loop 的职责：
+> 批次调度、并发约束（并行批信号量）、结果回灌顺序与 guard 拒绝
+> （guard 拒绝不产生执行，无需准入）。
+> 架构 tripwire：`crates/leveler-agent/tests/tool_host_boundary.rs`
+> 扫描本 crate 源码，`registry.execute` 与 `run_pre` 出现在 host.rs
+> 之外即失败。MCP 工具与内置工具同在 registry，走同一 admit 管线。
+> 已知豁免（记录在案）：engine 崩溃恢复重放
+> （`replay_dangling`）直接调 `ToolRegistry::execute`——它只对
+> persisted-risk=Safe 的只读幂等工具生效（风险门在前），不构成仓库写入
+> 或进程执行的绕过；阶段 3 收敛恢复入口时一并处理。
+> 行为等价证据：agent/engine/app 三 crate 测试全绿（含审批、hooks、
+> 沙箱、并行、写串行、取消全部既有用例），无任何测试改动。
 
 工作：
 

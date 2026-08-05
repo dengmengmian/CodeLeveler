@@ -14,7 +14,7 @@ use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelRequest, Role, ToolCall, ToolChoice,
     ToolResultContent,
 };
-use leveler_tools::{ToolContext, ToolRegistry};
+use leveler_tools::ToolRegistry;
 
 use super::round_verdict::{self, RoundVerdict};
 
@@ -26,13 +26,14 @@ use super::dispatch::{
     collect_modified, compact_json, deny_call, extract_image, extract_plan, is_plan_explore_tool,
     newly_modified_paths, note_tool_side_effects, preview, task_needs_structured_plan,
 };
+use super::host::AdmitError;
 use super::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor, LOOP_GUARD_THRESHOLD,
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
-    call_needs_host_escape, collect_scoped_paths_from_call, counts_as_verification_evidence,
-    extract_command, is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
+    collect_scoped_paths_from_call, counts_as_verification_evidence, extract_command,
+    is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
     write_targets_outside_allowlist,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
@@ -836,10 +837,10 @@ impl Executor {
             let mut pending_images: Vec<ContentPart> = Vec::new();
             // Read-only, side-effect-free tools deferred to run concurrently
             // after this in-order pass. Everything else runs here, serially.
+            // Each job carries the AdmittedCall proving the host pipeline ran.
             struct ParallelJob {
                 index: usize,
-                call: ToolCall,
-                ctx: ToolContext,
+                admitted: crate::executor::host::AdmittedCall,
                 loop_key: String,
             }
             let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
@@ -1355,14 +1356,6 @@ impl Executor {
                     arguments: compact_json(&call.arguments),
                     parallel,
                 });
-                // Side-effect barrier, first wait: the announcing
-                // `ToolCallStarted` must be durable before ANYTHING can act on
-                // this call — authorize runs pre-tool hooks, which are external
-                // side effects themselves. A flush failure aborts the run
-                // before the tool executes (never a fake success).
-                if let Some(barrier) = &self.event_barrier {
-                    barrier.flush().await?;
-                }
                 collect_scoped_paths_from_call(&call, &mut scoped_paths);
 
                 // Build the effective context: apply turn grants from
@@ -1381,49 +1374,30 @@ impl Executor {
                     epoch_paths,
                 );
 
-                // `parallel` (computed above) also decides deferral to the batch;
-                // every other tool runs here, in order.
-                let (content, is_error, image, workspace_snapshot, plan, newly_modified) =
+                // Admission: the ToolHost pipeline (side-effect barrier →
+                // hooks → rules → policy → approval → barrier). Execution
+                // requires the AdmittedCall it returns; `parallel` (computed
+                // above) decides deferral to the batch — every other admitted
+                // call runs here, in order.
+                let (content, is_error, image, workspace_snapshot, plan, newly_modified, call) =
                     match self
-                        .authorize_with_cancellation(&call, &mut session_approved, &cancellation)
+                        .admit(call, ctx, parallel, &mut session_approved, &cancellation)
                         .await
                     {
-                        Ok(()) if parallel => {
-                            if self.registry.runs_command(&call.name) {
+                        Ok(admitted) if parallel => {
+                            if self.registry.runs_command(&admitted.call.name) {
                                 commands_run += 1;
-                            }
-                            // Host openers (`open`/`xdg-open`) only work outside
-                            // seatbelt; elevate after authorize (user already OK'd).
-                            let mut ctx = ctx;
-                            if call_needs_host_escape(&call) {
-                                ctx.turn_unrestricted_fs = true;
                             }
                             parallel_jobs.push(ParallelJob {
                                 index,
-                                call,
-                                ctx,
+                                admitted,
                                 loop_key,
                             });
                             continue;
                         }
-                        Ok(()) => {
-                            if self.registry.runs_command(&call.name) {
+                        Ok(admitted) => {
+                            if self.registry.runs_command(&admitted.call.name) {
                                 commands_run += 1;
-                            }
-                            let mut ctx = ctx;
-                            if call_needs_host_escape(&call) {
-                                ctx.turn_unrestricted_fs = true;
-                            }
-                            // Side-effect barrier, second wait: authorization
-                            // may have produced ApprovalRequested/Resolved —
-                            // the decision must be durable before the tool it
-                            // authorized can produce a side effect (else a
-                            // crash leaves an approved side effect that resume
-                            // sees as still pending approval). Parallel-batch
-                            // tools skip this: they are read-only and
-                            // side-effect-free by declaration.
-                            if let Some(barrier) = &self.event_barrier {
-                                barrier.flush().await?;
                             }
                             let files_before = modified_files.clone();
                             // Heartbeat: while a long command runs, emit a
@@ -1431,11 +1405,12 @@ impl Executor {
                             // "运行 cargo test · <elapsed>" instead of a bare
                             // "等待模型". select! keeps this in the same task, so
                             // calling `observer` from the ticker branch is sound.
-                            let progress_label = command_progress_label(&self.registry, &call);
+                            let progress_label =
+                                command_progress_label(&self.registry, &admitted.call);
                             let (content, is_error, image, workspace_snapshot, plan) = {
                                 let started = std::time::Instant::now();
                                 let dispatch_fut =
-                                    self.dispatch(&call, ctx, &mut modified_files, &cancellation);
+                                    self.dispatch(&admitted, &mut modified_files, &cancellation);
                                 tokio::pin!(dispatch_fut);
                                 let mut ticker = tokio::time::interval(
                                     std::time::Duration::from_secs(COMMAND_HEARTBEAT_SECS),
@@ -1465,9 +1440,18 @@ impl Executor {
                                 cancelled_mid_batch = true;
                             }
                             let newly = newly_modified_paths(&files_before, &modified_files);
-                            (content, is_error, image, workspace_snapshot, plan, newly)
+                            (
+                                content,
+                                is_error,
+                                image,
+                                workspace_snapshot,
+                                plan,
+                                newly,
+                                admitted.into_call(),
+                            )
                         }
-                        Err(reason) => {
+                        Err(AdmitError::Fatal(error)) => return Err(error),
+                        Err(AdmitError::Refused { call, reason }) => {
                             denied_calls_this_round += 1;
                             (
                                 format!("action not permitted: {reason}"),
@@ -1476,6 +1460,7 @@ impl Executor {
                                 None,
                                 None,
                                 Vec::new(),
+                                call,
                             )
                         }
                     };
@@ -1637,9 +1622,7 @@ impl Executor {
                             .acquire()
                             .await
                             .expect("tool-batch semaphore is never closed");
-                        let out = self
-                            .dispatch_raw(&job.call, job.ctx.clone(), cancellation_ref)
-                            .await;
+                        let out = self.dispatch_raw(&job.admitted, cancellation_ref).await;
                         (job.index, out)
                     });
                 }
@@ -1665,8 +1648,8 @@ impl Executor {
                         verification_ran = false;
                         note_tool_side_effects(
                             &mut ledger,
-                            job.call.id.as_str(),
-                            job.call.name.as_str(),
+                            job.admitted.call.id.as_str(),
+                            job.admitted.call.name.as_str(),
                             job_files.clone(),
                             &plan_state,
                             observer,
@@ -1682,15 +1665,15 @@ impl Executor {
                         }
                     }
                     observer(AgentEvent::ToolResult {
-                        id: job.call.id.as_str().to_string(),
-                        name: job.call.name.clone(),
+                        id: job.admitted.call.id.as_str().to_string(),
+                        name: job.admitted.call.name.clone(),
                         is_error,
                         preview: preview(&content),
                     });
                     if !is_error && let Some(steps) = extract_plan(&metadata) {
                         observer(AgentEvent::PlanUpdated { steps });
                     }
-                    if !is_search_tool(&job.call.name) {
+                    if !is_search_tool(&job.admitted.call.name) {
                         consecutive_searches = 0;
                     }
                     for path in &modified_files {
@@ -1698,7 +1681,7 @@ impl Executor {
                     }
                     results[job.index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
-                            call_id: job.call.id.clone(),
+                            call_id: job.admitted.call.id.clone(),
                             // Already size-capped centrally by `ToolRegistry::execute`.
                             content,
                             is_error,

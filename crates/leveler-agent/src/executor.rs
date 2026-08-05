@@ -4,6 +4,7 @@ pub mod closeout;
 mod dispatch;
 mod drive;
 mod handlers;
+mod host;
 pub mod round_verdict;
 mod stream;
 
