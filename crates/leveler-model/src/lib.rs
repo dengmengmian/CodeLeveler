@@ -37,7 +37,7 @@ pub use protocol::{
 };
 pub use request::{ModelRef, ModelRequest, RequestMetadata};
 pub use response::ModelResponse;
-pub use runtime::{ModelEventStream, ModelRuntime};
+pub use runtime::{ModelEventStream, ModelRuntime, stream_from_response};
 pub use tool_catalog::{
     BuiltinToolClass, BuiltinToolMetadata, builtin_observe_key, builtin_tool_metadata,
     is_safe_replay_tool, is_search_tool,

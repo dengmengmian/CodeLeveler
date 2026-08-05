@@ -64,7 +64,10 @@
 # configs/providers/<id>.yaml — an upstream API endpoint
 # ══════════════════════════════════════════════════════════════════════════════
 id: deepseek                 # provider id, referenced by models
-protocol: openai_chat        # openai_chat | openai_responses | anthropic_messages | gemini_generate_content
+protocol: openai_chat        # implemented: openai_chat | anthropic_messages
+                             # (openai_responses / gemini_generate_content parse
+                             # but fail at startup with a named error — no
+                             # silent fallback; they are not implemented yet)
 base_url: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}   # env expansion + default
 api_key_env: DEEPSEEK_API_KEY   # key ALWAYS from env, never stored in the repo
 headers:

@@ -333,6 +333,54 @@ fn build_client(config: &ProviderConfig) -> Result<reqwest::Client, RegistryErro
 }
 
 #[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    fn config_for(protocol: ProtocolKind) -> ProviderConfig {
+        ProviderConfig {
+            id: "p".into(),
+            protocol,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key_env: String::new(),
+            api_key: None,
+            headers: Default::default(),
+            timeouts: Default::default(),
+            retry: Default::default(),
+        }
+    }
+
+    /// A configured-but-unimplemented wire protocol is a NAMED, immediate
+    /// error — never a silent fallback to a different adapter (phase 6:
+    /// unimplemented protocols are not advertised and cannot degrade).
+    #[test]
+    fn unimplemented_protocols_fail_loudly_by_name() {
+        for protocol in [
+            ProtocolKind::OpenAiResponses,
+            ProtocolKind::GeminiGenerateContent,
+        ] {
+            match adapter_for(&config_for(protocol)) {
+                Err(RegistryError::UnsupportedProtocol(id, kind)) => {
+                    assert_eq!(id, "p");
+                    assert_eq!(kind, protocol);
+                }
+                Err(other) => panic!("expected UnsupportedProtocol, got {other:?}"),
+                Ok(_) => panic!("{protocol:?} must not resolve to an adapter"),
+            }
+        }
+    }
+
+    #[test]
+    fn implemented_protocols_resolve() {
+        for protocol in [ProtocolKind::OpenAiChat, ProtocolKind::AnthropicMessages] {
+            assert!(
+                adapter_for(&config_for(protocol)).is_ok(),
+                "{protocol:?} must resolve"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod proxy_tests {
     use super::base_url_is_loopback;
 

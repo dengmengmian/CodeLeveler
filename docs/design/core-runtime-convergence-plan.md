@@ -48,7 +48,7 @@
 | 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
 | 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
 | 5 | 产品策略移出 direct loop | 完成（开关化+分类；协议化迁移与旧策略删除待 eval 数据，见阶段 5 状态注记） |
-| 6 | 收紧模型与 provider 边界 | 待开始 |
+| 6 | 收紧模型与 provider 边界 | 完成（见阶段 6 状态注记） |
 | 7 | 稳定性与开源发布门槛 | 待开始 |
 
 状态只能在对应验收证据已链接到本文后改为“完成”；代码已经存在但尚未经过本阶段
@@ -289,6 +289,32 @@
 ### 阶段 6：收紧模型与 provider 边界
 
 **目的：** 只保留真实实现且可验证的厂商中立接口。
+
+> **状态：完成。**
+>
+> - **不宣传未实现协议。** `configs/example.yaml` 只宣传已实现的
+>   `openai_chat` / `anthropic_messages`；`openai_responses` 与
+>   `gemini_generate_content` 变体保留在 `ProtocolKind`（解析成功 →
+>   registry 以命名错误 `UnsupportedProtocol` 立即失败，绝不静默回退），
+>   由 `registry.rs::unimplemented_protocols_fail_loudly_by_name` 与
+>   `implemented_protocols_resolve` 锁定。
+> - **一致性测试盘点。** 两个已实现协议各自覆盖：请求编码（含工具、
+>   温度、reasoning 风格）、流式（分片 tool-call 组装）、截断
+>   （`length`/`max_tokens` → `FinishReason::Length`）、畸形/超大参数
+>   报错不猜、finalize 幂等（openai_chat 30 例、anthropic_messages
+>   14 例，本阶段核查为已齐备）。
+> - **同步/流式组装统一。** 新增
+>   `leveler_model::stream_from_response`：非流式响应到规范事件流的
+>   唯一定义（started → 内容序 → usage → completed，含零 usage 不上报），
+>   单测锁定；engine 侧 4 个测试替身的手写 stream 全部改用它。
+> - **厂商细节零泄漏（复核）。** engine/agent/tools/TUI 源码无
+>   Authorization/x-api-key/anthropic-version 等厂商 wire 细节。
+> - **crate 边界决策。** `leveler-protocol` 保持独立 crate、只导出
+>   adapter 实现（trait 在 `leveler-model`）：合并进 provider 只减
+>   crate 数不改边界，与实施原则「不为减少 crate 合并职责」一致，
+>   不做。
+> - 无失效 middleware（全仓无 provider 侧 middleware）；`policy:` 旧
+>   模型分档配置早已按硬错误处理（example.yaml 注明）。
 
 工作：
 

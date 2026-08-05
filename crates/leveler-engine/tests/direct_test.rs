@@ -56,27 +56,9 @@ impl ModelRuntime for MockRuntime {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
-        use leveler_model::ModelEvent;
+        // One shared definition of response→stream semantics (phase 6).
         let response = self.generate(request, cancellation).await?;
-        let mut events: Vec<Result<ModelEvent, ModelError>> = Vec::new();
-        events.push(Ok(ModelEvent::MessageStarted {
-            request_id: response.request_id.clone(),
-        }));
-        for part in &response.message.content {
-            match part {
-                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
-                    delta: text.clone(),
-                })),
-                ContentPart::ToolCall { call } => {
-                    events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }));
-                }
-                _ => {}
-            }
-        }
-        events.push(Ok(ModelEvent::MessageCompleted {
-            finish_reason: response.finish_reason,
-        }));
-        Ok(Box::pin(futures::stream::iter(events)))
+        Ok(leveler_model::stream_from_response(response))
     }
 
     async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
