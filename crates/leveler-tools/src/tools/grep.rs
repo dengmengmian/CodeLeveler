@@ -73,12 +73,6 @@ impl Tool for GrepTool {
         RiskLevel::Safe
     }
 
-    /// Pure in-process file read: no write, no subprocess, no language
-    /// server, no network. Re-running it after a crash changes nothing.
-    fn replay_is_side_effect_free(&self) -> bool {
-        true
-    }
-
     fn supports_parallel(&self) -> bool {
         true
     }

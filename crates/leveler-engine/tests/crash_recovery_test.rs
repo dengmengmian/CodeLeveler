@@ -791,3 +791,62 @@ async fn a_declared_replay_safe_tool_still_replays() {
         "the safe read must be replayed and recorded: {events:?}"
     );
 }
+
+/// Call ids are local to the agent that issued them, so two concurrent
+/// sub-agents routinely produce the same one. If dangling calls were paired by
+/// call id alone, one child's finish would close the other child's record and
+/// a real side effect would vanish from recovery's view.
+#[tokio::test]
+async fn two_agents_sharing_a_call_id_do_not_close_each_others_records() {
+    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&engine, &session).await;
+
+    let turn = TurnRepository::new(&engine.db)
+        .start(&session, "user", None, leveler_core::now())
+        .await
+        .unwrap();
+    let turn_id = TurnId::new(turn.id);
+    let log = EventLog::new(&engine.db, session.clone());
+
+    // Both children open a call with the SAME local id.
+    for agent in ["agent-a", "agent-b"] {
+        log.append(
+            Some(&turn_id),
+            EngineEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "apply_patch".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                risk: Some(leveler_execution::RiskLevel::WorkspaceWrite),
+                agent_id: Some(agent.to_string()),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    }
+    // Only agent-a finishes.
+    log.append(
+        Some(&turn_id),
+        EngineEvent::ToolCallFinished {
+            call_id: "c1".into(),
+            name: "apply_patch".into(),
+            is_error: false,
+            preview: "done".into(),
+            agent_id: Some("agent-a".to_string()),
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+
+    let dangling = log.dangling_tool_calls().await.unwrap();
+    assert_eq!(
+        dangling.len(),
+        1,
+        "agent-b's call must still be dangling: {dangling:?}"
+    );
+    assert_eq!(dangling[0].agent_id.as_deref(), Some("agent-b"));
+}

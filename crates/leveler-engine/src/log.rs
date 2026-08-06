@@ -129,8 +129,16 @@ impl<'a> EventLog<'a> {
                     agent_id,
                     pending_approval: false,
                 }),
-                EngineEvent::ToolCallFinished { call_id, .. } => {
-                    open.retain(|c| c.call_id != call_id);
+                EngineEvent::ToolCallFinished {
+                    call_id, agent_id, ..
+                } => {
+                    // Pair on (agent, call), not call alone. Call ids are
+                    // local to the agent that made them, so two concurrent
+                    // sub-agents can easily produce the same one — and a
+                    // call-id-only match would let one child's finish close
+                    // the other child's dangling record, hiding a side effect
+                    // recovery must reconcile.
+                    open.retain(|c| !(c.call_id == call_id && c.agent_id == agent_id));
                 }
                 // Approval events sit between a call's Started and Finished, so
                 // they attach to the most-recent open call: a request marks it

@@ -536,7 +536,12 @@ pub trait EventBarrier: Send + Sync {
     /// [`Self::flush`] drains. Anything else races: the flush marker could
     /// overtake the event it is supposed to be waiting for, and the barrier
     /// would report durability for a call that is not recorded yet.
-    fn record_child_tool_event(&self, _event: ChildToolEvent) {}
+    ///
+    /// Required, deliberately. A default no-op would let a barrier flush
+    /// successfully while silently discarding the record — the caller would
+    /// then run a delegated side effect believing it was durable, which is
+    /// the exact failure this method exists to prevent.
+    fn record_child_tool_event(&self, event: ChildToolEvent);
 }
 
 /// A delegated agent's tool call, attributed to the child that made it.

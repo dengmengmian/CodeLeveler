@@ -1498,10 +1498,27 @@ fn slash_clear_empties_transcript() {
         ),
         "one /clear must start a new session: {effects:?}"
     );
-    assert!(s.transcript.is_empty(), "the view starts empty");
+    assert!(
+        !s.transcript.is_empty(),
+        "the view must NOT clear before the host confirms: if creating the \
+         session fails, an emptied screen is a lie about work that still exists"
+    );
     assert!(
         !s.clear_confirm_armed,
         "a non-destructive action must not arm a confirmation"
+    );
+
+    // The switch happens when the host says it happened.
+    let mut fresh = snapshot();
+    fresh.id = SessionId::new("s-new");
+    fresh.messages = vec![];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: fresh }),
+    );
+    assert!(
+        s.transcript.is_empty(),
+        "the view switches once SessionOpened arrives"
     );
 }
 

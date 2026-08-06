@@ -510,6 +510,25 @@ impl InProcessRuntimeClient {
 
     /// Steering for one session. Cloned into the executor, which drains it at
     /// the top of every round.
+    /// Remove a session that was created but never handed to a client, so a
+    /// failure partway through setup does not leave an orphan row the user
+    /// sees in the session list and cannot explain.
+    async fn discard_session(&self, session_id: &SessionId) {
+        let removed: Result<(), anyhow::Error> = async {
+            let db = self.app.open_database().await?;
+            SessionRepository::new(&db).delete(session_id).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = removed {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "could not roll back a half-created session"
+            );
+        }
+    }
+
     fn steering_for(&self, session_id: &SessionId) -> Arc<SessionSteering> {
         Arc::new(SessionSteering {
             session_id: session_id.clone(),
@@ -1548,19 +1567,29 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         // Carry the caller's runtime axes over so a fresh
                         // conversation is not silently a different permission
                         // profile or work mode.
-                        if let Err(error) = self.persist_runtime_config(&session_id, config).await {
-                            self.notify_error(
-                                &requester_session_id,
-                                format!("新建会话失败: {error}"),
-                            );
-                            return Ok(());
+                        // Anything that fails from here on leaves a row the
+                        // client never switched to. Roll it back rather than
+                        // leaving an orphan in the session list.
+                        let prepared = async {
+                            self.persist_runtime_config(&session_id, config).await?;
+                            self.snapshot(&session_id).await
                         }
+                        .await;
+                        let session = match prepared {
+                            Ok(session) => session,
+                            Err(error) => {
+                                self.discard_session(&session_id).await;
+                                self.notify_error(
+                                    &requester_session_id,
+                                    format!("新建会话失败: {error}"),
+                                );
+                                return Ok(());
+                            }
+                        };
                         self.attach_session(session_id.clone());
-                        if let Ok(session) = self.snapshot(&session_id).await {
-                            let _ = self
-                                .events_for(&requester_session_id)
-                                .send(RuntimeEvent::SessionOpened { session });
-                        }
+                        let _ = self
+                            .events_for(&requester_session_id)
+                            .send(RuntimeEvent::SessionOpened { session });
                         let _ = self.events.send(RuntimeEvent::SessionList {
                             sessions: self.list_sessions().await,
                         });

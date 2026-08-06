@@ -96,7 +96,9 @@ repair turn（有界，`failed_verification_repairs_once_then_fails`）。
     `acknowledge_crash_window`（CLI `leveler resume --acknowledge...`，run_cmds.rs:854）；
   - pending_approval → 同样硬停（审批落盘与 dispatch 存在竞态窗口，注释明确）；
   - 幂等只读 → 自动重放，结果只进事件日志不进 transcript。
-  - 全部由 `crash_recovery_test.rs` 8 个用例锁定。
+  - 全部由 `crash_recovery_test.rs` 锁定（写作时 8 例，现 13 例——后续
+    阶段补入了 chat 路径 reconciliation、Safe-但有副作用不重放、并发子
+    Agent 事件配对）。
 - **已确认的语义缺口**：`recover_crash_window` 只在 `resume()` 路径被调用。
   交互路径（TUI/Web 重开会话后继续 chat）走 `TaskEngine::chat`，不做 dangling
   reconciliation——崩溃遗留的 dangling `ToolCallStarted` 永远悬着，交互续聊
@@ -169,7 +171,7 @@ HTTP bytes → SSE 解码 → protocol chunk 解码（openai_chat / anthropic_me
 | 取消传播（turn/task 记 Interrupted） | ✅ 自动化 | `direct_test::cancellation_is_recorded_as_interrupted`；手机端取消 `pairing_flow_test.dart`（模拟器） |
 | 进程树取消 / 孤儿清理 | ✅ 自动化（capability-gated） | `leveler-execution` 单测 + PDEATHSIG（Linux）；macOS 实机 soak 为手工 |
 | resume 不丢消息（snapshot+水位合并） | ✅ 自动化 | `direct_test::interrupted_direct_task_resumes_from_the_persisted_transcript`、`multi_turn_session_test::multi_turn_deictic_followup_after_compact_then_resume` |
-| 崩溃窗口分类恢复（resume 路径） | ✅ 自动化 | `crash_recovery_test.rs` 全部 8 例 |
+| 崩溃窗口分类恢复（resume 路径） | ✅ 自动化 | `crash_recovery_test.rs`（基线时 8 例，现 13 例） |
 | 崩溃窗口 reconciliation（交互 chat 路径） | ❌ 缺陷/未覆盖 | 只有 `resume()` 调 `recover_crash_window`；`chat()` 不调（§一.5） |
 | ToolCallStarted 先于副作用落盘 | ❌ 缺陷已证实 | `phase0_baseline_test::tool_side_effect_can_precede_durable_tool_call_started`（确定性复现） |
 | goal complete/blocked | ✅ 自动化 | `loop_test::goal_mode_update_goal_emits_completed_tool_event`、`goal_mode_blocked_reports_blocked`、`quiet_without_update_goal_is_not_task_success` |

@@ -29,6 +29,9 @@ export class RuntimeBridge {
   private readonly getState: GetState;
   /** selectSession 后等待的目标会话 id（防止采纳别会话的广播整量） */
   private pendingSessionId: SessionId | null = null;
+  /** `/clear` 已发出、等待宿主返回新会话。新会话 id 由宿主分配，事先不知道，
+   *  所以只能标记"下一个 session_opened 就是它"，并在采纳时切换 WS 订阅。 */
+  private awaitingNewSession = false;
 
   constructor(dispatch: Dispatch<Action>, getState: GetState) {
     this.dispatch = dispatch;
@@ -80,8 +83,14 @@ export class RuntimeBridge {
   private applySnapshot(snap: UiSessionSnapshot, contextWindow?: number | null): void {
     const { current, draft } = this.getState();
     // 广播流里可能夹带别会话的 session_opened/updated：只接收当前会话的整量；
-    // 例外是 selectSession 后等待目标会话 snapshot 的窗口期
-    if (current && current.id !== snap.id) return;
+    // 例外一是 selectSession 后等待目标会话 snapshot 的窗口期；
+    // 例外二是 `/clear`：宿主刚建的新会话 id 与当前不同，正是要切过去的那个。
+    if (current && current.id !== snap.id) {
+      if (!this.awaitingNewSession) return;
+      this.awaitingNewSession = false;
+      this.dispatch({ type: 'select_session', id: snap.id });
+      this.ws.setSession(snap.id);
+    }
     if (!current && (draft || (this.pendingSessionId !== null && snap.id !== this.pendingSessionId))) {
       return;
     }
@@ -249,6 +258,8 @@ export class RuntimeBridge {
   // ── 会话切换 / 新建 ───────────────────────────────────────────────
 
   selectSession(id: SessionId): void {
+    // An explicit pick supersedes a pending `/clear`.
+    this.awaitingNewSession = false;
     this.pendingSessionId = id;
     this.dispatch({ type: 'select_session', id });
     this.ws.setSession(id);
@@ -604,7 +615,13 @@ export class RuntimeBridge {
         // This used to send clear_conversation, which wiped the session in
         // place — the label said one thing and the wire said another.
         const sid = needSession();
-        if (sid) this.deliver({ type: 'new_session_for', requester_session_id: sid });
+        if (sid) {
+          // The host assigns the id, so accept the next snapshot even though
+          // it will not match the current session — otherwise applySnapshot
+          // drops it and the view never switches.
+          this.awaitingNewSession = true;
+          this.deliver({ type: 'new_session_for', requester_session_id: sid });
+        }
         return;
       }
       case '/diff': {

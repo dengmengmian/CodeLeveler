@@ -109,7 +109,7 @@
 > 验收证据：`crates/leveler-engine/tests/side_effect_barrier_test.rs`
 > （落盘失败不执行、审批结论先于副作用）、
 > `phase0_baseline_test::tool_side_effect_cannot_precede_durable_tool_call_started`
-> （阶段 0 崩溃窗口测试按约定反转）、`crash_recovery_test` 8 例不变，
+> （阶段 0 崩溃窗口测试按约定反转）、`crash_recovery_test`（现 13 例）不变，
 > engine/agent/app 三 crate 测试全绿。dangling call 的分类恢复语义
 > （可重试/需 idempotency/人工裁决）不变，仍由 M5 恢复链处理。
 
@@ -196,7 +196,7 @@
 >    TUI/Web 重开后首个 chat 可能报确认错误而不是静默继续——这是把
 >    原本被隐藏的工作区不确定性暴露给用户，属计划要求的语义修复。
 >    证据：`crash_recovery_test` 新增 2 例（chat 阻断至确认、chat 自动
->    重放安全读），全套 10 例绿。
+>    重放安全读），全套绿（该文件现 13 例）。
 
 工作：
 
@@ -390,7 +390,7 @@
 > - client protocol 已有版本（1.3）与兼容性校验（`version.rs`），
 >   握手不兼容显式报错；Web/手机 transport 复用同一协议。
 > - **故障测试盘点**（现有自动化）：崩溃窗口全分类
->   （`crash_recovery_test` 10 例 + 副作用屏障 4 例）；SQLite busy/full/
+>   （`crash_recovery_test` 13 例 + 副作用屏障 3 例）；SQLite busy/full/
 >   投影回滚（`terminal_repo` 4 例）；provider 断流/畸形分片
 >   （protocol 流式错误用例）；审批超时与本机在场豁免（remote
 >   `approval_timeout` 7 例）；取消（engine/TUI/手机各层）；孤儿进程
