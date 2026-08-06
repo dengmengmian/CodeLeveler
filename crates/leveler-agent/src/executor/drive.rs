@@ -16,6 +16,7 @@ use leveler_model::{
 };
 use leveler_tools::ToolRegistry;
 
+use super::gates;
 use super::round_verdict::{self, RoundVerdict};
 
 use super::closeout::{
@@ -879,52 +880,40 @@ impl Executor {
                 // Complex tasks must register a structured plan before mutation.
                 // Read-only explore tools may run for PLAN_EXPLORE_ROUNDS first
                 // (W2-04). Clarification and permission requests stay available.
-                if structured_plan_required
-                    && !structured_plan_started
-                    && !matches!(
+                if let gates::GateVerdict::Refuse(msg) = gates::plan_gate(&gates::PlanGate {
+                    required: structured_plan_required,
+                    plan_started: structured_plan_started,
+                    explore_rounds_used: plan_explore_rounds_used,
+                    explore_rounds_allowed: PLAN_EXPLORE_ROUNDS,
+                    tool_is_explore: is_plan_explore_tool(&call.name),
+                    tool_is_exempt: matches!(
                         call.name.as_str(),
                         "update_plan"
                             | "request_user_input"
                             | "ask_user"
                             | REQUEST_PERMISSIONS_TOOL
-                    )
-                {
-                    let explore_ok = is_plan_explore_tool(&call.name)
-                        && plan_explore_rounds_used < PLAN_EXPLORE_ROUNDS;
-                    if !explore_ok {
-                        metrics.plan_first_write_blocked += 1;
-                        let msg = if plan_explore_rounds_used < PLAN_EXPLORE_ROUNDS {
-                            "This task has multiple independently verifiable steps. Call \
-                             update_plan first with one in_progress step and the remaining \
-                             steps pending; a prose checklist does not satisfy the plan gate. \
-                             Read-only explore tools (read/grep/list/search) are allowed before the plan."
-                                .to_string()
-                        } else {
-                            "Explore budget used. Call update_plan with one in_progress step \
-                             and remaining steps pending before any further tools."
-                                .to_string()
-                        };
-                        denied_calls_this_round += 1;
-                        results[index] = Some(deny_call(observer, call, msg));
-                        continue;
-                    }
+                    ),
+                }) {
+                    metrics.plan_first_write_blocked += 1;
+                    denied_calls_this_round += 1;
+                    results[index] = Some(deny_call(observer, call, msg));
+                    continue;
                 }
 
                 // Cap consecutive search calls so the model acts on
                 // what they have instead of searching in circles (spec §17).
-                if self.policy.max_search_calls_per_step > 0 && is_search_tool(&call.name) {
+                let tool_is_search = is_search_tool(&call.name);
+                if tool_is_search && self.policy.max_search_calls_per_step > 0 {
                     consecutive_searches += 1;
-                    if consecutive_searches > self.policy.max_search_calls_per_step {
-                        let msg = format!(
-                            "Search budget reached ({} consecutive searches). Use the results you \
-                             already have and take an action (read a specific file or edit) \
-                             instead of searching again.",
-                            self.policy.max_search_calls_per_step
-                        );
-                        denied_calls_this_round += 1;
-                        results[index] = Some(deny_call(observer, call, msg));
-                        continue;
-                    }
+                }
+                if let gates::GateVerdict::Refuse(msg) = gates::search_budget_gate(
+                    tool_is_search,
+                    consecutive_searches,
+                    self.policy.max_search_calls_per_step,
+                ) {
+                    denied_calls_this_round += 1;
+                    results[index] = Some(deny_call(observer, call, msg));
+                    continue;
                 }
 
                 // Delivery: complete_step with evidence_ref against the ledger.
@@ -1257,16 +1246,12 @@ impl Executor {
                 // produced an identical result LOOP_GUARD_THRESHOLD times.
                 let loop_key = observe_class(&call.name, &call.arguments)
                     .unwrap_or_else(|| format!("{}\0{}", call.name, compact_json(&call.arguments)));
-                if self.policy.progress_guards
-                    && call_history.get(&loop_key).map(|(_, n)| *n).unwrap_or(0)
-                        >= LOOP_GUARD_THRESHOLD
-                {
-                    let msg = format!(
-                        "This exact `{}` call already ran {} times with the same result and made \
-                         no progress. Do something different — change the arguments or take \
-                         another action.",
-                        call.name, LOOP_GUARD_THRESHOLD
-                    );
+                let repeats = if self.policy.progress_guards {
+                    call_history.get(&loop_key).map(|(_, n)| *n).unwrap_or(0)
+                } else {
+                    0
+                };
+                if let gates::GateVerdict::Refuse(msg) = gates::loop_guard(&call.name, repeats) {
                     denied_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;

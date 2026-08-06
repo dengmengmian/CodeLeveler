@@ -277,12 +277,20 @@
 > （默认不变）、`minimal_policy_keeps_the_admission_boundary`
 > （切换 policy 不动摇审批/沙箱/取消边界）。
 >
-> **刻意保留待做**（需真实复杂任务 eval 数据，非本环境可完成）：
-> 把策略实现从 drive.rs 迁到独立 policy 模块并定义
-> 「规范事件输入 → 受限控制信号输出」协议；以及基于 eval 对照决定
-> 删除哪些旧启发式。当前每个策略已可独立关断，为该迁移提供了
-> 行为等价的对照面。engine 侧续跑（continue/extend）同属产品策略，
-> 与此一并迁移。
+> **策略模块化（后续补齐，已完成）**：三个 per-call 门禁
+> （plan gate、连续搜索预算、同参同果 loop guard）从 drive.rs 的内联
+> 分支抽到 `executor/gates.rs`，形式为**纯函数：声明式事实输入 →
+> `GateVerdict` 受限信号输出**（只能 Allow / Refuse(理由)，无法执行
+> 工具、无法写存储、无法放行 admission 会拒绝的调用）。drive 只负责
+> 采集事实与消费信号。8 个门禁单测无需模型或工作区即可跑，其中
+> `asking_the_user_is_never_gated` 锁住「门禁永远不能堵死向人求助的
+> 出口」。轮次级判定（observe/closeout/all-refused）此前已由
+> `round_verdict.rs` 以同样形状承担。engine 侧续跑决策见阶段 4 注记
+> （`SupervisorPolicy`）。
+>
+> **仍然待做（需真实复杂任务 eval 数据，非本环境可完成）**：基于 eval
+> 对照决定删除哪些旧启发式。抽离后每个门禁可独立关断且有纯函数对照面，
+> 该决策所需的实验装置已就位。
 
 工作：
 
