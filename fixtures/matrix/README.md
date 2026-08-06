@@ -60,7 +60,7 @@ interrupt, and "no approval overlay AND the file survived" usually means the
 model never attempted the deletion. Both are recorded as
 `precondition-unmet` — an untested boundary, not a passing one.
 
-## Three PTY traps
+## Four PTY traps
 
 1. Set `TIOCSWINSZ`. A forked PTY defaults to 0×0 and `render()` returns before
    drawing a single character.
