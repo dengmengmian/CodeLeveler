@@ -375,6 +375,7 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        supervisor: None,
     };
     let spec = TaskSpec {
         repository: h.dir.path().to_path_buf(),
@@ -446,6 +447,7 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        supervisor: None,
     };
     let spec = TaskSpec {
         repository: h.dir.path().to_path_buf(),

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod baseline;
+mod continuation;
 mod engine;
 mod event;
 mod factory;
@@ -26,6 +27,10 @@ pub use event::{
 };
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
+pub use continuation::{
+    Continuation, DefaultSupervisorPolicy, MAX_EXTENSIONS, NoContinuation, SupervisorPolicy,
+    TurnEnded,
+};
 pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::{EventLog, SnapshotView};

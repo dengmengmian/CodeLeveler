@@ -166,6 +166,7 @@ async fn harness(
         },
         approver,
         clarifier: Arc::new(AutoClarify),
+        supervisor: None,
     };
     (engine, dir)
 }

@@ -9,10 +9,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{
-    Clarifier, ContinuationPolicy, MAX_BUDGET_EXTENSIONS, StepLimits, StopReason,
-    budget_extension_allowed, grant_budget_extension, stop_detail_indicates_no_progress,
-};
+use leveler_agent::{Clarifier, ContinuationPolicy, StepLimits, StopReason};
 use leveler_core::{SessionId, TurnId};
 use leveler_execution::{Approver, PermissionProfile, RiskLevel};
 use leveler_lifecycle::{AgentState, SessionStatus};
@@ -322,7 +319,16 @@ pub struct TaskEngine {
     pub factory: ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
+    /// Decides whether a finished turn gets a successor. The engine owns the
+    /// mechanism and the hard bounds; this owns the judgement. `None` uses
+    /// [`DefaultSupervisorPolicy`] (historical behavior).
+    pub supervisor: Option<Arc<dyn crate::SupervisorPolicy>>,
 }
+
+/// Absolute ceiling on supervisor-initiated turns for one task. Policies are
+/// replaceable; this bound is not — it guarantees the supervision loop
+/// terminates even if a policy keeps asking for another turn.
+const MAX_SUPERVISED_TURNS: u32 = 32;
 
 impl TaskEngine {
     /// Attach mid-turn user input for this engine's runs.
@@ -332,6 +338,18 @@ impl TaskEngine {
     pub fn with_steering(mut self, source: Option<Arc<dyn leveler_agent::SteeringSource>>) -> Self {
         self.factory.steering = source;
         self
+    }
+
+    /// Install a supervision policy (see [`crate::SupervisorPolicy`]).
+    pub fn with_supervisor(mut self, policy: Arc<dyn crate::SupervisorPolicy>) -> Self {
+        self.supervisor = Some(policy);
+        self
+    }
+
+    fn supervisor_policy(&self) -> Arc<dyn crate::SupervisorPolicy> {
+        self.supervisor
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::DefaultSupervisorPolicy::default()))
     }
 
     /// Commit the canonical terminal event and every session lifecycle column
@@ -877,7 +895,7 @@ impl TaskEngine {
             )
             .await?;
         let outcome = self
-            .continue_active_goal(
+            .supervise(
                 log,
                 runner,
                 spec,
@@ -919,7 +937,7 @@ impl TaskEngine {
         // Epoch spend lives on ProgressLedger inside the drive (seeded across
         // continue/resume). Do not re-accumulate here — that would double-count.
         let outcome = self
-            .continue_active_goal(
+            .supervise(
                 log,
                 runner,
                 spec,
@@ -959,7 +977,10 @@ impl TaskEngine {
     /// goal. Start another persisted turn from the latest model-visible context
     /// until the model explicitly completes/blocks, the user cancels, or an
     /// explicit resource limit stops the executor.
-    /// Pure gate used by continue_active_goal (testable without DB).
+    /// The stalled-goal rule, kept as a named delegate onto the default
+    /// policy so the rule has one implementation and its tests keep pointing
+    /// at the behavior users actually get.
+    #[cfg(test)]
     pub(crate) fn stalled_goal_may_continue(
         stop_reason: leveler_agent::StopReason,
         progress: &leveler_lifecycle::ProgressLedger,
@@ -968,7 +989,12 @@ impl TaskEngine {
         stop_reason == leveler_agent::StopReason::Stalled && progress.allows_engine_continue(caps)
     }
 
-    async fn continue_active_goal(
+    /// The ONE supervision loop: after each turn, ask the policy whether the
+    /// task deserves another one and run the mechanism it names. The engine
+    /// keeps every bound — a pinned round budget, the extension cap, the
+    /// absolute [`MAX_SUPERVISED_TURNS`] ceiling, and cancellation — so a
+    /// policy can shorten a run but never make one unbounded.
+    async fn supervise(
         &self,
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
@@ -977,158 +1003,177 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<leveler_agent::AgentOutcome, EngineError> {
-        if spec.continuation.round_limit().is_some() {
-            return Ok(outcome);
-        }
+        let policy = self.supervisor_policy();
+        let mut extensions = 0u32;
+        let mut limits = spec.limits;
 
-        let progress_caps = leveler_lifecycle::ProgressCaps::default();
-        while outcome.stop_reason == StopReason::Stalled {
-            // No infinite continue when the prior drive already showed zero
-            // progress / closeout thrash — stops fake “always running” loops.
-            if !Self::stalled_goal_may_continue(
-                outcome.stop_reason,
-                &outcome.progress,
-                progress_caps,
-            ) {
-                outcome.stop_detail = Some(
-                    outcome
-                        .stop_detail
-                        .clone()
-                        .unwrap_or_else(|| "continue suppressed: no-progress cap".into()),
-                );
+        for _ in 0..MAX_SUPERVISED_TURNS {
+            if cancellation.is_cancelled() {
                 break;
             }
-            // Announce BEFORE the transcript load / compaction / model call.
-            // Everything below is invisible work that happens after the user
-            // already read a final answer; without this the status line shows
-            // a bare "waiting for model" for the whole continuation.
-            observer(EngineEvent::AdvisoryStarted {
-                kind: leveler_agent::AdvisoryKind::GoalContinuation
-                    .as_key()
-                    .to_string(),
+            let decision = policy.after_turn(&crate::TurnEnded {
+                stop_reason: outcome.stop_reason,
+                stop_detail: outcome.stop_detail.as_deref(),
+                progress: &outcome.progress,
+                budget_exhaustion: outcome.budget_exhaustion.as_ref(),
+                modified_files: &outcome.modified_files,
+                extensions_granted: extensions,
+                round_budget: spec.continuation,
             });
-            let raw = crate::RawTranscript::load_strict(
-                &self.db,
-                &runner.session_id,
-                "goal transcript during continuation",
-            )
-            .await?;
-            let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
-            let context = raw
-                .assemble(
-                    log,
-                    summary.as_deref(),
-                    Some(spec.goal.as_str()),
-                    leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
-                )
-                .await?;
-            if context.compacted {
-                log.append(None, context.snapshot_event(), observer).await?;
-            }
-            let prior = context.prior;
-            // Full objective restatement — not a vague “Continue…” only. When
-            // the previous drive recorded WHY its closeout stalled, name that
-            // gap so the continuation addresses it instead of repeating the
-            // same summary into the same wall.
-            let closeout_note = outcome
-                .stop_detail
-                .as_deref()
-                .and_then(leveler_agent::closeout::reason_from_stalled_detail)
-                .map(|reason| {
-                    format!(
-                        "\n\nThe previous turn's closeout stalled on: {}. Close that specific \
-                         gap first instead of re-stating what was already done.",
-                        reason.as_key()
-                    )
-                })
-                .unwrap_or_default();
-            let continue_text = format!(
-                "Continue working toward the active goal. The previous turn ended without \
-                 proving completion.{closeout_note}\n\n\
-                 <objective>\n{}\n</objective>\n\n\
-                 Inspect the current workspace, make concrete progress, and call update_goal \
-                 only when the full objective is complete or genuinely blocked. Do not \
-                 re-audit already finished plan steps with git status thrash.",
-                spec.goal
-            );
-            let continued = runner
-                .run_turn(
-                    TurnKind::User,
-                    goal_profile(spec),
-                    TurnInput::Content {
-                        prior,
-                        content: vec![leveler_model::ContentPart::Text {
-                            text: continue_text,
-                        }],
-                    },
-                    observer,
-                    cancellation.clone(),
-                )
-                .await?;
-            merge_continued_outcome(&mut outcome, continued.outcome);
+
+            let continued = match decision {
+                crate::Continuation::Stop => {
+                    // Name why a quiet goal was not nudged again, so the stop
+                    // reads as a decision instead of an unexplained end.
+                    if outcome.stop_reason == StopReason::Stalled && outcome.stop_detail.is_none() {
+                        outcome.stop_detail =
+                            Some("continue suppressed: no-progress cap".to_string());
+                    }
+                    break;
+                }
+                crate::Continuation::DriveGoalAgain => {
+                    self.drive_goal_again(log, runner, spec, &outcome, observer, &cancellation)
+                        .await?
+                }
+                crate::Continuation::ExtendBudget(exhaustion) => {
+                    extensions = extensions.saturating_add(1);
+                    limits = crate::continuation::extended_limits(limits, &exhaustion);
+                    observer(EngineEvent::AdvisoryStarted {
+                        kind: format!(
+                            "budget_extension:{}/{}:{}",
+                            extensions,
+                            crate::MAX_EXTENSIONS,
+                            exhaustion.dimension.as_str()
+                        ),
+                    });
+                    match self
+                        .resume_with_limits(runner, spec, limits, observer, &cancellation)
+                        .await?
+                    {
+                        Some(continued) => continued,
+                        // Nothing to resume from: stop rather than spin.
+                        None => break,
+                    }
+                }
+            };
+            merge_continued_outcome(&mut outcome, continued);
         }
         Ok(outcome)
     }
 
-    /// When a drive stops on resource budget with real progress, grant a small
-    /// extra allowance and resume the transcript (at most
-    /// [`MAX_BUDGET_EXTENSIONS`] times). Absolute round ceilings and
-    /// no-progress stops never extend.
-    async fn extend_budget_exhausted(
+    /// Mechanism for [`crate::Continuation::DriveGoalAgain`]: restate the
+    /// objective over the latest model-visible context and run one more turn.
+    async fn drive_goal_again(
         &self,
-        _log: &EventLog<'_>,
+        log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
-        mut outcome: leveler_agent::AgentOutcome,
+        outcome: &leveler_agent::AgentOutcome,
         observer: &mut dyn FnMut(EngineEvent),
-        cancellation: CancellationToken,
+        cancellation: &CancellationToken,
     ) -> Result<leveler_agent::AgentOutcome, EngineError> {
-        let mut extensions = 0u32;
-        let mut limits = spec.limits;
-        while budget_extension_allowed(
-            outcome.stop_reason,
-            extensions,
-            !outcome.modified_files.is_empty(),
-            stop_detail_indicates_no_progress(outcome.stop_detail.as_deref()),
-        ) {
-            let Some(exhaustion) = outcome.budget_exhaustion.clone() else {
-                break;
-            };
-            limits = grant_budget_extension(limits, &exhaustion);
-            extensions = extensions.saturating_add(1);
-            observer(EngineEvent::AdvisoryStarted {
-                kind: format!(
-                    "budget_extension:{}/{}:{}",
-                    extensions,
-                    MAX_BUDGET_EXTENSIONS,
-                    exhaustion.dimension.as_str()
-                ),
-            });
-            let raw = crate::RawTranscript::load_strict(
-                &self.db,
-                &runner.session_id,
-                "transcript during budget extension",
+        // Announce BEFORE the transcript load / compaction / model call.
+        // Everything below is invisible work that happens after the user
+        // already read a final answer; without this the status line shows
+        // a bare "waiting for model" for the whole continuation.
+        observer(EngineEvent::AdvisoryStarted {
+            kind: leveler_agent::AdvisoryKind::GoalContinuation
+                .as_key()
+                .to_string(),
+        });
+        let raw = crate::RawTranscript::load_strict(
+            &self.db,
+            &runner.session_id,
+            "goal transcript during continuation",
+        )
+        .await?;
+        let summary = self.summarize_if_over(&raw.messages, cancellation).await;
+        let context = raw
+            .assemble(
+                log,
+                summary.as_deref(),
+                Some(spec.goal.as_str()),
+                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
             )
             .await?;
-            if raw.is_empty() {
-                break;
-            }
-            let prior = raw.messages;
-            let continued = runner
-                .run_turn(
-                    TurnKind::User,
-                    TurnProfile::Goal {
-                        continuation: spec.continuation,
-                        limits,
-                    },
-                    TurnInput::Resume(prior),
-                    observer,
-                    cancellation.clone(),
-                )
-                .await?;
-            merge_continued_outcome(&mut outcome, continued.outcome);
+        if context.compacted {
+            log.append(None, context.snapshot_event(), observer).await?;
         }
-        Ok(outcome)
+        // Full objective restatement — not a vague "Continue…" only. When
+        // the previous drive recorded WHY its closeout stalled, name that
+        // gap so the continuation addresses it instead of repeating the
+        // same summary into the same wall.
+        let closeout_note = outcome
+            .stop_detail
+            .as_deref()
+            .and_then(leveler_agent::closeout::reason_from_stalled_detail)
+            .map(|reason| {
+                format!(
+                    "\n\nThe previous turn's closeout stalled on: {}. Close that specific \
+                     gap first instead of re-stating what was already done.",
+                    reason.as_key()
+                )
+            })
+            .unwrap_or_default();
+        let continue_text = format!(
+            "Continue working toward the active goal. The previous turn ended without \
+             proving completion.{closeout_note}\n\n\
+             <objective>\n{}\n</objective>\n\n\
+             Inspect the current workspace, make concrete progress, and call update_goal \
+             only when the full objective is complete or genuinely blocked. Do not \
+             re-audit already finished plan steps with git status thrash.",
+            spec.goal
+        );
+        let recorded = runner
+            .run_turn(
+                TurnKind::User,
+                goal_profile(spec),
+                TurnInput::Content {
+                    prior: context.prior,
+                    content: vec![leveler_model::ContentPart::Text {
+                        text: continue_text,
+                    }],
+                },
+                observer,
+                cancellation.clone(),
+            )
+            .await?;
+        Ok(recorded.outcome)
+    }
+
+    /// Mechanism for [`crate::Continuation::ExtendBudget`]: resume the
+    /// transcript with the granted allowance. `None` when there is no
+    /// transcript to resume from.
+    async fn resume_with_limits(
+        &self,
+        runner: &TurnRunner<'_>,
+        spec: &TaskSpec,
+        limits: StepLimits,
+        observer: &mut dyn FnMut(EngineEvent),
+        cancellation: &CancellationToken,
+    ) -> Result<Option<leveler_agent::AgentOutcome>, EngineError> {
+        let raw = crate::RawTranscript::load_strict(
+            &self.db,
+            &runner.session_id,
+            "transcript during budget extension",
+        )
+        .await?;
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let recorded = runner
+            .run_turn(
+                TurnKind::User,
+                TurnProfile::Goal {
+                    continuation: spec.continuation,
+                    limits,
+                },
+                TurnInput::Resume(raw.messages),
+                observer,
+                cancellation.clone(),
+            )
+            .await?;
+        Ok(Some(recorded.outcome))
     }
 
     /// Shared tail of fresh and resumed direct runs: map the stop reason,
@@ -1142,15 +1187,8 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        // Bounded L2 resource extension: BudgetExhausted + real progress may
-        // get up to MAX_BUDGET_EXTENSIONS extra grants. TurnLimitReached and
-        // no-progress stops never extend. Eval cases with a fixed round budget
-        // skip auto-extend (reproducibility).
-        if spec.continuation.round_limit().is_none() {
-            outcome = self
-                .extend_budget_exhausted(log, runner, spec, outcome, observer, cancellation.clone())
-                .await?;
-        }
+        // Goal continuation and bounded budget extension already happened in
+        // `supervise` — one loop, one decision point (convergence plan phase 4).
 
         // Completed and Answered both count as clean finishes — and both must
         // verify if they touched files. Most other stop reasons are terminal

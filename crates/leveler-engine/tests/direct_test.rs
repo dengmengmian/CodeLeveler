@@ -182,6 +182,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        supervisor: None,
     };
     Harness {
         engine,
@@ -881,6 +882,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        supervisor: None,
     };
     let spec2 = TaskSpec {
         repository: dir2.path().to_path_buf(),
@@ -1039,4 +1041,47 @@ async fn direct_spends_no_extra_model_call_on_acceptance() {
         .unwrap();
 
     assert_eq!(report.outcome, TaskOutcome::Verified);
+}
+
+/// The supervision decision is injectable: the same stalled script that the
+/// default policy nudges into a second turn produces exactly ONE turn under a
+/// supervisor that never continues. Mechanism stays in the engine; the
+/// judgement is replaceable (convergence plan phase 4/5).
+#[tokio::test]
+async fn a_supervisor_policy_that_never_continues_leaves_one_turn() {
+    let mut h = harness(vec![
+        text("still working 1"),
+        text("still working 2"),
+        text("still working 3"),
+        text("still working 4"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "would finish after a continue"}),
+        ),
+    ])
+    .await;
+    h.engine = h
+        .engine
+        .with_supervisor(std::sync::Arc::new(leveler_engine::NoContinuation));
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    // The goal was never resolved, because the supervisor did not re-drive it.
+    assert_eq!(report.stop_reason, StopReason::Stalled);
+    let turns = TurnRepository::new(&h.engine.db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "a no-continuation supervisor must not open a second turn: {turns:?}"
+    );
 }

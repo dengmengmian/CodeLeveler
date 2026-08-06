@@ -218,10 +218,21 @@
 >   `merge_continued_outcome`。**迁移影响**：stalled-continue 现在与预算
 >   扩展一样传递 `budget_exhaustion`——续跑后耗尽预算的 goal 从此可以
 >   进入有界扩展（此前被静默丢弃，永远无法扩展）。
-> - **刻意不做（转阶段 5）**：engine 的 `continue_active_goal` 与
->   `extend_budget_exhausted` 本身未删除。续跑何时发生是产品策略
->   （TurnPolicy 方向），随阶段 5 的策略外移一并迁移；现有行为由
->   `direct_test` 续跑/预算用例锁定，本阶段先consolidate其状态写入。
+> - **续跑所有权（后续补齐，已完成）**：`continue_active_goal` 与
+>   `extend_budget_exhausted` 两个循环已合并为**唯一**的 `supervise`
+>   循环，其「是否再跑一轮」的判断移出 engine，交给
+>   `SupervisorPolicy`（`continuation.rs`）。engine 只保留机制与硬边界：
+>   固定 round budget、扩展次数上限、新增的绝对
+>   `MAX_SUPERVISED_TURNS = 32` 上限（此前 `while Stalled` 只受进度账本
+>   约束，没有绝对迭代上限）、以及取消检查——**策略只能让运行更短，
+>   不能让它无界**。`DefaultSupervisorPolicy` 完全复刻既有行为；
+>   `NoContinuation` 是不续跑的最小监督者。
+>   证据：`continuation.rs` 7 个策略单测 +
+>   `direct_test::a_supervisor_policy_that_never_continues_leaves_one_turn`
+>   （同一脚本默认策略产生 2 个 turn、NoContinuation 只产生 1 个）。
+>   **迁移影响**：两个循环合并后，预算扩展轮若以 Stalled 结束，现在会
+>   再走 goal 续跑（此前因 continue 已在 conclude 之前跑完而不会）；
+>   反向路径行为不变。
 
 工作：
 

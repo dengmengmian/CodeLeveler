@@ -460,6 +460,10 @@ impl Application {
             },
             approver,
             clarifier,
+            // Default supervision (goal continuation + bounded budget
+            // extension). A host that owns its own pacing installs its policy
+            // with `TaskEngine::with_supervisor`.
+            supervisor: None,
         })
     }
 

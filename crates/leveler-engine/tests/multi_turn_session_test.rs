@@ -152,6 +152,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        supervisor: None,
     };
     Harness {
         engine,
