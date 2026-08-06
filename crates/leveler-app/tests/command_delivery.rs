@@ -99,7 +99,7 @@ async fn build_client() -> (
 
 #[tokio::test]
 async fn duplicate_command_id_dispatches_once() {
-    let (_tmp, _app, client, session_id) = build_client().await;
+    let (_tmp, app, client, session_id) = build_client().await;
     let mut rx = client.subscribe();
     let envelope = CommandEnvelope {
         command_id: CommandId::new("cmd-dup"),
@@ -125,6 +125,7 @@ async fn duplicate_command_id_dispatches_once() {
         user_messages, 1,
         "a duplicate command_id must not dispatch the action twice"
     );
+    settle_background_turns(&app, &client, &[&session_id]).await;
 }
 
 #[tokio::test]
@@ -262,7 +263,7 @@ async fn creating_a_daemon_session_does_not_reap_another_live_turn() {
 
 #[tokio::test]
 async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
-    let (_tmp, _app, client, _existing_session) = build_client().await;
+    let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
             goal: "first".to_string(),
@@ -304,18 +305,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
     assert_eq!(second_snapshot.checkpoints.len(), 1);
     assert_eq!(second_snapshot.checkpoints[0].label, "second checkpoint");
 
-    client
-        .send(ClientCommand::CancelCurrentTurn {
-            session_id: first.session.id,
-        })
-        .await
-        .unwrap();
-    client
-        .send(ClientCommand::CancelCurrentTurn {
-            session_id: second.session.id,
-        })
-        .await
-        .unwrap();
+    settle_background_turns(&app, &client, &[&first.session.id, &second.session.id]).await;
 }
 
 #[tokio::test]
@@ -411,6 +401,51 @@ async fn socket_clients_receive_only_their_session_events() {
 
     shutdown.cancel();
     task.await.unwrap().unwrap();
+}
+
+/// Drive every background turn to a terminal state before the test returns.
+///
+/// `SubmitMessage` asserts on a synchronous dispatch effect, but it also spawns
+/// a real turn. Returning while one is still running drops the test runtime out
+/// from under it, and tokio's timer panics on the way down with "A Tokio 1.x
+/// context was found, but it is being shutdown". The test still reports
+/// success, so the panic reads as harmless noise instead of the leak it is —
+/// and a test that leaks a task is a test whose next failure is unexplainable.
+///
+/// Cancel is a request, not a completion, so this waits on the turn's terminal
+/// row rather than on the send returning.
+async fn settle_background_turns(
+    app: &Arc<Application>,
+    client: &Arc<InProcessRuntimeClient>,
+    submitted_to: &[&SessionId],
+) {
+    let db = app.open_database().await.unwrap();
+    let repo = TurnRepository::new(&db);
+    for session in submitted_to {
+        // The turn is spawned, so its row may not exist the instant dispatch
+        // returns. Waiting for it to appear is what makes the drain below mean
+        // something: polling "nothing is running" too early passes instantly
+        // and leaks exactly the task this helper exists to collect.
+        for _ in 0..400 {
+            if !repo.list(session).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        client
+            .send(ClientCommand::CancelCurrentTurn {
+                session_id: (*session).clone(),
+            })
+            .await
+            .unwrap();
+    }
+    for _ in 0..400 {
+        if repo.list_running(None).await.unwrap().is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("a background turn never reached a terminal state after cancellation");
 }
 
 /// Wait for the spawned background turn to reach a terminal event so the next
@@ -652,4 +687,6 @@ async fn a_new_session_leaves_the_previous_one_intact() {
         old.iter().any(|p| p.contains("SURVIVES_THE_CLEAR")),
         "the previous session's transcript must survive /clear"
     );
+
+    settle_background_turns(&app, &client, &[&session_id]).await;
 }
