@@ -18,6 +18,19 @@ mkdir -p "$dest_root"
 # name|git-url|pinned-ref   (ref must be a tag or full SHA present after clone)
 REPOS=(
   "ripgrep|https://github.com/BurntSushi/ripgrep|14.1.1"
+  # The real-project TUI matrix (fixtures/matrix/README.md) drives these.
+  # Pinned so a case starts from the same tree on every machine.
+  "rust-csv|https://github.com/BurntSushi/rust-csv|1.4.0"
+  "rust-semver|https://github.com/dtolnay/semver|280ebcb"
+  "rust-httparse|https://github.com/seanmonstar/httparse|a0fa552"
+  "rust-similar|https://github.com/mitsuhiko/similar|3.1.1"
+  "mux|https://github.com/gorilla/mux|db9d1d0"
+  "jwt|https://github.com/golang-jwt/jwt|1a11d37"
+  "decimal|https://github.com/shopspring/decimal|3090cc4"
+  "go-humanize|https://github.com/dustin/go-humanize|4d1d908"
+  "commander|https://github.com/tj/commander.js|v15.0.0"
+  "ms|https://github.com/vercel/ms|4ff48ce"
+  "negotiator|https://github.com/jshttp/negotiator|a690ff2"
 )
 
 fetch_one() {

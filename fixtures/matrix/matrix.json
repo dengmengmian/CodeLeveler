@@ -50,56 +50,6 @@
     ]
   },
   {
-    "name": "hard-anyhow",
-    "path": "fixtures/repos/hard-anyhow",
-    "type": "rust",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "错误链是怎么串起来的？",
-      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
-    ]
-  },
-  {
-    "name": "hard-bitflags",
-    "path": "fixtures/repos/hard-bitflags",
-    "type": "rust",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "宏展开后生成了什么？",
-      "找出这个项目里最长的一个源文件，说明它的职责。"
-    ]
-  },
-  {
-    "name": "hard-http",
-    "path": "fixtures/repos/hard-http",
-    "type": "rust",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "HeaderMap 的存储结构是什么？",
-      "找出这个项目里最长的一个源文件，说明它的职责。"
-    ]
-  },
-  {
-    "name": "hard-indexmap",
-    "path": "fixtures/repos/hard-indexmap",
-    "type": "rust",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "它如何同时保证顺序和 O(1) 查找？",
-      "找出这个项目里最长的一个源文件，说明它的职责。"
-    ]
-  },
-  {
-    "name": "hard-slab",
-    "path": "fixtures/repos/hard-slab",
-    "type": "rust",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "空闲槽位是怎么复用的？",
-      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
-    ]
-  },
-  {
     "name": "mux",
     "path": "fixtures/repos/mux",
     "type": "go",
@@ -140,16 +90,6 @@
     ]
   },
   {
-    "name": "hard-semver",
-    "path": "fixtures/repos/hard-semver",
-    "type": "go",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "预发布版本怎么排序？",
-      "找出这个项目里最长的一个源文件，说明它的职责。"
-    ]
-  },
-  {
     "name": "commander",
     "path": "fixtures/repos/commander",
     "type": "node",
@@ -176,26 +116,6 @@
     "prompts": [
       "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
       "Accept 头的权重怎么算？",
-      "找出这个项目里最长的一个源文件，说明它的职责。"
-    ]
-  },
-  {
-    "name": "hard-qs",
-    "path": "fixtures/repos/hard-qs",
-    "type": "node",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "嵌套对象的解析深度有限制吗？",
-      "找出这个项目里最长的一个源文件，说明它的职责。"
-    ]
-  },
-  {
-    "name": "hard-picomatch",
-    "path": "fixtures/repos/hard-picomatch",
-    "type": "node",
-    "prompts": [
-      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
-      "glob 转正则的核心函数是哪个？",
       "找出这个项目里最长的一个源文件，说明它的职责。"
     ]
   },
