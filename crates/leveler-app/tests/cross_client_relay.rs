@@ -335,6 +335,12 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
     )
     .await;
 
+    // Compare the two views only once the turn has settled. `status` is a
+    // live value: two snapshot calls a moment apart legitimately straddle the
+    // created→running transition, and asserting across that samples a moving
+    // number rather than proving anything about forked state.
+    wait_turn_settled(&mut in_process_events).await;
+
     // Both clients' snapshots agree on the same facts.
     let via_socket = socket_client.snapshot(&session).await.unwrap();
     let via_in_process = h.runtime.snapshot(&session).await.unwrap();
