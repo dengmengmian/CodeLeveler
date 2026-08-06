@@ -44,12 +44,12 @@
 | --- | --- | --- |
 | 0 | 冻结基线与可观测语义 | 完成（验收证据：[`phase0-baseline.md`](phase0-baseline.md)） |
 | 1 | 可靠的工具副作用屏障 | **部分完成**：父 Agent 路径已闭环；**子 Agent 未覆盖**（见阶段 1 状态注记） |
-| 2 | 唯一 ToolHost 调用边界 | 完成（见阶段 2 状态注记） |
+| 2 | 唯一 ToolHost 调用边界 | **部分完成**：Agent 侧唯一化并由 tripwire 守住；engine 恢复重放是记录在案的第二执行点（见阶段 2 状态注记） |
 | 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
 | 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
 | 5 | 产品策略移出 direct loop | 完成（开关化+分类；协议化迁移与旧策略删除待 eval 数据，见阶段 5 状态注记） |
 | 6 | 收紧模型与 provider 边界 | 完成（见阶段 6 状态注记） |
-| 7 | 稳定性与开源发布门槛 | 进行中（决策/文档/故障测试盘点已完成；24h soak 与真机验收为环境受限项，见阶段 7 状态注记） |
+| 7 | 稳定性与开源发布门槛 | 进行中（决策待所有者签署；矩阵驱动已修但**验收结论已撤回未重取**；24h soak 与真机受限，见阶段 7 状态注记） |
 
 状态只能在对应验收证据已链接到本文后改为“完成”；代码已经存在但尚未经过本阶段
 验收时，应标记为“进行中”，不能按完成计算。
@@ -81,7 +81,8 @@
 
 **目的：** 消除“工具已经执行，但开始事件尚未可靠落盘”的崩溃窗口。
 
-> **状态：完成。** 实现为 `EventBarrier` flush 屏障（`leveler-agent` 定义、
+> **状态：部分完成——父 Agent 路径已闭环，子 Agent 未覆盖，因此本阶段
+> 不得按完成计算。** 实现为 `EventBarrier` flush 屏障（`leveler-agent` 定义、
 > `leveler-engine` 实现）：flush 标记与事件走同一条有序 pump 队列，因此
 > 屏障永远不会与它等待的事件竞态（直写 EventLog 的替代方案会让
 > `ApprovalRequested` 与 `ToolCallStarted` 在持久化顺序上乱序，破坏
@@ -125,7 +126,14 @@
 
 **目的：** 让所有工具共享一条不可绕过的安全与执行路径。
 
-> **状态：完成。** ToolHost 管线收拢在
+> **状态：部分完成。** Agent 侧已唯一化；但 engine 的崩溃恢复仍是**第二个
+> 执行点**（`recovery.rs`），因此「唯一调用边界」尚未字面成立。它现在是
+> 单一具名入口、只对声明为纯读的工具生效、并由扩展后的 tripwire 守住
+> （tripwire 在收拢前是红的，证明它此前确实看不见 engine）。真正收口需要
+> 一个宿主拥有的 `ToolHost::reconcile` 入口，让恢复与正常执行共用同一条
+> 准入链——未做。
+>
+> ToolHost 管线收拢在
 > `crates/leveler-agent/src/executor/host.rs`：
 > `admit()`（副作用屏障 → pre-hooks → 权限规则 → profile 策略 → 审批 →
 > 屏障）返回 `AdmittedCall`——`dispatch`/`dispatch_raw` 只接受该类型，
@@ -388,9 +396,9 @@
 >   `crates/leveler-app/tests/cross_client_relay.rs` 三例——客户端消失后
 >   任务自行跑到终态并由下一个客户端从快照原样接手、双客户端同流不分叉、
 >   接力后重发同一 command envelope 只执行一次。
-> - **真实项目 TUI 矩阵（压缩版 soak）已完成**：驱动与用例见
->   `fixtures/matrix/`（gitignored），方法学与结论见
->   [`tui-matrix-soak.md`](tui-matrix-soak.md)。
+> - **真实项目 TUI 矩阵：驱动已修好并提交，但验收结论已撤回，尚未重新取证。**
+>   驱动与用例见 `fixtures/matrix/`（已提交，生成物仍忽略），方法学与
+>   已知问题见 [`tui-matrix-soak.md`](tui-matrix-soak.md)。
 >
 > **环境受限，未完成（发布前必须补，不得以本清单替代）：**
 >

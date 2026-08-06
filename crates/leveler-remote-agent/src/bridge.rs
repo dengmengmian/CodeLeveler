@@ -571,6 +571,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::ClearConversation { .. } => "clear_conversation",
         ClientCommand::RequestSessionList => "request_session_list",
         ClientCommand::RequestSessionListFor { .. } => "request_session_list_for",
+        ClientCommand::NewSessionFor { .. } => "new_session_for",
         ClientCommand::OpenSession { .. } => "open_session",
         ClientCommand::OpenSessionFor { .. } => "open_session_for",
         ClientCommand::DeleteSession { .. } => "delete_session",

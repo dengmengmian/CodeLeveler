@@ -1542,11 +1542,20 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .await
                 {
                     Ok(session_id) => {
+                        // Persist the axes BEFORE attaching or announcing: a
+                        // session that is attached and then fails to persist
+                        // is an orphan the client has already switched to.
+                        // Carry the caller's runtime axes over so a fresh
+                        // conversation is not silently a different permission
+                        // profile or work mode.
+                        if let Err(error) = self.persist_runtime_config(&session_id, config).await {
+                            self.notify_error(
+                                &requester_session_id,
+                                format!("新建会话失败: {error}"),
+                            );
+                            return Ok(());
+                        }
                         self.attach_session(session_id.clone());
-                        // Carry the caller's runtime axes onto the new session
-                        // so a fresh conversation is not silently a different
-                        // permission profile or work mode.
-                        self.persist_runtime_config(&session_id, config).await?;
                         if let Ok(session) = self.snapshot(&session_id).await {
                             let _ = self
                                 .events_for(&requester_session_id)

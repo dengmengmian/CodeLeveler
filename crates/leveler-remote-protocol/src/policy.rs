@@ -171,6 +171,10 @@ impl RemotePolicy {
             | ClientCommand::ClearConversation { .. }
             | ClientCommand::RequestSessionList
             | ClientCommand::RequestSessionListFor { .. }
+            // Starting a fresh session creates; it deletes nothing and reaches
+            // nothing local, so it is strictly safer than the in-place clear
+            // already allowed above.
+            | ClientCommand::NewSessionFor { .. }
             | ClientCommand::OpenSession { .. }
             | ClientCommand::OpenSessionFor { .. }
             | ClientCommand::Btw { .. } => RemoteVerdict::Allow,

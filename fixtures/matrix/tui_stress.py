@@ -22,6 +22,7 @@ import os
 import sqlite3
 import sys
 import time
+import uuid
 
 from tui_drive import COLS, ERROR_MARKERS, PANIC_MARKERS, ROWS, Tui, load_matrix, report
 
@@ -159,14 +160,19 @@ def run_project(spec, binary, log_dir):
             tui.settle(timeout=10, quiet=0.5)
         gating_mode = "full" not in tui.frame_text()
 
-        canary = os.path.join(spec["path"], "STRESS_CANARY.txt")
+        # A fixed name opened with "w" truncates — and later deletes — a file
+        # the repository may already have. Use a name that cannot collide and
+        # create it exclusively, so an existing file is never touched.
+        canary_name = f"leveler-stress-canary-{uuid.uuid4().hex}.txt"
+        canary = os.path.join(spec["path"], canary_name)
         try:
-            with open(canary, "w") as fh:
+            fd = os.open(canary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as fh:
                 fh.write("must survive a denied deletion\n")
         except OSError:
             canary = None
         if canary:
-            tui.send("用 rm 删除仓库根目录下的 STRESS_CANARY.txt 文件。\r")
+            tui.send(f"用 rm 删除仓库根目录下的 {canary_name} 文件。\r")
             # Wait for either the approval overlay or the turn to end.
             deadline = time.time() + 120
             saw_overlay = False
@@ -229,6 +235,10 @@ def run_project(spec, binary, log_dir):
         state = tui.settle(timeout=180, quiet=2.0)
         record("resize-mid-turn", state)
         scan(tui.frame_text(), "resize mid-turn")
+        if state in ("busy", "timeout", "dead"):
+            note("resize-mid-turn-unsettled",
+                 f"the turn never settled after a mid-turn resize ({state})",
+                 tui.frame_text())
 
         # A4 — keystroke burst faster than the input debounce.
         # Confirm the composer is actually accepting input before judging a
@@ -236,8 +246,11 @@ def run_project(spec, binary, log_dir):
         tui.send("探针")
         tui.settle(timeout=10, quiet=0.6)
         if "探针" not in tui.frame_text():
-            record("composer-blocked", "info",
-                   {"note": "composer not accepting input; skipping burst check"})
+            # An unusable composer is a defect OR a leftover modal; either way
+            # the rounds after it did not test what they claim to.
+            note("composer-blocked",
+                 "the composer stopped accepting input; every later round is "
+                 "untested, not passing", tui.frame_text())
             tui.send("\x15")
             tui.settle(timeout=8, quiet=0.5)
             composer_live = False
@@ -266,6 +279,10 @@ def run_project(spec, binary, log_dir):
         state = tui.settle(timeout=240, quiet=2.0)
         record("oversized-output", state)
         scan(tui.frame_text(), "oversized tool output")
+        if state in ("busy", "timeout", "dead"):
+            note("oversized-output-unsettled",
+                 f"the turn never settled on oversized tool output ({state})",
+                 tui.frame_text())
 
         # A6 — single Ctrl+C must warn, not exit; the session stays usable.
         tui.send("\x03")
@@ -291,14 +308,35 @@ def run_project(spec, binary, log_dir):
     # resumed — both were true of the first version of this round.
     marker = f"SESSION_MARKER_{os.getpid()}_{int(time.time())}"
     session_id = None
+    killed_in_flight = False
     tui_a = Tui(spec["path"], binary, log_dir, f"{name}.precrash").start()
     try:
         if tui_a.settle(timeout=45, quiet=1.2) != "dead":
-            tui_a.send(f"记住这个标记：{marker}\r")
-            tui_a.settle(timeout=180, quiet=2.0)
-            session_id = newest_session_id(spec["path"])
+            # Ask for something long, so the turn is still RUNNING when the
+            # process dies. Waiting for the turn to settle first (as this
+            # once did) only proves an idle process can restart — it never
+            # enters the crash window at all.
+            tui_a.send(f"记住这个标记：{marker}。然后逐个文件通读整个项目并写一份很长的报告。\r")
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                tui_a._read_available(0.3)
+                session_id = session_id or newest_session_id(spec["path"])
+                if session_id:
+                    facts = session_facts(spec["path"], session_id, marker)
+                    # The crash window: the marker is already durable AND a
+                    # turn is still running. Kill exactly here.
+                    if facts.get("marker_present") and facts.get("running_turns", 0) > 0:
+                        killed_in_flight = True
+                        break
+                if not tui_a.busy() and time.time() > deadline - 150:
+                    break
             record("pre-crash-turn", "ok",
-                   {"marker": marker, "session": (session_id or "?")[:8]})
+                   {"marker": marker, "session": (session_id or "?")[:8],
+                    "killed_in_flight": killed_in_flight})
+            if not killed_in_flight:
+                note("precondition-unmet",
+                     "never reached the crash window (message durable + turn "
+                     "running); the SIGKILL below only tests an idle restart")
         # A real crash: no teardown, no flush, no goodbye.
         tui_a.kill_hard()
     finally:
@@ -328,6 +366,22 @@ def run_project(spec, binary, log_dir):
                     note("turn-left-running",
                          "a turn is still marked running after the crash; it must "
                          "be reaped or reconciled")
+                # Recovery means usable, not merely present: the recovered
+                # session must accept another turn.
+                before = facts.get("messages", 0)
+                tui2.send("崩溃恢复后继续：刚才的标记是什么？\r")
+                state = tui2.settle(timeout=240, quiet=2.0)
+                after = session_facts(spec["path"], session_id).get("messages", 0)
+                record("continue-after-crash", state,
+                       {"messages_before": before, "messages_after": after})
+                if state in ("busy", "timeout"):
+                    note("post-crash-turn-hung",
+                         "a turn after crash recovery never settled",
+                         tui2.frame_text())
+                elif after <= before:
+                    note("post-crash-turn-not-recorded",
+                         "the turn after recovery added no messages to the "
+                         "recovered session")
     finally:
         tui2.close()
         for m in tui2.panics():

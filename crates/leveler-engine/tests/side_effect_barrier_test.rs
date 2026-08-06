@@ -210,9 +210,73 @@ async fn run_chat_turn(
 // 1. A persistence failure must abort the turn BEFORE the tool runs.
 // ---------------------------------------------------------------------------
 
-/// Fails every `tool_call_started` append; everything else persists normally.
+/// Fails appends of one event type; everything else persists normally.
 struct FailingStartedStore {
     inner: Database,
+}
+
+/// Fails every `approval_resolved` append — the barrier after authorization
+/// must then refuse, and no durable permission rule may exist.
+struct FailingApprovalStore {
+    inner: Database,
+}
+
+#[async_trait]
+impl EventStore for FailingApprovalStore {
+    async fn append(
+        &self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<EventRecord, StorageError> {
+        if event_type == "approval_resolved" {
+            return Err(StorageError::InvalidData(
+                "injected: cannot persist approval_resolved".into(),
+            ));
+        }
+        self.inner
+            .append(session_id, turn_id, event_type, payload, now)
+            .await
+    }
+
+    async fn load(&self, session_id: &SessionId) -> Result<Vec<EventRecord>, StorageError> {
+        self.inner.load(session_id).await
+    }
+
+    async fn load_after(
+        &self,
+        session_id: &SessionId,
+        after: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        self.inner.load_after(session_id, after).await
+    }
+
+    async fn load_last_by_type(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        turn_id: Option<&TurnId>,
+    ) -> Result<Option<EventRecord>, StorageError> {
+        self.inner
+            .load_last_by_type(session_id, event_type, turn_id)
+            .await
+    }
+}
+
+/// Answers every approval with "always", so the durable permission rule is
+/// the thing under test.
+struct ApproveAlwaysHuman;
+
+#[async_trait]
+impl Approver for ApproveAlwaysHuman {
+    fn has_human(&self) -> bool {
+        true
+    }
+    async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::ApproveAlways
+    }
 }
 
 #[async_trait]
@@ -428,5 +492,44 @@ async fn approval_resolution_is_durable_before_dispatch() {
         store.gate_saw_no_side_effect.load(Ordering::SeqCst),
         "the approval_resolved gate never engaged — the approval flow did \
          not produce the expected canonical events"
+    );
+}
+
+/// A standing "always" permission must never outlive the approval that
+/// granted it. If the resolution cannot be made durable, the rule file must
+/// not exist — otherwise a crash leaves a permanent grant that the event log
+/// cannot explain.
+#[tokio::test]
+async fn a_failed_approval_flush_writes_no_standing_permission() {
+    let h = harness(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+        ),
+        text("done"),
+    ])
+    .await;
+    std::fs::create_dir_all(h.dir.path().join("scratch")).unwrap();
+    let rules_path = leveler_execution::project_rules_path(h.dir.path());
+
+    let store = FailingApprovalStore {
+        inner: h.db.clone(),
+    };
+    let log = EventLog::new(&store, h.session.clone());
+    let mut factory = h.factory;
+    factory.permission_rules_path = Some(rules_path.clone());
+    let h = Harness { factory, ..h };
+
+    let result = run_chat_turn(&h, &log, Arc::new(ApproveAlwaysHuman), "remove scratch").await;
+
+    assert!(
+        result.is_err(),
+        "a turn whose approval resolution cannot persist must fail"
+    );
+    assert!(
+        !rules_path.exists(),
+        "a standing permission was written even though the approval that \
+         granted it never became durable"
     );
 }

@@ -201,6 +201,16 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
+            // Starting a fresh session creates and deletes nothing, so a
+            // paired phone may do it — unlike the memory and attachment
+            // commands below, which stay shut.
+            "new_session_for",
+            ClientCommand::NewSessionFor {
+                requester_session_id: session(),
+            },
+            true,
+        ),
+        (
             "open_session",
             ClientCommand::OpenSession {
                 session_id: session(),

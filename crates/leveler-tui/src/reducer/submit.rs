@@ -319,15 +319,11 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
 /// nothing, so there is nothing to confirm.
 fn clear_conversation(state: &mut AppState) -> Vec<Effect> {
     state.clear_confirm_armed = false;
-    state.transcript.clear();
-    state.context_tokens = 0;
-    state.token_input = 0;
-    state.token_output = 0;
-    state.turn_tool_calls = 0;
-    state.notification = Some(Notification {
-        level: NotificationLevel::Info,
-        message: state.t().clear_done.to_string(),
-    });
+    // Ask, do not act. Clearing the view here would show success before the
+    // host has created anything — and if creation or config persistence
+    // fails, the user is left staring at an empty screen with their old
+    // conversation apparently gone. The switch happens when `SessionOpened`
+    // arrives (see `runtime_apply`), which is the host confirming it.
     vec![Effect::Send(ClientCommand::NewSessionFor {
         requester_session_id: state.session_id.clone(),
     })]

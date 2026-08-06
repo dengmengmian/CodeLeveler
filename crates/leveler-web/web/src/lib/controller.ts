@@ -600,8 +600,11 @@ export class RuntimeBridge {
         return;
       }
       case '/clear': {
+        // Start a NEW session; the current one stays in the session list.
+        // This used to send clear_conversation, which wiped the session in
+        // place — the label said one thing and the wire said another.
         const sid = needSession();
-        if (sid) this.deliver({ type: 'clear_conversation', session_id: sid });
+        if (sid) this.deliver({ type: 'new_session_for', requester_session_id: sid });
         return;
       }
       case '/diff': {

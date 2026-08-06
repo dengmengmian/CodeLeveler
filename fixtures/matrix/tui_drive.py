@@ -101,6 +101,9 @@ class Tui:
     # ── io ────────────────────────────────────────────────────────────────
     def _read_available(self, timeout):
         """Read whatever is ready; return True if any bytes arrived."""
+        if self.fd is None:
+            self.dead = True
+            return False
         got = False
         deadline = time.time() + timeout
         while True:
@@ -133,6 +136,9 @@ class Tui:
         return got
 
     def send(self, data):
+        if self.fd is None:
+            self.dead = True
+            return
         if isinstance(data, str):
             data = data.encode()
         try:
@@ -185,6 +191,17 @@ class Tui:
                 return "idle"
         return "busy" if self.busy() else "timeout"
 
+    def _close_fd(self):
+        """Idempotent fd release. Every exit path routes through this: the
+        `dead` early-return used to skip it, leaking one PTY fd per project
+        (measured: /dev/fd grew 5 -> 25 over 20 rounds)."""
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
     def kill_hard(self):
         """SIGKILL the child — a real crash, not a graceful exit.
 
@@ -200,6 +217,7 @@ class Tui:
         except (ProcessLookupError, ChildProcessError):
             pass
         self.dead = True
+        self._close_fd()
         self._flush_log()
 
     def _flush_log(self):
@@ -209,6 +227,7 @@ class Tui:
 
     def close(self):
         if self.pid is None or self.dead:
+            self._close_fd()
             self._flush_log()
             return
         self.send(b"\x03")
@@ -229,10 +248,7 @@ class Tui:
                 os.waitpid(self.pid, 0)
             except (ProcessLookupError, ChildProcessError):
                 pass
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
+        self._close_fd()
         self._flush_log()
 
     # ── diagnostics ───────────────────────────────────────────────────────

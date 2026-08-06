@@ -188,6 +188,7 @@ export type ClientCommand =
   | { type: 'compact_context'; session_id: SessionId }
   | { type: 'clear_conversation'; session_id: SessionId }
   | { type: 'request_session_list' }
+  | { type: 'new_session_for'; requester_session_id: SessionId }
   | { type: 'request_session_list_for'; requester_session_id: SessionId }
   | { type: 'open_session'; session_id: SessionId }
   | { type: 'open_session_for'; requester_session_id: SessionId; session_id: SessionId }
