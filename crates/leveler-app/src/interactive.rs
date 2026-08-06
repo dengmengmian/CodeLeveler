@@ -1528,6 +1528,40 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::NewSessionFor {
+                requester_session_id,
+            } => {
+                // Start fresh WITHOUT destroying anything: the caller's
+                // session keeps its transcript and checkpoints and stays in
+                // the session list, so `/clear` is a reversible move (reopen
+                // the old session) rather than an unrecoverable wipe.
+                let config = self.runtime_config(&requester_session_id).await?;
+                match self
+                    .app
+                    .create_daemon_session(&config.model, PLACEHOLDER_GOAL)
+                    .await
+                {
+                    Ok(session_id) => {
+                        self.attach_session(session_id.clone());
+                        // Carry the caller's runtime axes onto the new session
+                        // so a fresh conversation is not silently a different
+                        // permission profile or work mode.
+                        self.persist_runtime_config(&session_id, config).await?;
+                        if let Ok(session) = self.snapshot(&session_id).await {
+                            let _ = self
+                                .events_for(&requester_session_id)
+                                .send(RuntimeEvent::SessionOpened { session });
+                        }
+                        let _ = self.events.send(RuntimeEvent::SessionList {
+                            sessions: self.list_sessions().await,
+                        });
+                    }
+                    Err(error) => {
+                        self.notify_error(&requester_session_id, format!("新建会话失败: {error}"));
+                    }
+                }
+                Ok(())
+            }
             ClientCommand::OpenSessionFor {
                 requester_session_id,
                 session_id,

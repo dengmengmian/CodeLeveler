@@ -310,15 +310,14 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
 }
 
 /// `/clear` requires a second confirmation so a fat-finger does not wipe history.
+/// `/clear` (alias `/new`): start a fresh conversation.
+///
+/// This starts a NEW session and switches to it; the current one keeps its
+/// transcript and checkpoints and stays in `/sessions`. It used to wipe the
+/// current session in place — unrecoverable, checkpoints and all — which is
+/// the only reason it needed a two-step confirmation. Starting fresh loses
+/// nothing, so there is nothing to confirm.
 fn clear_conversation(state: &mut AppState) -> Vec<Effect> {
-    if !state.clear_confirm_armed {
-        state.clear_confirm_armed = true;
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: state.t().clear_confirm.to_string(),
-        });
-        return Vec::new();
-    }
     state.clear_confirm_armed = false;
     state.transcript.clear();
     state.context_tokens = 0;
@@ -329,8 +328,8 @@ fn clear_conversation(state: &mut AppState) -> Vec<Effect> {
         level: NotificationLevel::Info,
         message: state.t().clear_done.to_string(),
     });
-    vec![Effect::Send(ClientCommand::ClearConversation {
-        session_id: state.session_id.clone(),
+    vec![Effect::Send(ClientCommand::NewSessionFor {
+        requester_session_id: state.session_id.clone(),
     })]
 }
 

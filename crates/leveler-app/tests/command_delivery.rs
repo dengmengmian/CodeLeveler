@@ -588,3 +588,68 @@ async fn session_menu_rename_archive_fork_roundtrip() {
         "archive is not delete"
     );
 }
+
+/// `/clear` must be a fresh start, not a wipe: the previous session keeps its
+/// transcript and stays listed, so the move is reversible by reopening it.
+#[tokio::test]
+async fn a_new_session_leaves_the_previous_one_intact() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "SURVIVES_THE_CLEAR".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    let db = app.open_database().await.unwrap();
+    for _ in 0..100 {
+        let payloads = leveler_storage::MessageRepository::new(&db)
+            .load(&session_id)
+            .await
+            .unwrap();
+        if payloads.iter().any(|p| p.contains("SURVIVES_THE_CLEAR")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let mut events = client.subscribe_session(&session_id);
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    // The requester is switched to a different, empty session.
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(RuntimeEvent::SessionOpened { session }) = events.recv().await {
+                return session;
+            }
+        }
+    })
+    .await
+    .expect("the new session must be opened for the requester");
+    assert_ne!(
+        opened.id, session_id,
+        "/clear must switch to a NEW session, not reuse the old id"
+    );
+    assert!(
+        opened.messages.is_empty(),
+        "the new session starts empty: {:?}",
+        opened.messages
+    );
+
+    // …and the old one is untouched, so reopening it gets the work back.
+    let old = leveler_storage::MessageRepository::new(&db)
+        .load(&session_id)
+        .await
+        .unwrap();
+    assert!(
+        old.iter().any(|p| p.contains("SURVIVES_THE_CLEAR")),
+        "the previous session's transcript must survive /clear"
+    );
+}

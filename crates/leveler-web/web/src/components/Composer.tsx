@@ -17,7 +17,7 @@ const SLASH: ReadonlyArray<readonly [string, string, string]> = [
   ['/mode', '切换 agent 模式', 'SetAgentMode'],
   ['/perm', '切换权限档位', 'SetPermissionProfile'],
   ['/compact', '压缩上下文', 'CompactContext'],
-  ['/clear', '清空对话', 'ClearConversation'],
+  ['/clear', '开始新对话（当前这段保留在会话列表）', 'NewSessionFor'],
   ['/diff', '查看当前变更', 'RequestDiff'],
   ['/checkpoint', '回滚到检查点', 'RestoreCheckpoint'],
   ['/memory', '查看 / 遗忘项目记忆', 'ListMemory / ForgetMemory'],

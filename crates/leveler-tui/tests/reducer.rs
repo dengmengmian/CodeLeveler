@@ -1484,20 +1484,41 @@ fn slash_clear_empties_transcript() {
         }),
     );
     assert!(!s.transcript.is_empty());
-    // First /clear only arms confirm; second actually wipes.
+    // `/clear` starts a NEW session on the FIRST press. It used to wipe the
+    // current session in place, which took its checkpoints with it and could
+    // not be undone — hence the old two-step confirm. Starting fresh leaves
+    // the previous session in /sessions, so there is nothing to confirm and
+    // nothing to lose.
     typed(&mut s, "/clear");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(effects.is_empty());
-    assert!(!s.transcript.is_empty());
-    assert!(s.clear_confirm_armed);
-    typed(&mut s, "/clear");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::NewSessionFor { .. })]
+        ),
+        "one /clear must start a new session: {effects:?}"
+    );
+    assert!(s.transcript.is_empty(), "the view starts empty");
+    assert!(
+        !s.clear_confirm_armed,
+        "a non-destructive action must not arm a confirmation"
+    );
+}
+
+/// `/new` is an alias of `/clear`, so it must do the same thing — not a
+/// second, differently-behaved way to start over.
+#[test]
+fn slash_new_is_the_same_fresh_start_as_clear() {
+    let mut s = opened();
+    typed(&mut s, "/new");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Send(ClientCommand::ClearConversation { .. })]
-    ));
-    assert!(s.transcript.is_empty());
-    assert!(!s.clear_confirm_armed);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::NewSessionFor { .. })]
+        ),
+        "/new must start a new session like /clear: {effects:?}"
+    );
 }
 
 #[test]

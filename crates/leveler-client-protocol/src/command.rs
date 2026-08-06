@@ -115,6 +115,14 @@ pub enum ClientCommand {
     /// Ask for the session list and route the response only to the requesting
     /// session's event stream.
     RequestSessionListFor { requester_session_id: SessionId },
+    /// Start a FRESH session and switch the requester's view to it, leaving
+    /// the current one intact in the session list.
+    ///
+    /// This is what `/clear` does. Wiping the current session in place would
+    /// be destructive and unrecoverable (it takes the checkpoints with it),
+    /// which is why that shape needed a confirmation; starting a new session
+    /// loses nothing, so it needs none.
+    NewSessionFor { requester_session_id: SessionId },
     /// Open a stored session, loading its transcript into the view.
     OpenSession { session_id: SessionId },
     /// Open a stored session on behalf of another currently displayed session.
@@ -188,6 +196,9 @@ impl ClientCommand {
             | ClientCommand::RestoreCheckpoint { session_id, .. }
             | ClientCommand::Btw { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
+                requester_session_id,
+            }
+            | ClientCommand::NewSessionFor {
                 requester_session_id,
             }
             | ClientCommand::OpenSessionFor {
