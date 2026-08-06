@@ -355,6 +355,7 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
         "the two clients disagree on session status — state has forked"
     );
 
+    // The turn already settled above; nothing is in flight at teardown.
     shutdown.cancel();
     let _ = task.await;
 }
@@ -371,6 +372,7 @@ async fn a_command_retried_by_the_next_client_is_not_executed_twice() {
         .await
         .unwrap();
 
+    let mut settle_rx = h.runtime.subscribe_session(&session);
     let envelope = CommandEnvelope {
         command_id: CommandId::new("cmd-relay"),
         session_id: session.clone(),
@@ -412,6 +414,11 @@ async fn a_command_retried_by_the_next_client_is_not_executed_twice() {
         "a command retried after handover must dispatch exactly once"
     );
 
+    // Let the turn this dispatched reach its terminal marker before tearing
+    // the runtime down: a background task still driving a turn against a
+    // dying Tokio runtime panics on the way out, which reads as a product
+    // crash in the test output.
+    wait_turn_settled(&mut settle_rx).await;
     shutdown.cancel();
     let _ = task.await;
 }
