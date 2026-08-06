@@ -1103,9 +1103,13 @@ impl Executor {
             permission_rules_path: self.permission_rules_path.clone(),
             hook_runner: self.hook_runner.clone(),
             grants_state_dir: self.grants_state_dir.clone(),
-            // A child's tool starts/finishes are transient activity, not
-            // canonical events — there is nothing durable to wait for. (Child
-            // side-effect recording is a known gap; see phase0-baseline §一.6.)
+            // KNOWN GAP, tracked as blocking phase 1 acceptance in
+            // docs/design/core-runtime-convergence-plan.md: a child's tool
+            // starts/finishes are only transient `SubAgentActivity`, never
+            // canonical events, so there is nothing durable for a barrier to
+            // wait on. A worker child that crashes mid-edit therefore leaves
+            // no record the host can reconcile. Closing this needs
+            // parent/child-attributed persisted events, not a barrier here.
             event_barrier: None,
         }
     }

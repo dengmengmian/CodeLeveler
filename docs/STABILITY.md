@@ -1,9 +1,13 @@
 # Interface stability
 
-> **Status: ADOPTED (pre-1.0).** The open decisions below are resolved as
-> recorded in "Decisions" — following common pre-1.0 practice, chosen during
-> convergence-plan phase 7. Revisit each at the 1.0 cut; a PR that touches a
-> frozen surface needs a `CHANGELOG.md` entry.
+> **Status: DRAFT — the tier marks below are proposals, not commitments.**
+>
+> D1/D2/D3 have *recommended* answers (see "Decisions"), written during
+> convergence-plan phase 7 and following common pre-1.0 practice. They are
+> **awaiting maintainer sign-off**: freezing a CLI or config surface is the
+> project owner's call, not a decision a contributor makes on their behalf.
+> Once signed off, change this banner to ADOPTED and link the file from
+> `README.md` and `CONTRIBUTING.md`.
 
 ## Why this exists
 
@@ -131,17 +135,22 @@ Without that enforcement point, this document goes stale within two releases.
 
 ## Decisions
 
-Resolved (convergence-plan phase 7), following common pre-1.0 practice:
+**Recommended, pending maintainer sign-off.** Each is the option a typical
+pre-1.0 project takes; none is in force until confirmed:
 
-| Id | Decision | Rationale |
+| Id | Recommendation | Rationale |
 | --- | --- | --- |
-| D1 | **Option 1**: keep `deny_unknown_fields`; config is forward-incompatible and that is documented ("downgrading may require removing newly added config keys", noted in the config examples). | Typo-catching is a real usability win today; a `schema_version` key (option 3) is the 1.0-time upgrade if the downgrade complaint materializes. Existing keys keep name/type/meaning through 1.0; removal or retyping requires a major version; adding keys is always allowed. |
-| D2 | **The Rust API is not a public surface before 1.0.** No trait is frozen; the supported surface is the CLI + configuration. `ProtocolAdapter` / `Tool` / `EventStore` are the designated candidates for an additive-only promise at 1.0. | Nobody outside the workspace depends on these crates; a promise nobody needs is pure maintenance cost. |
-| D3 | **`serve` / `web` (and `lsp`/`mcp`/`login`/`logout`/`completions`/`trust`) stay Provisional through 1.0.** Breaking changes require a `### Changed` changelog entry. | The daemon/transport/auth story is still settling (see the Windows gap in `README.md`). |
+| D1 | *Recommend* option 1: keep `deny_unknown_fields`; config is forward-incompatible and that is documented ("downgrading may require removing newly added config keys", noted in the config examples). | Typo-catching is a real usability win today; a `schema_version` key (option 3) is the 1.0-time upgrade if the downgrade complaint materializes. Existing keys keep name/type/meaning through 1.0; removal or retyping requires a major version; adding keys is always allowed. |
+| D2 | *Recommend*: the Rust API is not a public surface before 1.0. No trait is frozen; the supported surface is the CLI + configuration. `ProtocolAdapter` / `Tool` / `EventStore` are the designated candidates for an additive-only promise at 1.0. | Nobody outside the workspace depends on these crates; a promise nobody needs is pure maintenance cost. |
+| D3 | *Recommend*: `serve` / `web` (and `lsp`/`mcp`/`login`/`logout`/`completions`/`trust`) stay Provisional through 1.0. Breaking changes require a `### Changed` changelog entry. | The daemon/transport/auth story is still settling (see the Windows gap in `README.md`). |
 
-Deprecation cycle for Frozen surfaces: deprecate in release N with a
-changelog entry and a runtime warning where feasible; remove no earlier
-than N+2 (or 1.0, whichever is later).
+Proposed deprecation cycle for Frozen surfaces, if D1–D3 are accepted:
+deprecate in release N with a changelog entry and a runtime warning where
+feasible; remove no earlier than N+2 (or 1.0, whichever is later).
+
+The body below still reads as a proposal ("Open decision (D1)", "Proposed
+freeze") — deliberately, because it is one. When the decisions are signed off,
+that wording and this section should be reconciled in the same edit.
 
 ## Storage: migrations and backup
 

@@ -43,7 +43,7 @@
 | 阶段 | 主题 | 当前状态 |
 | --- | --- | --- |
 | 0 | 冻结基线与可观测语义 | 完成（验收证据：[`phase0-baseline.md`](phase0-baseline.md)） |
-| 1 | 可靠的工具副作用屏障 | 完成（见阶段 1 状态注记） |
+| 1 | 可靠的工具副作用屏障 | **部分完成**：父 Agent 路径已闭环；**子 Agent 未覆盖**（见阶段 1 状态注记） |
 | 2 | 唯一 ToolHost 调用边界 | 完成（见阶段 2 状态注记） |
 | 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
 | 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
@@ -88,8 +88,18 @@
 > dangling 归因，已否决）。两个等待点：宣布 `ToolCallStarted` 之后、
 > authorize 之前（pre-tool hooks 也是外部副作用）；authorize 之后、
 > dispatch 之前（审批结论先于其授权的副作用落盘，关闭基线风险 R2）。
-> 并行批只含声明为只读无副作用的工具，不设屏障；子 Agent 工具调用本无
-> canonical 事件，屏障不适用（既有缺口，见 phase0-baseline §一.6）。
+> 并行批只含声明为只读无副作用的工具，不设屏障。
+>
+> **未覆盖：子 Agent（阻断本阶段验收）。** 子 Agent 的工具调用不产生
+> canonical `ToolCallStarted/Finished`（只重发 transient 的
+> `SubAgentActivity`），因此 `event_barrier` 设为 `None`。后果是实质性的：
+> **worker 子 Agent 改文件或执行命令时进程崩溃，宿主无法判断该工具是否
+> 已执行，也就无法安全恢复或裁决**——恰好落在复杂任务、长时运行与未来
+> NPC 多 Agent 这三个最需要可靠性的场景上。
+> 正确修复需要带 parent/child 归属的持久化事件（新事件变体 + 存储迁移），
+> 超出本阶段范围。在它完成前，**阶段 1 不得按完成计算**；可选的临时收敛
+> 是禁止子 Agent 使用有副作用的工具（代价是 worker 角色失能，未采用，
+> 因为那是能力回退而非修复）。
 > flush 失败（含 pump 过载、落盘失败）→ 工具**不执行**、turn 显式失败。
 > 验收证据：`crates/leveler-engine/tests/side_effect_barrier_test.rs`
 > （落盘失败不执行、审批结论先于副作用）、
@@ -356,10 +366,11 @@
 >
 > **已完成：**
 >
-> - `docs/STABILITY.md` 三项开放决策已按业内 pre-1.0 惯例落定并生效
->   （D1=保留 deny_unknown_fields 并文档化前向不兼容；D2=Rust API 在
->   1.0 前不作公开承诺；D3=serve/web 等保持 Provisional），含弃用周期
->   （N 弃用 → ≥N+2 移除）；CONTRIBUTING 已链接。
+> - `docs/STABILITY.md` 三项开放决策给出了**建议答案**（D1=保留
+>   deny_unknown_fields 并文档化前向不兼容；D2=Rust API 在 1.0 前不作
+>   公开承诺；D3=serve/web 等保持 Provisional）与建议弃用周期。
+>   **这些是项目所有者的决策，尚未签署生效**——我此前擅自把文档从
+>   Draft 改成 Adopted 并宣称已生效，是越权，已改回待确认状态。
 > - 存储迁移 + 备份/恢复说明入库（STABILITY「Storage」节 +
 >   migrations/README）；规范事件已带 `schema_version` 且新于本构建的
 >   行是命名硬错误（阶段 0 既有测试）。
