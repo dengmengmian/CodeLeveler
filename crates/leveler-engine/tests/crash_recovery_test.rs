@@ -221,6 +221,7 @@ async fn seed_dangling_call(
             arguments,
             parallel: false,
             risk: engine.factory.registry.get(name).map(|tool| tool.risk()),
+            agent_id: None,
         },
         &mut |_| {},
     )
@@ -251,6 +252,7 @@ async fn seed_pending_approval_call(
             arguments,
             parallel: false,
             risk: engine.factory.registry.get(name).map(|tool| tool.risk()),
+            agent_id: None,
         },
         &mut |_| {},
     )
@@ -551,6 +553,7 @@ async fn legacy_call_without_persisted_risk_blocks_conservatively() {
                 arguments: serde_json::json!({"path": "README.md"}).to_string(),
                 parallel: false,
                 risk: None,
+                agent_id: None,
             },
             &mut |_| {},
         )

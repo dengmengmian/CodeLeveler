@@ -190,7 +190,11 @@ impl Executor {
                 )
                 .await;
         }
-        let mut child = self.child_for_role_on(role, files, model_override);
+        let mut child = self
+            .child_for_role_on(role, files, model_override)
+            // Attribute the child's canonical tool events to it, so a
+            // dangling call after a crash names whose side effect it was.
+            .with_agent_id(id.clone());
         // A definition that declares its own tools / round budget binds every
         // spawn of it — otherwise the field is decoration.
         child.apply_agent_policy(&agent_tools, agent_max_rounds);

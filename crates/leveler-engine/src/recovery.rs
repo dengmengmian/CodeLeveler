@@ -13,25 +13,28 @@
 
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::PriorlyAdmitted;
 use leveler_tools::{ToolContext, ToolRegistry};
 
-/// Re-run a dangling call. Returns `(is_error, preview)`; a failure is a
-/// recorded errored result, never a fake success and never a hard stop —
-/// recovery reports what happened and lets the model re-drive.
+/// Re-run a dangling call through the host's reconciliation entry.
+///
+/// The engine no longer executes tools itself: it hands a
+/// [`PriorlyAdmitted`] call to `leveler_agent::reconcile`, so the whole
+/// system has ONE place that runs a tool, not one per crate. Returns
+/// `(is_error, preview)`; `None` when the tool refuses reconstruction
+/// (unknown to this build, or never declared replay-safe), which the caller
+/// must treat as "stop for human reconciliation", never as a skip.
 pub(crate) async fn replay_tool(
     registry: &ToolRegistry,
     context: ToolContext,
     name: &str,
     args: serde_json::Value,
     cancellation: &CancellationToken,
-) -> (bool, String) {
-    match registry
-        .execute(name, args, context, cancellation.child_token())
-        .await
-    {
-        Ok(output) => (output.is_error, preview(&output.content)),
-        Err(error) => (true, preview(&error.to_string())),
-    }
+) -> Option<(bool, String)> {
+    let admitted = PriorlyAdmitted::from_persisted(registry, name, args)?;
+    let (is_error, output) =
+        leveler_agent::reconcile(registry, context, &admitted, cancellation).await;
+    Some((is_error, preview(&output)))
 }
 
 /// Bound a replayed tool's output for the event-log preview (the full result

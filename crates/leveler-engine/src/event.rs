@@ -185,12 +185,19 @@ pub enum EngineEvent {
         /// treats `None` conservatively rather than consulting today's registry.
         #[serde(default)]
         risk: Option<leveler_execution::RiskLevel>,
+        /// The delegated agent that made this call, when it was not the
+        /// top-level one. Legacy events omit it (parent call).
+        #[serde(default)]
+        agent_id: Option<String>,
     },
     ToolCallFinished {
         call_id: String,
         name: String,
         is_error: bool,
         preview: String,
+        /// The delegated agent that made this call (see `ToolCallStarted`).
+        #[serde(default)]
+        agent_id: Option<String>,
     },
     WorkspaceSnapshotCreated {
         call_id: String,
@@ -783,7 +790,11 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 name,
                 arguments,
                 parallel,
+                // Risk is stamped by the turn pump, which owns the registry.
                 risk: None,
+                // The top-level loop's own call; a delegated one arrives as a
+                // ChildToolEvent and carries its agent id.
+                agent_id: None,
             },
             A::ToolResult {
                 id,
@@ -795,6 +806,7 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 name,
                 is_error,
                 preview,
+                agent_id: None,
             },
             A::WorkspaceSnapshot { call_id, snapshot } => {
                 EngineEvent::WorkspaceSnapshotCreated { call_id, snapshot }
@@ -940,6 +952,7 @@ mod contract_tests {
                 name: "read_file".into(),
                 is_error: false,
                 preview: "source".into(),
+                agent_id: None,
             }
             .data_class(),
             DataClass::LocalOnly
@@ -1053,6 +1066,7 @@ mod contract_tests {
                 arguments: "{\"token\":\"secret\"}".into(),
                 parallel: false,
                 risk: None,
+                agent_id: None,
             },
             EngineEvent::ContextSnapshot {
                 messages: vec![],

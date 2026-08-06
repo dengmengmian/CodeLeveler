@@ -119,12 +119,14 @@ impl<'a> EventLog<'a> {
                     arguments,
                     parallel: _,
                     risk,
+                    agent_id,
                 } => open.push(DanglingCall {
                     turn_id: row.turn_id.clone(),
                     call_id,
                     name,
                     arguments,
                     risk,
+                    agent_id,
                     pending_approval: false,
                 }),
                 EngineEvent::ToolCallFinished { call_id, .. } => {
@@ -170,6 +172,9 @@ pub struct DanglingCall {
     /// Risk captured when the call originally started. `None` is legacy or
     /// unknown and must never be auto-replayed.
     pub risk: Option<leveler_execution::RiskLevel>,
+    /// The delegated agent that made this call, when it was not the top-level
+    /// one. Recovery reports it so a human裁决 knows whose side effect it is.
+    pub agent_id: Option<String>,
     /// Crashed while blocked in approval (`ApprovalRequested` with no resolution):
     /// dispatch never ran, so there is no side effect to recover.
     pub pending_approval: bool,
@@ -249,6 +254,7 @@ mod tests {
                     arguments: "{\"path\":\"README.md\"}".into(),
                     parallel: false,
                     risk: Some(leveler_execution::RiskLevel::Safe),
+                    agent_id: None,
                 },
                 &mut |_| {},
             )
@@ -262,6 +268,7 @@ mod tests {
                         name: "read_file".into(),
                         is_error: false,
                         preview: "ok".into(),
+                        agent_id: None,
                     },
                     &mut |_| {},
                 )

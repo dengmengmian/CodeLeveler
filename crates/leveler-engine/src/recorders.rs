@@ -135,6 +135,42 @@ impl leveler_agent::EventBarrier for PumpBarrier {
             .await
             .map_err(leveler_agent::AgentError::Persistence)
     }
+
+    /// Enqueue a delegated agent's tool event on the SAME queue `flush`
+    /// drains. That ordering is the whole point: a separate channel would let
+    /// the flush marker overtake the event, and the barrier would report a
+    /// side effect durable that is not recorded yet.
+    fn record_child_tool_event(&self, event: leveler_agent::ChildToolEvent) {
+        self.events.emit(match event {
+            leveler_agent::ChildToolEvent::Started {
+                agent_id,
+                call_id,
+                name,
+                arguments,
+            } => EngineEvent::ToolCallStarted {
+                call_id,
+                name,
+                arguments,
+                parallel: false,
+                // Stamped by the pump, which owns the registry.
+                risk: None,
+                agent_id: Some(agent_id),
+            },
+            leveler_agent::ChildToolEvent::Finished {
+                agent_id,
+                call_id,
+                name,
+                is_error,
+                preview,
+            } => EngineEvent::ToolCallFinished {
+                call_id,
+                name,
+                is_error,
+                preview,
+                agent_id: Some(agent_id),
+            },
+        });
+    }
 }
 
 pub struct RecordingApprover {

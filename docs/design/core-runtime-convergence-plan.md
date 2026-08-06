@@ -43,8 +43,8 @@
 | 阶段 | 主题 | 当前状态 |
 | --- | --- | --- |
 | 0 | 冻结基线与可观测语义 | 完成（验收证据：[`phase0-baseline.md`](phase0-baseline.md)） |
-| 1 | 可靠的工具副作用屏障 | **部分完成**：父 Agent 路径已闭环；**子 Agent 未覆盖**（见阶段 1 状态注记） |
-| 2 | 唯一 ToolHost 调用边界 | **部分完成**：Agent 侧唯一化并由 tripwire 守住；engine 恢复重放是记录在案的第二执行点（见阶段 2 状态注记） |
+| 1 | 可靠的工具副作用屏障 | 完成（父 Agent 与子 Agent 均已闭环，见阶段 1 状态注记） |
+| 2 | 唯一 ToolHost 调用边界 | 完成（全系统唯一执行点，跨 crate tripwire 守住，见阶段 2 状态注记） |
 | 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
 | 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
 | 5 | 产品策略移出 direct loop | 完成（开关化+分类；协议化迁移与旧策略删除待 eval 数据，见阶段 5 状态注记） |
@@ -81,8 +81,7 @@
 
 **目的：** 消除“工具已经执行，但开始事件尚未可靠落盘”的崩溃窗口。
 
-> **状态：部分完成——父 Agent 路径已闭环，子 Agent 未覆盖，因此本阶段
-> 不得按完成计算。** 实现为 `EventBarrier` flush 屏障（`leveler-agent` 定义、
+> **状态：完成。** 实现为 `EventBarrier` flush 屏障（`leveler-agent` 定义、
 > `leveler-engine` 实现）：flush 标记与事件走同一条有序 pump 队列，因此
 > 屏障永远不会与它等待的事件竞态（直写 EventLog 的替代方案会让
 > `ApprovalRequested` 与 `ToolCallStarted` 在持久化顺序上乱序，破坏
@@ -91,16 +90,21 @@
 > dispatch 之前（审批结论先于其授权的副作用落盘，关闭基线风险 R2）。
 > 并行批只含声明为只读无副作用的工具，不设屏障。
 >
-> **未覆盖：子 Agent（阻断本阶段验收）。** 子 Agent 的工具调用不产生
-> canonical `ToolCallStarted/Finished`（只重发 transient 的
-> `SubAgentActivity`），因此 `event_barrier` 设为 `None`。后果是实质性的：
-> **worker 子 Agent 改文件或执行命令时进程崩溃，宿主无法判断该工具是否
-> 已执行，也就无法安全恢复或裁决**——恰好落在复杂任务、长时运行与未来
-> NPC 多 Agent 这三个最需要可靠性的场景上。
-> 正确修复需要带 parent/child 归属的持久化事件（新事件变体 + 存储迁移），
-> 超出本阶段范围。在它完成前，**阶段 1 不得按完成计算**；可选的临时收敛
-> 是禁止子 Agent 使用有副作用的工具（代价是 worker 角色失能，未采用，
-> 因为那是能力回退而非修复）。
+> **子 Agent（后续补齐，已完成）。** 此前子 Agent 的工具调用只产生
+> transient 的 `SubAgentActivity`，`event_barrier` 为 `None`——worker 子
+> Agent 改文件时崩溃，宿主无法判断工具是否已执行。现在子 Agent 继承父
+> 的屏障，并通过 `EventBarrier::record_child_tool_event` 产生**带归属的
+> canonical 事件**（`ToolCallStarted/Finished` 新增 `agent_id`，serde
+> default，旧行读出 `None`，无需存储迁移）。
+> **关键约束写进 trait 契约**：实现必须把子事件放进 `flush` 所排空的
+> **同一条有序队列**——另开通道会让 flush 标记越过它等待的事件，屏障就会
+> 为一个尚未记录的副作用报告"已持久化"。engine 的 `PumpBarrier` 正是这样
+> 实现的。子事件不再投影成父级 UI 事件（界面已有 `SubAgentActivity`），
+> 否则每个子工具调用会渲染两次。
+> 证据：`multi_agent_test::child_side_effects_are_recoverable` 两例——
+> 调用被记录且带归属、且**记录先于 flush**（顺序正是本条要闭合的窗口）。
+> 完成记录放在 `dispatch_raw` 而非 `dispatch`：只读工具走并发批，
+> 否则每个并行子调用都会永远看起来是悬挂的。
 > flush 失败（含 pump 过载、落盘失败）→ 工具**不执行**、turn 显式失败。
 > 验收证据：`crates/leveler-engine/tests/side_effect_barrier_test.rs`
 > （落盘失败不执行、审批结论先于副作用）、
@@ -126,12 +130,13 @@
 
 **目的：** 让所有工具共享一条不可绕过的安全与执行路径。
 
-> **状态：部分完成。** Agent 侧已唯一化；但 engine 的崩溃恢复仍是**第二个
-> 执行点**（`recovery.rs`），因此「唯一调用边界」尚未字面成立。它现在是
-> 单一具名入口、只对声明为纯读的工具生效、并由扩展后的 tripwire 守住
-> （tripwire 在收拢前是红的，证明它此前确实看不见 engine）。真正收口需要
-> 一个宿主拥有的 `ToolHost::reconcile` 入口，让恢复与正常执行共用同一条
-> 准入链——未做。
+> **状态：完成。** 恢复路径已收口：engine 不再自己执行工具，而是把
+> `PriorlyAdmitted`（唯一构造器 `from_persisted` 会拒绝任何未声明
+> replay-safe 的工具）交给 `leveler_agent::reconcile`。因此
+> `registry.execute` 在**全系统只出现在 host.rs 一处**，由跨 crate
+> tripwire（`no_other_crate_executes_a_tool`，扫描 engine 与 app，要求
+> 零出现）守住。此前 tripwire 只扫 agent crate，所以看不见 engine 的
+> 绕过路径——收口前该测试是红的。
 >
 > ToolHost 管线收拢在
 > `crates/leveler-agent/src/executor/host.rs`：

@@ -23,7 +23,7 @@ use leveler_execution::{
 };
 use leveler_lifecycle::PlanStep;
 use leveler_model::{ContentPart, ToolCall};
-use leveler_tools::{ToolContext, ToolError};
+use leveler_tools::{ToolContext, ToolError, ToolRegistry};
 
 use super::dispatch::{collect_modified, extract_image, extract_plan};
 use super::{AgentError, Executor};
@@ -46,6 +46,62 @@ impl AdmittedCall {
     /// Hand the call back for the loop's post-execution bookkeeping.
     pub(crate) fn into_call(self) -> ToolCall {
         self.call
+    }
+}
+
+/// A call whose admission ALREADY happened and is on the durable record — a
+/// `ToolCallStarted` the engine found dangling after a crash.
+///
+/// Reconciliation re-runs such a call without asking again: the human already
+/// decided, and the decision is in the event log. What it must NOT do is
+/// re-run something whose replay could act on the world, so the only way to
+/// build one is [`PriorlyAdmitted::from_persisted`], which refuses anything
+/// the tool has not declared replay-safe.
+pub struct PriorlyAdmitted {
+    name: String,
+    arguments: serde_json::Value,
+}
+
+impl PriorlyAdmitted {
+    /// Rebuild an admitted call from what the event log recorded. `None` when
+    /// the tool is unknown to this build or never declared replay safety —
+    /// the caller must then stop for human reconciliation instead.
+    pub fn from_persisted(
+        registry: &ToolRegistry,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Option<Self> {
+        registry.replay_is_side_effect_free(name).then(|| Self {
+            name: name.to_string(),
+            arguments,
+        })
+    }
+}
+
+/// Execute a previously-admitted call during crash reconciliation.
+///
+/// This exists so the host has ONE place that runs a tool. Recovery used to
+/// call `ToolRegistry::execute` from the engine, which meant the "single
+/// ToolHost boundary" was true of the agent crate and false of the system.
+/// Returns `(is_error, output)`; a failure is a result to record, never a
+/// panic and never a silent success.
+pub async fn reconcile(
+    registry: &ToolRegistry,
+    context: ToolContext,
+    call: &PriorlyAdmitted,
+    cancellation: &CancellationToken,
+) -> (bool, String) {
+    match registry
+        .execute(
+            &call.name,
+            call.arguments.clone(),
+            context,
+            cancellation.child_token(),
+        )
+        .await
+    {
+        Ok(output) => (output.is_error, output.content),
+        Err(error) => (true, format!("tool error: {error}")),
     }
 }
 
@@ -81,6 +137,18 @@ impl Executor {
         session_approved: &mut HashSet<String>,
         cancellation: &CancellationToken,
     ) -> Result<AdmittedCall, AdmitError> {
+        // A delegated agent's call has no canonical event of its own — the
+        // parent loop announced nothing for it — so record one, attributed,
+        // on the same queue the barrier drains. Without this a worker child
+        // that crashes mid-edit leaves a side effect the host cannot see.
+        if let (Some(barrier), Some(agent_id)) = (&self.event_barrier, &self.agent_id) {
+            barrier.record_child_tool_event(super::ChildToolEvent::Started {
+                agent_id: agent_id.clone(),
+                call_id: call.id.as_str().to_string(),
+                name: call.name.clone(),
+                arguments: super::dispatch::compact_json(&call.arguments),
+            });
+        }
         // Side-effect barrier, first wait: the announcing `ToolCallStarted`
         // must be durable before ANYTHING can act on this call — the pre-tool
         // hooks below are external side effects themselves. A flush failure
@@ -429,7 +497,7 @@ impl Executor {
         cancellation: &CancellationToken,
     ) -> (String, bool, serde_json::Value) {
         let call = &admitted.call;
-        match self
+        let outcome = match self
             .registry
             .execute(
                 &call.name,
@@ -446,7 +514,21 @@ impl Executor {
                 serde_json::Value::Null,
             ),
             Err(e) => (format!("tool error: {e}"), true, serde_json::Value::Null),
+        };
+        // Close a delegated call's canonical record here, not in `dispatch`:
+        // read-only tools run in the concurrent batch, which calls this
+        // directly, so recording upstream would leave every parallel child
+        // call looking permanently dangling.
+        if let (Some(barrier), Some(agent_id)) = (&self.event_barrier, &self.agent_id) {
+            barrier.record_child_tool_event(super::ChildToolEvent::Finished {
+                agent_id: agent_id.clone(),
+                call_id: call.id.as_str().to_string(),
+                name: call.name.clone(),
+                is_error: outcome.1,
+                preview: super::dispatch::preview(&outcome.0),
+            });
         }
+        outcome
     }
 }
 

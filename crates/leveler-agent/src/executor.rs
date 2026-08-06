@@ -5,7 +5,7 @@ mod dispatch;
 mod drive;
 mod gates;
 mod handlers;
-mod host;
+pub(crate) mod host;
 pub mod round_verdict;
 mod stream;
 
@@ -525,6 +525,36 @@ pub enum AgentError {
 #[async_trait]
 pub trait EventBarrier: Send + Sync {
     async fn flush(&self) -> Result<(), AgentError>;
+
+    /// Record a canonical tool event from a DELEGATED agent, attributed to it.
+    ///
+    /// A sub-agent's tool calls used to surface only as transient
+    /// `SubAgentActivity`, so a worker child that crashed mid-edit left
+    /// nothing the host could reconcile. These are the durable facts instead.
+    ///
+    /// The implementation MUST enqueue this on the same ordered queue that
+    /// [`Self::flush`] drains. Anything else races: the flush marker could
+    /// overtake the event it is supposed to be waiting for, and the barrier
+    /// would report durability for a call that is not recorded yet.
+    fn record_child_tool_event(&self, _event: ChildToolEvent) {}
+}
+
+/// A delegated agent's tool call, attributed to the child that made it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChildToolEvent {
+    Started {
+        agent_id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    Finished {
+        agent_id: String,
+        call_id: String,
+        name: String,
+        is_error: bool,
+        preview: String,
+    },
 }
 
 /// A sink that persists the transcript as the loop advances, enabling resume.
@@ -808,8 +838,12 @@ pub struct Executor {
     grants_state_dir: Option<std::path::PathBuf>,
     /// Side-effect barrier: canonical tool events must be durable before a
     /// tool with possible side effects is dispatched. `None` = no durable
-    /// host (sub-agents, standalone use); the loop proceeds without waiting.
+    /// host (standalone library use); the loop proceeds without waiting.
     event_barrier: Option<Arc<dyn EventBarrier>>,
+    /// This agent's delegation id, when it IS a delegated agent. Its tool
+    /// events are attributed to it so the host can tell whose side effect a
+    /// dangling call belongs to.
+    agent_id: Option<String>,
 }
 
 impl Executor {
@@ -859,6 +893,7 @@ impl Executor {
             ),
             grants_state_dir: None,
             event_barrier: None,
+            agent_id: None,
         }
     }
 
@@ -1103,14 +1138,12 @@ impl Executor {
             permission_rules_path: self.permission_rules_path.clone(),
             hook_runner: self.hook_runner.clone(),
             grants_state_dir: self.grants_state_dir.clone(),
-            // KNOWN GAP, tracked as blocking phase 1 acceptance in
-            // docs/design/core-runtime-convergence-plan.md: a child's tool
-            // starts/finishes are only transient `SubAgentActivity`, never
-            // canonical events, so there is nothing durable for a barrier to
-            // wait on. A worker child that crashes mid-edit therefore leaves
-            // no record the host can reconcile. Closing this needs
-            // parent/child-attributed persisted events, not a barrier here.
-            event_barrier: None,
+            // A child shares the parent's barrier: its tool events are
+            // recorded on the SAME ordered queue the barrier flushes, so a
+            // delegated side effect is as durable-before-execution as a
+            // parent one. `agent_id` is stamped by the spawn handler.
+            event_barrier: self.event_barrier.clone(),
+            agent_id: None,
         }
     }
 
@@ -1303,6 +1336,13 @@ impl Executor {
     /// Install the host's side-effect barrier (see [`EventBarrier`]).
     pub fn with_event_barrier(mut self, barrier: Arc<dyn EventBarrier>) -> Self {
         self.event_barrier = Some(barrier);
+        self
+    }
+
+    /// Identify this executor as a delegated agent, so its tool events are
+    /// recorded against it rather than looking like the parent's.
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = Some(id.into());
         self
     }
 

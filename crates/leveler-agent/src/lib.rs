@@ -27,9 +27,10 @@ pub use compaction::{
     COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages, estimate_tokens,
     summarize_with_model,
 };
+pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
-    ClarificationRequest, Clarifier, ContinuationPolicy, EventBarrier, Executor,
+    ChildToolEvent, ClarificationRequest, Clarifier, ContinuationPolicy, EventBarrier, Executor,
     ModelRequestRecord, NoopSink, SteeringSource, StepLimits, StopReason,
     SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink, TurnPolicy, closeout,
 };

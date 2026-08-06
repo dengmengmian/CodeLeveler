@@ -2271,3 +2271,184 @@ mod steering {
         assert_eq!(outcome.final_text, "done", "blank steering must be dropped");
     }
 }
+
+// ── a delegated agent's side effects must be recoverable ────────────────────
+
+/// A worker child that crashes mid-edit used to leave nothing the host could
+/// reconcile: its tool calls surfaced only as transient `SubAgentActivity`,
+/// never as durable facts. These assert the two properties recovery needs —
+/// the call is recorded, attributed to the child that made it, and the record
+/// is durable BEFORE the tool runs.
+mod child_side_effects_are_recoverable {
+    use super::*;
+    use std::sync::Mutex;
+
+    use leveler_agent::{ChildToolEvent, EventBarrier};
+
+    #[derive(Default)]
+    struct RecordingBarrier {
+        events: Mutex<Vec<ChildToolEvent>>,
+        /// Order of operations, so "recorded before flushed" is checkable.
+        order: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventBarrier for RecordingBarrier {
+        async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
+            self.order.lock().unwrap().push("flush");
+            Ok(())
+        }
+        fn record_child_tool_event(&self, event: ChildToolEvent) {
+            self.order.lock().unwrap().push(match event {
+                ChildToolEvent::Started { .. } => "started",
+                ChildToolEvent::Finished { .. } => "finished",
+            });
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_tool_call_is_recorded_and_attributed() {
+        let dir = tmp("child-attribution", 71);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+        let barrier = Arc::new(RecordingBarrier::default());
+        let runtime = Arc::new(SleepyRuntime::new(
+            vec![
+                // The parent delegates…
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"role": "explorer", "task": "read the library"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // …the child reads a file…
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "read_file",
+                        serde_json::json!({"path": "src/lib.rs"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // …and both finish.
+                assistant_text("child done"),
+                assistant_text("parent done"),
+            ],
+            Duration::from_millis(0),
+        ));
+
+        let workspace = Workspace::new(&dir).unwrap();
+        let executor = Executor::new(
+            runtime,
+            Arc::new(default_registry()),
+            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_delegation(true)
+        .with_event_barrier(barrier.clone());
+
+        executor
+            .run(
+                "delegate a read",
+                &mut |_| {},
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let events = barrier.events.lock().unwrap().clone();
+        assert!(
+            !events.is_empty(),
+            "a delegated tool call produced no durable record at all"
+        );
+        let started = events
+            .iter()
+            .find_map(|e| match e {
+                ChildToolEvent::Started { agent_id, name, .. } => {
+                    Some((agent_id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .expect("the child's call must be recorded as started");
+        assert_eq!(started.1, "read_file");
+        assert!(
+            !started.0.is_empty(),
+            "the record must name WHICH agent made the call"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChildToolEvent::Finished { name, .. } if name == "read_file"
+            )),
+            "the child's call must also be closed, or it looks dangling forever"
+        );
+    }
+
+    /// Ordering is the property that makes the record useful: if the flush
+    /// could overtake the event, the barrier would report durability for a
+    /// call that is not recorded yet — precisely the crash window this is
+    /// supposed to close.
+    #[tokio::test]
+    async fn the_child_record_precedes_the_barrier_flush() {
+        let dir = tmp("child-order", 73);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+        let barrier = Arc::new(RecordingBarrier::default());
+        let runtime = Arc::new(SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"role": "explorer", "task": "read it"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "read_file",
+                        serde_json::json!({"path": "src/lib.rs"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child done"),
+                assistant_text("parent done"),
+            ],
+            Duration::from_millis(0),
+        ));
+
+        let workspace = Workspace::new(&dir).unwrap();
+        Executor::new(
+            runtime,
+            Arc::new(default_registry()),
+            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_delegation(true)
+        .with_event_barrier(barrier.clone())
+        .run(
+            "delegate a read",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let order = barrier.order.lock().unwrap().clone();
+        let started_at = order.iter().position(|s| *s == "started");
+        assert!(started_at.is_some(), "no child record was made: {order:?}");
+        let flush_after = order[started_at.unwrap()..].contains(&"flush");
+        assert!(
+            flush_after,
+            "the child's call was recorded but never flushed before dispatch: {order:?}"
+        );
+    }
+}

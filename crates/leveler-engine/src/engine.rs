@@ -837,14 +837,23 @@ impl TaskEngine {
         // Execution during recovery goes through the host's reconciliation
         // entry, so the engine has exactly one auditable place that runs a
         // tool (enforced by the ToolHost boundary tripwire).
-        let (is_error, preview) = crate::recovery::replay_tool(
+        // The replay gate above already established this tool declares itself
+        // replay-safe; if the host still refuses to reconstruct the call, that
+        // is a disagreement between two checks and must stop, not proceed.
+        let Some((is_error, preview)) = crate::recovery::replay_tool(
             &self.factory.registry,
             self.factory.tool_context.clone(),
             &call.name,
             args,
             cancellation,
         )
-        .await;
+        .await
+        else {
+            return Err(EngineError::RecoveryConfirmationRequired {
+                call_id: call.call_id.clone(),
+                tool: call.name.clone(),
+            });
+        };
         log.append(
             turn_ref,
             EngineEvent::ToolCallFinished {
@@ -852,6 +861,7 @@ impl TaskEngine {
                 name: call.name.clone(),
                 is_error,
                 preview,
+                agent_id: call.agent_id.clone(),
             },
             observer,
         )
@@ -873,6 +883,7 @@ impl TaskEngine {
                 name: call.name.clone(),
                 is_error: true,
                 preview: reason.to_string(),
+                agent_id: call.agent_id.clone(),
             },
             observer,
         )
@@ -1630,6 +1641,7 @@ pub async fn acknowledge_crash_window(
                           is unknown; the workspace was verified manually and the call was \
                           not replayed"
                     .to_string(),
+                agent_id: call.agent_id.clone(),
             },
             &mut |_| {},
         )

@@ -101,6 +101,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             name,
             arguments,
             parallel,
+            agent_id: None,
             ..
         } => AgentEvent::ToolCall {
             id: call_id,
@@ -113,12 +114,18 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             name,
             is_error,
             preview,
+            agent_id: None,
         } => AgentEvent::ToolResult {
             id: call_id,
             name,
             is_error,
             preview,
         },
+        // A delegated agent's canonical events are durable FACTS for recovery,
+        // not a second UI stream: the parent already surfaces child work as
+        // attributed `SubAgentActivity`. Projecting them here would render
+        // every child tool call twice.
+        EngineEvent::ToolCallStarted { .. } | EngineEvent::ToolCallFinished { .. } => return None,
         EngineEvent::WorkspaceSnapshotCreated { call_id, snapshot } => {
             AgentEvent::WorkspaceSnapshot { call_id, snapshot }
         }
