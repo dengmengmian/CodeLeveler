@@ -262,6 +262,8 @@ async fn seed_pending_approval_call(
         Some(&turn_id),
         EngineEvent::ApprovalRequested {
             id: ApprovalId::generate(),
+            call_id: Some("c1".into()),
+            agent_id: None,
             tool: name.into(),
             summary: "apply the interrupted patch".into(),
             command: None,

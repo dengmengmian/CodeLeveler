@@ -533,3 +533,78 @@ async fn a_failed_approval_flush_writes_no_standing_permission() {
          granted it never became durable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 3. Recovery needs to know WHAT was gated, not just that something was.
+// ---------------------------------------------------------------------------
+
+/// Every `ToolCallStarted` reaches the log with its risk filled in, and every
+/// approval names the call it gated.
+///
+/// Both facts are easy to misread from the emit sites: the executor→engine
+/// conversion and the delegated-agent barrier BOTH construct the event with
+/// `risk: None`, because the pump — which owns the registry — stamps it on the
+/// way to the log. This test pins the stamped result rather than the
+/// placeholder, so a reader who concludes from one emit site that risk is
+/// never recorded has a failing test to check the claim against.
+///
+/// The attribution matters for the same reason: recovery decides whether a
+/// dangling call is safe to replay from its risk, and whether it was blocked
+/// in approval from the ids on the approval events.
+#[tokio::test]
+async fn the_log_records_each_call_s_risk_and_what_the_approval_gated() {
+    let h = harness(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+        ),
+        text("removed"),
+    ])
+    .await;
+    std::fs::create_dir_all(h.dir.path().join("scratch")).unwrap();
+    let log = EventLog::new(&h.db, h.session.clone());
+
+    run_chat_turn(&h, &log, Arc::new(ApproveOnceHuman), "remove scratch")
+        .await
+        .expect("approved turn must complete");
+
+    let events = log.replay().await.unwrap();
+
+    let risk = events
+        .iter()
+        .find_map(|e| match e {
+            leveler_engine::EngineEvent::ToolCallStarted { name, risk, .. }
+                if name == "run_command" =>
+            {
+                Some(*risk)
+            }
+            _ => None,
+        })
+        .expect("the call must be recorded");
+    assert!(
+        risk.is_some(),
+        "the pump must stamp the call's risk; recovery reads this to decide \
+         whether replaying the call unattended is safe"
+    );
+
+    for event in &events {
+        match event {
+            leveler_engine::EngineEvent::ApprovalRequested { call_id, .. }
+            | leveler_engine::EngineEvent::ApprovalResolved { call_id, .. } => {
+                assert_eq!(
+                    call_id.as_deref(),
+                    Some("c1"),
+                    "an approval must name the call it gated: {event:?}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, leveler_engine::EngineEvent::ApprovalResolved { .. })),
+        "the approval flow never ran, so nothing above was actually checked"
+    );
+}

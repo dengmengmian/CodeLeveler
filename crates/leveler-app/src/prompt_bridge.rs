@@ -247,6 +247,7 @@ mod tests {
         ApprovalRequest {
             id: ApprovalId::new("approval-disconnect"),
             turn_id: Some(leveler_core::TurnId::new("turn-a")),
+            agent_id: None,
             call_id: "call-a".to_string(),
             action_fingerprint: "fingerprint-a".to_string(),
             tool: "run_command".to_string(),

@@ -23,6 +23,8 @@ async fn pending_approval_survives_a_restart_via_the_event_log() {
             None,
             EngineEvent::ApprovalRequested {
                 id: ApprovalId::generate(),
+                call_id: Some("c1".into()),
+                agent_id: None,
                 tool: "run_command".into(),
                 summary: "run tests".into(),
                 command: Some("cargo test".into()),

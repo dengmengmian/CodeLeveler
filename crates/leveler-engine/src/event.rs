@@ -296,6 +296,15 @@ pub enum EngineEvent {
     // ── kernel: approvals / clarifications ──────────────────────────────
     ApprovalRequested {
         id: ApprovalId,
+        /// The call this approval gates, and the agent that made it. Recovery
+        /// pairs on both: call ids are local to their agent, so two concurrent
+        /// delegated agents can raise the same one. `None` on rows written
+        /// before the attribution existed — recovery falls back to the most
+        /// recent open call there rather than dropping the marker.
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
         tool: String,
         summary: String,
         command: Option<String>,
@@ -303,6 +312,11 @@ pub enum EngineEvent {
     },
     ApprovalResolved {
         id: ApprovalId,
+        /// See [`EngineEvent::ApprovalRequested`].
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
         /// approve | approve_session | deny
         decision: String,
     },
@@ -990,6 +1004,8 @@ mod contract_tests {
         assert_eq!(
             EngineEvent::ApprovalRequested {
                 id: leveler_core::ApprovalId::generate(),
+                call_id: Some("call-1".into()),
+                agent_id: None,
                 tool: "run_command".into(),
                 summary: "run tests".into(),
                 command: Some("cargo test".into()),
@@ -1030,6 +1046,8 @@ mod contract_tests {
             },
             EngineEvent::ApprovalRequested {
                 id: ApprovalId::new("approval-safe"),
+                call_id: Some(secret.into()),
+                agent_id: Some(secret.into()),
                 tool: secret.into(),
                 summary: secret.into(),
                 command: Some(secret.into()),

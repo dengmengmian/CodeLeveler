@@ -140,23 +140,45 @@ impl<'a> EventLog<'a> {
                     // recovery must reconcile.
                     open.retain(|c| !(c.call_id == call_id && c.agent_id == agent_id));
                 }
-                // Approval events sit between a call's Started and Finished, so
-                // they attach to the most-recent open call: a request marks it
-                // blocked-in-approval, a resolution clears that.
-                EngineEvent::ApprovalRequested { .. } => {
-                    if let Some(last) = open.last_mut() {
-                        last.pending_approval = true;
-                    }
-                }
-                EngineEvent::ApprovalResolved { .. } => {
-                    if let Some(last) = open.last_mut() {
-                        last.pending_approval = false;
-                    }
-                }
+                // An approval attaches to the call it was raised for. Pairing
+                // on (agent, call) matters for the same reason as above: with
+                // concurrent delegated agents, "the most recent open call" is
+                // routinely somebody else's.
+                EngineEvent::ApprovalRequested {
+                    call_id, agent_id, ..
+                } => set_pending(&mut open, &call_id, &agent_id, true),
+                EngineEvent::ApprovalResolved {
+                    call_id, agent_id, ..
+                } => set_pending(&mut open, &call_id, &agent_id, false),
                 _ => {}
             }
         }
         Ok(open)
+    }
+}
+
+/// Mark (or unmark) the open call an approval was raised for.
+///
+/// Rows written before approvals carried attribution have no ids at all; those
+/// fall back to the most recent open call, which is what the single-agent
+/// sessions they come from actually mean. Dropping the marker instead would
+/// silently turn "crashed while blocked in approval, so the side effect never
+/// ran" into "may have run" — the more dangerous of the two readings.
+fn set_pending(
+    open: &mut [DanglingCall],
+    call_id: &Option<String>,
+    agent_id: &Option<String>,
+    pending: bool,
+) {
+    let target = match call_id {
+        Some(call_id) => open
+            .iter_mut()
+            .rev()
+            .find(|c| c.call_id == *call_id && c.agent_id == *agent_id),
+        None => open.last_mut(),
+    };
+    if let Some(call) = target {
+        call.pending_approval = pending;
     }
 }
 
@@ -292,6 +314,124 @@ mod tests {
         assert_eq!(dangling[0].turn_id.as_deref(), Some(turn_id.as_str()));
         assert_eq!(dangling[0].arguments, "{\"path\":\"README.md\"}");
         assert!(!dangling[0].pending_approval);
+    }
+
+    /// Call ids are local to the agent that produced them, so two concurrent
+    /// delegated agents routinely produce the same one. An approval must mark
+    /// the call it was actually raised for — attributing it to whichever call
+    /// opened most recently tells recovery the wrong story: one child looks
+    /// blocked in approval (its side effect never ran) while the child that
+    /// really was blocked looks like it may have run.
+    #[tokio::test]
+    async fn an_approval_marks_its_own_call_not_the_most_recent_one() {
+        let (db, session) = db_with_session().await;
+        let turn = TurnRepository::new(&db)
+            .start(&session, "node", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = TurnId::new(turn.id.clone());
+        let log = EventLog::new(&db, session.clone());
+
+        // Both children pick the id "call-1"; alpha's is the one that blocks.
+        for agent in ["alpha", "beta"] {
+            log.append(
+                Some(&turn_id),
+                EngineEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "run_command".into(),
+                    arguments: "{}".into(),
+                    parallel: false,
+                    risk: Some(leveler_execution::RiskLevel::Destructive),
+                    agent_id: Some(agent.to_string()),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        }
+
+        log.append(
+            Some(&turn_id),
+            EngineEvent::ApprovalRequested {
+                id: leveler_core::ApprovalId::generate(),
+                call_id: Some("call-1".into()),
+                agent_id: Some("alpha".into()),
+                tool: "run_command".into(),
+                summary: String::new(),
+                command: Some("rm -rf build".into()),
+                risk: "Destructive".into(),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        let dangling = log.dangling_tool_calls().await.unwrap();
+        assert_eq!(dangling.len(), 2, "both children are still open");
+        let alpha = dangling
+            .iter()
+            .find(|c| c.agent_id.as_deref() == Some("alpha"))
+            .expect("alpha's call");
+        let beta = dangling
+            .iter()
+            .find(|c| c.agent_id.as_deref() == Some("beta"))
+            .expect("beta's call");
+        assert!(
+            alpha.pending_approval,
+            "the approval was raised for alpha's call"
+        );
+        assert!(
+            !beta.pending_approval,
+            "beta merely started later; it was never blocked in approval"
+        );
+    }
+
+    /// Legacy rows carry no call attribution. Falling back to the most recent
+    /// open call keeps old sessions recoverable instead of silently losing the
+    /// blocked-in-approval marker.
+    #[tokio::test]
+    async fn an_unattributed_approval_still_marks_the_most_recent_call() {
+        let (db, session) = db_with_session().await;
+        let turn = TurnRepository::new(&db)
+            .start(&session, "node", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = TurnId::new(turn.id.clone());
+        let log = EventLog::new(&db, session.clone());
+
+        log.append(
+            Some(&turn_id),
+            EngineEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                risk: Some(leveler_execution::RiskLevel::Destructive),
+                agent_id: None,
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        log.append(
+            Some(&turn_id),
+            EngineEvent::ApprovalRequested {
+                id: leveler_core::ApprovalId::generate(),
+                call_id: None,
+                agent_id: None,
+                tool: "run_command".into(),
+                summary: String::new(),
+                command: None,
+                risk: "Destructive".into(),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        let dangling = log.dangling_tool_calls().await.unwrap();
+        assert_eq!(dangling.len(), 1);
+        assert!(dangling[0].pending_approval);
     }
 
     #[tokio::test]

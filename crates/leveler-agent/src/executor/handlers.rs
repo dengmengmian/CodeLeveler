@@ -107,6 +107,7 @@ impl Executor {
             id: ApprovalId::generate(),
             turn_id: None,
             call_id: call.id.to_string(),
+            agent_id: self.agent_id.clone(),
             action_fingerprint: action_fingerprint(call),
             tool: call.name.clone(),
             risk,

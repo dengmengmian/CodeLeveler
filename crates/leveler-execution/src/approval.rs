@@ -21,6 +21,10 @@ pub struct ApprovalRequest {
     /// Filled by the engine recorder once the persisted turn exists.
     pub turn_id: Option<TurnId>,
     pub call_id: String,
+    /// The delegated agent that made the call, if any. Call ids are local to
+    /// their agent, so this is what makes the pair unique when several
+    /// sub-agents run at once.
+    pub agent_id: Option<String>,
     /// Hash of the exact tool name and arguments; never the raw arguments.
     pub action_fingerprint: String,
     pub tool: String,
@@ -711,6 +715,7 @@ mod tests {
             id: leveler_core::ApprovalId::generate(),
             turn_id: None,
             call_id: "c1".into(),
+            agent_id: None,
             action_fingerprint: "fp".into(),
             tool: "remember".into(),
             risk: RiskLevel::WorkspaceWrite,
@@ -724,6 +729,7 @@ mod tests {
             id: leveler_core::ApprovalId::generate(),
             turn_id: None,
             call_id: "c2".into(),
+            agent_id: None,
             action_fingerprint: "fp2".into(),
             tool: "consolidate_memory".into(),
             risk: RiskLevel::WorkspaceWrite,

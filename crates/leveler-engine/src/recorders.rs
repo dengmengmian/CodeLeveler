@@ -192,6 +192,8 @@ impl Approver for RecordingApprover {
         request.turn_id = Some(self.turn_id.clone());
         self.events.emit(EngineEvent::ApprovalRequested {
             id: request.id.clone(),
+            call_id: Some(request.call_id.clone()),
+            agent_id: request.agent_id.clone(),
             tool: request.tool.clone(),
             summary: request.description.clone(),
             command: request.command.clone(),
@@ -200,6 +202,8 @@ impl Approver for RecordingApprover {
         let decision = self.inner.decide(&request).await;
         self.events.emit(EngineEvent::ApprovalResolved {
             id: request.id.clone(),
+            call_id: Some(request.call_id.clone()),
+            agent_id: request.agent_id.clone(),
             decision: match decision {
                 ApprovalDecision::ApproveOnce => "approve_once".to_string(),
                 ApprovalDecision::ApproveSession => "approve_session".to_string(),
