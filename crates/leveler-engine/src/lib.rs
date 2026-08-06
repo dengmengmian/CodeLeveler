@@ -15,6 +15,7 @@ mod log;
 mod policy_resolver;
 mod reaper;
 mod recorders;
+mod recovery;
 mod session_context;
 mod turn;
 

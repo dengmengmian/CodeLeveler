@@ -307,6 +307,24 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether re-running this call after a crash, with the same arguments, is
+    /// guaranteed to have no external effect beyond what the first (possibly
+    /// completed) attempt already had.
+    ///
+    /// **Defaults to `false`, and that default is the safe one.** Crash
+    /// recovery may auto-replay a tool ONLY when this is `true`; everything
+    /// else stops for human reconciliation.
+    ///
+    /// This is deliberately NOT derived from [`Self::risk`]. `RiskLevel::Safe`
+    /// answers "does this need approval", and it admits side effects:
+    /// `create_checkpoint` resets the rollback baseline and `wait_task` can
+    /// restore a workspace snapshot, yet both are Safe. Replaying either after
+    /// a crash would silently undo work. Only a tool that reads and returns —
+    /// with no write, no process, no external call — may set this.
+    fn replay_is_side_effect_free(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with already-schema-validated arguments.
     async fn execute(
         &self,

@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 
 const HOST_FILE: &str = "executor/host.rs";
 
+/// Crates that must not reach the execution entry outside their declared
+/// boundary. `leveler-engine` is here because it was NOT here before: its
+/// crash-recovery replay called `registry.execute` directly, and a tripwire
+/// that only scanned this crate could never have seen it.
+const ALSO_SCANNED: &[(&str, &str)] = &[("../leveler-engine/src", "recovery.rs")];
+
 /// Patterns that mark the host-only entries. Textual on purpose: cheap,
 /// obvious, and a rename that defeats the pattern will be caught in review
 /// because this file names the contract.
@@ -65,4 +71,36 @@ fn tool_execution_is_confined_to_the_host_boundary() {
         "tool execution/gate entries outside the ToolHost boundary:\n{}",
         violations.join("\n")
     );
+}
+
+/// The engine executes tools in exactly one place: the crash-recovery
+/// reconciliation entry. Anywhere else in the engine reaching
+/// `registry.execute` is a second, ungated execution path — which is what the
+/// original tripwire missed by scanning only this crate.
+#[test]
+fn engine_tool_execution_is_confined_to_its_recovery_entry() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (dir, allowed_file) in ALSO_SCANNED {
+        let root = base.join(dir);
+        if !root.exists() {
+            continue;
+        }
+        let mut files = Vec::new();
+        rust_sources(&root, &mut files);
+        let mut violations = Vec::new();
+        for path in files {
+            if path.file_name().is_some_and(|n| n == *allowed_file) {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("source must be readable");
+            if condensed(&source).contains(&condensed("registry.execute(")) {
+                violations.push(path.display().to_string());
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "tool execution outside {allowed_file}:\n{}",
+            violations.join("\n")
+        );
+    }
 }

@@ -51,6 +51,11 @@ impl Tool for ListFilesTool {
         RiskLevel::Safe
     }
 
+    /// Reads and returns; re-running it after a crash changes nothing.
+    fn replay_is_side_effect_free(&self) -> bool {
+        true
+    }
+
     fn supports_parallel(&self) -> bool {
         true
     }

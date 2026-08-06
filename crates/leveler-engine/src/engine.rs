@@ -27,17 +27,24 @@ use crate::{EngineError, EngineEvent, ExecutionKind, TaskOutcome, TurnKind};
 /// How many verification-repair turns a direct task may spend.
 const DIRECT_REPAIR_ATTEMPTS: u32 = 1;
 
-/// A read-only tool (`RiskLevel::Safe`) is idempotent, so re-running it after a
-/// crash has no external effect; anything that mutates the workspace or runs a
-/// process is not and must not auto-replay.
-fn is_auto_replayable(risk: RiskLevel) -> bool {
-    risk == RiskLevel::Safe
-}
-
-/// Bound a replayed tool's output for the event-log preview (the full result is
-/// not needed here — the model re-drives from the clean turn boundary).
-fn recovery_preview(text: &str) -> String {
-    text.chars().take(200).collect()
+/// Whether a dangling call may be re-run automatically after a crash.
+///
+/// This asks the TOOL, never the risk label. `RiskLevel::Safe` answers "does
+/// this need approval" and it admits side effects — `create_checkpoint` resets
+/// the rollback baseline, `wait_task` can restore a workspace snapshot, and
+/// both are Safe. Deriving replay-safety from risk (as this once did) would
+/// silently undo the user's work during recovery.
+///
+/// A tool this build does not know, or one that never declared itself
+/// replay-safe, is NOT replayed: recovery stops for human reconciliation.
+/// `risk` is still consulted first as a coarse veto so a legacy event with no
+/// persisted risk can never be replayed either.
+fn is_auto_replayable(
+    registry: &leveler_tools::ToolRegistry,
+    name: &str,
+    risk: Option<RiskLevel>,
+) -> bool {
+    matches!(risk, Some(RiskLevel::Safe)) && registry.replay_is_side_effect_free(name)
 }
 
 /// Everything needed to create a task.
@@ -785,7 +792,7 @@ impl TaskEngine {
                 });
             }
 
-            if !matches!(call.risk, Some(r) if is_auto_replayable(r)) {
+            if !is_auto_replayable(&self.factory.registry, &call.name, call.risk) {
                 // Risk classification must precede argument parsing. Corrupt
                 // arguments do not make a mutating/unknown call safe: its side
                 // effect may already have happened before the crash.
@@ -827,20 +834,17 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: &CancellationToken,
     ) -> Result<(), EngineError> {
-        let (is_error, preview) = match self
-            .factory
-            .registry
-            .execute(
-                &call.name,
-                args,
-                self.factory.tool_context.clone(),
-                cancellation.child_token(),
-            )
-            .await
-        {
-            Ok(output) => (output.is_error, recovery_preview(&output.content)),
-            Err(error) => (true, recovery_preview(&error.to_string())),
-        };
+        // Execution during recovery goes through the host's reconciliation
+        // entry, so the engine has exactly one auditable place that runs a
+        // tool (enforced by the ToolHost boundary tripwire).
+        let (is_error, preview) = crate::recovery::replay_tool(
+            &self.factory.registry,
+            self.factory.tool_context.clone(),
+            &call.name,
+            args,
+            cancellation,
+        )
+        .await;
         log.append(
             turn_ref,
             EngineEvent::ToolCallFinished {

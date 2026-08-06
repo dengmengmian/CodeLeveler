@@ -723,3 +723,68 @@ async fn chat_auto_replays_a_safe_dangling_read_tool() {
         "the dangling read must be reconciled with a recorded finish: {events:?}"
     );
 }
+
+/// `RiskLevel::Safe` answers "does this need approval", NOT "is replaying it
+/// harmless". `create_checkpoint` is Safe and resets the rollback baseline;
+/// replaying it after a crash would quietly move the point the user can
+/// return to. Recovery must ask the TOOL, and a tool that never declared
+/// itself replay-safe stops for human reconciliation.
+#[tokio::test]
+async fn a_safe_tool_with_side_effects_is_not_auto_replayed() {
+    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&engine, &session).await;
+    seed_dangling_call(
+        &engine,
+        &session,
+        "create_checkpoint",
+        serde_json::json!({"label": "before the crash"}).to_string(),
+    )
+    .await;
+
+    let err = engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("a Safe-labelled tool with side effects must not auto-replay");
+    assert!(
+        matches!(
+            &err,
+            leveler_engine::EngineError::RecoveryConfirmationRequired { tool, .. }
+                if tool == "create_checkpoint"
+        ),
+        "expected recovery to stop for confirmation, got: {err:?}"
+    );
+}
+
+/// The other half of the same rule: a tool that DOES declare itself
+/// replay-safe still replays, so tightening the gate did not turn recovery
+/// into "always ask".
+#[tokio::test]
+async fn a_declared_replay_safe_tool_still_replays() {
+    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&engine, &session).await;
+    seed_dangling_call(
+        &engine,
+        &session,
+        "read_file",
+        serde_json::json!({"path": "README.md"}).to_string(),
+    )
+    .await;
+
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("a declared replay-safe read must still be reconciled automatically");
+
+    let events = recorded_events(&engine, &session).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EngineEvent::ToolCallFinished { call_id, is_error: false, .. } if call_id == "c1"
+        )),
+        "the safe read must be replayed and recorded: {events:?}"
+    );
+}

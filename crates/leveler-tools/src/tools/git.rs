@@ -64,6 +64,11 @@ impl Tool for GitStatusTool {
     fn risk(&self) -> RiskLevel {
         RiskLevel::Safe
     }
+
+    /// Reads and returns; re-running it after a crash changes nothing.
+    fn replay_is_side_effect_free(&self) -> bool {
+        true
+    }
     async fn execute(
         &self,
         _input: serde_json::Value,
@@ -104,6 +109,11 @@ impl Tool for GitDiffTool {
     }
     fn risk(&self) -> RiskLevel {
         RiskLevel::Safe
+    }
+
+    /// Reads and returns; re-running it after a crash changes nothing.
+    fn replay_is_side_effect_free(&self) -> bool {
+        true
     }
     async fn execute(
         &self,

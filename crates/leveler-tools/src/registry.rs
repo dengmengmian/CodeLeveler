@@ -41,6 +41,16 @@ impl ToolRegistry {
 
     /// Whether `name` is a registered tool that executes a shell command.
     /// See [`Tool::runs_command`]. Unknown names are `false`.
+    /// Whether re-running this tool after a crash is guaranteed to have no
+    /// external effect (see [`Tool::replay_is_side_effect_free`]). An UNKNOWN
+    /// tool answers `false`: recovery must never auto-replay something this
+    /// build cannot ask about.
+    pub fn replay_is_side_effect_free(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .is_some_and(|t| t.replay_is_side_effect_free())
+    }
+
     pub fn runs_command(&self, name: &str) -> bool {
         self.tools.get(name).is_some_and(|t| t.runs_command())
     }

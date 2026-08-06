@@ -49,6 +49,15 @@ impl AdmittedCall {
     }
 }
 
+/// An `ApproveAlways` decision waiting to become a durable permission rule.
+/// Held until the barrier confirms the approval resolution is on disk, so a
+/// crash can never leave a permanent grant that the event log does not explain.
+pub(crate) struct PendingStandingGrant {
+    tool: String,
+    command_line: Option<String>,
+    paths: Vec<String>,
+}
+
 /// Why admission did not produce an [`AdmittedCall`].
 pub(crate) enum AdmitError {
     /// The host refused the call (hook/rule/policy/approval). The loop feeds
@@ -81,8 +90,9 @@ impl Executor {
         {
             return Err(AdmitError::Fatal(error));
         }
+        let mut pending_always: Option<PendingStandingGrant> = None;
         if let Err(reason) = self
-            .authorize_with_cancellation(&call, session_approved, cancellation)
+            .authorize_with_cancellation(&call, session_approved, &mut pending_always, cancellation)
             .await
         {
             return Err(AdmitError::Refused { call, reason });
@@ -98,6 +108,19 @@ impl Executor {
             && let Err(error) = barrier.flush().await
         {
             return Err(AdmitError::Fatal(error));
+        }
+        // The approval outcome is durable now, so a standing "always" grant can
+        // be written without the risk of outliving an unresolved approval in
+        // the log. Parallel-batch calls take the same order: they are
+        // side-effect-free, but the grant is still durable state.
+        if let Some(grant) = pending_always {
+            if parallel
+                && let Some(barrier) = &self.event_barrier
+                && let Err(error) = barrier.flush().await
+            {
+                return Err(AdmitError::Fatal(error));
+            }
+            self.remember_always(&grant.tool, grant.command_line.as_deref(), &grant.paths);
         }
         // Host openers (`open`/`xdg-open`) only work outside seatbelt;
         // elevate after approval (the user already OK'd this call).
@@ -116,6 +139,7 @@ impl Executor {
         &self,
         call: &ToolCall,
         session_approved: &mut HashSet<String>,
+        pending_always: &mut Option<PendingStandingGrant>,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
         let args_json = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
@@ -230,7 +254,17 @@ impl Executor {
                         Ok(())
                     }
                     ApprovalDecision::ApproveAlways => {
-                        self.remember_always(&call.name, command_line.as_deref(), &scoped_paths);
+                        // Do NOT write the standing permission here. The
+                        // decision is only queued for persistence at this
+                        // point; writing a durable rule now means a crash can
+                        // leave a permanent grant in place while the event log
+                        // still shows the approval unresolved. `admit` writes
+                        // it after the barrier confirms the resolution landed.
+                        *pending_always = Some(PendingStandingGrant {
+                            tool: call.name.clone(),
+                            command_line: command_line.clone(),
+                            paths: scoped_paths.clone(),
+                        });
                         // Session grant too: the current action proceeds even
                         // when no durable rule could be persisted.
                         session_approved.insert(signature);
@@ -254,8 +288,21 @@ impl Executor {
         call: &ToolCall,
         session_approved: &mut HashSet<String>,
     ) -> Result<(), String> {
-        self.authorize_with_cancellation(call, session_approved, &CancellationToken::new())
-            .await
+        let mut pending = None;
+        let result = self
+            .authorize_with_cancellation(
+                call,
+                session_approved,
+                &mut pending,
+                &CancellationToken::new(),
+            )
+            .await;
+        // The inline tests assert on the durable rule file, so apply what a
+        // real run would apply after its barrier.
+        if let Some(grant) = pending {
+            self.remember_always(&grant.tool, grant.command_line.as_deref(), &grant.paths);
+        }
+        result
     }
 
     /// Explain a denial that came from a context with no human in it, and — for
