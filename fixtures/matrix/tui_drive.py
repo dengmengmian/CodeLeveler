@@ -24,12 +24,16 @@ import pty
 import re
 import select
 import signal
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import termios
 import time
 
 import pyte
+from wcwidth import wcwidth
 
 ROWS, COLS = 40, 120
 SPINNER = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -166,9 +170,24 @@ class Tui:
         lines = []
         for y in range(self.screen.lines):
             row = self.screen.buffer[y]
-            lines.append(
-                "".join(row[x].data or " " for x in range(self.screen.columns)).rstrip()
-            )
+            out = []
+            skip_next = False
+            for x in range(self.screen.columns):
+                if skip_next:
+                    skip_next = False
+                    continue
+                data = row[x].data
+                if not data:
+                    out.append(" ")
+                    continue
+                out.append(data)
+                # A double-width glyph occupies two cells and pyte leaves the
+                # second one empty. Emitting a space for that continuation
+                # cell turns "测试" into "测 试" and breaks every CJK
+                # assertion — which is exactly what it did.
+                if wcwidth(data[0]) == 2:
+                    skip_next = True
+            lines.append("".join(out).rstrip())
         return lines
 
     def frame_text(self):
@@ -260,8 +279,25 @@ class Tui:
         return [m for m in PANIC_MARKERS if m in text]
 
 
+def assert_disposable(path):
+    """Refuse to drive a workspace that is not a throwaway.
+
+    The agent edits, deletes, and runs commands in here. Pointing that at the
+    fixture corpus itself is how the corpus ends up permanently dirty and the
+    matrix stops being repeatable.
+    """
+    real = os.path.realpath(path)
+    fixtures = os.path.realpath(os.path.join(repo_root(), "fixtures"))
+    if real.startswith(fixtures + os.sep):
+        raise RuntimeError(
+            f"refusing to run against the fixture corpus in place: {real}\n"
+            "cases must run in a disposable workspace (see prepare_workspace)"
+        )
+
+
 def run_project(spec, binary, log_dir, prompts):
     """One project: >= 10 rounds mixing UI interaction and real model turns."""
+    assert_disposable(spec["path"])
     name = spec["name"]
     tui = Tui(spec["path"], binary, log_dir, name).start()
     findings = []
@@ -384,6 +420,77 @@ def run_project(spec, binary, log_dir, prompts):
             "findings": findings, "raw_log": tui.log_path}
 
 
+class Workspace:
+    """A throwaway checkout the agent may freely modify.
+
+    Running against the fixture repositories directly makes the matrix
+    unrepeatable: the second run inherits the first run's edits, and a real
+    upstream corpus ends up permanently dirty. Every case gets its own copy
+    pinned to a fixed ref, and it is discarded afterwards.
+    """
+
+    def __init__(self, path, base_ref, cleanup):
+        self.path = path
+        self.base_ref = base_ref
+        self._cleanup = cleanup
+
+    def discard(self):
+        try:
+            self._cleanup()
+        except Exception as exc:  # cleanup must never mask a real result
+            print(f"    warning: workspace cleanup failed: {exc!r}", flush=True)
+
+
+def _git(args, cwd=None):
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
+    )
+
+
+def prepare_workspace(spec, tmp_root):
+    """Check `spec` out into a disposable workspace and return it.
+
+    Git projects use a detached worktree at a pinned ref, so the base is the
+    same on every run no matter what a previous run left behind. Non-git
+    directories (a deliberate fixture shape) are copied.
+    """
+    source = spec["path"]
+    dest = os.path.join(tmp_root, spec["name"])
+    if os.path.isdir(os.path.join(source, ".git")):
+        requested = spec.get("base_ref", "HEAD")
+        resolved = _git(["rev-parse", requested], cwd=source).stdout.strip()
+        if not resolved:
+            raise RuntimeError(f"{spec['name']}: cannot resolve base ref {requested!r}")
+        added = _git(["worktree", "add", "--detach", dest, resolved], cwd=source)
+        if added.returncode != 0:
+            raise RuntimeError(
+                f"{spec['name']}: git worktree add failed: {added.stderr.strip()}"
+            )
+
+        def cleanup():
+            _git(["worktree", "remove", "--force", dest], cwd=source)
+            _git(["worktree", "prune"], cwd=source)
+
+        return Workspace(dest, resolved, cleanup)
+
+    shutil.copytree(source, dest)
+    return Workspace(dest, "(not version controlled)", lambda: shutil.rmtree(dest, True))
+
+
+def run_metadata(binary):
+    """What a result file needs to be re-checkable later."""
+    root = repo_root()
+    return {
+        "leveler_commit": _git(["rev-parse", "HEAD"], cwd=root).stdout.strip(),
+        "leveler_dirty": bool(_git(["status", "--porcelain"], cwd=root).stdout.strip()),
+        "binary": binary,
+        "binary_version": subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, check=False
+        ).stdout.strip(),
+        "command": " ".join(sys.argv),
+    }
+
+
 def repo_root():
     """The checkout this file lives in — matrix paths are relative to it."""
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -443,23 +550,38 @@ def main():
     matrix = load_matrix(args.matrix, args.only)
 
     results = []
+    meta = run_metadata(args.binary)
+    tmp_root = tempfile.mkdtemp(prefix="leveler-matrix-")
+    print(f"workspaces: {tmp_root}", flush=True)
+    print(f"leveler: {meta['leveler_commit'][:12]}"
+          + ("+dirty" if meta["leveler_dirty"] else "")
+          + f"  binary: {meta['binary_version']}", flush=True)
     for spec in matrix:
         started = time.time()
         print(f"[{len(results)+1}/{len(matrix)}] {spec['name']} ({spec['type']})",
               flush=True)
+        workspace = None
         try:
-            res = run_project(spec, args.binary, args.log_dir, spec["prompts"])
+            workspace = prepare_workspace(spec, tmp_root)
+            isolated = dict(spec, path=workspace.path)
+            res = run_project(isolated, args.binary, args.log_dir, spec["prompts"])
+            res["base_ref"] = workspace.base_ref
         except Exception as e:  # driver bug must not look like a product bug
             res = {"name": spec["name"], "type": spec["type"], "rounds": [],
                    "findings": [{"kind": "driver-error", "detail": repr(e)}]}
+        finally:
+            if workspace is not None:
+                workspace.discard()
         res["seconds"] = round(time.time() - started, 1)
         results.append(res)
         bad = [f for f in res["findings"]]
         print(f"    {res['seconds']}s  rounds={len(res['rounds'])}  findings={len(bad)}"
               + ("  " + "; ".join(f["kind"] for f in bad) if bad else ""), flush=True)
         with open(args.out, "w") as fh:
-            json.dump(results, fh, ensure_ascii=False, indent=2)
+            json.dump({"meta": meta, "results": results}, fh,
+                      ensure_ascii=False, indent=2)
 
+    shutil.rmtree(tmp_root, ignore_errors=True)
     return report(results, len(matrix), min_rounds=10)
 
 

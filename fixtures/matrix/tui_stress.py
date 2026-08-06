@@ -20,11 +20,24 @@ import argparse
 import json
 import os
 import sqlite3
+import shutil
 import sys
+import tempfile
 import time
 import uuid
 
-from tui_drive import COLS, ERROR_MARKERS, PANIC_MARKERS, ROWS, Tui, load_matrix, report
+from tui_drive import (
+    COLS,
+    ERROR_MARKERS,
+    PANIC_MARKERS,
+    ROWS,
+    Tui,
+    assert_disposable,
+    load_matrix,
+    prepare_workspace,
+    report,
+    run_metadata,
+)
 
 
 def state_dir_for(repo):
@@ -94,6 +107,7 @@ def session_facts(repo, session_id, marker=None):
 
 
 def run_project(spec, binary, log_dir):
+    assert_disposable(spec["path"])
     name = spec["name"]
     findings, rounds = [], []
 
@@ -406,22 +420,36 @@ def main():
     matrix = load_matrix(args.matrix, args.only)
 
     results = []
+    meta = run_metadata(args.binary)
+    tmp_root = tempfile.mkdtemp(prefix="leveler-matrix-")
+    print(f"workspaces: {tmp_root}", flush=True)
+    print(f"leveler: {meta['leveler_commit'][:12]}"
+          + ("+dirty" if meta["leveler_dirty"] else "")
+          + f"  binary: {meta['binary_version']}", flush=True)
     for spec in matrix:
         started = time.time()
         print(f"[{len(results)+1}/{len(matrix)}] {spec['name']} ({spec['type']})", flush=True)
+        workspace = None
         try:
-            res = run_project(spec, args.binary, args.log_dir)
+            workspace = prepare_workspace(spec, tmp_root)
+            res = run_project(dict(spec, path=workspace.path), args.binary, args.log_dir)
+            res["base_ref"] = workspace.base_ref
         except Exception as e:
             res = {"name": spec["name"], "type": spec["type"], "rounds": [],
                    "findings": [{"kind": "driver-error", "detail": repr(e)}]}
+        finally:
+            if workspace is not None:
+                workspace.discard()
         res["seconds"] = round(time.time() - started, 1)
         results.append(res)
         bad = res["findings"]
         print(f"    {res['seconds']}s  rounds={len(res['rounds'])}  findings={len(bad)}"
               + ("  " + "; ".join(f["kind"] for f in bad) if bad else ""), flush=True)
         with open(args.out, "w") as fh:
-            json.dump(results, fh, ensure_ascii=False, indent=2)
+            json.dump({"meta": meta, "results": results}, fh,
+                      ensure_ascii=False, indent=2)
 
+    shutil.rmtree(tmp_root, ignore_errors=True)
     return report(results, len(matrix), min_rounds=8)
 
 

@@ -28,6 +28,15 @@ zero exit is the only green.
 `matrix.json` holds paths **relative to the checkout**; the drivers resolve
 them against the repo root, so a fresh clone or CI runs unchanged.
 
+Every case runs in a **disposable workspace**, never in the fixture itself: a
+git project gets a detached worktree pinned to a fixed ref, a non-git directory
+gets a copy, and both are discarded afterwards. `assert_disposable` refuses to
+drive anything under `fixtures/`, because running in place is how the corpus
+ends up permanently dirty and the second run inherits the first one's edits.
+The resolved base ref is recorded per case, and the result file carries the
+leveler commit, whether the tree was dirty, the binary version, and the exact
+command.
+
 ## What is and is not committed
 
 Committed: the two drivers, `matrix.json`, `setup.sh`, this file.
@@ -57,7 +66,12 @@ model never attempted the deletion. Both are recorded as
    drawing a single character.
 2. Assert on the **current frame**. PTY output is cumulative; concatenating it
    mixes in history.
-3. Resize the **emulator** together with the PTY. `pyte`'s `display` calls
+3. Read the frame yourself, and skip a wide glyph's continuation cell. pyte
+   stores a double-width character in one cell and leaves the next empty;
+   emitting a space for it turns `测试` into `测 试` and fails every CJK
+   assertion. (The drivers caught this on themselves — the CJK round went red
+   until it was fixed.)
+4. Resize the **emulator** together with the PTY. `pyte`'s `display` calls
    `wcwidth(char[0])` and raises on the orphaned wide-character cells a CJK
    screen leaves behind after a resize — which reads as a product crash.
 
