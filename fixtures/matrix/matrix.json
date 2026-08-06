@@ -238,5 +238,65 @@
       "工作区当前有未提交改动吗？如实报告。",
       "找出这个项目里最长的一个源文件，说明它的职责。"
     ]
+  },
+  {
+    "name": "ruby-gem",
+    "path": "fixtures/matrix/ruby-gem",
+    "type": "ruby",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "Tokenizer.tokens 对空白和标点的处理有边界问题吗？",
+      "给它加一个最小长度过滤参数并说明改了哪里。"
+    ]
+  },
+  {
+    "name": "php-lib",
+    "path": "fixtures/matrix/php-lib",
+    "type": "php",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "Money::add 的货币校验够不够严？",
+      "给 Money 加一个 subtract 方法。"
+    ]
+  },
+  {
+    "name": "terraform-infra",
+    "path": "fixtures/matrix/terraform-infra",
+    "type": "terraform",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "这个配置有什么可改进的地方？",
+      "把 replicas 提成变量并给默认值。"
+    ]
+  },
+  {
+    "name": "container",
+    "path": "fixtures/matrix/container",
+    "type": "dockerfile",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "这个 Dockerfile 有什么安全或体积问题？",
+      "指出最值得改的一处并改掉。"
+    ]
+  },
+  {
+    "name": "proto-api",
+    "path": "fixtures/matrix/proto-api",
+    "type": "protobuf",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "分页设计合理吗？",
+      "给 Entry 加一个可选的 description 字段，注意字段号。"
+    ]
+  },
+  {
+    "name": "deep-tree",
+    "path": "fixtures/matrix/deep-tree",
+    "type": "deep-paths",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "最深的那个文件在哪？路径是什么？",
+      "在同样深度再建一个文件并列出目录树。"
+    ]
   }
 ]

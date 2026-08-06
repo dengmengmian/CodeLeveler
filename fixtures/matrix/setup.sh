@@ -416,12 +416,157 @@ cat > web/index.html <<'E'
 E
 cd ..
 
+# 13. ruby-gem
+mk ruby-gem && cd ruby-gem
+cat > Gemfile <<'E'
+source "https://rubygems.org"
+gem "rake"
+E
+mkdir -p lib/tokenizer
+cat > lib/tokenizer.rb <<'E'
+# Splits a query string into normalized search tokens.
+module Tokenizer
+  SEPARATORS = /[\s,;]+/.freeze
+
+  def self.tokens(text)
+    return [] if text.nil?
+    text.downcase.split(SEPARATORS).reject(&:empty?).uniq
+  end
+end
+E
+cd ..
+
+# 14. php-composer
+mk php-lib && cd php-lib
+cat > composer.json <<'E'
+{ "name": "example/money", "require": { "php": ">=8.1" }, "autoload": { "psr-4": { "Money\\": "src/" } } }
+E
+mkdir -p src
+cat > src/Money.php <<'E'
+<?php
+declare(strict_types=1);
+
+namespace Money;
+
+/** Integer minor units; never floats. */
+final class Money
+{
+    public function __construct(
+        private readonly int $amountMinor,
+        private readonly string $currency,
+    ) {}
+
+    public function add(Money $other): Money
+    {
+        if ($other->currency !== $this->currency) {
+            throw new \InvalidArgumentException('currency mismatch');
+        }
+        return new Money($this->amountMinor + $other->amountMinor, $this->currency);
+    }
+
+    public function format(): string
+    {
+        return sprintf('%.2f %s', $this->amountMinor / 100, $this->currency);
+    }
+}
+E
+cd ..
+
+# 15. terraform-infra
+mk terraform-infra && cd terraform-infra
+cat > main.tf <<'E'
+terraform {
+  required_version = ">= 1.6"
+}
+
+variable "environment" {
+  type        = string
+  description = "Deployment environment"
+}
+
+resource "local_file" "manifest" {
+  filename = "${path.module}/out/${var.environment}.json"
+  content  = jsonencode({ environment = var.environment, replicas = 3 })
+}
+
+output "manifest_path" {
+  value = local_file.manifest.filename
+}
+E
+cd ..
+
+# 16. dockerfile-only
+mk container && cd container
+cat > Dockerfile <<'E'
+FROM rust:1.90-slim AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/app /usr/local/bin/app
+USER 10001
+ENTRYPOINT ["/usr/local/bin/app"]
+E
+cat > .dockerignore <<'E'
+target/
+.git/
+E
+cd ..
+
+# 17. protobuf-schema
+mk proto-api && cd proto-api
+mkdir -p proto/ledger/v1
+cat > proto/ledger/v1/ledger.proto <<'E'
+syntax = "proto3";
+
+package ledger.v1;
+
+// Amounts are integer minor units.
+message Entry {
+  string id = 1;
+  int64 amount_minor = 2;
+  string currency = 3;
+  int64 created_at_unix = 4;
+}
+
+message ListEntriesRequest {
+  int32 page_size = 1;
+  string after_cursor = 2;
+}
+
+message ListEntriesResponse {
+  repeated Entry entries = 1;
+  string next_cursor = 2;
+}
+
+service Ledger {
+  rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
+}
+E
+cd ..
+
+# 18. deep-nesting (path-handling stress)
+mk deep-tree && cd deep-tree
+mkdir -p a/b/c/d/e/f/g/h
+cat > a/b/c/d/e/f/g/h/leaf.txt <<'E'
+The file at the bottom of a deliberately deep path.
+E
+cat > README.md <<'E'
+# deep-tree
+
+A deliberately deep directory, for exercising path handling and listing.
+E
+cd ..
+
 # Deterministic git baseline: every project starts committed, EXCEPT the two
 # that deliberately are not (a non-git directory and a dirty worktree). A
 # fixture whose baseline depends on what a previous run left behind is not a
 # fixture.
 for d in py-lib c-lib shell-tools docs-site infra-config java-lib red-repo \
-         monorepo empty-repo sql-warehouse polyglot; do
+         monorepo empty-repo sql-warehouse polyglot ruby-gem php-lib \
+         terraform-infra container proto-api deep-tree; do
   (
     cd "$ROOT/$d"
     rm -rf .git
