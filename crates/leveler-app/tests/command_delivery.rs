@@ -690,3 +690,68 @@ async fn a_new_session_leaves_the_previous_one_intact() {
 
     settle_background_turns(&app, &client, &[&session_id]).await;
 }
+
+/// `/clear` opens a new session for the tab that asked, and only for that tab.
+///
+/// The web serves every tab from one process. Its client adopts "the next
+/// snapshot with a different id" while waiting for its own new session, so if
+/// another tab's `NewSessionFor` reached this tab's stream, the two would swap
+/// conversations mid-click. The routing that prevents it is the requester's
+/// own event channel — this pins that, since the client-side rule has no
+/// correlation of its own to fall back on.
+#[tokio::test]
+async fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
+    let (_tmp, app, client, _existing) = build_client().await;
+    let onlooker = client
+        .create_session(CreateSessionRequest {
+            goal: "onlooker".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let requester = client
+        .create_session(CreateSessionRequest {
+            goal: "requester".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+
+    let mut onlooker_events = client.subscribe_session(&onlooker.session.id);
+    let mut requester_events = client.subscribe_session(&requester.session.id);
+
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: requester.session.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(RuntimeEvent::SessionOpened { session }) = requester_events.recv().await {
+                return session;
+            }
+        }
+    })
+    .await
+    .expect("the requester must be handed its new session");
+    assert_ne!(opened.id, requester.session.id);
+
+    // The onlooker may see cross-session facts (a refreshed session list); what
+    // it must never see is somebody else's new session, because that is the one
+    // event its client would switch to.
+    while let Ok(event) = onlooker_events.try_recv() {
+        if let RuntimeEvent::SessionOpened { session } = event {
+            assert_ne!(
+                session.id, opened.id,
+                "another tab's /clear reached this session's stream; the two \
+                 tabs would swap conversations"
+            );
+        }
+    }
+
+    settle_background_turns(&app, &client, &[]).await;
+}

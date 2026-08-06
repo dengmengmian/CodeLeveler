@@ -86,7 +86,10 @@ export class RuntimeBridge {
     // 例外一是 selectSession 后等待目标会话 snapshot 的窗口期；
     // 例外二是 `/clear`：宿主刚建的新会话 id 与当前不同，正是要切过去的那个。
     if (current && current.id !== snap.id) {
-      if (!this.awaitingNewSession) return;
+      // 只接受 `/clear` 真正在等的那一个：宿主刚建的会话必然是空的。
+      // 若换成"下一个不同 id 就采纳"，一旦 new_session_for 失败，这个标志
+      // 会一直举着，把之后任意一个无关快照当成自己的新会话切过去。
+      if (!this.awaitingNewSession || snap.messages.length > 0) return;
       this.awaitingNewSession = false;
       this.dispatch({ type: 'select_session', id: snap.id });
       this.ws.setSession(snap.id);

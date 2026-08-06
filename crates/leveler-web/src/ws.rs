@@ -72,12 +72,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, session: Option<Strin
     let (outgoing, outgoing_rx) = mpsc::channel::<DownstreamMessage>(64);
     let (switch_tx, switch_rx) = mpsc::channel::<SessionSwitch>(4);
     let events = state.service.subscribe();
-    // Aggregation mode: session events come from a dedicated per-session
-    // stream (the global stream carries only cross-project facts).
-    let session_events = match (&state.multi, &session) {
-        (Some(_), Some(id)) => Some(state.service.subscribe_session(&SessionId::new(id))),
-        _ => None,
-    };
+    // A connection bound to a session takes its session events from that
+    // session's own stream, in every mode. The aggregating router already
+    // strips session events from the global stream; a single-project runtime
+    // does not, and handing the tab that undivided stream let another tab's
+    // `session_opened` land here — which the browser client, while waiting for
+    // its own `/clear`, adopts. Runtimes with no per-session routing fall back
+    // to the global stream, so this is never a loss of events.
+    let session_events = session
+        .as_ref()
+        .map(|id| state.service.subscribe_session(&SessionId::new(id)));
     let statuses = state
         .multi
         .as_ref()
@@ -166,6 +170,12 @@ async fn write_loop(
                 }
             }
             event = events.recv() => match event {
+                // Exactly one stream is authoritative for session events: the
+                // per-session one. Once it exists, the global stream
+                // contributes only the cross-project facts — the complement of
+                // the filter on the session arm below.
+                Ok(event) if session_events.is_some()
+                    && !matches!(event, RuntimeEvent::SessionList { .. } | RuntimeEvent::RuntimeReady) => {}
                 Ok(event) => {
                     if send_frame(&mut sink, &DownstreamMessage::Event { event })
                         .await

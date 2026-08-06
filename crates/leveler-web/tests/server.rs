@@ -28,13 +28,33 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 /// drive session creation, commands, snapshots, and events deterministically.
 struct TestService {
     mock: MockRuntimeClient,
+    /// Per-session streams, as a daemon-capable runtime provides. The mock's
+    /// own stream is global; without these, a test cannot tell a correctly
+    /// routed event from one that merely arrived.
+    session_events:
+        std::sync::Mutex<std::collections::HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>,
 }
 
 impl TestService {
     fn new() -> Self {
         Self {
             mock: MockRuntimeClient::new(SessionId::new("s1")),
+            session_events: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn session_sender(&self, session_id: &SessionId) -> broadcast::Sender<RuntimeEvent> {
+        self.session_events
+            .lock()
+            .unwrap()
+            .entry(session_id.clone())
+            .or_insert_with(|| broadcast::channel(64).0)
+            .clone()
+    }
+
+    /// Emit on one session's stream, the way a daemon routes a session event.
+    fn emit_for(&self, session_id: &SessionId, event: RuntimeEvent) {
+        let _ = self.session_sender(session_id).send(event);
     }
 }
 
@@ -46,6 +66,10 @@ impl InteractiveRuntimeClient for TestService {
 
     fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
         self.mock.subscribe()
+    }
+
+    fn subscribe_session(&self, session_id: &SessionId) -> broadcast::Receiver<RuntimeEvent> {
+        self.session_sender(session_id).subscribe()
     }
 
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
@@ -271,11 +295,16 @@ async fn ws_pushes_snapshot_then_acks_and_forwards_events() {
         matches!(&commands[0], ClientCommand::SubmitMessage { content, .. } if content == "你好")
     );
 
-    // An event emitted by the runtime arrives as an event frame.
-    server.service.mock.emit(RuntimeEvent::Notification {
-        level: NotificationLevel::Info,
-        message: "hi".to_string(),
-    });
+    // An event emitted by the runtime arrives as an event frame. It goes on
+    // the session's own stream because that is where a routed runtime puts a
+    // session event; the global stream carries cross-project facts only.
+    server.service.emit_for(
+        &SessionId::new("s1"),
+        RuntimeEvent::Notification {
+            level: NotificationLevel::Info,
+            message: "hi".to_string(),
+        },
+    );
     let event = next_json(&mut socket).await;
     assert_eq!(
         event,
@@ -1073,4 +1102,59 @@ async fn attachments_reject_windows_junction_upload_parent() {
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+/// A socket bound to one session must not be fed another session's events.
+///
+/// The browser client adopts "the next snapshot with a different id" while it
+/// waits for its own `/clear` to land, so a foreign `session_opened` on this
+/// socket would silently move the tab into somebody else's conversation. The
+/// aggregating server already routes per session; this pins the same rule for
+/// the single-project entry point, which used to hand the tab the runtime's
+/// undivided global stream.
+#[tokio::test]
+async fn ws_does_not_forward_another_session_s_events() {
+    let server = TestServer::start().await;
+    let (mut socket, _) =
+        connect_async(format!("ws://{}/ws?session=s1&token={TOKEN}", server.addr))
+            .await
+            .unwrap();
+    assert_eq!(next_json(&mut socket).await["type"], "snapshot");
+
+    // Another tab's session opens. It is broadcast the way an in-process
+    // runtime broadcasts: on the global stream as well as its own.
+    let foreign = UiSessionSnapshot {
+        id: SessionId::new("s2"),
+        ..server
+            .service
+            .mock
+            .snapshot(&SessionId::new("s1"))
+            .await
+            .unwrap()
+    };
+    server.service.mock.emit(RuntimeEvent::SessionOpened {
+        session: foreign.clone(),
+    });
+    server.service.emit_for(
+        &SessionId::new("s2"),
+        RuntimeEvent::SessionOpened { session: foreign },
+    );
+
+    // This session's own event is the one that must arrive — and arrive first,
+    // which is what makes the absence of the foreign one meaningful rather
+    // than a race with a frame still in flight.
+    server.service.emit_for(
+        &SessionId::new("s1"),
+        RuntimeEvent::Notification {
+            level: NotificationLevel::Info,
+            message: "mine".to_string(),
+        },
+    );
+
+    let frame = next_json(&mut socket).await;
+    assert_eq!(
+        frame["event"]["type"], "notification",
+        "the tab was handed another session's event: {frame}"
+    );
+    assert_eq!(frame["event"]["message"], "mine");
 }
