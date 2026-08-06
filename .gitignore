@@ -50,7 +50,20 @@ crates/leveler-execution/leveler-tool-cache/
 leveler-chat-*.md
 
 # Local per-session test scratch dir
-fixtures/
+# Ignore the CONTENTS, not the directory: git cannot re-include a file from
+# inside a wholesale-excluded directory, and the matrix harness has to be
+# reproducible from a fresh clone.
+fixtures/*
+!fixtures/matrix/
+fixtures/matrix/*
+# The harness itself: drivers, the relative-path matrix, the fixture
+# generator. Everything they produce — generated projects, cloned repos, run
+# artefacts — stays ignored.
+!fixtures/matrix/tui_drive.py
+!fixtures/matrix/tui_stress.py
+!fixtures/matrix/matrix.json
+!fixtures/matrix/setup.sh
+!fixtures/matrix/README.md
 
 # Screenshot runs (scripts/screenshots.sh writes wherever it is told; this is
 # the default place I point it at when looking at the app).

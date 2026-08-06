@@ -1,0 +1,322 @@
+[
+  {
+    "name": "ripgrep",
+    "path": "fixtures/repos/ripgrep",
+    "type": "rust-large",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "grep 一下 ignore 规则的实现在哪个 crate，说明分层。",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "rust-csv",
+    "path": "fixtures/repos/rust-csv",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "这个库怎么处理带引号的换行？指出具体代码位置。",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "rust-semver",
+    "path": "fixtures/repos/rust-semver",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "版本号比较的核心函数是哪个？",
+      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
+    ]
+  },
+  {
+    "name": "rust-httparse",
+    "path": "fixtures/repos/rust-httparse",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "它是如何避免分配的？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "rust-similar",
+    "path": "fixtures/repos/rust-similar",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "diff 算法用的是哪一种？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "hard-anyhow",
+    "path": "fixtures/repos/hard-anyhow",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "错误链是怎么串起来的？",
+      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
+    ]
+  },
+  {
+    "name": "hard-bitflags",
+    "path": "fixtures/repos/hard-bitflags",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "宏展开后生成了什么？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "hard-http",
+    "path": "fixtures/repos/hard-http",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "HeaderMap 的存储结构是什么？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "hard-indexmap",
+    "path": "fixtures/repos/hard-indexmap",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "它如何同时保证顺序和 O(1) 查找？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "hard-slab",
+    "path": "fixtures/repos/hard-slab",
+    "type": "rust",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "空闲槽位是怎么复用的？",
+      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
+    ]
+  },
+  {
+    "name": "mux",
+    "path": "fixtures/repos/mux",
+    "type": "go",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "路由匹配的优先级规则是什么？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "jwt",
+    "path": "fixtures/repos/jwt",
+    "type": "go",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "签名校验在哪里做的？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "decimal",
+    "path": "fixtures/repos/decimal",
+    "type": "go",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "它如何避免浮点误差？",
+      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
+    ]
+  },
+  {
+    "name": "go-humanize",
+    "path": "fixtures/repos/go-humanize",
+    "type": "go",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "时间格式化支持哪些语言？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "hard-semver",
+    "path": "fixtures/repos/hard-semver",
+    "type": "go",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "预发布版本怎么排序？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "commander",
+    "path": "fixtures/repos/commander",
+    "type": "node",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "子命令是怎么注册的？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "ms",
+    "path": "fixtures/repos/ms",
+    "type": "node",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "解析 '2 days' 的正则在哪？",
+      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
+    ]
+  },
+  {
+    "name": "negotiator",
+    "path": "fixtures/repos/negotiator",
+    "type": "node",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "Accept 头的权重怎么算？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "hard-qs",
+    "path": "fixtures/repos/hard-qs",
+    "type": "node",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "嵌套对象的解析深度有限制吗？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "hard-picomatch",
+    "path": "fixtures/repos/hard-picomatch",
+    "type": "node",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "glob 转正则的核心函数是哪个？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "py-lib",
+    "path": "fixtures/matrix/py-lib",
+    "type": "python",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "给 slugify 加一个 max_length 参数并写测试。",
+      "跑一下测试看是否通过。"
+    ]
+  },
+  {
+    "name": "c-lib",
+    "path": "fixtures/matrix/c-lib",
+    "type": "c",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "ring_push 在满的时候行为对吗？",
+      "用 make test 验证一下。"
+    ]
+  },
+  {
+    "name": "shell-tools",
+    "path": "fixtures/matrix/shell-tools",
+    "type": "shell",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "backup.sh 有什么边界问题？",
+      "在 README 里追加一节 ## Notes，写一句这个项目的构建方式。改完告诉我改了哪个文件。"
+    ]
+  },
+  {
+    "name": "docs-site",
+    "path": "fixtures/matrix/docs-site",
+    "type": "docs-only",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "文档里有没有前后矛盾的地方？",
+      "给 docs/entries.md 补一个错误码表格。"
+    ]
+  },
+  {
+    "name": "infra-config",
+    "path": "fixtures/matrix/infra-config",
+    "type": "yaml-infra",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "生产环境副本数和资源配额合理吗？",
+      "把 api 服务加一个 healthcheck。"
+    ]
+  },
+  {
+    "name": "java-lib",
+    "path": "fixtures/matrix/java-lib",
+    "type": "java",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "Retry 的退避算法有什么问题？",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  },
+  {
+    "name": "red-repo",
+    "path": "fixtures/matrix/red-repo",
+    "type": "rust-red",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "跑一下 cargo test，如实报告结果。",
+      "这个失败的测试是我之前就有的，不要改它，只在 README 记一句。"
+    ]
+  },
+  {
+    "name": "monorepo",
+    "path": "fixtures/matrix/monorepo",
+    "type": "node-mono",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "parseDuration 有什么 bug？",
+      "修掉它并说明。"
+    ]
+  },
+  {
+    "name": "empty-repo",
+    "path": "fixtures/matrix/empty-repo",
+    "type": "empty",
+    "prompts": [
+      "这个仓库是空的吗？如实说明你看到了什么。",
+      "建一个最小的 Python 项目骨架。",
+      "列一下你创建的文件。"
+    ]
+  },
+  {
+    "name": "nogit-notes",
+    "path": "fixtures/matrix/nogit-notes",
+    "type": "non-git",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "data.csv 里那条跨行记录会怎么被解析？",
+      "写一个能正确解析它的 Python 脚本。"
+    ]
+  },
+  {
+    "name": "sql-warehouse",
+    "path": "fixtures/matrix/sql-warehouse",
+    "type": "sql",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "orders.sql 的 group by 有问题吗？",
+      "给 customers.sql 加一个复购率字段。"
+    ]
+  },
+  {
+    "name": "polyglot",
+    "path": "fixtures/matrix/polyglot",
+    "type": "polyglot-dirty",
+    "prompts": [
+      "这个仓库是做什么的？看一眼目录结构和主要入口，用三句话说明。",
+      "工作区当前有未提交改动吗？如实报告。",
+      "找出这个项目里最长的一个源文件，说明它的职责。"
+    ]
+  }
+]
