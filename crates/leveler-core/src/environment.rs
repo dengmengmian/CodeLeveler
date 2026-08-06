@@ -158,6 +158,29 @@ pub fn git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run a `git diff` that is expected to report differences, and return its
+/// stdout.
+///
+/// `git diff --no-index` (and `--exit-code`) signal "the files differ" with
+/// exit status 1, which [`git_stdout`] cannot distinguish from a real failure
+/// — it would throw away the diff it just produced. Status 1 is a result here;
+/// anything above it is still an error. Same credential scrubbing as
+/// [`git_stdout`].
+pub fn git_diff_stdout(repo: &Path, args: &[&str]) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .args(args)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .env_clear()
+        .envs(scrubbed_environment());
+    let out = command.output().ok()?;
+    match out.status.code() {
+        Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => None,
+    }
+}
+
 static ENVIRONMENT: OnceLock<EnvSnapshot> = OnceLock::new();
 
 /// Install the process-wide snapshot. The composition root calls this once,

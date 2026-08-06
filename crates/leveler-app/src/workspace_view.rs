@@ -4,9 +4,12 @@ use leveler_client_protocol::{UiDiff, UiDiffFile};
 
 /// Compute the working-tree diff vs HEAD via git — staged AND unstaged, the
 /// same yardstick as the web Git panel, so the two views never contradict.
-/// `with_patch` also loads each file's unified diff hunk. Untracked new files
-/// are not listed (they are absent from `git diff`); this is a known
-/// limitation of the summary.
+/// `with_patch` also loads each file's unified diff hunk.
+///
+/// Untracked files are included as whole-file additions. `git diff` cannot see
+/// them, and leaving them out made the review surface report 无改动 right after
+/// the agent created a file — the single most common thing it does. Ignored
+/// paths stay out: they are not review material.
 pub(crate) fn compute_diff(repo: &Path, with_patch: bool) -> UiDiff {
     let numstat =
         leveler_core::git_stdout(repo, &["diff", "--numstat", "HEAD", "--"]).unwrap_or_default();
@@ -28,7 +31,51 @@ pub(crate) fn compute_diff(repo: &Path, with_patch: bool) -> UiDiff {
             });
         }
     }
+    files.extend(untracked_files(repo, with_patch));
     UiDiff { files }
+}
+
+/// New files the user has not staged yet, rendered as additions.
+///
+/// `--exclude-standard` applies .gitignore; `-z` keeps paths with spaces or
+/// newlines intact instead of splitting them into phantom entries.
+fn untracked_files(repo: &Path, with_patch: bool) -> Vec<UiDiffFile> {
+    let listing =
+        leveler_core::git_stdout(repo, &["ls-files", "--others", "--exclude-standard", "-z"])
+            .unwrap_or_default();
+
+    listing
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            // `--no-index` against /dev/null is how git itself renders a
+            // file with no index entry. It exits 1 for "differs", so this must
+            // go through the diff-aware runner or the output is discarded.
+            let patch = leveler_core::git_diff_stdout(
+                repo,
+                &["diff", "--no-index", "--numstat", "--", "/dev/null", path],
+            )
+            .unwrap_or_default();
+            let added = patch
+                .lines()
+                .next()
+                .and_then(|line| line.split('\t').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            UiDiffFile {
+                path: path.to_string(),
+                added,
+                removed: 0,
+                patch: with_patch.then(|| {
+                    leveler_core::git_diff_stdout(
+                        repo,
+                        &["diff", "--no-index", "--", "/dev/null", path],
+                    )
+                    .unwrap_or_default()
+                }),
+            }
+        })
+        .collect()
 }
 
 /// Current branch label for the TUI header (`main`, `main*` when dirty, or
@@ -114,6 +161,56 @@ mod tests {
                 .is_some_and(|p| p.contains("+two")),
             "patch must carry the staged hunk: {:?}",
             diff.files[0].patch
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Creating a file is the most common thing the agent does, and `git diff`
+    /// does not see untracked paths — so the review surface said 无改动 while
+    /// the agent's whole output sat in the working tree. Anything the user
+    /// would have to review must be listed.
+    #[test]
+    fn compute_diff_includes_untracked_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-diff-untracked-{}",
+            std::process::id() as u64 * 271 + 13
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
+        git(&dir, &["add", ".gitignore"]);
+        git(&dir, &["commit", "-q", "-m", "ignore"]);
+
+        std::fs::write(dir.join("NOTES.md"), "line one\nline two\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"), "noise\n").unwrap();
+
+        let diff = compute_diff(&dir, true);
+        let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            paths.contains(&"NOTES.md"),
+            "a new untracked file must be listed: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"ignored.txt"),
+            "gitignored paths are not review material: {paths:?}"
+        );
+
+        let notes = diff.files.iter().find(|f| f.path == "NOTES.md").unwrap();
+        assert_eq!(notes.added, 2, "every line of a new file is an addition");
+        assert_eq!(notes.removed, 0);
+        assert!(
+            notes
+                .patch
+                .as_deref()
+                .is_some_and(|p| p.contains("+line one") && p.contains("+line two")),
+            "patch must carry the new file's contents: {:?}",
+            notes.patch
         );
 
         std::fs::remove_dir_all(&dir).ok();

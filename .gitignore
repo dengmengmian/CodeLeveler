@@ -61,6 +61,7 @@ fixtures/matrix/*
 # artefacts — stays ignored.
 !fixtures/matrix/tui_drive.py
 !fixtures/matrix/tui_stress.py
+!fixtures/matrix/tui_forty.py
 !fixtures/matrix/matrix.json
 !fixtures/matrix/setup.sh
 !fixtures/matrix/README.md

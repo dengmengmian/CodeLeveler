@@ -15,8 +15,8 @@ pub mod time;
 
 pub use budget::ResourceBudget;
 pub use environment::{
-    EnvSnapshot, environment, git_stdout, install_environment, is_credential_env_name,
-    leveler_home_dir, leveler_home_dir_from, scrubbed_environment,
+    EnvSnapshot, environment, git_diff_stdout, git_stdout, install_environment,
+    is_credential_env_name, leveler_home_dir, leveler_home_dir_from, scrubbed_environment,
 };
 pub use ids::{
     ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, RequestId,
