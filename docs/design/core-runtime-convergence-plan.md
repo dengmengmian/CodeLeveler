@@ -373,12 +373,21 @@
 >   （`zombie_turns`、reaper、Linux PDEATHSIG）；事件缓冲过载显式失败
 >   （recorders 3 例）；确定性短 soak（`tui_path_soak`）在 CI 每次运行。
 >
+> - **跨端接力（基线 R8）已完成**：
+>   `crates/leveler-app/tests/cross_client_relay.rs` 三例——客户端消失后
+>   任务自行跑到终态并由下一个客户端从快照原样接手、双客户端同流不分叉、
+>   接力后重发同一 command envelope 只执行一次。
+> - **真实项目 TUI 矩阵（压缩版 soak）已完成**：驱动与用例见
+>   `fixtures/matrix/`（gitignored），方法学与结论见
+>   [`tui-matrix-soak.md`](tui-matrix-soak.md)。
+>
 > **环境受限，未完成（发布前必须补，不得以本清单替代）：**
 >
-> - ≥24 小时确定性长稳 soak（墙钟不可压缩；资源增长阈值待 soak 数据）。
+> - ≥24 小时连续长稳 soak。本次以「32 个真实项目 × 多轮真实模型回合 +
+>   对抗轮」的压缩矩阵替代，能覆盖功能与崩溃面，但**不能替代**长时程
+>   资源增长观测（内存/句柄/数据库增长阈值仍待真正的 24h 数据）。
 > - 手机端真机验收（iOS 签名/Android SDK/蜂窝网络，见
 >   [`phase1-acceptance-checklist.md`](phase1-acceptance-checklist.md)）。
-> - TUI→Web→手机同 session 跨端接力的单场景自动化（基线 R8）。
 > - Windows/Linux 全平台矩阵在 CI 之外的实机复核。
 
 工作：

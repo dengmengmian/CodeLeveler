@@ -6029,3 +6029,58 @@ async fn minimal_policy_keeps_the_admission_boundary() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A real TUI run under the "auto" (Assisted) profile deleted a file with no
+/// approval prompt. The classifier and `ApprovalPolicy::evaluate` both say a
+/// deletion must be gated there, so this drives the REAL executor to find out
+/// which layer actually decides — and to keep it decided.
+#[tokio::test]
+async fn assisted_gates_a_shell_deletion_before_it_runs() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-assisted-rm-{}",
+        std::process::id() as u64 * 13 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let canary = dir.join("CANARY.txt");
+    std::fs::write(&canary, "must survive a denied deletion\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    // The profile the TUI shows as `auto`.
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "shell_command",
+            serde_json::json!({"cmd": "rm CANARY.txt && ls -la"}),
+        ),
+        assistant_text("understood"),
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
+
+    let mut events = Vec::new();
+    executor
+        .run(
+            "clean up",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        canary.exists(),
+        "assisted must ask before a deletion; a denied `rm` still removed the file"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

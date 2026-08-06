@@ -241,3 +241,125 @@ fn sandbox_first_verdicts() {
     assert_eq!(classify("npm", &["publish"]), CommandClass::Safe);
     assert_eq!(classify("open", &["index.html"]), CommandClass::Dangerous);
 }
+
+// ── Assisted must gate a deletion however it is spelled ─────────────────────
+//
+// Assisted's contract is "read/write/network/shell run themselves; deletion,
+// privilege escalation, and opening external apps ask". A real TUI run found
+// `rm FILE && ls -la` executing with no approval overlay while a bare `rm
+// FILE` raised one, so these pin the classification for every spelling a
+// model actually produces.
+
+#[test]
+fn a_bare_deletion_is_destructive() {
+    assert!(leveler_execution::command_is_destructive(
+        &leveler_execution::CommandView {
+            program: "rm",
+            args: &["scratch.txt".to_string()],
+        }
+    ));
+}
+
+#[test]
+fn a_deletion_joined_to_another_command_is_still_destructive() {
+    for script in [
+        "rm scratch.txt && ls -la",
+        "ls -la && rm scratch.txt",
+        "rm scratch.txt; echo done",
+        "echo start; rm -rf build",
+        "true || rm scratch.txt",
+        "rm scratch.txt | cat",
+    ] {
+        assert!(
+            leveler_execution::command_is_destructive(&leveler_execution::CommandView {
+                program: "sh",
+                args: &["-c".to_string(), script.to_string()],
+            }),
+            "a deletion hidden in `{script}` must still read as destructive"
+        );
+    }
+}
+
+#[test]
+fn a_shell_command_without_a_deletion_is_not_destructive() {
+    for script in ["ls -la && git status", "echo rm is only a word"] {
+        assert!(
+            !leveler_execution::command_is_destructive(&leveler_execution::CommandView {
+                program: "sh",
+                args: &["-c".to_string(), script.to_string()],
+            }),
+            "`{script}` deletes nothing and must not be labelled destructive"
+        );
+    }
+}
+
+/// The decisive question behind the deletion tests above: under **Assisted**
+/// ("only deletion, privilege escalation, and host escape ask"), does a
+/// deletion actually reach the human however the model spells it?
+///
+/// `classify_command` — not `command_is_destructive` — is what
+/// `ApprovalPolicy::evaluate` consults for a command tool, so this asserts the
+/// real admission decision end to end.
+#[test]
+fn assisted_requires_approval_for_a_deletion_in_any_spelling() {
+    use leveler_execution::{ApprovalPolicy, PermissionProfile, Requirement, RiskLevel};
+
+    let policy = ApprovalPolicy::default();
+    for (program, args) in [
+        ("rm", vec!["scratch.txt"]),
+        ("rm", vec!["-rf", "build"]),
+        ("sh", vec!["-c", "rm scratch.txt && ls -la"]),
+        ("sh", vec!["-c", "ls -la && rm scratch.txt"]),
+        ("sh", vec!["-c", "rm scratch.txt; echo done"]),
+        ("bash", vec!["-c", "true || rm scratch.txt"]),
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let view = CommandView {
+            program,
+            args: &owned,
+        };
+        let requirement = policy.evaluate(
+            PermissionProfile::Assisted,
+            "shell_command",
+            RiskLevel::WorkspaceWrite,
+            Some(view),
+        );
+        assert_eq!(
+            requirement,
+            Requirement::NeedApproval,
+            "assisted must ask before `{program} {}` deletes anything",
+            args.join(" ")
+        );
+    }
+}
+
+/// The same profile must NOT prompt for ordinary work, or the mode is just
+/// request-approval with extra steps.
+#[test]
+fn assisted_still_auto_runs_ordinary_commands() {
+    use leveler_execution::{ApprovalPolicy, PermissionProfile, Requirement, RiskLevel};
+
+    let policy = ApprovalPolicy::default();
+    for (program, args) in [
+        ("cargo", vec!["test"]),
+        ("sh", vec!["-c", "ls -la && git status"]),
+        ("git", vec!["push"]),
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let requirement = policy.evaluate(
+            PermissionProfile::Assisted,
+            "shell_command",
+            RiskLevel::WorkspaceWrite,
+            Some(CommandView {
+                program,
+                args: &owned,
+            }),
+        );
+        assert_eq!(
+            requirement,
+            Requirement::Auto,
+            "assisted must not prompt for `{program} {}`",
+            args.join(" ")
+        );
+    }
+}
