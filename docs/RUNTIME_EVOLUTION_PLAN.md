@@ -1117,6 +1117,17 @@ and runtime process restart produces explicit resume/recovery behavior rather th
 
 # 13. Core Stability Gate
 
+> Status: **PASSED 2026-08-07** (see the gate report). Decisions recorded:
+> the local daemon is persistent until explicit runtime shutdown (no idle
+> exit; any future idle policy must never exit during an active turn,
+> unresolved approval/clarification, pending crash reconciliation, or
+> recovery). Daemon loss under a live client heals via the client-side
+> RuntimeReviver (discover-or-start; same durable RuntimeId; fresh
+> OwnerEpoch inside the daemon). Runtime health (accepting/active/
+> capacity/shutting_down) is additive RuntimeInfo and is never authority.
+> Windows durable daemon transport = DEFERRED (embedded mode remains; not
+> a Unix gate blocker).
+
 This gate separates **Core Architecture Work** from **Product Expansion Work**.
 
 The following must be stable enough before Cloud/Scheduler/NPC becomes the main line:

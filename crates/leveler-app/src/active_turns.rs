@@ -29,6 +29,17 @@ impl Default for ActiveTurns {
 }
 
 impl ActiveTurns {
+    /// `(active main turns, admission capacity)` — the real limit `admit`
+    /// enforces, surfaced for runtime health.
+    pub(crate) fn load(&self) -> (usize, usize) {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        (active, self.capacity)
+    }
+
     pub(crate) fn admit(
         &self,
         session_id: &SessionId,

@@ -174,6 +174,9 @@ pub struct InProcessRuntimeClient {
     live_views: Arc<Mutex<HashMap<SessionId, LiveSessionView>>>,
     /// Per-session ownership and cancellation of active main turns.
     active: Arc<ActiveTurns>,
+    /// Set when the runtime owner begins an explicit shutdown (Quit);
+    /// reported in health and never bypasses ownership fencing.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Text the user sent while a turn was already running, per session.
     /// Drained by the agent loop at the top of each round.
     steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
@@ -305,6 +308,7 @@ impl InProcessRuntimeClient {
             checkpoint_snapshots: Arc::new(Mutex::new(HashMap::new())),
             live_views: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(ActiveTurns::default()),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1775,6 +1779,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 Ok(())
             }
             ClientCommand::Quit => {
+                self.shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 self.active.cancel_all();
                 // Process is exiting: reaper is the safety net for turns that
                 // never got finish() because the OS killed the process mid-flight.
@@ -2108,10 +2114,20 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             .app
             .runtime_id()
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let (active, capacity) = self.active.load();
+        let shutting_down = self.shutting_down.load(std::sync::atomic::Ordering::SeqCst);
         Ok(leveler_client_protocol::RuntimeInfo {
             runtime_id,
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
+            health: leveler_client_protocol::RuntimeHealth {
+                // Health is admission state, never authority: task writes
+                // still require a current OwnershipToken regardless.
+                accepting_work: !shutting_down && active < capacity,
+                active_turns: active as u32,
+                turn_capacity: Some(capacity as u32),
+                shutting_down,
+            },
         })
     }
 }
