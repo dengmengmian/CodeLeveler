@@ -6,16 +6,13 @@
 //! client reloads from a fresh snapshot after reconnect, so canonical state is
 //! never silently skipped.
 //!
-//! Event routing depends on the server mode:
-//! - **Single-project** (`--connect` bridge, embedding, tests): the global
-//!   stream carries everything; it is forwarded wholesale — the historical
-//!   behavior, unchanged.
-//! - **Aggregation** (multi-project): the router's global stream carries only
-//!   cross-project facts (merged session lists, readiness). Session-internal
-//!   events flow through a per-connection `subscribe_session` that follows
-//!   the tab's active session, so two tabs on different sessions or projects
-//!   never see each other's traffic. Project daemon state changes arrive as
-//!   `project_status` frames.
+//! Event routing has one rule in both server modes: session-internal events
+//! come from the connection's `subscribe_session` stream, while the global
+//! stream contributes cross-session facts (session lists and readiness).
+//! Aggregation mode additionally carries project daemon state as
+//! `project_status` frames. Keeping the rule mode-independent prevents one tab
+//! from receiving another tab's session events through a single-project or
+//! `--connect` bridge.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, RawQuery, State};

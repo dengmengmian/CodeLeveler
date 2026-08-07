@@ -765,8 +765,22 @@ impl InteractiveRuntimeClient for DaemonService {
         self.0.send(command).await
     }
 
+    async fn deliver(
+        &self,
+        envelope: leveler_client_protocol::CommandEnvelope,
+    ) -> Result<(), leveler_client_protocol::ClientError> {
+        self.0.deliver(envelope).await
+    }
+
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
         self.0.subscribe()
+    }
+
+    fn subscribe_session(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
+        self.0.subscribe_session(session_id)
     }
 
     async fn snapshot(
@@ -786,6 +800,10 @@ impl leveler_local_transport::LocalRuntimeService for DaemonService {
     ) -> Result<leveler_local_transport::SessionBootstrap, leveler_client_protocol::ClientError>
     {
         self.0.create_session(request).await
+    }
+
+    async fn local_waiter_count(&self) -> Result<usize, leveler_client_protocol::ClientError> {
+        self.0.local_waiter_count().await
     }
 }
 
@@ -1126,25 +1144,57 @@ mod tui_runtime_selection_tests {
 mod daemon_bind_tests {
     use super::*;
     use leveler_client_protocol::{
-        ClientCommand, ClientError, RuntimeEvent, SessionId, UiSessionSnapshot,
+        ClientCommand, ClientError, NotificationLevel, RuntimeEvent, SessionId, UiSessionSnapshot,
         mock::MockRuntimeClient,
     };
     use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::broadcast;
 
     /// Minimal LocalRuntimeService for bind tests: command surface is never
     /// exercised, only the transports are bound.
     struct TestService {
         mock: MockRuntimeClient,
+        session_events: Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>,
+        raw_sends: AtomicUsize,
+        deliveries: AtomicUsize,
+    }
+
+    impl TestService {
+        fn session_sender(&self, session_id: &SessionId) -> broadcast::Sender<RuntimeEvent> {
+            self.session_events
+                .lock()
+                .unwrap()
+                .entry(session_id.clone())
+                .or_insert_with(|| broadcast::channel(64).0)
+                .clone()
+        }
+
+        fn emit_for(&self, session_id: &SessionId, event: RuntimeEvent) {
+            let _ = self.session_sender(session_id).send(event);
+        }
     }
 
     #[async_trait::async_trait]
     impl InteractiveRuntimeClient for TestService {
         async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+            self.raw_sends.fetch_add(1, Ordering::SeqCst);
             self.mock.send(command).await
+        }
+        async fn deliver(
+            &self,
+            envelope: leveler_client_protocol::CommandEnvelope,
+        ) -> Result<(), ClientError> {
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            self.mock.deliver(envelope).await
         }
         fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
             self.mock.subscribe()
+        }
+        fn subscribe_session(&self, session_id: &SessionId) -> broadcast::Receiver<RuntimeEvent> {
+            self.session_sender(session_id).subscribe()
         }
         async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
             self.mock.snapshot(session_id).await
@@ -1161,10 +1211,86 @@ mod daemon_bind_tests {
         }
     }
 
-    fn test_service() -> Arc<dyn LocalRuntimeService> {
+    fn test_service() -> Arc<TestService> {
         Arc::new(TestService {
             mock: MockRuntimeClient::new(SessionId::new("s-test")),
+            session_events: Mutex::new(HashMap::new()),
+            raw_sends: AtomicUsize::new(0),
+            deliveries: AtomicUsize::new(0),
         })
+    }
+
+    #[tokio::test]
+    async fn connected_web_bridge_preserves_the_daemon_s_runtime_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let upstream = test_service();
+        let mut bound = bind_daemon_transports(
+            &sock,
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some("bridge-token".to_string()),
+            upstream.clone(),
+        )
+        .await
+        .expect("daemon transports bind");
+        let (server, token) = bound.tcp.take().expect("TCP transport");
+        let addr = server.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+
+        let client = LocalSocketRuntimeClient::connect_tcp(addr, token)
+            .await
+            .expect("web bridge connects to daemon");
+        let session_id = SessionId::new("s1");
+        client
+            .send(ClientCommand::OpenSession {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("opens the daemon's per-session subscription");
+        let bridge = DaemonService(client);
+        let mut events = bridge.subscribe_session(&session_id);
+
+        upstream.emit_for(
+            &session_id,
+            RuntimeEvent::Notification {
+                level: NotificationLevel::Info,
+                message: "session-only".to_string(),
+            },
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("the web bridge lost the daemon's per-session stream")
+            .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::Notification { message, .. } if message == "session-only"
+        ));
+
+        let sends_before = upstream.raw_sends.load(Ordering::SeqCst);
+        bridge
+            .issue(session_id, ClientCommand::RequestSessionList)
+            .await
+            .expect("the web bridge delivers an enveloped command");
+        assert_eq!(
+            upstream.deliveries.load(Ordering::SeqCst),
+            1,
+            "the web bridge must preserve the daemon's idempotent delivery boundary"
+        );
+        assert_eq!(
+            upstream.raw_sends.load(Ordering::SeqCst),
+            sends_before,
+            "an enveloped web command must not be downgraded to raw send"
+        );
+        assert_eq!(
+            bridge.local_waiter_count().await.unwrap(),
+            2,
+            "the daemon sees the bridge's global and per-session subscriptions; \
+             returning the facade default of one would hide both"
+        );
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
