@@ -62,8 +62,11 @@ impl std::fmt::Display for OwnerEpoch {
 /// the task's current epoch is stale and must be rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnershipToken {
+    /// The owned task.
     pub task_id: TaskId,
+    /// The owning runtime's durable identity.
     pub runtime_id: RuntimeId,
+    /// The ownership generation this token was minted at.
     pub owner_epoch: OwnerEpoch,
 }
 
