@@ -425,6 +425,14 @@ mod unix {
         listener: UnixListener,
         runtime: Arc<dyn LocalRuntimeService>,
         local_waiters: LocalWaiters,
+        /// Exclusive `flock` on `<path>.lock`, held for the server's whole
+        /// lifetime. This is the single-daemon guarantee: two processes
+        /// racing a stale socket used to both pass the connect probe, both
+        /// remove the file, and both bind — leaving one daemon serving an
+        /// unlinked socket nobody can reach. The lock makes the
+        /// inspect-remove-bind sequence exclusive. Released implicitly when
+        /// the file handle drops (including on crash).
+        _lock: std::fs::File,
     }
 
     impl Drop for LocalSocketServer {
@@ -461,6 +469,19 @@ mod unix {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
+            // Take the daemon ownership lock BEFORE inspecting the socket
+            // path. A live daemon holds it for its whole lifetime, so a
+            // failed try-lock means one is running; a crashed daemon's lock
+            // is released by the OS, so a stale file never blocks startup.
+            let lock_path = path.with_extension("lock");
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)?;
+            if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+                return Err(TransportError::AlreadyRunning(path.display().to_string()));
+            }
             if let Ok(metadata) = tokio::fs::symlink_metadata(&path).await {
                 if !metadata.file_type().is_socket() {
                     return Err(TransportError::Unavailable(format!(
@@ -468,6 +489,8 @@ mod unix {
                         path.display()
                     )));
                 }
+                // Kept as a cross-version safety net: a daemon built before
+                // the flock existed holds no lock but still answers here.
                 if UnixStream::connect(&path).await.is_ok() {
                     return Err(TransportError::AlreadyRunning(path.display().to_string()));
                 }
@@ -483,6 +506,7 @@ mod unix {
                 listener,
                 runtime,
                 local_waiters: LocalWaiters::new(),
+                _lock: lock,
             })
         }
 
@@ -1354,6 +1378,55 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(response, WireResponse::SessionCreated(_)));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn concurrent_binds_on_a_stale_socket_elect_exactly_one_server() {
+        // Leave a stale socket file behind (dead daemon): every contender
+        // sees "exists, nobody answers" — the historical double-bind window.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        {
+            let runtime: Arc<dyn LocalRuntimeService> = Arc::new(TestRuntime::new());
+            let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
+            // Simulate a crash: forget the server without letting Drop clean
+            // up the file (std::mem::forget would leak the listener; instead
+            // recreate the stale state by hand after a clean drop).
+            drop(server);
+        }
+        std::os::unix::net::UnixListener::bind(&path).unwrap(); // stale, no accept loop after drop below
+        // (bound listener dropped immediately; the file stays)
+        let contenders = 6;
+        let mut join = tokio::task::JoinSet::new();
+        for _ in 0..contenders {
+            let path = path.clone();
+            join.spawn(async move {
+                let runtime: Arc<dyn LocalRuntimeService> = Arc::new(TestRuntime::new());
+                LocalSocketServer::bind(&path, runtime).await.map(|s| s)
+            });
+        }
+        let mut winners = Vec::new();
+        let mut losers = 0;
+        while let Some(result) = join.join_next().await {
+            match result.unwrap() {
+                Ok(server) => winners.push(server),
+                Err(TransportError::AlreadyRunning(_)) => losers += 1,
+                Err(other) => panic!("unexpected bind failure: {other}"),
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one contender may own the socket ({losers} refused)"
+        );
+        // And the winner is actually reachable.
+        let server = winners.pop().unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+        assert_eq!(info.runtime_id.as_str(), "rt-test");
         shutdown.cancel();
     }
 

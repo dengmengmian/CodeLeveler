@@ -1794,6 +1794,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "fs2",
  "futures",
  "leveler-agent",
  "leveler-client-protocol",
@@ -1993,6 +1994,7 @@ name = "leveler-local-transport"
 version = "0.1.4"
 dependencies = [
  "async-trait",
+ "fs2",
  "leveler-client-protocol",
  "leveler-model",
  "serde",

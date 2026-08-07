@@ -221,6 +221,107 @@ async fn connect_default_runtime(
     Ok(None)
 }
 
+/// How long an ensure-started daemon gets to report readiness before the TUI
+/// gives up. Model/config loading dominates; ten seconds is generous.
+#[cfg(unix)]
+const DAEMON_ENSURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Discover the repository's local runtime, starting one if none is running.
+///
+/// The default TUI path: probe the per-repo socket; when nobody answers,
+/// spawn `leveler --repo <root> serve` as a *detached* process (its own
+/// process group, no kill-on-drop — the daemon must outlive this TUI), wait
+/// for its `--ready-json`, and connect. Two TUIs racing this function are
+/// safe: the socket bind's flock elects exactly one daemon, the loser child
+/// exits `AlreadyRunning`, and the losing TUI's retry loop connects to the
+/// winner. Returns the connected client; a startup failure is a hard error
+/// carrying the daemon's log tail — never a silent fall back to an
+/// in-process runtime.
+#[cfg(unix)]
+async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
+    let socket_path = layout.socket_path();
+    if let Some(client) = connect_default_runtime(&socket_path).await? {
+        return Ok(client);
+    }
+
+    std::fs::create_dir_all(&layout.state_dir)?;
+    let log_path = layout.state_dir.join("daemon.log");
+    let log = std::fs::File::create(&log_path)?;
+    let ready_path = std::env::temp_dir().join(format!(
+        "leveler-tui-ready-{}-{}.json",
+        std::process::id(),
+        leveler_core::new_uuid_string()
+    ));
+    let _ = std::fs::remove_file(&ready_path);
+    let exe = std::env::current_exe()?;
+    let mut child = tokio::process::Command::new(&exe)
+        .arg("--repo")
+        .arg(&layout.repo_root)
+        .arg("serve")
+        .arg("--ready-json")
+        .arg(&ready_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log))
+        // Detached: the daemon owns task lifetime, so it must not share the
+        // TUI's process group (terminal signals) and is never kill-on-drop.
+        .process_group(0)
+        .spawn()?;
+
+    let deadline = tokio::time::Instant::now() + DAEMON_ENSURE_TIMEOUT;
+    let client = loop {
+        // The child exiting is not necessarily failure: losing the daemon
+        // election (another TUI's child bound first) exits AlreadyRunning,
+        // and the winner is exactly who we want to connect to.
+        let child_done = child.try_wait()?.is_some();
+        if ready_path.is_file()
+            && let Ok(client) = LocalSocketRuntimeClient::connect(&socket_path).await
+        {
+            break client;
+        }
+        if child_done {
+            if let Some(client) = connect_default_runtime(&socket_path).await? {
+                break client;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.start_kill();
+            anyhow::bail!(
+                "the local runtime did not become ready within {}s; \
+                 inspect {} or run `leveler tui --in-process` as a fallback",
+                DAEMON_ENSURE_TIMEOUT.as_secs(),
+                log_path.display()
+            );
+        }
+        if child_done {
+            // Startup failed for real (bad config, corrupt identity, …):
+            // surface it now instead of burning the whole deadline.
+            let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail = tail.lines().rev().take(8).collect::<Vec<_>>();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            anyhow::bail!(
+                "the local runtime failed to start (log: {}):\n{}\n\
+                 run `leveler tui --in-process` as a fallback",
+                log_path.display(),
+                tail.join("\n")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _ = std::fs::remove_file(&ready_path);
+    // Identity check is best-effort observability: log which runtime serves
+    // us; an old daemon that cannot answer still serves sessions fine.
+    match leveler_local_transport::LocalRuntimeService::runtime_info(&client).await {
+        Ok(info) => tracing::info!(
+            runtime_id = %info.runtime_id,
+            pid = info.pid,
+            "connected to local runtime"
+        ),
+        Err(error) => tracing::debug!(%error, "local runtime did not report an identity"),
+    }
+    Ok(client)
+}
+
 /// Open the interactive terminal UI. Reuses a healthy per-repository daemon
 /// when possible and otherwise starts the runtime inside the TUI process.
 #[allow(clippy::too_many_arguments)]
@@ -248,6 +349,14 @@ pub(crate) async fn cmd_tui(
     let socket_path = socket.unwrap_or_else(|| layout.socket_path());
     let socket_client = match intent {
         SocketIntent::Embedded => None,
+        // The normal product path: discover the repository's runtime, start
+        // one when none is running, and connect. The TUI does not own task
+        // lifetime here — closing it leaves the daemon (and its tasks)
+        // running. Unix only: platforms without the socket transport keep
+        // the embedded runtime.
+        #[cfg(unix)]
+        SocketIntent::ProbeDefault => Some(ensure_default_runtime(&layout).await?),
+        #[cfg(not(unix))]
         SocketIntent::ProbeDefault => connect_default_runtime(&socket_path).await.map_err(
             |error| {
                 anyhow::anyhow!(
