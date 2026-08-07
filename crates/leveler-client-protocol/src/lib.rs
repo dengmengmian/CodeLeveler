@@ -65,8 +65,8 @@ pub use progress::{
     UiPlanStep, UiVerification,
 };
 pub use snapshot::{
-    MessageId, RuntimeStatus, UiActiveToolCall, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot,
-    UiSessionSummary,
+    MessageId, RuntimeInfo, RuntimeStatus, UiActiveToolCall, UiCheckpoint, UiMessage, UiRole,
+    UiSessionSnapshot, UiSessionSummary,
 };
 pub use version::{PROTOCOL_VERSION, ProtocolEnvelope, ProtocolError, ProtocolVersion};
 pub use wire_types::{ApprovalDecision, PermissionProfile};
@@ -77,7 +77,7 @@ pub mod mock;
 // Re-export the shared domain types the protocol references, so clients get one
 // import surface and never generate provider-specific formats themselves.
 pub use leveler_core::{
-    ApprovalId, CheckpointId, ClarificationId, CommandId, SessionId, ToolCallId,
+    ApprovalId, CheckpointId, ClarificationId, CommandId, RuntimeId, SessionId, ToolCallId,
 };
 pub use leveler_model::ModelRef;
 

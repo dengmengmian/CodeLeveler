@@ -74,6 +74,24 @@ pub struct UiMessage {
     pub text: String,
 }
 
+/// The runtime's self-description, served to clients for identity
+/// verification, diagnostics, and reconnect checks.
+///
+/// `runtime_id` is the durable identity (stable across daemon restarts);
+/// `pid` and `version` are diagnostics about the *current process* serving
+/// that identity — never identity themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeInfo {
+    pub runtime_id: leveler_core::RuntimeId,
+    /// The serving binary's version (diagnostics).
+    #[serde(default)]
+    pub version: String,
+    /// The serving process id (diagnostics; changes on restart).
+    #[serde(default)]
+    pub pid: u32,
+}
+
 /// Coarse runtime state, surfaced in the status line .
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

@@ -415,6 +415,12 @@ impl LocalRuntimeService for RouterService {
             .insert(bootstrap.session.id.clone(), self.primary_repo.clone());
         Ok(bootstrap)
     }
+
+    /// The router fronts several runtimes; its own identity for clients is the
+    /// primary repository's runtime.
+    async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
+        self.primary.runtime_info().await
+    }
 }
 
 #[cfg(test)]

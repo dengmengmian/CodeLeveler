@@ -573,14 +573,21 @@ pub(crate) async fn cmd_serve(
         tracing::warn!(reaped, "reaped zombie turns before daemon startup");
     }
 
+    // Resolve the durable identity before declaring readiness, so a
+    // corrupt identity file fails startup loudly instead of serving with an
+    // unknown identity.
+    let runtime_id = app.runtime_id()?;
+
     if let Some(path) = &ready_json {
         // Machine-readable readiness for the supervising process (spawned by
-        // the WebUI aggregator): where to connect and how to authenticate.
+        // the WebUI aggregator or an ensure-daemon TUI): where to connect,
+        // how to authenticate, and which runtime identity is serving.
         let ready = serde_json::json!({
             "pid": std::process::id(),
             "socket": socket_path,
             "addr": bound.tcp.as_ref().map(|(s, _)| s.local_addr()).transpose()?.map(|a| a.to_string()),
             "token": bound.tcp.as_ref().map(|(_, t)| t.clone()),
+            "runtime_id": runtime_id.as_str(),
         });
         std::fs::write(path, serde_json::to_vec_pretty(&ready)?)?;
     }
@@ -596,6 +603,7 @@ pub(crate) async fn cmd_serve(
         println!("  token: {token}");
     }
     println!("  model: {model_ref}");
+    println!("  runtime: {runtime_id}");
     println!("  press Ctrl+C to stop the daemon");
 
     let shutdown = CancellationToken::new();
@@ -804,6 +812,12 @@ impl leveler_local_transport::LocalRuntimeService for DaemonService {
 
     async fn local_waiter_count(&self) -> Result<usize, leveler_client_protocol::ClientError> {
         self.0.local_waiter_count().await
+    }
+
+    async fn runtime_info(
+        &self,
+    ) -> Result<leveler_client_protocol::RuntimeInfo, leveler_client_protocol::ClientError> {
+        leveler_local_transport::LocalRuntimeService::runtime_info(&self.0).await
     }
 }
 

@@ -2083,6 +2083,21 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             context_window,
         })
     }
+
+    /// The in-process runtime IS the runtime for this state directory: its
+    /// identity is the directory's persisted RuntimeId, not anything about
+    /// this process.
+    async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
+        let runtime_id = self
+            .app
+            .runtime_id()
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        Ok(leveler_client_protocol::RuntimeInfo {
+            runtime_id,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+        })
+    }
 }
 
 /// Parse every stored message payload; any corrupt row is a hard error so

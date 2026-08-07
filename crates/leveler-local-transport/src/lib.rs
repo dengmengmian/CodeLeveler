@@ -108,6 +108,18 @@ pub trait LocalRuntimeService: InteractiveRuntimeClient {
     async fn local_waiter_count(&self) -> Result<usize, ClientError> {
         Ok(1)
     }
+
+    /// This runtime's identity and process diagnostics.
+    ///
+    /// Used by clients to verify which runtime they discovered/reconnected to.
+    /// The default errs so test doubles need not fake an identity; every
+    /// production service (in-process runtime, socket client, daemon bridge,
+    /// web router) overrides it.
+    async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
+        Err(ClientError::Runtime(
+            "runtime identity is not available on this service".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -143,6 +155,10 @@ enum WireRequest {
     /// How many local interactive UIs are attached. Asked by the remote agent,
     /// which cannot see this machine's terminals from its own process.
     LocalWaiters,
+    /// The runtime's identity + process diagnostics. Additive: a daemon built
+    /// before this variant fails the request, which clients treat as
+    /// "identity unknown", never as a fatal error.
+    RuntimeInfo,
     Subscribe {
         session_id: Option<SessionId>,
         /// Absent from clients built before remote control existed; `default`
@@ -161,6 +177,7 @@ enum WireResponse {
     SessionCreated(SessionBootstrap),
     Event(RuntimeEvent),
     LocalWaiters(usize),
+    RuntimeInfo(leveler_client_protocol::RuntimeInfo),
     Error(WireError),
 }
 
@@ -345,6 +362,13 @@ mod unix {
                 send_response(
                     &mut stream,
                     WireResponse::LocalWaiters(local_waiters.count()),
+                )
+                .await
+            }
+            WireRequest::RuntimeInfo => {
+                send_result(
+                    &mut stream,
+                    runtime.runtime_info().await.map(WireResponse::RuntimeInfo),
                 )
                 .await
             }
@@ -656,6 +680,21 @@ mod unix {
                 .map_err(transport_client_error)?
             {
                 WireResponse::LocalWaiters(count) => Ok(count),
+                WireResponse::Error(error) => Err(error.into_client_error()),
+                response => Err(unexpected_response(response)),
+            }
+        }
+
+        /// Ask the daemon for its identity. A daemon predating the request
+        /// (or a transport failure) surfaces as `Err`, which callers treat as
+        /// "identity unknown" — discovery still works, verification degrades.
+        async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
+            match self
+                .request(WireRequest::RuntimeInfo)
+                .await
+                .map_err(transport_client_error)?
+            {
+                WireResponse::RuntimeInfo(info) => Ok(info),
                 WireResponse::Error(error) => Err(error.into_client_error()),
                 response => Err(unexpected_response(response)),
             }
@@ -1278,6 +1317,14 @@ mod tests {
                 context_window: 128_000,
             })
         }
+
+        async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
+            Ok(leveler_client_protocol::RuntimeInfo {
+                runtime_id: leveler_client_protocol::RuntimeId::new("rt-test"),
+                version: "test".to_string(),
+                pid: std::process::id(),
+            })
+        }
     }
 
     async fn tcp_server(token: &str) -> (SocketAddr, Arc<TestRuntime>, CancellationToken) {
@@ -1307,6 +1354,24 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(response, WireResponse::SessionCreated(_)));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn runtime_info_round_trips_over_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+        assert_eq!(info.runtime_id.as_str(), "rt-test");
+        assert_eq!(info.version, "test");
         shutdown.cancel();
     }
 
