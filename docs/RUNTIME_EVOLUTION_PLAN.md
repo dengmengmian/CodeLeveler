@@ -966,11 +966,17 @@ NPC/future domain code can depend on generic lifecycle without needing Coding wo
 
 Priority: **P1/P2**
 
-> Status: **partial**. `EventStore` (pre-existing) and `TaskStore` (new) are
-> ports with SQLite + in-memory implementations sharing contract tests. The
-> engine still holds a concrete `Database` for session/turn/message/terminal
-> repositories — extracting those ports is deferred until a consumer (cloud
-> store, engine tests without SQLite) needs each one.
+> Status: **landed**. The engine consumes only narrow ports — `EventStore`,
+> `TaskStore`, `SessionStore`, `TurnStore`, `MessageStore`,
+> `ModelRequestStore`, `TerminalStore` — bundled in the plain `EngineStores`
+> composition struct; `TaskEngine`/`TurnRunner` no longer hold a concrete
+> `Database`. Terminal task/turn commits stay single-transaction inside the
+> SQLite adapter (`TerminalRepository` unchanged); the memory terminal store
+> simulates the same atomic semantics and offers injected commit failures.
+> `leveler-app` remains the composition root wiring
+> `EngineStores::from_database`. SQLite is still the only production
+> adapter; app/CLI/Web convenience queries (session list, checkpoints,
+> command receipts) intentionally stay on concrete repositories.
 
 The existing EventStore seam should be preserved and expanded with narrow contracts where necessary.
 

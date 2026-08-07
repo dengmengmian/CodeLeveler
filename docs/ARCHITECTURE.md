@@ -269,9 +269,13 @@ aggregate. Today every task has exactly one primary session and the engine
 records the association when a session is created or first runs; legacy
 databases are backfilled deterministically (a legacy session's id is its task
 id). Lifecycle columns stay on the session row while the relationship is 1:1 —
-one writer per fact. Narrow storage ports (`EventStore`, `TaskStore`) sit
-between the engine and SQLite, each with an in-memory implementation exercising
-the same contract tests.
+one writer per fact. The engine depends only on narrow storage ports
+(`EventStore`, `TaskStore`, `SessionStore`, `TurnStore`, `MessageStore`,
+`ModelRequestStore`, `TerminalStore`, bundled as `EngineStores`), each with an
+in-memory implementation exercising the same contract tests; SQLite is the
+production adapter wired by the composition root. Terminal task/turn facts
+commit atomically inside the terminal port's adapter — the transaction
+boundary is part of that port's contract, not the engine's concern.
 
 The transport DTOs are separate from internal engine types so the local protocol
 can evolve without exposing storage or provider structures.
