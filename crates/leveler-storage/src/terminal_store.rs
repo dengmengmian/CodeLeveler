@@ -95,16 +95,20 @@ impl TerminalStore for Database {
     }
 }
 
-/// An in-memory [`TerminalStore`] that simulates the atomic semantics, not
-/// just the happy path: it validates existence against the sibling memory
-/// stores BEFORE writing anything, so a failed commit leaves no partial
-/// state — the same observable contract as the SQLite transaction. A `fail`
-/// switch injects commit failures for engine-level tests.
+/// An in-memory [`TerminalStore`] that honors the atomic contract by
+/// construction: every fallible step (existence validation, the injected
+/// failure hook, the canonical event append) runs BEFORE the infallible
+/// projection apply. A failure at any stage — including the event
+/// append/commit stage itself — therefore leaves projections untouched and
+/// no event behind, with no rollback machinery: the same observable contract
+/// as the SQLite transaction.
 pub struct MemoryTerminalStore {
     sessions: std::sync::Arc<crate::MemorySessionStore>,
     turns: std::sync::Arc<crate::MemoryTurnStore>,
     events: std::sync::Arc<crate::MemoryEventStore>,
-    /// When set, every commit fails without writing — failure injection for
+    /// When set, the commit fails AT THE EVENT-APPEND STAGE — after
+    /// validation, before anything lands — modeling "projection logically
+    /// prepared, commit fails". Deterministic failure injection for
     /// "terminal write fails ⇒ nothing visible" tests.
     fail: std::sync::atomic::AtomicBool,
 }
@@ -152,21 +156,22 @@ impl TerminalStore for MemoryTerminalStore {
         state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
-        self.check_injected_failure()?;
-        // Validate BEFORE any write — the memory equivalent of rollback.
+        // Fallible stages first: validate, then the append/commit (where the
+        // injected failure fires). Nothing is written until both succeed.
+        if !self
+            .sessions
+            .rows
+            .lock()
+            .unwrap()
+            .contains_key(session_id.as_str())
         {
-            let mut rows = self.sessions.rows.lock().unwrap();
-            let Some(session) = rows.get_mut(session_id.as_str()) else {
-                return Err(StorageError::InvalidData(format!(
-                    "session {} not found for terminal transition",
-                    session_id.as_str()
-                )));
-            };
-            session.outcome = Some(outcome);
-            session.status = status;
-            session.state = state;
+            return Err(StorageError::InvalidData(format!(
+                "session {} not found for terminal transition",
+                session_id.as_str()
+            )));
         }
-        crate::EventStore::append(
+        self.check_injected_failure()?;
+        let appended = crate::EventStore::append(
             self.events.as_ref(),
             session_id,
             None,
@@ -174,7 +179,18 @@ impl TerminalStore for MemoryTerminalStore {
             &leveler_core::redact_secrets(payload),
             now,
         )
-        .await
+        .await?;
+        // Infallible projection apply — the event is durable, so the
+        // projection always lands with it.
+        {
+            let mut rows = self.sessions.rows.lock().unwrap();
+            if let Some(session) = rows.get_mut(session_id.as_str()) {
+                session.outcome = Some(outcome);
+                session.status = status;
+                session.state = state;
+            }
+        }
+        Ok(appended)
     }
 
     async fn finish_turn(
@@ -186,19 +202,24 @@ impl TerminalStore for MemoryTerminalStore {
         outcome: TurnOutcome,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
-        self.check_injected_failure()?;
+        // Same ordering as finish_task: fallible stages (validation, then
+        // the append/commit where injection fires) before the infallible
+        // projection apply.
+        if !self
+            .turns
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.id == turn_id.as_str())
         {
-            let mut rows = self.turns.rows.lock().unwrap();
-            let Some(turn) = rows.iter_mut().find(|t| t.id == turn_id.as_str()) else {
-                return Err(StorageError::InvalidData(format!(
-                    "turn {} not found for terminal transition",
-                    turn_id.as_str()
-                )));
-            };
-            turn.status = outcome.as_str().to_string();
-            turn.finished_at = Some(now.to_rfc3339());
+            return Err(StorageError::InvalidData(format!(
+                "turn {} not found for terminal transition",
+                turn_id.as_str()
+            )));
         }
-        crate::EventStore::append(
+        self.check_injected_failure()?;
+        let appended = crate::EventStore::append(
             self.events.as_ref(),
             session_id,
             Some(turn_id),
@@ -206,7 +227,15 @@ impl TerminalStore for MemoryTerminalStore {
             &leveler_core::redact_secrets(payload),
             now,
         )
-        .await
+        .await?;
+        {
+            let mut rows = self.turns.rows.lock().unwrap();
+            if let Some(turn) = rows.iter_mut().find(|t| t.id == turn_id.as_str()) {
+                turn.status = outcome.as_str().to_string();
+                turn.finished_at = Some(now.to_rfc3339());
+            }
+        }
+        Ok(appended)
     }
 }
 
@@ -339,16 +368,28 @@ mod tests {
 
     #[tokio::test]
     async fn injected_commit_failure_leaves_no_partial_state() {
+        // The injected failure fires AT THE APPEND/COMMIT STAGE — after the
+        // target session/turn was validated to exist — so this covers the
+        // real half-write window: "projection logically prepared, commit
+        // fails". Under a mutate-then-append implementation this test fails
+        // (the projection would already carry the terminal fact).
         let sessions = Arc::new(MemorySessionStore::new());
         let turns = Arc::new(MemoryTurnStore::new());
         let events = Arc::new(MemoryEventStore::new());
         let terminal = MemoryTerminalStore::new(sessions.clone(), turns.clone(), events.clone());
 
+        // A real session AND a real running turn: validation passes, so the
+        // failure can only come from the commit stage itself.
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
         let session = SessionId::new(record.id.clone());
         SessionStore::create(sessions.as_ref(), &record)
             .await
             .unwrap();
+        let before = sessions.lifecycle(&session).expect("session row");
+        let turn = TurnStore::start(turns.as_ref(), &session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = TurnId::new(turn.id.clone());
 
         terminal.fail_commits(true);
         assert!(
@@ -365,17 +406,88 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            terminal
+                .finish_turn(
+                    &session,
+                    &turn_id,
+                    "turn_finished",
+                    "{}",
+                    TurnOutcome::Interrupted,
+                    leveler_core::now(),
+                )
+                .await
+                .is_err()
+        );
+
+        // Session projection: outcome, status, and state all unchanged.
         let (_, _, _, outcome) = SessionStore::execution(sessions.as_ref(), &session)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(outcome, None, "no outcome without its event");
+        assert_eq!(
+            sessions.lifecycle(&session).unwrap(),
+            before,
+            "status/state must be untouched by a failed commit"
+        );
+        // Turn projection: still running, finished_at unset.
+        assert_eq!(turns.status(&turn_id).as_deref(), Some("running"));
+        assert_eq!(
+            TurnStore::list_running(turns.as_ref(), Some(&session))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the turn must still be visibly running"
+        );
+        // Canonical log: empty.
         assert!(
             EventStore::load(events.as_ref(), &session)
                 .await
                 .unwrap()
                 .is_empty(),
             "no event without its projection"
+        );
+
+        // Once the store recovers, the same commits succeed and land BOTH
+        // sides together.
+        terminal.fail_commits(false);
+        terminal
+            .finish_turn(
+                &session,
+                &turn_id,
+                "turn_finished",
+                "{}",
+                TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        terminal
+            .finish_task(
+                &session,
+                "task_finished",
+                "{}",
+                TaskOutcome::Verified,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(turns.status(&turn_id).as_deref(), Some("interrupted"));
+        let (_, _, _, outcome) = SessionStore::execution(sessions.as_ref(), &session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Some(TaskOutcome::Verified));
+        assert_eq!(
+            EventStore::load(events.as_ref(), &session)
+                .await
+                .unwrap()
+                .len(),
+            2
         );
     }
 }
