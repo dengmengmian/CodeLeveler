@@ -378,15 +378,19 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
         supervisor: None,
     };
     let spec = TaskSpec {
-        repository: h.dir.path().to_path_buf(),
-        goal: "do the impossible".to_string(),
-        mode: PermissionProfile::Assisted,
-        sandbox: false,
-        kind: ExecutionKind::Direct,
-        continuation: ContinuationPolicy::UntilTerminal,
-        limits: StepLimits::default(),
-        verification: leveler_verifier::VerificationPlan::default(),
-        base_commit: None,
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: "do the impossible".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::UntilTerminal,
+            limits: StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: h.dir.path().to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: leveler_verifier::VerificationPlan::default(),
+            base_commit: None,
+        },
     };
     let session = engine.create_task(&spec).await.unwrap();
     let mut turn_stops: Vec<Option<leveler_agent::StopReason>> = Vec::new();
@@ -450,15 +454,19 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
         supervisor: None,
     };
     let spec = TaskSpec {
-        repository: h.dir.path().to_path_buf(),
-        goal: "add a function".to_string(),
-        mode: PermissionProfile::Assisted,
-        sandbox: false,
-        kind: ExecutionKind::Direct,
-        continuation: ContinuationPolicy::UntilTerminal,
-        limits: StepLimits::default(),
-        verification: leveler_verifier::VerificationPlan::default(),
-        base_commit: None,
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: "add a function".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::UntilTerminal,
+            limits: StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: h.dir.path().to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: leveler_verifier::VerificationPlan::default(),
+            base_commit: None,
+        },
     };
     let session = engine.create_task(&spec).await.unwrap();
     engine

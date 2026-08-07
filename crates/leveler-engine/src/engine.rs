@@ -10,10 +10,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::{Clarifier, ContinuationPolicy, StepLimits, StopReason};
-use leveler_core::{SessionId, TurnId};
+use leveler_core::{SessionId, TaskId, TurnId};
 use leveler_execution::{Approver, PermissionProfile, RiskLevel};
 use leveler_lifecycle::{AgentState, SessionStatus};
-use leveler_storage::{Database, SessionRecord, SessionRepository, TerminalRepository};
+use leveler_storage::{Database, SessionRecord, SessionRepository, TaskStore, TerminalRepository};
 use leveler_verifier::{
     CompletionVerdict, ExpectedEvidence, Verdict, VerificationPlan, VerificationReport, Verifier,
     finalize_task_outcome,
@@ -47,13 +47,12 @@ fn is_auto_replayable(
     matches!(risk, Some(RiskLevel::Safe)) && registry.replay_is_side_effect_free(name)
 }
 
-/// Everything needed to create a task.
+/// The domain-neutral half of a task: what to do and how long the runtime
+/// may spend on it. Nothing here names Git, a repository, or a verification
+/// plan — the engine's generic lifecycle machinery reads only this half.
 #[derive(Clone)]
-pub struct TaskSpec {
-    pub repository: PathBuf,
+pub struct RuntimeTaskSpec {
     pub goal: String,
-    pub mode: PermissionProfile,
-    pub sandbox: bool,
     pub kind: ExecutionKind,
     /// Top-level continuation is independent from model capability. Interactive
     /// tasks use `UntilTerminal`; evals may supply a fixed case budget.
@@ -61,6 +60,16 @@ pub struct TaskSpec {
     /// Optional top-level token/cost/duration limits. Defaults are unlimited.
     /// Evaluation may additionally supply an explicit case-wide round budget.
     pub limits: StepLimits,
+}
+
+/// The Coding-domain half of a task: where the work happens and how its
+/// completion is proven. Verification and baseline attribution live here —
+/// they are the Coding completion gate's inputs, not runtime lifecycle.
+#[derive(Clone)]
+pub struct CodingTaskSpec {
+    pub repository: PathBuf,
+    pub mode: PermissionProfile,
+    pub sandbox: bool,
     /// The post-edit verification plan (empty = nothing to verify → the task
     /// can at best finish `CompletedUnverified`).
     pub verification: VerificationPlan,
@@ -70,10 +79,20 @@ pub struct TaskSpec {
     pub base_commit: Option<String>,
 }
 
+/// Everything needed to create a task: the runtime descriptor plus the Coding
+/// execution spec. The split is the migration seam toward a domain-neutral
+/// engine — while Coding is the only domain, the engine still receives both
+/// halves together, but which half a code path reads is now explicit.
+#[derive(Clone)]
+pub struct TaskSpec {
+    pub runtime: RuntimeTaskSpec,
+    pub coding: CodingTaskSpec,
+}
+
 fn goal_profile(spec: &TaskSpec) -> TurnProfile {
     TurnProfile::Goal {
-        continuation: spec.continuation,
-        limits: spec.limits,
+        continuation: spec.runtime.continuation,
+        limits: spec.runtime.limits,
     }
 }
 
@@ -140,8 +159,8 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
 
 fn chat_profile(spec: &TaskSpec) -> TurnProfile {
     TurnProfile::Chat {
-        continuation: spec.continuation,
-        limits: spec.limits,
+        continuation: spec.runtime.continuation,
+        limits: spec.runtime.limits,
     }
 }
 
@@ -445,7 +464,16 @@ impl TaskEngine {
 
     /// Mark the session running before the first turn. The engine owns this
     /// transition too — clients observe lifecycle, they never write it.
-    async fn mark_running(&self, session_id: &SessionId) -> Result<(), EngineError> {
+    ///
+    /// Also the ONE seam where the durable task identity is guaranteed: every
+    /// execution entry (run/chat/resume) passes here, so a session created by
+    /// any path — including one that predates the tasks table — has its task
+    /// row before the first turn. Returns that task id.
+    async fn mark_running(&self, session_id: &SessionId) -> Result<TaskId, EngineError> {
+        let task_id = self
+            .db
+            .ensure_for_session(session_id, leveler_core::now())
+            .await?;
         SessionRepository::new(&self.db)
             .update_status(
                 session_id,
@@ -454,14 +482,24 @@ impl TaskEngine {
                 leveler_core::now(),
             )
             .await?;
-        Ok(())
+        Ok(task_id)
     }
 
-    /// Create and persist the session row, including its execution config.
+    /// The durable task owning `session_id`, if the association exists yet.
+    /// (It is created at latest when the session first runs.)
+    pub async fn task_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<TaskId>, EngineError> {
+        Ok(TaskStore::task_for_session(&self.db, session_id).await?)
+    }
+
+    /// Create and persist the session row, including its execution config,
+    /// and the durable task row associated with it.
     pub async fn create_task(&self, spec: &TaskSpec) -> Result<SessionId, EngineError> {
         let record = SessionRecord::new(
-            spec.repository.display().to_string(),
-            spec.goal.clone(),
+            spec.coding.repository.display().to_string(),
+            spec.runtime.goal.clone(),
             self.factory.model.to_string(),
             leveler_core::now(),
         );
@@ -470,12 +508,13 @@ impl TaskEngine {
         let id = SessionId::new(record.id);
         repo.set_execution(
             &id,
-            mode_str(spec.mode),
-            spec.sandbox,
-            spec.kind.as_str(),
+            mode_str(spec.coding.mode),
+            spec.coding.sandbox,
+            spec.runtime.kind.as_str(),
             leveler_core::now(),
         )
         .await?;
+        self.db.ensure_for_session(&id, leveler_core::now()).await?;
         Ok(id)
     }
 
@@ -497,15 +536,16 @@ impl TaskEngine {
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
         };
-        self.mark_running(session_id).await?;
+        let task_id = self.mark_running(session_id).await?;
         log.append(
             None,
             EngineEvent::TaskStarted {
-                goal: spec.goal.clone(),
+                goal: spec.runtime.goal.clone(),
                 model: self.factory.model.to_string(),
-                mode: mode_str(spec.mode).to_string(),
-                sandbox: spec.sandbox,
-                kind: spec.kind,
+                mode: mode_str(spec.coding.mode).to_string(),
+                sandbox: spec.coding.sandbox,
+                kind: spec.runtime.kind,
+                task_id: Some(task_id),
             },
             observer,
         )
@@ -517,11 +557,14 @@ impl TaskEngine {
         // spec so every path that reaches `verify` — including resume — sees it
         // without threading. None (left as-is) outside a git work tree.
         let owned_spec;
-        let spec = if spec.base_commit.is_none() {
-            if let Some(head) = crate::baseline::capture_head(&spec.repository).await {
+        let spec = if spec.coding.base_commit.is_none() {
+            if let Some(head) = crate::baseline::capture_head(&spec.coding.repository).await {
                 owned_spec = TaskSpec {
-                    base_commit: Some(head),
-                    ..spec.clone()
+                    coding: CodingTaskSpec {
+                        base_commit: Some(head),
+                        ..spec.coding.clone()
+                    },
+                    runtime: spec.runtime.clone(),
                 };
                 &owned_spec
             } else {
@@ -532,7 +575,7 @@ impl TaskEngine {
         };
 
         // Orchestrate execution path removed; legacy kind falls through to direct.
-        let result = match spec.kind {
+        let result = match spec.runtime.kind {
             ExecutionKind::Direct => {
                 self.run_direct(&log, &runner, spec, observer, cancellation)
                     .await
@@ -569,12 +612,15 @@ impl TaskEngine {
         // Interactive chat is the path where a dirty, already-red worktree is the
         // normal case, so it needs this more than `run` does.
         let owned_spec;
-        let spec = if spec.base_commit.is_none() {
-            match crate::baseline::capture_head(&spec.repository).await {
+        let spec = if spec.coding.base_commit.is_none() {
+            match crate::baseline::capture_head(&spec.coding.repository).await {
                 Some(head) => {
                     owned_spec = TaskSpec {
-                        base_commit: Some(head),
-                        ..spec.clone()
+                        coding: CodingTaskSpec {
+                            base_commit: Some(head),
+                            ..spec.coding.clone()
+                        },
+                        runtime: spec.runtime.clone(),
                     };
                     &owned_spec
                 }
@@ -665,10 +711,10 @@ impl TaskEngine {
             .execution(session_id)
             .await?
             .ok_or_else(|| EngineError::Config(format!("no session {session_id}")))?;
-        if kind != spec.kind.as_str() {
+        if kind != spec.runtime.kind.as_str() {
             return Err(EngineError::Config(format!(
                 "session {session_id} is `{kind}`, not `{}`",
-                spec.kind.as_str()
+                spec.runtime.kind.as_str()
             )));
         }
         if matches!(
@@ -695,7 +741,7 @@ impl TaskEngine {
             .assemble(
                 &log,
                 summary.as_deref(),
-                Some(spec.goal.as_str()),
+                Some(spec.runtime.goal.as_str()),
                 leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
             )
             .await?;
@@ -935,14 +981,14 @@ impl TaskEngine {
         // Multi-turn Goal: inject bounded session history so follow-ups can
         // resolve deictic references ("刚才那个超时").
         let prior = self
-            .bounded_session_history(log, &runner.session_id, &spec.goal)
+            .bounded_session_history(log, &runner.session_id, &spec.runtime.goal)
             .await?;
         let recorded = runner
             .run_turn(
                 TurnKind::User,
                 goal_profile(spec),
                 TurnInput::Goal {
-                    goal: spec.goal.clone(),
+                    goal: spec.runtime.goal.clone(),
                     prior,
                 },
                 observer,
@@ -1020,7 +1066,7 @@ impl TaskEngine {
     ) -> Result<leveler_agent::AgentOutcome, EngineError> {
         let policy = self.supervisor_policy();
         let mut extensions = 0u32;
-        let mut limits = spec.limits;
+        let mut limits = spec.runtime.limits;
 
         for _ in 0..MAX_SUPERVISED_TURNS {
             if cancellation.is_cancelled() {
@@ -1033,7 +1079,7 @@ impl TaskEngine {
                 budget_exhaustion: outcome.budget_exhaustion.as_ref(),
                 modified_files: &outcome.modified_files,
                 extensions_granted: extensions,
-                round_budget: spec.continuation,
+                round_budget: spec.runtime.continuation,
             });
 
             let continued = match decision {
@@ -1107,7 +1153,7 @@ impl TaskEngine {
             .assemble(
                 log,
                 summary.as_deref(),
-                Some(spec.goal.as_str()),
+                Some(spec.runtime.goal.as_str()),
                 leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
             )
             .await?;
@@ -1137,7 +1183,7 @@ impl TaskEngine {
              Inspect the current workspace, make concrete progress, and call update_goal \
              only when the full objective is complete or genuinely blocked. Do not \
              re-audit already finished plan steps with git status thrash.",
-            spec.goal
+            spec.runtime.goal
         );
         let recorded = runner
             .run_turn(
@@ -1180,7 +1226,7 @@ impl TaskEngine {
             .run_turn(
                 TurnKind::User,
                 TurnProfile::Goal {
-                    continuation: spec.continuation,
+                    continuation: spec.runtime.continuation,
                     limits,
                 },
                 TurnInput::Resume(raw.messages),
@@ -1222,7 +1268,7 @@ impl TaskEngine {
 
         // K19 early short-circuit: no mutation or no gates → never claim Verified
         // (pure Q&A over a green repo must stay CompletedUnverified).
-        if outcome.modified_files.is_empty() || !spec.verification.has_gates() {
+        if outcome.modified_files.is_empty() || !spec.coding.verification.has_gates() {
             return Ok(report_from_agent_outcome(
                 outcome,
                 TaskOutcome::CompletedUnverified,
@@ -1257,7 +1303,7 @@ impl TaskEngine {
                     TurnKind::Repair { attempt: attempts },
                     goal_profile(spec),
                     TurnInput::Goal {
-                        goal: repair_goal(&spec.goal, &report),
+                        goal: repair_goal(&spec.runtime.goal, &report),
                         prior: Vec::new(),
                     },
                     observer,
@@ -1295,7 +1341,7 @@ impl TaskEngine {
         // with the code (see `leveler_verifier::outcome` docs). The call is gone.
         let expected = ExpectedEvidence {
             needs_mutation: direct_needs_mutation(
-                &spec.goal,
+                &spec.runtime.goal,
                 matches!(
                     self.factory.work_profile,
                     leveler_agent::WorkProfile::Delivery
@@ -1323,7 +1369,7 @@ impl TaskEngine {
         log.append(None, EngineEvent::VerificationStarted, observer)
             .await?;
         let verifier = Verifier::with_environment(
-            &spec.repository,
+            &spec.coding.repository,
             self.factory.tool_context.environment.clone(),
         );
         let mut plan = gate_plan(spec);
@@ -1344,10 +1390,10 @@ impl TaskEngine {
         // Attribute pre-existing/flaky failures to the baseline so only THIS
         // change's failures gate completion. No-op when the gate is green or no
         // baseline is available (`base_commit` captured at task start).
-        if let Some(base_commit) = spec.base_commit.as_deref() {
+        if let Some(base_commit) = spec.coding.base_commit.as_deref() {
             crate::baseline::reconcile_with_baseline(
                 &mut report,
-                &spec.repository,
+                &spec.coding.repository,
                 base_commit,
                 &plan,
                 modified_files,
@@ -1440,10 +1486,10 @@ fn direct_needs_mutation(goal: &str, delivery_gate: bool) -> bool {
 /// by then the project it created is on disk. An explicit plan is always
 /// honored as given.
 fn gate_plan(spec: &TaskSpec) -> VerificationPlan {
-    if spec.verification.commands.is_empty() {
-        leveler_verifier::discover::plan_for_repo(&spec.repository)
+    if spec.coding.verification.commands.is_empty() {
+        leveler_verifier::discover::plan_for_repo(&spec.coding.repository)
     } else {
-        spec.verification.clone()
+        spec.coding.verification.clone()
     }
 }
 
@@ -1676,15 +1722,19 @@ mod gate_plan_tests {
 
     fn spec(repository: std::path::PathBuf, verification: VerificationPlan) -> TaskSpec {
         TaskSpec {
-            repository,
-            goal: "build it".to_string(),
-            mode: leveler_execution::PermissionProfile::Assisted,
-            sandbox: false,
-            kind: ExecutionKind::Direct,
-            continuation: ContinuationPolicy::UntilTerminal,
-            limits: StepLimits::default(),
-            verification,
-            base_commit: None,
+            runtime: RuntimeTaskSpec {
+                goal: "build it".to_string(),
+                kind: ExecutionKind::Direct,
+                continuation: ContinuationPolicy::UntilTerminal,
+                limits: StepLimits::default(),
+            },
+            coding: CodingTaskSpec {
+                repository,
+                mode: leveler_execution::PermissionProfile::Assisted,
+                sandbox: false,
+                verification,
+                base_commit: None,
+            },
         }
     }
 

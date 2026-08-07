@@ -14,6 +14,7 @@ mod event_store;
 mod message_repo;
 mod model_request_repo;
 mod session_repo;
+mod task_store;
 mod terminal_repo;
 mod turn_repo;
 
@@ -24,5 +25,6 @@ pub use event_store::{EventStore, MemoryEventStore};
 pub use message_repo::MessageRepository;
 pub use model_request_repo::{ModelRequestRecord, ModelRequestRepository};
 pub use session_repo::{SessionRecord, SessionRepository};
+pub use task_store::{MemoryTaskStore, TaskStore};
 pub use terminal_repo::TerminalRepository;
 pub use turn_repo::{TurnRecord, TurnRepository};

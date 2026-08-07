@@ -213,9 +213,12 @@ fan-out. The multi-phase orchestrate stack (crate, CLI `plan`/`discuss`, dual
 session mode) has been removed. Legacy log kinds named `orchestrate` are
 accepted and run as direct.
 
-Lifecycle vocabulary is shared through `leveler-lifecycle`. The model may
-propose actions, but host code owns the state transition, resource budget,
-cancellation, permission decision, and completion rules.
+Lifecycle vocabulary is shared through `leveler-lifecycle`, split into a
+generic `runtime` module (`SessionStatus`, `TaskOutcome`, `TurnOutcome` — the
+states any domain understands) and a Coding `workflow` module (`AgentState`
+phase breadcrumbs, which refine runtime states but never redefine them). The
+model may propose actions, but host code owns the state transition, resource
+budget, cancellation, permission decision, and completion rules.
 
 ### 4. Tools and command execution
 
@@ -259,6 +262,16 @@ built-in defaults; projects can provide commands for other stacks in
 `leveler-storage` persists sessions and runtime state in SQLite. The local
 runtime publishes normalized events through `leveler-client-protocol`; the TUI
 can reconnect, request a snapshot, and continue from the current session state.
+
+Task and session are distinct identities: a **task** (`TaskId`, `tasks` table)
+is the engine-owned unit of work, a **session** is the conversation/client
+aggregate. Today every task has exactly one primary session and the engine
+records the association when a session is created or first runs; legacy
+databases are backfilled deterministically (a legacy session's id is its task
+id). Lifecycle columns stay on the session row while the relationship is 1:1 —
+one writer per fact. Narrow storage ports (`EventStore`, `TaskStore`) sit
+between the engine and SQLite, each with an in-memory implementation exercising
+the same contract tests.
 
 The transport DTOs are separate from internal engine types so the local protocol
 can evolve without exposing storage or provider structures.

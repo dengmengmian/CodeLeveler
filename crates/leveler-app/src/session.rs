@@ -382,15 +382,19 @@ impl Application {
     /// from `.leveler/config.yaml` or the repo's manifests.
     fn direct_spec(&self, goal: String, mode: PermissionProfile, sandbox: bool) -> TaskSpec {
         TaskSpec {
-            repository: self.layout.repo_root.clone(),
-            goal,
-            mode,
-            sandbox,
-            kind: ExecutionKind::Direct,
-            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
-            limits: self.top_level_limits(),
-            verification: leveler_verifier::discover::plan_for_repo(&self.layout.repo_root),
-            base_commit: None,
+            runtime: leveler_engine::RuntimeTaskSpec {
+                goal,
+                kind: ExecutionKind::Direct,
+                continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+                limits: self.top_level_limits(),
+            },
+            coding: leveler_engine::CodingTaskSpec {
+                repository: self.layout.repo_root.clone(),
+                mode,
+                sandbox,
+                verification: leveler_verifier::discover::plan_for_repo(&self.layout.repo_root),
+                base_commit: None,
+            },
         }
     }
 
@@ -551,8 +555,8 @@ impl Application {
         // signals). Never writes active memory; user accept is separate (K36).
         self.enqueue_memory_candidates(goal);
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
-        spec.continuation = continuation;
-        spec.limits = limits;
+        spec.runtime.continuation = continuation;
+        spec.runtime.limits = limits;
         let result = engine
             .run(
                 session_id,
@@ -686,7 +690,7 @@ impl Application {
             .await?;
         let mut spec = self.direct_spec(record.goal.clone(), mode, sandbox);
         // Resume with the persisted strategy, not an assumed one.
-        spec.kind = kind;
+        spec.runtime.kind = kind;
         let result = engine
             .resume(
                 session_id,

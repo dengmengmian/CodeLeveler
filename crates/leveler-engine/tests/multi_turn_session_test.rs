@@ -163,21 +163,25 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
 
 fn spec(h: &Harness, goal: &str) -> TaskSpec {
     TaskSpec {
-        repository: h.dir.path().to_path_buf(),
-        goal: goal.into(),
-        mode: PermissionProfile::Assisted,
-        sandbox: false,
-        kind: ExecutionKind::Direct,
-        continuation: ContinuationPolicy::bounded(6),
-        limits: StepLimits::default(),
-        verification: VerificationPlan::default(),
-        base_commit: None,
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: goal.into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(6),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: h.dir.path().to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: VerificationPlan::default(),
+            base_commit: None,
+        },
     }
 }
 
 fn spec_with_command_budget(h: &Harness, goal: &str, max_commands: u32) -> TaskSpec {
     let mut s = spec(h, goal);
-    s.limits = StepLimits {
+    s.runtime.limits = StepLimits {
         max_commands: Some(max_commands),
         ..StepLimits::default()
     };
@@ -459,7 +463,7 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     // Incomplete Goal: 1-round budget so we land BudgetLimited (resumable), not
     // CompletedUnverified from update_goal.
     let mut goal_spec = spec(&h, "把刚才那个超时也处理一下");
-    goal_spec.continuation = ContinuationPolicy::bounded(1);
+    goal_spec.runtime.continuation = ContinuationPolicy::bounded(1);
 
     // Chat left outcome CompletedUnverified; force interrupted epoch for resume.
     SessionRepository::new(&h.engine.db)
@@ -659,7 +663,10 @@ async fn chat_anchors_a_baseline_for_pre_existing_failures() {
     leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "base"]);
 
     let spec = spec(&h, "explain this repo");
-    assert!(spec.base_commit.is_none(), "spec starts without an anchor");
+    assert!(
+        spec.coding.base_commit.is_none(),
+        "spec starts without an anchor"
+    );
     let session = h.engine.create_task(&spec).await.unwrap();
     h.engine
         .chat(

@@ -151,6 +151,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_0016_backfills_tasks_for_legacy_sessions() {
+        use sqlx::ConnectOptions;
+        use sqlx::migrate::Migrate;
+
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-db-task-backfill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.db");
+
+        // Build a genuine legacy database: apply every migration BEFORE the
+        // tasks table (recorded in _sqlx_migrations exactly as an old binary
+        // would have), then write session rows.
+        {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .unwrap();
+            conn.ensure_migrations_table().await.unwrap();
+            for migration in MIGRATOR.migrations.iter().filter(|m| m.version < 16) {
+                conn.apply(migration).await.unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO sessions (id, repository, goal, status, model, state, \
+                 created_at, updated_at) VALUES \
+                 ('legacy-a','/r','g','completed','m','complete','t1','t1'), \
+                 ('legacy-b','/r','g','created','m','understand','t2','t2')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        // Reopening runs the remaining migrations; 0016 must backfill one
+        // task per legacy session, deterministically (task id = session id).
+        let db = Database::connect(&path).await.unwrap();
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, session_id, created_at FROM tasks ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("legacy-a".into(), "legacy-a".into(), "t1".into()),
+                ("legacy-b".into(), "legacy-b".into(), "t2".into()),
+            ]
+        );
+        // Legacy sessions survive untouched (resume/list depend on them).
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 2);
+
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn peek_repository_reads_latest_row_without_migrating() {
         let dir = std::env::temp_dir().join(format!(
             "leveler-db-peek-{}-{}",

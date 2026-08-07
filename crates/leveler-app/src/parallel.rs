@@ -11,7 +11,7 @@ use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_lifecycle::{AgentState, SessionStatus};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{SessionRecord, SessionRepository};
+use leveler_storage::{SessionRecord, SessionRepository, TaskStore};
 use leveler_vcs::{GitWorkflow, MergeCandidate, slugify, worktree_path};
 
 use crate::{AppError, Application};
@@ -79,6 +79,10 @@ impl Application {
             leveler_core::now(),
         )
         .await?;
+        // The parallel parent never enters the engine's run path, so its
+        // durable task row is ensured here (the engine does the same in
+        // `mark_running` for direct/chat/resume sessions).
+        let task_id = TaskStore::ensure_for_session(&db, &parent, leveler_core::now()).await?;
         let log = EventLog::new(&db, parent.clone());
         let sink = &mut |_: EngineEvent| {};
         log.append(
@@ -89,6 +93,7 @@ impl Application {
                 mode: mode_str(mode).to_string(),
                 sandbox: false,
                 kind: ExecutionKind::Parallel,
+                task_id: Some(task_id),
             },
             sink,
         )
@@ -216,35 +221,42 @@ impl Application {
         } else {
             TaskOutcome::Failed
         };
-        repo.set_outcome(&parent, outcome, leveler_core::now())
-            .await?;
-        // Operational status only; the verified-vs-unverified verdict is the
-        // `outcome` column above.
+        // Operational status; the verified-vs-unverified verdict is `outcome`.
         let (status, state) = match outcome {
             TaskOutcome::Verified => (SessionStatus::Completed, AgentState::Complete),
             TaskOutcome::CompletedUnverified => (SessionStatus::Completed, AgentState::Complete),
             _ => (SessionStatus::Failed, AgentState::Failed),
         };
-        repo.update_status(&parent, status, state, leveler_core::now())
-            .await?;
-        log.append(
-            None,
-            EngineEvent::TaskFinished {
-                stop: None,
+        // Terminal event + every lifecycle column in ONE transaction — the
+        // same barrier the engine uses. Three separate writes here used to
+        // leave a window where a crash produced an outcome without its
+        // canonical TaskFinished event (or vice versa).
+        let event = EngineEvent::TaskFinished {
+            stop: None,
+            outcome,
+            reason: (outcome != TaskOutcome::Verified).then(|| {
+                format!(
+                    "{} candidate(s), {} verified, {} integrated",
+                    candidates.len(),
+                    verified,
+                    merge.integrated.len()
+                )
+            }),
+        };
+        let (event_type, payload) = event
+            .to_row()
+            .map_err(crate::session::app_error_from_engine)?;
+        leveler_storage::TerminalRepository::new(&db)
+            .finish_task(
+                &parent,
+                &event_type,
+                &payload,
                 outcome,
-                reason: (outcome != TaskOutcome::Verified).then(|| {
-                    format!(
-                        "{} candidate(s), {} verified, {} integrated",
-                        candidates.len(),
-                        verified,
-                        merge.integrated.len()
-                    )
-                }),
-            },
-            sink,
-        )
-        .await
-        .map_err(crate::session::app_error_from_engine)?;
+                status,
+                state,
+                leveler_core::now(),
+            )
+            .await?;
 
         Ok(ParallelEditOutcome {
             candidates: candidates.len(),

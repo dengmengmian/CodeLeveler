@@ -173,17 +173,21 @@ async fn harness(
 
 fn direct_spec(dir: &Path) -> TaskSpec {
     TaskSpec {
-        repository: dir.to_path_buf(),
-        goal: "add a function".to_string(),
-        mode: PermissionProfile::Assisted,
-        sandbox: false,
-        kind: ExecutionKind::Direct,
-        continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
-        limits: leveler_agent::StepLimits::default(),
-        // No gates: the resume turn can at best land CompletedUnverified, which
-        // keeps these tests focused on the crash-window reconciliation.
-        verification: VerificationPlan::default(),
-        base_commit: None,
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: "add a function".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+            limits: leveler_agent::StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: dir.to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            // No gates: the resume turn can at best land CompletedUnverified, which
+            // keeps these tests focused on the crash-window reconciliation.
+            verification: VerificationPlan::default(),
+            base_commit: None,
+        },
     }
 }
 
