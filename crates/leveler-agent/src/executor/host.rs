@@ -190,6 +190,20 @@ impl Executor {
             }
             self.remember_always(&grant.tool, grant.command_line.as_deref(), &grant.paths);
         }
+        // OWNERSHIP FENCE — last gate before an AdmittedCall can exist. The
+        // announcing/approval facts are durable (barriers above); now prove
+        // this runtime still owns the task. A stale runtime must not start a
+        // new external side effect: abort the run with a typed error, never a
+        // model-visible refusal it could loop on. This is an additional gate
+        // on top of the persistence barrier, not a replacement — and it does
+        // not claim exactly-once (ownership may still change between this
+        // check and the tool's effect; that window belongs to transfer
+        // protocols, not P2C).
+        if let Some(fence) = &self.execution_fence
+            && let Err(reason) = fence.ensure_current().await
+        {
+            return Err(AdmitError::Fatal(AgentError::StaleOwnership(reason)));
+        }
         // Host openers (`open`/`xdg-open`) only work outside seatbelt;
         // elevate after approval (the user already OK'd this call).
         let mut ctx = ctx;
