@@ -862,6 +862,15 @@ No Cloud Worker, Scheduler or NPC implementation becomes the main development pr
 
 Priority: **P1**
 
+> Status: **landed (task identity slice)**. `TaskId` is a typed identity in
+> `leveler-core`; the `tasks` table (migration 0016) records the 1:1
+> task↔primary-session association with a deterministic legacy backfill
+> (task id = session id); the engine ensures the association at creation and
+> at every execution entry, and `TaskStarted` carries the task id additively.
+> `TaskSpec` is split into `RuntimeTaskSpec` (goal/kind/continuation/limits)
+> and `CodingTaskSpec` (repository/mode/sandbox/verification/base_commit).
+> `RuntimeId` is intentionally not introduced yet — nothing consumes it.
+
 Introduce the minimum Task abstraction required by future runtimes.
 
 ## 8.1 New generic identities
@@ -919,6 +928,13 @@ Existing session ids and resume flows must continue working through an explicit 
 
 Priority: **P1**
 
+> Status: **first semantic split landed**. `leveler-lifecycle` now has a
+> `runtime` module (SessionStatus/TaskOutcome/TurnOutcome) that must not
+> reference the Coding `workflow` module (AgentState). All original paths are
+> re-exported; wire strings and the `sessions.state` column are unchanged.
+> The remaining Coding vocabulary (plan/progress/readiness/…) still lives at
+> the crate top level pending a consumer that needs the physical split.
+
 Refactor `leveler-lifecycle` semantically before splitting crates.
 
 Generic status example:
@@ -949,6 +965,12 @@ NPC/future domain code can depend on generic lifecycle without needing Coding wo
 # 10. Phase 3 — Runtime storage ports
 
 Priority: **P1/P2**
+
+> Status: **partial**. `EventStore` (pre-existing) and `TaskStore` (new) are
+> ports with SQLite + in-memory implementations sharing contract tests. The
+> engine still holds a concrete `Database` for session/turn/message/terminal
+> repositories — extracting those ports is deferred until a consumer (cloud
+> store, engine tests without SQLite) needs each one.
 
 The existing EventStore seam should be preserved and expanded with narrow contracts where necessary.
 
