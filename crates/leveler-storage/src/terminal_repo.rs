@@ -139,10 +139,14 @@ impl TerminalRepository<'_> {
         state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError> {
+        // BEGIN IMMEDIATE: the ownership SELECT below precedes the writes, and
+        // a deferred read-then-write upgrade deadlocks against a concurrent
+        // writer with an immediate "database is locked" no busy_timeout can
+        // wait out (same rule as MessageRepository::append_in_turn).
         let mut tx = self
             .db
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(StorageError::from)
             .map_err(crate::OwnershipError::Storage)?;
@@ -195,10 +199,14 @@ impl TerminalRepository<'_> {
         outcome: TurnOutcome,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError> {
+        // BEGIN IMMEDIATE: the ownership SELECT below precedes the writes, and
+        // a deferred read-then-write upgrade deadlocks against a concurrent
+        // writer with an immediate "database is locked" no busy_timeout can
+        // wait out (same rule as MessageRepository::append_in_turn).
         let mut tx = self
             .db
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(StorageError::from)
             .map_err(crate::OwnershipError::Storage)?;

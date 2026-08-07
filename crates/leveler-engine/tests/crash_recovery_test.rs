@@ -872,3 +872,87 @@ async fn two_agents_sharing_a_call_id_do_not_close_each_others_records() {
     );
     assert_eq!(dangling[0].agent_id.as_deref(), Some("agent-b"));
 }
+
+/// A stale token cannot acknowledge the crash window: the dangling call
+/// survives and no recovery ToolCallFinished is appended.
+#[tokio::test]
+async fn stale_runtime_cannot_acknowledge_crash_window() {
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), Vec::new()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "apply_patch", "{}".into()).await;
+
+    let task = engine.task_for_session(&session).await.unwrap().unwrap();
+    let rt = leveler_core::RuntimeId::new("rt-test");
+    let stale = leveler_storage::OwnershipStore::acquire(
+        &db,
+        &task,
+        &rt,
+        leveler_core::OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
+    // Reacquire: the first token is now stale.
+    leveler_storage::OwnershipStore::acquire(&db, &task, &rt, stale.owner_epoch)
+        .await
+        .unwrap();
+
+    let result = leveler_engine::acknowledge_crash_window(&db, &stale, &session).await;
+    assert!(result.is_err(), "a stale token must not acknowledge");
+    let log = EventLog::new(&db, session.clone());
+    assert_eq!(
+        log.dangling_tool_calls().await.unwrap().len(),
+        1,
+        "the dangling call must survive a stale acknowledgement"
+    );
+}
+
+/// A different runtime cannot acknowledge a foreign-owned task's crash
+/// window: explicit OwnershipConflict, canonical history untouched.
+#[tokio::test]
+async fn foreign_runtime_cannot_acknowledge_crash_window() {
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), Vec::new()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "apply_patch", "{}".into()).await;
+
+    let task = engine.task_for_session(&session).await.unwrap().unwrap();
+    leveler_storage::OwnershipStore::acquire(
+        &db,
+        &task,
+        &leveler_core::RuntimeId::new("rt-other"),
+        leveler_core::OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
+
+    // The engine (rt-test) refuses: conflict, no steal, nothing written.
+    let error = engine
+        .acknowledge_crash_window(&session)
+        .await
+        .expect_err("foreign-owned task must not be acknowledged");
+    assert!(
+        error.to_string().contains("owned by runtime"),
+        "must be a named conflict: {error}"
+    );
+    let log = EventLog::new(&db, session.clone());
+    assert_eq!(log.dangling_tool_calls().await.unwrap().len(), 1);
+}
+
+/// The engine's own acknowledge path (current/unowned task) reacquires a
+/// fresh epoch and closes the window — the positive control.
+#[tokio::test]
+async fn current_owner_can_acknowledge_crash_window() {
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), Vec::new()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "apply_patch", "{}".into()).await;
+
+    let closed = engine.acknowledge_crash_window(&session).await.unwrap();
+    assert_eq!(closed, 1);
+    let log = EventLog::new(&db, session.clone());
+    assert!(log.dangling_tool_calls().await.unwrap().is_empty());
+}
