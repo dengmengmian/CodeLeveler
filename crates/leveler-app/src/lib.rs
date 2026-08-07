@@ -21,7 +21,7 @@ mod workspace_view;
 
 pub use global_config::{GlobalConfig, GlobalConfigError};
 pub use interactive::InProcessRuntimeClient;
-pub use parallel::ParallelEditOutcome;
+pub use parallel::{ParallelEditOutcome, acquire_parallel_parent_ownership};
 pub use runtime_identity::{RuntimeIdentityError, load_or_create_runtime_id};
 pub use session::engine_event_to_agent;
 pub use vcs::ShipOptions;

@@ -110,3 +110,53 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
         .unwrap();
     assert_eq!(outcome, None, "no stale outcome mutation");
 }
+
+/// A foreign-owned task must never be auto-stolen by the parallel parent
+/// path: explicit error, owner and epoch untouched, session not Running,
+/// canonical log empty.
+#[tokio::test]
+async fn parallel_parent_refuses_foreign_owner() {
+    let db = Database::connect_in_memory().await.unwrap();
+    let record = SessionRecord::new("/repo", "parallel goal", "mock/m", leveler_core::now());
+    let parent = SessionId::new(record.id.clone());
+    SessionStore::create(&db, &record).await.unwrap();
+    let task = TaskStore::ensure_for_session(&db, &parent, leveler_core::now())
+        .await
+        .unwrap();
+
+    // runtime-B owns the task at epoch 1.
+    let b = RuntimeId::new("rt-b");
+    OwnershipStore::acquire(&db, &task, &b, OwnerEpoch::UNOWNED)
+        .await
+        .unwrap();
+
+    // runtime-A's parallel parent acquisition must refuse, not CAS-steal.
+    let error = leveler_app::acquire_parallel_parent_ownership(&db, &task, &RuntimeId::new("rt-a"))
+        .await
+        .expect_err("a foreign owner must never be auto-stolen");
+    assert!(
+        error.to_string().contains("owned by runtime"),
+        "must be a named conflict: {error}"
+    );
+
+    // Owner, epoch, session status, and canonical log are all untouched.
+    let current = OwnershipStore::current(&db, &task).await.unwrap().unwrap();
+    assert_eq!(current.runtime.as_ref(), Some(&b));
+    assert_eq!(current.epoch.get(), 1);
+    let (_, _, _, outcome) = SessionStore::execution(&db, &parent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, None);
+    let record = leveler_storage::SessionRepository::new(&db)
+        .get(&parent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.status,
+        SessionStatus::Created,
+        "the session must not have entered Running"
+    );
+    assert!(EventStore::load(&db, &parent).await.unwrap().is_empty());
+}

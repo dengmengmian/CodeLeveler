@@ -28,6 +28,36 @@ pub struct ParallelEditOutcome {
     pub session: String,
 }
 
+/// Acquire (or same-runtime reacquire) the parallel parent's task ownership —
+/// the SAME policy as `TaskEngine::acquire_ownership`: unowned or owned by
+/// this runtime → CAS to a fresh epoch; owned by a FOREIGN runtime → explicit
+/// error, no acquire, no owner mutation. The OwnershipStore CAS can transfer
+/// across runtimes when given the right expected epoch; that capability is for
+/// explicit future transfer protocols, never an execution path's auto-acquire.
+pub async fn acquire_parallel_parent_ownership(
+    ownership: &dyn leveler_storage::OwnershipStore,
+    task_id: &leveler_core::TaskId,
+    runtime_id: &leveler_core::RuntimeId,
+) -> Result<leveler_core::OwnershipToken, AppError> {
+    let current = ownership
+        .current(task_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no task row for task {task_id}")))?;
+    if let Some(owner) = &current.runtime
+        && owner != runtime_id
+    {
+        return Err(AppError::Engine(format!(
+            "task {task_id} is owned by runtime {owner} at epoch {}; \
+             this runtime ({runtime_id}) must not run it as a parallel parent",
+            current.epoch
+        )));
+    }
+    ownership
+        .acquire(task_id, runtime_id, current.epoch)
+        .await
+        .map_err(|e| AppError::Engine(e.to_string()))
+}
+
 impl Application {
     /// Run `n` agents concurrently on `task` in isolated worktrees and integrate
     /// the results into the current branch. Requires a clean, committed repo.
@@ -80,13 +110,7 @@ impl Application {
         // a stale runtime never stamps a covering terminal fact.
         let task_id = TaskStore::ensure_for_session(&db, &parent, leveler_core::now()).await?;
         let runtime_id = self.runtime_id()?;
-        let current = leveler_storage::OwnershipStore::current(&db, &task_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("no task row for session {parent}")))?;
-        let token =
-            leveler_storage::OwnershipStore::acquire(&db, &task_id, &runtime_id, current.epoch)
-                .await
-                .map_err(|e| AppError::Engine(e.to_string()))?;
+        let token = acquire_parallel_parent_ownership(&db, &task_id, &runtime_id).await?;
         leveler_storage::SessionStore::update_status_owned(
             &db,
             &token,
