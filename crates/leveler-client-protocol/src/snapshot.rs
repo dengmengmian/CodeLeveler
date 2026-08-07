@@ -90,6 +90,36 @@ pub struct RuntimeInfo {
     /// The serving process id (diagnostics; changes on restart).
     #[serde(default)]
     pub pid: u32,
+    /// Minimal health (all additive; old daemons deserialize as defaults).
+    ///
+    /// Health is NOT ownership: a reachable, accepting runtime still proves
+    /// task authority only through its current OwnershipToken — this block
+    /// never bypasses fencing. Reachability itself is the request having
+    /// succeeded; a timeout/decode failure means "unreachable", never a
+    /// healthy-shaped default.
+    #[serde(default)]
+    pub health: RuntimeHealth,
+}
+
+/// The runtime's admission/lifecycle health at answer time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeHealth {
+    /// Whether the runtime will admit new main turns right now (false while
+    /// shutting down or at capacity). Old daemons report the default
+    /// `false` — callers treat "unknown" conservatively.
+    #[serde(default)]
+    pub accepting_work: bool,
+    /// Main turns currently executing.
+    #[serde(default)]
+    pub active_turns: u32,
+    /// The concurrent main-turn admission limit, when one exists. This is
+    /// the real ActiveTurns capacity, not an invented number.
+    #[serde(default)]
+    pub turn_capacity: Option<u32>,
+    /// The runtime has begun an explicit shutdown.
+    #[serde(default)]
+    pub shutting_down: bool,
 }
 
 /// Coarse runtime state, surfaced in the status line .

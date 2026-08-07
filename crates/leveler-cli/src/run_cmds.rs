@@ -226,6 +226,27 @@ async fn connect_default_runtime(
 #[cfg(unix)]
 const DAEMON_ENSURE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The client-side daemon revival hook: when the daemon dies mid-session,
+/// the transport calls back here to run the SAME discover-or-start flow the
+/// TUI used at startup. The connected probe client is dropped immediately —
+/// revival only guarantees a runtime is serving again; the caller reconnects
+/// itself.
+#[cfg(unix)]
+struct DaemonReviver {
+    layout: Layout,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl leveler_local_transport::RuntimeReviver for DaemonReviver {
+    async fn revive(&self) -> Result<(), String> {
+        ensure_default_runtime(&self.layout)
+            .await
+            .map(|_probe_client| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Discover the repository's local runtime, starting one if none is running.
 ///
 /// The default TUI path: probe the per-repo socket; when nobody answers,
@@ -355,7 +376,19 @@ pub(crate) async fn cmd_tui(
         // running. Unix only: platforms without the socket transport keep
         // the embedded runtime.
         #[cfg(unix)]
-        SocketIntent::ProbeDefault => Some(ensure_default_runtime(&layout).await?),
+        SocketIntent::ProbeDefault => {
+            let client = ensure_default_runtime(&layout).await?;
+            // Supervisor semantics for a daemon that dies mid-session: the
+            // client's reconnect/request paths call back into the same
+            // ensure-daemon flow (idempotent; a concurrent revival race
+            // elects one winner), the restarted daemon keeps its durable
+            // RuntimeId, recovery reacquires a fresh OwnerEpoch inside the
+            // daemon, and session subscriptions resync from a fresh snapshot.
+            client.set_reviver(Arc::new(DaemonReviver {
+                layout: layout.clone(),
+            }));
+            Some(client)
+        }
         #[cfg(not(unix))]
         SocketIntent::ProbeDefault => connect_default_runtime(&socket_path).await.map_err(
             |error| {

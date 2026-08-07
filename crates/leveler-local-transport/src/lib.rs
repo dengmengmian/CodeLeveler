@@ -73,6 +73,19 @@ impl Drop for LocalWaiterGuard {
     }
 }
 
+/// Brings a dead local runtime back: called by the socket client when the
+/// daemon stops answering. The implementation (the CLI's ensure-daemon path)
+/// probes and, if needed, starts a fresh detached daemon for the same state
+/// directory — same durable RuntimeId, fresh OwnerEpoch on reacquire; task
+/// recovery itself stays in the daemon/engine. Idempotent: losing a
+/// concurrent revival race and connecting to the winner is success.
+#[async_trait]
+pub trait RuntimeReviver: Send + Sync {
+    /// Ensure a runtime is serving the endpoint again. `Err` = revival
+    /// failed (reported, then retried by the caller's loop).
+    async fn revive(&self) -> Result<(), String>;
+}
+
 /// Everything the daemon needs to create a new interactive session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -560,6 +573,10 @@ mod unix {
         session_events:
             Arc<Mutex<std::collections::HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>>,
         shutdown: CancellationToken,
+        /// Optional daemon revival hook (see [`RuntimeReviver`]); installed by
+        /// the composition root, consulted by request retries and the
+        /// subscription reconnect loop.
+        reviver: Arc<std::sync::OnceLock<Arc<dyn RuntimeReviver>>>,
     }
 
     impl LocalSocketRuntimeClient {
@@ -609,6 +626,8 @@ mod unix {
             let (events, _) = broadcast::channel(2048);
             let session_events = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let shutdown = CancellationToken::new();
+            let reviver: Arc<std::sync::OnceLock<Arc<dyn RuntimeReviver>>> =
+                Arc::new(std::sync::OnceLock::new());
             tokio::spawn(subscription_loop(
                 endpoint.clone(),
                 stream,
@@ -616,6 +635,7 @@ mod unix {
                 None,
                 shutdown.clone(),
                 client_kind,
+                reviver.clone(),
             ));
             Ok(Self {
                 endpoint,
@@ -623,11 +643,33 @@ mod unix {
                 events,
                 session_events,
                 shutdown,
+                reviver,
             })
         }
 
+        /// Install the daemon revival hook. All existing and future
+        /// subscriptions and request retries use it from now on.
+        pub fn set_reviver(&self, reviver: Arc<dyn RuntimeReviver>) {
+            let _ = self.reviver.set(reviver);
+        }
+
         async fn request(&self, request: WireRequest) -> Result<WireResponse, TransportError> {
-            request_endpoint(&self.endpoint, request).await
+            match request_endpoint(&self.endpoint, request.clone()).await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    // The daemon may be gone. Revive (idempotent ensure) and
+                    // retry ONCE; commands themselves are idempotent at the
+                    // envelope layer, and a second failure surfaces loudly.
+                    let Some(reviver) = self.reviver.get() else {
+                        return Err(error);
+                    };
+                    reviver
+                        .revive()
+                        .await
+                        .map_err(TransportError::Unavailable)?;
+                    request_endpoint(&self.endpoint, request).await
+                }
+            }
         }
 
         async fn ensure_session_subscription(
@@ -652,6 +694,7 @@ mod unix {
                 Some(session_id.clone()),
                 self.shutdown.clone(),
                 self.client_kind,
+                self.reviver.clone(),
             ));
             Ok(events)
         }
@@ -778,6 +821,7 @@ mod unix {
             let session_id = session_id.clone();
             let shutdown = self.shutdown.clone();
             let client_kind = self.client_kind;
+            let reviver = self.reviver.clone();
             tokio::spawn(async move {
                 loop {
                     match open_subscription(&endpoint, Some(session_id.clone()), client_kind).await
@@ -790,6 +834,7 @@ mod unix {
                                 Some(session_id),
                                 shutdown,
                                 client_kind,
+                                reviver,
                             )
                             .await;
                             return;
@@ -902,6 +947,7 @@ mod unix {
         session_id: Option<SessionId>,
         shutdown: CancellationToken,
         client_kind: ClientKind,
+        reviver: Arc<std::sync::OnceLock<Arc<dyn RuntimeReviver>>>,
     ) {
         loop {
             loop {
@@ -937,10 +983,20 @@ mod unix {
                         }
                         break;
                     }
-                    Err(_) => tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
-                    },
+                    Err(_) => {
+                        // Nobody is answering: if a reviver is installed, try
+                        // to bring the daemon back (idempotent ensure; losing
+                        // a concurrent revival race is fine). Then retry.
+                        if let Some(reviver) = reviver.get()
+                            && let Err(error) = reviver.revive().await
+                        {
+                            tracing::warn!(%error, "local runtime revival failed; retrying");
+                        }
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                        }
+                    }
                 }
             }
         }
@@ -1347,6 +1403,12 @@ mod tests {
                 runtime_id: leveler_client_protocol::RuntimeId::new("rt-test"),
                 version: "test".to_string(),
                 pid: std::process::id(),
+                health: leveler_client_protocol::RuntimeHealth {
+                    accepting_work: true,
+                    active_turns: 0,
+                    turn_capacity: Some(4),
+                    shutting_down: false,
+                },
             })
         }
     }
