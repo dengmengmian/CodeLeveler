@@ -310,8 +310,25 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
     };
     let log = EventLog::new(&store, h.session.clone());
     let stores = leveler_storage::EngineStores::from_database(&h.db);
+    let task =
+        leveler_storage::TaskStore::ensure_for_session(&h.db, &h.session, leveler_core::now())
+            .await
+            .unwrap();
+    let owner = leveler_storage::OwnershipStore::current(&h.db, &task)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = leveler_storage::OwnershipStore::acquire(
+        &h.db,
+        &task,
+        &leveler_core::RuntimeId::new("rt-test"),
+        owner.epoch,
+    )
+    .await
+    .unwrap();
     let runner = TurnRunner {
         stores: &stores,
+        token,
         session_id: h.session.clone(),
         log: &log,
         factory: &h.factory,
@@ -390,6 +407,7 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
     let stores = leveler_storage::EngineStores::from_database(&h.db);
     let engine = TaskEngine {
         stores,
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -467,6 +485,7 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
     let stores = leveler_storage::EngineStores::from_database(&h.db);
     let engine = TaskEngine {
         stores,
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

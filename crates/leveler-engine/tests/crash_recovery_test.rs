@@ -149,6 +149,7 @@ async fn harness(
     let db = Database::connect_in_memory().await.unwrap();
     let engine = TaskEngine {
         stores: leveler_storage::EngineStores::from_database(&db),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(responses)),
             registry: Arc::new(default_registry()),

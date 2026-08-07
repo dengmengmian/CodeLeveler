@@ -185,8 +185,25 @@ async fn run_chat_turn(
     text: &str,
 ) -> Result<leveler_engine::TurnRecordedOutcome, leveler_engine::EngineError> {
     let stores = leveler_storage::EngineStores::from_database(&h.db);
+    let task =
+        leveler_storage::TaskStore::ensure_for_session(&h.db, &h.session, leveler_core::now())
+            .await
+            .unwrap();
+    let owner = leveler_storage::OwnershipStore::current(&h.db, &task)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = leveler_storage::OwnershipStore::acquire(
+        &h.db,
+        &task,
+        &leveler_core::RuntimeId::new("rt-test"),
+        owner.epoch,
+    )
+    .await
+    .unwrap();
     let runner = TurnRunner {
         stores: &stores,
+        token,
         session_id: h.session.clone(),
         log,
         factory: &h.factory,

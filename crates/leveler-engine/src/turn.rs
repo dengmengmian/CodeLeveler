@@ -46,6 +46,7 @@ pub struct TurnRecordedOutcome {
 struct TurnSink {
     messages: Arc<dyn MessageStore>,
     model_requests: Arc<dyn ModelRequestStore>,
+    token: leveler_core::OwnershipToken,
     session_id: SessionId,
     turn_id: TurnId,
 }
@@ -59,7 +60,8 @@ impl TranscriptSink for TurnSink {
             .collect::<Result<_, _>>()
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
         self.messages
-            .append_in_turn(
+            .append_in_turn_owned(
+                &self.token,
                 &self.session_id,
                 &self.turn_id,
                 &payloads,
@@ -95,10 +97,43 @@ impl TranscriptSink for TurnSink {
     }
 }
 
+/// The engine's [`leveler_agent::ExecutionFence`]: before a tool dispatch,
+/// re-read the task's current owner and compare it to this run's token.
+/// Inherently check-then-dispatch (§ the fence guarantees a runtime already
+/// known stale dispatches nothing new; it does not claim exactly-once).
+struct OwnershipFence {
+    ownership: Arc<dyn leveler_storage::OwnershipStore>,
+    token: leveler_core::OwnershipToken,
+}
+
+#[async_trait::async_trait]
+impl leveler_agent::ExecutionFence for OwnershipFence {
+    async fn ensure_current(&self) -> Result<(), String> {
+        match self.ownership.current(&self.token.task_id).await {
+            Ok(Some(owner))
+                if owner.runtime.as_ref() == Some(&self.token.runtime_id)
+                    && owner.epoch == self.token.owner_epoch =>
+            {
+                Ok(())
+            }
+            Ok(current) => Err(format!(
+                "token {} is stale (current owner: {:?})",
+                self.token,
+                current.map(|o| (o.runtime, o.epoch))
+            )),
+            // A fence that cannot be verified must fail closed.
+            Err(error) => Err(format!("ownership check failed: {error}")),
+        }
+    }
+}
+
 /// Everything a strategy needs to run persisted turns. Persistence enters
 /// through the same narrow ports as the engine — never a concrete database.
 pub struct TurnRunner<'a> {
     pub stores: &'a EngineStores,
+    /// Proof of current task ownership; every authoritative write this
+    /// runner performs is fenced on it.
+    pub token: leveler_core::OwnershipToken,
     pub session_id: SessionId,
     pub log: &'a EventLog<'a>,
     pub factory: &'a ExecutorFactory,
@@ -125,9 +160,10 @@ impl TurnRunner<'_> {
         };
         // Reap zombies left by kill -9 / unclean TUI exit so a new turn never
         // coexists with a permanent `running` sibling on the same session.
-        let reaped_events = crate::reap_running_turns(
+        let reaped_events = crate::reap_running_turns_owned(
             self.stores.turns.as_ref(),
             self.stores.terminal.as_ref(),
+            &self.token,
             Some(&self.session_id),
         )
         .await?;
@@ -145,7 +181,8 @@ impl TurnRunner<'_> {
         let turn = self
             .stores
             .turns
-            .start(
+            .start_owned(
+                &self.token,
                 &self.session_id,
                 kind.as_str(),
                 payload.as_deref(),
@@ -170,6 +207,7 @@ impl TurnRunner<'_> {
         let mut sink = TurnSink {
             messages: self.stores.messages.clone(),
             model_requests: self.stores.model_requests.clone(),
+            token: self.token.clone(),
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
         };
@@ -207,6 +245,13 @@ impl TurnRunner<'_> {
                 // canonical events are durable in this turn's event log.
                 .with_event_barrier(Arc::new(crate::recorders::PumpBarrier {
                     events: events.clone(),
+                }))
+                // Ownership fence: after the barriers, before dispatch, the
+                // host re-proves this runtime still owns the task. Inherited
+                // by delegated child executors.
+                .with_execution_fence(Arc::new(OwnershipFence {
+                    ownership: self.stores.ownership.clone(),
+                    token: self.token.clone(),
                 }));
             // Resume / same unfinished task: seed Plan/Ledger/Progress so
             // Delivery and closeout stay consistent. Fresh Content turns must
@@ -367,7 +412,8 @@ impl TurnRunner<'_> {
         let (event_type, payload) = event.to_row()?;
         self.stores
             .terminal
-            .finish_turn(
+            .finish_turn_owned(
+                &self.token,
                 &self.session_id,
                 &turn_id,
                 &event_type,

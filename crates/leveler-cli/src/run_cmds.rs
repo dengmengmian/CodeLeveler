@@ -676,18 +676,26 @@ pub(crate) async fn cmd_serve(
     // token-less clients); an ephemeral TCP port alone proves nothing.
     let bound = bind_daemon_transports(&socket_path, tcp, token, service).await?;
 
-    let db = app.open_database().await?;
-    let reaped = leveler_engine::reap_running_turns(&db, &db, None)
-        .await?
-        .len();
-    if reaped > 0 {
-        tracing::warn!(reaped, "reaped zombie turns before daemon startup");
-    }
-
-    // Resolve the durable identity before declaring readiness, so a
-    // corrupt identity file fails startup loudly instead of serving with an
-    // unknown identity.
+    // Resolve the durable identity before the reap: recovery is an
+    // authoritative write and must be performed as a named runtime.
     let runtime_id = app.runtime_id()?;
+    let db = app.open_database().await?;
+    let reap = leveler_engine::reap_after_restart(
+        &leveler_storage::EngineStores::from_database(&db),
+        &runtime_id,
+        None,
+    )
+    .await?;
+    for conflict in &reap.conflicts {
+        tracing::warn!(session = conflict.session_id.as_str(), owner = ?conflict.owner,
+            "not reaping a task owned by another runtime");
+    }
+    if !reap.events.is_empty() {
+        tracing::warn!(
+            reaped = reap.events.len(),
+            "reaped zombie turns before daemon startup"
+        );
+    }
 
     if let Some(path) = &ready_json {
         // Machine-readable readiness for the supervising process (spawned by
@@ -808,11 +816,18 @@ pub(crate) async fn cmd_web(
             ));
             let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
             let db = app.open_database().await?;
-            let reaped = leveler_engine::reap_running_turns(&db, &db, None)
-                .await?
-                .len();
-            if reaped > 0 {
-                tracing::warn!(reaped, "reaped zombie turns before WebUI startup");
+            let runtime_id = app.runtime_id()?;
+            let reap = leveler_engine::reap_after_restart(
+                &leveler_storage::EngineStores::from_database(&db),
+                &runtime_id,
+                None,
+            )
+            .await?;
+            if !reap.events.is_empty() {
+                tracing::warn!(
+                    reaped = reap.events.len(),
+                    "reaped zombie turns before WebUI startup"
+                );
             }
             let router = leveler_web::RouterService::new(service, app.layout.repo_root.clone());
             let registry_path = web_projects_registry_path();

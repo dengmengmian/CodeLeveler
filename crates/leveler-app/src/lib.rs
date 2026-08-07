@@ -459,6 +459,7 @@ impl Application {
             // The composition root chooses the adapter: every engine port
             // backed by this repository's SQLite database (shared pool).
             stores: leveler_storage::EngineStores::from_database(&self.open_database().await?),
+            runtime_id: self.runtime_id()?,
             factory: leveler_engine::ExecutorFactory {
                 runtime,
                 registry: Arc::new(registry),

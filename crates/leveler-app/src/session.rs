@@ -307,6 +307,11 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
              run; inspect the workspace, then resume with --confirm-recovery to acknowledge \
              and continue"
         )),
+        // Ownership failures stay loud and named: the user (or a supervising
+        // layer) must know this was a fencing decision, not a storage fault.
+        error @ (EngineError::Ownership(_) | EngineError::OwnershipConflict { .. }) => {
+            AppError::Engine(error.to_string())
+        }
     }
 }
 
@@ -326,13 +331,28 @@ impl Application {
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
         // Local single-user CLI: clear zombie `running` turns left by a prior
-        // process kill before starting a fresh interactive session.
-        let reaped = leveler_engine::reap_running_turns(&db, &db, None)
-            .await
-            .map_err(app_error_from_engine)?
-            .len();
-        if reaped > 0 {
-            tracing::warn!(reaped, "reaped zombie running turns on session create");
+        // process kill before starting a fresh interactive session. Foreign-
+        // owned tasks are reported, never touched.
+        let runtime_id = self.runtime_id()?;
+        let outcome = leveler_engine::reap_after_restart(
+            &leveler_storage::EngineStores::from_database(&db),
+            &runtime_id,
+            None,
+        )
+        .await
+        .map_err(app_error_from_engine)?;
+        for conflict in &outcome.conflicts {
+            tracing::warn!(
+                session = conflict.session_id.as_str(),
+                owner = ?conflict.owner,
+                "not reaping a task owned by another runtime"
+            );
+        }
+        if !outcome.events.is_empty() {
+            tracing::warn!(
+                reaped = outcome.events.len(),
+                "reaped zombie running turns on session create"
+            );
         }
         self.insert_session(&db, model, goal).await
     }

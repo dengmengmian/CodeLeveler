@@ -166,6 +166,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     let db = Database::connect_in_memory().await.unwrap();
     let engine = TaskEngine {
         stores: leveler_storage::EngineStores::from_database(&db),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(default_registry()),
@@ -1089,6 +1090,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
     let workspace = Workspace::new(dir2.path()).unwrap();
     let engine2 = TaskEngine {
         stores: leveler_storage::EngineStores::from_database(&h.db),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(patch_then_resolve())),
             registry: Arc::new(default_registry()),
