@@ -1,0 +1,125 @@
+# R1 — Post-turn verification failure that must drive Engine repair.
+# The repo's own verification gate (.leveler/config.yaml) runs the test suite
+# WITH the `integration` build tag; the agent's natural in-turn check
+# (`go test ./...`) does not compile those files at all. The library fix
+# alone therefore looks green in the main turn, while the CLI keeps its own
+# duplicated (still buggy) splitting — the gate catches it AFTER the turn:
+# VerificationFailed → RepairStarted → repair turn → reverify.
+# The integration-tagged suite is a normal engineering pattern, not a trick:
+# the failing test names the file and behavior precisely.
+id: r1-post-turn-test-failure
+name: "[repair] trailing empty CSV cells are dropped (library and CLI)"
+max_rounds: 80
+files:
+  .leveler/config.yaml: |
+    verify:
+      build:
+        program: go
+        args: ["build", "./..."]
+      test:
+        program: go
+        args: ["test", "-tags", "integration", "./..."]
+  go.mod: |
+    module csvnorm
+
+    go 1.21
+  csv/fields.go: |
+    package csv
+
+    import "strings"
+
+    // SplitRecord splits one CSV record into its cells. Quoting is out of
+    // scope for this tool; cells never contain commas.
+    func SplitRecord(line string) []string {
+    	return strings.FieldsFunc(line, func(r rune) bool { return r == ',' })
+    }
+  csv/fields_test.go: |
+    package csv
+
+    import (
+    	"reflect"
+    	"testing"
+    )
+
+    func TestSplitRecordBasic(t *testing.T) {
+    	got := SplitRecord("a,b,c")
+    	if !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
+    		t.Fatalf("SplitRecord = %#v", got)
+    	}
+    }
+  cmd/csvnorm/main.go: |
+    package main
+
+    import (
+    	"bufio"
+    	"fmt"
+    	"os"
+    	"strings"
+    )
+
+    // csvnorm reads CSV on stdin and reprints each record as
+    // `<n> cells: <cell|cell|...>` so downstream scripts can rely on a fixed
+    // shape.
+    func main() {
+    	scanner := bufio.NewScanner(os.Stdin)
+    	for scanner.Scan() {
+    		line := scanner.Text()
+    		cells := strings.FieldsFunc(line, func(r rune) bool { return r == ',' })
+    		fmt.Printf("%d cells: %s\n", len(cells), strings.Join(cells, "|"))
+    	}
+    }
+  integration/cli_test.go: |
+    //go:build integration
+
+    package integration
+
+    import (
+    	"os/exec"
+    	"strings"
+    	"testing"
+    )
+
+    // The CLI must preserve empty cells end to end, exactly like the library.
+    func TestCLIPreservesEmptyCells(t *testing.T) {
+    	cmd := exec.Command("go", "run", "csvnorm/cmd/csvnorm")
+    	cmd.Stdin = strings.NewReader("a,b,\n,x,\n")
+    	out, err := cmd.CombinedOutput()
+    	if err != nil {
+    		t.Fatalf("cli failed: %v\n%s", err, out)
+    	}
+    	want := "3 cells: a|b|\n3 cells: |x|\n"
+    	if string(out) != want {
+    		t.Fatalf("cli output = %q, want %q", out, want)
+    	}
+    }
+task: |
+  Bug report: empty CSV cells are silently dropped. A record like
+
+      a,b,
+
+  has three cells (the last one empty), but this tool reports two — both the
+  library's SplitRecord and the csvnorm command lose empty cells anywhere in
+  the record ("a,,c" comes back as two cells as well).
+
+  Expected behavior: splitting preserves every cell, including empty ones,
+  so "a,b," has 3 cells and ",x," has 3 cells. Quoting stays out of scope.
+
+  Fix the behavior and cover it with tests. The project's verification must
+  pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go test -tags integration ./... > /dev/null
+      # Direct behavioral check of the binary, independent of the tests.
+      d="$(mktemp -d)"
+      cp -R . "$d/work"
+      cd "$d/work"
+      go build -o csvnorm-bin ./cmd/csvnorm
+      out="$(printf 'a,b,\n,x,\n' | ./csvnorm-bin)"
+      [ "$(sed -n '1p' <<<"$out")" = "3 cells: a|b|" ]
+      [ "$(sed -n '2p' <<<"$out")" = "3 cells: |x|" ]
+      # The empty-cell rule is locked by a non-tagged unit test too.
+      grep -rqliE 'empty' --include='*_test.go' csv/ > /dev/null

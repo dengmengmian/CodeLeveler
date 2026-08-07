@@ -1,0 +1,235 @@
+# R2 — Multi-gate verification with a partial first pass: format and build
+# gates PASS while the test gate FAILS after the main turn. The e2e-tagged
+# suite exercises TWO consumers that duplicate the library's normalization
+# (the CLI and the report renderer); a main-turn fix of the library alone
+# leaves both failing, and the single repair round (DIRECT_REPAIR_ATTEMPTS=1,
+# unmodified) has to carry the whole remaining distance — that capacity is
+# exactly what this case measures.
+id: r2-multi-gate-repair
+name: "[repair] label slashes are flattened in the library, CLI and report"
+max_rounds: 80
+files:
+  .leveler/config.yaml: |
+    verify:
+      format:
+        program: bash
+        args: ["-c", "test -z \"$(gofmt -l .)\""]
+      build:
+        program: go
+        args: ["build", "./..."]
+      test:
+        program: go
+        args: ["test", "-tags", "e2e", "./..."]
+  go.mod: |
+    module labeler
+
+    go 1.21
+  label/normalize.go: |
+    package label
+
+    import "strings"
+
+    // Normalize canonicalizes an issue label: trimmed, lowercase, runs of
+    // non-alphanumeric characters collapse to '-'.
+    func Normalize(raw string) string {
+    	raw = strings.TrimSpace(strings.ToLower(raw))
+    	var b strings.Builder
+    	lastDash := false
+    	for _, r := range raw {
+    		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+    			b.WriteRune(r)
+    			lastDash = false
+    			continue
+    		}
+    		if !lastDash && b.Len() > 0 {
+    			b.WriteByte('-')
+    			lastDash = true
+    		}
+    	}
+    	return strings.TrimSuffix(b.String(), "-")
+    }
+  label/normalize_test.go: |
+    package label
+
+    import "testing"
+
+    func TestNormalizeBasics(t *testing.T) {
+    	cases := map[string]string{
+    		"  Bug  ":      "bug",
+    		"UI Polish":    "ui-polish",
+    		"Good First!!": "good-first",
+    		"P1  Hotfix":   "p1-hotfix",
+    	}
+    	for in, want := range cases {
+    		if got := Normalize(in); got != want {
+    			t.Fatalf("Normalize(%q) = %q, want %q", in, got, want)
+    		}
+    	}
+    }
+  report/render.go: |
+    package report
+
+    import (
+    	"fmt"
+    	"sort"
+    	"strings"
+    )
+
+    // ByArea groups normalized labels under their top-level area (the part
+    // before the first '/'; labels without an area group under "general").
+    // It normalizes its inputs itself so raw labels can be passed straight in.
+    func ByArea(rawLabels []string) string {
+    	groups := map[string][]string{}
+    	for _, raw := range rawLabels {
+    		normalized := inlineNormalize(raw)
+    		area := "general"
+    		rest := normalized
+    		if i := strings.IndexByte(normalized, '/'); i > 0 {
+    			area = normalized[:i]
+    			rest = normalized[i+1:]
+    		}
+    		groups[area] = append(groups[area], rest)
+    	}
+    	areas := make([]string, 0, len(groups))
+    	for area := range groups {
+    		areas = append(areas, area)
+    	}
+    	sort.Strings(areas)
+    	var b strings.Builder
+    	for _, area := range areas {
+    		sort.Strings(groups[area])
+    		fmt.Fprintf(&b, "%s: %s\n", area, strings.Join(groups[area], ", "))
+    	}
+    	return b.String()
+    }
+
+    // inlineNormalize duplicates label.Normalize's rules for report use.
+    func inlineNormalize(raw string) string {
+    	raw = strings.TrimSpace(strings.ToLower(raw))
+    	var b strings.Builder
+    	lastDash := false
+    	for _, r := range raw {
+    		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+    			b.WriteRune(r)
+    			lastDash = false
+    			continue
+    		}
+    		if !lastDash && b.Len() > 0 {
+    			b.WriteByte('-')
+    			lastDash = true
+    		}
+    	}
+    	return strings.TrimSuffix(b.String(), "-")
+    }
+  cmd/labeler/main.go: |
+    package main
+
+    import (
+    	"bufio"
+    	"fmt"
+    	"os"
+    	"strings"
+    )
+
+    // labeler normalizes one label per stdin line and prints it back.
+    func main() {
+    	scanner := bufio.NewScanner(os.Stdin)
+    	for scanner.Scan() {
+    		raw := scanner.Text()
+    		fmt.Println(cliNormalize(raw))
+    	}
+    }
+
+    // cliNormalize duplicates label.Normalize's rules to keep the binary
+    // dependency-free.
+    func cliNormalize(raw string) string {
+    	raw = strings.TrimSpace(strings.ToLower(raw))
+    	var b strings.Builder
+    	lastDash := false
+    	for _, r := range raw {
+    		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+    			b.WriteRune(r)
+    			lastDash = false
+    			continue
+    		}
+    		if !lastDash && b.Len() > 0 {
+    			b.WriteByte('-')
+    			lastDash = true
+    		}
+    	}
+    	return strings.TrimSuffix(b.String(), "-")
+    }
+  e2e/cli_test.go: |
+    //go:build e2e
+
+    package e2e
+
+    import (
+    	"os/exec"
+    	"strings"
+    	"testing"
+    )
+
+    func TestCLIKeepsAreaSlashes(t *testing.T) {
+    	cmd := exec.Command("go", "run", "labeler/cmd/labeler")
+    	cmd.Stdin = strings.NewReader("area/UI Polish\nBug\n")
+    	out, err := cmd.CombinedOutput()
+    	if err != nil {
+    		t.Fatalf("cli failed: %v\n%s", err, out)
+    	}
+    	want := "area/ui-polish\nbug\n"
+    	if string(out) != want {
+    		t.Fatalf("cli output = %q, want %q", out, want)
+    	}
+    }
+  e2e/report_test.go: |
+    //go:build e2e
+
+    package e2e
+
+    import (
+    	"testing"
+
+    	"labeler/report"
+    )
+
+    func TestReportGroupsByArea(t *testing.T) {
+    	out := report.ByArea([]string{"area/UI Polish", "area/Dark Mode", "Bug"})
+    	want := "area: dark-mode, ui-polish\ngeneral: bug\n"
+    	if out != want {
+    		t.Fatalf("ByArea = %q, want %q", out, want)
+    	}
+    }
+task: |
+  Bug report: label areas are being destroyed. Labels use `/` to carry an
+  area prefix — "area/UI Polish" means label "UI Polish" in area "area" —
+  but normalization flattens the slash into a dash: the tool prints
+  "area-ui-polish", and the area report can no longer group anything (every
+  label lands under "general").
+
+  Expected behavior everywhere labels are normalized: `/` is a structural
+  separator and must be preserved as-is, each slash-separated segment is
+  normalized under the existing rules (lowercase, non-alphanumeric runs
+  collapse to '-'), and labels without a slash behave exactly as before.
+  "area/UI Polish" normalizes to "area/ui-polish", and the area report
+  groups it under "area".
+
+  Fix the behavior, cover it with tests, and make the project's
+  verification pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go test -tags e2e ./... > /dev/null
+      test -z "$(gofmt -l .)"
+      d="$(mktemp -d)"
+      cp -R . "$d/work"
+      cd "$d/work"
+      go build -o labeler-bin ./cmd/labeler
+      out="$(printf 'area/UI Polish\nBug\n' | ./labeler-bin)"
+      [ "$(sed -n '1p' <<<"$out")" = "area/ui-polish" ]
+      [ "$(sed -n '2p' <<<"$out")" = "bug" ]
+      # slash rule locked by an untagged unit test as well
+      grep -rqliE 'slash|area/' --include='*_test.go' label/ > /dev/null
