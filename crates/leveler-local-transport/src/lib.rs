@@ -686,14 +686,31 @@ mod unix {
             match request_endpoint(&self.endpoint, request.clone()).await {
                 Ok(response) => Ok(response),
                 Err(error) => {
-                    // The daemon may be gone. Revive it (idempotent ensure)
-                    // in every case — but only REPLAY the request when its
-                    // outcome cannot have mutated anything (reads) or the
-                    // daemon deduplicates it (Deliver's CommandEnvelope).
-                    // A raw Send or CreateSession whose response was lost may
-                    // already have run: replaying could duplicate a mutation,
-                    // so it fails loudly as outcome-unknown instead. Safety
-                    // over seamlessness.
+                    // Only REPLAY a request whose outcome cannot have mutated
+                    // anything (reads) or that the daemon deduplicates
+                    // (Deliver's CommandEnvelope). A raw Send or
+                    // CreateSession whose response was lost may already have
+                    // run: no matter whether a reviver exists, succeeds, or
+                    // fails, the ONLY truthful answer is outcome-unknown —
+                    // revival heals the daemon, it never resolves what the
+                    // first attempt did. Safety over seamlessness.
+                    if !request.safe_to_retry_after_transport_failure() {
+                        let revival = match self.reviver.get() {
+                            Some(reviver) => match reviver.revive().await {
+                                Ok(()) => "the runtime was revived".to_string(),
+                                Err(revive_error) => {
+                                    format!("revival also failed: {revive_error}")
+                                }
+                            },
+                            None => "no reviver installed".to_string(),
+                        };
+                        return Err(TransportError::OutcomeUnknown(format!(
+                            "the local runtime connection failed mid-request; the request was \
+                             NOT replayed because its first attempt may already have taken \
+                             effect ({error}; {revival})"
+                        )));
+                    }
+                    // Safe request: revive, then replay exactly once.
                     let Some(reviver) = self.reviver.get() else {
                         return Err(error);
                     };
@@ -701,13 +718,6 @@ mod unix {
                         .revive()
                         .await
                         .map_err(TransportError::Unavailable)?;
-                    if !request.safe_to_retry_after_transport_failure() {
-                        return Err(TransportError::OutcomeUnknown(format!(
-                            "the local runtime connection failed mid-request; the request was \
-                             NOT replayed because its first attempt may already have taken \
-                             effect ({error})"
-                        )));
-                    }
                     request_endpoint(&self.endpoint, request).await
                 }
             }
@@ -1619,8 +1629,19 @@ mod tests {
         let _ = serve.await;
 
         // A safe request through the real failure path: fails → reviver runs
-        // the ensure → retried once → succeeds against the revived daemon.
-        let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+        // the ensure → retried → succeeds against the revived daemon. A
+        // short outer retry absorbs scheduler races between the old server's
+        // teardown and the revived bind under a parallel test load.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let info = loop {
+            match LocalRuntimeService::runtime_info(&client).await {
+                Ok(info) => break info,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await
+                }
+                Err(error) => panic!("revival never produced a reachable runtime: {error}"),
+            }
+        };
         assert_eq!(info.runtime_id.as_str(), "rt-test");
         assert!(
             reviver.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
@@ -1784,6 +1805,86 @@ mod tests {
 
     /// Raw Send has no idempotency key: after an uncertain failure it fails
     /// outcome-unknown and is never replayed.
+    #[tokio::test]
+    async fn unsafe_request_without_reviver_is_outcome_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let boot = Arc::new(TestRuntime::new());
+        let boot_server = LocalSocketServer::bind(&path, boot.clone()).await.unwrap();
+        let boot_shutdown = CancellationToken::new();
+        let boot_serve = tokio::spawn(boot_server.serve(boot_shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        boot_shutdown.cancel();
+        let _ = boot_serve.await;
+
+        // The dead end fully reads the request and drops the connection; NO
+        // reviver is installed.
+        let received = deadend_server(&path);
+        let error = client
+            .create_session(CreateSessionRequest {
+                goal: "must not duplicate".to_string(),
+                model: None,
+                mode: PermissionProfile::Assisted,
+            })
+            .await
+            .expect_err("uncertain CreateSession without a reviver must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("outcome unknown") && text.contains("NOT replayed"),
+            "outcome-unknown is the primary semantic even without a reviver: {text}"
+        );
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A reviver that always fails: revival failure must NOT downgrade the
+    /// mutation-outcome uncertainty to a plain Unavailable.
+    struct FailingReviver;
+
+    #[async_trait]
+    impl RuntimeReviver for FailingReviver {
+        async fn revive(&self) -> Result<(), String> {
+            Err("revival unavailable in this test".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_request_stays_outcome_unknown_when_revival_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        client.set_reviver(Arc::new(FailingReviver));
+        shutdown.cancel();
+        let _ = serve.await;
+
+        let error = client
+            .send(ClientCommand::SubmitMessage {
+                session_id: SessionId::new("s1"),
+                content: "must not duplicate".to_string(),
+                attachments: vec![],
+            })
+            .await
+            .expect_err("uncertain raw Send with a failing reviver must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("outcome unknown") && text.contains("NOT replayed"),
+            "OutcomeUnknown must not be overridden by the revival failure: {text}"
+        );
+        assert!(
+            !text.starts_with("runtime error: local transport is unavailable"),
+            "revival failure must not become the primary error: {text}"
+        );
+        assert!(
+            runtime.commands.lock().unwrap().is_empty(),
+            "the request must not have been replayed"
+        );
+    }
+
     #[tokio::test]
     async fn raw_send_is_not_replayed_after_uncertain_failure() {
         let dir = tempfile::tempdir().unwrap();
