@@ -256,6 +256,37 @@ impl leveler_storage::TerminalStore for FailingTerminal {
             "injected terminal failure".into(),
         ))
     }
+
+    async fn finish_task_owned(
+        &self,
+        _: &leveler_core::OwnershipToken,
+        _: &leveler_core::SessionId,
+        _: &str,
+        _: &str,
+        _: leveler_engine::TaskOutcome,
+        _: leveler_lifecycle::SessionStatus,
+        _: leveler_lifecycle::AgentState,
+        _: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
+        Err(leveler_storage::OwnershipError::Storage(
+            leveler_storage::StorageError::InvalidData("injected terminal failure".into()),
+        ))
+    }
+
+    async fn finish_turn_owned(
+        &self,
+        _: &leveler_core::OwnershipToken,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+        _: &str,
+        _: &str,
+        _: leveler_engine::TurnOutcome,
+        _: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
+        Err(leveler_storage::OwnershipError::Storage(
+            leveler_storage::StorageError::InvalidData("injected terminal failure".into()),
+        ))
+    }
 }
 
 /// A MessageStore whose appends fail — the transcript is not durable and the
@@ -281,6 +312,19 @@ impl leveler_storage::MessageStore for FailingMessages {
         _: &leveler_core::SessionId,
     ) -> Result<Vec<String>, leveler_storage::StorageError> {
         Ok(Vec::new())
+    }
+
+    async fn append_in_turn_owned(
+        &self,
+        _: &leveler_core::OwnershipToken,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+        _: &[String],
+        _: leveler_core::Timestamp,
+    ) -> Result<(), leveler_storage::OwnershipError> {
+        Err(leveler_storage::OwnershipError::Storage(
+            leveler_storage::StorageError::InvalidData("injected transcript failure".into()),
+        ))
     }
 }
 

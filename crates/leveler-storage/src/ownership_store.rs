@@ -188,24 +188,44 @@ impl MemoryOwnershipState {
     /// Run `write` only if `token` is current, holding the ownership lock for
     /// the whole check+write — a concurrent CAS cannot interleave, so the
     /// fenced write is atomic with its check (same observable contract as the
-    /// SQLite conditional statement).
+    /// SQLite conditional statement). Lock order everywhere: ownership first,
+    /// then the store's own row lock inside `write`.
     pub fn with_current<T>(
         &self,
         token: &OwnershipToken,
         write: impl FnOnce() -> T,
-    ) -> Result<T, StorageError> {
+    ) -> Result<T, OwnershipError> {
         let owners = self.owners.lock().unwrap();
         if !Self::is_current_locked(&owners, token) {
             let (runtime, epoch) = owners
                 .get(token.task_id.as_str())
                 .cloned()
                 .unwrap_or((None, 0));
-            return Err(StorageError::InvalidData(format!(
-                "stale ownership for task {}: token epoch {}, current owner {:?} at epoch {}",
-                token.task_id, token.owner_epoch, runtime, epoch
-            )));
+            return Err(OwnershipError::Stale {
+                task_id: token.task_id.clone(),
+                expected_epoch: token.owner_epoch,
+                actual_runtime: runtime.map(RuntimeId::new),
+                actual_epoch: OwnerEpoch::new(epoch),
+            });
         }
         Ok(write())
+    }
+}
+
+/// SQLite-side helper: build the typed stale error for a fenced write that
+/// matched zero rows, reading the task's actual owner state.
+pub(crate) async fn sqlite_stale_error(db: &Database, token: &OwnershipToken) -> OwnershipError {
+    match OwnershipStore::current(db, &token.task_id).await {
+        Ok(Some(actual)) => OwnershipError::Stale {
+            task_id: token.task_id.clone(),
+            expected_epoch: token.owner_epoch,
+            actual_runtime: actual.runtime,
+            actual_epoch: actual.epoch,
+        },
+        Ok(None) => OwnershipError::UnknownTask {
+            task_id: token.task_id.clone(),
+        },
+        Err(error) => OwnershipError::Storage(error),
     }
 }
 

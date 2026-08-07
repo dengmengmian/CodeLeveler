@@ -138,6 +138,22 @@ struct GatedStartedStore {
 
 #[async_trait]
 impl EventStore for GatedStartedStore {
+    // Fenced append: these doubles test event persistence/gating, not
+    // ownership - delegate to the unfenced path.
+    async fn append_owned(
+        &self,
+        _token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&leveler_core::TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<EventRecord, leveler_storage::OwnershipError> {
+        self.append(session_id, turn_id, event_type, payload, now)
+            .await
+            .map_err(leveler_storage::OwnershipError::Storage)
+    }
+
     async fn append(
         &self,
         session_id: &SessionId,

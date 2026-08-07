@@ -54,6 +54,17 @@ pub trait SessionStore: Send + Sync {
         &self,
         id: &SessionId,
     ) -> Result<Option<(String, bool, String, Option<TaskOutcome>)>, StorageError>;
+
+    /// Fenced [`Self::update_status`]: guard and update in one statement, so
+    /// a stale runtime cannot flip the operational lifecycle.
+    async fn update_status_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        id: &SessionId,
+        status: SessionStatus,
+        state: AgentState,
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError>;
 }
 
 /// The production SQLite adapter: delegates to [`SessionRepository`].
@@ -94,6 +105,35 @@ impl SessionStore for Database {
     ) -> Result<Option<(String, bool, String, Option<TaskOutcome>)>, StorageError> {
         SessionRepository::new(self).execution(id).await
     }
+
+    async fn update_status_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        id: &SessionId,
+        status: SessionStatus,
+        state: AgentState,
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        let updated = sqlx::query(
+            "UPDATE sessions SET status = ?2, state = ?3, updated_at = ?4 \
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM tasks WHERE session_id = ?1 \
+                 AND id = ?5 AND owner_runtime_id = ?6 AND owner_epoch = ?7)",
+        )
+        .bind(id.as_str())
+        .bind(status.as_str())
+        .bind(state.as_str())
+        .bind(now.to_rfc3339())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if updated.rows_affected() != 1 {
+            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+        }
+        Ok(())
+    }
 }
 
 /// One in-memory session row (only what the port can observe or mutate).
@@ -113,12 +153,19 @@ pub(crate) struct MemorySession {
 #[derive(Default)]
 pub struct MemorySessionStore {
     pub(crate) rows: Mutex<std::collections::HashMap<String, MemorySession>>,
+    ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
 }
 
 impl MemorySessionStore {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Couple to the shared ownership authority for fenced updates.
+    pub fn with_ownership(self, state: std::sync::Arc<crate::MemoryOwnershipState>) -> Self {
+        let _ = self.ownership.set(state);
+        self
     }
 
     /// Test hook: the lifecycle columns of one session, for contract
@@ -196,6 +243,27 @@ impl SessionStore for MemorySessionStore {
             .unwrap()
             .get(id.as_str())
             .map(|s| (s.mode.clone(), s.sandbox, s.kind.clone(), s.outcome)))
+    }
+
+    async fn update_status_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        id: &SessionId,
+        status: SessionStatus,
+        state: AgentState,
+        _now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory session store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership.with_current(token, || {
+            if let Some(session) = self.rows.lock().unwrap().get_mut(id.as_str()) {
+                session.status = status;
+                session.state = state;
+            }
+        })
     }
 }
 
