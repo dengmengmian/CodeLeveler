@@ -9,21 +9,23 @@
 
 CodeLeveler should evolve from a reliable local Coding Agent into a **Durable Agent Runtime**.
 
-The user does not need to remain in front of one terminal while work is executing. The user submits a goal to a runtime, the runtime executes that work locally, in a managed container, or in the cloud, and the user may observe and control the same task from TUI, Web, Mobile, or another product embedding CodeLeveler.
+The long-term user model is not “stay in front of one terminal while the agent works”. The user submits a goal to a runtime, the runtime keeps executing independently of a particular client, and the user may observe or control the same task from TUI, Web, or Mobile.
 
 The long-term definition is:
 
-> **CodeLeveler is a durable agent runtime that lets AI agents safely execute long-running work in real environments, locally, in managed containers, or in the cloud, while users and host products can observe and control the work through stable runtime protocols.**
+> **CodeLeveler is a durable agent runtime that lets AI agents safely execute long-running work in real environments, locally or in the cloud, while users can observe and control the same task from multiple clients.**
 
-Coding is the first and primary product domain. NPC / long-running autonomous agents are the second major domain. Other products may embed CodeLeveler as an execution engine without adopting the CodeLeveler user interfaces.
+Coding is the first and primary product domain. NPC / long-running autonomous agents are the second major domain.
+
+CodeLeveler may also be deployed inside a managed container for another product, such as an online programming environment. That is a **possible deployment form of the same runtime**, not a separate product line and not a reason to build a second agent core.
+
+AgentGate is intentionally outside this architecture. A model gateway may be used externally, but CodeLeveler must not depend on AgentGate as part of its Runtime Core.
 
 The runtime is not a generic chatbot framework. Its differentiators are durable execution, safe side effects, recoverability, multi-client control, explicit ownership, and evidence-backed completion.
 
 ---
 
-## 2. Product principles
-
-The following principles are architectural constraints, not optional product preferences.
+## 2. Non-negotiable product principles
 
 1. **TUI remains the primary Coding interface.**
 2. **Task lifetime is independent from client lifetime.** Closing TUI, Web, or Mobile does not cancel accepted work.
@@ -33,13 +35,13 @@ The following principles are architectural constraints, not optional product pre
 6. **Local and cloud databases do not use naive bidirectional table synchronization.**
 7. **Agent decisions cannot bypass ToolHost, permission, sandbox, cancellation, or durable side-effect barriers.**
 8. **The model cannot promote its own work to verified completion.**
-9. **Coding, NPC, cloud execution, and embedded execution reuse the same Runtime Core.**
+9. **Coding, NPC, local execution, cloud execution, and possible container deployment reuse the same Runtime Core.**
 10. **NPC does not create a second agent loop, permission system, event model, or recovery model.**
-11. **Scheduler belongs to the runtime/control plane, not to NPC.**
+11. **Scheduler belongs to Runtime / Control Plane infrastructure, not to NPC.**
 12. **Cloud execution uses isolated workers.**
 13. **Ownership transfer is explicit, quiesced, fenced, and recoverable.**
 14. **Client state is a projection. Runtime facts come from canonical state and events.**
-15. **The core must be stable before product breadth is expanded.**
+15. **Architecture and core stability come before product breadth.** Cloud, Scheduler, NPC, and other product surfaces must not drive premature core rewrites.
 
 ---
 
@@ -47,7 +49,7 @@ The following principles are architectural constraints, not optional product pre
 
 ### 3.1 Local Coding with remote handoff
 
-The normal development path remains TUI-first:
+TUI remains the normal development path:
 
 ```text
 Developer
@@ -79,7 +81,7 @@ Local Runtime continues
       └── Mobile reconnects
 ```
 
-From Web or Mobile the user must be able to observe or control the same task:
+Web or Mobile must eventually be able to observe or control the same task:
 
 - current status;
 - conversation;
@@ -93,9 +95,13 @@ From Web or Mobile the user must be able to observe or control the same task:
 - cancel / resume;
 - completion evidence.
 
+The architectural rule is:
+
+> **Task belongs to Runtime, not to TUI/Web/Mobile.**
+
 ### 3.2 Mobile-created local Coding task
 
-A user away from the computer can create work on an online development machine:
+A user away from the computer may create work on an online development machine:
 
 ```text
 Mobile
@@ -127,7 +133,7 @@ Create Task
    └── Auto (future policy)
 ```
 
-Cloud execution means the developer's machine may be completely offline:
+Cloud execution means the user's development machine may be completely offline:
 
 ```text
 TUI / Web / Mobile
@@ -148,7 +154,7 @@ Cloud Worker
 
 ### 3.4 NPC / long-running autonomous work
 
-NPC is a durable domain runtime above the same execution kernel.
+NPC is a long-lived domain runtime above the same execution kernel.
 
 Example:
 
@@ -175,26 +181,12 @@ Cloud Worker
 
 The user can later receive a Mobile notification, inspect progress, answer a question, approve a risky operation, or review the final evidence.
 
-### 3.5 Embedded / Container Runtime
+### 3.5 Possible container deployment in another product
 
-CodeLeveler must also be usable as infrastructure inside another product.
-
-Examples:
-
-- browser-based online programming product;
-- AI programming education environment;
-- enterprise code workspace;
-- automated maintenance service;
-- remote ephemeral development environment;
-- internal engineering platform.
-
-A host product may start one isolated container per user/workspace and run CodeLeveler inside that container:
+A future product may run CodeLeveler inside an isolated container, for example an online programming product:
 
 ```text
-Host Product / Web IDE
-        │
-        ▼
-Product Backend
+Online Programming Product
         │
         ▼
 Managed Container
@@ -210,24 +202,35 @@ Managed Container
               └── Verification
 ```
 
-The host product does not need to use CodeLeveler TUI, Web, Mobile, Relay, or consumer Control Plane. It can consume a stable Runtime API/SDK directly.
+This scenario does **not** currently require a new `Runtime SDK` product or a separate embedded architecture.
 
-This makes **Embedded Runtime / Container Runtime** a first-class deployment mode rather than a special fork of the Coding Agent.
+The preferred reuse path is the same interface family CodeLeveler already needs for itself:
+
+```text
+TUI / Web / Client Protocol
+            │
+            ▼
+      CodeLeveler Runtime
+```
+
+For an online programming product, Web is likely the main user-facing surface; TUI may also be exposed inside the remote/container development environment.
+
+If a future real integration proves that the existing client/runtime protocol is insufficient, a dedicated SDK/API may be extracted then. It is not a current architectural prerequisite.
 
 ---
 
-## 4. Deployment model
+## 4. Deployment forms
 
-CodeLeveler should support four runtime deployment forms while keeping one execution kernel.
+The core should support multiple execution environments without becoming multiple runtimes.
 
-| Deployment | Owner location | Typical client | Storage | Main use |
+| Deployment | Owner location | Typical client | Storage | Importance |
 | --- | --- | --- | --- | --- |
-| Local Runtime | User machine | TUI / local Web / remote Mobile | SQLite | Primary Coding workflow |
-| Managed Container Runtime | Product-controlled container | Host product API / Web IDE | SQLite or host adapter | Embedded products / online coding |
-| Cloud Worker Runtime | CodeLeveler cloud worker | Web / Mobile / API | Cloud store + object storage | Laptop-off long tasks |
-| NPC Runtime | Usually cloud task runtime, scheduled | Mobile / Web / API | Cloud store | Long-running autonomous work |
+| Local Runtime | User machine | TUI / local Web / remote Mobile | SQLite | Primary current direction |
+| Cloud Worker Runtime | Cloud isolated worker | Web / Mobile / TUI remote view | Cloud store + object storage | Major future direction |
+| Container-hosted Runtime | Product-managed container | Primarily Web / TUI | Usually local/container storage or host-provided persistence | Possible future integration |
+| NPC tasks | Usually Cloud Runtime | Mobile / Web | Cloud store | Major future domain |
 
-These are deployment and domain differences. They must not become separate implementations of the agent core.
+Container hosting is a deployment option, not a separate Runtime Core.
 
 ---
 
@@ -235,14 +238,13 @@ These are deployment and domain differences. They must not become separate imple
 
 ```mermaid
 flowchart TB
-    subgraph CLIENT["Client / Host Plane"]
+    subgraph CLIENT["Client Plane"]
         TUI["TUI\nPrimary Coding Client"]
-        WEB["Web\nLocal or Remote Client"]
+        WEB["Web\nLocal / Remote / Container UI"]
         MOBILE["Mobile\nRemote Control"]
-        SDK["Runtime SDK / API\nEmbedded Products"]
     end
 
-    subgraph CONTROL["Control Plane - optional for local/embedded"]
+    subgraph CONTROL["Control Plane - future"]
         AUTH["Identity / Device / Auth"]
         DIRECTORY["Runtime + Task Directory"]
         ROUTER["Command / Event Router"]
@@ -266,22 +268,22 @@ flowchart TB
         ENGINE --> AGENT --> HOST --> TOOLS --> EXECUTION
     end
 
-    subgraph DEPLOY["Execution Environments"]
+    subgraph ENV["Execution Environment"]
         LOCAL["Local Machine"]
-        CONTAINER["Managed Container"]
+        CONTAINER["Managed Container\noptional deployment"]
         CLOUD["Cloud Worker / VM / MicroVM"]
     end
 
     subgraph DATA["Persistence"]
-        SQLITE["Local / Container SQLite"]
-        PG["Cloud Runtime Store"]
+        SQLITE["Local SQLite"]
+        CLOUDSTORE["Cloud Runtime Store"]
         OBJECT["Artifact / Workspace Object Store"]
     end
 
     TUI --> ROUTER
     WEB --> ROUTER
     MOBILE --> ROUTER
-    SDK --> ENGINE
+    ROUTER --> ENGINE
 
     AUTH --- ROUTER
     DIRECTORY --- ROUTER
@@ -289,7 +291,6 @@ flowchart TB
     NOTIFY --- ROUTER
     PROJ --- ROUTER
 
-    ROUTER --> ENGINE
     CODING --> ENGINE
     NPC --> ENGINE
     FUTURE --> ENGINE
@@ -299,11 +300,11 @@ flowchart TB
     EXECUTION --> CLOUD
 
     ENGINE --> SQLITE
-    ENGINE --> PG
+    ENGINE --> CLOUDSTORE
     ENGINE --> OBJECT
 ```
 
-Control Plane is required for remote/cloud orchestration, but not for every deployment. A self-contained container embedding CodeLeveler should be able to run without depending on CodeLeveler Cloud.
+For purely local or container-hosted use, the Control Plane is optional. Clients may connect directly through local/runtime transport.
 
 ---
 
@@ -330,7 +331,7 @@ It owns generic runtime semantics:
 It must not require Coding-specific concepts such as:
 
 - Cargo;
-- Git verification strategy;
+- Git-specific verification strategy;
 - repository-specific task phases;
 - LSP;
 - NPC identity;
@@ -338,13 +339,13 @@ It must not require Coding-specific concepts such as:
 - NPC world state;
 - UI concerns.
 
-The current implementation can remain Coding-first during migration. The target boundary is generic, not an instruction to remove working Coding behavior prematurely.
+The current implementation should remain Coding-first during migration. The target boundary is generic, but that is not a reason to prematurely remove working Coding behavior.
 
 ---
 
 ## 7. Agent Loop boundary
 
-`leveler-agent` should remain the direct model-tool-result loop.
+`leveler-agent` remains the direct model-tool-result loop:
 
 ```text
 Context
@@ -374,7 +375,7 @@ The Agent may:
 - manage context and compaction;
 - propose tools;
 - receive tool results;
-- request continuation/delegation through host-provided policies.
+- request continuation/delegation through host-provided policy.
 
 The Agent must not:
 
@@ -389,7 +390,7 @@ The Agent must not:
 
 ## 8. ToolHost and execution safety
 
-ToolHost is the single admission path from model-proposed action to real execution.
+ToolHost is the single admission path from model-proposed action to real execution:
 
 ```text
 Tool proposal
@@ -416,16 +417,15 @@ Execution
 Durable finish record
 ```
 
-All domains and deployment modes reuse this boundary:
+All domains and execution environments reuse this boundary:
 
 - local Coding;
 - cloud Coding;
-- container-embedded Coding;
+- container-hosted Coding;
 - child agents;
-- NPC-triggered work;
-- future Review or Maintenance runtimes.
+- NPC-triggered work.
 
-There must not be separate `NpcToolExecutor`, `CloudToolExecutor`, or `EmbeddedToolExecutor` paths that bypass the same safety contract.
+There must not be separate `NpcToolExecutor`, `CloudToolExecutor`, or `ContainerToolExecutor` paths that bypass the same safety contract.
 
 ---
 
@@ -437,7 +437,7 @@ The current product naturally grew around Session as the unit of work. The targe
 
 A Task is a durable unit of work with an execution lifecycle.
 
-Suggested conceptual fields:
+Conceptually:
 
 ```text
 Task
@@ -470,11 +470,9 @@ The migration must be gradual. Existing sessions cannot be invalidated merely to
 
 ---
 
-## 10. Generic runtime lifecycle vs domain workflow
+## 10. Generic lifecycle vs domain workflow
 
-Runtime lifecycle should be coarse and domain-neutral.
-
-Suggested generic lifecycle:
+Runtime lifecycle should be coarse and domain-neutral:
 
 ```text
 Created
@@ -489,7 +487,7 @@ Failed
 Cancelled
 ```
 
-Coding-specific workflow may retain richer states such as:
+Coding-specific workflow can retain richer states such as:
 
 ```text
 Understand
@@ -501,7 +499,7 @@ Repair
 Review
 ```
 
-NPC may have a completely different domain state model.
+NPC may have a different domain state model.
 
 The invariant is:
 
@@ -511,7 +509,7 @@ The invariant is:
 
 ## 11. Single Authoritative Runtime Owner
 
-This is the most important distributed-runtime invariant.
+The most important distributed-runtime invariant is:
 
 > **Each Task has exactly one authoritative Runtime Owner at any point in time.**
 
@@ -525,20 +523,7 @@ ExecutionLocation
 Lease / heartbeat metadata
 ```
 
-Example:
-
-```json
-{
-  "task_id": "task-123",
-  "runtime_id": "runtime-macbook",
-  "owner_epoch": 7,
-  "execution_location": "local"
-}
-```
-
-The owner is the only writer allowed to produce canonical runtime facts for the task.
-
-`OwnerEpoch` is a fencing token. When ownership changes, the epoch advances. A stale runtime reconnecting after a network partition must not be able to append canonical events, resolve approvals, or complete the task under an older epoch.
+`OwnerEpoch` acts as a fencing token. When ownership changes, the epoch advances. A stale runtime reconnecting after a partition must not append canonical events, resolve approvals, or complete the task under an older epoch.
 
 This prevents split brain and duplicate side effects.
 
@@ -546,16 +531,16 @@ This prevents split brain and duplicate side effects.
 
 ## 12. Commands and events
 
-### Command direction
+### Commands
 
 ```text
-TUI / Web / Mobile / Host API
-            │
-            ▼
-        Router
-            │
-            ▼
- Authoritative Runtime Owner
+TUI / Web / Mobile
+        │
+        ▼
+     Router
+        │
+        ▼
+Authoritative Runtime Owner
 ```
 
 Typical commands:
@@ -572,41 +557,38 @@ Typical commands:
 - TransferTask;
 - ScheduleTask.
 
-### Event direction
+### Events
 
 ```text
 Authoritative Runtime Owner
-            │
-            ▼
-   Canonical Event Stream
-            │
-            ├── TUI
-            ├── Web
-            ├── Mobile
-            ├── Host Product
-            └── Cloud Projection
+        │
+        ▼
+Canonical Event Stream
+        │
+        ├── TUI
+        ├── Web
+        ├── Mobile
+        └── Cloud Projection
 ```
 
 Canonical events must be:
 
 - sequenced;
 - versioned;
-- durable where they describe runtime facts;
+- durable when they describe runtime facts;
 - attributable;
 - replayable for recovery/projection;
 - ownership/fencing aware in distributed mode.
 
-Display-only streaming deltas can remain transient.
+Display-only streaming deltas may remain transient.
 
 ---
 
 ## 13. Storage architecture
 
-### 13.1 Local Runtime
+### Local Runtime
 
-SQLite remains an appropriate local source of truth.
-
-It may persist:
+SQLite remains an appropriate local source of truth for:
 
 - task/session metadata;
 - turns;
@@ -617,34 +599,28 @@ It may persist:
 - verification records;
 - artifact metadata.
 
-### 13.2 Embedded / Container Runtime
+### Container-hosted Runtime
 
-The default embedded container can also use local SQLite because the container itself is the authoritative runtime owner.
+A container may use the same local storage model when the container runtime is authoritative. If a future host product needs stronger centralized durability, that requirement should be satisfied through the same storage ports introduced for Runtime generalization, not by creating a new agent implementation.
 
-A host product may optionally provide a different Runtime Store adapter when it needs centralized durability.
+### Cloud Runtime
 
-### 13.3 Cloud Runtime
+Cloud execution should use a cloud-capable transactional store behind the same logical storage contracts. PostgreSQL is the expected candidate, but the architecture should depend on semantics rather than a database brand.
 
-Cloud execution should use a cloud-capable transactional store, expected to be PostgreSQL or an equivalent implementation behind runtime storage ports.
-
-Large data belongs outside transactional rows:
+Large payloads belong in object storage when appropriate:
 
 - workspace packages;
 - large logs;
 - attachments;
 - artifact bodies;
 - diff bundles;
-- snapshots too large for row storage.
-
-Use an object store for those payloads.
+- large snapshots.
 
 ---
 
 ## 14. Local and cloud data interoperability
 
-Local SQLite and cloud storage must be **semantically interoperable**, not directly bidirectionally synchronized at the table level.
-
-Correct model:
+Local SQLite and cloud storage are **semantically interoperable**, not directly bidirectionally synchronized at the table level.
 
 ```text
 Local Task
@@ -654,18 +630,9 @@ Cloud Task
    └── Cloud Runtime Store = authoritative
 ```
 
-The cloud may maintain a projection for a local task:
+The cloud may maintain a projection of a local task for Web/Mobile display and notification, but that projection is not an execution writer.
 
-- task name;
-- owner;
-- current projected status;
-- last event/time;
-- waiting approval flag;
-- notification metadata.
-
-A projection is not an execution writer.
-
-User actions travel as Commands to the authoritative Runtime Owner. They are not applied by updating a projection table and later syncing databases.
+User actions travel as Commands to the authoritative Runtime Owner. They are not applied by updating a projection row and later merging databases.
 
 ---
 
@@ -687,24 +654,9 @@ sequenceDiagram
     L->>C: Release ownership
     C->>W: Assign task
     W->>C: Acquire ownership for new epoch
-    W->>W: Restore runtime context + workspace
+    W->>W: Restore context + workspace
     W->>W: Resume execution
 ```
-
-A transfer package may include:
-
-- task metadata;
-- event watermark;
-- context snapshot;
-- transcript state required to resume;
-- repository base/ref;
-- dirty tracked changes;
-- untracked files;
-- required artifacts;
-- pending interactions;
-- execution configuration.
-
-Secrets are not blindly copied. The destination runtime obtains scoped credentials through its own credential mechanism.
 
 A task with an unreconciled `ToolCallStarted` and no matching finish cannot transfer ownership until recovery determines whether the side effect ran.
 
@@ -714,19 +666,13 @@ A task with an unreconciled `ToolCallStarted` and no matching finish cannot tran
 
 The local runtime must become a durable service independent of TUI lifetime.
 
-TUI target relationship:
+Target relationship:
 
 ```text
-TUI
- │
- └── connect to Runtime
-```
-
-not:
-
-```text
-TUI process
- └── owns task lifetime
+TUI / Web
+    │
+    ▼
+Local Runtime Service
 ```
 
 The local runtime/supervisor is responsible for:
@@ -738,110 +684,33 @@ The local runtime/supervisor is responsible for:
 - restart/recovery;
 - task admission capacity;
 - remote attachment;
-- optional registration with a Control Plane.
+- optional registration with Control Plane.
 
-An in-process mode may remain for development, tests, debugging, or minimal embedded use, but must not define product semantics.
-
----
-
-## 17. Embedded Runtime API
-
-Embedded use requires a stable headless contract independent from UI crates.
-
-The API should expose runtime semantics, not internal storage or engine structs.
-
-Conceptual surface:
-
-```text
-Runtime::create_task(...)
-Runtime::submit(...)
-Runtime::subscribe(task_id)
-Runtime::snapshot(task_id)
-Runtime::approve(...)
-Runtime::clarify(...)
-Runtime::steer(...)
-Runtime::cancel(...)
-Runtime::request_diff(...)
-Runtime::shutdown(...)
-```
-
-The actual shape may be:
-
-- Rust library API;
-- local socket protocol;
-- HTTP/gRPC adapter;
-- host process protocol.
-
-The important requirement is one semantic contract.
-
-A product embedding CodeLeveler in a container must not need dependencies on TUI, browser assets, Mobile, Relay, or consumer cloud services.
+An in-process mode may remain for development, tests, debugging, or fallback, but must not define product lifecycle semantics.
 
 ---
 
-## 18. Control Plane
+## 17. Control Plane
 
-Control Plane exists to coordinate multiple runtimes and clients. It is not the Agent Runtime itself.
+Control Plane coordinates multiple runtimes and clients. It is not the Agent Runtime itself.
 
 Responsibilities:
 
-### Identity and devices
+- identity and devices;
+- runtime directory;
+- task directory;
+- command routing;
+- event projection;
+- notifications;
+- scheduler/wake-up infrastructure.
 
-- user identity;
-- paired device identity;
-- runtime identity;
-- worker identity;
-- revocation.
-
-### Runtime directory
-
-```text
-RuntimeId
-ExecutionLocation
-Online / Offline
-Capabilities
-LastHeartbeat
-Version
-```
-
-### Task directory
-
-```text
-TaskId
-RuntimeOwner
-OwnerEpoch
-ExecutionLocation
-ProjectedStatus
-Project / Workspace identity
-UpdatedAt
-```
-
-### Command routing
-
-Route commands to the authoritative owner.
-
-### Event projection
-
-Consume owner-produced events and build read-optimized views for remote clients.
-
-### Notification
-
-Notify on:
-
-- approval required;
-- clarification required;
-- blocked;
-- failed;
-- completed;
-- transfer completed;
-- NPC wake / scheduled work.
-
-The Control Plane must not directly execute model-proposed tools.
+It must not directly execute model-proposed tools or become a hidden second writer of Task facts.
 
 ---
 
-## 19. Cloud Worker
+## 18. Cloud Worker
 
-Cloud Worker is a deployment of the same Runtime Core.
+Cloud Worker is another deployment of the same Runtime Core:
 
 ```text
 Cloud Worker
@@ -850,26 +719,23 @@ Cloud Worker
    ├── leveler-agent
    ├── ToolHost
    ├── leveler-tools
-   ├── leveler-execution
-   └── Coding/NPC domain policy
+   └── leveler-execution
 ```
 
-Cloud differences belong to environment adapters and infrastructure:
+Cloud-specific differences belong to environment adapters and infrastructure:
 
 - isolated workspace provisioning;
 - credential brokering;
 - network policy;
 - CPU/memory/disk quotas;
 - process cleanup;
-- object store;
+- cloud storage;
 - worker lease / ownership;
 - environment image selection.
 
-Production cloud isolation should target container plus strong isolation, VM, or microVM depending on threat model. A worker must never be treated as trusted merely because it is cloud-hosted.
-
 ---
 
-## 20. Coding Runtime
+## 19. Coding Runtime
 
 Coding is a domain runtime layered above the generic execution kernel.
 
@@ -889,9 +755,9 @@ The generic Runtime Core should not absorb these concepts simply because Coding 
 
 ---
 
-## 21. Completion and evidence
+## 20. Completion and evidence
 
-Completion must remain host-controlled.
+Completion remains host-controlled:
 
 ```text
 Model:
@@ -909,13 +775,13 @@ Domain Completion Gate
 Engine commits terminal outcome
 ```
 
-For Coding, `Verified` remains stronger than merely receiving a model completion statement.
+For Coding, `Verified` is stronger than a model completion statement.
 
-For NPC and future domains, completion policy may differ, but the same rule holds: the model does not write its own authoritative terminal status.
+For NPC and future domains, completion policy may differ, but the model still does not write its own authoritative terminal status.
 
 ---
 
-## 22. NPC Runtime
+## 21. NPC Runtime
 
 NPC is a domain runtime that adds long-lived identity and context.
 
@@ -943,20 +809,20 @@ NPC does not own:
 - provider execution;
 - cloud worker safety.
 
-Those are shared Runtime Core responsibilities.
+Those remain shared Runtime Core responsibilities.
 
 ---
 
-## 23. Scheduler and wake-up
+## 22. Scheduler and wake-up
 
-Scheduler is runtime/control-plane infrastructure.
+Scheduler is Runtime / Control Plane infrastructure.
 
 Possible triggers:
 
 ```text
 Manual
 At(time)
-Cron / recurring schedule
+Recurring schedule
 Inbox message
 External event
 Task completed
@@ -964,29 +830,25 @@ Dependency changed
 Retry deadline
 ```
 
-The Scheduler does not run the agent loop itself. It produces a durable wake/create/resume action which is then executed by a Runtime Owner.
-
-This is necessary for NPC but is also useful for Coding maintenance, scheduled reviews, dependency checks, and unattended jobs.
+Scheduler does not run the Agent Loop itself. It creates or wakes durable work which is then executed by a Runtime Owner.
 
 ---
 
-## 24. Multi-agent
+## 23. Multi-agent
 
 The preferred model remains a main agent with dynamic delegated children rather than a permanently fixed Planner/Coder/Tester/Reviewer topology.
 
 All delegated agents:
 
 - execute through the same ToolHost;
-- share the same ownership boundary;
+- share the same task ownership boundary;
 - produce attributable events;
 - obey the same permission and cancellation semantics;
 - cannot create a hidden secondary runtime lifecycle.
 
-Future cloud scheduling may place delegated work on additional workers, but the top-level Task still has one authoritative owner coordinating canonical state.
-
 ---
 
-## 25. Client model
+## 24. Client model
 
 ### TUI
 
@@ -1000,16 +862,15 @@ TUI is the most capable Coding client:
 - sub-agents;
 - approvals;
 - steering;
-- runtime target;
 - task/session controls.
 
 ### Local Web
 
-Local Web remains loopback-bound and talks to the same local runtime contract.
+Local Web remains a browser client over the same local runtime contract.
 
 ### Remote Web
 
-Remote Web should connect through the Control Plane / remote runtime protocol. It must not be implemented by exposing the loopback Web server directly to the public internet.
+Remote Web should connect through future Control Plane / remote runtime routing. It must not be implemented by exposing the local Web server directly to the public internet.
 
 ### Mobile
 
@@ -1025,15 +886,13 @@ Mobile optimizes for remote control:
 - notifications;
 - diff / verification / evidence views.
 
-It is not expected to reproduce every TUI interaction pattern.
+### Container-hosted use
 
-### Host Product / SDK
-
-Embedded clients consume the runtime semantic API and may render their own UI entirely.
+When CodeLeveler is used inside another online programming product, the expected UI reuse is still primarily **Web and/or TUI**. A new SDK is optional and should only be introduced if real integration requirements prove necessary.
 
 ---
 
-## 26. Reconnect and offline semantics
+## 25. Reconnect and offline semantics
 
 If a client disconnects, execution continues.
 
@@ -1049,13 +908,13 @@ snapshot + watermark
 events after watermark
 ```
 
-If a Local Runtime becomes offline, Control Plane projections must display owner offline / last known state. They must not pretend execution is continuing.
+If a Local Runtime becomes offline, cloud projections must display owner offline / last known state. They must not pretend execution is continuing.
 
-If an event stream lags or continuity cannot be proven, the client must resync from a canonical snapshot rather than guess missing state.
+If event continuity cannot be proven, the client must resync from canonical state rather than guess missing events.
 
 ---
 
-## 27. Security model
+## 26. Security model
 
 ### Local
 
@@ -1077,24 +936,15 @@ If an event stream lags or continuity cannot be proven, the client must resync f
 - runtime-authenticated responses;
 - remote capability allowlist;
 - stricter remote approval rules;
-- no direct public exposure of local Web runtime.
+- no direct public exposure of the local Web runtime.
 
-### Embedded container
+### Container hosting
 
-The host product is responsible for tenant/environment isolation around the container, while CodeLeveler remains responsible for in-runtime execution safety.
-
-Required concerns include:
-
-- workspace mount boundaries;
-- secret injection scope;
-- network restrictions;
-- container escape threat model;
-- runtime shutdown cleanup;
-- host API authorization.
+The host product is responsible for isolation around the container while CodeLeveler remains responsible for in-runtime execution safety. This scenario must reuse the same ToolHost and execution policy.
 
 ### Cloud
 
-Cloud adds:
+Cloud additionally requires:
 
 - worker identity;
 - tenant isolation;
@@ -1108,18 +958,13 @@ Cloud adds:
 
 ---
 
-## 28. Model and provider independence
+## 27. Model/provider boundary
 
-The Runtime must remain independent of any one model/provider.
+CodeLeveler Runtime remains independent from a specific provider or gateway.
 
-Provider-specific:
+External model gateways, including AgentGate, may be configured like any other compatible provider route, but they are not part of CodeLeveler Runtime architecture.
 
-- HTTP endpoint;
-- authentication;
-- SSE/wire representation;
-- vendor-specific token/tool metadata.
-
-Runtime-level:
+Runtime-level semantics remain:
 
 - messages;
 - model events;
@@ -1128,13 +973,18 @@ Runtime-level:
 - context management;
 - execution policy.
 
-Embedded products must be able to supply their own provider routing strategy without forking the Runtime Core.
+Provider/gateway concerns remain outside:
+
+- endpoint selection;
+- authorization;
+- vendor wire quirks;
+- provider failover/routing implementation.
 
 ---
 
-## 29. Extension model
+## 28. Extension model
 
-The architecture should support these extension categories independently:
+The architecture may support independent extensions for:
 
 - providers / model protocols;
 - tools;
@@ -1144,34 +994,35 @@ The architecture should support these extension categories independently:
 - context providers;
 - storage adapters;
 - transports;
-- worker environment adapters;
-- host SDKs.
+- worker environment adapters.
 
-An extension must not acquire permission to bypass core invariants simply because it is pluggable.
+An extension never gains the right to bypass Runtime Core invariants.
 
 ---
 
-## 30. Non-goals
+## 29. Non-goals
 
 The target architecture explicitly rejects:
 
 - SQLite/PostgreSQL table-level bidirectional synchronization;
 - client-side authoritative task state machines;
 - Web/Mobile/NPC-specific agent loops;
-- a separate cloud tool executor bypassing ToolHost;
-- a relay becoming an execution engine;
+- a separate cloud or container Tool executor bypassing ToolHost;
+- Relay becoming an execution engine;
+- AgentGate becoming part of the CodeLeveler core architecture;
 - last-write-wins conflict resolution for runtime ownership;
-- keeping a terminal process alive as a requirement for task survival;
-- exposing the local Web server directly to the internet as remote architecture;
+- terminal process lifetime as a requirement for Task survival;
+- exposing local Web directly to the public internet as remote architecture;
+- building a Runtime SDK before a real integration requires it;
 - premature universal workflow DSLs;
 - fixed multi-agent role graphs as a core requirement;
 - abstracting every Coding concept before a second real domain proves the shared abstraction.
 
 ---
 
-## 31. Target user experience
+## 30. Target user experience
 
-A user should eventually see tasks, not process topology:
+The user should eventually see Tasks, not process topology:
 
 ```text
 Tasks
@@ -1182,9 +1033,6 @@ Running · MacBook
 Upgrade database client
 Running · Cloud
 
-Refactor exercise workspace
-Running · Embedded Container
-
 Dependency audit
 Completed · NPC
 
@@ -1192,23 +1040,17 @@ Security migration
 Waiting Approval · Cloud
 ```
 
-Entering any task from an authorized client shows the same authoritative facts.
-
-The user may choose execution location when it matters, but does not need to understand which internal crate owns the loop.
+A container-hosted integration may expose the same CodeLeveler Web/TUI experience inside another product, but this is optional and should not distort the primary runtime roadmap.
 
 ---
 
-## 32. Final architecture statement
-
-CodeLeveler should converge on this structure:
+## 31. Final architecture statement
 
 ```text
-Clients / Host Products
-        │
-        ├── TUI
-        ├── Web
-        ├── Mobile
-        └── Runtime SDK / API
+Clients
+  ├── TUI
+  ├── Web
+  └── Mobile
         │
         ▼
 Command / Event Contract
@@ -1223,8 +1065,8 @@ Authoritative Runtime Owner
         └── Execution
         │
         ├── Local Machine
-        ├── Managed Container
-        └── Cloud Worker
+        ├── Cloud Worker
+        └── Managed Container (optional deployment)
         │
         ▼
 Domain Runtime
@@ -1233,6 +1075,6 @@ Domain Runtime
         └── Future domains
 ```
 
-The strategic rule is simple:
+The strategic rule is:
 
-> **Build one durable, recoverable, safely executable Runtime Core. Product surfaces and domain runtimes should compose on top of it, not fork it.**
+> **First make one durable, recoverable, safely executable Runtime Core stable. Then build Cloud, NPC, and other product capabilities on top of that core without forking it.**
