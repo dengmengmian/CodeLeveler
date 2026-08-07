@@ -90,9 +90,7 @@ NPC 或工作流不会产生第二套会话、权限和恢复语义。
 - 旧配置、旧数据库和旧事件通过显式兼容窗口与迁移处理，不靠猜测式修复。
 - TUI、Web 或手机端断开不会改变任务事实；重连只能通过规范 snapshot / resync 恢复。
 
-目标架构的分阶段落地与验收条件见
-[`design/core-runtime-convergence-plan.md`](design/core-runtime-convergence-plan.md)。在计划完成前，
-本文描述的是规范目标；尚未满足的部分必须在计划中保持可见，不能按已实现能力宣传。
+本文描述的是规范目标架构；与当前代码之间的差距不能按已实现能力宣传。
 
 每个 crate 都 `forbid(unsafe_code)`。应用与 CLI 可用 `anyhow` 补充上下文；
 可复用的库 crate 暴露 `thiserror` 类型化错误。

@@ -3,8 +3,8 @@
 
 use leveler_remote_protocol::{ContentType, Sender, SignedEnvelope, id_is_valid};
 
-/// The worked example from `docs/design/remote-app-control.md`. An empty
-/// payload, whose SHA-256 is the well-known `e3b0c442…` digest.
+/// Worked example for an empty payload (SHA-256 is the well-known
+/// `e3b0c442…` digest).
 #[test]
 fn canonical_string_matches_the_design_example() {
     let envelope = SignedEnvelope {

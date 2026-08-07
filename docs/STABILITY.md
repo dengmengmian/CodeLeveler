@@ -36,7 +36,7 @@ was removed; long tasks use `run` / TUI with `--collaboration goal` (or
 | **Frozen** | `doctor`, `init`, `upgrade`, `config`, `models`, `model`, `sessions`, `memory`, `permissions` | Same promise. These are what setup scripts and CI call. |
 | **Provisional** | `serve`, `web`, `lsp`, `mcp`, `login`, `logout`, `completions`, `trust` | Semantics may change while the daemon/transport/auth story settles (see the Windows gap in `README.md`). Breaking changes require a `CHANGELOG.md` entry under a `### Changed` heading. |
 | **Unstable** | `eval` | Internal evaluation harness. No promise; may change or disappear without notice. Should say so in its own `--help` text. |
-| **Unstable** | `remote` | Remote control from a paired phone, and the TUI's `/remote`. The wire protocol, the pairing payload and the on-disk `~/.leveler/remote/` layout may all change; a change that invalidates existing pairings means re-pairing every device, and will say so in `CHANGELOG.md`. Not to be described as production-ready until the security gate passes (`docs/design/remote-security-gate.md`). |
+| **Unstable** | `remote` | Remote control from a paired phone, and the TUI's `/remote`. The wire protocol, the pairing payload and the on-disk `~/.leveler/remote/` layout may all change; a change that invalidates existing pairings means re-pairing every device, and will say so in `CHANGELOG.md`. Not to be described as production-ready until its security model is reviewed. |
 
 Rationale for the split: the first two tiers are what a user types or scripts
 by hand. `eval` is development tooling that happens to ship in the same binary

@@ -4,7 +4,6 @@
 | --- | --- | --- |
 | [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md) | 贡献者 | 架构与边界 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 贡献者 | 英文架构 |
-| [design/core-runtime-convergence-plan.md](design/core-runtime-convergence-plan.md) | 维护者 | 核心收敛改造与验收计划 |
 | [leveler-config-example.yaml](leveler-config-example.yaml) | 用户 | 项目 `.leveler/config.yaml` |
 | [permissions.example.yaml](permissions.example.yaml) | 用户 | 权限规则 |
 | [hooks.example.yaml](hooks.example.yaml) | 用户 | 工具钩子 |

@@ -123,10 +123,8 @@ model.
 - Old configuration, databases, and events use explicit compatibility windows and migrations, never guessed repairs.
 - Disconnecting TUI, Web, or mobile does not alter task facts; reconnect uses canonical snapshot/resync only.
 
-The staged implementation and acceptance gates are defined in
-[`design/core-runtime-convergence-plan.md`](design/core-runtime-convergence-plan.md).
-Until that plan is complete, this section is the normative target; gaps must
-remain visible in the plan and must not be presented as implemented behavior.
+This section is the normative target architecture. Gaps between it and the
+current code must not be presented as implemented behavior.
 
 Every crate forbids unsafe Rust except `leveler-execution`, which is
 `#![deny(unsafe_code)]` with a single audited exception (the Linux
