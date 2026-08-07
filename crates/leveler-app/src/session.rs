@@ -327,7 +327,7 @@ impl Application {
         let db = self.open_database().await?;
         // Local single-user CLI: clear zombie `running` turns left by a prior
         // process kill before starting a fresh interactive session.
-        let reaped = leveler_engine::reap_running_turns(&db, None)
+        let reaped = leveler_engine::reap_running_turns(&db, &db, None)
             .await
             .map_err(app_error_from_engine)?
             .len();

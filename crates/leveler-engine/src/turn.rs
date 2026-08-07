@@ -15,7 +15,7 @@ use leveler_agent::{AgentError, AgentOutcome, Clarifier, Executor, TranscriptSin
 use leveler_core::{SessionId, TurnId};
 use leveler_execution::Approver;
 use leveler_model::Message;
-use leveler_storage::{Database, MessageRepository, TerminalRepository, TurnRepository};
+use leveler_storage::{EngineStores, EventStore, MessageStore, ModelRequestStore};
 
 use crate::factory::{ExecutorFactory, TurnProfile};
 use crate::log::EventLog;
@@ -43,21 +43,22 @@ pub struct TurnRecordedOutcome {
 }
 
 /// A transcript sink that stamps every persisted message with the turn.
-struct TurnSink<'a> {
-    db: &'a Database,
+struct TurnSink {
+    messages: Arc<dyn MessageStore>,
+    model_requests: Arc<dyn ModelRequestStore>,
     session_id: SessionId,
     turn_id: TurnId,
 }
 
 #[async_trait::async_trait]
-impl TranscriptSink for TurnSink<'_> {
+impl TranscriptSink for TurnSink {
     async fn append(&mut self, messages: &[Message]) -> Result<(), AgentError> {
         let payloads: Vec<String> = messages
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<_, _>>()
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
-        MessageRepository::new(self.db)
+        self.messages
             .append_in_turn(
                 &self.session_id,
                 &self.turn_id,
@@ -75,7 +76,7 @@ impl TranscriptSink for TurnSink<'_> {
         let finish_reason = serde_json::to_value(record.finish_reason)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned));
-        leveler_storage::ModelRequestRepository::new(self.db)
+        self.model_requests
             .insert(&leveler_storage::ModelRequestRecord {
                 id: record.id.clone(),
                 session_id: self.session_id.clone(),
@@ -94,9 +95,10 @@ impl TranscriptSink for TurnSink<'_> {
     }
 }
 
-/// Everything a strategy needs to run persisted turns.
+/// Everything a strategy needs to run persisted turns. Persistence enters
+/// through the same narrow ports as the engine — never a concrete database.
 pub struct TurnRunner<'a> {
-    pub db: &'a Database,
+    pub stores: &'a EngineStores,
     pub session_id: SessionId,
     pub log: &'a EventLog<'a>,
     pub factory: &'a ExecutorFactory,
@@ -123,7 +125,12 @@ impl TurnRunner<'_> {
         };
         // Reap zombies left by kill -9 / unclean TUI exit so a new turn never
         // coexists with a permanent `running` sibling on the same session.
-        let reaped_events = crate::reap_running_turns(self.db, Some(&self.session_id)).await?;
+        let reaped_events = crate::reap_running_turns(
+            self.stores.turns.as_ref(),
+            self.stores.terminal.as_ref(),
+            Some(&self.session_id),
+        )
+        .await?;
         let reaped = reaped_events.len();
         for event in reaped_events {
             observer(event);
@@ -135,7 +142,9 @@ impl TurnRunner<'_> {
                 "reaped zombie running turns before starting a new turn"
             );
         }
-        let turn = TurnRepository::new(self.db)
+        let turn = self
+            .stores
+            .turns
             .start(
                 &self.session_id,
                 kind.as_str(),
@@ -159,7 +168,8 @@ impl TurnRunner<'_> {
         let (events, mut rx, pump_state) =
             EventEmitter::channel(EVENT_BUFFER_CAPACITY, cancellation.clone());
         let mut sink = TurnSink {
-            db: self.db,
+            messages: self.stores.messages.clone(),
+            model_requests: self.stores.model_requests.clone(),
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
         };
@@ -205,8 +215,9 @@ impl TurnRunner<'_> {
             // the seed decision and the seeding itself. Each `last_persisted_*`
             // call scans the full event log, so loading plan/progress twice
             // (as this did) doubled that cost every Content/Goal turn.
-            let progress = last_persisted_progress(self.db, &self.session_id).await?;
-            let plan = last_persisted_plan(self.db, &self.session_id).await?;
+            let progress =
+                last_persisted_progress(self.stores.events.as_ref(), &self.session_id).await?;
+            let plan = last_persisted_plan(self.stores.events.as_ref(), &self.session_id).await?;
             let seed_state = match &input {
                 TurnInput::Resume(_) => true,
                 TurnInput::Content { .. } | TurnInput::Goal { .. } => {
@@ -217,7 +228,9 @@ impl TurnRunner<'_> {
                 if let Some(plan) = plan {
                     executor = executor.with_seeded_plan(plan);
                 }
-                if let Some(ledger) = last_persisted_ledger(self.db, &self.session_id).await? {
+                if let Some(ledger) =
+                    last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
+                {
                     executor = executor.with_seeded_ledger(ledger);
                 }
                 if let Some(progress) = progress {
@@ -352,7 +365,8 @@ impl TurnRunner<'_> {
             modified_files,
         };
         let (event_type, payload) = event.to_row()?;
-        TerminalRepository::new(self.db)
+        self.stores
+            .terminal
             .finish_turn(
                 &self.session_id,
                 &turn_id,
@@ -410,12 +424,11 @@ pub(crate) fn should_seed_task_state(
 /// selected row that fails to parse is a hard error — same fail-loud policy as
 /// `EventLog::replay`, never a silently missing seed.
 async fn last_event_of_type(
-    db: &Database,
+    events: &dyn EventStore,
     session_id: &SessionId,
     event_type: &str,
 ) -> Result<Option<EngineEvent>, EngineError> {
-    use leveler_storage::EventRepository;
-    match EventRepository::new(db)
+    match events
         .load_last_by_type(session_id, event_type, None)
         .await?
     {
@@ -426,11 +439,11 @@ async fn last_event_of_type(
 
 /// Last full-list plan from the event log (SoT for resume PlanState).
 async fn last_persisted_plan(
-    db: &Database,
+    events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_agent::PlanState>, EngineError> {
     Ok(
-        match last_event_of_type(db, session_id, "plan_updated").await? {
+        match last_event_of_type(events, session_id, "plan_updated").await? {
             Some(EngineEvent::PlanUpdated { steps }) => Some(leveler_agent::PlanState { steps }),
             _ => None,
         },
@@ -439,11 +452,11 @@ async fn last_persisted_plan(
 
 /// Last EvidenceLedger snapshot from the event log (SoT for Delivery resume).
 async fn last_persisted_ledger(
-    db: &Database,
+    events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::EvidenceLedger>, EngineError> {
     Ok(
-        match last_event_of_type(db, session_id, "evidence_ledger_updated").await? {
+        match last_event_of_type(events, session_id, "evidence_ledger_updated").await? {
             Some(EngineEvent::EvidenceLedgerUpdated { ledger }) => Some(ledger),
             _ => None,
         },
@@ -452,11 +465,11 @@ async fn last_persisted_ledger(
 
 /// Last ProgressLedger snapshot (closeout / no-progress streak for continue).
 async fn last_persisted_progress(
-    db: &Database,
+    events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::ProgressLedger>, EngineError> {
     Ok(
-        match last_event_of_type(db, session_id, "progress_updated").await? {
+        match last_event_of_type(events, session_id, "progress_updated").await? {
             Some(EngineEvent::ProgressUpdated { ledger }) => Some(ledger),
             _ => None,
         },

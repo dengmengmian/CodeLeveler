@@ -677,7 +677,9 @@ pub(crate) async fn cmd_serve(
     let bound = bind_daemon_transports(&socket_path, tcp, token, service).await?;
 
     let db = app.open_database().await?;
-    let reaped = leveler_engine::reap_running_turns(&db, None).await?.len();
+    let reaped = leveler_engine::reap_running_turns(&db, &db, None)
+        .await?
+        .len();
     if reaped > 0 {
         tracing::warn!(reaped, "reaped zombie turns before daemon startup");
     }
@@ -806,7 +808,9 @@ pub(crate) async fn cmd_web(
             ));
             let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
             let db = app.open_database().await?;
-            let reaped = leveler_engine::reap_running_turns(&db, None).await?.len();
+            let reaped = leveler_engine::reap_running_turns(&db, &db, None)
+                .await?
+                .len();
             if reaped > 0 {
                 tracing::warn!(reaped, "reaped zombie turns before WebUI startup");
             }

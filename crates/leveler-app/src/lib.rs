@@ -456,7 +456,9 @@ impl Application {
             leveler_execution::HookRunner::load(&leveler_home, &self.layout.repo_root);
         let runtime: Arc<dyn ModelRuntime> = self.registry.clone();
         Ok(leveler_engine::TaskEngine {
-            db: self.open_database().await?,
+            // The composition root chooses the adapter: every engine port
+            // backed by this repository's SQLite database (shared pool).
+            stores: leveler_storage::EngineStores::from_database(&self.open_database().await?),
             factory: leveler_engine::ExecutorFactory {
                 runtime,
                 registry: Arc::new(registry),

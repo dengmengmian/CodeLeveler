@@ -139,15 +139,16 @@ impl Approver for PanickingApprover {
 async fn harness(
     approver: Arc<dyn Approver>,
     responses: Vec<ModelResponse>,
-) -> (TaskEngine, tempfile::TempDir) {
+) -> (TaskEngine, Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
     std::fs::write(dir.path().join("README.md"), "# Project\n").unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let db = Database::connect_in_memory().await.unwrap();
     let engine = TaskEngine {
-        db: Database::connect_in_memory().await.unwrap(),
+        stores: leveler_storage::EngineStores::from_database(&db),
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(responses)),
             registry: Arc::new(default_registry()),
@@ -168,7 +169,7 @@ async fn harness(
         clarifier: Arc::new(AutoClarify),
         supervisor: None,
     };
-    (engine, dir)
+    (engine, db, dir)
 }
 
 fn direct_spec(dir: &Path) -> TaskSpec {
@@ -193,11 +194,11 @@ fn direct_spec(dir: &Path) -> TaskSpec {
 
 /// Seed a minimal, replayable transcript so `resume` does not early-return with
 /// "no transcript to resume".
-async fn seed_transcript(engine: &TaskEngine, session: &SessionId) {
+async fn seed_transcript(db: &Database, session: &SessionId) {
     let system =
         serde_json::to_string(&Message::text(Role::System, "you are a coding agent")).unwrap();
     let user = serde_json::to_string(&Message::text(Role::User, "add a function")).unwrap();
-    MessageRepository::new(&engine.db)
+    MessageRepository::new(&db)
         .append(session, &[system, user], leveler_core::now())
         .await
         .unwrap();
@@ -206,17 +207,18 @@ async fn seed_transcript(engine: &TaskEngine, session: &SessionId) {
 /// Seed a dangling tool call `c1`: a `ToolCallStarted` with no matching
 /// `ToolCallFinished`, exactly what a crash mid-execution leaves behind.
 async fn seed_dangling_call(
+    db: &Database,
     engine: &TaskEngine,
     session: &SessionId,
     name: &str,
     arguments: String,
 ) {
-    let turn = TurnRepository::new(&engine.db)
+    let turn = TurnRepository::new(&db)
         .start(session, "user", None, leveler_core::now())
         .await
         .unwrap();
     let turn_id = TurnId::new(turn.id);
-    let log = EventLog::new(&engine.db, session.clone());
+    let log = EventLog::new(db, session.clone());
     log.append(
         Some(&turn_id),
         EngineEvent::ToolCallStarted {
@@ -237,17 +239,18 @@ async fn seed_dangling_call(
 /// `ToolCallStarted` followed by an `ApprovalRequested` with no resolution — its
 /// dispatch never ran, so there is no side effect to recover.
 async fn seed_pending_approval_call(
+    db: &Database,
     engine: &TaskEngine,
     session: &SessionId,
     name: &str,
     arguments: String,
 ) {
-    let turn = TurnRepository::new(&engine.db)
+    let turn = TurnRepository::new(&db)
         .start(session, "user", None, leveler_core::now())
         .await
         .unwrap();
     let turn_id = TurnId::new(turn.id);
-    let log = EventLog::new(&engine.db, session.clone());
+    let log = EventLog::new(db, session.clone());
     log.append(
         Some(&turn_id),
         EngineEvent::ToolCallStarted {
@@ -280,8 +283,8 @@ async fn seed_pending_approval_call(
 }
 
 /// Replay the persisted event log as decoded engine events, in order.
-async fn recorded_events(engine: &TaskEngine, session: &SessionId) -> Vec<EngineEvent> {
-    EventRepository::new(&engine.db)
+async fn recorded_events(db: &Database, session: &SessionId) -> Vec<EngineEvent> {
+    EventRepository::new(&db)
         .load(session)
         .await
         .unwrap()
@@ -296,11 +299,12 @@ async fn recorded_events(engine: &TaskEngine, session: &SessionId) -> Vec<Engine
 /// re-runs it and records the fresh result — no approval prompt.
 #[tokio::test]
 async fn safe_dangling_read_tool_is_auto_replayed_on_resume() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
+    seed_transcript(&db, &session).await;
     seed_dangling_call(
+        &db,
         &engine,
         &session,
         "read_file",
@@ -313,7 +317,7 @@ async fn safe_dangling_read_tool_is_auto_replayed_on_resume() {
         .await
         .unwrap();
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     let replayed = events.iter().find_map(|e| match e {
         EngineEvent::ToolCallFinished {
             call_id, is_error, ..
@@ -342,11 +346,11 @@ async fn non_idempotent_dangling_tool_blocks_resume_without_replay() {
         "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
     })
     .to_string();
-    let (engine, dir) = harness(Arc::new(PanickingApprover), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(PanickingApprover), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
-    seed_dangling_call(&engine, &session, "apply_patch", patch).await;
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "apply_patch", patch).await;
 
     let err = engine
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
@@ -364,7 +368,7 @@ async fn non_idempotent_dangling_tool_blocks_resume_without_replay() {
         "resume must stop with the exact uncertain call, got {err}"
     );
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -393,11 +397,11 @@ async fn non_idempotent_dangling_tool_is_not_falsely_marked_skipped() {
         "patch": "*** Begin Patch\n*** Update File: README.md\n # Project\n+added by patch\n*** End Patch"
     })
     .to_string();
-    let (engine, dir) = harness(Arc::new(AutoDeny), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoDeny), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
-    seed_dangling_call(&engine, &session, "apply_patch", patch).await;
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "apply_patch", patch).await;
 
     let err = engine
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
@@ -408,7 +412,7 @@ async fn non_idempotent_dangling_tool_is_not_falsely_marked_skipped() {
         leveler_engine::EngineError::RecoveryConfirmationRequired { .. }
     ));
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -434,15 +438,15 @@ async fn pending_approval_dangling_call_blocks_without_replay() {
         "patch": "*** Begin Patch\n*** Update File: README.md\n # Project\n+added by patch\n*** End Patch"
     })
     .to_string();
-    let (engine, dir) = harness(Arc::new(PanickingApprover), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(PanickingApprover), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
-    seed_pending_approval_call(&engine, &session, "apply_patch", patch).await;
+    seed_transcript(&db, &session).await;
+    seed_pending_approval_call(&db, &engine, &session, "apply_patch", patch).await;
 
     // The seeded ApprovalRequested is the ONLY one that may appear; recovery
     // must not add a second (that would mean it re-entered the approval flow).
-    let seeded_approvals = recorded_events(&engine, &session)
+    let seeded_approvals = recorded_events(&db, &session)
         .await
         .iter()
         .filter(|e| matches!(e, EngineEvent::ApprovalRequested { .. }))
@@ -463,7 +467,7 @@ async fn pending_approval_dangling_call_blocks_without_replay() {
         "unexpected recovery error: {err:?}"
     );
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(
         !events
             .iter()
@@ -488,11 +492,18 @@ async fn pending_approval_dangling_call_blocks_without_replay() {
 /// dangling for manual reconciliation.
 #[tokio::test]
 async fn corrupt_arguments_on_mutating_call_still_require_confirmation() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
-    seed_dangling_call(&engine, &session, "apply_patch", "not valid json".into()).await;
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(
+        &db,
+        &engine,
+        &session,
+        "apply_patch",
+        "not valid json".into(),
+    )
+    .await;
 
     let err = engine
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
@@ -504,7 +515,7 @@ async fn corrupt_arguments_on_mutating_call_still_require_confirmation() {
             if call_id == "c1" && tool == "apply_patch"
     ));
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -519,18 +530,18 @@ async fn corrupt_arguments_on_mutating_call_still_require_confirmation() {
 /// continue without executing a side effect.
 #[tokio::test]
 async fn corrupt_arguments_on_safe_call_are_recorded_without_replay() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
-    seed_dangling_call(&engine, &session, "read_file", "not valid json".into()).await;
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "read_file", "not valid json".into()).await;
 
     engine
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(events.iter().any(|e| matches!(
         e,
         EngineEvent::ToolCallFinished { call_id, is_error: true, preview, .. }
@@ -542,15 +553,15 @@ async fn corrupt_arguments_on_safe_call_are_recorded_without_replay() {
 /// registry classifies the tool as Safe, recovery must not reinterpret history.
 #[tokio::test]
 async fn legacy_call_without_persisted_risk_blocks_conservatively() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
-    let turn = TurnRepository::new(&engine.db)
+    seed_transcript(&db, &session).await;
+    let turn = TurnRepository::new(&db)
         .start(&session, "user", None, leveler_core::now())
         .await
         .unwrap();
-    EventLog::new(&engine.db, session.clone())
+    EventLog::new(&db, session.clone())
         .append(
             Some(&TurnId::new(turn.id)),
             EngineEvent::ToolCallStarted {
@@ -586,11 +597,11 @@ async fn acknowledged_crash_window_unblocks_resume() {
         "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
     })
     .to_string();
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
-    seed_dangling_call(&engine, &session, "apply_patch", patch).await;
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(&db, &engine, &session, "apply_patch", patch).await;
 
     // Without acknowledgement the resume is blocked (locked elsewhere).
     engine
@@ -603,7 +614,7 @@ async fn acknowledged_crash_window_unblocks_resume() {
     let closed = engine.acknowledge_crash_window(&session).await.unwrap();
     assert_eq!(closed, 1, "exactly the one dangling call is closed");
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -633,15 +644,16 @@ async fn acknowledged_crash_window_unblocks_resume() {
 /// the workspace uncertainty from the user.
 #[tokio::test]
 async fn chat_blocks_on_a_mutating_dangling_call_until_acknowledged() {
-    let (engine, dir) = harness(
+    let (engine, db, dir) = harness(
         Arc::new(AutoApprove),
         vec![text("好的，已确认工作区状态。")],
     )
     .await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
+    seed_transcript(&db, &session).await;
     seed_dangling_call(
+        &db,
         &engine,
         &session,
         "apply_patch",
@@ -698,11 +710,12 @@ async fn chat_blocks_on_a_mutating_dangling_call_until_acknowledged() {
 /// place (recorded finish, no prompt, no block) — same policy as resume.
 #[tokio::test]
 async fn chat_auto_replays_a_safe_dangling_read_tool() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), vec![text("继续。")]).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), vec![text("继续。")]).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
+    seed_transcript(&db, &session).await;
     seed_dangling_call(
+        &db,
         &engine,
         &session,
         "read_file",
@@ -723,7 +736,7 @@ async fn chat_auto_replays_a_safe_dangling_read_tool() {
         .await
         .expect("a safe dangling read must not block chat");
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -740,11 +753,12 @@ async fn chat_auto_replays_a_safe_dangling_read_tool() {
 /// itself replay-safe stops for human reconciliation.
 #[tokio::test]
 async fn a_safe_tool_with_side_effects_is_not_auto_replayed() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
+    seed_transcript(&db, &session).await;
     seed_dangling_call(
+        &db,
         &engine,
         &session,
         "create_checkpoint",
@@ -771,11 +785,12 @@ async fn a_safe_tool_with_side_effects_is_not_auto_replayed() {
 /// into "always ask".
 #[tokio::test]
 async fn a_declared_replay_safe_tool_still_replays() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
+    seed_transcript(&db, &session).await;
     seed_dangling_call(
+        &db,
         &engine,
         &session,
         "read_file",
@@ -788,7 +803,7 @@ async fn a_declared_replay_safe_tool_still_replays() {
         .await
         .expect("a declared replay-safe read must still be reconciled automatically");
 
-    let events = recorded_events(&engine, &session).await;
+    let events = recorded_events(&db, &session).await;
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -804,17 +819,17 @@ async fn a_declared_replay_safe_tool_still_replays() {
 /// a real side effect would vanish from recovery's view.
 #[tokio::test]
 async fn two_agents_sharing_a_call_id_do_not_close_each_others_records() {
-    let (engine, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
-    seed_transcript(&engine, &session).await;
+    seed_transcript(&db, &session).await;
 
-    let turn = TurnRepository::new(&engine.db)
+    let turn = TurnRepository::new(&db)
         .start(&session, "user", None, leveler_core::now())
         .await
         .unwrap();
     let turn_id = TurnId::new(turn.id);
-    let log = EventLog::new(&engine.db, session.clone());
+    let log = EventLog::new(&db, session.clone());
 
     // Both children open a call with the SAME local id.
     for agent in ["agent-a", "agent-b"] {
