@@ -21,7 +21,7 @@ files:
     // CONTRACT (current): keys are compared exactly as written, minus
     // surrounding whitespace.
     func Normalize(path string) string {
-        return strings.TrimSpace(path)
+    	return strings.TrimSpace(path)
     }
   key/key_test.go: |
     package key
@@ -29,44 +29,44 @@ files:
     import "testing"
 
     func TestNormalizeTrimsWhitespace(t *testing.T) {
-        if got := Normalize("  assets/logo.png "); got != "assets/logo.png" {
-            t.Fatalf("Normalize = %q", got)
-        }
+    	if got := Normalize("  assets/logo.png "); got != "assets/logo.png" {
+    		t.Fatalf("Normalize = %q", got)
+    	}
     }
   cache/cache.go: |
     package cache
 
     import (
-        "strings"
+    	"strings"
 
-        "assetcache/key"
+    	"assetcache/key"
     )
 
     // Cache maps canonical asset keys to their contents.
     type Cache struct {
-        entries map[string][]byte
+    	entries map[string][]byte
     }
 
     func New() *Cache {
-        return &Cache{entries: map[string][]byte{}}
+    	return &Cache{entries: map[string][]byte{}}
     }
 
     func (c *Cache) Put(path string, data []byte) {
-        c.entries[key.Normalize(path)] = data
+    	c.entries[key.Normalize(path)] = data
     }
 
     // Get looks an asset up by path.
     func (c *Cache) Get(path string) ([]byte, bool) {
-        data, ok := c.entries[strings.TrimSpace(path)]
-        return data, ok
+    	data, ok := c.entries[strings.TrimSpace(path)]
+    	return data, ok
     }
 
     func (c *Cache) Delete(path string) {
-        delete(c.entries, strings.TrimSpace(path))
+    	delete(c.entries, strings.TrimSpace(path))
     }
 
     func (c *Cache) Len() int {
-        return len(c.entries)
+    	return len(c.entries)
     }
   index/index.go: |
     package index
@@ -76,17 +76,17 @@ files:
     // Unique returns the distinct asset paths, first occurrence wins.
     // Distinctness must follow the cache-key contract.
     func Unique(paths []string) []string {
-        seen := map[string]bool{}
-        var out []string
-        for _, p := range paths {
-            k := strings.TrimSpace(p)
-            if seen[k] {
-                continue
-            }
-            seen[k] = true
-            out = append(out, p)
-        }
-        return out
+    	seen := map[string]bool{}
+    	var out []string
+    	for _, p := range paths {
+    		k := strings.TrimSpace(p)
+    		if seen[k] {
+    			continue
+    		}
+    		seen[k] = true
+    		out = append(out, p)
+    	}
+    	return out
     }
   stats/stats.go: |
     package stats
@@ -95,54 +95,55 @@ files:
 
     // DistinctKeys counts how many distinct canonical keys a request log hits.
     func DistinctKeys(requests []string) int {
-        seen := map[string]bool{}
-        for _, r := range requests {
-            seen[strings.TrimSpace(r)] = true
-        }
-        return len(seen)
+    	seen := map[string]bool{}
+    	for _, r := range requests {
+    		seen[strings.TrimSpace(r)] = true
+    	}
+    	return len(seen)
     }
   cmd/assetcache/main.go: |
     package main
 
     import (
-        "bufio"
-        "fmt"
-        "os"
-        "strings"
+    	"bufio"
+    	"fmt"
+    	"os"
+    	"strings"
 
-        "assetcache/cache"
-        "assetcache/index"
-        "assetcache/stats"
+    	"assetcache/cache"
+    	"assetcache/index"
+    	"assetcache/stats"
     )
 
     // Reads commands from stdin, one per line:
-    //   put <path> <content>
-    //   get <path>            -> prints "hit <content>" or "miss"
-    //   unique <p1> <p2> ...  -> prints the distinct paths joined by ','
-    //   count <p1> <p2> ...   -> prints the distinct-key count
+    //
+    //	put <path> <content>
+    //	get <path>            -> prints "hit <content>" or "miss"
+    //	unique <p1> <p2> ...  -> prints the distinct paths joined by ','
+    //	count <p1> <p2> ...   -> prints the distinct-key count
     func main() {
-        c := cache.New()
-        scanner := bufio.NewScanner(os.Stdin)
-        for scanner.Scan() {
-            fields := strings.Fields(scanner.Text())
-            if len(fields) == 0 {
-                continue
-            }
-            switch fields[0] {
-            case "put":
-                c.Put(fields[1], []byte(strings.Join(fields[2:], " ")))
-            case "get":
-                if data, ok := c.Get(fields[1]); ok {
-                    fmt.Printf("hit %s\n", data)
-                } else {
-                    fmt.Println("miss")
-                }
-            case "unique":
-                fmt.Println(strings.Join(index.Unique(fields[1:]), ","))
-            case "count":
-                fmt.Println(stats.DistinctKeys(fields[1:]))
-            }
-        }
+    	c := cache.New()
+    	scanner := bufio.NewScanner(os.Stdin)
+    	for scanner.Scan() {
+    		fields := strings.Fields(scanner.Text())
+    		if len(fields) == 0 {
+    			continue
+    		}
+    		switch fields[0] {
+    		case "put":
+    			c.Put(fields[1], []byte(strings.Join(fields[2:], " ")))
+    		case "get":
+    			if data, ok := c.Get(fields[1]); ok {
+    				fmt.Printf("hit %s\n", data)
+    			} else {
+    				fmt.Println("miss")
+    			}
+    		case "unique":
+    			fmt.Println(strings.Join(index.Unique(fields[1:]), ","))
+    		case "count":
+    			fmt.Println(stats.DistinctKeys(fields[1:]))
+    		}
+    	}
     }
 task: |
   We are changing the asset-key contract. Today two spellings of the same

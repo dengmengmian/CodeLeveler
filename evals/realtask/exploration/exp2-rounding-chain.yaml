@@ -50,7 +50,7 @@ files:
 
     // CentsFromMillis renders a millicent amount in whole cents.
     func CentsFromMillis(m Millis) Cents {
-        return Cents(m / 10)
+    	return Cents(m / 10)
     }
   money/format.go: |
     package money
@@ -59,12 +59,12 @@ files:
 
     // Format renders cents as a dollar string, e.g. 1234 -> "$12.34".
     func Format(c Cents) string {
-        sign := ""
-        if c < 0 {
-            sign = "-"
-            c = -c
-        }
-        return fmt.Sprintf("%s$%d.%02d", sign, c/100, c%100)
+    	sign := ""
+    	if c < 0 {
+    		sign = "-"
+    		c = -c
+    	}
+    	return fmt.Sprintf("%s$%d.%02d", sign, c/100, c%100)
     }
   money/format_test.go: |
     package money
@@ -72,22 +72,22 @@ files:
     import "testing"
 
     func TestFormatRendersDollars(t *testing.T) {
-        cases := map[Cents]string{0: "$0.00", 5: "$0.05", 1234: "$12.34", -250: "-$2.50"}
-        for c, want := range cases {
-            if got := Format(c); got != want {
-                t.Fatalf("Format(%d) = %q, want %q", c, got, want)
-            }
-        }
+    	cases := map[Cents]string{0: "$0.00", 5: "$0.05", 1234: "$12.34", -250: "-$2.50"}
+    	for c, want := range cases {
+    		if got := Format(c); got != want {
+    			t.Fatalf("Format(%d) = %q, want %q", c, got, want)
+    		}
+    	}
     }
 
     func TestCentsFromMillisWholeCents(t *testing.T) {
-        // Whole-cent inputs: no fraction involved.
-        if got := CentsFromMillis(310); got != 31 {
-            t.Fatalf("CentsFromMillis(310) = %d, want 31", got)
-        }
-        if got := CentsFromMillis(1000); got != 100 {
-            t.Fatalf("CentsFromMillis(1000) = %d, want 100", got)
-        }
+    	// Whole-cent inputs: no fraction involved.
+    	if got := CentsFromMillis(310); got != 31 {
+    		t.Fatalf("CentsFromMillis(310) = %d, want 31", got)
+    	}
+    	if got := CentsFromMillis(1000); got != 100 {
+    		t.Fatalf("CentsFromMillis(1000) = %d, want 100", got)
+    	}
     }
   catalog/item.go: |
     package catalog
@@ -96,47 +96,47 @@ files:
 
     // Item is one orderable product.
     type Item struct {
-        Name       string
-        UnitMillis money.Millis
-        Quantity   int64
+    	Name       string
+    	UnitMillis money.Millis
+    	Quantity   int64
     }
   catalog/parse.go: |
     package catalog
 
     import (
-        "fmt"
-        "strconv"
-        "strings"
+    	"fmt"
+    	"strconv"
+    	"strings"
 
-        "invoicer/money"
+    	"invoicer/money"
     )
 
     // ParseOrder reads `name;quantity;unit_price_millicents` lines.
     func ParseOrder(text string) ([]Item, error) {
-        var items []Item
-        for lineNo, line := range strings.Split(strings.TrimSpace(text), "\n") {
-            line = strings.TrimSpace(line)
-            if line == "" || strings.HasPrefix(line, "#") {
-                continue
-            }
-            parts := strings.Split(line, ";")
-            if len(parts) != 3 {
-                return nil, fmt.Errorf("line %d: want name;qty;millis, got %q", lineNo+1, line)
-            }
-            qty, err := strconv.ParseInt(parts[1], 10, 64)
-            if err != nil || qty <= 0 {
-                return nil, fmt.Errorf("line %d: bad quantity %q", lineNo+1, parts[1])
-            }
-            millis, err := strconv.ParseInt(parts[2], 10, 64)
-            if err != nil || millis < 0 {
-                return nil, fmt.Errorf("line %d: bad unit price %q", lineNo+1, parts[2])
-            }
-            items = append(items, Item{Name: parts[0], Quantity: qty, UnitMillis: money.Millis(millis)})
-        }
-        if len(items) == 0 {
-            return nil, fmt.Errorf("order is empty")
-        }
-        return items, nil
+    	var items []Item
+    	for lineNo, line := range strings.Split(strings.TrimSpace(text), "\n") {
+    		line = strings.TrimSpace(line)
+    		if line == "" || strings.HasPrefix(line, "#") {
+    			continue
+    		}
+    		parts := strings.Split(line, ";")
+    		if len(parts) != 3 {
+    			return nil, fmt.Errorf("line %d: want name;qty;millis, got %q", lineNo+1, line)
+    		}
+    		qty, err := strconv.ParseInt(parts[1], 10, 64)
+    		if err != nil || qty <= 0 {
+    			return nil, fmt.Errorf("line %d: bad quantity %q", lineNo+1, parts[1])
+    		}
+    		millis, err := strconv.ParseInt(parts[2], 10, 64)
+    		if err != nil || millis < 0 {
+    			return nil, fmt.Errorf("line %d: bad unit price %q", lineNo+1, parts[2])
+    		}
+    		items = append(items, Item{Name: parts[0], Quantity: qty, UnitMillis: money.Millis(millis)})
+    	}
+    	if len(items) == 0 {
+    		return nil, fmt.Errorf("order is empty")
+    	}
+    	return items, nil
     }
   catalog/parse_test.go: |
     package catalog
@@ -144,31 +144,31 @@ files:
     import "testing"
 
     func TestParseOrderReadsLines(t *testing.T) {
-        items, err := ParseOrder("widget;2;1500\n# comment\ngadget;1;995\n")
-        if err != nil {
-            t.Fatal(err)
-        }
-        if len(items) != 2 || items[0].Quantity != 2 || items[1].UnitMillis != 995 {
-            t.Fatalf("unexpected items: %+v", items)
-        }
+    	items, err := ParseOrder("widget;2;1500\n# comment\ngadget;1;995\n")
+    	if err != nil {
+    		t.Fatal(err)
+    	}
+    	if len(items) != 2 || items[0].Quantity != 2 || items[1].UnitMillis != 995 {
+    		t.Fatalf("unexpected items: %+v", items)
+    	}
     }
 
     func TestParseOrderRejectsGarbage(t *testing.T) {
-        if _, err := ParseOrder("just-a-name\n"); err == nil {
-            t.Fatal("malformed line must be rejected")
-        }
+    	if _, err := ParseOrder("just-a-name\n"); err == nil {
+    		t.Fatal("malformed line must be rejected")
+    	}
     }
   pricing/engine.go: |
     package pricing
 
     import (
-        "invoicer/catalog"
-        "invoicer/money"
+    	"invoicer/catalog"
+    	"invoicer/money"
     )
 
     // Engine prices one order line, in millicents.
     type Engine interface {
-        LineMillis(item catalog.Item) money.Millis
+    	LineMillis(item catalog.Item) money.Millis
     }
   pricing/tiered/tiered.go: |
     // Package tiered implements the default pricing engine: volume discounts
@@ -176,47 +176,47 @@ files:
     package tiered
 
     import (
-        "invoicer/catalog"
-        "invoicer/money"
+    	"invoicer/catalog"
+    	"invoicer/money"
     )
 
     type Engine struct{}
 
     func New() Engine {
-        return Engine{}
+    	return Engine{}
     }
 
     // LineMillis prices a line: quantity times unit price, minus the volume
     // tier discount (5% off 10+, 10% off 100+), all in millicents.
     func (Engine) LineMillis(item catalog.Item) money.Millis {
-        raw := int64(item.UnitMillis) * item.Quantity
-        switch {
-        case item.Quantity >= 100:
-            raw = raw * 90 / 100
-        case item.Quantity >= 10:
-            raw = raw * 95 / 100
-        }
-        return money.Millis(raw)
+    	raw := int64(item.UnitMillis) * item.Quantity
+    	switch {
+    	case item.Quantity >= 100:
+    		raw = raw * 90 / 100
+    	case item.Quantity >= 10:
+    		raw = raw * 95 / 100
+    	}
+    	return money.Millis(raw)
     }
   pricing/tiered/tiered_test.go: |
     package tiered
 
     import (
-        "testing"
+    	"testing"
 
-        "invoicer/catalog"
+    	"invoicer/catalog"
     )
 
     func TestLineMillisAppliesTiers(t *testing.T) {
-        e := New()
-        small := e.LineMillis(catalog.Item{Quantity: 2, UnitMillis: 1000})
-        if small != 2000 {
-            t.Fatalf("no-tier line = %d, want 2000", small)
-        }
-        ten := e.LineMillis(catalog.Item{Quantity: 10, UnitMillis: 1000})
-        if ten != 9500 {
-            t.Fatalf("5%% tier line = %d, want 9500", ten)
-        }
+    	e := New()
+    	small := e.LineMillis(catalog.Item{Quantity: 2, UnitMillis: 1000})
+    	if small != 2000 {
+    		t.Fatalf("no-tier line = %d, want 2000", small)
+    	}
+    	ten := e.LineMillis(catalog.Item{Quantity: 10, UnitMillis: 1000})
+    	if ten != 9500 {
+    		t.Fatalf("5%% tier line = %d, want 9500", ten)
+    	}
     }
   pricing/flat/flat.go: |
     // Package flat is the promotional no-discount engine. It is selectable in
@@ -224,18 +224,18 @@ files:
     package flat
 
     import (
-        "invoicer/catalog"
-        "invoicer/money"
+    	"invoicer/catalog"
+    	"invoicer/money"
     )
 
     type Engine struct{}
 
     func New() Engine {
-        return Engine{}
+    	return Engine{}
     }
 
     func (Engine) LineMillis(item catalog.Item) money.Millis {
-        return money.Millis(int64(item.UnitMillis) * item.Quantity)
+    	return money.Millis(int64(item.UnitMillis) * item.Quantity)
     }
   tax/tax.go: |
     package tax
@@ -248,27 +248,27 @@ files:
     // OnMillis computes the tax on a subtotal, in millicents, rounding the
     // millicent result half-up per docs/pricing.md.
     func OnMillis(subtotal money.Millis) money.Millis {
-        raw := int64(subtotal) * RatePercent
-        // raw is in hundredths of a millicent; round half-up to millicents.
-        return money.Millis((raw + 50) / 100)
+    	raw := int64(subtotal) * RatePercent
+    	// raw is in hundredths of a millicent; round half-up to millicents.
+    	return money.Millis((raw + 50) / 100)
     }
   tax/tax_test.go: |
     package tax
 
     import (
-        "testing"
+    	"testing"
 
-        "invoicer/money"
+    	"invoicer/money"
     )
 
     func TestTaxRoundsHalfUp(t *testing.T) {
-        // 8% of 1006 millis = 80.48 -> 80; 8% of 1069 = 85.52 -> 86.
-        if got := OnMillis(money.Millis(1006)); got != 80 {
-            t.Fatalf("tax(1006) = %d, want 80", got)
-        }
-        if got := OnMillis(money.Millis(1069)); got != 86 {
-            t.Fatalf("tax(1069) = %d, want 86", got)
-        }
+    	// 8% of 1006 millis = 80.48 -> 80; 8% of 1069 = 85.52 -> 86.
+    	if got := OnMillis(money.Millis(1006)); got != 80 {
+    		t.Fatalf("tax(1006) = %d, want 80", got)
+    	}
+    	if got := OnMillis(money.Millis(1069)); got != 86 {
+    		t.Fatalf("tax(1069) = %d, want 86", got)
+    	}
     }
   discount/discount.go: |
     package discount
@@ -278,117 +278,117 @@ files:
     // Coupon takes whole percentage points off a millicent amount. Integer
     // math; the caller rounds when rendering.
     func Coupon(amount money.Millis, percent int64) money.Millis {
-        if percent <= 0 {
-            return amount
-        }
-        if percent >= 100 {
-            return 0
-        }
-        return money.Millis(int64(amount) * (100 - percent) / 100)
+    	if percent <= 0 {
+    		return amount
+    	}
+    	if percent >= 100 {
+    		return 0
+    	}
+    	return money.Millis(int64(amount) * (100 - percent) / 100)
     }
   invoice/service.go: |
     package invoice
 
     import (
-        "invoicer/catalog"
-        "invoicer/money"
-        "invoicer/pricing"
-        "invoicer/tax"
+    	"invoicer/catalog"
+    	"invoicer/money"
+    	"invoicer/pricing"
+    	"invoicer/tax"
     )
 
     // Line is one rendered invoice row.
     type Line struct {
-        Name  string
-        Cents money.Cents
+    	Name  string
+    	Cents money.Cents
     }
 
     // Invoice is the rendered result.
     type Invoice struct {
-        Lines    []Line
-        Subtotal money.Cents
-        Tax      money.Cents
-        Total    money.Cents
+    	Lines    []Line
+    	Subtotal money.Cents
+    	Tax      money.Cents
+    	Total    money.Cents
     }
 
     // Service turns an order into an invoice using a pricing engine.
     type Service struct {
-        engine pricing.Engine
+    	engine pricing.Engine
     }
 
     func NewService(engine pricing.Engine) *Service {
-        return &Service{engine: engine}
+    	return &Service{engine: engine}
     }
 
     // Generate prices every item and renders the rollup. Each rendered
     // amount is rounded independently from its own millicent value, per
     // docs/pricing.md.
     func (s *Service) Generate(items []catalog.Item) Invoice {
-        var inv Invoice
-        var subtotalMillis money.Millis
-        for _, item := range items {
-            lineMillis := s.engine.LineMillis(item)
-            subtotalMillis += lineMillis
-            inv.Lines = append(inv.Lines, Line{
-                Name:  item.Name,
-                Cents: money.CentsFromMillis(lineMillis),
-            })
-        }
-        taxMillis := tax.OnMillis(subtotalMillis)
-        inv.Subtotal = money.CentsFromMillis(subtotalMillis)
-        inv.Tax = money.CentsFromMillis(taxMillis)
-        inv.Total = money.CentsFromMillis(subtotalMillis + taxMillis)
-        return inv
+    	var inv Invoice
+    	var subtotalMillis money.Millis
+    	for _, item := range items {
+    		lineMillis := s.engine.LineMillis(item)
+    		subtotalMillis += lineMillis
+    		inv.Lines = append(inv.Lines, Line{
+    			Name:  item.Name,
+    			Cents: money.CentsFromMillis(lineMillis),
+    		})
+    	}
+    	taxMillis := tax.OnMillis(subtotalMillis)
+    	inv.Subtotal = money.CentsFromMillis(subtotalMillis)
+    	inv.Tax = money.CentsFromMillis(taxMillis)
+    	inv.Total = money.CentsFromMillis(subtotalMillis + taxMillis)
+    	return inv
     }
   invoice/render.go: |
     package invoice
 
     import (
-        "fmt"
-        "strings"
+    	"fmt"
+    	"strings"
 
-        "invoicer/money"
+    	"invoicer/money"
     )
 
     // Render prints the invoice in the CLI's output format.
     func Render(inv Invoice) string {
-        var b strings.Builder
-        for _, line := range inv.Lines {
-            fmt.Fprintf(&b, "%s: %s\n", line.Name, money.Format(line.Cents))
-        }
-        fmt.Fprintf(&b, "Subtotal: %s\n", money.Format(inv.Subtotal))
-        fmt.Fprintf(&b, "Tax: %s\n", money.Format(inv.Tax))
-        fmt.Fprintf(&b, "Total: %s\n", money.Format(inv.Total))
-        return b.String()
+    	var b strings.Builder
+    	for _, line := range inv.Lines {
+    		fmt.Fprintf(&b, "%s: %s\n", line.Name, money.Format(line.Cents))
+    	}
+    	fmt.Fprintf(&b, "Subtotal: %s\n", money.Format(inv.Subtotal))
+    	fmt.Fprintf(&b, "Tax: %s\n", money.Format(inv.Tax))
+    	fmt.Fprintf(&b, "Total: %s\n", money.Format(inv.Total))
+    	return b.String()
     }
   cmd/invoicer/main.go: |
     package main
 
     import (
-        "fmt"
-        "os"
+    	"fmt"
+    	"os"
 
-        "invoicer/catalog"
-        "invoicer/invoice"
-        "invoicer/pricing/tiered"
+    	"invoicer/catalog"
+    	"invoicer/invoice"
+    	"invoicer/pricing/tiered"
     )
 
     func main() {
-        if len(os.Args) != 2 {
-            fmt.Fprintln(os.Stderr, "usage: invoicer <order-file>")
-            os.Exit(2)
-        }
-        data, err := os.ReadFile(os.Args[1])
-        if err != nil {
-            fmt.Fprintln(os.Stderr, err)
-            os.Exit(1)
-        }
-        items, err := catalog.ParseOrder(string(data))
-        if err != nil {
-            fmt.Fprintln(os.Stderr, err)
-            os.Exit(1)
-        }
-        service := invoice.NewService(tiered.New())
-        fmt.Print(invoice.Render(service.Generate(items)))
+    	if len(os.Args) != 2 {
+    		fmt.Fprintln(os.Stderr, "usage: invoicer <order-file>")
+    		os.Exit(2)
+    	}
+    	data, err := os.ReadFile(os.Args[1])
+    	if err != nil {
+    		fmt.Fprintln(os.Stderr, err)
+    		os.Exit(1)
+    	}
+    	items, err := catalog.ParseOrder(string(data))
+    	if err != nil {
+    		fmt.Fprintln(os.Stderr, err)
+    		os.Exit(1)
+    	}
+    	service := invoice.NewService(tiered.New())
+    	fmt.Print(invoice.Render(service.Generate(items)))
     }
 task: |
   Bug report from accounting:

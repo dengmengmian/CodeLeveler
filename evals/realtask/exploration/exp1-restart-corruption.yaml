@@ -48,44 +48,44 @@ files:
 
     // Options are the runtime knobs for the CLI.
     type Options struct {
-        // DBPath is the file-backed store location.
-        DBPath string
-        // MaxSlugLen bounds generated slugs.
-        MaxSlugLen int
+    	// DBPath is the file-backed store location.
+    	DBPath string
+    	// MaxSlugLen bounds generated slugs.
+    	MaxSlugLen int
     }
   config/defaults.go: |
     package config
 
     // Defaults returns the options used when nothing is overridden.
     func Defaults() Options {
-        return Options{
-            DBPath:     "linkhub.db",
-            MaxSlugLen: 10,
-        }
+    	return Options{
+    		DBPath:     "linkhub.db",
+    		MaxSlugLen: 10,
+    	}
     }
   normalize/url.go: |
     package normalize
 
     import (
-        "fmt"
-        "net/url"
-        "strings"
+    	"fmt"
+    	"net/url"
+    	"strings"
     )
 
     // Canonical rewrites a URL into its canonical form. Per RFC 3986 the
     // scheme and host are case-insensitive and are lowercased here; the path,
     // query and fragment are case-sensitive and preserved exactly.
     func Canonical(raw string) (string, error) {
-        parsed, err := url.Parse(strings.TrimSpace(raw))
-        if err != nil {
-            return "", fmt.Errorf("invalid url: %w", err)
-        }
-        if parsed.Scheme == "" || parsed.Host == "" {
-            return "", fmt.Errorf("url must be absolute: %q", raw)
-        }
-        parsed.Scheme = strings.ToLower(parsed.Scheme)
-        parsed.Host = strings.ToLower(parsed.Host)
-        return parsed.String(), nil
+    	parsed, err := url.Parse(strings.TrimSpace(raw))
+    	if err != nil {
+    		return "", fmt.Errorf("invalid url: %w", err)
+    	}
+    	if parsed.Scheme == "" || parsed.Host == "" {
+    		return "", fmt.Errorf("url must be absolute: %q", raw)
+    	}
+    	parsed.Scheme = strings.ToLower(parsed.Scheme)
+    	parsed.Host = strings.ToLower(parsed.Host)
+    	return parsed.String(), nil
     }
   normalize/url_test.go: |
     package normalize
@@ -93,20 +93,20 @@ files:
     import "testing"
 
     func TestCanonicalLowercasesSchemeAndHostOnly(t *testing.T) {
-        got, err := Canonical("HTTPS://Example.COM/CaseSensitive/Path?Token=AbC123")
-        if err != nil {
-            t.Fatal(err)
-        }
-        want := "https://example.com/CaseSensitive/Path?Token=AbC123"
-        if got != want {
-            t.Fatalf("Canonical = %q, want %q", got, want)
-        }
+    	got, err := Canonical("HTTPS://Example.COM/CaseSensitive/Path?Token=AbC123")
+    	if err != nil {
+    		t.Fatal(err)
+    	}
+    	want := "https://example.com/CaseSensitive/Path?Token=AbC123"
+    	if got != want {
+    		t.Fatalf("Canonical = %q, want %q", got, want)
+    	}
     }
 
     func TestCanonicalRejectsRelativeURLs(t *testing.T) {
-        if _, err := Canonical("/just/a/path"); err == nil {
-            t.Fatal("relative URL must be rejected")
-        }
+    	if _, err := Canonical("/just/a/path"); err == nil {
+    		t.Fatal("relative URL must be rejected")
+    	}
     }
   slug/alphabet.go: |
     package slug
@@ -117,19 +117,19 @@ files:
     package slug
 
     import (
-        "crypto/sha256"
-        "encoding/binary"
+    	"crypto/sha256"
+    	"encoding/binary"
     )
 
     // For derives a deterministic slug of length n from a canonical URL.
     func For(url string, n int) string {
-        sum := sha256.Sum256([]byte(url))
-        out := make([]byte, n)
-        for i := 0; i < n; i++ {
-            v := binary.BigEndian.Uint32(sum[(i*4)%28 : (i*4)%28+4])
-            out[i] = alphabet[int(v)%len(alphabet)]
-        }
-        return string(out)
+    	sum := sha256.Sum256([]byte(url))
+    	out := make([]byte, n)
+    	for i := 0; i < n; i++ {
+    		v := binary.BigEndian.Uint32(sum[(i*4)%28 : (i*4)%28+4])
+    		out[i] = alphabet[int(v)%len(alphabet)]
+    	}
+    	return string(out)
     }
   slug/validate.go: |
     package slug
@@ -138,15 +138,15 @@ files:
 
     // Valid reports whether s could have been produced by For.
     func Valid(s string) bool {
-        if s == "" || len(s) > 32 {
-            return false
-        }
-        for _, r := range s {
-            if !strings.ContainsRune(alphabet, r) {
-                return false
-            }
-        }
-        return true
+    	if s == "" || len(s) > 32 {
+    		return false
+    	}
+    	for _, r := range s {
+    		if !strings.ContainsRune(alphabet, r) {
+    			return false
+    		}
+    	}
+    	return true
     }
   slug/slug_test.go: |
     package slug
@@ -154,31 +154,31 @@ files:
     import "testing"
 
     func TestForIsDeterministic(t *testing.T) {
-        a := For("https://example.com/x", 8)
-        b := For("https://example.com/x", 8)
-        if a != b || len(a) != 8 {
-            t.Fatalf("slug not deterministic: %q vs %q", a, b)
-        }
-        if !Valid(a) {
-            t.Fatalf("generated slug %q must validate", a)
-        }
+    	a := For("https://example.com/x", 8)
+    	b := For("https://example.com/x", 8)
+    	if a != b || len(a) != 8 {
+    		t.Fatalf("slug not deterministic: %q vs %q", a, b)
+    	}
+    	if !Valid(a) {
+    		t.Fatalf("generated slug %q must validate", a)
+    	}
     }
 
     func TestValidRejectsForeignCharacters(t *testing.T) {
-        for _, bad := range []string{"", "UPPER", "with space", "sl/ug"} {
-            if Valid(bad) {
-                t.Fatalf("Valid(%q) = true, want false", bad)
-            }
-        }
+    	for _, bad := range []string{"", "UPPER", "with space", "sl/ug"} {
+    		if Valid(bad) {
+    			t.Fatalf("Valid(%q) = true, want false", bad)
+    		}
+    	}
     }
   store/store.go: |
     package store
 
     // Store persists slug → URL mappings.
     type Store interface {
-        Put(slug, url string) error
-        Get(slug string) (string, bool, error)
-        All() (map[string]string, error)
+    	Put(slug, url string) error
+    	Get(slug string) (string, bool, error)
+    	All() (map[string]string, error)
     }
   store/errors.go: |
     package store
@@ -192,29 +192,29 @@ files:
 
     // Memory is the in-memory Store used by tests and dry runs.
     type Memory struct {
-        entries map[string]string
+    	entries map[string]string
     }
 
     func NewMemory() *Memory {
-        return &Memory{entries: map[string]string{}}
+    	return &Memory{entries: map[string]string{}}
     }
 
     func (m *Memory) Put(slug, url string) error {
-        m.entries[slug] = url
-        return nil
+    	m.entries[slug] = url
+    	return nil
     }
 
     func (m *Memory) Get(slug string) (string, bool, error) {
-        url, ok := m.entries[slug]
-        return url, ok, nil
+    	url, ok := m.entries[slug]
+    	return url, ok, nil
     }
 
     func (m *Memory) All() (map[string]string, error) {
-        out := make(map[string]string, len(m.entries))
-        for k, v := range m.entries {
-            out[k] = v
-        }
-        return out, nil
+    	out := make(map[string]string, len(m.entries))
+    	for k, v := range m.entries {
+    		out[k] = v
+    	}
+    	return out, nil
     }
   store/memory_test.go: |
     package store
@@ -222,181 +222,181 @@ files:
     import "testing"
 
     func TestMemoryRoundTrip(t *testing.T) {
-        m := NewMemory()
-        if err := m.Put("abc", "https://example.com/A"); err != nil {
-            t.Fatal(err)
-        }
-        url, ok, err := m.Get("abc")
-        if err != nil || !ok || url != "https://example.com/A" {
-            t.Fatalf("Get = %q %v %v", url, ok, err)
-        }
+    	m := NewMemory()
+    	if err := m.Put("abc", "https://example.com/A"); err != nil {
+    		t.Fatal(err)
+    	}
+    	url, ok, err := m.Get("abc")
+    	if err != nil || !ok || url != "https://example.com/A" {
+    		t.Fatalf("Get = %q %v %v", url, ok, err)
+    	}
     }
   store/file.go: |
     package store
 
     import (
-        "fmt"
-        "os"
-        "strings"
+    	"fmt"
+    	"os"
+    	"strings"
     )
 
     // File is the file-backed Store the CLI uses: one `slug<TAB>url` record
     // per line.
     type File struct {
-        path    string
-        entries map[string]string
+    	path    string
+    	entries map[string]string
     }
 
     // OpenFile loads (or initializes) the database at path.
     func OpenFile(path string) (*File, error) {
-        f := &File{path: path, entries: map[string]string{}}
-        data, err := os.ReadFile(path)
-        if os.IsNotExist(err) {
-            return f, nil
-        }
-        if err != nil {
-            return nil, err
-        }
-        for _, line := range strings.Split(string(data), "\n") {
-            if line == "" {
-                continue
-            }
-            slug, url, found := strings.Cut(line, "\t")
-            if !found {
-                return nil, fmt.Errorf("%w: %q", ErrCorrupt, line)
-            }
-            f.entries[slug] = url
-        }
-        return f, nil
+    	f := &File{path: path, entries: map[string]string{}}
+    	data, err := os.ReadFile(path)
+    	if os.IsNotExist(err) {
+    		return f, nil
+    	}
+    	if err != nil {
+    		return nil, err
+    	}
+    	for _, line := range strings.Split(string(data), "\n") {
+    		if line == "" {
+    			continue
+    		}
+    		slug, url, found := strings.Cut(line, "\t")
+    		if !found {
+    			return nil, fmt.Errorf("%w: %q", ErrCorrupt, line)
+    		}
+    		f.entries[slug] = url
+    	}
+    	return f, nil
     }
 
     func (f *File) Put(slug, url string) error {
-        f.entries[slug] = url
-        return f.flush()
+    	f.entries[slug] = url
+    	return f.flush()
     }
 
     func (f *File) Get(slug string) (string, bool, error) {
-        url, ok := f.entries[slug]
-        return url, ok, nil
+    	url, ok := f.entries[slug]
+    	return url, ok, nil
     }
 
     func (f *File) All() (map[string]string, error) {
-        out := make(map[string]string, len(f.entries))
-        for k, v := range f.entries {
-            out[k] = v
-        }
-        return out, nil
+    	out := make(map[string]string, len(f.entries))
+    	for k, v := range f.entries {
+    		out[k] = v
+    	}
+    	return out, nil
     }
 
     // flush rewrites the database file. Records are written lowercased so
     // the on-disk form stays consistent regardless of how entries were
     // produced.
     func (f *File) flush() error {
-        var b strings.Builder
-        for slug, url := range f.entries {
-            line := slug + "\t" + url
-            b.WriteString(strings.ToLower(line))
-            b.WriteByte('\n')
-        }
-        return os.WriteFile(f.path, []byte(b.String()), 0o644)
+    	var b strings.Builder
+    	for slug, url := range f.entries {
+    		line := slug + "\t" + url
+    		b.WriteString(strings.ToLower(line))
+    		b.WriteByte('\n')
+    	}
+    	return os.WriteFile(f.path, []byte(b.String()), 0o644)
     }
   links/service.go: |
     package links
 
     import (
-        "linkhub/config"
-        "linkhub/normalize"
-        "linkhub/slug"
-        "linkhub/store"
+    	"linkhub/config"
+    	"linkhub/normalize"
+    	"linkhub/slug"
+    	"linkhub/store"
     )
 
     // Service ties normalization, slug generation and storage together.
     type Service struct {
-        opts  config.Options
-        store store.Store
+    	opts  config.Options
+    	store store.Store
     }
 
     func NewService(opts config.Options, s store.Store) *Service {
-        return &Service{opts: opts, store: s}
+    	return &Service{opts: opts, store: s}
     }
 
     // Add canonicalizes the URL, derives its slug and persists the mapping.
     func (s *Service) Add(raw string) (string, error) {
-        canonical, err := normalize.Canonical(raw)
-        if err != nil {
-            return "", err
-        }
-        sl := slug.For(canonical, s.opts.MaxSlugLen)
-        if err := s.store.Put(sl, canonical); err != nil {
-            return "", err
-        }
-        return sl, nil
+    	canonical, err := normalize.Canonical(raw)
+    	if err != nil {
+    		return "", err
+    	}
+    	sl := slug.For(canonical, s.opts.MaxSlugLen)
+    	if err := s.store.Put(sl, canonical); err != nil {
+    		return "", err
+    	}
+    	return sl, nil
     }
   resolve/resolver.go: |
     package resolve
 
     import (
-        "fmt"
+    	"fmt"
 
-        "linkhub/slug"
-        "linkhub/store"
+    	"linkhub/slug"
+    	"linkhub/store"
     )
 
     // Resolver answers slug lookups on top of a store.
     type Resolver struct {
-        store store.Store
+    	store store.Store
     }
 
     func New(s store.Store) *Resolver {
-        return &Resolver{store: s}
+    	return &Resolver{store: s}
     }
 
     // Resolve returns the URL for a slug.
     func (r *Resolver) Resolve(s string) (string, error) {
-        if !slug.Valid(s) {
-            return "", fmt.Errorf("invalid slug %q", s)
-        }
-        url, ok, err := r.store.Get(s)
-        if err != nil {
-            return "", err
-        }
-        if !ok {
-            return "", fmt.Errorf("not found: %s", s)
-        }
-        return url, nil
+    	if !slug.Valid(s) {
+    		return "", fmt.Errorf("invalid slug %q", s)
+    	}
+    	url, ok, err := r.store.Get(s)
+    	if err != nil {
+    		return "", err
+    	}
+    	if !ok {
+    		return "", fmt.Errorf("not found: %s", s)
+    	}
+    	return url, nil
     }
   resolve/resolver_test.go: |
     package resolve
 
     import (
-        "testing"
+    	"testing"
 
-        "linkhub/store"
+    	"linkhub/store"
     )
 
     func TestResolveFindsStoredSlug(t *testing.T) {
-        m := store.NewMemory()
-        _ = m.Put("abcd", "https://example.com/Path")
-        r := New(m)
-        url, err := r.Resolve("abcd")
-        if err != nil || url != "https://example.com/Path" {
-            t.Fatalf("Resolve = %q, %v", url, err)
-        }
+    	m := store.NewMemory()
+    	_ = m.Put("abcd", "https://example.com/Path")
+    	r := New(m)
+    	url, err := r.Resolve("abcd")
+    	if err != nil || url != "https://example.com/Path" {
+    		t.Fatalf("Resolve = %q, %v", url, err)
+    	}
     }
 
     func TestResolveRejectsInvalidSlug(t *testing.T) {
-        r := New(store.NewMemory())
-        if _, err := r.Resolve("NOT A SLUG"); err == nil {
-            t.Fatal("invalid slug must be rejected")
-        }
+    	r := New(store.NewMemory())
+    	if _, err := r.Resolve("NOT A SLUG"); err == nil {
+    		t.Fatal("invalid slug must be rejected")
+    	}
     }
   stats/counter.go: |
     package stats
 
     // Counters tracks how often the CLI's verbs run.
     type Counters struct {
-        Adds     int
-        Resolves int
+    	Adds     int
+    	Resolves int
     }
 
     func (c *Counters) NoteAdd()     { c.Adds++ }
@@ -408,63 +408,63 @@ files:
 
     // Render prints the counters in the CLI's `stats` output format.
     func Render(c Counters) string {
-        return fmt.Sprintf("adds=%d resolves=%d", c.Adds, c.Resolves)
+    	return fmt.Sprintf("adds=%d resolves=%d", c.Adds, c.Resolves)
     }
   cmd/linkhub/main.go: |
     package main
 
     import (
-        "fmt"
-        "os"
+    	"fmt"
+    	"os"
 
-        "linkhub/config"
-        "linkhub/links"
-        "linkhub/resolve"
-        "linkhub/store"
+    	"linkhub/config"
+    	"linkhub/links"
+    	"linkhub/resolve"
+    	"linkhub/store"
     )
 
     func main() {
-        if len(os.Args) < 2 {
-            usage()
-        }
-        opts := config.Defaults()
-        db, err := store.OpenFile(opts.DBPath)
-        if err != nil {
-            fail(err)
-        }
-        switch os.Args[1] {
-        case "add":
-            if len(os.Args) != 3 {
-                usage()
-            }
-            service := links.NewService(opts, db)
-            sl, err := service.Add(os.Args[2])
-            if err != nil {
-                fail(err)
-            }
-            fmt.Println(sl)
-        case "resolve":
-            if len(os.Args) != 3 {
-                usage()
-            }
-            url, err := resolve.New(db).Resolve(os.Args[2])
-            if err != nil {
-                fail(err)
-            }
-            fmt.Println(url)
-        default:
-            usage()
-        }
+    	if len(os.Args) < 2 {
+    		usage()
+    	}
+    	opts := config.Defaults()
+    	db, err := store.OpenFile(opts.DBPath)
+    	if err != nil {
+    		fail(err)
+    	}
+    	switch os.Args[1] {
+    	case "add":
+    		if len(os.Args) != 3 {
+    			usage()
+    		}
+    		service := links.NewService(opts, db)
+    		sl, err := service.Add(os.Args[2])
+    		if err != nil {
+    			fail(err)
+    		}
+    		fmt.Println(sl)
+    	case "resolve":
+    		if len(os.Args) != 3 {
+    			usage()
+    		}
+    		url, err := resolve.New(db).Resolve(os.Args[2])
+    		if err != nil {
+    			fail(err)
+    		}
+    		fmt.Println(url)
+    	default:
+    		usage()
+    	}
     }
 
     func usage() {
-        fmt.Fprintln(os.Stderr, "usage: linkhub add <url> | linkhub resolve <slug>")
-        os.Exit(2)
+    	fmt.Fprintln(os.Stderr, "usage: linkhub add <url> | linkhub resolve <slug>")
+    	os.Exit(2)
     }
 
     func fail(err error) {
-        fmt.Fprintln(os.Stderr, err)
-        os.Exit(1)
+    	fmt.Fprintln(os.Stderr, err)
+    	os.Exit(1)
     }
 task: |
   Bug report from a user:

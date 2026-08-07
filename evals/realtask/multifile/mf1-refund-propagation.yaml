@@ -16,21 +16,21 @@ files:
     // Entry is one recorded expense. A refunded entry stays in the ledger for
     // audit history but must not count as spending anywhere in the product.
     type Entry struct {
-        ID          string
-        Description string
-        AmountCents int64
-        Refunded    bool
+    	ID          string
+    	Description string
+    	AmountCents int64
+    	Refunded    bool
     }
   ledger/total.go: |
     package ledger
 
     // NetTotal sums the ledger's spending in cents.
     func NetTotal(entries []Entry) int64 {
-        var total int64
-        for _, e := range entries {
-            total += e.AmountCents
-        }
-        return total
+    	var total int64
+    	for _, e := range entries {
+    		total += e.AmountCents
+    	}
+    	return total
     }
   ledger/total_test.go: |
     package ledger
@@ -38,13 +38,13 @@ files:
     import "testing"
 
     func TestNetTotalSumsEntries(t *testing.T) {
-        entries := []Entry{
-            {ID: "a", AmountCents: 1200},
-            {ID: "b", AmountCents: 3300},
-        }
-        if got := NetTotal(entries); got != 4500 {
-            t.Fatalf("NetTotal = %d, want 4500", got)
-        }
+    	entries := []Entry{
+    		{ID: "a", AmountCents: 1200},
+    		{ID: "b", AmountCents: 3300},
+    	}
+    	if got := NetTotal(entries); got != 4500 {
+    		t.Fatalf("NetTotal = %d, want 4500", got)
+    	}
     }
   report/monthly.go: |
     package report
@@ -53,90 +53,90 @@ files:
 
     // Summary is the monthly rollup shown to the user.
     type Summary struct {
-        TotalCents   int64
-        LargestCents int64
-        ActiveCount  int
+    	TotalCents   int64
+    	LargestCents int64
+    	ActiveCount  int
     }
 
     // Monthly builds the rollup for one month of entries.
     func Monthly(entries []ledger.Entry) Summary {
-        summary := Summary{TotalCents: ledger.NetTotal(entries)}
-        for _, e := range entries {
-            if e.AmountCents > summary.LargestCents {
-                summary.LargestCents = e.AmountCents
-            }
-        }
-        summary.ActiveCount = len(entries)
-        return summary
+    	summary := Summary{TotalCents: ledger.NetTotal(entries)}
+    	for _, e := range entries {
+    		if e.AmountCents > summary.LargestCents {
+    			summary.LargestCents = e.AmountCents
+    		}
+    	}
+    	summary.ActiveCount = len(entries)
+    	return summary
     }
   report/monthly_test.go: |
     package report
 
     import (
-        "testing"
+    	"testing"
 
-        "expensetrack/ledger"
+    	"expensetrack/ledger"
     )
 
     func TestMonthlyRollsUpBasics(t *testing.T) {
-        entries := []ledger.Entry{
-            {ID: "a", AmountCents: 1500},
-            {ID: "b", AmountCents: 3000},
-        }
-        s := Monthly(entries)
-        if s.TotalCents != 4500 || s.LargestCents != 3000 || s.ActiveCount != 2 {
-            t.Fatalf("unexpected summary: %+v", s)
-        }
+    	entries := []ledger.Entry{
+    		{ID: "a", AmountCents: 1500},
+    		{ID: "b", AmountCents: 3000},
+    	}
+    	s := Monthly(entries)
+    	if s.TotalCents != 4500 || s.LargestCents != 3000 || s.ActiveCount != 2 {
+    		t.Fatalf("unexpected summary: %+v", s)
+    	}
     }
   cmd/expensetrack/main.go: |
     package main
 
     import (
-        "encoding/csv"
-        "fmt"
-        "os"
-        "strconv"
+    	"encoding/csv"
+    	"fmt"
+    	"os"
+    	"strconv"
 
-        "expensetrack/ledger"
-        "expensetrack/report"
+    	"expensetrack/ledger"
+    	"expensetrack/report"
     )
 
     // Reads a CSV of `id,description,amount_cents,refunded` rows and prints
     // the monthly summary.
     func main() {
-        if len(os.Args) != 2 {
-            fmt.Fprintln(os.Stderr, "usage: expensetrack <entries.csv>")
-            os.Exit(2)
-        }
-        file, err := os.Open(os.Args[1])
-        if err != nil {
-            fmt.Fprintln(os.Stderr, err)
-            os.Exit(1)
-        }
-        defer file.Close()
-        rows, err := csv.NewReader(file).ReadAll()
-        if err != nil {
-            fmt.Fprintln(os.Stderr, err)
-            os.Exit(1)
-        }
-        var entries []ledger.Entry
-        for _, row := range rows {
-            amount, err := strconv.ParseInt(row[2], 10, 64)
-            if err != nil {
-                fmt.Fprintln(os.Stderr, err)
-                os.Exit(1)
-            }
-            entries = append(entries, ledger.Entry{
-                ID:          row[0],
-                Description: row[1],
-                AmountCents: amount,
-                Refunded:    row[3] == "true",
-            })
-        }
-        s := report.Monthly(entries)
-        fmt.Printf("Total: %d\n", s.TotalCents)
-        fmt.Printf("Largest: %d\n", s.LargestCents)
-        fmt.Printf("Active entries: %d\n", s.ActiveCount)
+    	if len(os.Args) != 2 {
+    		fmt.Fprintln(os.Stderr, "usage: expensetrack <entries.csv>")
+    		os.Exit(2)
+    	}
+    	file, err := os.Open(os.Args[1])
+    	if err != nil {
+    		fmt.Fprintln(os.Stderr, err)
+    		os.Exit(1)
+    	}
+    	defer file.Close()
+    	rows, err := csv.NewReader(file).ReadAll()
+    	if err != nil {
+    		fmt.Fprintln(os.Stderr, err)
+    		os.Exit(1)
+    	}
+    	var entries []ledger.Entry
+    	for _, row := range rows {
+    		amount, err := strconv.ParseInt(row[2], 10, 64)
+    		if err != nil {
+    			fmt.Fprintln(os.Stderr, err)
+    			os.Exit(1)
+    		}
+    		entries = append(entries, ledger.Entry{
+    			ID:          row[0],
+    			Description: row[1],
+    			AmountCents: amount,
+    			Refunded:    row[3] == "true",
+    		})
+    	}
+    	s := report.Monthly(entries)
+    	fmt.Printf("Total: %d\n", s.TotalCents)
+    	fmt.Printf("Largest: %d\n", s.LargestCents)
+    	fmt.Printf("Active entries: %d\n", s.ActiveCount)
     }
 task: |
   Users report that refunded expenses are still being counted as spending.

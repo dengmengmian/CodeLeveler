@@ -15,30 +15,30 @@ files:
 
     // Task is one to-do item.
     type Task struct {
-        Title string
-        Done  bool
+    	Title string
+    	Done  bool
     }
   task/store.go: |
     package task
 
     // Store keeps tasks in insertion order.
     type Store struct {
-        tasks []Task
+    	tasks []Task
     }
 
     func NewStore() *Store {
-        return &Store{}
+    	return &Store{}
     }
 
     func (s *Store) Add(t Task) {
-        s.tasks = append(s.tasks, t)
+    	s.tasks = append(s.tasks, t)
     }
 
     // List returns tasks in display order (currently: insertion order).
     func (s *Store) List() []Task {
-        out := make([]Task, len(s.tasks))
-        copy(out, s.tasks)
-        return out
+    	out := make([]Task, len(s.tasks))
+    	copy(out, s.tasks)
+    	return out
     }
   task/store_test.go: |
     package task
@@ -46,46 +46,46 @@ files:
     import "testing"
 
     func TestStoreKeepsTasks(t *testing.T) {
-        s := NewStore()
-        s.Add(Task{Title: "write report"})
-        s.Add(Task{Title: "review patch"})
-        got := s.List()
-        if len(got) != 2 || got[0].Title != "write report" {
-            t.Fatalf("unexpected list: %+v", got)
-        }
+    	s := NewStore()
+    	s.Add(Task{Title: "write report"})
+    	s.Add(Task{Title: "review patch"})
+    	got := s.List()
+    	if len(got) != 2 || got[0].Title != "write report" {
+    		t.Fatalf("unexpected list: %+v", got)
+    	}
     }
   render/render.go: |
     package render
 
     import (
-        "fmt"
-        "strings"
+    	"fmt"
+    	"strings"
 
-        "tasklist/task"
+    	"tasklist/task"
     )
 
     // Lines renders one task per line for the terminal.
     func Lines(tasks []task.Task) string {
-        var b strings.Builder
-        for _, t := range tasks {
-            marker := " "
-            if t.Done {
-                marker = "x"
-            }
-            fmt.Fprintf(&b, "[%s] %s\n", marker, t.Title)
-        }
-        return b.String()
+    	var b strings.Builder
+    	for _, t := range tasks {
+    		marker := " "
+    		if t.Done {
+    			marker = "x"
+    		}
+    		fmt.Fprintf(&b, "[%s] %s\n", marker, t.Title)
+    	}
+    	return b.String()
     }
   cmd/tasks/main.go: |
     package main
 
     import (
-        "fmt"
-        "os"
-        "strings"
+    	"fmt"
+    	"os"
+    	"strings"
 
-        "tasklist/render"
-        "tasklist/task"
+    	"tasklist/render"
+    	"tasklist/task"
     )
 
     // Toy CLI: `tasks add <title>` appends to a plain-text file next to the
@@ -93,42 +93,42 @@ files:
     const dbFile = "tasks.txt"
 
     func main() {
-        if len(os.Args) < 2 {
-            fmt.Fprintln(os.Stderr, "usage: tasks add <title> | tasks list")
-            os.Exit(2)
-        }
-        switch os.Args[1] {
-        case "add":
-            if len(os.Args) < 3 {
-                fmt.Fprintln(os.Stderr, "usage: tasks add <title>")
-                os.Exit(2)
-            }
-            title := os.Args[2]
-            f, err := os.OpenFile(dbFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-            if err != nil {
-                fmt.Fprintln(os.Stderr, err)
-                os.Exit(1)
-            }
-            defer f.Close()
-            fmt.Fprintln(f, title)
-        case "list":
-            data, err := os.ReadFile(dbFile)
-            if err != nil && !os.IsNotExist(err) {
-                fmt.Fprintln(os.Stderr, err)
-                os.Exit(1)
-            }
-            store := task.NewStore()
-            for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-                if line == "" {
-                    continue
-                }
-                store.Add(task.Task{Title: line})
-            }
-            fmt.Print(render.Lines(store.List()))
-        default:
-            fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
-            os.Exit(2)
-        }
+    	if len(os.Args) < 2 {
+    		fmt.Fprintln(os.Stderr, "usage: tasks add <title> | tasks list")
+    		os.Exit(2)
+    	}
+    	switch os.Args[1] {
+    	case "add":
+    		if len(os.Args) < 3 {
+    			fmt.Fprintln(os.Stderr, "usage: tasks add <title>")
+    			os.Exit(2)
+    		}
+    		title := os.Args[2]
+    		f, err := os.OpenFile(dbFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+    		if err != nil {
+    			fmt.Fprintln(os.Stderr, err)
+    			os.Exit(1)
+    		}
+    		defer f.Close()
+    		fmt.Fprintln(f, title)
+    	case "list":
+    		data, err := os.ReadFile(dbFile)
+    		if err != nil && !os.IsNotExist(err) {
+    			fmt.Fprintln(os.Stderr, err)
+    			os.Exit(1)
+    		}
+    		store := task.NewStore()
+    		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+    			if line == "" {
+    				continue
+    			}
+    			store.Add(task.Task{Title: line})
+    		}
+    		fmt.Print(render.Lines(store.List()))
+    	default:
+    		fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
+    		os.Exit(2)
+    	}
     }
 task: |
   Feature request: due-date support for tasks.
