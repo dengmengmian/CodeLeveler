@@ -449,24 +449,31 @@ async fn run_tier(
 /// Build the ablated arm's overrides for one knob: exactly one resolver input
 /// flipped away from its default. Legacy `require_*` names stay as aliases so
 /// existing scripts keep working.
+///
+/// Direction: control = production default, ablated = the flip that measures
+/// "what is this knob worth". Rails that default ON ablate OFF; the plan gate
+/// defaults ON in the resolver, so its ablated arm is `false`.
 fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, bool)> {
     let mut o = ExecutionOverrides::default();
     let (before, after) = match knob {
         "explicit_plan" | "require_explicit_plan" => {
-            o.explicit_plan = Some(true);
-            (false, true)
+            // Production resolve defaults to true; flip it off to measure value.
+            o.explicit_plan = Some(false);
+            (true, false)
         }
         "completion_evidence" | "require_completion_evidence" => {
             o.completion_evidence = Some(false);
             (true, false)
         }
-        "repeated_read_guard" => {
+        // Tools-layer read guard and agent-level progress heuristics share this
+        // seam (factory wires both from the resolved flag).
+        "repeated_read_guard" | "progress_guards" => {
             o.repeated_read_guard = Some(false);
             (true, false)
         }
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
-             completion_evidence, repeated_read_guard"
+             completion_evidence, repeated_read_guard, progress_guards"
         ),
     };
     Ok((o, before, after))
@@ -1177,9 +1184,10 @@ mod ablation_tests {
 
     #[test]
     fn ablation_overrides_flip_exactly_the_named_resolver_input() {
+        // Plan gate defaults ON in the resolver; ablate turns it OFF.
         let (o, before, after) = super::ablation_overrides("explicit_plan").unwrap();
-        assert!(!before && after);
-        assert_eq!(o.explicit_plan, Some(true), "the named knob flipped ON");
+        assert!(before && !after);
+        assert_eq!(o.explicit_plan, Some(false), "the named knob flipped OFF");
         // The single-variable contract: nothing else moved.
         assert_eq!(o.completion_evidence, None);
         assert_eq!(o.repeated_read_guard, None);
@@ -1190,9 +1198,13 @@ mod ablation_tests {
         assert!(before && !after);
         assert_eq!(o.completion_evidence, Some(false));
 
+        let (o, before, after) = super::ablation_overrides("progress_guards").unwrap();
+        assert!(before && !after);
+        assert_eq!(o.repeated_read_guard, Some(false));
+
         // Legacy knob names keep working.
         let (legacy, ..) = super::ablation_overrides("require_explicit_plan").unwrap();
-        assert_eq!(legacy.explicit_plan, Some(true));
+        assert_eq!(legacy.explicit_plan, Some(false));
 
         let err = super::ablation_overrides("not_a_knob").unwrap_err();
         assert!(

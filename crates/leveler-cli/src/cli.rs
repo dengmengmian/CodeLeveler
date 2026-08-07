@@ -572,7 +572,7 @@ pub enum EvalCommand {
     /// Run once per model to measure whether the mechanism helps or hurts it.
     Ablate {
         /// The resolver input to flip: explicit_plan, completion_evidence,
-        /// or repeated_read_guard (legacy require_* names accepted).
+        /// repeated_read_guard / progress_guards (legacy require_* names accepted).
         knob: String,
         /// Model reference.
         #[arg(long)]

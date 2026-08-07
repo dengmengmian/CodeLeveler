@@ -158,6 +158,11 @@ impl ExecutorFactory {
             resolved.max_parallel_tools,
         )
         .with_structure(resolved.explicit_plan)
+        // Progress heuristics (loop guard + observe/closeout thrash) share the
+        // eval ablation seam with the tools-layer repeated-read guard so a
+        // single-knob flip measures the whole product class. Production default
+        // is on for both; only ExecutionOverrides may lower them.
+        .with_progress_guards(resolved.repeated_read_guard)
         .with_sub_agent_policies(child_policies)
         .with_delegation(self.allow_delegation)
         // Every profile carries only the limits explicitly selected by its caller.
@@ -166,6 +171,13 @@ impl ExecutorFactory {
         executor = executor
             .with_work_profile(self.work_profile)
             .with_memory_index(self.memory_index.clone());
+
+        // `completion_evidence` is the eval-only lower of the Delivery evidence
+        // gate. The work profile decides the production default; only the
+        // ablation seam may force the gate off (never raise it above the profile).
+        if !resolved.completion_evidence {
+            executor = executor.with_delivery_gate(false);
+        }
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

@@ -975,6 +975,14 @@ impl Executor {
         self
     }
 
+    /// Force the Delivery evidence gate on or off after the work profile is set.
+    /// The eval ablation seam uses this to lower the rail without rebuilding
+    /// the whole profile; production hosts should prefer [`Self::with_work_profile`].
+    pub fn with_delivery_gate(mut self, on: bool) -> Self {
+        self.policy.delivery_gate = on;
+        self
+    }
+
     /// Short INDEX lines injected into the system prompt (bodies never go here).
     pub fn with_memory_index(mut self, index: impl Into<String>) -> Self {
         self.memory_index = index.into();

@@ -47,7 +47,7 @@
 | 2 | 唯一 ToolHost 调用边界 | 完成（全系统唯一执行点，跨 crate tripwire 守住，见阶段 2 状态注记） |
 | 3 | 统一会话恢复与上下文装载 | 完成（见阶段 3 状态注记） |
 | 4 | 统一生命周期与 goal 续跑所有权 | 完成（见阶段 4 状态注记；续跑所有权转移记录为阶段 5 前置） |
-| 5 | 产品策略移出 direct loop | 进行中（开关化、分类和门禁模块化已完成；旧策略删除决策待真实复杂任务 eval，见阶段 5 状态注记） |
+| 5 | 产品策略移出 direct loop | 完成（开关化 + 分类 + 门禁模块化 + eval 删除决策：全部保留为可开关策略，见阶段 5 状态注记与 [`phase5-policy-ablation.md`](phase5-policy-ablation.md)） |
 | 6 | 收紧模型与 provider 边界 | 完成（见阶段 6 状态注记） |
 | 7 | 稳定性与开源发布门槛 | 进行中（决策待所有者签署；真实项目矩阵 Pass 1 已重取，Pass 2、24h soak 与真机仍待完成，见阶段 7 状态注记） |
 
@@ -270,9 +270,8 @@
 
 **目的：** 精简循环，同时保留复杂任务能力。
 
-> **状态：进行中。** 策略开关化、逐项分类和门禁模块化已经完成；旧启发式
-> 是否删除仍待真实复杂任务 eval 数据，因此尚不满足本计划“所有工作项均有
-> 验收证据后才能完成”的状态规则。
+> **状态：完成。** 策略开关化、逐项分类、门禁模块化与**删除决策**均已闭环。
+> 删除决策证据：[`phase5-policy-ablation.md`](phase5-policy-ablation.md)。
 >
 > **逐项分类结论**（工作项 1）：
 >
@@ -308,9 +307,15 @@
 > `round_verdict.rs` 以同样形状承担。engine 侧续跑决策见阶段 4 注记
 > （`SupervisorPolicy`）。
 >
-> **仍然待做（需真实复杂任务 eval 数据，非本环境可完成）**：基于 eval
-> 对照决定删除哪些旧启发式。抽离后每个门禁可独立关断且有纯函数对照面，
-> 该决策所需的实验装置已就位。
+> **删除决策（已完成）**：对 `progress_guards`、`explicit_plan`、
+> `completion_evidence` 做了真实模型单旋钮 ablation（hard 5 + core 21，
+> `deepseek-v4-flash`）。通过率双臂均为 100%、无 case 因旋钮翻转；
+> 关掉 progress_guards 略增均轮次。**结论：不删除任何产品启发式**——
+> 全部保留为可开关策略，默认不变。详见
+> [`phase5-policy-ablation.md`](phase5-policy-ablation.md)。
+> 顺带修了 ablation 接线：`explicit_plan` 原先 control/ablated 同为 ON；
+> `progress_guards` 现与 tools 层 read guard 共 seam；
+> `completion_evidence` 只能压低 delivery_gate。
 
 工作：
 
