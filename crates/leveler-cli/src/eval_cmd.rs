@@ -638,6 +638,7 @@ async fn run_bare_case(
     u32,
     String,
     leveler_eval::TerminationClass,
+    Option<leveler_eval::FailureCategory>,
 ) {
     let engine = match app
         .engine_for(
@@ -652,7 +653,8 @@ async fn run_bare_case(
         Ok(engine) => engine,
         Err(e) => {
             let termination = termination_from_app_error(&e);
-            return (None, false, 0, format!("engine: {e}"), termination);
+            let cause = infrastructure_cause_from_app_error(&e);
+            return (None, false, 0, format!("engine: {e}"), termination, cause);
         }
     };
     let spec = leveler_engine::TaskSpec {
@@ -675,7 +677,8 @@ async fn run_bare_case(
         Ok(id) => id,
         Err(e) => {
             let termination = termination_from_engine_error(&e);
-            return (None, false, 0, format!("session: {e}"), termination);
+            let cause = infrastructure_cause_from_engine_error(&e);
+            return (None, false, 0, format!("session: {e}"), termination, cause);
         }
     };
     let result = engine
@@ -695,16 +698,19 @@ async fn run_bare_case(
                 report.rounds,
                 format!("{:?}", report.outcome),
                 termination,
+                None,
             )
         }
         Err(e) => {
             let termination = termination_from_engine_error(&e);
+            let cause = infrastructure_cause_from_engine_error(&e);
             (
                 Some(session_id),
                 false,
                 0,
                 format!("error: {e}"),
                 termination,
+                cause,
             )
         }
     }
@@ -744,6 +750,72 @@ fn termination_from_model_error(
         leveler_model::ModelErrorKind::RateLimit => leveler_eval::TerminationClass::UsageLimited,
         leveler_model::ModelErrorKind::Cancelled => leveler_eval::TerminationClass::Incomplete,
         _ => leveler_eval::TerminationClass::InfrastructureFailed,
+    }
+}
+
+/// First-cause category for a run killed by a model-layer error, from the
+/// STRUCTURED kind — never from the vendor's message text. `Some` exactly for
+/// the kinds `termination_from_model_error` books as `InfrastructureFailed`,
+/// so the execution boundary and the attribution never disagree.
+fn infrastructure_cause_from_model_error(
+    error: &leveler_model::ModelError,
+) -> Option<leveler_eval::FailureCategory> {
+    use leveler_model::ModelErrorKind as K;
+    match error.kind {
+        // Not infrastructure boundaries (UsageLimited / Incomplete).
+        K::RateLimit | K::Cancelled => None,
+        // Wire/protocol contract violations: the provider rejected the request
+        // as invalid, or sent a body we could not decode.
+        K::InvalidRequest | K::Decode => Some(leveler_eval::FailureCategory::ProviderProtocol),
+        // Reachability, credentials, and provider-side behavior: the
+        // environment around the run, not the protocol contract.
+        K::Auth
+        | K::ProviderUnavailable
+        | K::Transport
+        | K::Timeout
+        | K::StreamInterrupted
+        | K::Truncated
+        | K::ContentFiltered
+        | K::Other => Some(leveler_eval::FailureCategory::Environment),
+    }
+}
+
+/// First-cause category for an app-layer death. Non-model failures are the
+/// harness/framework's own — never `ProviderProtocol`.
+fn infrastructure_cause_from_app_error(
+    error: &leveler_app::AppError,
+) -> Option<leveler_eval::FailureCategory> {
+    match error {
+        leveler_app::AppError::Model(error)
+        | leveler_app::AppError::Agent(leveler_agent::AgentError::Model(error)) => {
+            infrastructure_cause_from_model_error(error)
+        }
+        leveler_app::AppError::Agent(leveler_agent::AgentError::Cancelled) => None,
+        // Setup around the run: config, workspace, filesystem.
+        leveler_app::AppError::Config(_)
+        | leveler_app::AppError::GlobalConfig(_)
+        | leveler_app::AppError::Registry(_)
+        | leveler_app::AppError::Workspace(_)
+        | leveler_app::AppError::NotFound(_)
+        | leveler_app::AppError::Io { .. }
+        | leveler_app::AppError::RuntimeIdentity(_) => {
+            Some(leveler_eval::FailureCategory::Environment)
+        }
+        // Storage / engine internals / everything else: framework failure.
+        _ => Some(leveler_eval::FailureCategory::Runtime),
+    }
+}
+
+/// First-cause category for an engine-layer death — same policy as app errors.
+fn infrastructure_cause_from_engine_error(
+    error: &leveler_engine::EngineError,
+) -> Option<leveler_eval::FailureCategory> {
+    match error {
+        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Model(error)) => {
+            infrastructure_cause_from_model_error(error)
+        }
+        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled) => None,
+        _ => Some(leveler_eval::FailureCategory::Runtime),
     }
 }
 
@@ -910,56 +982,64 @@ async fn run_eval_case(
     // (L1 taskset doc §8); the overlay's paths proxy for "the relevant files".
     let mut collector = crate::eval_signals::SignalCollector::new(case.files.keys().cloned());
     // Eval runs the direct tool loop only (orchestrate dual path removed).
-    let (session_id, completed, rounds, mut note, termination) = if no_verify_gate {
-        // Ablation: the SAME direct loop with ONE variable removed — the
-        // post-edit verification gate and the repair turn it drives.
-        run_bare_case(&app, model, case, &mut collector).await
-    } else {
-        let _ = direct; // flag retained for CLI compatibility; always direct.
-        match app.create_session(model, &case.task).await {
-            Ok(session_id) => {
-                let outcome = app
-                    .run_in_session_bounded(
-                        &session_id,
-                        model,
-                        PermissionProfile::Assisted,
-                        &case.task,
-                        build_approver(true),
-                        false,
-                        &mut |e| collector.observe_agent(&e),
-                        CancellationToken::new(),
-                        case.max_rounds,
-                    )
-                    .await;
-                match outcome {
-                    Ok(o) => {
-                        let termination = termination_from_stop_reason(o.stop_reason);
-                        (
-                            Some(session_id),
-                            o.stop_reason == StopReason::Completed,
-                            o.rounds,
-                            format!("{:?}", o.stop_reason),
-                            termination,
-                        )
-                    }
-                    Err(e) => {
-                        let termination = termination_from_app_error(&e);
-                        (
-                            Some(session_id),
+    // `infrastructure_cause` is the structured first-cause of an error-path
+    // death (None when the run finished on its own), fed to attribution so
+    // `InfrastructureFailed` alone never implies provider protocol.
+    let (session_id, completed, rounds, mut note, termination, infrastructure_cause) =
+        if no_verify_gate {
+            // Ablation: the SAME direct loop with ONE variable removed — the
+            // post-edit verification gate and the repair turn it drives.
+            run_bare_case(&app, model, case, &mut collector).await
+        } else {
+            let _ = direct; // flag retained for CLI compatibility; always direct.
+            match app.create_session(model, &case.task).await {
+                Ok(session_id) => {
+                    let outcome = app
+                        .run_in_session_bounded(
+                            &session_id,
+                            model,
+                            PermissionProfile::Assisted,
+                            &case.task,
+                            build_approver(true),
                             false,
-                            0,
-                            format!("error: {e}"),
-                            termination,
+                            &mut |e| collector.observe_agent(&e),
+                            CancellationToken::new(),
+                            case.max_rounds,
                         )
+                        .await;
+                    match outcome {
+                        Ok(o) => {
+                            let termination = termination_from_stop_reason(o.stop_reason);
+                            (
+                                Some(session_id),
+                                o.stop_reason == StopReason::Completed,
+                                o.rounds,
+                                format!("{:?}", o.stop_reason),
+                                termination,
+                                None,
+                            )
+                        }
+                        Err(e) => {
+                            let termination = termination_from_app_error(&e);
+                            let cause = infrastructure_cause_from_app_error(&e);
+                            (
+                                Some(session_id),
+                                false,
+                                0,
+                                format!("error: {e}"),
+                                termination,
+                                cause,
+                            )
+                        }
                     }
                 }
+                Err(e) => {
+                    let termination = termination_from_app_error(&e);
+                    let cause = infrastructure_cause_from_app_error(&e);
+                    (None, false, 0, format!("session: {e}"), termination, cause)
+                }
             }
-            Err(e) => {
-                let termination = termination_from_app_error(&e);
-                (None, false, 0, format!("session: {e}"), termination)
-            }
-        }
-    };
+        };
 
     // Usage and the observed round count both come from the persisted model
     // requests. `rounds` is 0 on the error paths above (the outcome that carries
@@ -1030,7 +1110,7 @@ async fn run_eval_case(
         failure_category: leveler_eval::attribute_failure(
             completed,
             expect_passed,
-            Some(termination),
+            infrastructure_cause,
             &signals,
         ),
         failure_source: (!(completed && expect_passed))
@@ -1299,5 +1379,122 @@ mod ablation_tests {
             "same step limits as the normal run"
         );
         assert_eq!(bare.runtime.kind, leveler_engine::ExecutionKind::Direct);
+    }
+}
+
+#[cfg(test)]
+mod attribution_provenance_tests {
+    //! `InfrastructureFailed` is an execution boundary, not a first cause:
+    //! only structured provider/protocol provenance may book
+    //! `ProviderProtocol`. These lock the mapping trio + the attribution
+    //! chain, all from typed errors — never vendor message text.
+
+    use leveler_eval::{FailureCategory, TerminationClass, TrajectorySignals};
+    use leveler_model::{ModelError, ModelErrorKind};
+
+    fn model_error(kind: ModelErrorKind) -> ModelError {
+        ModelError::new(kind, "vendor text is irrelevant to attribution")
+    }
+
+    /// 1. A provider InvalidRequest is an infrastructure boundary AND a
+    ///    provider-protocol first cause — the ripgrep C1.1a failure.
+    #[test]
+    fn invalid_request_is_infrastructure_and_provider_protocol() {
+        let error = model_error(ModelErrorKind::InvalidRequest);
+        assert_eq!(
+            super::termination_from_model_error(&error),
+            TerminationClass::InfrastructureFailed
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_model_error(&error),
+            Some(FailureCategory::ProviderProtocol)
+        );
+    }
+
+    /// 2. A non-model app-layer death is the framework's own failure — never
+    ///    provider protocol, even though its termination is InfrastructureFailed.
+    #[test]
+    fn non_model_app_error_is_not_provider_protocol() {
+        let error = leveler_app::AppError::Engine("engine internals fell over".into());
+        assert_eq!(
+            super::termination_from_app_error(&error),
+            TerminationClass::InfrastructureFailed
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_app_error(&error),
+            Some(FailureCategory::Runtime)
+        );
+        // Setup-class app errors book as Environment, still not provider protocol.
+        let missing = leveler_app::AppError::NotFound("no such session".into());
+        assert_eq!(
+            super::infrastructure_cause_from_app_error(&missing),
+            Some(FailureCategory::Environment)
+        );
+    }
+
+    /// 3. A non-model engine-layer death: same policy.
+    #[test]
+    fn non_model_engine_error_is_not_provider_protocol() {
+        let error = leveler_engine::EngineError::Config("bad engine config".into());
+        assert_eq!(
+            super::termination_from_engine_error(&error),
+            TerminationClass::InfrastructureFailed
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_engine_error(&error),
+            Some(FailureCategory::Runtime)
+        );
+    }
+
+    /// 4. Reachability failures are environment, not protocol: the wire
+    ///    contract was never even exercised.
+    #[test]
+    fn unreachable_provider_is_environment_not_provider_protocol() {
+        for kind in [
+            ModelErrorKind::ProviderUnavailable,
+            ModelErrorKind::Transport,
+            ModelErrorKind::Timeout,
+            ModelErrorKind::Auth,
+        ] {
+            let error = model_error(kind);
+            assert_eq!(
+                super::termination_from_model_error(&error),
+                TerminationClass::InfrastructureFailed,
+                "{kind:?} stays an infrastructure boundary"
+            );
+            assert_eq!(
+                super::infrastructure_cause_from_model_error(&error),
+                Some(FailureCategory::Environment),
+                "{kind:?} must not be booked as provider_protocol"
+            );
+        }
+        // Non-infrastructure terminations carry no infrastructure cause.
+        assert_eq!(
+            super::infrastructure_cause_from_model_error(&model_error(ModelErrorKind::RateLimit)),
+            None
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_model_error(&model_error(ModelErrorKind::Cancelled)),
+            None
+        );
+    }
+
+    /// 5. The original ripgrep shape end to end: a provider InvalidRequest
+    ///    reaching attribution through the app-error path still books
+    ///    provider_protocol, not the trajectory's localization shape.
+    #[test]
+    fn ripgrep_invalid_request_still_attributes_provider_protocol() {
+        let error = leveler_app::AppError::Agent(leveler_agent::AgentError::Model(model_error(
+            ModelErrorKind::InvalidRequest,
+        )));
+        let cause = super::infrastructure_cause_from_app_error(&error);
+        let localization_shaped = TrajectorySignals {
+            tool_calls: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            leveler_eval::attribute_failure(false, false, cause, &localization_shaped),
+            Some(FailureCategory::ProviderProtocol)
+        );
     }
 }
