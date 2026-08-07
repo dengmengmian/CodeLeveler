@@ -18,6 +18,7 @@ would misread as completion.
 import argparse
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -296,7 +297,7 @@ def assert_disposable(path):
 
 
 def run_project(spec, binary, log_dir, prompts):
-    """One project: >= 10 rounds mixing UI interaction and real model turns."""
+    """One project: 11 rounds mixing UI interaction and real model turns."""
     assert_disposable(spec["path"])
     name = spec["name"]
     tui = Tui(spec["path"], binary, log_dir, name).start()
@@ -480,10 +481,15 @@ def prepare_workspace(spec, tmp_root):
 def run_metadata(binary):
     """What a result file needs to be re-checkable later."""
     root = repo_root()
+    digest = hashlib.sha256()
+    with open(binary, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {
         "leveler_commit": _git(["rev-parse", "HEAD"], cwd=root).stdout.strip(),
         "leveler_dirty": bool(_git(["status", "--porcelain"], cwd=root).stdout.strip()),
         "binary": binary,
+        "binary_sha256": digest.hexdigest(),
         "binary_version": subprocess.run(
             [binary, "--version"], capture_output=True, text=True, check=False
         ).stdout.strip(),
@@ -509,6 +515,10 @@ def load_matrix(path, only=None):
         spec["path"] = os.path.normpath(os.path.join(root, spec["path"]))
     if only:
         wanted = set(only.split(","))
+        known = {m["name"] for m in matrix}
+        missing = sorted(wanted - known)
+        if missing:
+            raise ValueError(f"unknown matrix project(s): {', '.join(missing)}")
         matrix = [m for m in matrix if m["name"] in wanted]
     return matrix
 
@@ -582,7 +592,7 @@ def main():
                       ensure_ascii=False, indent=2)
 
     shutil.rmtree(tmp_root, ignore_errors=True)
-    return report(results, len(matrix), min_rounds=10)
+    return report(results, len(matrix), min_rounds=11)
 
 
 if __name__ == "__main__":

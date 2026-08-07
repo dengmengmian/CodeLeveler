@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forty rounds per project against the real TUI: commands, interaction,
+"""Forty-one rounds per project against the real TUI: commands, interaction,
 boundaries, short work, long work, interruption, and crash recovery.
 
 The earlier passes answered "does an ordinary session work" and "do the
@@ -8,16 +8,18 @@ terminal UI live in the paths nobody scripts — a slash screen opened and
 dismissed, a resize mid-answer, an empty submit, a command that does not
 exist, a paste larger than the viewport, a turn interrupted halfway.
 
-Round budget (40):
+Round budget (41):
    1– 3  startup, help, splash sanity
-   4–14  every slash screen this build advertises, opened and dismissed
+   4–14  eleven read-only slash screens, opened and dismissed
   15–19  interaction: scroll, expand, permission cycle, resize, theme
-  20–25  input boundaries: empty, unknown command, very long, CJK, paste, clear
-  26–30  SHORT model turns (cheap questions, quick answers)
-  31–33  /clear semantics, then a long task interrupted and recovered
-  34–36  ONE LONG goal-mode task carried to completion, then /diff
-  37–38  approval boundary with approvals ON
-  39–41  crash (SIGKILL) mid-turn, reopen, continue
+  20–24  input boundaries: empty, unknown command, very long, CJK, paste
+  25–29  SHORT model turns (cheap questions, quick answers)
+      30  /clear starts a new session without destroying the old one
+  31–33  a long task interrupted and then continued
+  34–35  ONE LONG goal-mode task carried to completion, then /diff
+      36  single Ctrl+C stays in the TUI
+      37  approval boundary with approvals ON
+  38–41  crash (SIGKILL) mid-turn, reopen, recover, continue
 
 Shares the PTY plumbing, workspace isolation, and exit-code contract with
 `tui_drive.py`; see `README.md` for the traps that plumbing encodes.
@@ -92,8 +94,8 @@ def permission_profile(tui):
                 return parts[-2]
     return None
 
-# Screens this build advertises. Each is opened and dismissed; a screen that
-# paints nothing, or leaves the composer unusable, is a finding.
+# Read-only screens that need no arguments or external side effects. Each is
+# opened and dismissed; a screen that paints nothing is a finding.
 SLASH_SCREENS = [
     "/help",
     "/tools",
@@ -264,7 +266,7 @@ def run_project(spec, binary, log_dir):
                  tui.frame_text())
         record("composer-alive-after-menu", "ok", {"usable": usable(tui, "after menu")})
 
-        # ── 4–14 every advertised screen, opened and dismissed ───────────
+        # ── 4–14 read-only screens, opened and dismissed ───────────
         for screen in SLASH_SCREENS:
             tui.send(f"{screen}\r")
             state = tui.settle(timeout=45, quiet=1.0)
@@ -326,7 +328,7 @@ def run_project(spec, binary, log_dir):
         record("composer-alive-after-resize", "ok",
                {"usable": usable(tui, "after resize")})
 
-        # ── 20–25 input boundaries ──────────────────────────────────────
+        # ── 20–24 input boundaries ──────────────────────────────────────
         tui.send("\r")  # empty submit must not start a turn or crash
         tui.settle(timeout=12, quiet=0.6)
         f = tui.frame_text()
@@ -372,7 +374,7 @@ def run_project(spec, binary, log_dir):
         scan(tui.frame_text(), "multiline paste")
         clear_composer(tui)
 
-        # ── 26–30 SHORT model turns ─────────────────────────────────────
+        # ── 25–29 SHORT model turns ─────────────────────────────────────
         short_prompts = [
             "这个项目用什么语言写的？一句话。",
             "列出仓库根目录下的文件名，不要解释。",
@@ -415,7 +417,7 @@ def run_project(spec, binary, log_dir):
             note("clear-destroyed-history",
                  f"the previous session {before_id[:8]} lost its messages")
 
-        # ── 31–35 a LONG task, interrupted, then recovered ──────────────
+        # ── 31–35 interrupt, recover, and complete a long task ──────────────
         tui.send(
             "逐个文件通读这个项目，写一份尽可能详细的架构报告：分层、主要类型、"
             "数据流、边界条件、以及你认为最脆弱的三个地方。\r"
@@ -480,7 +482,7 @@ def run_project(spec, binary, log_dir):
         tui.send("\x1b")
         tui.settle(timeout=12, quiet=0.5)
 
-        # ── 36–38 approval boundary (approvals ON in a second process) ───
+        # ── 36–37 Ctrl+C and approval boundary ───
         tui.send("\x03")
         tui.settle(timeout=10, quiet=0.6)
         alive = not tui.dead
@@ -507,6 +509,13 @@ def run_project(spec, binary, log_dir):
                 gated.send("\x1b[Z")
                 gated.settle(timeout=10, quiet=0.5)
             gating = "full" not in gated.frame_text()
+            if not gating:
+                note(
+                    "precondition-unmet",
+                    "the driver could not leave the full-access profile, so the "
+                    "approval boundary cannot be exercised",
+                    gated.frame_text(),
+                )
             canary_name = f"leveler-forty-canary-{uuid.uuid4().hex}.txt"
             canary = os.path.join(spec["path"], canary_name)
             try:
@@ -557,7 +566,7 @@ def run_project(spec, binary, log_dir):
         for m in gated.panics():
             note("panic", f"gated session: {m}")
 
-    # ── 39–40 crash mid-turn, reopen, continue ──────────────────────────
+    # ── 38–41 crash mid-turn, reopen, continue ──────────────────────────
     crash_marker = f"CRASH_MARKER_{uuid.uuid4().hex[:8]}"
     session_id = None
     killed_in_flight = False
@@ -691,7 +700,7 @@ def main():
             json.dump({"meta": meta, "results": results}, fh, ensure_ascii=False, indent=2)
 
     shutil.rmtree(tmp_root, ignore_errors=True)
-    return report(results, len(matrix), min_rounds=40)
+    return report(results, len(matrix), min_rounds=41)
 
 
 if __name__ == "__main__":

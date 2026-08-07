@@ -14,6 +14,7 @@ actually tend to break a TUI + runtime pair:
 * a tool whose output is far larger than the viewport.
 
 Shares the PTY plumbing with `tui_drive.py`.
+The current driver records 12 rounds per project; all 12 are required.
 """
 
 import argparse
@@ -173,6 +174,13 @@ def run_project(spec, binary, log_dir):
             tui.send("\x1b[Z")  # Shift+Tab cycles the permission profile
             tui.settle(timeout=10, quiet=0.5)
         gating_mode = "full" not in tui.frame_text()
+        if not gating_mode:
+            note(
+                "precondition-unmet",
+                "the driver could not leave the full-access profile, so the "
+                "approval boundary cannot be exercised",
+                tui.frame_text(),
+            )
 
         # A fixed name opened with "w" truncates — and later deletes — a file
         # the repository may already have. Use a name that cannot collide and
@@ -183,8 +191,13 @@ def run_project(spec, binary, log_dir):
             fd = os.open(canary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as fh:
                 fh.write("must survive a denied deletion\n")
-        except OSError:
+        except OSError as error:
             canary = None
+            note(
+                "precondition-unmet",
+                f"could not create the approval canary: {error!r}",
+                tui.frame_text(),
+            )
         if canary:
             tui.send(f"用 rm 删除仓库根目录下的 {canary_name} 文件。\r")
             # Wait for either the approval overlay or the turn to end.
@@ -314,12 +327,12 @@ def run_project(spec, binary, log_dir):
         for err in tui.emulator_errors[:3]:
             note("emulator-error", f"phase A (driver-side, not product): {err}")
 
-    # ── phase B: SIGKILL, then prove the same session comes back ─────────
+    # ── phase B: SIGKILL, then prove durable recovery ──────────────
     #
     # The point is crash recovery, so the previous process must die the way a
     # crash kills it. A graceful double Ctrl+C proves nothing about the crash
-    # window, and reading /sessions proves nothing about WHICH session
-    # resumed — both were true of the first version of this round.
+    # window. Recovery requires the crashed session to stay durable and
+    # reachable while the newly opened session remains usable.
     marker = f"SESSION_MARKER_{os.getpid()}_{int(time.time())}"
     session_id = None
     killed_in_flight = False
@@ -330,7 +343,10 @@ def run_project(spec, binary, log_dir):
             # process dies. Waiting for the turn to settle first (as this
             # once did) only proves an idle process can restart — it never
             # enters the crash window at all.
-            tui_a.send(f"记住这个标记：{marker}。然后逐个文件通读整个项目并写一份很长的报告。\r")
+            # Keep the marker first: `/sessions` truncates titles to 40
+            # display columns, and the recovery assertion must see the whole
+            # marker rather than a truncated suffix.
+            tui_a.send(f"{marker}：请记住这个标记，然后逐个文件通读整个项目并写一份很长的报告。\r")
             deadline = time.time() + 180
             while time.time() < deadline:
                 tui_a._read_available(0.3)
@@ -380,14 +396,32 @@ def run_project(spec, binary, log_dir):
                     note("turn-left-running",
                          "a turn is still marked running after the crash; it must "
                          "be reaped or reconciled")
-                # Recovery means usable, not merely present: the recovered
-                # session must accept another turn.
-                before = facts.get("messages", 0)
-                tui2.send("崩溃恢复后继续：刚才的标记是什么？\r")
+
+                # Reopening intentionally starts a fresh session. The crashed
+                # work must remain reachable from /sessions, while the fresh
+                # session must accept new work; requiring the new process to
+                # attach the old session implicitly tests a behavior the
+                # product does not promise.
+                tui2.send("/sessions\r")
+                tui2.settle(timeout=45, quiet=1.2)
+                listed = marker in tui2.frame_text()
+                tui2.send("\x1b")
+                tui2.settle(timeout=12, quiet=0.5)
+                if not listed:
+                    note(
+                        "crashed-session-unreachable",
+                        "the crashed session does not appear in /sessions",
+                        tui2.frame_text(),
+                    )
+
+                fresh_id = newest_session_id(spec["path"])
+                before = session_facts(spec["path"], fresh_id).get("messages", 0)
+                tui2.send("崩溃恢复后继续：说一句话即可。\r")
                 state = tui2.settle(timeout=240, quiet=2.0)
-                after = session_facts(spec["path"], session_id).get("messages", 0)
+                after = session_facts(spec["path"], fresh_id).get("messages", 0)
                 record("continue-after-crash", state,
-                       {"messages_before": before, "messages_after": after})
+                       {"crashed_session_listed": listed,
+                        "messages_before": before, "messages_after": after})
                 if state in ("busy", "timeout"):
                     note("post-crash-turn-hung",
                          "a turn after crash recovery never settled",
@@ -395,7 +429,7 @@ def run_project(spec, binary, log_dir):
                 elif after <= before:
                     note("post-crash-turn-not-recorded",
                          "the turn after recovery added no messages to the "
-                         "recovered session")
+                         "fresh session")
     finally:
         tui2.close()
         for m in tui2.panics():
@@ -450,7 +484,7 @@ def main():
                       ensure_ascii=False, indent=2)
 
     shutil.rmtree(tmp_root, ignore_errors=True)
-    return report(results, len(matrix), min_rounds=8)
+    return report(results, len(matrix), min_rounds=12)
 
 
 if __name__ == "__main__":
