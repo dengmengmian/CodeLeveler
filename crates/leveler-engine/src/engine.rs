@@ -10,10 +10,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::{Clarifier, ContinuationPolicy, StepLimits, StopReason};
-use leveler_core::{SessionId, TurnId};
+use leveler_core::{SessionId, TaskId, TurnId};
 use leveler_execution::{Approver, PermissionProfile, RiskLevel};
 use leveler_lifecycle::{AgentState, SessionStatus};
-use leveler_storage::{Database, SessionRecord, SessionRepository, TerminalRepository};
+use leveler_storage::{
+    Database, SessionRecord, SessionRepository, TaskStore, TerminalRepository,
+};
 use leveler_verifier::{
     CompletionVerdict, ExpectedEvidence, Verdict, VerificationPlan, VerificationReport, Verifier,
     finalize_task_outcome,
@@ -445,7 +447,16 @@ impl TaskEngine {
 
     /// Mark the session running before the first turn. The engine owns this
     /// transition too — clients observe lifecycle, they never write it.
-    async fn mark_running(&self, session_id: &SessionId) -> Result<(), EngineError> {
+    ///
+    /// Also the ONE seam where the durable task identity is guaranteed: every
+    /// execution entry (run/chat/resume) passes here, so a session created by
+    /// any path — including one that predates the tasks table — has its task
+    /// row before the first turn. Returns that task id.
+    async fn mark_running(&self, session_id: &SessionId) -> Result<TaskId, EngineError> {
+        let task_id = self
+            .db
+            .ensure_for_session(session_id, leveler_core::now())
+            .await?;
         SessionRepository::new(&self.db)
             .update_status(
                 session_id,
@@ -454,10 +465,20 @@ impl TaskEngine {
                 leveler_core::now(),
             )
             .await?;
-        Ok(())
+        Ok(task_id)
     }
 
-    /// Create and persist the session row, including its execution config.
+    /// The durable task owning `session_id`, if the association exists yet.
+    /// (It is created at latest when the session first runs.)
+    pub async fn task_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<TaskId>, EngineError> {
+        Ok(TaskStore::task_for_session(&self.db, session_id).await?)
+    }
+
+    /// Create and persist the session row, including its execution config,
+    /// and the durable task row associated with it.
     pub async fn create_task(&self, spec: &TaskSpec) -> Result<SessionId, EngineError> {
         let record = SessionRecord::new(
             spec.repository.display().to_string(),
@@ -476,6 +497,9 @@ impl TaskEngine {
             leveler_core::now(),
         )
         .await?;
+        self.db
+            .ensure_for_session(&id, leveler_core::now())
+            .await?;
         Ok(id)
     }
 
@@ -497,7 +521,7 @@ impl TaskEngine {
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
         };
-        self.mark_running(session_id).await?;
+        let task_id = self.mark_running(session_id).await?;
         log.append(
             None,
             EngineEvent::TaskStarted {
@@ -506,6 +530,7 @@ impl TaskEngine {
                 mode: mode_str(spec.mode).to_string(),
                 sandbox: spec.sandbox,
                 kind: spec.kind,
+                task_id: Some(task_id),
             },
             observer,
         )

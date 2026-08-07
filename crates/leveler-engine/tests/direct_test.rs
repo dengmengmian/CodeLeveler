@@ -219,6 +219,80 @@ async fn factory_reasoning_override_reaches_every_model_request() {
     );
 }
 
+#[tokio::test]
+async fn create_task_records_the_durable_task_association() {
+    let h = harness(Vec::new()).await;
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let task = h
+        .engine
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .expect("create_task must record the task association");
+    assert_eq!(
+        leveler_storage::TaskStore::session_for_task(&h.engine.db, &task)
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(&session),
+        "the association must read back in both directions"
+    );
+}
+
+#[tokio::test]
+async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
+    let mut h = harness(vec![tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "done"}),
+    )])
+    .await;
+    h.engine.factory.allow_delegation = false;
+    let spec = spec(&h, VerificationPlan::default());
+    // A session written by an older binary: session row only, no task row.
+    let record = leveler_storage::SessionRecord::new(
+        h.dir.path().display().to_string(),
+        "add a function",
+        "mock/m",
+        leveler_core::now(),
+    );
+    SessionRepository::new(&h.engine.db)
+        .create(&record)
+        .await
+        .unwrap();
+    let session = leveler_core::SessionId::new(record.id);
+    assert_eq!(h.engine.task_for_session(&session).await.unwrap(), None);
+
+    let mut events = Vec::new();
+    h.engine
+        .run(
+            &session,
+            &spec,
+            &mut |e| events.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let task = h
+        .engine
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .expect("running must ensure the task association");
+    let stamped = events.iter().find_map(|e| match e {
+        EngineEvent::TaskStarted { task_id, .. } => Some(task_id.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        stamped,
+        Some(Some(task)),
+        "TaskStarted must carry the durable task id"
+    );
+}
+
 fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
     TaskSpec {
         repository: h.dir.path().to_path_buf(),

@@ -416,6 +416,7 @@ mod tests {
             mode: "assisted".into(),
             sandbox: false,
             kind: leveler_engine::ExecutionKind::Direct,
+            task_id: None,
         });
         let s = c.finish(false);
         assert!(s.ttff_ms.is_some());

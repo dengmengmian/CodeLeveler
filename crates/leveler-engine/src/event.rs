@@ -127,6 +127,11 @@ pub enum EngineEvent {
         mode: String,
         sandbox: bool,
         kind: ExecutionKind,
+        /// The durable task identity behind this run. Additive: legacy events
+        /// omit it and deserialize as `None` (their task id equals the
+        /// session id by the migration-0016 backfill rule).
+        #[serde(default)]
+        task_id: Option<leveler_core::TaskId>,
     },
     TurnStarted {
         turn_id: TurnId,
@@ -1030,6 +1035,7 @@ mod contract_tests {
                 mode: secret.into(),
                 sandbox: true,
                 kind: ExecutionKind::Direct,
+                task_id: Some(leveler_core::TaskId::new(secret)),
             },
             EngineEvent::TurnFinished {
                 turn_id: TurnId::new("turn-safe"),

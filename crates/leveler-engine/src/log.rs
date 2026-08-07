@@ -584,6 +584,7 @@ mod tests {
                 mode: "assisted".into(),
                 sandbox: false,
                 kind: crate::ExecutionKind::Direct,
+                task_id: Some(leveler_core::TaskId::new("task-1")),
             },
             EngineEvent::PhaseChanged {
                 from: leveler_lifecycle::AgentState::Understand,
