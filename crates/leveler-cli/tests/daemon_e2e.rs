@@ -396,3 +396,138 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication() {
     drop(client);
     stop_daemon(&mut daemon);
 }
+
+/// Gate Scenario A: a running daemon reports identity + admission health
+/// over the socket, and the numbers reflect reality (no active work yet).
+#[tokio::test]
+async fn health_reports_identity_and_admission() {
+    let env = test_env("http://127.0.0.1:9");
+    let ready = env.home.join("ready.json");
+    let mut daemon = spawn_serve(&env, &ready);
+    let ready_doc = wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+    assert_eq!(
+        info.runtime_id.as_str(),
+        ready_doc["runtime_id"].as_str().unwrap()
+    );
+    assert!(info.health.accepting_work, "an idle daemon accepts work");
+    assert_eq!(info.health.active_turns, 0);
+    assert!(info.health.turn_capacity.unwrap_or(0) > 0, "real capacity");
+    assert!(!info.health.shutting_down);
+
+    drop(client);
+    stop_daemon(&mut daemon);
+}
+
+/// Gate Scenarios C+D: the daemon dies (SIGKILL) under a connected client
+/// mid-task; after a restart the SAME client object reaches the SAME
+/// RuntimeId, the session snapshot is served again, the orphan turn was
+/// recovered, and the ownership epoch advanced (old tokens powerless).
+#[tokio::test]
+async fn connected_client_recovers_after_daemon_sigkill() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready1 = env.home.join("ready1.json");
+    let mut daemon = spawn_serve(&env, &ready1);
+    let first = wait_ready(&ready1, &mut daemon, Duration::from_secs(30));
+    let runtime_id = first["runtime_id"].as_str().unwrap().to_string();
+
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            goal: "survive the crash".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "MARKER".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    // Wait for a durable running turn, then note the pre-crash epoch.
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let turns = leveler_storage::TurnRepository::new(&db)
+            .list(&session)
+            .await
+            .unwrap();
+        if turns.iter().any(|t| t.status == "running") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn never became durable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let task = leveler_storage::TaskStore::task_for_session(&db, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch_before = leveler_storage::OwnershipStore::current(&db, &task)
+        .await
+        .unwrap()
+        .unwrap()
+        .epoch;
+    drop(db);
+
+    daemon.kill().expect("SIGKILL");
+    let _ = daemon.wait();
+
+    // The supervisor semantics: a (revived) daemon comes back for the same
+    // state dir. Here the test plays the reviver's role directly.
+    let ready2 = env.home.join("ready2.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    let second = wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+    assert_eq!(second["runtime_id"].as_str().unwrap(), runtime_id);
+
+    // SAME client object: per-request connections + the subscription
+    // reconnect loop reach the restarted daemon without a rebuild.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let snapshot = loop {
+        match client.snapshot(&session).await {
+            Ok(snapshot) => break snapshot,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(error) => panic!("session unreachable after restart: {error}"),
+        }
+    };
+    assert_eq!(snapshot.id, session);
+    let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+    assert_eq!(info.runtime_id.as_str(), runtime_id);
+    assert!(info.health.accepting_work);
+
+    // Ownership: the restart reap reacquired — the epoch advanced, so every
+    // pre-crash token is powerless; the orphan turn is no longer running.
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let epoch_after = leveler_storage::OwnershipStore::current(&db, &task)
+        .await
+        .unwrap()
+        .unwrap()
+        .epoch;
+    assert!(
+        epoch_after > epoch_before,
+        "restart recovery must advance the owner epoch ({epoch_before} -> {epoch_after})"
+    );
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert!(turns.iter().all(|t| t.status != "running"));
+
+    drop(client);
+    stop_daemon(&mut daemon);
+}
