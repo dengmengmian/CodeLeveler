@@ -61,7 +61,7 @@ turn's context.
 | tool failure | model-visible error text; patch errors show actual file content + line numbers | no escalation on repeated same error |
 | edit failure | apply_patch atomic; write allowlist; file budget | — |
 | build/test failure | evidence + classification + 1 repair turn | repair lacks context; single round |
-| verification | blast-radius scoping; baseline attribution (tests) | compile failures have no baseline offset |
+| verification | blast-radius scoping; baseline attribution: non-Test gates (Build/Fmt/Lint) marked pre-existing when the SAME gate fails on the baseline; Test gates require test-level proof (every failing test already failing on baseline) | Test-kind gates with a compile/infra failure usually have no parsed `failed_tests`, so baseline equivalence cannot be proven and they conservatively keep gating |
 | no-progress loop | call fingerprint guard -> observe-thrash second chance -> hard stop cap | measured 0% |
 | budget exhaustion | typed; <= 2 targeted extensions | — |
 | model failure | same-request retry; malformed tool-JSON repair | — |
@@ -80,21 +80,33 @@ Gaps: multi-file changes, repository exploration (fixed tiny file sets),
 long tasks / context exhaustion, multi-round repair chains, repos without
 verification, real-repo noise (pre-existing red, dirty worktree).
 
-## 6. Real Model Baseline (measured)
+## 6. Real Model Baseline (measured — representative sample)
 
 12 cases (hard x5 + recovery-compile-fail + core sample x6), plus the 3-case
-gate sample: **15/15 passed, 100% completion accuracy, 0 false completion,
-0 user intervention, loop rate 0%, validation rate 100%, recovery rate 100%,
-avg 5.8 steps / 7.5 tool calls.** Heaviest case: ts-concurrency-limit
-(9 steps, ~139k input tokens).
+gate sample: **15/15 sampled cases passed, 100% completion accuracy, 0 false
+completion, 0 user intervention, loop rate 0%, validation rate 100%, recovery
+rate 100%, avg 5.8 steps / 7.5 tool calls.** Heaviest case:
+ts-concurrency-limit (9 steps, ~139k input tokens).
+
+This is a REPRESENTATIVE SAMPLE, not the full existing real-model suite —
+the remaining core cases have not been exhaustively run. The structural
+coverage gaps are confirmed regardless: multi-file, exploration, realistic
+repos, long context, weak verification.
 
 ## 7. Top Failure Modes (by real-task impact)
 
-1. **Eval saturation** — the current suite no longer separates anything;
-   improvement work has no signal source.
+1. **Representative sample saturation** — 15/15 sampled cases pass; the
+   full existing suite is not exhaustively verified, but the confirmed
+   structural gaps (multi-file / exploration / realistic repo / long
+   context / weak verification) mean the current suite cannot be the
+   signal source for improvement work.
 2. **Repair context break** — empty `prior`, single round.
-3. **Compile failures cannot be baseline-attributed** (missing observation
-   event; test failures can).
+3. **Test-gate compile/infra failures resist baseline attribution** —
+   standalone non-Test gates (Build/Fmt/Lint) already attribute correctly;
+   the gap is a Test-kind gate whose run died before producing parsed
+   `failed_tests`, where equivalence with the baseline cannot be proven and
+   gating stays conservative (by design; the cost is repair turns spent on
+   pre-existing breakage).
 4. **Localization without structure** on large repos (C2 scope, noted).
 5. **Sub-agent failure not enforced at the completion gate.**
 6. **Weak-verification repos**: CompletedUnverified is honest but offers no
@@ -103,13 +115,21 @@ avg 5.8 steps / 7.5 tool calls.** Heaviest case: ts-concurrency-limit
 ## 8. C1 Scope Proposal
 
 DO (small, measurable):
-1. Eval expansion FIRST with the existing framework: multi-file cases,
+1. C1.1a: run the FULL existing runnable real-model suite first to form the
+   FULL EXISTING BASELINE (the sample above is not it).
+   C1.1b: then expand the existing Eval Framework: multi-file cases,
    exploration-required cases, repair-chain cases, no-verification case —
-   restore metric resolution before changing behavior.
+   restore metric resolution before changing behavior. Broken-baseline
+   cases split into:
+   - BB1: pre-existing non-Test build failure -> baseline attribution is
+     EXPECTED to work (locks current behavior);
+   - BB2: compile/infra failure inside a Test gate -> conservative gating
+     is EXPECTED (no test identity to prove equivalence).
 2. Repair with context: inject the original turn's compacted context
    (existing RawTranscript/assemble machinery); allow a second repair round
    only when round one improved a gate.
-3. Baseline attribution for build failures.
+3. (removed — non-Test build-failure attribution already works; BB1/BB2
+   eval cases above lock the real semantics instead of re-implementing it)
 4. Unresolved child-agent failures surface at the `update_goal` gate.
 5. Token-cost audit for heavy cases (repeated context injection).
 
