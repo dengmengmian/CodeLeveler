@@ -105,7 +105,12 @@ string_id!(
     CommandId
 );
 string_id!(
- /// Identifies a task graph.
+ /// Identifies a durable runtime task — the unit of work the engine owns,
+ /// independent of any client or conversation. Distinct from [`SessionId`]:
+ /// a session is the conversation/UI attachment point; a task is the
+ /// execution lifecycle aggregate. Today each task has exactly one primary
+ /// session (the storage layer records the association); multi-session
+ /// tasks are a future extension of the same identity.
     TaskId
 );
 string_id!(
@@ -139,5 +144,24 @@ mod tests {
         assert_eq!(json, "\"call_42\"");
         let back: ToolCallId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn task_id_is_a_distinct_type_from_session_id() {
+        // Same underlying string, different types: the compiler rejects
+        // passing one where the other is expected, and equality is only
+        // defined within a type. This pins the Task/Session identity split.
+        fn takes_task(id: &TaskId) -> &str {
+            id.as_str()
+        }
+        let task = TaskId::new("shared-string");
+        let session = SessionId::new("shared-string");
+        assert_eq!(takes_task(&task), session.as_str());
+        // `takes_task(&session)` must not compile; the wire form stays a
+        // transparent string for both.
+        let json = serde_json::to_string(&task).unwrap();
+        assert_eq!(json, "\"shared-string\"");
+        let back: TaskId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, task);
     }
 }
