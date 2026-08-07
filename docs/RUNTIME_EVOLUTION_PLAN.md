@@ -1041,6 +1041,21 @@ Do not interpret lease expiry alone as permission to blindly replay an in-flight
 
 Priority: **P2**
 
+> Status: **landed (single-host slice)**. `RuntimeId` is a typed identity in
+> `leveler-core`, persisted per state directory (flock-guarded first mint,
+> atomic write, corrupt-file = hard error) and stable across daemon restarts.
+> `leveler serve` remains the one daemon; its socket bind now holds an
+> exclusive lock for the daemon's lifetime, so concurrent starts elect
+> exactly one runtime. The default Unix TUI path is discover-or-start
+> (detached spawn + ready-json + connect-with-retry) with `--in-process` as
+> the explicit embedded mode. Clients read `RuntimeInfo` (identity +
+> diagnostics) through an additive local-transport request. Lifecycle
+> invariants are locked by process-level E2E (restart-stable identity,
+> daemon election, SIGKILL recovery) and transport-level tests (disconnect
+> never cancels, explicit cancel fires once, session isolation).
+> Not in scope yet: health/capacity reporting, restart supervision of the
+> daemon itself, and remote registration.
+
 Build on existing `leveler serve` and local transport.
 
 Goal:

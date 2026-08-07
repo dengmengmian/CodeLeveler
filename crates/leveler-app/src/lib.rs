@@ -14,6 +14,7 @@ mod interactive;
 pub mod mcp_config;
 mod parallel;
 mod prompt_bridge;
+mod runtime_identity;
 mod session;
 mod vcs;
 mod workspace_view;
@@ -21,6 +22,7 @@ mod workspace_view;
 pub use global_config::{GlobalConfig, GlobalConfigError};
 pub use interactive::InProcessRuntimeClient;
 pub use parallel::ParallelEditOutcome;
+pub use runtime_identity::{RuntimeIdentityError, load_or_create_runtime_id};
 pub use session::engine_event_to_agent;
 pub use vcs::ShipOptions;
 
@@ -69,6 +71,8 @@ pub enum AppError {
         path: String,
         source: std::io::Error,
     },
+    #[error("runtime identity error: {0}")]
+    RuntimeIdentity(#[from] runtime_identity::RuntimeIdentityError),
 }
 
 /// The loaded configuration bundle (kept around for `config show` / `doctor`).
@@ -135,6 +139,9 @@ pub struct Application {
     /// every background process — hence servers dying between turns. Only the
     /// process exit drops the last handle.
     background_tasks: Arc<leveler_execution::BackgroundTaskRegistry>,
+    /// Durable runtime identity, loaded (and minted on first use) lazily from
+    /// the state directory. Cached: the id cannot change within one process.
+    runtime_id: OnceLock<leveler_core::RuntimeId>,
 }
 
 impl Application {
@@ -228,7 +235,19 @@ impl Application {
             collaboration: CollaborationMode::Chat,
             environment,
             background_tasks,
+            runtime_id: OnceLock::new(),
         })
+    }
+
+    /// This runtime's durable identity: read from the state directory, minted
+    /// and persisted on first use, stable across process restarts. Fails on a
+    /// corrupt identity file rather than silently minting a new identity.
+    pub fn runtime_id(&self) -> Result<leveler_core::RuntimeId, AppError> {
+        if let Some(id) = self.runtime_id.get() {
+            return Ok(id.clone());
+        }
+        let id = runtime_identity::load_or_create_runtime_id(&self.layout.state_dir)?;
+        Ok(self.runtime_id.get_or_init(|| id).clone())
     }
 
     /// Set work profile for subsequent engine builds and session creates.

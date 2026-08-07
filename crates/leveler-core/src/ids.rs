@@ -117,6 +117,15 @@ string_id!(
  /// Identifies a single node within a task graph.
     TaskNodeId
 );
+string_id!(
+ /// Identifies one CodeLeveler runtime — the durable execution host, not a
+ /// process. For a local runtime the id is persisted in the repository's
+ /// state directory, so a daemon restart keeps the same identity; it changes
+ /// only when that state is explicitly re-initialized. Never derived from
+ /// PID, hostname, or hardware, and never a connection/session/task id.
+ /// Future cloud-worker and embedded runtimes carry the same identity type.
+    RuntimeId
+);
 
 #[cfg(test)]
 mod tests {
@@ -144,6 +153,23 @@ mod tests {
         assert_eq!(json, "\"call_42\"");
         let back: ToolCallId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn runtime_id_is_a_distinct_type_from_process_scoped_ids() {
+        // RuntimeId identifies the durable runtime, not a process or a
+        // conversation: the compiler rejects passing SessionId/TaskId where a
+        // RuntimeId is expected, and the wire form stays a transparent string.
+        fn takes_runtime(id: &RuntimeId) -> &str {
+            id.as_str()
+        }
+        let runtime = RuntimeId::new("rt-1");
+        assert_eq!(takes_runtime(&runtime), "rt-1");
+        // `takes_runtime(&SessionId::new("rt-1"))` must not compile.
+        let json = serde_json::to_string(&runtime).unwrap();
+        assert_eq!(json, "\"rt-1\"");
+        let back: RuntimeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, runtime);
     }
 
     #[test]
