@@ -11,7 +11,7 @@
 //! of inferring overlap.
 
 use leveler_core::SessionId;
-use leveler_storage::{Database, MessageRepository};
+use leveler_storage::MessageStore;
 
 use crate::log::EventLog;
 use crate::{EngineError, EngineEvent, budget_prior_messages};
@@ -37,11 +37,11 @@ impl RawTranscript {
     /// Strict load: any unparsable row is a hard `Corrupt` error naming
     /// `what` (resume and continuation must reconstruct exactly).
     pub async fn load_strict(
-        db: &Database,
+        messages: &dyn MessageStore,
         session_id: &SessionId,
         what: &str,
     ) -> Result<Self, EngineError> {
-        let payloads = MessageRepository::new(db).load(session_id).await?;
+        let payloads = messages.load(session_id).await?;
         let messages = payloads
             .iter()
             .map(|p| serde_json::from_str(p))
@@ -52,8 +52,11 @@ impl RawTranscript {
 
     /// Lossy load: an unreadable legacy row only loses context (interactive
     /// chat and side questions tolerate that; resume must not).
-    pub async fn load_lossy(db: &Database, session_id: &SessionId) -> Result<Self, EngineError> {
-        let payloads = MessageRepository::new(db).load(session_id).await?;
+    pub async fn load_lossy(
+        messages: &dyn MessageStore,
+        session_id: &SessionId,
+    ) -> Result<Self, EngineError> {
+        let payloads = messages.load(session_id).await?;
         let messages = payloads
             .iter()
             .filter_map(|p| serde_json::from_str(p).ok())

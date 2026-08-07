@@ -557,7 +557,7 @@ impl InProcessRuntimeClient {
         let Ok(db) = self.app.open_database().await else {
             return;
         };
-        let result = leveler_engine::reap_running_turns(&db, session).await;
+        let result = leveler_engine::reap_running_turns(&db, &db, session).await;
         match result {
             Ok(events) if events.is_empty() => {}
             Ok(events) => {

@@ -9,6 +9,7 @@
 
 mod command_receipt_repo;
 mod database;
+mod engine_stores;
 mod event_repo;
 mod event_store;
 mod message_repo;
@@ -24,6 +25,7 @@ mod turn_store;
 
 pub use command_receipt_repo::{Admission, CommandReceiptRepository};
 pub use database::{Database, StorageError, peek_repository};
+pub use engine_stores::EngineStores;
 pub use event_repo::{EVENT_SCHEMA_VERSION, EventRecord, EventRepository};
 pub use event_store::{EventStore, MemoryEventStore};
 pub use message_repo::MessageRepository;

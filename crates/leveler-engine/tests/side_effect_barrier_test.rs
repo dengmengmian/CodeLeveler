@@ -184,8 +184,9 @@ async fn run_chat_turn(
     approver: Arc<dyn Approver>,
     text: &str,
 ) -> Result<leveler_engine::TurnRecordedOutcome, leveler_engine::EngineError> {
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
     let runner = TurnRunner {
-        db: &h.db,
+        stores: &stores,
         session_id: h.session.clone(),
         log,
         factory: &h.factory,

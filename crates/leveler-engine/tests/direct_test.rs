@@ -142,6 +142,7 @@ fn patch_resolve_and_proven_ac() -> Vec<ModelResponse> {
 
 struct Harness {
     engine: TaskEngine,
+    db: Database,
     dir: tempfile::TempDir,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
 }
@@ -162,8 +163,9 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     );
     let runtime = Arc::new(MockRuntime::new(responses));
     let requests = runtime.requests.clone();
+    let db = Database::connect_in_memory().await.unwrap();
     let engine = TaskEngine {
-        db: Database::connect_in_memory().await.unwrap(),
+        stores: leveler_storage::EngineStores::from_database(&db),
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(default_registry()),
@@ -186,6 +188,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     };
     Harness {
         engine,
+        db,
         dir,
         requests,
     }
@@ -219,6 +222,141 @@ async fn factory_reasoning_override_reaches_every_model_request() {
     );
 }
 
+/// A TerminalStore that always refuses to commit — engine-level failure
+/// injection for "the terminal fact is atomic or absent".
+struct FailingTerminal;
+
+#[async_trait]
+impl leveler_storage::TerminalStore for FailingTerminal {
+    async fn finish_task(
+        &self,
+        _: &leveler_core::SessionId,
+        _: &str,
+        _: &str,
+        _: leveler_engine::TaskOutcome,
+        _: leveler_lifecycle::SessionStatus,
+        _: leveler_lifecycle::AgentState,
+        _: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::StorageError> {
+        Err(leveler_storage::StorageError::InvalidData(
+            "injected terminal failure".into(),
+        ))
+    }
+
+    async fn finish_turn(
+        &self,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+        _: &str,
+        _: &str,
+        _: leveler_engine::TurnOutcome,
+        _: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::StorageError> {
+        Err(leveler_storage::StorageError::InvalidData(
+            "injected terminal failure".into(),
+        ))
+    }
+}
+
+/// A MessageStore whose appends fail — the transcript is not durable and the
+/// runtime must never pretend it is.
+struct FailingMessages;
+
+#[async_trait]
+impl leveler_storage::MessageStore for FailingMessages {
+    async fn append_in_turn(
+        &self,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+        _: &[String],
+        _: leveler_core::Timestamp,
+    ) -> Result<(), leveler_storage::StorageError> {
+        Err(leveler_storage::StorageError::InvalidData(
+            "injected transcript failure".into(),
+        ))
+    }
+
+    async fn load(
+        &self,
+        _: &leveler_core::SessionId,
+    ) -> Result<Vec<String>, leveler_storage::StorageError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Failure injection A/B at the engine level: when the atomic terminal commit
+/// fails, the run errors, and NEITHER the terminal event NOR the outcome
+/// projection is visible — no half-commit.
+#[tokio::test]
+async fn a_failed_terminal_commit_leaves_no_half_visible_task_fact() {
+    let mut h = harness(vec![tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "done"}),
+    )])
+    .await;
+    h.engine.stores.terminal = Arc::new(FailingTerminal);
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let result = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await;
+    assert!(result.is_err(), "a failed terminal commit must propagate");
+
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
+        .execution(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, None, "no outcome projection without its event");
+    let terminal_events = EventRepository::new(&h.db)
+        .load(&session)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == "task_finished" || e.event_type == "turn_finished")
+        .count();
+    assert_eq!(
+        terminal_events, 0,
+        "no terminal event without its projection"
+    );
+}
+
+/// Failure injection C: when the transcript append fails, the turn fails
+/// loudly (AgentError::Persistence) and the task lands Failed — the runtime
+/// never continues as if the transcript were durable.
+#[tokio::test]
+async fn a_failed_transcript_append_fails_the_turn_loudly() {
+    let mut h = harness(vec![tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "done"}),
+    )])
+    .await;
+    h.engine.stores.messages = Arc::new(FailingMessages);
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let result = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await;
+    let error = result.expect_err("an un-durable transcript must fail the run");
+    assert!(
+        error.to_string().contains("injected transcript failure"),
+        "the persistence cause must be named: {error}"
+    );
+    // The terminal store still works, so the failure is committed honestly.
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
+        .execution(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, Some(TaskOutcome::Failed));
+}
+
 #[tokio::test]
 async fn create_task_records_the_durable_task_association() {
     let h = harness(Vec::new()).await;
@@ -232,7 +370,7 @@ async fn create_task_records_the_durable_task_association() {
         .unwrap()
         .expect("create_task must record the task association");
     assert_eq!(
-        leveler_storage::TaskStore::session_for_task(&h.engine.db, &task)
+        leveler_storage::TaskStore::session_for_task(&h.db, &task)
             .await
             .unwrap()
             .as_ref(),
@@ -258,10 +396,7 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
         "mock/m",
         leveler_core::now(),
     );
-    SessionRepository::new(&h.engine.db)
-        .create(&record)
-        .await
-        .unwrap();
+    SessionRepository::new(&h.db).create(&record).await.unwrap();
     let session = leveler_core::SessionId::new(record.id);
     assert_eq!(h.engine.task_for_session(&session).await.unwrap(), None);
 
@@ -366,7 +501,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
     assert_eq!(report.modified_files, vec!["src/lib.rs".to_string()]);
 
     // Session row: execution config + terminal outcome.
-    let (mode, sandbox, kind, outcome) = SessionRepository::new(&h.engine.db)
+    let (mode, sandbox, kind, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
         .await
         .unwrap()
@@ -377,10 +512,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
     );
 
     // One user turn, completed, owning the transcript messages.
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert_eq!(turns.len(), 1);
     assert_eq!(
         (turns[0].kind.as_str(), turns[0].status.as_str()),
@@ -388,7 +520,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
     );
     assert!(turns[0].finished_at.is_some());
     let turn_id = leveler_core::TurnId::new(turns[0].id.clone());
-    let turn_messages = MessageRepository::new(&h.engine.db)
+    let turn_messages = MessageRepository::new(&h.db)
         .load_for_turn(&session, &turn_id)
         .await
         .unwrap();
@@ -398,10 +530,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
     );
 
     // The event log: ordered, persisted, and shaped as expected.
-    let rows = EventRepository::new(&h.engine.db)
-        .load(&session)
-        .await
-        .unwrap();
+    let rows = EventRepository::new(&h.db).load(&session).await.unwrap();
     let types: Vec<&str> = rows.iter().map(|r| r.event_type.as_str()).collect();
     assert_eq!(types.first(), Some(&"task_started"));
     assert_eq!(types.last(), Some(&"task_finished"));
@@ -444,7 +573,7 @@ async fn no_gates_means_completed_unverified() {
         .await
         .unwrap();
     assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
-    let (_, _, _, outcome) = SessionRepository::new(&h.engine.db)
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
         .await
         .unwrap()
@@ -640,10 +769,7 @@ async fn active_goal_automatically_continues_in_a_new_persisted_turn_after_stall
     assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
     assert_eq!(report.stop_reason, StopReason::Completed);
     assert_eq!(report.rounds, 5);
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert_eq!(
         turns
             .iter()
@@ -725,10 +851,7 @@ async fn failed_verification_repairs_once_then_fails() {
         "failed verification must never count as automation success"
     );
 
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     let kinds: Vec<&str> = turns.iter().map(|t| t.kind.as_str()).collect();
     assert_eq!(kinds, vec!["user", "repair"]);
     assert_eq!(
@@ -737,7 +860,7 @@ async fn failed_verification_repairs_once_then_fails() {
         "the repair turn records its attempt"
     );
 
-    let (_, _, _, outcome) = SessionRepository::new(&h.engine.db)
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
         .await
         .unwrap()
@@ -761,20 +884,17 @@ async fn agent_failure_persists_terminal_task_and_turn_events() {
         .expect_err("an exhausted model runtime must fail the task");
     assert!(matches!(error, leveler_engine::EngineError::Agent(_)));
 
-    let (_, _, _, outcome) = SessionRepository::new(&h.engine.db)
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(outcome, Some(TaskOutcome::Failed));
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].status, "failed");
 
-    let events = EventRepository::new(&h.engine.db)
+    let events = EventRepository::new(&h.db)
         .load(&session)
         .await
         .unwrap()
@@ -822,16 +942,13 @@ async fn cancellation_is_recorded_as_interrupted() {
         leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled)
     ));
 
-    let (_, _, _, outcome) = SessionRepository::new(&h.engine.db)
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(outcome, Some(TaskOutcome::Interrupted));
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert_eq!(turns[0].status, "interrupted");
 }
 
@@ -844,7 +961,7 @@ async fn starting_a_turn_reaps_orphan_running_siblings() {
     let session = h.engine.create_task(&spec).await.unwrap();
 
     // Simulate a zombie left by process kill: status running, no finished_at.
-    let zombie = TurnRepository::new(&h.engine.db)
+    let zombie = TurnRepository::new(&h.db)
         .start(&session, "chat", None, leveler_core::now())
         .await
         .unwrap();
@@ -858,10 +975,7 @@ async fn starting_a_turn_reaps_orphan_running_siblings() {
         .unwrap();
     assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
 
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert!(
         turns.len() >= 2,
         "zombie + at least one new turn, got {}",
@@ -887,7 +1001,7 @@ async fn starting_a_turn_reaps_orphan_running_siblings() {
             .all(|t| t.status != "running" || t.finished_at.is_some()),
         "no permanent running zombies should remain"
     );
-    let events = EventRepository::new(&h.engine.db)
+    let events = EventRepository::new(&h.db)
         .load(&session)
         .await
         .unwrap()
@@ -921,10 +1035,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         .run(&session, &spec, &mut |_| {}, token)
         .await
         .expect_err("pre-cancelled");
-    let before = MessageRepository::new(&h.engine.db)
-        .load(&session)
-        .await
-        .unwrap();
+    let before = MessageRepository::new(&h.db).load(&session).await.unwrap();
     assert!(!before.is_empty(), "the seed must have been persisted");
 
     // Phase 2: resume on the same database with a fresh scripted runtime.
@@ -933,7 +1044,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
     std::fs::write(dir2.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
     let workspace = Workspace::new(dir2.path()).unwrap();
     let engine2 = TaskEngine {
-        db: h.engine.db.clone(),
+        stores: leveler_storage::EngineStores::from_database(&h.db),
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(patch_then_resolve())),
             registry: Arc::new(default_registry()),
@@ -985,13 +1096,10 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
     assert_eq!(report.outcome, TaskOutcome::CompletedUnverified);
 
     // Two turns: the interrupted original and the completed resume.
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     let statuses: Vec<&str> = turns.iter().map(|t| t.status.as_str()).collect();
     assert_eq!(statuses, vec!["interrupted", "completed"]);
-    let (_, _, _, outcome) = SessionRepository::new(&h.engine.db)
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
         .execution(&session)
         .await
         .unwrap()
@@ -1157,10 +1265,7 @@ async fn a_supervisor_policy_that_never_continues_leaves_one_turn() {
 
     // The goal was never resolved, because the supervisor did not re-drive it.
     assert_eq!(report.stop_reason, StopReason::Stalled);
-    let turns = TurnRepository::new(&h.engine.db)
-        .list(&session)
-        .await
-        .unwrap();
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert_eq!(
         turns.len(),
         1,

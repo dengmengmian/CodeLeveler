@@ -120,6 +120,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
 
 struct Harness {
     engine: TaskEngine,
+    db: Database,
     dir: tempfile::TempDir,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
 }
@@ -132,8 +133,9 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let runtime = Arc::new(MockRuntime::new(responses));
     let requests = runtime.requests.clone();
+    let db = Database::connect_in_memory().await.unwrap();
     let engine = TaskEngine {
-        db: Database::connect_in_memory().await.unwrap(),
+        stores: leveler_storage::EngineStores::from_database(&db),
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(default_registry()),
@@ -156,6 +158,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     };
     Harness {
         engine,
+        db,
         dir,
         requests,
     }
@@ -196,7 +199,7 @@ fn request_blob(req: &ModelRequest) -> String {
         .join("\n")
 }
 
-async fn seed_oversized_login_history(engine: &TaskEngine, session: &leveler_core::SessionId) {
+async fn seed_oversized_login_history(db: &Database, session: &leveler_core::SessionId) {
     let mut payloads = Vec::new();
     payloads.push(serde_json::to_string(&Message::text(Role::User, "修改登录模块")).unwrap());
     let pad = "login-timeout-path-and-retry-policy ".repeat(40);
@@ -206,7 +209,7 @@ async fn seed_oversized_login_history(engine: &TaskEngine, session: &leveler_cor
                 .unwrap(),
         );
     }
-    MessageRepository::new(&engine.db)
+    MessageRepository::new(db)
         .append(session, &payloads, leveler_core::now())
         .await
         .unwrap();
@@ -244,7 +247,7 @@ async fn chat_compacts_when_history_oversized_and_persists_snapshot() {
             .unwrap(),
         );
     }
-    MessageRepository::new(&h.engine.db)
+    MessageRepository::new(&h.db)
         .append(&session, &payloads, leveler_core::now())
         .await
         .unwrap();
@@ -295,7 +298,7 @@ async fn second_chat_after_compact_still_sees_first_chat_turn() {
     .await;
     let s = spec(&h, "chat session");
     let session = h.engine.create_task(&s).await.unwrap();
-    seed_oversized_login_history(&h.engine, &session).await;
+    seed_oversized_login_history(&h.db, &session).await;
 
     let mut events = Vec::new();
     h.engine
@@ -359,7 +362,7 @@ async fn goal_turn_includes_prior_history_in_model_request() {
     .await;
     let s = spec(&h, "把刚才那个超时也处理一下");
     let session = h.engine.create_task(&s).await.unwrap();
-    MessageRepository::new(&h.engine.db)
+    MessageRepository::new(&h.db)
         .append(
             &session,
             &[
@@ -414,7 +417,7 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     .await;
     let s = spec(&h, "session");
     let session = h.engine.create_task(&s).await.unwrap();
-    seed_oversized_login_history(&h.engine, &session).await;
+    seed_oversized_login_history(&h.db, &session).await;
 
     let mut events = Vec::new();
     h.engine
@@ -466,7 +469,7 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     goal_spec.runtime.continuation = ContinuationPolicy::bounded(1);
 
     // Chat left outcome CompletedUnverified; force interrupted epoch for resume.
-    SessionRepository::new(&h.engine.db)
+    SessionRepository::new(&h.db)
         .set_execution(
             &session,
             "assisted",
@@ -476,7 +479,7 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
         )
         .await
         .unwrap();
-    SessionRepository::new(&h.engine.db)
+    SessionRepository::new(&h.db)
         .set_outcome(&session, TaskOutcome::Interrupted, leveler_core::now())
         .await
         .unwrap();
@@ -507,11 +510,11 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     );
 
     // If run marked CompletedUnverified (text answer), re-open for resume.
-    SessionRepository::new(&h.engine.db)
+    SessionRepository::new(&h.db)
         .set_outcome(&session, TaskOutcome::Interrupted, leveler_core::now())
         .await
         .unwrap();
-    SessionRepository::new(&h.engine.db)
+    SessionRepository::new(&h.db)
         .set_execution(
             &session,
             "assisted",

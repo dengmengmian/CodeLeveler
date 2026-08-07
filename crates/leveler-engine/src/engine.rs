@@ -13,7 +13,7 @@ use leveler_agent::{Clarifier, ContinuationPolicy, StepLimits, StopReason};
 use leveler_core::{SessionId, TaskId, TurnId};
 use leveler_execution::{Approver, PermissionProfile, RiskLevel};
 use leveler_lifecycle::{AgentState, SessionStatus};
-use leveler_storage::{Database, SessionRecord, SessionRepository, TaskStore, TerminalRepository};
+use leveler_storage::{EngineStores, EventStore, SessionRecord};
 use leveler_verifier::{
     CompletionVerdict, ExpectedEvidence, Verdict, VerificationPlan, VerificationReport, Verifier,
     finalize_task_outcome,
@@ -340,8 +340,12 @@ pub fn mode_str(mode: PermissionProfile) -> &'static str {
 }
 
 /// The persistent task engine.
+///
+/// Persistence enters exclusively through [`EngineStores`] — narrow
+/// capability ports the composition root wires to its adapter (SQLite
+/// locally). The engine never names a concrete database.
 pub struct TaskEngine {
-    pub db: Database,
+    pub stores: EngineStores,
     pub factory: ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
@@ -398,7 +402,8 @@ impl TaskEngine {
             stop,
         };
         let (event_type, payload) = event.to_row()?;
-        TerminalRepository::new(&self.db)
+        self.stores
+            .terminal
             .finish_task(
                 session_id,
                 &event_type,
@@ -471,10 +476,12 @@ impl TaskEngine {
     /// row before the first turn. Returns that task id.
     async fn mark_running(&self, session_id: &SessionId) -> Result<TaskId, EngineError> {
         let task_id = self
-            .db
+            .stores
+            .tasks
             .ensure_for_session(session_id, leveler_core::now())
             .await?;
-        SessionRepository::new(&self.db)
+        self.stores
+            .sessions
             .update_status(
                 session_id,
                 SessionStatus::Running,
@@ -491,7 +498,7 @@ impl TaskEngine {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<TaskId>, EngineError> {
-        Ok(TaskStore::task_for_session(&self.db, session_id).await?)
+        Ok(self.stores.tasks.task_for_session(session_id).await?)
     }
 
     /// Create and persist the session row, including its execution config,
@@ -503,18 +510,22 @@ impl TaskEngine {
             self.factory.model.to_string(),
             leveler_core::now(),
         );
-        let repo = SessionRepository::new(&self.db);
-        repo.create(&record).await?;
+        self.stores.sessions.create(&record).await?;
         let id = SessionId::new(record.id);
-        repo.set_execution(
-            &id,
-            mode_str(spec.coding.mode),
-            spec.coding.sandbox,
-            spec.runtime.kind.as_str(),
-            leveler_core::now(),
-        )
-        .await?;
-        self.db.ensure_for_session(&id, leveler_core::now()).await?;
+        self.stores
+            .sessions
+            .set_execution(
+                &id,
+                mode_str(spec.coding.mode),
+                spec.coding.sandbox,
+                spec.runtime.kind.as_str(),
+                leveler_core::now(),
+            )
+            .await?;
+        self.stores
+            .tasks
+            .ensure_for_session(&id, leveler_core::now())
+            .await?;
         Ok(id)
     }
 
@@ -527,9 +538,9 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        let log = EventLog::new(&self.db, session_id.clone());
+        let log = EventLog::new(self.stores.events.as_ref(), session_id.clone());
         let runner = TurnRunner {
-            db: &self.db,
+            stores: &self.stores,
             session_id: session_id.clone(),
             log: &log,
             factory: &self.factory,
@@ -631,8 +642,9 @@ impl TaskEngine {
         };
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
-        let raw = crate::RawTranscript::load_lossy(&self.db, session_id).await?;
-        let log = EventLog::new(&self.db, session_id.clone());
+        let raw =
+            crate::RawTranscript::load_lossy(self.stores.messages.as_ref(), session_id).await?;
+        let log = EventLog::new(self.stores.events.as_ref(), session_id.clone());
         self.mark_running(session_id).await?;
         // Reconcile the crash window before continuing — the interactive path
         // is how a crashed session normally gets reopened (TUI/Web), and a
@@ -662,7 +674,7 @@ impl TaskEngine {
         }
         let prior = context.prior;
         let runner = TurnRunner {
-            db: &self.db,
+            stores: &self.stores,
             session_id: session_id.clone(),
             log: &log,
             factory: &self.factory,
@@ -706,8 +718,9 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        let repo = SessionRepository::new(&self.db);
-        let (_, _, kind, outcome) = repo
+        let (_, _, kind, outcome) = self
+            .stores
+            .sessions
             .execution(session_id)
             .await?
             .ok_or_else(|| EngineError::Config(format!("no session {session_id}")))?;
@@ -726,14 +739,19 @@ impl TaskEngine {
                 outcome.map(|o| o.as_str()).unwrap_or_default()
             )));
         }
-        let raw = crate::RawTranscript::load_strict(&self.db, session_id, "transcript").await?;
+        let raw = crate::RawTranscript::load_strict(
+            self.stores.messages.as_ref(),
+            session_id,
+            "transcript",
+        )
+        .await?;
         if raw.is_empty() {
             return Err(EngineError::Config(format!(
                 "session {session_id} has no transcript to resume; \
                  for interactive chat reopen with: leveler tui --session {session_id}"
             )));
         }
-        let log = EventLog::new(&self.db, session_id.clone());
+        let log = EventLog::new(self.stores.events.as_ref(), session_id.clone());
         self.mark_running(session_id).await?;
         let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
         // Same merge rules as chat: never drop post-snapshot transcript rows.
@@ -750,7 +768,7 @@ impl TaskEngine {
         }
         let prior = context.prior;
         let runner = TurnRunner {
-            db: &self.db,
+            stores: &self.stores,
             session_id: session_id.clone(),
             log: &log,
             factory: &self.factory,
@@ -805,7 +823,7 @@ impl TaskEngine {
         &self,
         session_id: &SessionId,
     ) -> Result<usize, EngineError> {
-        acknowledge_crash_window(&self.db, session_id).await
+        acknowledge_crash_window(self.stores.events.as_ref(), session_id).await
     }
 
     /// Reconcile the crash window on resume: for every tool call that started
@@ -1019,7 +1037,8 @@ impl TaskEngine {
         goal: &str,
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
         const GOAL_HISTORY_MAX: usize = 24;
-        let raw = crate::RawTranscript::load_lossy(&self.db, session_id).await?;
+        let raw =
+            crate::RawTranscript::load_lossy(self.stores.messages.as_ref(), session_id).await?;
         if raw.is_empty() {
             return Ok(Vec::new());
         }
@@ -1143,7 +1162,7 @@ impl TaskEngine {
                 .to_string(),
         });
         let raw = crate::RawTranscript::load_strict(
-            &self.db,
+            self.stores.messages.as_ref(),
             &runner.session_id,
             "goal transcript during continuation",
         )
@@ -1214,7 +1233,7 @@ impl TaskEngine {
         cancellation: &CancellationToken,
     ) -> Result<Option<leveler_agent::AgentOutcome>, EngineError> {
         let raw = crate::RawTranscript::load_strict(
-            &self.db,
+            self.stores.messages.as_ref(),
             &runner.session_id,
             "transcript during budget extension",
         )
@@ -1669,10 +1688,10 @@ mod continue_cap_tests {
 /// success), so a resume blocked by `RecoveryConfirmationRequired` can
 /// proceed. Nothing is replayed. Returns how many calls were closed.
 pub async fn acknowledge_crash_window(
-    db: &Database,
+    events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<usize, EngineError> {
-    let log = EventLog::new(db, session_id.clone());
+    let log = EventLog::new(events, session_id.clone());
     let dangling = log.dangling_tool_calls().await?;
     let closed = dangling.len();
     for call in dangling {

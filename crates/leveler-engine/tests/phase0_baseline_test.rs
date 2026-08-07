@@ -293,8 +293,9 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
         poll_timed_out: AtomicBool::new(false),
     };
     let log = EventLog::new(&store, h.session.clone());
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
     let runner = TurnRunner {
-        db: &h.db,
+        stores: &stores,
         session_id: h.session.clone(),
         log: &log,
         factory: &h.factory,
@@ -370,8 +371,9 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
         serde_json::json!({"status": "blocked", "summary": "cannot proceed"}),
     )])
     .await;
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
     let engine = TaskEngine {
-        db: h.db,
+        stores,
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -418,7 +420,7 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
         Some(Some(leveler_agent::StopReason::Blocked)),
         "TaskFinished must carry the typed stop reason"
     );
-    let record = SessionRepository::new(&engine.db)
+    let record = SessionRepository::new(&h.db)
         .get(&session)
         .await
         .unwrap()
@@ -446,8 +448,9 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
         ),
     ])
     .await;
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
     let engine = TaskEngine {
-        db: h.db,
+        stores,
         factory: h.factory,
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -474,7 +477,7 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
         .await
         .unwrap();
 
-    let record = SessionRepository::new(&engine.db)
+    let record = SessionRepository::new(&h.db)
         .get(&session)
         .await
         .unwrap()
