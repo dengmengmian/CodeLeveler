@@ -304,8 +304,21 @@ paths apply redaction before writes.
 ### UI boundary
 
 The TUI renders client-protocol events and sends commands or interaction
-responses. It does not own agent execution. In daemon mode, closing the TUI does
-not cancel accepted work; shutting down the runtime does.
+responses. It does not own agent execution. On Unix, `leveler tui`'s default
+path is discover-or-start: it probes the repository's daemon socket, starts a
+detached `leveler serve` when none answers, and connects — so closing the TUI
+does not cancel accepted work; shutting down the runtime does. `--in-process`
+remains the explicit embedded mode (debug/fallback; also implied by
+`--auto-approve` and `--config-dir`, which a running daemon cannot inherit).
+Windows has no socket transport and keeps the embedded runtime.
+
+Each runtime state directory owns a durable `RuntimeId` (persisted in
+`<state_dir>/runtime-id`): a daemon restart keeps the same identity, and it
+changes only when that state is explicitly re-initialized. Clients read it via
+the local runtime contract (`RuntimeInfo`) for discovery/reconnect
+verification and diagnostics. Exactly one daemon serves a state directory at a
+time — the socket bind holds an exclusive lock file for the daemon's lifetime,
+so racing starters elect one winner and the losers exit with an error.
 
 `leveler-web` is the browser UI over the same seam: an axum server bridging a
 single-page app to a `LocalRuntimeService` (in-process, or a `leveler serve
