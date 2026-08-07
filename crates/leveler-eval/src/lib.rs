@@ -172,6 +172,34 @@ pub struct CaseResult {
     /// were observed (or legacy baseline). Never invented as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub silent_duration_ms: Option<u64>,
+    /// Edit-tool (apply_patch / replace) results observed / of those, errors.
+    /// `passed && edit_failures > 0` marks a self-recovered edit case — the
+    /// thrash is part of the record, not hidden by the eventual success.
+    #[serde(default)]
+    pub edit_attempts: u32,
+    #[serde(default)]
+    pub edit_failures: u32,
+    /// Exploration shape: read-class and search-class tool calls.
+    #[serde(default)]
+    pub read_calls: u32,
+    #[serde(default)]
+    pub search_calls: u32,
+    /// Edit-tool selection: how often each write tool was invoked.
+    #[serde(default)]
+    pub apply_patch_calls: u32,
+    #[serde(default)]
+    pub replace_calls: u32,
+    /// Round (stream-attempt count) of the first edit attempt; `None` when
+    /// the run never tried to edit. Convergence signal for exploration cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_edit_round: Option<u32>,
+    /// Engine repair turns started (persisted `repair_started` events).
+    #[serde(default)]
+    pub repair_attempts: u32,
+    /// Whether the verification AFTER the last repair passed. `None` when no
+    /// repair ran (or the event log was unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_success: Option<bool>,
 }
 
 const fn default_repetition() -> u32 {
@@ -1007,6 +1035,20 @@ pub struct TrajectorySignals {
     pub ttff_ms: Option<u64>,
     /// Longest inter-feedback silent gap in ms. `None` if <2 feedback events.
     pub max_silent_ms: Option<u64>,
+    /// Read-class tool calls (read_file / read_symbol). Exploration metric.
+    pub read_calls: u32,
+    /// Search-class tool calls (grep / find_files / find_symbol / list_files /
+    /// find_references / locate_hint). Exploration metric.
+    pub search_calls: u32,
+    /// `apply_patch` invocations (attempted, regardless of outcome).
+    pub apply_patch_calls: u32,
+    /// `replace` invocations (attempted, regardless of outcome).
+    pub replace_calls: u32,
+    /// The model round of the FIRST edit-tool call, counting rounds by
+    /// stream-attempt starts (retries inflate the count slightly — this is an
+    /// exploration-convergence signal, not an exact ledger). `None` when the
+    /// run never attempted an edit.
+    pub first_edit_round: Option<u32>,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order
@@ -1055,6 +1097,32 @@ impl EvalReport {
             *counts.entry(key).or_insert(0) += 1;
         }
         counts.into_iter().collect()
+    }
+
+    /// Case ids that passed with at least one edit failure: the run recovered
+    /// from edit thrash on its own. Surfaced so the eventual success does not
+    /// hide the intermediate failures.
+    pub fn self_recovered_edit_ids(&self) -> Vec<String> {
+        self.cases
+            .iter()
+            .filter(|c| c.passed() && c.edit_failures > 0)
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    /// `(cases where a repair turn started, of those where the post-repair
+    /// verification passed)`.
+    pub fn repair_counts(&self) -> (usize, usize) {
+        let triggered: Vec<_> = self
+            .cases
+            .iter()
+            .filter(|c| c.repair_attempts > 0)
+            .collect();
+        let succeeded = triggered
+            .iter()
+            .filter(|c| c.repair_success == Some(true))
+            .count();
+        (triggered.len(), succeeded)
     }
 
     /// Case ids whose repetitions disagree on passing — the flaky set that a
@@ -1113,6 +1181,15 @@ mod tests {
             is_recovery: false,
             ttff_ms: None,
             silent_duration_ms: None,
+            edit_attempts: 0,
+            edit_failures: 0,
+            read_calls: 0,
+            search_calls: 0,
+            apply_patch_calls: 0,
+            replace_calls: 0,
+            first_edit_round: None,
+            repair_attempts: 0,
+            repair_success: None,
         }
     }
 
@@ -1775,6 +1852,15 @@ mod tests {
             is_recovery: false,
             ttff_ms: None,
             silent_duration_ms: None,
+            edit_attempts: 0,
+            edit_failures: 0,
+            read_calls: 0,
+            search_calls: 0,
+            apply_patch_calls: 0,
+            replace_calls: 0,
+            first_edit_round: None,
+            repair_attempts: 0,
+            repair_success: None,
         }
     }
 

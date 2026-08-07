@@ -51,6 +51,9 @@ pub(crate) struct SignalCollector {
     max_silent_ms: u64,
     /// Count of feedback events observed (need ≥2 for a silent gap).
     feedback_events: u32,
+    /// Model rounds proxied by stream-attempt starts (retries inflate this
+    /// slightly); used to stamp `first_edit_round`.
+    rounds_started: u32,
 }
 
 impl SignalCollector {
@@ -65,6 +68,7 @@ impl SignalCollector {
             last_feedback: None,
             max_silent_ms: 0,
             feedback_events: 0,
+            rounds_started: 0,
         }
     }
 
@@ -94,6 +98,9 @@ impl SignalCollector {
     }
 
     pub(crate) fn observe_agent(&mut self, event: &AgentEvent) {
+        if matches!(event, AgentEvent::StreamAttemptStarted) {
+            self.rounds_started = self.rounds_started.saturating_add(1);
+        }
         match event {
             // User-visible feedback: status/wait labels, streaming text,
             // reasoning, tools, plan, verification, command heartbeats.
@@ -132,6 +139,22 @@ impl SignalCollector {
                     && self.relevant.iter().any(|p| arguments.contains(p.as_str()))
                 {
                     self.signals.touched_relevant_files = true;
+                }
+                match name.as_str() {
+                    "read_file" | "read_symbol" => self.signals.read_calls += 1,
+                    "grep" | "find_files" | "find_symbol" | "list_files" | "find_references"
+                    | "locate_hint" => self.signals.search_calls += 1,
+                    "apply_patch" | "replace" => {
+                        if name == "apply_patch" {
+                            self.signals.apply_patch_calls += 1;
+                        } else {
+                            self.signals.replace_calls += 1;
+                        }
+                        if self.signals.first_edit_round.is_none() {
+                            self.signals.first_edit_round = Some(self.rounds_started.max(1));
+                        }
+                    }
+                    _ => {}
                 }
                 if name == "run_command" && is_verification_program(arguments) {
                     self.verify_calls.insert(id.clone());
@@ -352,6 +375,45 @@ mod tests {
         c.observe_agent(&result("c1", "run_command", false, "ok"));
         let s = c.finish(false);
         assert!(s.verification_ran);
+    }
+
+    /// Exploration/edit-selection counters: reads, searches, per-tool edit
+    /// counts, and the first-edit round (proxied by stream attempts).
+    #[test]
+    fn exploration_and_edit_counters_track_tool_classes() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 1
+        c.observe_agent(&call("c1", "grep", serde_json::json!({"pattern": "x"})));
+        c.observe_agent(&result("c1", "grep", false, "1 match"));
+        c.observe_agent(&call(
+            "c2",
+            "read_file",
+            serde_json::json!({"path": "a.md"}),
+        ));
+        c.observe_agent(&result("c2", "read_file", false, "…"));
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 2
+        c.observe_agent(&call(
+            "c3",
+            "apply_patch",
+            serde_json::json!({"patch": "p"}),
+        ));
+        c.observe_agent(&result("c3", "apply_patch", true, "failed to apply hunk"));
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 3
+        c.observe_agent(&call("c4", "replace", serde_json::json!({"path": "a.md"})));
+        c.observe_agent(&result("c4", "replace", false, "ok"));
+
+        let s = c.finish(false);
+        assert_eq!(s.read_calls, 1);
+        assert_eq!(s.search_calls, 1);
+        assert_eq!(s.apply_patch_calls, 1);
+        assert_eq!(s.replace_calls, 1);
+        assert_eq!(s.edit_attempts, 2);
+        assert_eq!(s.edit_failures, 1);
+        assert_eq!(
+            s.first_edit_round,
+            Some(2),
+            "first edit landed in the second stream attempt"
+        );
     }
 
     #[test]

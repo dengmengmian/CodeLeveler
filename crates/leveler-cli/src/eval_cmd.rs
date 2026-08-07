@@ -716,6 +716,46 @@ async fn run_bare_case(
     }
 }
 
+/// Count engine repair turns and whether verification passed after the last
+/// one, from the persisted event log. `repair_started` / `verification_finished`
+/// are the engine's own canonical rows — a repair is only reported when the
+/// engine actually started one.
+async fn repair_metrics_from_events(
+    db: &leveler_storage::Database,
+    session_id: &leveler_core::SessionId,
+) -> (u32, Option<bool>) {
+    let events = match leveler_storage::EventRepository::new(db)
+        .load(session_id)
+        .await
+    {
+        Ok(events) => events,
+        Err(_) => return (0, None),
+    };
+    let mut repairs = 0u32;
+    let mut last_repair_seq: Option<i64> = None;
+    for event in &events {
+        if event.event_type == "repair_started" {
+            repairs += 1;
+            last_repair_seq = Some(event.sequence);
+        }
+    }
+    let Some(repair_seq) = last_repair_seq else {
+        return (0, None);
+    };
+    // The first verification verdict AFTER the last repair is its outcome.
+    let post_repair_verdict = events
+        .iter()
+        .filter(|e| e.sequence > repair_seq && e.event_type == "verification_finished")
+        .find_map(|e| {
+            serde_json::from_str::<serde_json::Value>(&e.payload)
+                .ok()?
+                .get("payload")?
+                .get("passed")?
+                .as_bool()
+        });
+    (repairs, post_repair_verdict)
+}
+
 fn termination_from_stop_reason(reason: StopReason) -> leveler_eval::TerminationClass {
     match reason {
         StopReason::Completed
@@ -879,6 +919,15 @@ async fn run_eval_case(
         is_recovery: case.recovery,
         ttff_ms: None,
         silent_duration_ms: None,
+        edit_attempts: 0,
+        edit_failures: 0,
+        read_calls: 0,
+        search_calls: 0,
+        apply_patch_calls: 0,
+        replace_calls: 0,
+        first_edit_round: None,
+        repair_attempts: 0,
+        repair_success: None,
     };
 
     // Materialize the workspace. Two modes:
@@ -1067,6 +1116,18 @@ async fn run_eval_case(
     } else {
         (0, 0, 0)
     };
+
+    // Repair metrics come from the canonical persisted event log, not the
+    // AgentEvent stream (the engine-to-agent mapping drops RepairStarted): a
+    // repair only counts when the engine actually emitted the event.
+    let (repair_attempts, repair_success) = if let Some(session_id) = &session_id {
+        match app.open_database().await {
+            Ok(db) => repair_metrics_from_events(&db, session_id).await,
+            Err(_) => (0, None),
+        }
+    } else {
+        (0, None)
+    };
     let rounds = if rounds > 0 { rounds } else { observed_rounds };
 
     // Cost only when the model profile carries auditable pricing — never invented.
@@ -1128,6 +1189,15 @@ async fn run_eval_case(
         is_recovery: case.recovery,
         ttff_ms: signals.ttff_ms,
         silent_duration_ms: signals.max_silent_ms,
+        edit_attempts: signals.edit_attempts,
+        edit_failures: signals.edit_failures,
+        read_calls: signals.read_calls,
+        search_calls: signals.search_calls,
+        apply_patch_calls: signals.apply_patch_calls,
+        replace_calls: signals.replace_calls,
+        first_edit_round: signals.first_edit_round,
+        repair_attempts,
+        repair_success,
     }
 }
 
@@ -1162,8 +1232,38 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
             .and_then(|value| value.as_str().map(str::to_string))
             .map(|value| format!(" termination={value}"))
             .unwrap_or_default();
+        // Exploration/edit/repair shape, only when the run did any of it —
+        // legacy runs and pure-answer cases keep the compact line.
+        let mut shape = String::new();
+        if c.read_calls + c.search_calls > 0 {
+            shape.push_str(&format!(
+                " reads={} searches={}",
+                c.read_calls, c.search_calls
+            ));
+        }
+        if c.edit_attempts > 0 {
+            shape.push_str(&format!(
+                " edits={}/{}err (patch={} replace={} first@r{})",
+                c.edit_attempts,
+                c.edit_failures,
+                c.apply_patch_calls,
+                c.replace_calls,
+                c.first_edit_round.unwrap_or(0)
+            ));
+        }
+        if c.repair_attempts > 0 {
+            shape.push_str(&format!(
+                " repair={}({})",
+                c.repair_attempts,
+                match c.repair_success {
+                    Some(true) => "pass",
+                    Some(false) => "fail",
+                    None => "?",
+                }
+            ));
+        }
         println!(
-            "  {mark} {:<24} run={} steps={} tokens={}/{} latency={}ms {}{}{}",
+            "  {mark} {:<24} run={} steps={} tokens={}/{} latency={}ms{shape} {}{}{}",
             c.id,
             c.repetition,
             c.rounds,
@@ -1184,6 +1284,20 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
         report.completion_accuracy() * 100.0,
         report.avg_rounds()
     );
+    let self_recovered = report.self_recovered_edit_ids();
+    if !self_recovered.is_empty() {
+        println!(
+            "  → self-recovered edit cases: {} ({})",
+            self_recovered.len(),
+            self_recovered.join(", ")
+        );
+    }
+    let (repair_triggered, repair_succeeded) = report.repair_counts();
+    if repair_triggered > 0 {
+        println!(
+            "  → engine repair: triggered in {repair_triggered} case(s), post-repair verification passed in {repair_succeeded}"
+        );
+    }
     // Headline agent-quality signal: the agent claimed "done" but the
     // independent check disagreed. Surface it prominently, never buried.
     let false_completions = report.false_completion_count();
