@@ -2188,6 +2188,15 @@ expect: { program: cargo, args: [test] }
                 is_recovery: false,
                 ttff_ms: None,
                 silent_duration_ms: None,
+                edit_attempts: 0,
+                edit_failures: 0,
+                read_calls: 0,
+                search_calls: 0,
+                apply_patch_calls: 0,
+                replace_calls: 0,
+                first_edit_round: None,
+                repair_attempts: 0,
+                repair_success: None,
             }
             .passed()
         );
@@ -2213,6 +2222,15 @@ expect: { program: cargo, args: [test] }
                 is_recovery: false,
                 ttff_ms: None,
                 silent_duration_ms: None,
+                edit_attempts: 0,
+                edit_failures: 0,
+                read_calls: 0,
+                search_calls: 0,
+                apply_patch_calls: 0,
+                replace_calls: 0,
+                first_edit_round: None,
+                repair_attempts: 0,
+                repair_success: None,
             }
             .passed()
         );
