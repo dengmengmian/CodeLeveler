@@ -20,7 +20,7 @@ pub use environment::{
 };
 pub use ids::{
     ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, RequestId,
-    SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, new_uuid_string,
+    RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, new_uuid_string,
 };
 pub use text::{
     ceil_char_boundary, floor_char_boundary, redact_secrets, sanitize_terminal_output,
