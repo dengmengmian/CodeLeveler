@@ -18,3 +18,12 @@ limits:
 compatibility:
   synthesize_tool_call_ids: true
   drop_unsupported_fields: true
+  # DeepSeek rejects a forced tool_choice while thinking (HTTP 400), and
+  # thinking is its server-side default — the adapter must explicitly disable
+  # thinking on forced-choice requests. Measured 2026-08-07.
+  thinking_supports_forced_tool_choice: false
+  # DeepSeek thinking mode validates assistant tool-call ids: an id it does
+  # not recognize as its own thinking-mode generation (e.g. one produced in a
+  # thinking-disabled round) is rejected unless the message echoes
+  # `reasoning_content` (captured text, or "" when none). Measured 2026-08-07.
+  passback_reasoning_content: true

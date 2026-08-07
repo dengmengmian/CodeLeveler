@@ -346,6 +346,8 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             parallel_tool_calls: true,
             supports_temperature: true,
+            thinking_supports_forced_tool_choice: true,
+            passback_reasoning_content: false,
         }
     }
 

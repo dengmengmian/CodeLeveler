@@ -28,6 +28,13 @@ pub struct ProtocolContext {
     /// (Kimi For Coding) reject every value but their own default, so the field
     /// is omitted rather than forwarded — see `CompatibilityConfig`.
     pub supports_temperature: bool,
+    /// Whether the provider accepts a forced `tool_choice` while thinking mode
+    /// is active. When false, the thinking-flag adapter explicitly disables
+    /// thinking on forced-choice requests — see `CompatibilityConfig`.
+    pub thinking_supports_forced_tool_choice: bool,
+    /// Whether assistant tool-call messages must echo `reasoning_content`
+    /// back to the provider — see `CompatibilityConfig`.
+    pub passback_reasoning_content: bool,
 }
 
 /// A protocol-layer failure. Kept separate from `ModelError` because a protocol

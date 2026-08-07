@@ -146,6 +146,10 @@ impl ProviderRegistry {
             reasoning: profile.reasoning,
             parallel_tool_calls: profile.capabilities.parallel_tool_calls,
             supports_temperature: profile.compatibility.supports_temperature,
+            thinking_supports_forced_tool_choice: profile
+                .compatibility
+                .thinking_supports_forced_tool_choice,
+            passback_reasoning_content: profile.compatibility.passback_reasoning_content,
         }
     }
 

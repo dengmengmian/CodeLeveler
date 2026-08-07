@@ -209,6 +209,18 @@ struct GlobalModel {
     /// false there. Defaults to true.
     #[serde(default = "default_true")]
     supports_temperature: bool,
+    /// Whether the provider accepts a forced `tool_choice` (`required` /
+    /// named function) while thinking mode is active. DeepSeek rejects that
+    /// combination (HTTP 400 "Thinking mode does not support this
+    /// tool_choice") — set false there so the adapter explicitly disables
+    /// thinking on exactly those requests. Defaults to true.
+    #[serde(default = "default_true")]
+    thinking_supports_forced_tool_choice: bool,
+    /// Whether assistant tool-call messages must echo `reasoning_content`
+    /// back (DeepSeek thinking-mode contract: an unrecognized tool-call id is
+    /// rejected unless the key is present). Defaults to false.
+    #[serde(default)]
+    passback_reasoning_content: bool,
 }
 
 fn default_true() -> bool {
@@ -407,6 +419,9 @@ impl GlobalConfig {
                         },
                         compatibility: CompatibilityConfig {
                             supports_temperature: m.supports_temperature,
+                            thinking_supports_forced_tool_choice: m
+                                .thinking_supports_forced_tool_choice,
+                            passback_reasoning_content: m.passback_reasoning_content,
                             ..CompatibilityConfig::default()
                         },
                         // Global models use the default prompt; a per-model prompt
@@ -938,5 +953,70 @@ provider = "kimi"
         };
         assert!(!find("kimi-for-coding"), "explicit false must be honored");
         assert!(find("normal"), "omitted must default to true");
+    }
+
+    #[test]
+    fn thinking_forced_tool_choice_defaults_true_and_can_be_disabled() {
+        let toml = r#"
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+
+[models."thinking-forced-incompatible"]
+provider = "deepseek"
+thinking_supports_forced_tool_choice = false
+
+[models."legacy"]
+provider = "deepseek"
+"#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let find = |id: &str| {
+            bundle
+                .models
+                .iter()
+                .find(|m| m.profile.id == id)
+                .unwrap()
+                .profile
+                .compatibility
+                .thinking_supports_forced_tool_choice
+        };
+        assert!(
+            !find("thinking-forced-incompatible"),
+            "explicit false must reach the profile"
+        );
+        assert!(
+            find("legacy"),
+            "legacy profiles keep the compatible default"
+        );
+    }
+
+    #[test]
+    fn passback_reasoning_content_defaults_false_and_can_be_enabled() {
+        let toml = r#"
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+
+[models."needs-passback"]
+provider = "deepseek"
+passback_reasoning_content = true
+
+[models."legacy"]
+provider = "deepseek"
+"#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let find = |id: &str| {
+            bundle
+                .models
+                .iter()
+                .find(|m| m.profile.id == id)
+                .unwrap()
+                .profile
+                .compatibility
+                .passback_reasoning_content
+        };
+        assert!(
+            find("needs-passback"),
+            "explicit true must reach the profile"
+        );
+        assert!(!find("legacy"), "legacy profiles never send the key");
     }
 }
