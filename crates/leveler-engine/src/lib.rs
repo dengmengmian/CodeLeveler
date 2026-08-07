@@ -20,7 +20,8 @@ mod session_context;
 mod turn;
 
 pub use engine::{
-    TaskEngine, TaskReport, TaskSpec, acknowledge_crash_window, budget_prior_messages, mode_str,
+    CodingTaskSpec, RuntimeTaskSpec, TaskEngine, TaskReport, TaskSpec, acknowledge_crash_window,
+    budget_prior_messages, mode_str,
 };
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,

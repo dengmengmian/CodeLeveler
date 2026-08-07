@@ -38,10 +38,7 @@ pub trait TaskStore: Send + Sync {
     ) -> Result<Option<TaskId>, StorageError>;
 
     /// The primary session of `task_id`, if the task exists.
-    async fn session_for_task(
-        &self,
-        task_id: &TaskId,
-    ) -> Result<Option<SessionId>, StorageError>;
+    async fn session_for_task(&self, task_id: &TaskId) -> Result<Option<SessionId>, StorageError>;
 }
 
 /// The production SQLite adapter over the `tasks` table (migration 0016).
@@ -88,10 +85,7 @@ impl TaskStore for Database {
         Ok(id.map(TaskId::new))
     }
 
-    async fn session_for_task(
-        &self,
-        task_id: &TaskId,
-    ) -> Result<Option<SessionId>, StorageError> {
+    async fn session_for_task(&self, task_id: &TaskId) -> Result<Option<SessionId>, StorageError> {
         let id: Option<String> = sqlx::query_scalar("SELECT session_id FROM tasks WHERE id = ?1")
             .bind(task_id.as_str())
             .fetch_optional(self.pool())
@@ -144,10 +138,7 @@ impl TaskStore for MemoryTaskStore {
             .map(|(t, _)| TaskId::new(t.clone())))
     }
 
-    async fn session_for_task(
-        &self,
-        task_id: &TaskId,
-    ) -> Result<Option<SessionId>, StorageError> {
+    async fn session_for_task(&self, task_id: &TaskId) -> Result<Option<SessionId>, StorageError> {
         let rows = self.rows.lock().unwrap();
         Ok(rows
             .iter()

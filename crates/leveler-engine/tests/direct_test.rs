@@ -295,15 +295,19 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
 
 fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
     TaskSpec {
-        repository: h.dir.path().to_path_buf(),
-        goal: "add a function".to_string(),
-        mode: PermissionProfile::Assisted,
-        sandbox: false,
-        kind: ExecutionKind::Direct,
-        continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
-        limits: leveler_agent::StepLimits::default(),
-        verification: plan,
-        base_commit: None,
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: "add a function".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+            limits: leveler_agent::StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: h.dir.path().to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: plan,
+            base_commit: None,
+        },
     }
 }
 
@@ -459,7 +463,7 @@ async fn pure_qa_with_green_gates_is_completed_unverified() {
     )])
     .await;
     let mut s = spec(&h, gate("ok", "true"));
-    s.goal = "explain how auth works".to_string();
+    s.runtime.goal = "explain how auth works".to_string();
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -488,7 +492,7 @@ async fn impl_with_mutations_and_green_gates_is_verified() {
     // Goal contains "add" → task_looks_like_implementation; patch mutates src/lib.rs.
     let s = spec(&h, gate("ok", "true"));
     assert!(
-        s.goal.to_lowercase().contains("add"),
+        s.runtime.goal.to_lowercase().contains("add"),
         "fixture goal must look like implementation"
     );
     let session = h.engine.create_task(&s).await.unwrap();
@@ -555,7 +559,7 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
     let h = harness(responses).await;
     std::fs::write(h.dir.path().join("quicksort.py"), "def qs(): pass\n").unwrap();
     let mut s = spec(&h, gate("ok", "true"));
-    s.goal = "delete quicksort.py".to_string();
+    s.runtime.goal = "delete quicksort.py".to_string();
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -658,7 +662,7 @@ async fn bounded_eval_goal_still_stops_at_the_case_round_limit() {
     ])
     .await;
     let mut spec = spec(&h, VerificationPlan::default());
-    spec.continuation = leveler_agent::ContinuationPolicy::bounded(2);
+    spec.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(2);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let report = h
@@ -676,7 +680,7 @@ async fn bounded_eval_goal_still_stops_at_the_case_round_limit() {
 async fn direct_budget_stop_preserves_the_executor_detail() {
     let h = harness(vec![text("never reached")]).await;
     let mut spec = spec(&h, VerificationPlan::default());
-    spec.limits.max_duration = Some(std::time::Duration::ZERO);
+    spec.runtime.limits.max_duration = Some(std::time::Duration::ZERO);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let report = h
@@ -959,15 +963,19 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         supervisor: None,
     };
     let spec2 = TaskSpec {
-        repository: dir2.path().to_path_buf(),
-        goal: "add a function".to_string(),
-        mode: PermissionProfile::Assisted,
-        sandbox: false,
-        kind: ExecutionKind::Direct,
-        continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
-        limits: leveler_agent::StepLimits::default(),
-        verification: VerificationPlan::default(),
-        base_commit: None,
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: "add a function".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+            limits: leveler_agent::StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: dir2.path().to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: VerificationPlan::default(),
+            base_commit: None,
+        },
     };
 
     let report = engine2

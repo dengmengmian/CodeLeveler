@@ -656,16 +656,20 @@ async fn run_bare_case(
         }
     };
     let spec = leveler_engine::TaskSpec {
-        repository: app.layout.repo_root.clone(),
-        goal: case.task.clone(),
-        mode: PermissionProfile::Assisted,
-        sandbox: false,
-        kind: leveler_engine::ExecutionKind::Direct,
-        continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
-        limits: leveler_agent::StepLimits::default(),
-        // THE ablated variable: an empty plan means there is nothing to verify.
-        verification: leveler_verifier::VerificationPlan::default(),
-        base_commit: None,
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: case.task.clone(),
+            kind: leveler_engine::ExecutionKind::Direct,
+            continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
+            limits: leveler_agent::StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: app.layout.repo_root.clone(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            // THE ablated variable: an empty plan means there is nothing to verify.
+            verification: leveler_verifier::VerificationPlan::default(),
+            base_commit: None,
+        },
     };
     let session_id = match engine.create_task(&spec).await {
         Ok(id) => id,
@@ -1255,36 +1259,40 @@ mod ablation_tests {
         };
 
         let bare = leveler_engine::TaskSpec {
-            repository: std::path::PathBuf::from("/repo"),
-            goal: case.task.clone(),
-            mode: leveler_execution::PermissionProfile::Assisted,
-            sandbox: false,
-            kind: leveler_engine::ExecutionKind::Direct,
-            continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
-            limits: leveler_agent::StepLimits::default(),
-            verification: leveler_verifier::VerificationPlan::default(),
-            base_commit: None,
+            runtime: leveler_engine::RuntimeTaskSpec {
+                goal: case.task.clone(),
+                kind: leveler_engine::ExecutionKind::Direct,
+                continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
+                limits: leveler_agent::StepLimits::default(),
+            },
+            coding: leveler_engine::CodingTaskSpec {
+                repository: std::path::PathBuf::from("/repo"),
+                mode: leveler_execution::PermissionProfile::Assisted,
+                sandbox: false,
+                verification: leveler_verifier::VerificationPlan::default(),
+                base_commit: None,
+            },
         };
 
         assert!(
-            bare.verification.commands.is_empty(),
+            bare.coding.verification.commands.is_empty(),
             "the ablated run must have nothing to verify with"
         );
         assert!(
-            !bare.verification.has_gates(),
+            !bare.coding.verification.has_gates(),
             "an empty plan must report no gates, so the engine skips verification"
         );
         // The controls: identical to what the normal direct path passes.
         assert_eq!(
-            bare.continuation,
+            bare.runtime.continuation,
             leveler_agent::ContinuationPolicy::bounded(40),
             "same round budget as the normal run"
         );
         assert_eq!(
-            bare.limits,
+            bare.runtime.limits,
             leveler_agent::StepLimits::default(),
             "same step limits as the normal run"
         );
-        assert_eq!(bare.kind, leveler_engine::ExecutionKind::Direct);
+        assert_eq!(bare.runtime.kind, leveler_engine::ExecutionKind::Direct);
     }
 }
