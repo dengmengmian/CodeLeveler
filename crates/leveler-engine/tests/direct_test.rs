@@ -166,6 +166,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     let db = Database::connect_in_memory().await.unwrap();
     let engine = TaskEngine {
         stores: leveler_storage::EngineStores::from_database(&db),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: ExecutorFactory {
             runtime,
             registry: Arc::new(default_registry()),
@@ -256,6 +257,37 @@ impl leveler_storage::TerminalStore for FailingTerminal {
             "injected terminal failure".into(),
         ))
     }
+
+    async fn finish_task_owned(
+        &self,
+        _: &leveler_core::OwnershipToken,
+        _: &leveler_core::SessionId,
+        _: &str,
+        _: &str,
+        _: leveler_engine::TaskOutcome,
+        _: leveler_lifecycle::SessionStatus,
+        _: leveler_lifecycle::AgentState,
+        _: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
+        Err(leveler_storage::OwnershipError::Storage(
+            leveler_storage::StorageError::InvalidData("injected terminal failure".into()),
+        ))
+    }
+
+    async fn finish_turn_owned(
+        &self,
+        _: &leveler_core::OwnershipToken,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+        _: &str,
+        _: &str,
+        _: leveler_engine::TurnOutcome,
+        _: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::EventRecord, leveler_storage::OwnershipError> {
+        Err(leveler_storage::OwnershipError::Storage(
+            leveler_storage::StorageError::InvalidData("injected terminal failure".into()),
+        ))
+    }
 }
 
 /// A MessageStore whose appends fail — the transcript is not durable and the
@@ -281,6 +313,19 @@ impl leveler_storage::MessageStore for FailingMessages {
         _: &leveler_core::SessionId,
     ) -> Result<Vec<String>, leveler_storage::StorageError> {
         Ok(Vec::new())
+    }
+
+    async fn append_in_turn_owned(
+        &self,
+        _: &leveler_core::OwnershipToken,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+        _: &[String],
+        _: leveler_core::Timestamp,
+    ) -> Result<(), leveler_storage::OwnershipError> {
+        Err(leveler_storage::OwnershipError::Storage(
+            leveler_storage::StorageError::InvalidData("injected transcript failure".into()),
+        ))
     }
 }
 
@@ -355,6 +400,218 @@ async fn a_failed_transcript_append_fails_the_turn_loudly() {
         .unwrap()
         .unwrap();
     assert_eq!(outcome, Some(TaskOutcome::Failed));
+}
+
+/// A model runtime that hijacks task ownership (CAS to another runtime)
+/// before answering with a mutating tool call — Scenario H's deterministic
+/// "stale before dispatch" injection.
+struct HijackingRuntime {
+    inner: MockRuntime,
+    db: Database,
+    session: Arc<std::sync::OnceLock<leveler_core::SessionId>>,
+    hijacked: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl ModelRuntime for HijackingRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        if !self
+            .hijacked
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Steal ownership via legitimate CAS: read current, acquire as a
+            // different runtime. The engine's token is now stale.
+            let session = self.session.get().expect("session registered").clone();
+            let task = leveler_storage::TaskStore::task_for_session(&self.db, &session)
+                .await
+                .unwrap()
+                .expect("task exists");
+            let current = leveler_storage::OwnershipStore::current(&self.db, &task)
+                .await
+                .unwrap()
+                .unwrap();
+            leveler_storage::OwnershipStore::acquire(
+                &self.db,
+                &task,
+                &leveler_core::RuntimeId::new("rt-hijacker"),
+                current.epoch,
+            )
+            .await
+            .unwrap();
+        }
+        self.inner.generate(request, cancellation).await
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let response = self.generate(request, cancellation).await?;
+        Ok(leveler_model::stream_from_response(response))
+    }
+
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        self.inner.profile(model).await
+    }
+}
+
+/// Scenario H: ownership is lost between acquisition and the first tool
+/// dispatch. ToolHost's fence must refuse the dispatch — the mutating tool
+/// never runs — and the stale runtime writes no terminal fact.
+#[tokio::test]
+async fn stale_ownership_prevents_tool_dispatch() {
+    let mut h = harness(patch_then_resolve()).await;
+    let session_cell = Arc::new(std::sync::OnceLock::new());
+    h.engine.factory.runtime = Arc::new(HijackingRuntime {
+        inner: MockRuntime::new(patch_then_resolve()),
+        db: h.db.clone(),
+        session: session_cell.clone(),
+        hijacked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+    session_cell.set(session.clone()).unwrap();
+
+    let result = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await;
+    let error = result.expect_err("a stale runtime must abort");
+    // Two independent gates can fire first, both typed stale: the fenced
+    // canonical append (persist-before-side-effect already refuses to record
+    // the call) or the ToolHost ownership fence. Either way the run aborts
+    // with a named ownership failure.
+    let text = error.to_string();
+    assert!(
+        text.contains("stale runtime ownership") || text.contains("stale ownership for task"),
+        "the failure must be a named ownership fence, got: {error}"
+    );
+    // The mutating tool NEVER executed.
+    let source = std::fs::read_to_string(h.dir.path().join("src/lib.rs")).unwrap();
+    assert!(
+        !source.contains("pub fn added"),
+        "apply_patch must not have run: {source}"
+    );
+    // The stale runtime wrote no terminal fact.
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
+        .execution(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, None, "a stale runtime stamps no outcome");
+}
+
+/// Scenario J: same runtime restarts — reacquire advances the epoch, the old
+/// token is fenced, and recovery proceeds under the new token.
+#[tokio::test]
+async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
+    let h = harness(Vec::new()).await;
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let task = h.engine.task_for_session(&session).await.unwrap().unwrap();
+    let rt = leveler_core::RuntimeId::new("rt-test");
+    let old = leveler_storage::OwnershipStore::acquire(
+        &h.db,
+        &task,
+        &rt,
+        leveler_core::OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
+    // A crash left a running turn started under the old incarnation.
+    leveler_storage::TurnStore::start_owned(
+        &h.db,
+        &old,
+        &session,
+        "user",
+        None,
+        leveler_core::now(),
+    )
+    .await
+    .unwrap();
+
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
+    let reap = leveler_engine::reap_after_restart(&stores, &rt, None)
+        .await
+        .unwrap();
+    assert_eq!(reap.events.len(), 1, "the orphan turn is reaped");
+    assert!(reap.conflicts.is_empty());
+    // The old token is now stale (epoch advanced by the reacquire).
+    assert!(
+        leveler_storage::EventStore::append_owned(
+            &h.db,
+            &old,
+            &session,
+            None,
+            "task_started",
+            "{}",
+            leveler_core::now()
+        )
+        .await
+        .is_err(),
+        "the pre-restart token must be powerless"
+    );
+}
+
+/// Scenario K: a task owned by another runtime is never reaped or run —
+/// explicit conflict, no mutation.
+#[tokio::test]
+async fn a_foreign_owned_task_is_reported_not_touched() {
+    let h = harness(Vec::new()).await;
+    let spec = spec(&h, VerificationPlan::default());
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let task = h.engine.task_for_session(&session).await.unwrap().unwrap();
+    let other = leveler_core::RuntimeId::new("rt-other");
+    let foreign = leveler_storage::OwnershipStore::acquire(
+        &h.db,
+        &task,
+        &other,
+        leveler_core::OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
+    leveler_storage::TurnStore::start_owned(
+        &h.db,
+        &foreign,
+        &session,
+        "user",
+        None,
+        leveler_core::now(),
+    )
+    .await
+    .unwrap();
+
+    // Restart reap as rt-test: conflict reported, turn untouched.
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
+    let reap =
+        leveler_engine::reap_after_restart(&stores, &leveler_core::RuntimeId::new("rt-test"), None)
+            .await
+            .unwrap();
+    assert!(reap.events.is_empty());
+    assert_eq!(reap.conflicts.len(), 1);
+    assert_eq!(
+        leveler_storage::TurnStore::list_running(&h.db, Some(&session))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the foreign turn must still be running"
+    );
+    // Running the task from this engine is an explicit conflict, not a steal.
+    let error = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("must refuse a foreign-owned task");
+    assert!(
+        error.to_string().contains("owned by runtime"),
+        "conflict must be named: {error}"
+    );
 }
 
 #[tokio::test]
@@ -1045,6 +1302,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
     let workspace = Workspace::new(dir2.path()).unwrap();
     let engine2 = TaskEngine {
         stores: leveler_storage::EngineStores::from_database(&h.db),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
         factory: ExecutorFactory {
             runtime: Arc::new(MockRuntime::new(patch_then_resolve())),
             registry: Arc::new(default_registry()),

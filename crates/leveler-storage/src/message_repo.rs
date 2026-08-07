@@ -111,6 +111,68 @@ impl<'a> MessageRepository<'a> {
         Ok(())
     }
 
+    /// Fenced [`Self::append_in_turn`]: the ownership check runs INSIDE the
+    /// same immediate transaction as the inserts, so a stale token stores
+    /// nothing — no check-then-write window.
+    pub async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &leveler_core::TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let ts = now.to_rfc3339();
+        let mut tx = begin_immediate(self.db.pool())
+            .await
+            .map_err(crate::OwnershipError::Storage)?;
+        let current: Option<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT owner_runtime_id, owner_epoch FROM tasks WHERE session_id = ?1 AND id = ?2",
+        )
+        .bind(session_id.as_str())
+        .bind(token.task_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        let owned = current.as_ref().is_some_and(|(runtime, epoch)| {
+            runtime.as_deref() == Some(token.runtime_id.as_str())
+                && *epoch == token.owner_epoch.get() as i64
+        });
+        if !owned {
+            drop(tx); // implicit rollback: nothing was written
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM session_messages WHERE session_id = ?1",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        for (offset, payload) in payloads.iter().enumerate() {
+            let redacted = leveler_core::redact_secrets(payload);
+            sqlx::query(
+                "INSERT INTO session_messages (session_id, ordinal, payload, created_at, turn_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(session_id.as_str())
+            .bind(next + offset as i64)
+            .bind(&redacted)
+            .bind(&ts)
+            .bind(turn_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        Ok(())
+    }
+
     /// Load the payloads of one turn, in order.
     pub async fn load_for_turn(
         &self,

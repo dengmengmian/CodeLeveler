@@ -10,6 +10,7 @@
 pub mod budget;
 pub mod environment;
 pub mod ids;
+pub mod ownership;
 pub mod text;
 pub mod time;
 
@@ -22,6 +23,7 @@ pub use ids::{
     ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, RequestId,
     RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, new_uuid_string,
 };
+pub use ownership::{OwnerEpoch, OwnershipToken};
 pub use text::{
     ceil_char_boundary, floor_char_boundary, redact_secrets, sanitize_terminal_output,
     truncate_head_bytes, truncate_tail_bytes,

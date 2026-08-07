@@ -557,16 +557,32 @@ impl InProcessRuntimeClient {
         let Ok(db) = self.app.open_database().await else {
             return;
         };
-        let result = leveler_engine::reap_running_turns(&db, &db, session).await;
+        let Ok(runtime_id) = self.app.runtime_id() else {
+            tracing::warn!("cannot reap: runtime identity unavailable");
+            return;
+        };
+        let result = leveler_engine::reap_after_restart(
+            &leveler_storage::EngineStores::from_database(&db),
+            &runtime_id,
+            session,
+        )
+        .await;
         match result {
-            Ok(events) if events.is_empty() => {}
-            Ok(events) => {
-                let reaped = events.len();
-                tracing::warn!(
-                    reaped,
-                    session = session.map(|s| s.as_str()),
-                    "reaped zombie running turns"
-                );
+            Ok(outcome) => {
+                for conflict in &outcome.conflicts {
+                    tracing::warn!(
+                        session = conflict.session_id.as_str(),
+                        owner = ?conflict.owner,
+                        "not reaping a task owned by another runtime"
+                    );
+                }
+                if !outcome.events.is_empty() {
+                    tracing::warn!(
+                        reaped = outcome.events.len(),
+                        session = session.map(|s| s.as_str()),
+                        "reaped zombie running turns"
+                    );
+                }
             }
             Err(error) => {
                 tracing::warn!("failed to reap running turns: {error}");

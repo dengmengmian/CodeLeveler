@@ -1015,6 +1015,15 @@ Engine core unit/integration tests can run against test stores without depending
 
 Priority: **P1/P2 — required before cloud**
 
+> Status: **landed (single-host semantics)**. OwnerEpoch/OwnershipToken in
+> leveler-core; tasks carry owner_runtime_id + monotonic owner_epoch
+> (migration 0017, legacy tasks stay unowned). OwnershipStore acquire is a
+> one-statement CAS; every authoritative engine write (events, turn start,
+> transcript, Running transition, terminal commits) has a fenced _owned
+> variant whose check+write share one atomic boundary; ToolHost refuses
+> dispatch for a stale owner; recovery reacquires (epoch+1) and never touches
+> a foreign-owned task. No lease/heartbeat/transfer - later phases.
+
 Introduce:
 
 ```text

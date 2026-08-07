@@ -51,6 +51,22 @@ pub trait EventStore: Send + Sync {
         event_type: &str,
         turn_id: Option<&TurnId>,
     ) -> Result<Option<EventRecord>, StorageError>;
+
+    /// Fenced append: like `append`, but atomically guarded on `token` being
+    /// the session's task's CURRENT ownership. The check and the insert are
+    /// one atomic persistence step (single guarded statement in SQLite) — a
+    /// stale token stores nothing and gets a typed
+    /// [`crate::OwnershipError::Stale`]. This is how a runtime that lost its
+    /// task becomes unable to extend the canonical log.
+    async fn append_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<EventRecord, crate::OwnershipError>;
 }
 
 /// The production SQLite adapter: delegates to [`EventRepository`].
@@ -93,6 +109,55 @@ impl EventStore for Database {
             .load_last_by_type(session_id, event_type, turn_id)
             .await
     }
+
+    async fn append_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<EventRecord, crate::OwnershipError> {
+        let id = leveler_core::EventId::generate().into_inner();
+        let payload = leveler_core::redact_secrets(payload);
+        // One guarded statement: sequence assignment AND the ownership check
+        // happen inside the INSERT itself, so there is no window between
+        // "token verified" and "row written".
+        let inserted = sqlx::query(
+            "INSERT INTO events \
+             (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
+             SELECT ?1, ?2, ?3, \
+                    (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE session_id = ?2), \
+                    ?4, ?5, ?6, ?7 \
+             WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 \
+                           AND id = ?8 AND owner_runtime_id = ?9 AND owner_epoch = ?10)",
+        )
+        .bind(&id)
+        .bind(session_id.as_str())
+        .bind(turn_id.map(|t| t.as_str().to_string()))
+        .bind(event_type)
+        .bind(&payload)
+        .bind(now.to_rfc3339())
+        .bind(EVENT_SCHEMA_VERSION)
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if inserted.rows_affected() != 1 {
+            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+        }
+        Ok(sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events WHERE id = ?1",
+        )
+        .bind(&id)
+        .fetch_one(self.pool())
+        .await
+        .map_err(StorageError::from)?)
+    }
 }
 
 /// An in-memory [`EventStore`] for tests and ephemeral runs. Mirrors the SQLite
@@ -101,6 +166,10 @@ impl EventStore for Database {
 #[derive(Default)]
 pub struct MemoryEventStore {
     events: Mutex<Vec<EventRecord>>,
+    /// Shared ownership authority for fenced appends. Unset = `append_owned`
+    /// fails loudly (safe direction: a fenced write can never silently run
+    /// unfenced).
+    ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
 }
 
 impl MemoryEventStore {
@@ -109,23 +178,41 @@ impl MemoryEventStore {
         Self::default()
     }
 
+    /// Couple this store to the shared ownership authority so `append_owned`
+    /// can enforce the fence.
+    pub fn with_ownership(self, state: std::sync::Arc<crate::MemoryOwnershipState>) -> Self {
+        let _ = self.ownership.set(state);
+        self
+    }
+
     /// Insert a pre-built record verbatim (e.g. a migration/version fixture),
     /// bypassing sequence assignment. For tests and replaying external fixtures.
     pub fn seed(&self, record: EventRecord) {
         self.events.lock().unwrap().push(record);
     }
-}
 
-#[async_trait]
-impl EventStore for MemoryEventStore {
-    async fn append(
+    /// Crate-internal synchronous append for the memory terminal store,
+    /// whose commit body must run under the ownership lock.
+    pub(crate) fn append_record_for_terminal(
         &self,
         session_id: &SessionId,
         turn_id: Option<&TurnId>,
         event_type: &str,
         payload: &str,
         now: Timestamp,
-    ) -> Result<EventRecord, StorageError> {
+    ) -> EventRecord {
+        self.append_record(session_id, turn_id, event_type, payload, now)
+    }
+
+    /// The synchronous append shared by the fenced and unfenced paths.
+    fn append_record(
+        &self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> EventRecord {
         let mut events = self.events.lock().unwrap();
         let sequence = events
             .iter()
@@ -140,12 +227,46 @@ impl EventStore for MemoryEventStore {
             turn_id: turn_id.map(|t| t.as_str().to_string()),
             sequence,
             event_type: event_type.to_string(),
-            payload: payload.to_string(),
+            payload: leveler_core::redact_secrets(payload),
             created_at: now.to_rfc3339(),
             schema_version: EVENT_SCHEMA_VERSION,
         };
         events.push(record.clone());
-        Ok(record)
+        record
+    }
+}
+
+#[async_trait]
+impl EventStore for MemoryEventStore {
+    async fn append(
+        &self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<EventRecord, StorageError> {
+        Ok(self.append_record(session_id, turn_id, event_type, payload, now))
+    }
+
+    async fn append_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<EventRecord, crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory event store has no ownership authority configured".to_string(),
+            )));
+        };
+        // Ownership lock held across the append — no interleaved CAS window.
+        ownership.with_current(token, || {
+            self.append_record(session_id, turn_id, event_type, payload, now)
+        })
     }
 
     async fn load(&self, session_id: &SessionId) -> Result<Vec<EventRecord>, StorageError> {

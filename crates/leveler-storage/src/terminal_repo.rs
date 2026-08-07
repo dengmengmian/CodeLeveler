@@ -122,6 +122,155 @@ impl<'a> TerminalRepository<'a> {
     }
 }
 
+impl TerminalRepository<'_> {
+    /// Fenced [`Self::finish_task`]: the ownership assertion runs INSIDE the
+    /// same transaction as the terminal event and the projection update —
+    /// assert, append, project, COMMIT, with any failure rolling back all of
+    /// it. No assert-then-begin TOCTOU.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_task_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        event_type: &str,
+        payload: &str,
+        outcome: TaskOutcome,
+        status: SessionStatus,
+        state: AgentState,
+        now: Timestamp,
+    ) -> Result<EventRecord, crate::OwnershipError> {
+        // BEGIN IMMEDIATE: the ownership SELECT below precedes the writes, and
+        // a deferred read-then-write upgrade deadlocks against a concurrent
+        // writer with an immediate "database is locked" no busy_timeout can
+        // wait out (same rule as MessageRepository::append_in_turn).
+        let mut tx = self
+            .db
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)
+            .map_err(crate::OwnershipError::Storage)?;
+        if !owner_current_in_tx(&mut tx, token, session_id).await? {
+            let _ = tx.rollback().await;
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        let event = append_event(&mut tx, session_id, None, event_type, payload, &now)
+            .await
+            .map_err(crate::OwnershipError::Storage)?;
+        let updated = sqlx::query(
+            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5 \
+             WHERE id = ?1",
+        )
+        .bind(session_id.as_str())
+        .bind(outcome.as_str())
+        .bind(status.as_str())
+        .bind(state.as_str())
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await;
+        match updated {
+            Ok(updated) if updated.rows_affected() == 1 => {}
+            Ok(_) => {
+                let _ = tx.rollback().await;
+                return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                    format!("session {} not found for terminal transition", session_id),
+                )));
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(crate::OwnershipError::Storage(error.into()));
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(StorageError::from)
+            .map_err(crate::OwnershipError::Storage)?;
+        Ok(event)
+    }
+
+    /// Fenced [`Self::finish_turn`], same single-transaction contract.
+    pub async fn finish_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        event_type: &str,
+        payload: &str,
+        outcome: TurnOutcome,
+        now: Timestamp,
+    ) -> Result<EventRecord, crate::OwnershipError> {
+        // BEGIN IMMEDIATE: the ownership SELECT below precedes the writes, and
+        // a deferred read-then-write upgrade deadlocks against a concurrent
+        // writer with an immediate "database is locked" no busy_timeout can
+        // wait out (same rule as MessageRepository::append_in_turn).
+        let mut tx = self
+            .db
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)
+            .map_err(crate::OwnershipError::Storage)?;
+        if !owner_current_in_tx(&mut tx, token, session_id).await? {
+            let _ = tx.rollback().await;
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        let event = append_event(
+            &mut tx,
+            session_id,
+            Some(turn_id),
+            event_type,
+            payload,
+            &now,
+        )
+        .await
+        .map_err(crate::OwnershipError::Storage)?;
+        let updated = sqlx::query("UPDATE turns SET status = ?2, finished_at = ?3 WHERE id = ?1")
+            .bind(turn_id.as_str())
+            .bind(outcome.as_str())
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await;
+        match updated {
+            Ok(updated) if updated.rows_affected() == 1 => {}
+            Ok(_) => {
+                let _ = tx.rollback().await;
+                return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                    format!("turn {} not found for terminal transition", turn_id),
+                )));
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(crate::OwnershipError::Storage(error.into()));
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(StorageError::from)
+            .map_err(crate::OwnershipError::Storage)?;
+        Ok(event)
+    }
+}
+
+/// The in-transaction ownership assertion shared by both fenced terminals.
+async fn owner_current_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    token: &leveler_core::OwnershipToken,
+    session_id: &SessionId,
+) -> Result<bool, crate::OwnershipError> {
+    let row: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT owner_runtime_id, owner_epoch FROM tasks WHERE session_id = ?1 AND id = ?2",
+    )
+    .bind(session_id.as_str())
+    .bind(token.task_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+    Ok(row.is_some_and(|(runtime, epoch)| {
+        runtime.as_deref() == Some(token.runtime_id.as_str())
+            && epoch == token.owner_epoch.get() as i64
+    }))
+}
+
 async fn append_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     session_id: &SessionId,

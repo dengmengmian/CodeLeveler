@@ -445,7 +445,25 @@ async fn settle_background_turns(
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("a background turn never reached a terminal state after cancellation");
+    let stuck = repo.list_running(None).await.unwrap();
+    let mut diag = String::new();
+    for turn in &stuck {
+        let session = SessionId::new(turn.session_id.clone());
+        let task = leveler_storage::TaskStore::task_for_session(&db, &session)
+            .await
+            .unwrap();
+        let owner = match &task {
+            Some(task) => leveler_storage::OwnershipStore::current(&db, task)
+                .await
+                .unwrap(),
+            None => None,
+        };
+        diag.push_str(&format!(
+            "\n  turn {} session {} status {} task {task:?} owner {owner:?}",
+            turn.id, turn.session_id, turn.status
+        ));
+    }
+    panic!("a background turn never reached a terminal state after cancellation:{diag}");
 }
 
 /// Wait for the spawned background turn to reach a terminal event so the next

@@ -21,7 +21,7 @@ mod workspace_view;
 
 pub use global_config::{GlobalConfig, GlobalConfigError};
 pub use interactive::InProcessRuntimeClient;
-pub use parallel::ParallelEditOutcome;
+pub use parallel::{ParallelEditOutcome, acquire_parallel_parent_ownership};
 pub use runtime_identity::{RuntimeIdentityError, load_or_create_runtime_id};
 pub use session::engine_event_to_agent;
 pub use vcs::ShipOptions;
@@ -459,6 +459,7 @@ impl Application {
             // The composition root chooses the adapter: every engine port
             // backed by this repository's SQLite database (shared pool).
             stores: leveler_storage::EngineStores::from_database(&self.open_database().await?),
+            runtime_id: self.runtime_id()?,
             factory: leveler_engine::ExecutorFactory {
                 runtime,
                 registry: Arc::new(registry),

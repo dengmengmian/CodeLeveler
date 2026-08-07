@@ -346,6 +346,9 @@ pub fn mode_str(mode: PermissionProfile) -> &'static str {
 /// locally). The engine never names a concrete database.
 pub struct TaskEngine {
     pub stores: EngineStores,
+    /// This runtime's durable identity (from the composition root). Task
+    /// ownership is acquired for it at every execution entry.
+    pub runtime_id: leveler_core::RuntimeId,
     pub factory: ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
@@ -388,6 +391,7 @@ impl TaskEngine {
     /// a second copy — and an observer can never see an uncommitted fact.
     async fn finish_task(
         &self,
+        token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         outcome: TaskOutcome,
         reason: Option<String>,
@@ -404,7 +408,8 @@ impl TaskEngine {
         let (event_type, payload) = event.to_row()?;
         self.stores
             .terminal
-            .finish_task(
+            .finish_task_owned(
+                token,
                 session_id,
                 &event_type,
                 &payload,
@@ -422,14 +427,31 @@ impl TaskEngine {
     /// columns from the result and commit them with the TaskFinished event.
     async fn finish_from_result(
         &self,
+        token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         result: &Result<TaskReport, EngineError>,
         observer: &mut dyn FnMut(EngineEvent),
     ) -> Result<(), EngineError> {
+        // A stale runtime has no authority to write a terminal fact - not even
+        // Failed. Abort silently here; the current owner decides the task's
+        // future. (The fenced store would reject the write anyway; skipping
+        // avoids a second, noisier failure.)
+        if matches!(
+            result,
+            Err(EngineError::Ownership(
+                leveler_storage::OwnershipError::Stale { .. }
+            )) | Err(EngineError::OwnershipConflict { .. })
+                | Err(EngineError::Agent(
+                    leveler_agent::AgentError::StaleOwnership(_)
+                ))
+        ) {
+            return Ok(());
+        }
         match result {
             Ok(report) => {
                 let (status, state) = terminal_status_for(report);
                 self.finish_task(
+                    token,
                     session_id,
                     report.outcome,
                     (report.outcome != TaskOutcome::Verified).then(|| report.final_text.clone()),
@@ -442,6 +464,7 @@ impl TaskEngine {
             }
             Err(EngineError::Agent(leveler_agent::AgentError::Cancelled)) => {
                 self.finish_task(
+                    token,
                     session_id,
                     TaskOutcome::Interrupted,
                     None,
@@ -454,6 +477,7 @@ impl TaskEngine {
             }
             Err(error) => {
                 self.finish_task(
+                    token,
                     session_id,
                     TaskOutcome::Failed,
                     Some(error.to_string()),
@@ -474,22 +498,64 @@ impl TaskEngine {
     /// execution entry (run/chat/resume) passes here, so a session created by
     /// any path — including one that predates the tasks table — has its task
     /// row before the first turn. Returns that task id.
-    async fn mark_running(&self, session_id: &SessionId) -> Result<TaskId, EngineError> {
+    /// Acquire (or same-runtime reacquire) ownership of the session's task.
+    /// A task owned by a DIFFERENT runtime is a hard conflict - never
+    /// auto-stolen. The epoch always advances, fencing prior incarnations.
+    async fn acquire_ownership(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<leveler_core::OwnershipToken, EngineError> {
         let task_id = self
             .stores
             .tasks
             .ensure_for_session(session_id, leveler_core::now())
             .await?;
+        // Acquire (or same-runtime reacquire) ownership BEFORE any
+        // authoritative write. A task owned by another runtime is a hard
+        // conflict — never auto-stolen; the CAS itself refuses concurrent
+        // racers. The epoch always advances, so tokens from this runtime's
+        // previous incarnation become stale here.
+        let current = self
+            .stores
+            .ownership
+            .current(&task_id)
+            .await?
+            .ok_or_else(|| EngineError::Config(format!("no task row for session {session_id}")))?;
+        if let Some(owner) = &current.runtime
+            && owner != &self.runtime_id
+        {
+            return Err(EngineError::OwnershipConflict {
+                task_id,
+                owner: owner.clone(),
+                epoch: current.epoch,
+                this_runtime: self.runtime_id.clone(),
+            });
+        }
+        Ok(self
+            .stores
+            .ownership
+            .acquire(&task_id, &self.runtime_id, current.epoch)
+            .await?)
+    }
+
+    /// Mark the session running before the first turn (fenced), acquiring
+    /// ownership first — the ONE seam every execution entry passes through.
+    async fn mark_running(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<leveler_core::OwnershipToken, EngineError> {
+        let token = self.acquire_ownership(session_id).await?;
         self.stores
             .sessions
-            .update_status(
+            .update_status_owned(
+                &token,
                 session_id,
                 SessionStatus::Running,
                 AgentState::Execute,
                 leveler_core::now(),
             )
             .await?;
-        Ok(task_id)
+        Ok(token)
     }
 
     /// The durable task owning `session_id`, if the association exists yet.
@@ -538,16 +604,21 @@ impl TaskEngine {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        let log = EventLog::new(self.stores.events.as_ref(), session_id.clone());
+        let token = self.mark_running(session_id).await?;
+        let log = EventLog::new_owned(
+            self.stores.events.as_ref(),
+            session_id.clone(),
+            token.clone(),
+        );
         let runner = TurnRunner {
             stores: &self.stores,
+            token: token.clone(),
             session_id: session_id.clone(),
             log: &log,
             factory: &self.factory,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
         };
-        let task_id = self.mark_running(session_id).await?;
         log.append(
             None,
             EngineEvent::TaskStarted {
@@ -556,7 +627,7 @@ impl TaskEngine {
                 mode: mode_str(spec.coding.mode).to_string(),
                 sandbox: spec.coding.sandbox,
                 kind: spec.runtime.kind,
-                task_id: Some(task_id),
+                task_id: Some(token.task_id.clone()),
             },
             observer,
         )
@@ -598,7 +669,7 @@ impl TaskEngine {
 
         // Stamp the terminal outcome (interrupted on cancellation) and emit
         // TaskFinished before returning.
-        self.finish_from_result(session_id, &result, observer)
+        self.finish_from_result(&token, session_id, &result, observer)
             .await?;
         result
     }
@@ -644,8 +715,12 @@ impl TaskEngine {
         // context), unlike resume which must reconstruct exactly.
         let raw =
             crate::RawTranscript::load_lossy(self.stores.messages.as_ref(), session_id).await?;
-        let log = EventLog::new(self.stores.events.as_ref(), session_id.clone());
-        self.mark_running(session_id).await?;
+        let token = self.mark_running(session_id).await?;
+        let log = EventLog::new_owned(
+            self.stores.events.as_ref(),
+            session_id.clone(),
+            token.clone(),
+        );
         // Reconcile the crash window before continuing — the interactive path
         // is how a crashed session normally gets reopened (TUI/Web), and a
         // dangling mutating call means the workspace may already carry a side
@@ -675,6 +750,7 @@ impl TaskEngine {
         let prior = context.prior;
         let runner = TurnRunner {
             stores: &self.stores,
+            token: token.clone(),
             session_id: session_id.clone(),
             log: &log,
             factory: &self.factory,
@@ -702,7 +778,7 @@ impl TaskEngine {
             .await
         }
         .await;
-        self.finish_from_result(session_id, &result, observer)
+        self.finish_from_result(&token, session_id, &result, observer)
             .await?;
         result
     }
@@ -751,8 +827,12 @@ impl TaskEngine {
                  for interactive chat reopen with: leveler tui --session {session_id}"
             )));
         }
-        let log = EventLog::new(self.stores.events.as_ref(), session_id.clone());
-        self.mark_running(session_id).await?;
+        let token = self.mark_running(session_id).await?;
+        let log = EventLog::new_owned(
+            self.stores.events.as_ref(),
+            session_id.clone(),
+            token.clone(),
+        );
         let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
         // Same merge rules as chat: never drop post-snapshot transcript rows.
         let context = raw
@@ -769,6 +849,7 @@ impl TaskEngine {
         let prior = context.prior;
         let runner = TurnRunner {
             stores: &self.stores,
+            token: token.clone(),
             session_id: session_id.clone(),
             log: &log,
             factory: &self.factory,
@@ -785,7 +866,7 @@ impl TaskEngine {
         let result = self
             .resume_direct(&log, &runner, spec, prior, observer, cancellation)
             .await;
-        self.finish_from_result(session_id, &result, observer)
+        self.finish_from_result(&token, session_id, &result, observer)
             .await?;
         result
     }
@@ -819,11 +900,15 @@ impl TaskEngine {
     /// The marker is an errored result — never a fake success — and nothing is
     /// replayed; the model re-drives from the last clean turn boundary.
     /// Returns how many calls were closed.
+    /// Acknowledging is a canonical recovery write, so it is ownership-
+    /// fenced: this acquires (or same-runtime reacquires) the task first — a
+    /// foreign-owned task is an explicit conflict, never auto-stolen.
     pub async fn acknowledge_crash_window(
         &self,
         session_id: &SessionId,
     ) -> Result<usize, EngineError> {
-        acknowledge_crash_window(self.stores.events.as_ref(), session_id).await
+        let token = self.acquire_ownership(session_id).await?;
+        acknowledge_crash_window(self.stores.events.as_ref(), &token, session_id).await
     }
 
     /// Reconcile the crash window on resume: for every tool call that started
@@ -1689,9 +1774,12 @@ mod continue_cap_tests {
 /// proceed. Nothing is replayed. Returns how many calls were closed.
 pub async fn acknowledge_crash_window(
     events: &dyn EventStore,
+    token: &leveler_core::OwnershipToken,
     session_id: &SessionId,
 ) -> Result<usize, EngineError> {
-    let log = EventLog::new(events, session_id.clone());
+    // The reconciling markers are canonical recovery facts: fenced, so a
+    // stale or non-owner runtime cannot rewrite crash-window history.
+    let log = EventLog::new_owned(events, session_id.clone(), token.clone());
     let dangling = log.dangling_tool_calls().await?;
     let closed = dangling.len();
     for call in dangling {

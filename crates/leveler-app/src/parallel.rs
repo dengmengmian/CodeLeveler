@@ -28,6 +28,36 @@ pub struct ParallelEditOutcome {
     pub session: String,
 }
 
+/// Acquire (or same-runtime reacquire) the parallel parent's task ownership —
+/// the SAME policy as `TaskEngine::acquire_ownership`: unowned or owned by
+/// this runtime → CAS to a fresh epoch; owned by a FOREIGN runtime → explicit
+/// error, no acquire, no owner mutation. The OwnershipStore CAS can transfer
+/// across runtimes when given the right expected epoch; that capability is for
+/// explicit future transfer protocols, never an execution path's auto-acquire.
+pub async fn acquire_parallel_parent_ownership(
+    ownership: &dyn leveler_storage::OwnershipStore,
+    task_id: &leveler_core::TaskId,
+    runtime_id: &leveler_core::RuntimeId,
+) -> Result<leveler_core::OwnershipToken, AppError> {
+    let current = ownership
+        .current(task_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no task row for task {task_id}")))?;
+    if let Some(owner) = &current.runtime
+        && owner != runtime_id
+    {
+        return Err(AppError::Engine(format!(
+            "task {task_id} is owned by runtime {owner} at epoch {}; \
+             this runtime ({runtime_id}) must not run it as a parallel parent",
+            current.epoch
+        )));
+    }
+    ownership
+        .acquire(task_id, runtime_id, current.epoch)
+        .await
+        .map_err(|e| AppError::Engine(e.to_string()))
+}
+
 impl Application {
     /// Run `n` agents concurrently on `task` in isolated worktrees and integrate
     /// the results into the current branch. Requires a clean, committed repo.
@@ -72,18 +102,26 @@ impl Application {
             leveler_core::now(),
         )
         .await?;
-        repo.update_status(
+        // The parallel parent never enters the engine's run path, so its
+        // durable task row, ownership acquisition, and fenced Running
+        // transition happen here (the engine does the same in `mark_running`
+        // for direct/chat/resume sessions). Everything canonical below rides
+        // this token; if ownership is lost mid-run, the writes fail typed —
+        // a stale runtime never stamps a covering terminal fact.
+        let task_id = TaskStore::ensure_for_session(&db, &parent, leveler_core::now()).await?;
+        let runtime_id = self.runtime_id()?;
+        let token = acquire_parallel_parent_ownership(&db, &task_id, &runtime_id).await?;
+        leveler_storage::SessionStore::update_status_owned(
+            &db,
+            &token,
             &parent,
             SessionStatus::Running,
             AgentState::Execute,
             leveler_core::now(),
         )
-        .await?;
-        // The parallel parent never enters the engine's run path, so its
-        // durable task row is ensured here (the engine does the same in
-        // `mark_running` for direct/chat/resume sessions).
-        let task_id = TaskStore::ensure_for_session(&db, &parent, leveler_core::now()).await?;
-        let log = EventLog::new(&db, parent.clone());
+        .await
+        .map_err(|e| AppError::Engine(e.to_string()))?;
+        let log = EventLog::new_owned(&db, parent.clone(), token.clone());
         let sink = &mut |_: EngineEvent| {};
         log.append(
             None,
@@ -93,7 +131,7 @@ impl Application {
                 mode: mode_str(mode).to_string(),
                 sandbox: false,
                 kind: ExecutionKind::Parallel,
-                task_id: Some(task_id),
+                task_id: Some(token.task_id.clone()),
             },
             sink,
         )
@@ -246,17 +284,19 @@ impl Application {
         let (event_type, payload) = event
             .to_row()
             .map_err(crate::session::app_error_from_engine)?;
-        leveler_storage::TerminalRepository::new(&db)
-            .finish_task(
-                &parent,
-                &event_type,
-                &payload,
-                outcome,
-                status,
-                state,
-                leveler_core::now(),
-            )
-            .await?;
+        leveler_storage::TerminalStore::finish_task_owned(
+            &db,
+            &token,
+            &parent,
+            &event_type,
+            &payload,
+            outcome,
+            status,
+            state,
+            leveler_core::now(),
+        )
+        .await
+        .map_err(|e| AppError::Engine(e.to_string()))?;
 
         Ok(ParallelEditOutcome {
             candidates: candidates.len(),

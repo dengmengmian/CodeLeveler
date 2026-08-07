@@ -505,6 +505,11 @@ pub enum AgentError {
     Model(#[from] ModelError),
     #[error("cancelled")]
     Cancelled,
+    /// The runtime lost task ownership: a newer OwnerEpoch exists. The run
+    /// must abort; a stale runtime writes no further canonical facts and
+    /// dispatches no further tools.
+    #[error("stale runtime ownership: {0}")]
+    StaleOwnership(String),
     #[error("invalid execution budget: {0}")]
     InvalidBudget(String),
     #[error("persistence error: {0}")]
@@ -522,6 +527,17 @@ pub enum AgentError {
 ///
 /// Hosts without durable persistence (sub-agents, standalone library use)
 /// leave the barrier unset; the loop then proceeds without waiting.
+/// The ownership fence: proves the runtime still owns its task before a
+/// model-proposed tool may produce an external side effect. Checked AFTER
+/// the persistence barriers (ToolCallStarted + approval durable) and BEFORE
+/// dispatch. It cannot make side effects exactly-once - it only guarantees a
+/// runtime already known stale dispatches nothing new.
+#[async_trait::async_trait]
+pub trait ExecutionFence: Send + Sync {
+    /// Err(reason) = the token is stale; the run must abort.
+    async fn ensure_current(&self) -> Result<(), String>;
+}
+
 #[async_trait]
 pub trait EventBarrier: Send + Sync {
     async fn flush(&self) -> Result<(), AgentError>;
@@ -845,6 +861,9 @@ pub struct Executor {
     /// tool with possible side effects is dispatched. `None` = no durable
     /// host (standalone library use); the loop proceeds without waiting.
     event_barrier: Option<Arc<dyn EventBarrier>>,
+    /// Ownership fence consulted after the admission barriers and before
+    /// tool dispatch; None = unfenced (non-engine/test executors).
+    execution_fence: Option<Arc<dyn ExecutionFence>>,
     /// This agent's delegation id, when it IS a delegated agent. Its tool
     /// events are attributed to it so the host can tell whose side effect a
     /// dangling call belongs to.
@@ -898,6 +917,7 @@ impl Executor {
             ),
             grants_state_dir: None,
             event_barrier: None,
+            execution_fence: None,
             agent_id: None,
         }
     }
@@ -1156,6 +1176,7 @@ impl Executor {
             // delegated side effect is as durable-before-execution as a
             // parent one. `agent_id` is stamped by the spawn handler.
             event_barrier: self.event_barrier.clone(),
+            execution_fence: self.execution_fence.clone(),
             agent_id: None,
         }
     }
@@ -1349,6 +1370,12 @@ impl Executor {
     /// Install the host's side-effect barrier (see [`EventBarrier`]).
     pub fn with_event_barrier(mut self, barrier: Arc<dyn EventBarrier>) -> Self {
         self.event_barrier = Some(barrier);
+        self
+    }
+
+    /// Install the ownership fence checked before every tool dispatch.
+    pub fn with_execution_fence(mut self, fence: Arc<dyn ExecutionFence>) -> Self {
+        self.execution_fence = Some(fence);
         self
     }
 

@@ -218,6 +218,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_0017_leaves_legacy_tasks_unowned() {
+        use sqlx::ConnectOptions;
+        use sqlx::migrate::Migrate;
+
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-db-ownership-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.db");
+
+        // A genuine pre-0017 database: sessions + backfilled tasks exist.
+        {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .unwrap();
+            conn.ensure_migrations_table().await.unwrap();
+            for migration in MIGRATOR.migrations.iter().filter(|m| m.version < 17) {
+                conn.apply(migration).await.unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO sessions (id, repository, goal, status, model, state, \
+                 created_at, updated_at) VALUES ('legacy','/r','g','completed','m','complete','t','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO tasks (id, session_id, created_at) VALUES ('legacy','legacy','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        // Reopening applies 0017: historical tasks stay UNOWNED — the
+        // migration must not invent a runtime authority it cannot know.
+        let db = Database::connect(&path).await.unwrap();
+        let (runtime, epoch): (Option<String>, i64) =
+            sqlx::query_as("SELECT owner_runtime_id, owner_epoch FROM tasks WHERE id = 'legacy'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(runtime, None);
+        assert_eq!(epoch, 0);
+
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn peek_repository_reads_latest_row_without_migrating() {
         let dir = std::env::temp_dir().join(format!(
             "leveler-db-peek-{}-{}",

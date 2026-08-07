@@ -24,11 +24,32 @@ fn check_version(row: &EventRecord) -> Result<(), EngineError> {
 pub struct EventLog<'a> {
     store: &'a dyn EventStore,
     session_id: SessionId,
+    /// When set, every persisted append is fenced on this token being the
+    /// task's current ownership - a stale runtime cannot extend the log.
+    owner: Option<leveler_core::OwnershipToken>,
 }
 
 impl<'a> EventLog<'a> {
     pub fn new(store: &'a dyn EventStore, session_id: SessionId) -> Self {
-        Self { store, session_id }
+        Self {
+            store,
+            session_id,
+            owner: None,
+        }
+    }
+
+    /// An ownership-fenced log: appends carry `token` and are rejected
+    /// atomically once the token is stale.
+    pub fn new_owned(
+        store: &'a dyn EventStore,
+        session_id: SessionId,
+        token: leveler_core::OwnershipToken,
+    ) -> Self {
+        Self {
+            store,
+            session_id,
+            owner: Some(token),
+        }
     }
 
     /// Persist the event (unless transient), THEN forward it to the observer.
@@ -42,15 +63,31 @@ impl<'a> EventLog<'a> {
     ) -> Result<(), EngineError> {
         if !event.is_transient() {
             let (event_type, payload) = event.to_row()?;
-            self.store
-                .append(
-                    &self.session_id,
-                    turn_id,
-                    &event_type,
-                    &payload,
-                    leveler_core::now(),
-                )
-                .await?;
+            match &self.owner {
+                Some(token) => {
+                    self.store
+                        .append_owned(
+                            token,
+                            &self.session_id,
+                            turn_id,
+                            &event_type,
+                            &payload,
+                            leveler_core::now(),
+                        )
+                        .await?;
+                }
+                None => {
+                    self.store
+                        .append(
+                            &self.session_id,
+                            turn_id,
+                            &event_type,
+                            &payload,
+                            leveler_core::now(),
+                        )
+                        .await?;
+                }
+            }
         }
         forward(event);
         Ok(())

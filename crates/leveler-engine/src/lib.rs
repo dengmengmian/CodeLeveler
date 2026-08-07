@@ -40,7 +40,7 @@ pub use policy_resolver::{
     ExecutionOverrides, ExecutionRole, ResolvedExecutionPolicy, resolve_execution_policy,
     resolve_tool_limits,
 };
-pub use reaper::reap_running_turns;
+pub use reaper::{ReapConflict, ReapOutcome, reap_after_restart, reap_running_turns_owned};
 pub use session_context::{RawTranscript, SessionContext};
 pub use turn::{TurnInput, TurnRecordedOutcome, TurnRunner};
 
@@ -62,6 +62,21 @@ pub enum EngineError {
         "recovery requires manual confirmation: tool `{tool}` (call `{call_id}`) may have already produced a side effect; inspect the workspace before retrying"
     )]
     RecoveryConfirmationRequired { call_id: String, tool: String },
+    /// A fenced write or acquisition found this runtime's token stale. The
+    /// run aborts; a stale runtime writes no further canonical facts.
+    #[error(transparent)]
+    Ownership(#[from] leveler_storage::OwnershipError),
+    /// The task is owned by a different runtime. Never auto-steal: stop and
+    /// report; the current owner decides the task's future.
+    #[error(
+        "task {task_id} is owned by runtime {owner} at epoch {epoch}; this runtime ({this_runtime}) must not touch it"
+    )]
+    OwnershipConflict {
+        task_id: leveler_core::TaskId,
+        owner: leveler_core::RuntimeId,
+        epoch: leveler_core::OwnerEpoch,
+        this_runtime: leveler_core::RuntimeId,
+    },
     #[error("corrupt or unreplayable history: {0}")]
     Corrupt(String),
 }

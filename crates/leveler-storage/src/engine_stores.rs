@@ -32,6 +32,8 @@ pub struct EngineStores {
     pub model_requests: Arc<dyn ModelRequestStore>,
     /// Atomic terminal commits (event + projection in one transaction).
     pub terminal: Arc<dyn TerminalStore>,
+    /// Durable task ownership (CAS acquire + current-owner reads).
+    pub ownership: Arc<dyn crate::OwnershipStore>,
 }
 
 impl EngineStores {
@@ -46,6 +48,7 @@ impl EngineStores {
             messages: Arc::new(db.clone()),
             model_requests: Arc::new(db.clone()),
             terminal: Arc::new(db.clone()),
+            ownership: Arc::new(db.clone()),
         }
     }
 }

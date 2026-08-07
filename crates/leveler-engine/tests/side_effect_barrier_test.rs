@@ -185,8 +185,25 @@ async fn run_chat_turn(
     text: &str,
 ) -> Result<leveler_engine::TurnRecordedOutcome, leveler_engine::EngineError> {
     let stores = leveler_storage::EngineStores::from_database(&h.db);
+    let task =
+        leveler_storage::TaskStore::ensure_for_session(&h.db, &h.session, leveler_core::now())
+            .await
+            .unwrap();
+    let owner = leveler_storage::OwnershipStore::current(&h.db, &task)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = leveler_storage::OwnershipStore::acquire(
+        &h.db,
+        &task,
+        &leveler_core::RuntimeId::new("rt-test"),
+        owner.epoch,
+    )
+    .await
+    .unwrap();
     let runner = TurnRunner {
         stores: &stores,
+        token,
         session_id: h.session.clone(),
         log,
         factory: &h.factory,
@@ -224,6 +241,22 @@ struct FailingApprovalStore {
 
 #[async_trait]
 impl EventStore for FailingApprovalStore {
+    // Fenced append: these doubles test event persistence/gating, not
+    // ownership - delegate to the unfenced path.
+    async fn append_owned(
+        &self,
+        _token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&leveler_core::TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<EventRecord, leveler_storage::OwnershipError> {
+        self.append(session_id, turn_id, event_type, payload, now)
+            .await
+            .map_err(leveler_storage::OwnershipError::Storage)
+    }
+
     async fn append(
         &self,
         session_id: &SessionId,
@@ -282,6 +315,22 @@ impl Approver for ApproveAlwaysHuman {
 
 #[async_trait]
 impl EventStore for FailingStartedStore {
+    // Fenced append: these doubles test event persistence/gating, not
+    // ownership - delegate to the unfenced path.
+    async fn append_owned(
+        &self,
+        _token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&leveler_core::TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<EventRecord, leveler_storage::OwnershipError> {
+        self.append(session_id, turn_id, event_type, payload, now)
+            .await
+            .map_err(leveler_storage::OwnershipError::Storage)
+    }
+
     async fn append(
         &self,
         session_id: &SessionId,
@@ -382,6 +431,22 @@ struct GatedApprovalStore {
 
 #[async_trait]
 impl EventStore for GatedApprovalStore {
+    // Fenced append: these doubles test event persistence/gating, not
+    // ownership - delegate to the unfenced path.
+    async fn append_owned(
+        &self,
+        _token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&leveler_core::TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<EventRecord, leveler_storage::OwnershipError> {
+        self.append(session_id, turn_id, event_type, payload, now)
+            .await
+            .map_err(leveler_storage::OwnershipError::Storage)
+    }
+
     async fn append(
         &self,
         session_id: &SessionId,

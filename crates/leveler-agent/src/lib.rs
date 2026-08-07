@@ -30,8 +30,8 @@ pub use compaction::{
 pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
-    ChildToolEvent, ClarificationRequest, Clarifier, ContinuationPolicy, EventBarrier, Executor,
-    ModelRequestRecord, NoopSink, SteeringSource, StepLimits, StopReason,
+    ChildToolEvent, ClarificationRequest, Clarifier, ContinuationPolicy, EventBarrier,
+    ExecutionFence, Executor, ModelRequestRecord, NoopSink, SteeringSource, StepLimits, StopReason,
     SubAgentExecutionPolicies, SubAgentExecutionPolicy, TranscriptSink, TurnPolicy, closeout,
 };
 pub use leveler_lifecycle::{

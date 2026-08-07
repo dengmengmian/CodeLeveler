@@ -1,17 +1,20 @@
-//! Recovery of turns left running by an unclean process exit.
+//! Recovery of turns left running by an unclean process exit — now
+//! ownership-aware: reaping is an authoritative write, so it requires a
+//! current token, and a runtime never touches another runtime's task.
 
-use leveler_core::{SessionId, TurnId};
-use leveler_storage::{TerminalStore, TurnStore};
+use leveler_core::{OwnershipToken, RuntimeId, SessionId, TurnId};
+use leveler_storage::{EngineStores, TerminalStore, TurnStore};
 
 use crate::{EngineError, EngineEvent, TurnOutcome};
 
-/// Interrupt every orphan running turn in scope. Each row transition and its
-/// canonical event commit atomically (the terminal port's contract) before
-/// the observer is notified; a commit failure propagates — a turn is never
-/// *assumed* interrupted.
-pub async fn reap_running_turns(
+/// Reap the scope's orphan running turns with an ALREADY-HELD current token
+/// (the engine's in-run path). Each row transition commits atomically and
+/// fenced; a commit failure propagates — a turn is never *assumed*
+/// interrupted.
+pub async fn reap_running_turns_owned(
     turns: &dyn TurnStore,
     terminal: &dyn TerminalStore,
+    token: &OwnershipToken,
     session_id: Option<&SessionId>,
 ) -> Result<Vec<EngineEvent>, EngineError> {
     let running = turns.list_running(session_id).await?;
@@ -29,7 +32,8 @@ pub async fn reap_running_turns(
         };
         let (event_type, payload) = event.to_row()?;
         terminal
-            .finish_turn(
+            .finish_turn_owned(
+                token,
                 &session_id,
                 &turn_id,
                 &event_type,
@@ -43,56 +47,68 @@ pub async fn reap_running_turns(
     Ok(events)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use leveler_storage::{
-        MemoryEventStore, MemorySessionStore, MemoryTerminalStore, MemoryTurnStore,
-    };
-    use std::sync::Arc;
+/// A task the restart reaper refused to touch because another runtime owns it.
+#[derive(Debug)]
+pub struct ReapConflict {
+    pub session_id: SessionId,
+    pub owner: Option<RuntimeId>,
+}
 
-    /// Failure injection D: when the terminal commit fails, the reaper must
-    /// propagate the error and the turn must NOT be assumed interrupted — it
-    /// stays visibly `running` for the next recovery attempt.
-    #[tokio::test]
-    async fn a_failed_terminal_commit_never_guesses_a_turn_interrupted() {
-        let sessions = Arc::new(MemorySessionStore::new());
-        let turns = Arc::new(MemoryTurnStore::new());
-        let events = Arc::new(MemoryEventStore::new());
-        let terminal = MemoryTerminalStore::new(sessions.clone(), turns.clone(), events.clone());
+/// What a restart reap did: the reaped events, plus every foreign-owned task
+/// it explicitly left alone (callers report these; silence would hide a
+/// split-ownership situation).
+#[derive(Debug, Default)]
+pub struct ReapOutcome {
+    pub events: Vec<EngineEvent>,
+    pub conflicts: Vec<ReapConflict>,
+}
 
-        let session = SessionId::new("s1");
-        let orphan = turns
-            .start(&session, "user", None, leveler_core::now())
-            .await
-            .unwrap();
-
-        terminal.fail_commits(true);
-        let result = reap_running_turns(turns.as_ref(), &terminal, None).await;
-        assert!(result.is_err(), "a failed commit must propagate");
-        let still_running = turns.list_running(None).await.unwrap();
-        assert_eq!(
-            still_running
-                .iter()
-                .map(|t| t.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![orphan.id.as_str()],
-            "the turn must stay running — never guessed interrupted"
-        );
-        assert!(
-            leveler_storage::EventStore::load(events.as_ref(), &session)
-                .await
-                .unwrap()
-                .is_empty(),
-            "no canonical event without its projection"
-        );
-
-        // Once the store recovers, the same reap succeeds.
-        terminal.fail_commits(false);
-        let reaped = reap_running_turns(turns.as_ref(), &terminal, None)
-            .await
-            .unwrap();
-        assert_eq!(reaped.len(), 1);
-        assert!(turns.list_running(None).await.unwrap().is_empty());
+/// Daemon-restart recovery: for every session with orphan running turns,
+/// explicitly REACQUIRE ownership (same runtime or unowned → CAS to a fresh
+/// epoch, fencing any token from the previous incarnation) and reap under the
+/// new token. A task owned by a DIFFERENT runtime is never reaped or mutated —
+/// it is reported as a conflict.
+pub async fn reap_after_restart(
+    stores: &EngineStores,
+    runtime_id: &RuntimeId,
+    session_id: Option<&SessionId>,
+) -> Result<ReapOutcome, EngineError> {
+    let running = stores.turns.list_running(session_id).await?;
+    let mut sessions: Vec<String> = running.iter().map(|t| t.session_id.clone()).collect();
+    sessions.dedup();
+    let mut outcome = ReapOutcome::default();
+    for session in sessions {
+        let session = SessionId::new(session);
+        let task_id = stores
+            .tasks
+            .ensure_for_session(&session, leveler_core::now())
+            .await?;
+        let current = stores
+            .ownership
+            .current(&task_id)
+            .await?
+            .ok_or_else(|| EngineError::Config(format!("no task row for session {session}")))?;
+        if let Some(owner) = &current.runtime
+            && owner != runtime_id
+        {
+            outcome.conflicts.push(ReapConflict {
+                session_id: session,
+                owner: Some(owner.clone()),
+            });
+            continue;
+        }
+        let token = stores
+            .ownership
+            .acquire(&task_id, runtime_id, current.epoch)
+            .await?;
+        let events = reap_running_turns_owned(
+            stores.turns.as_ref(),
+            stores.terminal.as_ref(),
+            &token,
+            Some(&session),
+        )
+        .await?;
+        outcome.events.extend(events);
     }
+    Ok(outcome)
 }

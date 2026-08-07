@@ -307,6 +307,11 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
              run; inspect the workspace, then resume with --confirm-recovery to acknowledge \
              and continue"
         )),
+        // Ownership failures stay loud and named: the user (or a supervising
+        // layer) must know this was a fencing decision, not a storage fault.
+        error @ (EngineError::Ownership(_) | EngineError::OwnershipConflict { .. }) => {
+            AppError::Engine(error.to_string())
+        }
     }
 }
 
@@ -326,13 +331,28 @@ impl Application {
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
         // Local single-user CLI: clear zombie `running` turns left by a prior
-        // process kill before starting a fresh interactive session.
-        let reaped = leveler_engine::reap_running_turns(&db, &db, None)
-            .await
-            .map_err(app_error_from_engine)?
-            .len();
-        if reaped > 0 {
-            tracing::warn!(reaped, "reaped zombie running turns on session create");
+        // process kill before starting a fresh interactive session. Foreign-
+        // owned tasks are reported, never touched.
+        let runtime_id = self.runtime_id()?;
+        let outcome = leveler_engine::reap_after_restart(
+            &leveler_storage::EngineStores::from_database(&db),
+            &runtime_id,
+            None,
+        )
+        .await
+        .map_err(app_error_from_engine)?;
+        for conflict in &outcome.conflicts {
+            tracing::warn!(
+                session = conflict.session_id.as_str(),
+                owner = ?conflict.owner,
+                "not reaping a task owned by another runtime"
+            );
+        }
+        if !outcome.events.is_empty() {
+            tracing::warn!(
+                reaped = outcome.events.len(),
+                "reaped zombie running turns on session create"
+            );
         }
         self.insert_session(&db, model, goal).await
     }
@@ -643,7 +663,30 @@ impl Application {
         session_id: &leveler_core::SessionId,
     ) -> Result<usize, AppError> {
         let db = self.open_database().await?;
-        leveler_engine::acknowledge_crash_window(&db, session_id)
+        // Canonical recovery write ⇒ ownership-fenced. Resolve the task,
+        // refuse a foreign owner explicitly (never auto-steal), reacquire a
+        // fresh epoch for this runtime, then acknowledge under that token.
+        let runtime_id = self.runtime_id()?;
+        let task =
+            leveler_storage::TaskStore::ensure_for_session(&db, session_id, leveler_core::now())
+                .await?;
+        let current = leveler_storage::OwnershipStore::current(&db, &task)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("no task for session {session_id}")))?;
+        if let Some(owner) = &current.runtime
+            && owner != &runtime_id
+        {
+            return Err(AppError::Engine(format!(
+                "task {task} is owned by runtime {owner} at epoch {}; \
+                 this runtime ({runtime_id}) must not acknowledge its crash window",
+                current.epoch
+            )));
+        }
+        let token =
+            leveler_storage::OwnershipStore::acquire(&db, &task, &runtime_id, current.epoch)
+                .await
+                .map_err(|e| AppError::Engine(e.to_string()))?;
+        leveler_engine::acknowledge_crash_window(&db, &token, session_id)
             .await
             .map_err(app_error_from_engine)
     }

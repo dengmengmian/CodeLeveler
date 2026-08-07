@@ -34,6 +34,17 @@ pub trait MessageStore: Send + Sync {
 
     /// The session's full transcript payloads, in append order.
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError>;
+
+    /// Fenced append: the ownership check and the inserts share one atomic
+    /// persistence boundary. A stale runtime cannot extend the transcript.
+    async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError>;
 }
 
 /// The engine-facing model-request telemetry contract.
@@ -61,6 +72,19 @@ impl MessageStore for Database {
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
         MessageRepository::new(self).load(session_id).await
     }
+
+    async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        MessageRepository::new(self)
+            .append_in_turn_owned(token, session_id, turn_id, payloads, now)
+            .await
+    }
 }
 
 #[async_trait]
@@ -78,12 +102,29 @@ impl ModelRequestStore for Database {
 pub struct MemoryMessageStore {
     /// `(session_id, payload)` in append order.
     rows: Mutex<Vec<(String, String)>>,
+    ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
 }
 
 impl MemoryMessageStore {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Couple to the shared ownership authority for fenced appends.
+    pub fn with_ownership(self, state: std::sync::Arc<crate::MemoryOwnershipState>) -> Self {
+        let _ = self.ownership.set(state);
+        self
+    }
+
+    fn append_records(&self, session_id: &SessionId, payloads: &[String]) {
+        let mut rows = self.rows.lock().unwrap();
+        for payload in payloads {
+            rows.push((
+                session_id.as_str().to_string(),
+                leveler_core::redact_secrets(payload),
+            ));
+        }
     }
 }
 
@@ -96,14 +137,24 @@ impl MessageStore for MemoryMessageStore {
         payloads: &[String],
         _now: Timestamp,
     ) -> Result<(), StorageError> {
-        let mut rows = self.rows.lock().unwrap();
-        for payload in payloads {
-            rows.push((
-                session_id.as_str().to_string(),
-                leveler_core::redact_secrets(payload),
-            ));
-        }
+        self.append_records(session_id, payloads);
         Ok(())
+    }
+
+    async fn append_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        _turn_id: &TurnId,
+        payloads: &[String],
+        _now: Timestamp,
+    ) -> Result<(), crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory message store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership.with_current(token, || self.append_records(session_id, payloads))
     }
 
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
