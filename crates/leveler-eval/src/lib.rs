@@ -205,6 +205,10 @@ pub enum FailureCategory {
     Verification,
     Environment,
     Runtime,
+    /// The provider/model infrastructure killed the run before any
+    /// agent-capability outcome (e.g. a protocol-level `InvalidRequest`
+    /// rejection). Never booked against the agent's trajectory.
+    ProviderProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -922,22 +926,33 @@ impl Ablation {
 }
 
 /// Attribute a case's failure. `expect_passed` is ground truth (an independent
-/// command), `completed` is the runtime's own verdict.
+/// command), `completed` is the runtime's own verdict, and `termination` is
+/// the execution boundary that ended the run.
 ///
-/// The first rule is the important one: when the expectation passes but the
+/// Two rules outrank the trajectory classifier: an infrastructure death
+/// (provider/protocol rejection) is [`FailureCategory::ProviderProtocol`] —
+/// the agent never got to fail; and when the expectation passes but the
 /// runtime says the task did not complete, the MODEL solved the task and the
-/// RUNTIME's verification gate was wrong (its checks could not run, or they are
-/// too strict). That is a framework failure — [`FailureCategory::Runtime`] —
-/// and must never be booked against the model as an understanding failure.
+/// RUNTIME's verification gate was wrong (its checks could not run, or they
+/// are too strict) — [`FailureCategory::Runtime`]. Neither may ever be booked
+/// against the model as a capability failure.
 ///
 /// Returns `None` when the case passed.
 pub fn attribute_failure(
     completed: bool,
     expect_passed: bool,
+    termination: Option<TerminationClass>,
     signals: &TrajectorySignals,
 ) -> Option<FailureCategory> {
     if completed && expect_passed {
         return None;
+    }
+    // A provider/model infrastructure death (e.g. a wire-level InvalidRequest
+    // rejection) killed the run before any agent-capability outcome existed.
+    // The trajectory classifier would misread its truncated shape (typically
+    // as "localization": tools ran, nothing edited) — so it never runs.
+    if !completed && termination == Some(TerminationClass::InfrastructureFailed) {
+        return Some(FailureCategory::ProviderProtocol);
     }
     if expect_passed && !completed {
         return Some(FailureCategory::Runtime);
@@ -1329,25 +1344,26 @@ mod tests {
         };
 
         assert_eq!(
-            attribute_failure(false, true, &solved_but_gate_failed),
+            attribute_failure(false, true, None, &solved_but_gate_failed),
             Some(FailureCategory::Runtime),
             "expect passed → the model solved it; the gate is what failed"
         );
         assert_eq!(
-            attribute_failure(true, true, &solved_but_gate_failed),
+            attribute_failure(true, true, None, &solved_but_gate_failed),
             None,
             "a passing case has no failure category"
         );
         // The model genuinely failed: ground truth says the task is not done, so
         // the trajectory classifier decides.
         assert_eq!(
-            attribute_failure(false, false, &solved_but_gate_failed),
+            attribute_failure(false, false, None, &solved_but_gate_failed),
             Some(FailureCategory::Understanding)
         );
         assert_eq!(
             attribute_failure(
                 true,
                 false,
+                None,
                 &TrajectorySignals {
                     env_failure: true,
                     ..Default::default()
@@ -1355,6 +1371,41 @@ mod tests {
             ),
             Some(FailureCategory::Environment),
             "completed but expectation failed → the model's own verdict was wrong"
+        );
+    }
+
+    /// The C1.1a ripgrep case hit exactly this: DeepSeek rejected the request
+    /// wire-level ("Thinking mode does not support this tool_choice") at step
+    /// 2 — tools had run, nothing was edited — and the trajectory classifier
+    /// booked it as "localization". A provider/protocol death is
+    /// infrastructure, never an agent-capability category.
+    #[test]
+    fn an_infrastructure_killed_run_is_provider_protocol_not_localization() {
+        // Localization-shaped trajectory: tool calls, no edits, relevant
+        // files never touched.
+        let killed_mid_exploration = TrajectorySignals {
+            tool_calls: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            attribute_failure(
+                false,
+                false,
+                Some(TerminationClass::InfrastructureFailed),
+                &killed_mid_exploration
+            ),
+            Some(FailureCategory::ProviderProtocol),
+            "wire-level rejection must not be blamed on the agent"
+        );
+        // Same trajectory without the infra death keeps its normal category.
+        assert_eq!(
+            attribute_failure(
+                false,
+                false,
+                Some(TerminationClass::Failed),
+                &killed_mid_exploration
+            ),
+            Some(FailureCategory::Localization)
         );
     }
 

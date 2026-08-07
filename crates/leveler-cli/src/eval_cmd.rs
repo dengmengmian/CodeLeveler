@@ -1027,7 +1027,12 @@ async fn run_eval_case(
         input_tokens,
         output_tokens,
         cost_usd_micros,
-        failure_category: leveler_eval::attribute_failure(completed, expect_passed, &signals),
+        failure_category: leveler_eval::attribute_failure(
+            completed,
+            expect_passed,
+            Some(termination),
+            &signals,
+        ),
         failure_source: (!(completed && expect_passed))
             .then_some(leveler_eval::FailureSource::Auto),
         note,
