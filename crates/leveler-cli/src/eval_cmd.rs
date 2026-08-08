@@ -926,6 +926,11 @@ async fn run_eval_case(
         apply_patch_calls: 0,
         replace_calls: 0,
         first_edit_round: None,
+        unique_files_read: 0,
+        repeated_file_reads: 0,
+        unique_search_queries: 0,
+        repeated_search_queries: 0,
+        first_relevant_file_round: None,
         repair_attempts: 0,
         repair_success: None,
     };
@@ -1029,7 +1034,12 @@ async fn run_eval_case(
     };
     // Fold the event stream into trajectory signals for failure attribution
     // (L1 taskset doc §8); the overlay's paths proxy for "the relevant files".
-    let mut collector = crate::eval_signals::SignalCollector::new(case.files.keys().cloned());
+    let mut collector = crate::eval_signals::SignalCollector::new(
+        case.files
+            .keys()
+            .cloned()
+            .chain(case.relevant_paths.iter().cloned()),
+    );
     // Eval runs the direct tool loop only (orchestrate dual path removed).
     // `infrastructure_cause` is the structured first-cause of an error-path
     // death (None when the run finished on its own), fed to attribution so
@@ -1217,6 +1227,11 @@ async fn run_eval_case(
         apply_patch_calls: signals.apply_patch_calls,
         replace_calls: signals.replace_calls,
         first_edit_round: signals.first_edit_round,
+        unique_files_read: signals.unique_files_read,
+        repeated_file_reads: signals.repeated_file_reads,
+        unique_search_queries: signals.unique_search_queries,
+        repeated_search_queries: signals.repeated_search_queries,
+        first_relevant_file_round: signals.first_relevant_file_round,
         repair_attempts,
         repair_success,
     }
@@ -1472,6 +1487,7 @@ mod ablation_tests {
             recovery: false,
             task: "do the thing".into(),
             max_rounds: 40,
+            relevant_paths: Vec::new(),
             expected_outcome: Default::default(),
             expect: leveler_eval::ExpectCommand {
                 program: "true".into(),

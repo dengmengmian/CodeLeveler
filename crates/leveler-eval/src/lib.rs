@@ -41,6 +41,12 @@ pub struct EvaluationCase {
     /// completion and effort remain comparable across models.
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
+    /// Paths whose modification the fix is expected to involve. METRICS ONLY:
+    /// never rendered into the task, never shown to the agent — it exists so
+    /// a case that starts from a real repository (no `files` overlay) can
+    /// still report when the run first looked at the right code.
+    #[serde(default)]
+    pub relevant_paths: Vec<String>,
     /// The engine terminal outcome this case requires (default: a verified
     /// completion). A weak-verification case whose CORRECT product semantics
     /// is `CompletedUnverified` declares that here — and is then also failed
@@ -214,6 +220,18 @@ pub struct CaseResult {
     /// the run never tried to edit. Convergence signal for exploration cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_edit_round: Option<u32>,
+    /// Exploration shape: distinct vs repeated reads and searches, and the
+    /// round the run first touched a case-relevant path.
+    #[serde(default)]
+    pub unique_files_read: u32,
+    #[serde(default)]
+    pub repeated_file_reads: u32,
+    #[serde(default)]
+    pub unique_search_queries: u32,
+    #[serde(default)]
+    pub repeated_search_queries: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_relevant_file_round: Option<u32>,
     /// Engine repair turns started (persisted `repair_started` events).
     #[serde(default)]
     pub repair_attempts: u32,
@@ -1070,6 +1088,21 @@ pub struct TrajectorySignals {
     /// exploration-convergence signal, not an exact ledger). `None` when the
     /// run never attempted an edit.
     pub first_edit_round: Option<u32>,
+    /// Distinct file paths read, and reads that repeated a path already read.
+    /// Re-reading is not automatically waste (a file changes under an edit),
+    /// but a rising repeat share on a fixed task is the signature of an agent
+    /// re-deriving what it already saw.
+    pub unique_files_read: u32,
+    pub repeated_file_reads: u32,
+    /// Distinct search queries issued, and queries that repeated an earlier
+    /// one verbatim. The loop guard only catches an identical call producing
+    /// an identical result; this counts re-asking regardless of outcome.
+    pub unique_search_queries: u32,
+    pub repeated_search_queries: u32,
+    /// Round of the first read/search that named a case-relevant path — where
+    /// the run stopped hunting and started looking at the right code. `None`
+    /// when it never did.
+    pub first_relevant_file_round: Option<u32>,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order
@@ -1233,6 +1266,11 @@ mod tests {
             apply_patch_calls: 0,
             replace_calls: 0,
             first_edit_round: None,
+            unique_files_read: 0,
+            repeated_file_reads: 0,
+            unique_search_queries: 0,
+            repeated_search_queries: 0,
+            first_relevant_file_round: None,
             repair_attempts: 0,
             repair_success: None,
         }
@@ -1904,6 +1942,11 @@ mod tests {
             apply_patch_calls: 0,
             replace_calls: 0,
             first_edit_round: None,
+            unique_files_read: 0,
+            repeated_file_reads: 0,
+            unique_search_queries: 0,
+            repeated_search_queries: 0,
+            first_relevant_file_round: None,
             repair_attempts: 0,
             repair_success: None,
         }
@@ -2240,6 +2283,11 @@ expect: { program: cargo, args: [test] }
                 apply_patch_calls: 0,
                 replace_calls: 0,
                 first_edit_round: None,
+                unique_files_read: 0,
+                repeated_file_reads: 0,
+                unique_search_queries: 0,
+                repeated_search_queries: 0,
+                first_relevant_file_round: None,
                 repair_attempts: 0,
                 repair_success: None,
             }
@@ -2274,6 +2322,11 @@ expect: { program: cargo, args: [test] }
                 apply_patch_calls: 0,
                 replace_calls: 0,
                 first_edit_round: None,
+                unique_files_read: 0,
+                repeated_file_reads: 0,
+                unique_search_queries: 0,
+                repeated_search_queries: 0,
+                first_relevant_file_round: None,
                 repair_attempts: 0,
                 repair_success: None,
             }

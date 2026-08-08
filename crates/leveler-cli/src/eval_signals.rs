@@ -54,6 +54,10 @@ pub(crate) struct SignalCollector {
     /// Model rounds proxied by stream-attempt starts (retries inflate this
     /// slightly); used to stamp `first_edit_round`.
     rounds_started: u32,
+    /// Distinct file paths read so far, and distinct search queries issued,
+    /// so a repeat can be counted the first time it repeats.
+    files_read: HashSet<String>,
+    search_queries: HashSet<String>,
 }
 
 impl SignalCollector {
@@ -69,6 +73,8 @@ impl SignalCollector {
             max_silent_ms: 0,
             feedback_events: 0,
             rounds_started: 0,
+            files_read: HashSet::new(),
+            search_queries: HashSet::new(),
         }
     }
 
@@ -139,11 +145,37 @@ impl SignalCollector {
                     && self.relevant.iter().any(|p| arguments.contains(p.as_str()))
                 {
                     self.signals.touched_relevant_files = true;
+                    // The round the run stopped hunting and looked at the code
+                    // that actually matters.
+                    self.signals.first_relevant_file_round = Some(self.rounds_started.max(1));
                 }
                 match name.as_str() {
-                    "read_file" | "read_symbol" => self.signals.read_calls += 1,
+                    "read_file" | "read_symbol" => {
+                        self.signals.read_calls += 1;
+                        // A path already read is a repeat; a new one widens the
+                        // working set. Both are legitimate, the ratio is the
+                        // signal.
+                        if let Some(path) = tool_argument(arguments, "path")
+                            && !self.files_read.insert(path)
+                        {
+                            self.signals.repeated_file_reads += 1;
+                        }
+                        self.signals.unique_files_read = self.files_read.len() as u32;
+                    }
                     "grep" | "find_files" | "find_symbol" | "list_files" | "find_references"
-                    | "locate_hint" => self.signals.search_calls += 1,
+                    | "locate_hint" => {
+                        self.signals.search_calls += 1;
+                        // Whatever this tool calls its needle: the query text
+                        // is what makes two searches "the same question".
+                        let query = ["pattern", "query", "name", "symbol", "path", "text"]
+                            .iter()
+                            .find_map(|key| tool_argument(arguments, key))
+                            .unwrap_or_else(|| arguments.to_string());
+                        if !self.search_queries.insert(format!("{name}\u{1}{query}")) {
+                            self.signals.repeated_search_queries += 1;
+                        }
+                        self.signals.unique_search_queries = self.search_queries.len() as u32;
+                    }
                     "apply_patch" | "replace" => {
                         if name == "apply_patch" {
                             self.signals.apply_patch_calls += 1;
@@ -237,6 +269,15 @@ impl SignalCollector {
         self.signals.context_overflow = context_overflow;
         self.signals
     }
+}
+
+/// One string field out of a tool call's JSON arguments, when present.
+fn tool_argument(arguments: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Whether a `run_command`'s JSON arguments name a verification-class program.
