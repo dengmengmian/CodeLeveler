@@ -25,6 +25,12 @@ pub(crate) struct SandboxPaths {
     scratch: tempfile::TempDir,
     tool_cache: PathBuf,
     cargo_home: PathBuf,
+    /// The inherited host Cargo config named a cache-only rustc wrapper, so it
+    /// was dropped from the sandbox copy. Cargo also reads every ancestor
+    /// `.cargo/config.toml` of the workspace, and a workspace under `$HOME`
+    /// reaches the very file we just cleaned — so the child additionally gets
+    /// an empty `RUSTC_WRAPPER`, which takes precedence over any config.
+    neutralized_cache_wrapper: bool,
     go_mod_cache: PathBuf,
     npm_cache: PathBuf,
     cache_write_roots: Vec<PathBuf>,
@@ -281,7 +287,7 @@ pub(crate) fn prepare_sandbox_paths(
             Path::new(relative),
         )?);
     }
-    let cargo_home = prepare_cargo_home(
+    let (cargo_home, neutralized_cache_wrapper) = prepare_cargo_home(
         environment,
         &scratch,
         &cache_base,
@@ -305,6 +311,7 @@ pub(crate) fn prepare_sandbox_paths(
         scratch,
         tool_cache,
         cargo_home,
+        neutralized_cache_wrapper,
         go_mod_cache,
         npm_cache,
         cache_write_roots,
@@ -395,7 +402,79 @@ fn replace_with_readonly_link(
     directory.symlink_contents(source.canonicalize()?, destination)
 }
 
-fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result<()> {
+/// Rustc wrappers that are purely compilation CACHES: they hash the
+/// invocation, serve a stored artifact when it matches, and otherwise exec the
+/// real rustc. Dropping one changes build SPEED, never build OUTPUT — which is
+/// why these, and only these, may be neutralized when the host's Cargo
+/// configuration is inherited into the sandbox.
+///
+/// Any other wrapper is left exactly as the user configured it: a wrapper can
+/// carry real semantics (instrumentation, cross-compilation, a custom
+/// compiler), and silently removing one would change what the build means.
+const CACHE_ONLY_RUSTC_WRAPPERS: &[&str] = &["sccache", "cachepot"];
+
+/// Whether a `rustc-wrapper` value names one of the known cache-only wrappers,
+/// whether it was written as a bare command or an absolute path.
+fn is_cache_only_wrapper(value: &str) -> bool {
+    // A config is portable text: it may name the wrapper bare, or by a path
+    // written with either separator regardless of the host we parse it on.
+    let stem = value
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    CACHE_ONLY_RUSTC_WRAPPERS.contains(&stem.as_str())
+}
+
+/// Neutralize inherited cache-only rustc wrappers in a Cargo config.
+///
+/// A wrapper the host configured globally is a daemon with its own runtime
+/// state. Inside the sandbox it is handed a per-command temp root that is
+/// reclaimed the moment the command ends, while the daemon it spawned lives
+/// on — so a later compilation asks a surviving server to write under a
+/// directory that no longer exists and the build fails for a reason that has
+/// nothing to do with the code. A verification gate must never fail that way,
+/// so the inherited setting is removed explicitly, with the reason left in
+/// place, rather than imported and left to break.
+fn neutralize_cache_only_wrappers(config: &str) -> String {
+    let mut out = String::with_capacity(config.len());
+    for line in config.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let key_end = trimmed.find('=');
+        let is_wrapper_key = key_end.is_some_and(|end| {
+            matches!(
+                trimmed[..end].trim(),
+                "rustc-wrapper" | "rustc-workspace-wrapper"
+            )
+        });
+        let value = key_end
+            .map(|end| {
+                trimmed[end + 1..]
+                    .trim()
+                    .trim_matches(['"', '\'', '\r', '\n'])
+            })
+            .unwrap_or("");
+        if is_wrapper_key && is_cache_only_wrapper(value) {
+            out.push_str(&format!(
+                "# {} (compilation cache) removed by CodeLeveler: its daemon outlives the\n\
+                 # sandboxed command that starts it and cannot keep that command's temp\n\
+                 # directory. A cache changes build speed, not build output.\n\
+                 # original: {}",
+                value,
+                line.trim_end_matches(['\r', '\n'])
+            ));
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result<bool> {
+    let mut neutralized = false;
     const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
     let host = cap_std::fs::Dir::open_ambient_dir(host, cap_std::ambient_authority())?;
     for name in ["config", "config.toml", "credentials", "credentials.toml"] {
@@ -437,7 +516,17 @@ fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result
                         format!("Cargo {name} exceeds 1 MiB safety limit"),
                     ));
                 }
-                private.write(name, bytes)?;
+                // Credentials are copied verbatim; a config may carry an
+                // inherited toolchain wrapper the sandbox cannot host.
+                if matches!(name, "config" | "config.toml")
+                    && let Ok(text) = std::str::from_utf8(&bytes)
+                {
+                    let cleaned = neutralize_cache_only_wrappers(text);
+                    neutralized |= cleaned != text;
+                    private.write(name, cleaned)?;
+                } else {
+                    private.write(name, bytes)?;
+                }
                 copied = true;
             }
         }
@@ -449,7 +538,7 @@ fn sync_cargo_config(host: &Path, private: &cap_std::fs::Dir) -> std::io::Result
             }
         }
     }
-    Ok(())
+    Ok(neutralized)
 }
 
 fn prepare_cargo_home(
@@ -459,14 +548,15 @@ fn prepare_cargo_home(
     tool_cache: &Path,
     workspace: &Path,
     read_host_cache: bool,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<(PathBuf, bool)> {
+    let mut neutralized = false;
     let overlay = scratch.path().join("cargo-overlay");
     let scratch_dir =
         cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
     scratch_dir.create_dir("cargo-overlay")?;
     let overlay_dir = scratch_dir.open_dir("cargo-overlay")?;
     if let Some(host) = host_cargo_home(environment, workspace, Some(private_cache_base)) {
-        sync_cargo_config(&host, &overlay_dir)?;
+        neutralized = sync_cargo_config(&host, &overlay_dir)?;
     }
     for name in ["registry", "git"] {
         let source = if read_host_cache {
@@ -481,7 +571,7 @@ fn prepare_cargo_home(
             replace_with_readonly_link(&overlay_dir, &source, name)?;
         }
     }
-    Ok(overlay)
+    Ok((overlay, neutralized))
 }
 
 fn prepare_npm_cache(
@@ -524,6 +614,18 @@ pub(crate) fn apply_sandbox_environment(cmd: &mut Command, paths: &SandboxPaths)
     for name in ["TMPDIR", "TMP", "TEMP"] {
         cmd.env(name, &private_tmp);
     }
+    // The env form of the same inherited setting. `Command::env_remove` only
+    // affects this child, never the host session.
+    for name in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"] {
+        let inherited_is_cache =
+            std::env::var(name).is_ok_and(|value| is_cache_only_wrapper(&value));
+        if paths.neutralized_cache_wrapper || inherited_is_cache {
+            // Empty, not removed: Cargo reads this ahead of any config file,
+            // so an ancestor `.cargo/config.toml` cannot reintroduce the
+            // wrapper we already decided the sandbox cannot host.
+            cmd.env(name, "");
+        }
+    }
     let cache_variables = [
         ("GOCACHE", "go/build"),
         ("GOPATH", "go/path"),
@@ -544,6 +646,78 @@ pub(crate) fn apply_sandbox_environment(cmd: &mut Command, paths: &SandboxPaths)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wrapper settings a Cargo config actually applies — comments carry
+    /// the neutralization note and must not be mistaken for live settings.
+    fn active_wrapper_lines(config: &str) -> Vec<&str> {
+        config
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .filter(|line| {
+                line.starts_with("rustc-wrapper") || line.starts_with("rustc-workspace-wrapper")
+            })
+            .collect()
+    }
+
+    /// A cache wrapper is dropped, and the reason survives in the file so the
+    /// sandbox's config is self-explaining rather than mysteriously different
+    /// from the host's.
+    #[test]
+    fn a_cache_only_wrapper_is_neutralized_with_its_reason() {
+        let out = neutralize_cache_only_wrappers(
+            "[build]\nrustc-wrapper = \"sccache\"\nincremental = true\n",
+        );
+        assert!(active_wrapper_lines(&out).is_empty(), "{out}");
+        assert!(out.contains("removed by CodeLeveler"), "{out}");
+        assert!(
+            out.contains("original: rustc-wrapper = \"sccache\""),
+            "{out}"
+        );
+        // Everything else survives untouched.
+        assert!(out.contains("[build]"));
+        assert!(out.contains("incremental = true"));
+    }
+
+    #[test]
+    fn an_absolute_path_to_a_cache_wrapper_is_recognized() {
+        for value in [
+            "/opt/homebrew/bin/sccache",
+            "/usr/local/bin/cachepot",
+            "C:\\tools\\sccache.exe",
+        ] {
+            let out =
+                neutralize_cache_only_wrappers(&format!("[build]\nrustc-wrapper = \"{value}\"\n"));
+            assert!(active_wrapper_lines(&out).is_empty(), "{value}: {out}");
+        }
+    }
+
+    #[test]
+    fn the_workspace_wrapper_key_is_covered_too() {
+        let out =
+            neutralize_cache_only_wrappers("[build]\nrustc-workspace-wrapper = \"sccache\"\n");
+        assert!(active_wrapper_lines(&out).is_empty(), "{out}");
+    }
+
+    /// The narrow part of the contract: a wrapper we cannot prove is a cache
+    /// may carry real semantics (instrumentation, a custom compiler), so it is
+    /// inherited exactly as written — even though it may then fail in the
+    /// sandbox. Guessing here would silently change what the build means.
+    #[test]
+    fn an_unknown_wrapper_is_left_exactly_as_configured() {
+        let config = "[build]\nrustc-wrapper = \"my-instrumenting-wrapper\"\n";
+        assert_eq!(neutralize_cache_only_wrappers(config), config);
+        assert_eq!(active_wrapper_lines(config).len(), 1);
+        let by_path = "[build]\nrustc-wrapper = \"/opt/team/bin/coverage-rustc\"\n";
+        assert_eq!(neutralize_cache_only_wrappers(by_path), by_path);
+    }
+
+    #[test]
+    fn a_config_without_any_wrapper_is_byte_identical() {
+        let config = "[net]\nretry = 3\n\n[build]\nincremental = true\njobs = 4\n";
+        assert_eq!(neutralize_cache_only_wrappers(config), config);
+    }
+
     use std::time::Duration;
 
     #[test]

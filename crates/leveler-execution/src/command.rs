@@ -1779,6 +1779,180 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
     }
 
+    /// A crate + a host CARGO_HOME whose config points `rustc-wrapper` at
+    /// `wrapper_name`. The wrapper itself always fails, so the build can only
+    /// succeed if the sandbox declined to inherit it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn wrapper_fixture(wrapper_name: &str) -> Option<(tempfile::TempDir, PathBuf, CommandRunner)> {
+        wrapper_fixture_with(wrapper_name, false)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn wrapper_fixture_with(
+        wrapper_name: &str,
+        also_ancestor_config: bool,
+    ) -> Option<(tempfile::TempDir, PathBuf, CommandRunner)> {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return None;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"wrapper-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        // A stand-in for a wrapper whose runtime needs the sandbox cannot meet:
+        // it simply refuses to compile anything. No sccache install required.
+        let bin = base.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wrapper = bin.join(wrapper_name);
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\necho 'wrapper: error: Failed to create temp dir' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let host_cargo = base.path().join("host-cargo");
+        std::fs::create_dir_all(&host_cargo).unwrap();
+        std::fs::write(
+            host_cargo.join("config.toml"),
+            format!("[build]\nrustc-wrapper = \"{}\"\n", wrapper.display()),
+        )
+        .unwrap();
+
+        if also_ancestor_config {
+            // Cargo walks up from the workspace and reads every
+            // `.cargo/config.toml` on the way, so a repo living under the
+            // user's home directory still sees the host's own file even when
+            // CARGO_HOME points somewhere else.
+            let ancestor = base.path().join(".cargo");
+            std::fs::create_dir_all(&ancestor).unwrap();
+            std::fs::write(
+                ancestor.join("config.toml"),
+                format!("[build]\nrustc-wrapper = \"{}\"\n", wrapper.display()),
+            )
+            .unwrap();
+        }
+
+        let mut variables: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| name != "CARGO_HOME" && name != "RUSTC_WRAPPER")
+            .collect();
+        variables.push(("CARGO_HOME".into(), host_cargo.into_os_string()));
+        variables.push((
+            "LEVELER_HOME".into(),
+            base.path().join("home").into_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        Some((
+            base,
+            workspace,
+            CommandRunner::with_environment(environment),
+        ))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn verify_build(workspace: &Path, runner: &CommandRunner) -> ProcessOutput {
+        let request = process_request_for_verify_check(
+            "cargo",
+            vec!["build".into(), "--quiet".into(), "--offline".into()],
+            workspace.to_path_buf(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run verify check")
+    }
+
+    /// C1.6: a host-configured compilation cache must not be able to fail a
+    /// verification gate. The stand-in wrapper is named `sccache`, so the
+    /// sandbox declines to inherit it and the build compiles normally.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn an_inherited_cache_wrapper_cannot_fail_a_verification_gate() {
+        let Some((_base, workspace, runner)) = wrapper_fixture("sccache") else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            output.success(),
+            "a cache wrapper must not gate verification: {output:?}"
+        );
+    }
+
+    /// Cleaning the copied CARGO_HOME config is not enough on its own: Cargo
+    /// also reads the ancestor `.cargo/config.toml` files above the workspace,
+    /// and a repository under `$HOME` reaches the very host file that was
+    /// cleaned. The child therefore also gets an empty `RUSTC_WRAPPER`, which
+    /// Cargo honors ahead of any config.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn an_ancestor_config_cannot_reintroduce_the_cache_wrapper() {
+        let Some((_base, workspace, runner)) = wrapper_fixture_with("sccache", true) else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            output.success(),
+            "an ancestor config must not resurrect a neutralized cache wrapper: {output:?}"
+        );
+    }
+
+    /// The other half of the contract: a wrapper we cannot prove is a cache is
+    /// inherited verbatim. It may fail — but silently dropping it would change
+    /// what the build means, which is worse than a visible failure.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn an_unknown_wrapper_is_still_inherited() {
+        let Some((_base, workspace, runner)) = wrapper_fixture("team-instrumenting-rustc") else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            !output.success(),
+            "an unrecognized wrapper must still be honored: {output:?}"
+        );
+    }
+
+    /// And the gate must still fail on real code: neutralizing a cache cannot
+    /// become a way to swallow compiler errors.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_real_compile_error_still_fails_the_gate() {
+        let Some((_base, workspace, runner)) = wrapper_fixture("sccache") else {
+            return;
+        };
+        std::fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() { this is not rust }\n",
+        )
+        .unwrap();
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            !output.success(),
+            "a broken source file must fail verification: {output:?}"
+        );
+    }
+
     /// The verification temp contract, in one shape: a check gets a writable
     /// temp root through TMPDIR/TMP/TEMP, that root lives outside the
     /// workspace, and using it leaves the workspace untouched — so temp files
