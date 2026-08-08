@@ -1059,9 +1059,23 @@ async fn run_eval_case(
                     match outcome {
                         Ok(o) => {
                             let termination = termination_from_stop_reason(o.stop_reason);
+                            // `completed` = the run ended in the terminal
+                            // outcome THIS CASE requires. Default: a verified
+                            // completion (historical semantics). A declared
+                            // `completed_unverified` case matches exactly that
+                            // stop reason — and fails on a wrongful upgrade to
+                            // a verified completion.
+                            let completed = match case.expected_outcome {
+                                leveler_eval::ExpectedOutcome::Completed => {
+                                    o.stop_reason == StopReason::Completed
+                                }
+                                leveler_eval::ExpectedOutcome::CompletedUnverified => {
+                                    o.stop_reason == StopReason::CompletedUnverified
+                                }
+                            };
                             (
                                 Some(session_id),
-                                o.stop_reason == StopReason::Completed,
+                                completed,
                                 o.rounds,
                                 format!("{:?}", o.stop_reason),
                                 termination,
@@ -1153,7 +1167,14 @@ async fn run_eval_case(
         }
     };
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // Diagnostics: `LEVELER_EVAL_KEEP_WORKSPACE=1` leaves the case workspace on
+    // disk so a surprising verdict can be reproduced against the exact tree the
+    // gates saw. Off by default — a normal run still cleans up.
+    if std::env::var_os("LEVELER_EVAL_KEEP_WORKSPACE").is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        println!("  kept workspace: {}", dir.display());
+    }
     // First-cause attribution receives the structured budget marker rather
     // than parsing a debug-formatted outcome note.
     let signals = collector.finish(termination == leveler_eval::TerminationClass::BudgetLimited);
@@ -1451,6 +1472,7 @@ mod ablation_tests {
             recovery: false,
             task: "do the thing".into(),
             max_rounds: 40,
+            expected_outcome: Default::default(),
             expect: leveler_eval::ExpectCommand {
                 program: "true".into(),
                 args: vec![],

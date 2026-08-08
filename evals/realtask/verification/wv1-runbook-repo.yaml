@@ -4,13 +4,14 @@
 # CompletedUnverified — not Verified, and not a fabricated test pass. The
 # hidden acceptance checks the actual change independently, so a false
 # completion still cannot pass.
-# NOTE: the eval's `completed` flag is strict (`StopReason::Completed` only),
-# so this case is EXPECTED to register as not-completed with note
-# "CompletedUnverified" even when the work is correct — that recorded
-# outcome, plus expect_passed=true, IS the measurement.
+# The case declares `expected_outcome: completed_unverified`: it PASSES when
+# the hidden acceptance holds AND the engine honestly reports
+# CompletedUnverified — and fails if the run is ever wrongly upgraded to a
+# verified completion.
 id: wv1-runbook-repo
 name: "[weak-verify] update the backup runbook's retention default"
 max_rounds: 40
+expected_outcome: completed_unverified
 files:
   README.md: |
     # ops-runbooks

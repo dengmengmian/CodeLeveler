@@ -8,6 +8,11 @@
 id: bb1-preexisting-build-failure
 name: "[baseline] fix an app bug while the repo's build gate is already red"
 max_rounds: 60
+# A pre-existing gate failure is discounted (not charged to this change) but
+# cannot endorse it either — the honest terminal outcome is
+# CompletedUnverified, and a wrongful upgrade to a verified completion must
+# fail this case.
+expected_outcome: completed_unverified
 files:
   .leveler/config.yaml: |
     verify:
