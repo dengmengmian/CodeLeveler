@@ -32,7 +32,7 @@
 
 现状 contract 是**"完全继承宿主 Cargo semantics"**（逐字节复制，只做大小与符号链接的安全检查）。本轮**不重构**这一模型，只补上一条明确例外：**已知的纯缓存 wrapper 不被继承**，并把原因写在沙箱配置文件里，让差异自解释而非神秘消失。
 
-## 4. Chosen Fix — Strategy A/B 之中的窄化 B
+## 4. Chosen Fix — Strategy A/B 之中的窄化 B（含 Final Closure 的有效性判定）
 
 ```rust
 /// 纯编译缓存 wrapper：哈希调用、命中则取缓存、否则 exec 真正的 rustc。
@@ -40,9 +40,11 @@
 const CACHE_ONLY_RUSTC_WRAPPERS: &[&str] = &["sccache", "cachepot"];
 ```
 
-1. `sync_cargo_config` 复制配置时，把 `rustc-wrapper` / `rustc-workspace-wrapper` 中**值为已知纯缓存 wrapper** 的行替换为解释性注释（保留 `# original:` 原文），其余一字不动，并返回"是否中和过"。
-2. 若中和过（或宿主 env 本身指向纯缓存 wrapper），`apply_sandbox_environment` 为子进程设 `RUSTC_WRAPPER=""` / `RUSTC_WORKSPACE_WRAPPER=""` —— 堵住祖先配置这条路。
-3. 名称识别兼容裸命令、两种路径分隔符与 `.exe` 后缀。
+1. `sync_cargo_config` 复制配置时，把 `rustc-wrapper` / `rustc-workspace-wrapper` 中**值为已知纯缓存 wrapper** 的行替换为解释性注释（保留 `# original:` 原文），其余一字不动。
+2. **按 Cargo 的真实优先级计算"有效 wrapper"**（`effective_rustc_wrapper`）：环境变量 → 从 workspace 逐级向上的最近一个 `.cargo/config(.toml)` → 最后才是 `$CARGO_HOME` 配置。**只有当有效值是已知纯缓存 wrapper 时**，才为子进程设 `RUSTC_WRAPPER=""` / `RUSTC_WORKSPACE_WRAPPER=""`（Cargo 对该变量的优先级高于任何配置文件）。
+3. 名称识别兼容裸命令、两种路径分隔符与 `.exe` 后缀。配置读取器只认 `[build]` 表下的这两个标量（注释行、其它表下的同名键、显式空值都不算设置）。
+
+**为什么必须是"有效值"而不是"任意来源出现过"**：外层目录写了 sccache、而更近一级把它换成带真实构建语义的未知 wrapper 时，Cargo 用的是**更近的那个**。若只要在任何一层看见 sccache 就清空环境变量，就会把用户真正生效的 wrapper 一并废掉。测试 C 正是锁这一点。
 
 **Why not the alternatives**
 
@@ -60,13 +62,18 @@ C1.3 的四条契约测试原样通过：专属 temp root 在工作区外、三�
 
 `wrapper_fixture` 造一个**必定失败**的假 wrapper 脚本（打印 `wrapper: error: Failed to create temp dir` 并 exit 1），配上宿主 CARGO_HOME 配置，然后走**生产 verify 路径**跑 `cargo build`：
 
-| 测试 | 断言 |
-| --- | --- |
-| `an_inherited_cache_wrapper_cannot_fail_a_verification_gate` | 假 wrapper 名为 `sccache` → 被中和 → 构建**成功** |
-| `an_ancestor_config_cannot_reintroduce_the_cache_wrapper` | 同时在祖先 `.cargo/config.toml` 里也写上 → 仍**成功**（env 覆盖生效） |
-| `an_unknown_wrapper_is_still_inherited` | 名为 `team-instrumenting-rustc` → **保留** → 构建失败（证明不是无差别删除） |
-| `a_real_compile_error_still_fails_the_gate` | 源码写坏 → 门禁**仍然失败**（中和缓存不会吞掉编译错误） |
-| 5 条单元测试 | 裸名/绝对路径/`.exe`/`rustc-workspace-wrapper` 均识别；未知 wrapper 与无 wrapper 配置**逐字节不变** |
+fixture 把假 wrapper 按 **Cargo 优先级分层**植入：workspace 自身 `.cargo/config.toml` > 外层祖先目录 > 宿主 `CARGO_HOME`。
+
+| 编号 | 测试 | 布局 | 断言 |
+| --- | --- | --- | --- |
+| **A** | `an_ancestor_only_cache_wrapper_cannot_fail_a_verification_gate` | 仅外层祖先 = `sccache`（host 配置与 env **都没有**） | 构建**成功** ← 本轮补上的缺口 |
+| **B** | `an_ancestor_only_unknown_wrapper_is_still_inherited` | 仅外层祖先 = `team-instrumenting-rustc` | 构建**失败**（wrapper 照常执行） |
+| **C** | `a_nearer_unknown_wrapper_wins_over_an_outer_cache` | 外层 `sccache` + 近层未知 | 构建**失败**（不因外层见过 sccache 就清空） |
+| **D** | `a_nearer_cache_wins_over_an_outer_unknown_wrapper` | 外层未知 + 近层 `sccache` | 构建**成功**（近层生效值是缓存） |
+| — | `a_host_cargo_home_cache_wrapper_is_neutralized` | 仅宿主 CARGO_HOME = `sccache` | 构建**成功**（原始形态仍成立） |
+| **E** | `a_workspace_without_any_wrapper_builds_normally` | 无任何 wrapper | 行为逐字不变 |
+| **F** | `a_real_compile_error_still_fails_the_gate` | 外层 `sccache` + 源码写坏 | 门禁**仍然失败**（不吞编译错误） |
+| — | 6 条单元测试 | — | 裸名/绝对路径/`.exe`/`rustc-workspace-wrapper` 识别；`[build]` 表外同名键、注释、显式空值不算设置；未知 wrapper 与无 wrapper 配置**逐字节不变** |
 
 ## 7. Real sccache Evidence（同机、同守护进程、同命令的 before/after）
 
@@ -89,9 +96,11 @@ C1.3 的四条契约测试原样通过：专属 temp root 在工作区外、三�
 
 `cargo fmt --check` ✅ · `cargo check --workspace --all-targets` ✅ 0 error · `cargo test --workspace --no-fail-fast` ✅ 0 failed · execution sandbox 测试 ✅ · verifier 测试 ✅ · 真实 rustc-wrapper 门禁测试 ✅（1 passed）。
 
-## 10. 残留缺口（如实记录，未修）
+## 10. 残留缺口 —— 已在 Final Closure 中关闭
 
-若**祖先目录中的其它**配置文件（例如团队仓根部的 `.cargo/config.toml`）设置了纯缓存 wrapper，而宿主 CARGO_HOME 配置与环境变量都没有，则本轮的中和不会触发。修法一致（扫描祖先链），但当前无证据支持，不做。
+初版只在"宿主配置或环境变量命中"时才中和，因此**祖先目录独有**的缓存 wrapper 不会触发（测试 A 当时不存在：旧 fixture 无论是否植入祖先配置，都会先在宿主配置里写一份，env 覆盖可能是被宿主那份武装的）。现已改为按 Cargo 真实优先级计算有效 wrapper，测试 A/B/C/D 覆盖 ancestor-only 与两个方向的优先级。
+
+仍然成立的边界：判定只看 `build.rustc-wrapper` / `build.rustc-workspace-wrapper` 两个标量与对应环境变量；不解析 `[target.*]`、不处理 `--config` 命令行覆盖，也不构建 Cargo 配置框架。
 
 ## 11. Localization Commitment（§12）
 
