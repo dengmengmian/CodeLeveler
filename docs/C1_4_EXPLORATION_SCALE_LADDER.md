@@ -98,7 +98,11 @@ Evidence（全部来自唯一发散轨迹的实测，n=1，需在实施前用 1-
 | 收敛信号缺失 | **30 个全不重复的查询**，loop guard 按设计不会触发（args 每次都不同）——现有护栏对"查询漂移"完全无感 |
 | 反证据（重要） | 规模本身**不**是原因：15× 文件数、去掉架构地图，指标全平。所以不要做 repo map / 索引，那不是本次数据支持的方向 |
 
-**明确不推荐**（数据不支持）：Repository Context Compression（0 次 compaction，上下文没被压缩挤掉）；Repo Map / 索引（去地图对照证明地图不影响定位）；Plan Commitment（阶梯全部按时收敛，ripgrep 也确实产出了正确实现）。
+**明确不推荐**：Repo Map / 索引（去地图对照证明地图不影响定位）。
+
+**关于 context 的措辞更正**（原文过宽，已按 C1.4 Final Closure 修正）：0 次 compaction 只能排除 **compaction 导致的遗忘**，**不能**排除 context accumulation / 每轮 prompt 过大 / working-set 管理 / 相关证据留存 / 重复上下文搬运 —— 7.79M input ÷ 100 轮 = 78k/轮，本身就是 context-cost 信号。
+
+> **本节结论已被 `docs/C1_4_FINAL_CLOSURE.md` 取代**：补测两个真实仓后，共同签名不是"定位耗时"，而是**定位到承诺编辑之间的间隔**（first relevant r2-r3 → first edit r31-r64）。
 
 只推荐，不实现。
 
