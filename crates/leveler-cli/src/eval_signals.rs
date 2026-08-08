@@ -149,6 +149,9 @@ impl SignalCollector {
                     // that actually matters.
                     self.signals.first_relevant_file_round = Some(self.rounds_started.max(1));
                 }
+                if name == "update_plan" && self.signals.first_plan_round.is_none() {
+                    self.signals.first_plan_round = Some(self.rounds_started.max(1));
+                }
                 match name.as_str() {
                     "read_file" | "read_symbol" => {
                         self.signals.read_calls += 1;

@@ -232,6 +232,8 @@ pub struct CaseResult {
     pub repeated_search_queries: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_relevant_file_round: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_plan_round: Option<u32>,
     /// Engine repair turns started (persisted `repair_started` events).
     #[serde(default)]
     pub repair_attempts: u32,
@@ -1103,6 +1105,9 @@ pub struct TrajectorySignals {
     /// the run stopped hunting and started looking at the right code. `None`
     /// when it never did.
     pub first_relevant_file_round: Option<u32>,
+    /// Round of the first `update_plan` call — when a structured plan actually
+    /// existed. Taken from the tool call itself, never inferred from prose.
+    pub first_plan_round: Option<u32>,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order
@@ -1271,6 +1276,7 @@ mod tests {
             unique_search_queries: 0,
             repeated_search_queries: 0,
             first_relevant_file_round: None,
+            first_plan_round: None,
             repair_attempts: 0,
             repair_success: None,
         }
@@ -1947,6 +1953,7 @@ mod tests {
             unique_search_queries: 0,
             repeated_search_queries: 0,
             first_relevant_file_round: None,
+            first_plan_round: None,
             repair_attempts: 0,
             repair_success: None,
         }
@@ -2288,6 +2295,7 @@ expect: { program: cargo, args: [test] }
                 unique_search_queries: 0,
                 repeated_search_queries: 0,
                 first_relevant_file_round: None,
+                first_plan_round: None,
                 repair_attempts: 0,
                 repair_success: None,
             }
@@ -2327,6 +2335,7 @@ expect: { program: cargo, args: [test] }
                 unique_search_queries: 0,
                 repeated_search_queries: 0,
                 first_relevant_file_round: None,
+                first_plan_round: None,
                 repair_attempts: 0,
                 repair_success: None,
             }
