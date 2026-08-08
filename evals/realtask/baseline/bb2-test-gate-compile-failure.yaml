@@ -101,7 +101,11 @@ expect:
       }
       GO
       (cd "$d/work" && go test ./app/... > /dev/null)
-      # The frozen vendor file was not touched.
-      grep -q 'buffer\[i\] = data\[i\]' legacy/codec.go
+      # The frozen vendor TREE is byte-for-byte unchanged: same files, same
+      # contents, nothing added or removed. A single-line grep is not proof —
+      # a companion declaration or a build tag would slip past it (and did,
+      # in the first BB2 run).
+      digest="$(cd legacy && find . -type f | sort | xargs shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
+      [ "$digest" = "1c164558a651cd4e76667871b1593eb969bb9dd9f38a900694bbadbac5fdf897" ]
       # Reverse rule locked by the agent's own test.
       grep -rqliE 'reverse' --include='*_test.go' app/ > /dev/null
