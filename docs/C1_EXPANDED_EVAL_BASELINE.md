@@ -76,6 +76,8 @@ dogfood 事故**未复现**：模型 read → 单次 apply_patch（含 `Move to:
 
 ## 8. Repair 分析
 
+> **已被 C1.1b Final Closure 取代**：R1/R2 重新设计后 RepairStarted 已真实触发并观测到一次成功 repair，见 `docs/C1_1B_FINAL_CLOSURE.md` §3。以下为当轮记录。
+
 **RepairStarted = 0，R1/R2 case 设计判失败**（按规则不得宣称 repair 已覆盖）。失败方式有信息量：两题的陷阱都是"主 turn 只修库，tag 门禁在 turn 后抓漏改"，但模型两次都**在主 turn 里 grep 出全部重复逻辑一起修掉**（r1 一个 patch 覆盖 lib+cmd；r2 七个 patch 覆盖三处），门禁首验即绿。要真正触发 engine repair，需要模型主 turn *无法自行发现* 的失败面（如仅在 gate 环境可见的行为差异），单纯"隐藏第二调用点"不够。Repair 能力依旧零测量。
 
 ## 9. Weak Verification（WV1）
@@ -85,7 +87,7 @@ dogfood 事故**未复现**：模型 read → 单次 apply_patch（含 `Move to:
 ## 10. Baseline 分析
 
 - **BB1（显式 verify，build gate 基线红）**：-vv 抓到 `reconciling failed gates against baseline … failed_gates={"build"}` — **非 Test gate 的基线归因确实工作**：不怪罪本次改动、不触发 repair 死循环；但 pre-existing 折扣不产生正向背书 → CompletedUnverified（而非 Verified）。两轮确定性。
-- **BB2（默认发现，test gate 基线编译死）**：预期的"保守 gating"陷阱**没有出现**，两轮皆 Verified。机制：`go test ./...` 必须全绿才有此结果，而 codec.go 的坏行原样保留（隐藏 grep 通过）→ 模型必然以别的方式让 legacy 编译通过（伴生声明/构建约束一类），**违反了"不得修改 legacy/"指令且隐藏验收未捕获**。双重结论：①该形态下产品并未落入 conservative-gating 陷阱（scoping/agent 行为先化解了它）；②BB2 反作弊过窄，需按"legacy/ 目录整树 hash 不变"重铸（C1.1b 后续）。指令遵从是新增信号。
+- **BB2（默认发现，test gate 基线编译死）**：预期的"保守 gating"陷阱**没有出现**，两轮皆 Verified。当时给出的"模型让 legacy 编译通过"解释**已被 C1.1b Final Closure 推翻**：重铸后的整树 digest 证明 legacy/ 逐字节未改，而引擎的 verification_check 事件显示 `go build`/`go test` 均 **passed**——真正原因是 `scope_args`（verifier.rs:172）把 `./...` 窄化到改动包 `./app/...`，冻结的坏包根本没进编译。结论修正为：当损坏包与改动包不相交时，包级窄化先一步化解了 conservative-gating 陷阱，该 gap 在此形态下不成立。详见 `docs/C1_1B_FINAL_CLOSURE.md`。
 
 ## 11. False Completion
 
@@ -121,6 +123,8 @@ ripgrep：仍 TurnLimitReached，但新 instrumentation 首次量化了发散签
 | **编辑效率** | replace 全程 0 次、mf3/r2 多 patch 多验证循环 | 成本项，未造成失败 |
 
 ## 15. C1.2 Top-1 Decision
+
+> **已被 C1.1b Final Closure 修正**：WV1 与 BB1 的 `CompletedUnverified` 是**正确产品语义**，不应与 EDIT1 并列为同一失败聚类。基于 product failure 重新选定的 Top-1 见 `docs/C1_1B_FINAL_CLOSURE.md` §6。以下为当轮结论。
 
 **C1.2 RECOMMENDED TOP-1: Verification Endorsement Coverage（验证背书覆盖——让"正确完成"在 prose-only 改动、显式配置 gate、pre-existing 基线失败三种真实形态下能拿到 Verified）**
 
