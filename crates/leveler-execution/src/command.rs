@@ -1779,6 +1779,217 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
     }
 
+    /// The verification temp contract, in one shape: a check gets a writable
+    /// temp root through TMPDIR/TMP/TEMP, that root lives outside the
+    /// workspace, and using it leaves the workspace untouched — so temp files
+    /// can never reach a diff, `modified_files`, or the gate's own scoping.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn verify_check_gets_a_dedicated_temp_root_outside_the_workspace() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let request = process_request_for_verify_check(
+            "bash",
+            vec![
+                "-c".into(),
+                // The portable idiom: an explicit template under $TMPDIR.
+                "d=\"$(mktemp -d \"$TMPDIR/leveler-verify.XXXXXX\")\"; \
+                 echo scratch > \"$d/file\"; \
+                 printf '%s\\n%s\\n%s\\n' \"$TMPDIR\" \"$TMP\" \"$TEMP\""
+                    .into(),
+            ],
+            fixture.workspace.clone(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        let output = fixture
+            .runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run verify check");
+        assert!(
+            output.success(),
+            "a verify script must be able to create temp files: {output:?}"
+        );
+
+        let seen: Vec<&str> = output.stdout.lines().collect();
+        assert_eq!(seen.len(), 3, "TMPDIR/TMP/TEMP all set: {seen:?}");
+        assert!(
+            seen.iter().all(|value| value == &seen[0]),
+            "all three must name the same temp root: {seen:?}"
+        );
+        let temp_root = std::path::Path::new(seen[0]);
+        assert!(
+            !temp_root.starts_with(&fixture.workspace),
+            "the temp root must live outside the workspace, got {temp_root:?}"
+        );
+        assert!(
+            std::fs::read_dir(&fixture.workspace)
+                .unwrap()
+                .next()
+                .is_none(),
+            "verification temp work must leave no trace in the workspace"
+        );
+    }
+
+    /// The temp root belongs to one check: it is gone once the check ends, and
+    /// a second check never inherits the first one's leftovers.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn verify_check_scratch_is_per_check_and_removed_afterwards() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let temp_root_of = async |fixture: &VerifySandboxFixture| -> String {
+            let request = process_request_for_verify_check(
+                "bash",
+                vec![
+                    "-c".into(),
+                    "echo marker > \"$TMPDIR/leftover\"; printf '%s' \"$TMPDIR\"".into(),
+                ],
+                fixture.workspace.clone(),
+                VerifyNetworkPolicy::InheritSession,
+            );
+            let output = fixture
+                .runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("run verify check");
+            assert!(output.success(), "{output:?}");
+            output.stdout.trim().to_string()
+        };
+
+        let first = temp_root_of(&fixture).await;
+        assert!(
+            !std::path::Path::new(&first).exists(),
+            "the check's temp root must be cleaned up when it ends: {first}"
+        );
+        let second = temp_root_of(&fixture).await;
+        assert_ne!(
+            first, second,
+            "each check gets its own temp root, never a shared dirty one"
+        );
+    }
+
+    /// Temp access is a grant, not a hole: everything outside the workspace and
+    /// the check's own temp root stays unwritable.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn verify_check_cannot_write_outside_its_granted_roots() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let canary = fixture.outside.join("canary");
+        let request = process_request_for_verify_check(
+            "bash",
+            vec![
+                "-c".into(),
+                "touch \"$1\"".into(),
+                "bash".into(),
+                canary.display().to_string(),
+            ],
+            fixture.workspace.clone(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        let output = fixture
+            .runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run verify check");
+        assert!(
+            !output.success() && !canary.exists(),
+            "a path outside the workspace and temp root must stay unwritable: {output:?}"
+        );
+    }
+
+    /// KNOWN PLATFORM LIMITATION (macOS): `/usr/bin/mktemp` ignores `$TMPDIR`
+    /// and always targets the Darwin per-user temp directory, which the
+    /// sandbox does not grant. Tools that honor TMPDIR (language temp APIs,
+    /// or mktemp with an explicit template) work fine. This test pins both
+    /// halves so the difference stays visible instead of being rediscovered as
+    /// a "verifier bug" — closing it would mean granting write access to the
+    /// user's shared temp tree, which is a policy decision, not a fix.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_mktemp_without_a_template_bypasses_tmpdir() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let run = async |script: &str| {
+            let request = process_request_for_verify_check(
+                "bash",
+                vec!["-c".into(), script.to_string()],
+                fixture.workspace.clone(),
+                VerifyNetworkPolicy::InheritSession,
+            );
+            fixture
+                .runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("run verify check")
+        };
+
+        let bare = run("mktemp -d").await;
+        assert!(
+            !bare.success() && bare.stderr.contains("Operation not permitted"),
+            "bare `mktemp -d` reaches past TMPDIR into the shared temp tree: {bare:?}"
+        );
+        assert!(
+            !bare.stderr.contains("$TMPDIR"),
+            "and it never even consults TMPDIR: {bare:?}"
+        );
+
+        let templated = run("mktemp -d \"$TMPDIR/leveler.XXXXXX\"").await;
+        assert!(
+            templated.success(),
+            "an explicit TMPDIR template works under the same sandbox: {templated:?}"
+        );
+    }
+
+    /// Workspace + a sibling "outside" directory + a runner whose LEVELER_HOME
+    /// is private to this test. `None` when the platform sandbox is missing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    struct VerifySandboxFixture {
+        _base: tempfile::TempDir,
+        workspace: PathBuf,
+        outside: PathBuf,
+        runner: CommandRunner,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn verify_sandbox_fixture() -> Option<VerifySandboxFixture> {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return None;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("workspace");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut variables: Vec<_> = std::env::vars_os().collect();
+        variables.push((
+            "LEVELER_HOME".into(),
+            base.path().join("home").into_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        Some(VerifySandboxFixture {
+            _base: base,
+            workspace,
+            outside,
+            runner: CommandRunner::with_environment(environment),
+        })
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn confined_common_builds_use_private_temp_and_persistent_cache() {
