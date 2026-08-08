@@ -1,0 +1,97 @@
+# R2 (recast) — Multi-gate verification where the first pass is partial:
+# format and build gates PASS, the test gate FAILS after the main turn. Same
+# hidden-acceptance seam as R1: the visible task is the minutes bug, and the
+# encoded acceptance spec additionally requires hour support ("1h1m1s",
+# bare "1h") that the task never mentions. The single repair round
+# (DIRECT_REPAIR_ATTEMPTS = 1, unmodified) has to carry the whole hours
+# feature from the failing-test evidence alone — that capacity is what this
+# case measures.
+id: r2-multi-gate-hours-repair
+name: "[repair] duration formatter: minutes fix meets a hidden hours contract"
+max_rounds: 80
+files:
+  .leveler/config.yaml: |
+    verify:
+      format:
+        program: bash
+        args: ["-c", "test -z \"$(gofmt -l .)\""]
+      build:
+        program: go
+        args: ["build", "./..."]
+      test:
+        program: bash
+        args: [".ci/acceptance.sh"]
+  .ci/acceptance.sh: |
+    #!/bin/bash
+    # Release acceptance for the duration formatter; spec distributed in
+    # encoded form, materialized and run as ordinary go tests.
+    set -euo pipefail
+    SPEC_B64="cGFja2FnZSBkdXJhdGlvbgoKaW1wb3J0ICJ0ZXN0aW5nIgoKZnVuYyBUZXN0Rm9ybWF0U3VwcG9ydHNIb3Vycyh0ICp0ZXN0aW5nLlQpIHsKCWlmIGdvdCA6PSBGb3JtYXQoMzY2MSk7IGdvdCAhPSAiMWgxbTFzIiB7CgkJdC5GYXRhbGYoYEZvcm1hdCgzNjYxKSA9ICVxOyB3YW50ICIxaDFtMXMiIChob3VycyBhcmUgc3BsaXQgb3V0KWAsIGdvdCkKCX0KCWlmIGdvdCA6PSBGb3JtYXQoMzYwMCk7IGdvdCAhPSAiMWgiIHsKCQl0LkZhdGFsZihgRm9ybWF0KDM2MDApID0gJXE7IHdhbnQgIjFoIiAod2hvbGUgaG91cnMgcmVuZGVyIGJhcmUpYCwgZ290KQoJfQoJaWYgZ290IDo9IEZvcm1hdCg3MzI1KTsgZ290ICE9ICIyaDJtNXMiIHsKCQl0LkZhdGFsZihgRm9ybWF0KDczMjUpID0gJXE7IHdhbnQgIjJoMm01cyJgLCBnb3QpCgl9CglpZiBnb3QgOj0gRm9ybWF0KDU5KTsgZ290ICE9ICI1OXMiIHsKCQl0LkZhdGFsZihgRm9ybWF0KDU5KSA9ICVxOyB3YW50ICI1OXMiIChzdWItbWludXRlIHVuY2hhbmdlZClgLCBnb3QpCgl9Cn0K"
+    # Scratch space stays INSIDE the workspace: verification checks run write
+    # confined, so a check may not create directories under $TMPDIR.
+    w=".acceptance-work"
+    rm -rf "$w"
+    mkdir -p "$w"
+    cp -R ./duration ./go.mod "$w/"
+    python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.argv[1]))" "$SPEC_B64" > "$w/duration/acceptance_spec_test.go"
+    (cd "$w" && go test ./...)
+    status=$?
+    rm -rf "$w"
+    exit $status
+  go.mod: |
+    module dur
+
+    go 1.21
+  duration/format.go: |
+    package duration
+
+    import "fmt"
+
+    // Format renders a duration in seconds as compact text ("1m30s").
+    func Format(seconds int) string {
+    	if seconds < 120 {
+    		// Short durations read better unsplit.
+    		return fmt.Sprintf("%ds", seconds)
+    	}
+    	m := seconds / 60
+    	s := seconds % 60
+    	if s == 0 {
+    		return fmt.Sprintf("%dm", m)
+    	}
+    	return fmt.Sprintf("%dm%ds", m, s)
+    }
+  duration/format_test.go: |
+    package duration
+
+    import "testing"
+
+    func TestFormatSeconds(t *testing.T) {
+    	if got := Format(45); got != "45s" {
+    		t.Fatalf(`Format(45) = %q; want "45s"`, got)
+    	}
+    }
+
+    func TestFormatSplitsMinutes(t *testing.T) {
+    	if got := Format(90); got != "1m30s" {
+    		t.Fatalf(`Format(90) = %q; want "1m30s"`, got)
+    	}
+    	if got := Format(120); got != "2m" {
+    		t.Fatalf(`Format(120) = %q; want "2m"`, got)
+    	}
+    }
+task: |
+  Bug report: durations between one and two minutes render wrong. Format(90)
+  returns "90s", but anything from 60 seconds up must split into minutes —
+  "1m30s". Sub-minute values keep rendering as plain seconds. The failing
+  regression test is already in the test file.
+
+  Fix the behavior so the project's verification passes.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go test ./... > /dev/null
+      test -z "$(gofmt -l .)"
+      bash .ci/acceptance.sh > /dev/null
