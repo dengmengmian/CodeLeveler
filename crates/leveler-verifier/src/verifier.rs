@@ -348,6 +348,48 @@ fn pathext_extensions(environment: &leveler_core::EnvSnapshot) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// C1.6 real-toolchain regression (macOS host configured with a global
+    /// `rustc-wrapper`): the production Verifier path over a real Rust repo
+    /// must pass. Opt-in because it compiles ripgrep's dependency tree.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "runs a full cargo check over the ripgrep fixture; opt in with --ignored"]
+    async fn probe_real_repo_gate_under_host_rustc_wrapper() {
+        let repo =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/repos/ripgrep");
+        if !repo.join("Cargo.toml").exists() {
+            eprintln!("skipping: fixtures/repos/ripgrep not fetched");
+            return;
+        }
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "build".into(),
+                program: "cargo".into(),
+                args: vec!["check".into(), "--quiet".into(), "--offline".into()],
+                kind: CheckKind::Build,
+                gating: true,
+                timeout_seconds: 900,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        };
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let report = Verifier::with_environment(repo.canonicalize().unwrap(), environment)
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        let check = &report.checks[0];
+        assert_eq!(
+            check.status,
+            CheckStatus::Passed,
+            "a real repository gate must not fail on the host's compilation cache: {}",
+            &check.evidence[..check.evidence.len().min(600)]
+        );
+    }
+
     use super::*;
 
     fn cmd(name: &str, program: &str, args: &[&str], gating: bool) -> VerificationCommand {
