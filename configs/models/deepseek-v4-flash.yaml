@@ -1,3 +1,7 @@
+# DeepSeek-V4-Flash — https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+# Context 1M, max output 384K. Thinking on; effort max (wire: low|high|max).
+# Price (CNY / MTok, cache miss): input 1, output 2. pricing field is USD
+# (~7.2 CNY/USD): 0.1389 / 0.2778.
 id: deepseek-v4-flash
 provider: deepseek
 model_id: deepseek-v4-flash
@@ -7,14 +11,20 @@ capabilities:
   tool_calling: true
   parallel_tool_calls: false
   structured_output: true
-  reasoning: false
+  reasoning: true
   vision: false
+reasoning:
+  style: thinking_flag
+  effort: max
 limits:
   context_window: 1048576
-  reliable_context: 524288
-  max_output_tokens: 65536
+  reliable_context: 786432
+  max_output_tokens: 393216
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 1
+pricing:
+  input_usd_per_mtok: 0.1389
+  output_usd_per_mtok: 0.2778
 compatibility:
   synthesize_tool_call_ids: true
   drop_unsupported_fields: true

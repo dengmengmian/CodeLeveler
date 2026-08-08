@@ -21,9 +21,9 @@
 #     api_key_env = "DEEPSEEK_API_KEY"
 #     [models."deepseek-v4-pro"]
 #     provider = "deepseek"
-#     context_window = 1048576      # reliable_context is derived = window / 2
+#     context_window = 1048576      # official: 1M
 #     reliable_context = 786432     # optional explicit compaction threshold
-#     max_output_tokens = 65536     # omit → 8192
+#     max_output_tokens = 393216    # official max output 384K; omit → 8192
 #     streaming = true
 #     tool_calling = true
 #     parallel_tool_calls = false   # optional: force serial; omitted = provider-native
@@ -32,7 +32,9 @@
 #     max_parallel_tool_calls = 1
 #     reasoning = true              # model can reason (drives UI rendering)
 #     reasoning_style = "thinking_flag"   # HOW to ask for it — see below
-#     reasoning_effort = "high"
+#     reasoning_effort = "high"     # official default
+#     # pricing is USD/MTok (CNY list price ÷ ~7.2; input = cache-miss):
+#     # pricing = { input_usd_per_mtok = 0.4167, output_usd_per_mtok = 0.8333 }
 #
 # Kimi Code (K3 / K2.7) — OpenAI-compatible, docs:
 # https://www.kimi.com/code/docs/kimi-code/models
@@ -91,12 +93,13 @@ protocol: openai_chat
 # NOTE: the `policy:` key is RETIRED (model tiers are gone). A leftover
 # `policy: ...` line is a hard config error — execution configuration is
 # resolved from model facts + role + task + safety constraints at run time.
+# Spec: https://api-docs.deepseek.com/zh-cn/quick_start/pricing
 capabilities:
   streaming: true
   tool_calling: true
   parallel_tool_calls: false
   structured_output: true
-  reasoning: false           # model CAN reason; see `reasoning:` below for how to ask
+  reasoning: true            # model CAN reason; see `reasoning:` below for how to ask
   vision: false
 # How to spell a reasoning request on the wire. Omit the block entirely and we
 # send no reasoning field at all (safe for providers that reject them).
@@ -106,14 +109,18 @@ capabilities:
 # effort: minimal | low | medium | high | max. Omit → the provider's default.
 reasoning:
   style: thinking_flag
-  effort: high
+  effort: high               # DeepSeek default
 limits:
   context_window: 1048576    # hard window (DeepSeek v4 = 1M)
-  reliable_context: 786432   # auto-compaction threshold; only the file bundle can
-                             # set this explicitly (TOML derives window / 2)
-  max_output_tokens: 65536   # per-request output cap; keep input+output ≤ window
+  reliable_context: 786432   # auto-compaction threshold
+  max_output_tokens: 393216  # official max output 384K; keep input+output ≤ window
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 1
+# Optional cost accounting (USD/MTok). Official list is CNY; converted ~7.2.
+# input uses cache-miss list price (pro: 3 元, flash: 1 元).
+pricing:
+  input_usd_per_mtok: 0.4167
+  output_usd_per_mtok: 0.8333
 compatibility:
   synthesize_tool_call_ids: true   # provider omits tool-call ids → synthesize them
   drop_unsupported_fields: true
