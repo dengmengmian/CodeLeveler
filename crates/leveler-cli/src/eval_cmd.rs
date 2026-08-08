@@ -931,6 +931,7 @@ async fn run_eval_case(
         unique_search_queries: 0,
         repeated_search_queries: 0,
         first_relevant_file_round: None,
+        first_plan_round: None,
         repair_attempts: 0,
         repair_success: None,
     };
@@ -1040,6 +1041,8 @@ async fn run_eval_case(
             .cloned()
             .chain(case.relevant_paths.iter().cloned()),
     );
+    // C1.5A ablation arm; `None` on every normal run (see eval_commitment).
+    let commitment = crate::eval_commitment::CommitmentNudge::from_environment().map(Arc::new);
     // Eval runs the direct tool loop only (orchestrate dual path removed).
     // `infrastructure_cause` is the structured first-cause of an error-path
     // death (None when the run finished on its own), fed to attribution so
@@ -1061,9 +1064,17 @@ async fn run_eval_case(
                             &case.task,
                             build_approver(true),
                             false,
-                            &mut |e| collector.observe_agent(&e),
+                            &mut |e| {
+                                collector.observe_agent(&e);
+                                if let Some(nudge) = &commitment {
+                                    nudge.observe(&e);
+                                }
+                            },
                             CancellationToken::new(),
                             case.max_rounds,
+                            commitment
+                                .clone()
+                                .map(|n| n as std::sync::Arc<dyn leveler_agent::SteeringSource>),
                         )
                         .await;
                     match outcome {
@@ -1232,6 +1243,7 @@ async fn run_eval_case(
         unique_search_queries: signals.unique_search_queries,
         repeated_search_queries: signals.repeated_search_queries,
         first_relevant_file_round: signals.first_relevant_file_round,
+        first_plan_round: signals.first_plan_round,
         repair_attempts,
         repair_success,
     }

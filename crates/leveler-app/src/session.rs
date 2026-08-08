@@ -503,6 +503,10 @@ impl Application {
         observer: &mut dyn FnMut(AgentEvent),
         cancellation: CancellationToken,
         max_rounds: u32,
+        // Eval runs are unattended, so this is `None` for every normal run.
+        // The eval harness passes a source only when an ablation arm needs to
+        // inject a message mid-turn; nothing on a product path sets it.
+        steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
     ) -> Result<AgentOutcome, AppError> {
         self.run_in_session_with_policy(
             session_id,
@@ -512,8 +516,7 @@ impl Application {
             approver,
             Arc::new(AutoClarify),
             sandbox,
-            // Eval runs are unattended.
-            None,
+            steering,
             observer,
             cancellation,
             leveler_agent::ContinuationPolicy::bounded(max_rounds),
