@@ -457,6 +457,77 @@ mod tests {
         );
     }
 
+    /// `first_relevant_file_round` is a FIRST, not a latest: a later touch of
+    /// the same (or another) relevant path must not move it, or the metric
+    /// silently reports "when it last looked" instead of "when it found it".
+    #[test]
+    fn first_relevant_round_records_the_first_touch_only() {
+        let mut c = SignalCollector::new(vec!["internal/window/window.go".to_string()]);
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 1
+        c.observe_agent(&call(
+            "c1",
+            "grep",
+            serde_json::json!({"pattern": "boundary"}),
+        ));
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 2
+        c.observe_agent(&call(
+            "c2",
+            "read_file",
+            serde_json::json!({"path": "internal/window/window.go"}),
+        ));
+        for round in 3..=8 {
+            c.observe_agent(&AgentEvent::StreamAttemptStarted);
+            c.observe_agent(&call(
+                &format!("c{round}"),
+                "read_file",
+                serde_json::json!({"path": "internal/window/window.go"}),
+            ));
+        }
+        let s = c.finish(false);
+        assert_eq!(
+            s.first_relevant_file_round,
+            Some(2),
+            "six later touches must not overwrite the first"
+        );
+    }
+
+    /// Irrelevant work first: the round counter still points at the round the
+    /// run actually reached the relevant code.
+    #[test]
+    fn first_relevant_round_skips_irrelevant_exploration() {
+        let mut c = SignalCollector::new(vec!["internal/window/window.go".to_string()]);
+        for round in 1..=4 {
+            c.observe_agent(&AgentEvent::StreamAttemptStarted);
+            c.observe_agent(&call(
+                &format!("c{round}"),
+                "read_file",
+                serde_json::json!({"path": format!("internal/billing/store{round}.go")}),
+            ));
+        }
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 5
+        c.observe_agent(&call(
+            "hit",
+            "read_file",
+            serde_json::json!({"path": "internal/window/window.go"}),
+        ));
+        assert_eq!(c.finish(false).first_relevant_file_round, Some(5));
+    }
+
+    /// Never reached: absent, never a fabricated round number.
+    #[test]
+    fn first_relevant_round_is_absent_when_never_touched() {
+        let mut c = SignalCollector::new(vec!["internal/window/window.go".to_string()]);
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call(
+            "c1",
+            "read_file",
+            serde_json::json!({"path": "README.md"}),
+        ));
+        let s = c.finish(false);
+        assert_eq!(s.first_relevant_file_round, None);
+        assert!(!s.touched_relevant_files);
+    }
+
     #[test]
     fn ttff_records_time_to_first_feedback_event() {
         let mut c = SignalCollector::new(Vec::new());
