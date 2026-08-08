@@ -1035,11 +1035,12 @@ async fn run_eval_case(
     };
     // Fold the event stream into trajectory signals for failure attribution
     // (L1 taskset doc §8); the overlay's paths proxy for "the relevant files".
-    let mut collector = crate::eval_signals::SignalCollector::new(
+    let mut collector = crate::eval_signals::SignalCollector::with_paths(
         case.files
             .keys()
             .cloned()
             .chain(case.relevant_paths.iter().cloned()),
+        case.required_impact_paths.iter().cloned(),
     );
     // C1.5A ablation arm; `None` on every normal run (see eval_commitment).
     let commitment = crate::eval_commitment::CommitmentNudge::from_environment().map(Arc::new);
@@ -1500,6 +1501,7 @@ mod ablation_tests {
             task: "do the thing".into(),
             max_rounds: 40,
             relevant_paths: Vec::new(),
+            required_impact_paths: Vec::new(),
             expected_outcome: Default::default(),
             expect: leveler_eval::ExpectCommand {
                 program: "true".into(),

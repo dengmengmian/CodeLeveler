@@ -47,6 +47,16 @@ pub struct EvaluationCase {
     /// still report when the run first looked at the right code.
     #[serde(default)]
     pub relevant_paths: Vec<String>,
+    /// Paths a correct, complete change has to REACH — the callers, consumers,
+    /// interface definitions, configuration hops, or tests the edit's blast
+    /// radius covers. METRICS ONLY, exactly like `relevant_paths`: never
+    /// rendered into the task, never shown to the agent.
+    ///
+    /// `relevant_paths` answers "did it find the code?"; this answers "did it
+    /// see everything the change touches?" — the difference between a fix and
+    /// a half-fix. Reading a path counts, and so does editing it.
+    #[serde(default)]
+    pub required_impact_paths: Vec<String>,
     /// The engine terminal outcome this case requires (default: a verified
     /// completion). A weak-verification case whose CORRECT product semantics
     /// is `CompletedUnverified` declares that here — and is then also failed
@@ -1108,6 +1118,18 @@ pub struct TrajectorySignals {
     /// Round of the first `update_plan` call — when a structured plan actually
     /// existed. Taken from the tool call itself, never inferred from prose.
     pub first_plan_round: Option<u32>,
+    /// How many of the case's `relevant_paths` / `required_impact_paths` the
+    /// run actually reached (read or edited). Coverage, not first contact: a
+    /// run that finds one of three and stops looks identical to a complete one
+    /// on `touched_relevant_files` alone. The path names themselves stay with
+    /// the collector so these signals remain a cheap `Copy` value.
+    pub relevant_paths_touched: u32,
+    pub impact_paths_touched: u32,
+    /// Reads that named no line range (whole-file intent) versus reads that
+    /// asked for a bounded region. The ratio is the navigation shape: reading
+    /// the right region, or reading the file and hoping.
+    pub broad_reads: u32,
+    pub narrow_reads: u32,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order

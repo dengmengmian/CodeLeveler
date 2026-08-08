@@ -36,6 +36,14 @@ pub(crate) struct SignalCollector {
     /// Case-relevant paths (the overlay's files): the harness's proxy for
     /// "where the defect/acceptance lives".
     relevant: Vec<String>,
+    /// Paths a complete change must reach (callers, consumers, contracts,
+    /// config hops, tests). Metrics only — never shown to the agent.
+    impact: Vec<String>,
+    /// The metrics-only paths this run actually reached, by name — the source
+    /// of the coverage counts and of the missed-path list a failed case is
+    /// diagnosed with.
+    relevant_seen: HashSet<String>,
+    impact_seen: HashSet<String>,
     /// Tool-call ids of verification-class `run_command`s, to mark
     /// `verification_ran` when one succeeds.
     verify_calls: HashSet<String>,
@@ -62,9 +70,22 @@ pub(crate) struct SignalCollector {
 
 impl SignalCollector {
     pub(crate) fn new(relevant_paths: impl IntoIterator<Item = String>) -> Self {
+        Self::with_paths(relevant_paths, Vec::new())
+    }
+
+    /// Both metrics-only path sets: where the defect lives, and what a complete
+    /// change has to reach. Kept separate because a run can locate perfectly
+    /// and still half-fix.
+    pub(crate) fn with_paths(
+        relevant_paths: impl IntoIterator<Item = String>,
+        impact_paths: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self {
             signals: TrajectorySignals::default(),
+            impact: impact_paths.into_iter().collect(),
             relevant: relevant_paths.into_iter().collect(),
+            relevant_seen: HashSet::new(),
+            impact_seen: HashSet::new(),
             verify_calls: HashSet::new(),
             error_streak: None,
             started: Instant::now(),
@@ -141,6 +162,20 @@ impl SignalCollector {
                 ..
             } => {
                 self.signals.tool_calls += 1;
+                // Coverage: every metrics-only path this call names, whether it
+                // reads it or patches it. `arguments` is the raw JSON, so a
+                // path inside an apply_patch body counts the same as a
+                // `path` argument.
+                for path in &self.relevant {
+                    if arguments.contains(path.as_str()) {
+                        self.relevant_seen.insert(path.clone());
+                    }
+                }
+                for path in &self.impact {
+                    if arguments.contains(path.as_str()) {
+                        self.impact_seen.insert(path.clone());
+                    }
+                }
                 if !self.signals.touched_relevant_files
                     && self.relevant.iter().any(|p| arguments.contains(p.as_str()))
                 {
@@ -164,6 +199,17 @@ impl SignalCollector {
                             self.signals.repeated_file_reads += 1;
                         }
                         self.signals.unique_files_read = self.files_read.len() as u32;
+                        // No requested range means whole-file intent. The
+                        // *returned* range can still be clipped by the byte
+                        // cap; what this measures is what the model asked for,
+                        // which is the navigation decision.
+                        if has_argument(arguments, "start_line")
+                            || has_argument(arguments, "end_line")
+                        {
+                            self.signals.narrow_reads += 1;
+                        } else {
+                            self.signals.broad_reads += 1;
+                        }
                     }
                     "grep" | "find_files" | "find_symbol" | "list_files" | "find_references"
                     | "locate_hint" => {
@@ -270,8 +316,32 @@ impl SignalCollector {
     /// context ceiling), which the event stream itself does not carry.
     pub(crate) fn finish(mut self, context_overflow: bool) -> TrajectorySignals {
         self.signals.context_overflow = context_overflow;
+        self.signals.relevant_paths_touched = self.relevant_seen.len() as u32;
+        self.signals.impact_paths_touched = self.impact_seen.len() as u32;
         self.signals
     }
+
+    /// Impact-surface paths the run never reached. Empty is the good case; a
+    /// non-empty list on a case the agent called done is the half-fix, named.
+    pub(crate) fn missed_impact_paths(&self) -> Vec<String> {
+        let mut missed: Vec<String> = self
+            .impact
+            .iter()
+            .filter(|p| !self.impact_seen.contains(*p))
+            .cloned()
+            .collect();
+        missed.sort();
+        missed
+    }
+}
+
+/// Whether a tool call's JSON arguments carry `key` at all — line numbers are
+/// JSON numbers, so [`tool_argument`] (which reads strings) never sees them.
+fn has_argument(arguments: &str, key: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get(key).cloned())
+        .is_some_and(|v| !v.is_null())
 }
 
 /// One string field out of a tool call's JSON arguments, when present.
@@ -514,6 +584,80 @@ mod tests {
             serde_json::json!({"path": "internal/window/window.go"}),
         ));
         assert_eq!(c.finish(false).first_relevant_file_round, Some(5));
+    }
+
+    /// Coverage, not just first contact: the run's recall over the paths a
+    /// correct fix has to reach. A run that finds one of three relevant files
+    /// and stops has `touched_relevant_files = true` and is still two thirds
+    /// blind — that is exactly the half-fix this metric exists to expose.
+    #[test]
+    fn relevant_and_impact_coverage_are_tracked_per_path() {
+        let mut c = SignalCollector::with_paths(
+            vec!["cmd/root.go".to_string(), "cmd/utils.go".to_string()],
+            vec!["cmd/root.go".to_string(), "pkg/yqlib/stream.go".to_string()],
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call(
+            "c1",
+            "read_file",
+            serde_json::json!({"path": "cmd/root.go"}),
+        ));
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call(
+            "c2",
+            "read_file",
+            serde_json::json!({"path": "cmd/root.go"}),
+        ));
+        assert_eq!(
+            c.missed_impact_paths(),
+            vec!["pkg/yqlib/stream.go".to_string()],
+            "a never-read impact path is the half-fix, named"
+        );
+        let s = c.finish(false);
+        assert_eq!(
+            s.relevant_paths_touched, 1,
+            "a repeat of the same path is not extra coverage"
+        );
+        assert_eq!(s.impact_paths_touched, 1);
+    }
+
+    /// An edit counts as reaching a path just as much as a read does — a run
+    /// that patched a caller it found through a search has covered it.
+    #[test]
+    fn an_edit_covers_an_impact_path_too() {
+        let mut c =
+            SignalCollector::with_paths(Vec::new(), vec!["internal/report/scan.go".to_string()]);
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call(
+            "e1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Update File: internal/report/scan.go"}),
+        ));
+        assert!(c.missed_impact_paths().is_empty());
+        assert_eq!(c.finish(false).impact_paths_touched, 1);
+    }
+
+    /// Broad vs narrow reads: the shape C2.1 measured. A read with no range is
+    /// a whole-file intent; one with a range is targeted. This distinguishes
+    /// "read the right region" from "read the file and hope".
+    #[test]
+    fn reads_are_classified_broad_or_narrow_by_requested_range() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call("b", "read_file", serde_json::json!({"path": "a.go"})));
+        c.observe_agent(&call(
+            "n",
+            "read_file",
+            serde_json::json!({"path": "b.go", "start_line": 100, "end_line": 200}),
+        ));
+        c.observe_agent(&call(
+            "n2",
+            "read_file",
+            serde_json::json!({"path": "c.go", "start_line": 40}),
+        ));
+        let s = c.finish(false);
+        assert_eq!(s.broad_reads, 1);
+        assert_eq!(s.narrow_reads, 2);
     }
 
     /// Never reached: absent, never a fabricated round number.
