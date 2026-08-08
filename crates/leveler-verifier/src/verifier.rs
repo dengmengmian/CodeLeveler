@@ -1,6 +1,6 @@
 //! The verifier: runs the plan's checks, captures evidence, and enforces scope.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use leveler_execution::{CommandRunner, VerifyNetworkPolicy, process_request_for_
 use std::collections::BTreeSet;
 
 use crate::failure::classify;
-use crate::plan::{CheckKind, VerificationCommand, VerificationPlan};
+use crate::plan::{CheckKind, ScopePolicy, VerificationCommand, VerificationPlan};
 use crate::report::{CheckOutcome, CheckStatus, VerificationReport};
 use crate::test_results::{parse_go_failures, parse_rust_failures};
 
@@ -91,10 +91,7 @@ impl Verifier {
             };
         }
 
-        // Narrow whole-repo commands to the changed packages (spec §29.5).
-        let args = scope_args(&command.args, modified_files);
-        // Complete failure sets for baseline attribution (see with_no_fail_fast).
-        let args = with_no_fail_fast(command, args);
+        let args = effective_args(command, modified_files, &self.workspace_root);
         // Repo / builtin verify: write confinement on, network inherits session
         // (not force-deny — K12 so cargo/go/npm cold caches still work).
         let mut request = process_request_for_verify_check(
@@ -166,10 +163,32 @@ fn path_allows(allowed: &str, modified: &str) -> bool {
     modified == allowed || modified.starts_with(&format!("{allowed}/"))
 }
 
+/// The arguments a check actually runs with.
+///
+/// [`ScopePolicy::Exact`] commands run verbatim: the user declared a
+/// verification contract and the harness does not get to reinterpret it —
+/// neither by narrowing the target set nor by adding flags. Inferred commands
+/// are the harness's own construction, so they may be narrowed to the change
+/// under test and completed for baseline attribution.
+fn effective_args(
+    command: &VerificationCommand,
+    modified_files: &[String],
+    workspace_root: &Path,
+) -> Vec<String> {
+    if command.scope_policy == ScopePolicy::Exact {
+        return command.args.clone();
+    }
+    // Narrow whole-repo commands to the changed packages (spec §29.5).
+    let args = scope_args(&command.args, modified_files, workspace_root);
+    // Complete failure sets for baseline attribution (see with_no_fail_fast).
+    with_no_fail_fast(command, args)
+}
+
 /// Narrow a whole-repo package glob (`./...`) to just the packages containing the
 /// modified files (spec §29.5: prefer targeted → module → full). Falls back to
-/// the original args when it can't scope safely (e.g. a root-level change).
-fn scope_args(args: &[String], modified_files: &[String]) -> Vec<String> {
+/// the original args when it can't scope safely (a root-level change, or a
+/// target directory that no longer exists).
+fn scope_args(args: &[String], modified_files: &[String], workspace_root: &Path) -> Vec<String> {
     if modified_files.is_empty() || !args.iter().any(|a| a == "./...") {
         return args.to_vec();
     }
@@ -186,6 +205,16 @@ fn scope_args(args: &[String], modified_files: &[String]) -> Vec<String> {
         } else {
             format!("./{dir}/...")
         };
+        // `modified_files` is every path the run ever touched, so a directory
+        // here may be gone by now: a scratch tree the run created and removed,
+        // or a package it deleted outright. Narrowing to it would run a command
+        // that cannot resolve its own target ("no such file or directory") and
+        // fail the gate for a reason that has nothing to do with the code. A
+        // valid broader gate beats an invalid narrow one — and skipping
+        // verification is never the answer.
+        if !workspace_root.join(dir).is_dir() {
+            return args.to_vec();
+        }
         if !packages.contains(&glob) {
             packages.push(glob);
         }
@@ -320,7 +349,6 @@ fn pathext_extensions(environment: &leveler_core::EnvSnapshot) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::CheckKind;
 
     fn cmd(name: &str, program: &str, args: &[&str], gating: bool) -> VerificationCommand {
         VerificationCommand {
@@ -330,6 +358,7 @@ mod tests {
             kind: CheckKind::Build,
             gating,
             timeout_seconds: 30,
+            scope_policy: ScopePolicy::Auto,
         }
     }
 
@@ -346,28 +375,131 @@ mod tests {
 
     #[test]
     fn scope_narrows_go_glob_to_changed_packages() {
+        let root = root_with(&["errors"]);
         let args = sv(&["test", "./..."]);
-        let scoped = scope_args(&args, &["errors/x.go".into(), "errors/y.go".into()]);
+        let scoped = scope_args(
+            &args,
+            &["errors/x.go".into(), "errors/y.go".into()],
+            root.path(),
+        );
         assert_eq!(scoped, sv(&["test", "./errors/..."]));
     }
 
     #[test]
     fn scope_handles_multiple_packages() {
-        let scoped = scope_args(&sv(&["test", "./..."]), &["a/x.go".into(), "b/y.go".into()]);
+        let root = root_with(&["a", "b"]);
+        let scoped = scope_args(
+            &sv(&["test", "./..."]),
+            &["a/x.go".into(), "b/y.go".into()],
+            root.path(),
+        );
         assert_eq!(scoped, sv(&["test", "./a/...", "./b/..."]));
     }
 
+    /// F — a root-level change cannot be narrowed.
     #[test]
     fn scope_falls_back_to_full_on_root_change() {
+        let root = root_with(&[]);
         let args = sv(&["test", "./..."]);
-        let scoped = scope_args(&args, &["main.go".into()]);
+        let scoped = scope_args(&args, &["main.go".into()], root.path());
         assert_eq!(scoped, args);
     }
 
     #[test]
     fn scope_leaves_non_glob_commands_untouched() {
         let args = sv(&["check", "--workspace"]);
-        assert_eq!(scope_args(&args, &["src/lib.rs".into()]), args);
+        assert_eq!(
+            scope_args(&args, &["src/lib.rs".into()], Path::new(".")),
+            args
+        );
+    }
+
+    /// A workspace root with `dirs` materialized, for narrowing decisions that
+    /// must only ever name a directory that exists.
+    fn root_with(dirs: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        dir
+    }
+
+    /// A — the user declared `go test ./...`; that is the command that runs.
+    #[test]
+    fn explicit_args_are_never_rewritten() {
+        let root = root_with(&["app"]);
+        let mut command = test_check("go", &["test", "./..."]);
+        command.scope_policy = ScopePolicy::Exact;
+        assert_eq!(
+            effective_args(&command, &["app/foo.go".into()], root.path()),
+            sv(&["test", "./..."])
+        );
+    }
+
+    /// A (second rewrite path) — an explicit `cargo test` keeps its exact
+    /// arguments too; the harness does not slip `--no-fail-fast` in.
+    #[test]
+    fn explicit_cargo_test_keeps_its_exact_arguments() {
+        let root = root_with(&["crates/x/src"]);
+        let mut command = test_check("cargo", &["test", "--workspace"]);
+        command.scope_policy = ScopePolicy::Exact;
+        assert_eq!(
+            effective_args(&command, &["crates/x/src/lib.rs".into()], root.path()),
+            sv(&["test", "--workspace"])
+        );
+    }
+
+    /// B — the inferred plan keeps narrowing to the changed package.
+    #[test]
+    fn inferred_args_are_narrowed_to_the_changed_package() {
+        let root = root_with(&["app"]);
+        let command = test_check("go", &["test", "./..."]);
+        assert_eq!(
+            effective_args(&command, &["app/foo.go".into()], root.path()),
+            sv(&["test", "./app/..."])
+        );
+    }
+
+    /// E — the P1 reproduction: a transient directory the run created and
+    /// removed is still in `modified_files`, and narrowing to it would build a
+    /// target that cannot resolve (`lstat: no such file or directory`). Fall
+    /// back to the broader command instead of running a doomed one.
+    #[test]
+    fn a_vanished_target_falls_back_to_the_broader_command() {
+        let root = root_with(&["duration"]);
+        let command = test_check("go", &["test", "./..."]);
+        let scoped = effective_args(
+            &command,
+            &[
+                "duration/format.go".into(),
+                ".acceptance-work/duration/format.go".into(),
+            ],
+            root.path(),
+        );
+        assert_eq!(
+            scoped,
+            sv(&["test", "./..."]),
+            "a target that no longer exists must widen the gate, not break it"
+        );
+    }
+
+    /// G — deleting a source file inside a package that still exists narrows
+    /// normally; deleting the whole package widens instead of skipping.
+    #[test]
+    fn source_deletion_still_verifies() {
+        let root = root_with(&["app"]);
+        let command = test_check("go", &["test", "./..."]);
+        assert_eq!(
+            effective_args(&command, &["app/gone.go".into()], root.path()),
+            sv(&["test", "./app/..."]),
+            "the package survives the file deletion"
+        );
+        let widened = effective_args(&command, &["oldpkg/gone.go".into()], root.path());
+        assert_eq!(
+            widened,
+            sv(&["test", "./..."]),
+            "a removed package must still be verified, just more broadly"
+        );
     }
 
     fn test_check(program: &str, args: &[&str]) -> VerificationCommand {
@@ -378,6 +510,7 @@ mod tests {
             kind: CheckKind::Test,
             gating: true,
             timeout_seconds: 30,
+            scope_policy: ScopePolicy::Auto,
         }
     }
 
