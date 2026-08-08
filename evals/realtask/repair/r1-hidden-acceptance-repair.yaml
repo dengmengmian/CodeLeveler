@@ -29,17 +29,11 @@ files:
     # the real code.
     set -euo pipefail
     SPEC_B64="cGFja2FnZSBwZXJjZW50CgppbXBvcnQgKAoJInN0cmluZ3MiCgkidGVzdGluZyIKKQoKZnVuYyBUZXN0UGFyc2VSZWplY3RzT3V0T2ZSYW5nZSh0ICp0ZXN0aW5nLlQpIHsKCWlmIHYsIGVyciA6PSBQYXJzZSgiMTUwJSIpOyBlcnIgPT0gbmlsIHx8ICFzdHJpbmdzLkNvbnRhaW5zKGVyci5FcnJvcigpLCAib3V0IG9mIHJhbmdlIikgewoJCXQuRmF0YWxmKGBQYXJzZSgiMTUwJSUiKSA9ICVkLCAldjsgd2FudCBhbiBlcnJvciBjb250YWluaW5nICJvdXQgb2YgcmFuZ2UiICh2YWxpZCBwZXJjZW50cyBhcmUgMC0xMDApYCwgdiwgZXJyKQoJfQoJaWYgXywgZXJyIDo9IFBhcnNlKCItNSUiKTsgZXJyID09IG5pbCB8fCAhc3RyaW5ncy5Db250YWlucyhlcnIuRXJyb3IoKSwgIm91dCBvZiByYW5nZSIpIHsKCQl0LkZhdGFsZihgUGFyc2UoIi01JSUiKSBtdXN0IGJlIHJlamVjdGVkIHdpdGggYW4gIm91dCBvZiByYW5nZSIgZXJyb3IsIGdvdCAldmAsIGVycikKCX0KCWlmIHYsIGVyciA6PSBQYXJzZSgiMTAwJSIpOyBlcnIgIT0gbmlsIHx8IHYgIT0gMTAwIHsKCQl0LkZhdGFsZihgUGFyc2UoIjEwMCUlIikgPSAlZCwgJXY7IHdhbnQgMTAwLCBuaWxgLCB2LCBlcnIpCgl9CglpZiB2LCBlcnIgOj0gUGFyc2UoIjAlIik7IGVyciAhPSBuaWwgfHwgdiAhPSAwIHsKCQl0LkZhdGFsZihgUGFyc2UoIjAlJSIpID0gJWQsICV2OyB3YW50IDAsIG5pbGAsIHYsIGVycikKCX0KfQo="
-    # Scratch space stays INSIDE the workspace: verification checks run write
-    # confined, so a check may not create directories under $TMPDIR.
-    w=".acceptance-work"
-    rm -rf "$w"
-    mkdir -p "$w"
+    w="$(mktemp -d "${TMPDIR:-/tmp}/leveler-acceptance.XXXXXX")"
+    trap 'rm -rf "$w"' EXIT
     cp -R ./percent ./go.mod "$w/"
     python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.argv[1]))" "$SPEC_B64" > "$w/percent/acceptance_spec_test.go"
     (cd "$w" && go test ./...)
-    status=$?
-    rm -rf "$w"
-    exit $status
   go.mod: |
     module pct
 

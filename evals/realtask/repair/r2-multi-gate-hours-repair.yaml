@@ -27,17 +27,11 @@ files:
     # encoded form, materialized and run as ordinary go tests.
     set -euo pipefail
     SPEC_B64="cGFja2FnZSBkdXJhdGlvbgoKaW1wb3J0ICJ0ZXN0aW5nIgoKZnVuYyBUZXN0Rm9ybWF0U3VwcG9ydHNIb3Vycyh0ICp0ZXN0aW5nLlQpIHsKCWlmIGdvdCA6PSBGb3JtYXQoMzY2MSk7IGdvdCAhPSAiMWgxbTFzIiB7CgkJdC5GYXRhbGYoYEZvcm1hdCgzNjYxKSA9ICVxOyB3YW50ICIxaDFtMXMiIChob3VycyBhcmUgc3BsaXQgb3V0KWAsIGdvdCkKCX0KCWlmIGdvdCA6PSBGb3JtYXQoMzYwMCk7IGdvdCAhPSAiMWgiIHsKCQl0LkZhdGFsZihgRm9ybWF0KDM2MDApID0gJXE7IHdhbnQgIjFoIiAod2hvbGUgaG91cnMgcmVuZGVyIGJhcmUpYCwgZ290KQoJfQoJaWYgZ290IDo9IEZvcm1hdCg3MzI1KTsgZ290ICE9ICIyaDJtNXMiIHsKCQl0LkZhdGFsZihgRm9ybWF0KDczMjUpID0gJXE7IHdhbnQgIjJoMm01cyJgLCBnb3QpCgl9CglpZiBnb3QgOj0gRm9ybWF0KDU5KTsgZ290ICE9ICI1OXMiIHsKCQl0LkZhdGFsZihgRm9ybWF0KDU5KSA9ICVxOyB3YW50ICI1OXMiIChzdWItbWludXRlIHVuY2hhbmdlZClgLCBnb3QpCgl9Cn0K"
-    # Scratch space stays INSIDE the workspace: verification checks run write
-    # confined, so a check may not create directories under $TMPDIR.
-    w=".acceptance-work"
-    rm -rf "$w"
-    mkdir -p "$w"
+    w="$(mktemp -d "${TMPDIR:-/tmp}/leveler-acceptance.XXXXXX")"
+    trap 'rm -rf "$w"' EXIT
     cp -R ./duration ./go.mod "$w/"
     python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.argv[1]))" "$SPEC_B64" > "$w/duration/acceptance_spec_test.go"
     (cd "$w" && go test ./...)
-    status=$?
-    rm -rf "$w"
-    exit $status
   go.mod: |
     module dur
 
