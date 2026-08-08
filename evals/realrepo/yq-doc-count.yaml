@@ -1,0 +1,63 @@
+# C1.4 closure — real-repo localization case #2 (Go, ~477 files).
+# Same SHAPE as ripgrep-total-count: a small user-facing flag that has to be
+# wired from the CLI surface down through the evaluation path, on a real
+# third-party codebase the agent has never seen. No overlay, so nothing in
+# git history hints at the answer; the prompt names no file and no symbol.
+# Fetch with `scripts/fetch_eval_repos.sh yq` (pinned tag, not committed).
+id: yq-doc-count
+name: "yq: add a --doc-count flag (real repo, Go)"
+repo: fixtures/repos/yq
+base_ref: "v4.44.3"
+files: {}
+max_rounds: 100
+# Metrics only — never rendered into the task, never shown to the agent.
+# The flag surface plus the command that runs an expression over a stream:
+# any honest implementation has to reach both.
+relevant_paths:
+  - cmd/root.go
+  - cmd/evaluate_sequence_command.go
+  - cmd/utils.go
+task: |
+  Feature request from users scripting around yq:
+
+  "Before I process a multi-document YAML stream I want to know how many
+  documents it contains. Today I have to write an expression and count the
+  output lines myself, which breaks as soon as a document is multi-line."
+
+  Add a global flag `--doc-count`. When it is passed, yq prints just the
+  number of YAML documents in the input — a single line with the integer,
+  nothing else — and exits successfully. Reading from stdin and from a file
+  argument must both work.
+
+  Requirements:
+  - The flag appears in `yq --help`.
+  - Without `--doc-count`, behavior is completely unchanged.
+  - The count is the number of documents in the input stream, not the number
+    of output lines.
+
+  Build with `go build`. Do not weaken or delete existing tests.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/yq-accept.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/yq" .
+      # 1) discoverable in help
+      "$d/yq" --help 2>/dev/null | grep -q -- '--doc-count'
+      # 2) stdin, three documents (one of them multi-line, so a line count of
+      #    the normal output would give the wrong answer)
+      printf 'a: 1\n---\nb:\n  c: 2\n  d: 3\n---\ne: 4\n' > "$d/multi.yaml"
+      out="$(< "$d/multi.yaml" "$d/yq" --doc-count)"
+      [ "$out" = "3" ]
+      # 3) file argument, single document
+      printf 'only: 1\n' > "$d/single.yaml"
+      [ "$("$d/yq" --doc-count "$d/single.yaml")" = "1" ]
+      # 4) absent flag leaves normal evaluation untouched
+      normal="$(< "$d/multi.yaml" "$d/yq" '.')"
+      [ "$(grep -c -- '^---$' <<<"$normal")" -eq 2 ]
+      grep -qx 'a: 1' <<<"$normal"
+      # 5) the existing suite still passes
+      go test ./pkg/... > /dev/null
