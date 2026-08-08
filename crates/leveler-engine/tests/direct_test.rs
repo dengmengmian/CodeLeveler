@@ -719,6 +719,7 @@ fn gate(name: &str, program: &str) -> VerificationPlan {
             kind: CheckKind::Test,
             gating: true,
             timeout_seconds: 30,
+            scope_policy: Default::default(),
         }],
     }
 }

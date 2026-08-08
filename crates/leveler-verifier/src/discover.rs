@@ -7,7 +7,7 @@ use std::path::Path;
 
 use leveler_project::{Language, ProjectConfig};
 
-use crate::plan::{CheckKind, VerificationCommand, VerificationPlan};
+use crate::plan::{CheckKind, ScopePolicy, VerificationCommand, VerificationPlan};
 
 /// The verification plan for a repository as it exists RIGHT NOW: an explicit
 /// `.leveler/config.yaml` verify section if there is one, otherwise whatever the
@@ -51,6 +51,8 @@ fn plan_from_verify(spec: &leveler_project::VerifySpec) -> VerificationPlan {
             kind,
             gating,
             timeout_seconds: 600,
+            // User-declared: authority, not a heuristic input.
+            scope_policy: ScopePolicy::Exact,
         });
     };
     if let Some(f) = &spec.format {
@@ -246,6 +248,42 @@ mod tests {
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// The whole point of the `verify:` section: whatever the user wrote is
+    /// the contract. Discovery must mark it authoritative, or the harness's
+    /// scoping heuristics will quietly rewrite it downstream.
+    #[test]
+    fn an_explicit_verify_section_is_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".leveler")).unwrap();
+        std::fs::write(
+            dir.path().join(".leveler/config.yaml"),
+            "verify:\n  test:\n    program: bash\n    args: [\"scripts/docs-lint.sh\"]\n",
+        )
+        .unwrap();
+
+        let plan = plan_for_repo(dir.path());
+        let test = find(&plan, "test");
+        assert_eq!(test.scope_policy, ScopePolicy::Exact);
+        assert_eq!(test.program, "bash");
+        assert_eq!(test.args, vec!["scripts/docs-lint.sh".to_string()]);
+        assert!(test.gating);
+    }
+
+    /// A plan the harness inferred from the repo's manifests stays scopeable.
+    #[test]
+    fn an_inferred_plan_stays_scopeable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+
+        let plan = plan_for_repo(dir.path());
+        assert!(
+            plan.commands
+                .iter()
+                .all(|c| c.scope_policy == ScopePolicy::Auto),
+            "inferred commands must remain narrowable"
+        );
     }
 
     fn find<'a>(plan: &'a VerificationPlan, name: &str) -> &'a VerificationCommand {

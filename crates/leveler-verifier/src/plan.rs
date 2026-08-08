@@ -19,6 +19,28 @@ pub enum CheckKind {
     Lint,
 }
 
+/// How much liberty the harness has with a verification command.
+///
+/// This is authority, not a hint: a command the user declared in
+/// `.leveler/config.yaml` states a verification contract, and the harness's
+/// blast-radius heuristics must not quietly rewrite it into a different
+/// command or strip its gating power. Commands the harness inferred from a
+/// repository's manifests are its own construction, so it may narrow them to
+/// the change under test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopePolicy {
+    /// Harness-inferred: arguments may be narrowed to the changed packages,
+    /// and the gate may be downgraded when the change touches no compiled
+    /// input. The default, so a command deserialized from an older plan keeps
+    /// exactly today's behavior.
+    #[default]
+    Auto,
+    /// User-declared: run `program` + `args` verbatim and keep the declared
+    /// gating semantics, whatever the change looks like.
+    Exact,
+}
+
 /// A single verification command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationCommand {
@@ -30,6 +52,9 @@ pub struct VerificationCommand {
     pub gating: bool,
     /// Timeout in seconds.
     pub timeout_seconds: u64,
+    /// Whether the harness may rescope this command — see [`ScopePolicy`].
+    #[serde(default)]
+    pub scope_policy: ScopePolicy,
 }
 
 impl VerificationCommand {
@@ -47,6 +72,9 @@ impl VerificationCommand {
             kind,
             gating,
             timeout_seconds: 600,
+            // Every caller of this constructor builds a plan the harness
+            // inferred from the repository's own manifests.
+            scope_policy: ScopePolicy::Auto,
         }
     }
 }
@@ -172,11 +200,19 @@ impl VerificationPlan {
     /// so both layers judge "does this change need verification" identically);
     /// see its docs for the full trade-off. Empty `modified_files` (unknown
     /// blast radius) keeps the gates.
+    ///
+    /// [`ScopePolicy::Exact`] commands are exempt: a gate the user declared
+    /// says "check this, always". A docs lint is the clearest case — it exists
+    /// precisely for the changes this heuristic reads as inert, so silently
+    /// downgrading it would cancel the one check that mattered.
     pub fn scope_gates_to_changes(&mut self, modified_files: &[String]) {
         if modified_files.is_empty() || modified_files.iter().any(|f| is_build_relevant(f)) {
             return;
         }
         for cmd in &mut self.commands {
+            if cmd.scope_policy == ScopePolicy::Exact {
+                continue;
+            }
             if matches!(
                 cmd.kind,
                 CheckKind::Build | CheckKind::Test | CheckKind::Lint
@@ -283,6 +319,53 @@ mod tests {
             "到桌面".into(),
         ]);
         assert!(!plan.has_gates(), "got {:?}", gating_kinds(&plan));
+    }
+
+    /// C — a user-declared gate keeps gating whatever the change looks like.
+    /// A docs-lint the project configured itself is the whole point of a
+    /// markdown-only change; the blast-radius heuristic must not cancel it.
+    #[test]
+    fn explicit_gate_survives_an_inert_change() {
+        let mut plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "test".into(),
+                program: "bash".into(),
+                args: vec!["scripts/docs-lint.sh".into()],
+                kind: CheckKind::Test,
+                gating: true,
+                timeout_seconds: 600,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        };
+        plan.scope_gates_to_changes(&["README.md".into()]);
+        assert!(
+            plan.has_gates(),
+            "an explicitly declared gate is authority, not a heuristic input"
+        );
+    }
+
+    /// D — the inferred plan keeps its existing safety optimization.
+    #[test]
+    fn inferred_gate_is_still_downgraded_on_an_inert_change() {
+        let mut plan = VerificationPlan::for_languages(&[Language::Rust]);
+        plan.scope_gates_to_changes(&["README.md".into()]);
+        assert!(!plan.has_gates(), "got {:?}", gating_kinds(&plan));
+    }
+
+    /// A plan serialized before `scope_policy` existed must keep behaving as
+    /// the inferred command it was.
+    #[test]
+    fn a_command_without_scope_policy_defaults_to_auto() {
+        let command: VerificationCommand = serde_json::from_value(serde_json::json!({
+            "name": "cargo test",
+            "program": "cargo",
+            "args": ["test"],
+            "kind": "test",
+            "gating": true,
+            "timeout_seconds": 600
+        }))
+        .unwrap();
+        assert_eq!(command.scope_policy, ScopePolicy::Auto);
     }
 
     #[test]
