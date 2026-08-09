@@ -350,21 +350,22 @@ pub fn expand_tool_category(registry: &mut ToolRegistry, category: &str) {
 }
 
 #[cfg(test)]
-mod c2_3b_navigation_contract {
-    //! C2.3B §30 E/G — the navigation guidance may clarify *when* to use a
-    //! tool; it may not change what the tool accepts or promise less than it
-    //! delivers.
+mod navigation_tool_contract {
+    //! The tool table is what an eval measures navigation against, so the
+    //! parts a benchmark depends on are pinned here: `read_file`'s range is
+    //! optional, and its description states plainly what each form returns.
+    //! C2.3B's behavioural wording was removed after A/B showed it cost more
+    //! than it bought; what stays is capability, not advice.
 
-    /// G: schemas stay compatible. `read_file` still takes an optional
-    /// inclusive range, and no navigation wording added or removed a field.
     #[test]
-    fn read_file_schema_is_unchanged_by_the_navigation_guidance() {
+    fn read_file_takes_an_optional_range_and_says_what_each_form_returns() {
         let registry = crate::full_registry();
         let read = registry
             .definitions()
             .into_iter()
             .find(|d| d.name == "read_file")
             .expect("read_file registered");
+
         let props = read.input_schema["properties"]
             .as_object()
             .expect("object schema");
@@ -378,58 +379,40 @@ mod c2_3b_navigation_contract {
             "only `path` may be required: {required:?}"
         );
         assert_eq!(required[0], "path");
-    }
 
-    /// E: `read_file`'s contract is a *range*, not a cap. The description must
-    /// keep whole-file reads available and must never argue from token cost —
-    /// C2.3B forbids turning navigation guidance into a budget lecture.
-    #[test]
-    fn read_file_description_keeps_whole_file_reads_available() {
-        let registry = crate::full_registry();
-        let read = registry
-            .definitions()
-            .into_iter()
-            .find(|d| d.name == "read_file")
-            .expect("read_file registered");
-        let text = read.description.to_lowercase();
         assert!(
-            text.contains("omit the range to read the whole file"),
-            "reading a whole file must stay a stated option: {}",
+            read.description
+                .contains("omitting both returns the whole file"),
+            "both read shapes must be discoverable from the tool alone: {}",
             read.description
         );
-        for banned in ["token", "never read the whole", "avoid reading whole"] {
+        // Descriptions state capability. Steering belongs in the prompt, where
+        // it can be measured and reverted; C2.3B is the reason that matters.
+        for advisory in [
+            "first thing to reach for",
+            "where to start reading",
+            "token",
+        ] {
             assert!(
-                !text.contains(banned),
-                "tool descriptions must not carry {banned:?}: {}",
-                read.description
+                !read.description.to_lowercase().contains(advisory),
+                "tool descriptions must not carry navigation advice: {advisory:?}"
             );
         }
     }
 
-    /// The locate-first entry point has to be discoverable from the tool table
-    /// alone, not only from the system prompt.
+    /// The three localisation tools must stay distinguishable, or a navigation
+    /// eval cannot tell "used the wrong tool" from "did not look".
     #[test]
-    fn search_tools_say_what_they_are_for() {
+    fn localisation_tools_stay_distinguishable() {
         let registry = crate::full_registry();
         let by_name: std::collections::HashMap<_, _> = registry
             .definitions()
             .into_iter()
             .map(|d| (d.name.clone(), d.description))
             .collect();
-        assert!(
-            by_name["grep"].contains("do not yet know which file"),
-            "grep must name the unknown-location case: {}",
-            by_name["grep"]
-        );
-        assert!(
-            by_name["find_symbol"].contains("DEFINED"),
-            "find_symbol must stay distinguishable from grep"
-        );
-        assert!(
-            by_name["find_references"].contains("call sites"),
-            "find_references must stay the impact-surface tool: {}",
-            by_name["find_references"]
-        );
+        assert!(by_name["grep"].contains("pattern"));
+        assert!(by_name["find_symbol"].contains("DEFINED"));
+        assert!(by_name["find_references"].contains("call sites"));
     }
 }
 

@@ -527,66 +527,12 @@ mod tests {
     /// C2.3B §30 A/B/C — navigation discipline is HARNESS baseline behavior:
     /// it ships in `prompts/base.md`, so every production request carries it,
     /// and every provider gets the same principles. A model profile that
-    /// replaces the base prompt is the one documented exception.
-    #[test]
-    fn navigation_discipline_is_baseline_for_every_provider() {
-        let prompt = PromptBuilder::new().build();
-        // Locate before reading broadly (search-first, unknown location).
-        assert!(prompt.contains("locate before reading broadly"), "{prompt}");
-        // The symbol-aware tools are named — they were never mentioned before
-        // and went unused in every recorded real-repo run.
-        for tool in ["find_symbol", "find_references"] {
-            assert!(prompt.contains(tool), "navigation must name {tool}");
-        }
-        // Impact surface before a non-trivial edit.
-        assert!(prompt.contains("callers"), "{prompt}");
-        // Stopping discipline, not just search discipline.
-        assert!(prompt.contains("stop exploring"), "{prompt}");
-
-        // Same text with a plan policy off and on: navigation never depends on
-        // the plan switch (it is not conditional guidance).
-        let minimal = PromptBuilder::new().require_explicit_plan(false).build();
-        assert!(minimal.contains("locate before reading broadly"));
-        let planned = PromptBuilder::new().require_explicit_plan(true).build();
-        assert!(planned.contains("locate before reading broadly"));
-    }
 
     /// C2.3B §2/§6 — broader reads must stay legitimate. The guidance may not
     /// forbid whole-file reads or argue from token cost: the goal is evidence
-    /// quality, and a small file that is entirely relevant should be read whole.
-    #[test]
-    fn navigation_discipline_never_forbids_broad_reads_or_argues_from_tokens() {
-        let prompt = PromptBuilder::new().build();
-        for banned in [
-            "never read the whole file",
-            "avoid reading whole files",
-            "save tokens",
-            "minimize reads",
-            "as few reads as possible",
-        ] {
-            assert!(
-                !prompt.to_lowercase().contains(banned),
-                "navigation guidance must not contain {banned:?}"
-            );
-        }
-        // And it must say so positively.
-        assert!(
-            prompt.contains("Broader reads are correct"),
-            "broad reading must stay explicitly valid: {prompt}"
-        );
-    }
 
     /// C2.3B §4 — a known location must not cost a ceremonial search. The
     /// guidance has to state the KNOWN case, or "search first" degrades into
-    /// "always search".
-    #[test]
-    fn navigation_discipline_allows_reading_directly_when_the_location_is_known() {
-        let prompt = PromptBuilder::new().build();
-        assert!(
-            prompt.contains("read it directly"),
-            "a named file/symbol must be readable without a ritual search: {prompt}"
-        );
-    }
 
     /// C2.3B §30 D/F — C2.3A's contract is untouched: the plan block may ask
     /// for a plan before *mutations*, but nothing in the prompt may frame
@@ -612,15 +558,6 @@ mod tests {
     }
 
     /// C2.3B §15 — the dual of "re-read when a recollection may be stale":
-    /// after a patch reports success, re-reading it to confirm is waste.
-    #[test]
-    fn navigation_discipline_covers_rereading_after_a_successful_patch() {
-        let prompt = PromptBuilder::new().build();
-        assert!(
-            prompt.contains("do not re-read it just to confirm"),
-            "{prompt}"
-        );
-    }
 
     /// Analysis/review answers must not promote "tests passed" into unearned
 

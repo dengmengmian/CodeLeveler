@@ -62,9 +62,7 @@ impl Tool for GrepTool {
     fn description(&self) -> &'static str {
         "Search files under the workspace root (relative path, or absolute under \
          the workspace / a `--readonly-root`) for a pattern. Returns matching \
-         lines as `path:line:text`. Uses ripgrep when available. The first \
-         thing to reach for when you do not yet know which file implements a \
-         behavior; each hit's line number is where to start reading."
+         lines as `path:line:text`. Uses ripgrep when available."
     }
 
     fn input_schema(&self) -> serde_json::Value {

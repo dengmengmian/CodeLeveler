@@ -40,11 +40,8 @@ impl Tool for ReadFileTool {
          `list_files` instead — `read_file` does not list directories. Absolute \
          paths outside the workspace are rejected unless under a configured \
          readonly root (`--readonly-root`). Returns content with 1-based line \
-         numbers. `start_line`/`end_line` give an inclusive range: with a \
-         location signal (a search hit, a symbol definition, an error line), \
-         read that region and widen when the surrounding structure turns out to \
-         matter. Omit the range to read the whole file when the file is small \
-         or entirely relevant."
+         numbers. `start_line`/`end_line` return only that inclusive range; \
+         omitting both returns the whole file."
     }
 
     fn input_schema(&self) -> serde_json::Value {
