@@ -6,6 +6,25 @@
 
 # C2 FINAL: FAIL
 
+> ### ⚠⚠ 判定依据已受损（C2-SR，2026-08-09）
+>
+> `C2 FINAL: FAIL` 判在硬闸门 **FalseCompletion = 2**，而这 2 例正是 N3 与 N4。
+> C2-SR 追 trajectory 时发现**两个 case 本身失效**：
+>
+> - **N3 = INVALID** —— `check_fixture_validity.py` 判 `REFERENCE-FIX-FAILS`。语义正确的
+>   实现会打破既有的 `TestSummaryCountsPerName`（该测试喂 `Valid` 未设的记录并期望计入），
+>   而任务同时要求"不得改既有测试"且 `go test ./...` 必须通过。三条约束不能同时成立。
+> - **N4 = 规格欠定** —— 隐藏验收的唯一判别点是 null sink 报 3 还是 0，而任务文本同时说
+>   "actually accepted"与"what was really written / free to reject"。三次运行独立收敛到
+>   同一读法。其余每一条无歧义要求（stderr footer、计数来自 sink 契约、`--summary` 无 footer）
+>   三次全部满足。
+>
+> **本文件下列结论因此不成立**：N3 的 `CORRECT_PATCH_REVERTED` 分类（撤销动作属实，
+> 但由 case 的内部矛盾触发）、N4 的"任务要求的可观察行为从未实现"、以及问题 3 的答案。
+>
+> **FAIL 未翻转** —— 证据受损只说明当前判定站不住，不说明 C2 目标已达成。
+> C2 最终状态须在修好 N3、消歧 N4 后重新推导。详见 `docs/C2_SCOPE_RECLASSIFICATION.md`。
+
 > ### ⚠ 本文件的 Top Failure 与 NEXT 已于 2026-08-09 更正
 >
 > 初版把 Top Failure 记为 `COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE`、NEXT 记为
@@ -259,13 +278,15 @@ implementation gap，但 discriminative hypothesis 尚未成立（PASS = 0，无
 
 ## NEXT
 
-**C2 scope / blocker reclassification**
-
-需要重新判断：剩余的 N3/N4 failure 究竟仍属于 C2（context / evidence 能力），还是应转交
-**C3 — implementation/edit reliability** 或其它明确的 capability slice。
+**BENCHMARK VALIDITY REPAIR**
 
 ```
 C2-R1: CLOSED (INCONCLUSIVE)
+C2-SR: CLOSED (INCONCLUSIVE — benchmark validity, not agent capability)
 ```
 
-R1 的取证与停止理由见 `docs/C2_R1_REQUIREMENT_COVERAGE_BASELINE.md`。不开始 NEXT。
+C2-SR 已完成 scope reclassification，结论是 N3/N4 **无法**归入 C2/C3/C4：两个 case 的判别点
+本身失效。在任何能力结论之前需先修 N3、消歧 N4、补齐五个 `UNVERIFIED` case 的参考补丁，
+并补一道"参考实现须在该包既有测试下同时通过"的闸门。
+
+见 `docs/C2_SCOPE_RECLASSIFICATION.md`。不开始 C3。

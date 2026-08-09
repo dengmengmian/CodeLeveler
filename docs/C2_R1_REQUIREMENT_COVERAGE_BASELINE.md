@@ -2,9 +2,25 @@
 
 日期：2026-08-09。分支 `feat/coding-context-efficiency-c2`。模型 `deepseek/deepseek-v4-flash`。
 
-**结论前置：`C2-R1 = INCONCLUSIVE — insufficient PASS samples`。六次 replay 全部含有真实的
-implementation obligation gap，但因为本批没有任何 PASS run，数据只有一个 outcome class，
-无法判定 Implementation Coverage / Evidence Coverage 是否具备判别力。**
+**结论前置：`C2-R1 = INCONCLUSIVE — insufficient PASS samples`。因为本批没有任何 PASS run，
+数据只有一个 outcome class，无法判定 Implementation Coverage / Evidence Coverage 是否具备判别力。**
+
+> [!WARNING]
+> ## 两处记录已被 C2-SR 更正
+>
+> **1.「六次 FAIL 全部存在真实 implementation obligation gap」—— 撤销。**
+> C2-SR 追 trajectory 时发现两个 case 本身失效：N3 经 `check_fixture_validity.py` 判定
+> `INVALID`（语义正确的参考实现会打破既有的 `TestSummaryCountsPerName`，而任务同时要求
+> 不得改测试且 `go test ./...` 必须通过 —— 三条约束不能同时成立）；N4 的隐藏验收唯一
+> 判别点落在任务文本未消歧之处（null sink 该报 accepted=3 还是 written=0），而其余每一条
+> 无歧义要求三次运行都满足了。**因此本文的 obligation FAIL 计数不能读作 Agent 能力结论。**
+>
+> **2.「`session_id` 本轮只留存 2/6」—— 更正为 6/6 确定性可恢复。**
+> `~/.leveler/projects/` 的项目目录名内嵌完整 workspace 路径，每个 execution 一个目录、
+> 一条 session，无需任何推断。
+>
+> **R1 的 verdict 本身不变** —— 它取决于 PASS = 0，与 fixture 有效性无关。
+> 详见 `docs/C2_SCOPE_RECLASSIFICATION.md`。
 
 ## Baseline HEAD
 
@@ -207,10 +223,15 @@ FAIL = 6
 
 ## What Is Proven
 
-- 本批六次失败**全部含有真实的 implementation obligation gap** —— 它们不是"代码已经正确、
-  只是缺证据"。至少对这 6 个 session，最终实现本身不完整。
+> 本节第一条已被 C2-SR 撤销（见顶部横幅）：六次失败**不能**读作真实的 implementation gap，
+> 因为两个 case 的判别点本身失效。以下保留其余仍然成立的部分。
+
+- ~~本批六次失败全部含有真实的 implementation obligation gap。~~ **撤销**
 - Obligation-level oracle **能定位**整体隐藏验收 FAIL 内部究竟哪一条行为需求未满足
-  （N3 rep1：`distinct` 成立而 `summary` 不成立）。
+  （N3 rep1：`distinct` 成立而 `summary` 不成立）。该定位能力本身成立，与 case 是否有效无关。
+- **oracle 双向证明有一个已知盲区**：它用 `go test -run <单条 obligation 测试>`，不跑该包的
+  既有测试，因此无法发现"case 在其自身约束下不可满足"。N3 正是这样漏过去的。
+  证明 oracle 与证明 case 可满足**必须分开做**。
 - **Path Coverage 仍然不能代理 Implementation Obligation Coverage。** N3 在 clean baseline 上
   路径 2/2 touch、2/2 FullyRead、两文件均被修改，隐藏验收仍失败。
 
