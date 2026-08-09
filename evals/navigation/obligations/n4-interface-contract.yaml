@@ -1,0 +1,104 @@
+# C2-R1 obligation ground truth — METRICS ONLY. See n3 file header.
+#
+# N4's requirement has two independently-true-or-false parts: the sink must be
+# able to report what it accepted, and the command must print that count on
+# stderr when it is writing to a sink. A run can satisfy the first and miss the
+# second — which is what the control data shows.
+case: n4-interface-contract
+obligations:
+  - id: sink_reports_written_count
+    behavior: >
+      A sink can report how many records it accepted, and the count reflects
+      what the sink itself took rather than what the caller handed over.
+    behavioral_surface: sink implementation's own count accessor
+    source: user-stated
+    supporting_paths:
+      - internal/sink/sink.go
+      - internal/sink/stdout.go
+      - internal/sink/null.go
+    # Oracle drives the registry, not a named type, so any correct shape of the
+    # contract satisfies it. Uses reflection so the accessor may be named
+    # anything as long as it returns an integer count.
+    oracle: |
+      package sink
+
+      import (
+      	"reflect"
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func TestObligationSinkReportsWritten(t *testing.T) {
+      	for _, name := range []string{"null", "stdout"} {
+      		s, ok := For(name)
+      		if !ok {
+      			t.Fatalf("sink %q not registered", name)
+      		}
+      		batch := api.Batch{Records: []api.Record{
+      			{Name: "a", Value: 1}, {Name: "b", Value: 2}, {Name: "c", Value: 3},
+      		}}
+      		if err := s.Write(batch); err != nil {
+      			t.Fatalf("%s write: %v", name, err)
+      		}
+      		v := reflect.ValueOf(s)
+      		var got int64 = -1
+      		for i := 0; i < v.NumMethod(); i++ {
+      			m := v.Type().Method(i)
+      			mt := m.Type
+      			if mt.NumIn() != 1 || mt.NumOut() != 1 {
+      				continue
+      			}
+      			switch mt.Out(0).Kind() {
+      			case reflect.Int, reflect.Int64, reflect.Uint64, reflect.Uint, reflect.Int32, reflect.Uint32:
+      			default:
+      				continue
+      			}
+      			out := v.Method(i).Call(nil)[0]
+      			if out.CanInt() {
+      				got = out.Int()
+      			} else {
+      				got = int64(out.Uint())
+      			}
+      		}
+      		if got != 3 {
+      			t.Fatalf("sink %q reports %d written, want 3", name, got)
+      		}
+      		_ = s.Close()
+      	}
+      }
+    oracle_package: internal/sink
+    oracle_run: TestObligationSinkReportsWritten
+    evidence_surfaces:
+      - kind: package_test
+        package: internal/sink
+
+  - id: cli_prints_footer_on_stderr
+    behavior: >
+      When writing to a sink, the command ends with `wrote N records` on
+      stderr; in --summary mode it does not.
+    behavioral_surface: process stderr
+    source: user-stated
+    supporting_paths:
+      - cmd/navsvc/main.go
+    # Shell oracle: the behaviour is a process-level observation, so it is
+    # checked by running the built binary and separating the two streams.
+    oracle_shell: |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n4-ob.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\noutput.sink = null\n' > "$d/c.conf"
+      printf '{"name":"a","value":1}\n{"name":"b","value":2}\n{"name":"c","value":3}\n' > "$d/in.jsonl"
+      err="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" 2>&1 >/dev/null)"
+      printf '%s\n' "$err" | grep -qx 'wrote 3 records'
+      # summary mode must stay quiet
+      if < "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary 2>&1 >/dev/null | grep -q 'wrote'; then
+        exit 1
+      fi
+    evidence_surfaces:
+      # stdout alone cannot observe this: the control runs that failed watched
+      # exactly that and saw nothing wrong.
+      - kind: command_output
+        stream: stderr
+        must_match: "wrote"

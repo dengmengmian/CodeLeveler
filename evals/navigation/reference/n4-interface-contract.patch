@@ -118,15 +118,18 @@ index e787484..5205a2c 100644
 +
 +func (s *stdoutSink) RecordsWritten() int { return s.written }
 diff --git a/internal/testutil/fakesink.go b/internal/testutil/fakesink.go
-index b76b3ee..6a3bbbe 100644
+index 14620fc..4cb7407 100644
 --- a/internal/testutil/fakesink.go
 +++ b/internal/testutil/fakesink.go
-@@ -7,13 +7,17 @@ import "navsvc/pkg/api"
+@@ -10,6 +10,7 @@ import (
  type FakeSink struct {
  	Batches []api.Batch
  	Closed  bool
 +	written int
  }
+ 
+ // FakeSink must satisfy the sink contract, or tests would be asserting
+@@ -18,9 +19,12 @@ var _ sink.Sink = (*FakeSink)(nil)
  
  func (f *FakeSink) Write(batch api.Batch) error {
  	f.Batches = append(f.Batches, batch)
