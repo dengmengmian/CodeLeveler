@@ -932,6 +932,16 @@ async fn run_eval_case(
         repeated_search_queries: 0,
         first_relevant_file_round: None,
         first_plan_round: None,
+        relevant_paths_touched: 0,
+        relevant_paths_before_edit: 0,
+        impact_paths_touched: 0,
+        impact_paths_before_edit: 0,
+        distractor_paths_read: 0,
+        forbidden_paths_edited: 0,
+        broad_reads: 0,
+        narrow_reads: 0,
+        verification_driven_impact_discovery: false,
+        missed_impact_paths: Vec::new(),
         repair_attempts: 0,
         repair_success: None,
     };
@@ -992,6 +1002,15 @@ async fn run_eval_case(
         if let Some(base) = &case.base_ref {
             let _ = git(&["checkout", "--quiet", base]);
         }
+        // Drop the clone's origin. It points at the pristine fixture inside
+        // this repository, and a run that reads it can diff its way to the
+        // injected defect, or walk up to `evals/` and read the case file with
+        // its hidden relevant/impact/distractor paths. Observed: an N6 run
+        // followed exactly that path (`git remote -v` → `git -C <src> show` →
+        // `ls .../evals/`). `read_file` refuses paths outside the workspace;
+        // `shell_command` does not, so the breadcrumb has to go rather than
+        // the guard being trusted to hold.
+        let _ = git(&["remote", "remove", "origin"]);
         // Overlay the injected bug/failing test and commit it as the baseline.
         if let Err(e) = overlay_files(&dir) {
             return fail(e, leveler_eval::FailureCategory::Environment);
@@ -1201,6 +1220,9 @@ async fn run_eval_case(
     }
     // First-cause attribution receives the structured budget marker rather
     // than parsing a debug-formatted outcome note.
+    // Named before `finish` consumes the collector: a half-fix is only useful
+    // as a diagnosis if it says which path was missed.
+    let missed_impact_paths = collector.missed_impact_paths();
     let signals = collector.finish(termination == leveler_eval::TerminationClass::BudgetLimited);
     leveler_eval::CaseResult {
         id: case.id.clone(),
@@ -1247,6 +1269,16 @@ async fn run_eval_case(
         repeated_search_queries: signals.repeated_search_queries,
         first_relevant_file_round: signals.first_relevant_file_round,
         first_plan_round: signals.first_plan_round,
+        relevant_paths_touched: signals.relevant_paths_touched,
+        relevant_paths_before_edit: signals.relevant_paths_before_edit,
+        impact_paths_touched: signals.impact_paths_touched,
+        impact_paths_before_edit: signals.impact_paths_before_edit,
+        distractor_paths_read: signals.distractor_paths_read,
+        forbidden_paths_edited: signals.forbidden_paths_edited,
+        broad_reads: signals.broad_reads,
+        narrow_reads: signals.narrow_reads,
+        verification_driven_impact_discovery: signals.verification_driven_impact_discovery,
+        missed_impact_paths,
         repair_attempts,
         repair_success,
     }
@@ -1666,5 +1698,81 @@ mod attribution_provenance_tests {
             leveler_eval::attribute_failure(false, false, cause, &localization_shaped),
             Some(FailureCategory::ProviderProtocol)
         );
+    }
+
+    /// C2.3C §31 — a cloned workspace must not carry a path back to the
+    /// fixture it came from. An eval whose answer key is reachable from inside
+    /// the workspace measures the guard, not the agent.
+    #[test]
+    fn a_cloned_eval_workspace_keeps_no_pointer_to_its_source() {
+        let base = std::env::temp_dir().join(format!(
+            "leveler-eval-origin-{}",
+            std::process::id() as u64 * 31 + 7
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello\n").unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git")
+        };
+        run(&src, &["init", "-q"]);
+        run(&src, &["config", "user.email", "a@b"]);
+        run(&src, &["config", "user.name", "a"]);
+        run(&src, &["add", "-A"]);
+        run(&src, &["commit", "-qm", "seed"]);
+
+        std::process::Command::new("git")
+            .args(["clone", "--local", "--quiet"])
+            .arg(&src)
+            .arg(&dst)
+            .output()
+            .expect("clone");
+        let before = run(&dst, &["remote", "-v"]);
+        assert!(
+            String::from_utf8_lossy(&before.stdout).contains("src"),
+            "fixture precondition: a fresh clone names its origin"
+        );
+
+        // What the eval now does to it.
+        run(&dst, &["remote", "remove", "origin"]);
+
+        let after = run(&dst, &["remote", "-v"]);
+        assert!(
+            String::from_utf8_lossy(&after.stdout).trim().is_empty(),
+            "the workspace must not name its source: {}",
+            String::from_utf8_lossy(&after.stdout)
+        );
+        let config = std::fs::read_to_string(dst.join(".git/config")).unwrap();
+        assert!(
+            !config.contains(src.to_string_lossy().as_ref()),
+            "the source path must not survive in .git/config: {config}"
+        );
+
+        // C2.3C §15/§16 J — cutting the breadcrumb must not cut history. Real
+        // navigation uses `git log`/`show`/`blame` to ask why code looks the
+        // way it does; an anti-gaming fix that took those away would be
+        // measuring a crippled agent.
+        let log = run(&dst, &["log", "--oneline"]);
+        assert!(log.status.success(), "git log must still work");
+        assert!(
+            String::from_utf8_lossy(&log.stdout).contains("seed"),
+            "history must survive origin removal: {}",
+            String::from_utf8_lossy(&log.stdout)
+        );
+        let show = run(&dst, &["show", "HEAD:a.txt"]);
+        assert!(show.status.success(), "git show must still work");
+        assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "hello");
+        let blame = run(&dst, &["blame", "--porcelain", "a.txt"]);
+        assert!(blame.status.success(), "git blame must still work");
+        let status = run(&dst, &["status", "--porcelain"]);
+        assert!(status.status.success(), "git status must still work");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

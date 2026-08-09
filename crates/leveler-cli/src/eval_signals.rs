@@ -789,6 +789,32 @@ mod tests {
         assert_eq!(s.impact_paths_touched, 0);
     }
 
+    /// C2.3C §16 B — a partial read is still evidence. A run that read lines
+    /// 100-200 of the right file has learned something real about it, and the
+    /// path-touch metric says exactly that and no more: it never claims the
+    /// rest of the file was seen.
+    #[test]
+    fn a_successful_partial_read_counts_as_a_path_touch() {
+        let mut c = SignalCollector::with_navigation_paths(
+            vec!["internal/ingest/decoder.go".to_string()],
+            vec!["internal/ingest/decoder.go".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        ok_call(
+            &mut c,
+            "part",
+            "read_file",
+            serde_json::json!({"path": "internal/ingest/decoder.go", "start_line": 100, "end_line": 200}),
+        );
+        let s = c.finish(false);
+        assert_eq!(s.relevant_paths_touched, 1);
+        assert_eq!(s.impact_paths_touched, 1);
+        assert_eq!(s.narrow_reads, 1, "a ranged read is a narrow read");
+        assert_eq!(s.broad_reads, 0);
+    }
+
     /// C2.3C §37 I — looking at a distractor is normal navigation; editing a
     /// forbidden path is a localisation error. The two must never collapse
     /// into one number.

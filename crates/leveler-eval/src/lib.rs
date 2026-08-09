@@ -5,6 +5,8 @@
 //! runtime narrow the capability gap between models?
 #![forbid(unsafe_code)]
 
+pub mod read_coverage;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -277,6 +279,34 @@ pub struct CaseResult {
     pub first_relevant_file_round: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_plan_round: Option<u32>,
+    /// Navigation coverage (C2.3C). Counts, not paths: how many of the case's
+    /// metrics-only lists the run reached, and how many it had reached when it
+    /// committed to its first edit. Credited only from successful tool results.
+    #[serde(default)]
+    pub relevant_paths_touched: u32,
+    #[serde(default)]
+    pub relevant_paths_before_edit: u32,
+    #[serde(default)]
+    pub impact_paths_touched: u32,
+    #[serde(default)]
+    pub impact_paths_before_edit: u32,
+    /// Distractors looked at (diagnostic) versus forbidden paths modified
+    /// (a localisation error).
+    #[serde(default)]
+    pub distractor_paths_read: u32,
+    #[serde(default)]
+    pub forbidden_paths_edited: u32,
+    /// Reads that asked for no line range versus a bounded one.
+    #[serde(default)]
+    pub broad_reads: u32,
+    #[serde(default)]
+    pub narrow_reads: u32,
+    /// An impact path first reached only after a check had already failed.
+    #[serde(default)]
+    pub verification_driven_impact_discovery: bool,
+    /// Impact paths the run never reached, by name — the half-fix, named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missed_impact_paths: Vec<String>,
     /// Engine repair turns started (persisted `repair_started` events).
     #[serde(default)]
     pub repair_attempts: u32,
@@ -1152,10 +1182,18 @@ pub struct TrajectorySignals {
     /// existed. Taken from the tool call itself, never inferred from prose.
     pub first_plan_round: Option<u32>,
     /// How many of the case's `relevant_paths` / `required_impact_paths` the
-    /// run actually reached (read or edited). Coverage, not first contact: a
-    /// run that finds one of three and stops looks identical to a complete one
-    /// on `touched_relevant_files` alone. The path names themselves stay with
-    /// the collector so these signals remain a cheap `Copy` value.
+    /// run REACHED — a call naming that path returned successfully. Coverage,
+    /// not first contact: a run that finds one of three and stops looks
+    /// identical to a complete one on `touched_relevant_files` alone.
+    ///
+    /// **Path touch, not evidence coverage.** These count files the run got
+    /// *some* successful result for. They do not prove the returned text
+    /// contained the lines that matter: `read_file` with no range asks for the
+    /// whole file, and a byte ceiling can still return a prefix. Proving that
+    /// needs the returned range ([`read_coverage::returned_range`], which
+    /// requires the full result text) and, for evidence-level claims, a case
+    /// declaring which lines are the evidence. Report them under names that
+    /// say "touch".
     pub relevant_paths_touched: u32,
     pub impact_paths_touched: u32,
     /// Relevant / impact paths the run had already reached when it made its
@@ -1427,6 +1465,16 @@ mod tests {
             first_plan_round: None,
             repair_attempts: 0,
             repair_success: None,
+            relevant_paths_touched: 0,
+            relevant_paths_before_edit: 0,
+            impact_paths_touched: 0,
+            impact_paths_before_edit: 0,
+            distractor_paths_read: 0,
+            forbidden_paths_edited: 0,
+            broad_reads: 0,
+            narrow_reads: 0,
+            verification_driven_impact_discovery: false,
+            missed_impact_paths: Vec::new(),
         }
     }
 
@@ -2104,6 +2152,16 @@ mod tests {
             first_plan_round: None,
             repair_attempts: 0,
             repair_success: None,
+            relevant_paths_touched: 0,
+            relevant_paths_before_edit: 0,
+            impact_paths_touched: 0,
+            impact_paths_before_edit: 0,
+            distractor_paths_read: 0,
+            forbidden_paths_edited: 0,
+            broad_reads: 0,
+            narrow_reads: 0,
+            verification_driven_impact_discovery: false,
+            missed_impact_paths: Vec::new(),
         }
     }
 
@@ -2446,6 +2504,16 @@ expect: { program: cargo, args: [test] }
                 first_plan_round: None,
                 repair_attempts: 0,
                 repair_success: None,
+                relevant_paths_touched: 0,
+                relevant_paths_before_edit: 0,
+                impact_paths_touched: 0,
+                impact_paths_before_edit: 0,
+                distractor_paths_read: 0,
+                forbidden_paths_edited: 0,
+                broad_reads: 0,
+                narrow_reads: 0,
+                verification_driven_impact_discovery: false,
+                missed_impact_paths: Vec::new(),
             }
             .passed()
         );
@@ -2486,6 +2554,16 @@ expect: { program: cargo, args: [test] }
                 first_plan_round: None,
                 repair_attempts: 0,
                 repair_success: None,
+                relevant_paths_touched: 0,
+                relevant_paths_before_edit: 0,
+                impact_paths_touched: 0,
+                impact_paths_before_edit: 0,
+                distractor_paths_read: 0,
+                forbidden_paths_edited: 0,
+                broad_reads: 0,
+                narrow_reads: 0,
+                verification_driven_impact_discovery: false,
+                missed_impact_paths: Vec::new(),
             }
             .passed()
         );
