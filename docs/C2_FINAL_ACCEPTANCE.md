@@ -191,6 +191,12 @@ N3 两次 PASS 没有执行任何产物级 probe 却实现正确 —— 成功�
 **Implementation Obligation Coverage** 与 **Evidence Obligation Coverage**，
 找出哪一层能区分 PASS/FAIL，**不要预设答案是 evidence**。
 
+> **C2-R1 已就此取证，结论为 INCONCLUSIVE。** 六次 replay 的最终工作区逐条跑 obligation
+> oracle（4/4 双向证明、6/6 编译通过），确认**六次失败全部含有真实的 implementation
+> obligation gap** —— 不是"代码已正确、只是缺证据"。但该批 **PASS = 0**，只有单一 outcome
+> class，因此**无法**判定 Implementation Coverage / Evidence Coverage 是否具备判别力。
+> 详见 `docs/C2_R1_REQUIREMENT_COVERAGE_BASELINE.md`。
+
 ## False Completion
 
 **FalseCompletion = 2（N3、N4）。**
@@ -240,18 +246,26 @@ C1 的 `False Completion = 0` 是产品级硬不变量。C2 的干净 baseline �
 ```
 FALSIFIED:        COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE
 CURRENT BLOCKER:  REQUIREMENT_TO_EVIDENCE_ALIGNMENT
+                  (R1 established real implementation gaps,
+                   not a production discriminator)
+C2-R1:            INCONCLUSIVE — insufficient PASS samples
 ```
 
 `REQUIREMENT_TO_EVIDENCE_ALIGNMENT` 是**下一个研究问题**，不是已被证明的生产修复方案。
 
+**Top Failure 不改名为 `IMPLEMENTATION_COVERAGE_MISSING`** —— R1 确认了六次失败都存在真实的
+implementation gap，但 discriminative hypothesis 尚未成立（PASS = 0，无正类样本）。
+"每次失败都有实现缺口"不等于"实现缺口能区分成败"。
+
 ## NEXT
 
-**C2-R1 — Requirement Coverage & Evidence Alignment Baseline**（measurement-only）
+**C2 scope / blocker reclassification**
+
+需要重新判断：剩余的 N3/N4 failure 究竟仍属于 C2（context / evidence 能力），还是应转交
+**C3 — implementation/edit reliability** 或其它明确的 capability slice。
 
 ```
-STATUS: NOT STARTED
+C2-R1: CLOSED (INCONCLUSIVE)
 ```
 
-前置条件见 `docs/C2_COMPLETION_EVIDENCE_CONTROL_VARIANCE.md` §9。
-
-不开始 NEXT。
+R1 的取证与停止理由见 `docs/C2_R1_REQUIREMENT_COVERAGE_BASELINE.md`。不开始 NEXT。
