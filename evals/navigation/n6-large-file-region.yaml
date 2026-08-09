@@ -1,4 +1,10 @@
-# N6 — Large-file localisation. decoder.go is ~1030 lines. The live jsonl
+# N6 — Large-file localisation. Runs against `navsvc-n6`, the variant whose
+# jsonl decoder drops the `depth` field (see `--defect jsonl-depth`). The first
+# version of this case pointed at the healthy fixture, where the described
+# behaviour already worked: the hidden acceptance passed untouched and the case
+# measured nothing. `scripts/check_fixture_validity.py` now refuses that.
+#
+# decoder.go is ~1030 lines. The live jsonl
 # decoder sits near line 510, between 33 exporter-revision helpers before it
 # and 27 collector-normalisation helpers after it, all of which parse or trim
 # fields and none of which are on the path.
@@ -9,7 +15,7 @@
 # file is allowed and is not scored as an error.
 id: n6-large-file-region
 name: "[nav] JSON input never carries record depth"
-repo: fixtures/repos/navsvc
+repo: fixtures/repos/navsvc-n6
 max_rounds: 60
 relevant_paths:
   - internal/ingest/decoder.go

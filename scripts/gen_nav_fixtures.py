@@ -840,7 +840,14 @@ func run(args []string) error {
 }
 
 
-def large_decoder() -> str:
+# The defects a variant can carry. A navigation case that says "X is broken"
+# needs X to actually be broken; a fixture where the described behaviour
+# already works makes its hidden acceptance pass untouched and measures
+# nothing. Each defect is a named, minimal removal from the healthy source.
+DEFECTS = ("jsonl-depth",)
+
+
+def large_decoder(defect: str | None = None) -> str:
     """internal/ingest/decoder.go — a genuinely large file with the target in
     its middle, surrounded by plausible neighbours rather than filler."""
     head = '''package ingest
@@ -1007,7 +1014,28 @@ func (csvDecoder) DecodeLine(line []byte) (api.Record, bool) {
 	return record, true
 }
 ''')
-    return "".join(parts)
+    text = "".join(parts)
+
+    if defect == "jsonl-depth":
+        # The defect N6 describes: `depth` arrives in the JSON object and the
+        # decoder drops it on the floor, so every record downstream is depth 0
+        # and the flatten stage never has anything to clamp. Removing the case
+        # leaves it falling through to `default`, where it would land in
+        # Labels — so the key is skipped there too, which is what makes the
+        # symptom "always zero" rather than "shows up somewhere else".
+        depth_case = '''		case "depth":
+			depth, err := strconv.Atoi(value)
+			if err != nil {
+				continue
+			}
+			record.Depth = depth
+'''
+        assert depth_case in text, "healthy decoder must carry the depth case"
+        text = text.replace(depth_case, '''		case "depth":
+			// TODO(navsvc): wire this through once Record.Depth is used.
+			continue
+''', 1)
+    return text
 
 
 TESTS = {
@@ -1107,11 +1135,11 @@ func TestLoadRejectsUnknownKey(t *testing.T) {
 }
 
 
-def build(out: pathlib.Path) -> None:
+def build(out: pathlib.Path, defect: str | None = None) -> None:
     files: dict[str, str] = {"go.mod": go_mod()}
     for group in (CONFIG, API, INGEST, PIPELINE, SINK, REPORT, DISTRACTORS, CMD, TESTS):
         files.update(group)
-    files["internal/ingest/decoder.go"] = large_decoder()
+    files["internal/ingest/decoder.go"] = large_decoder(defect)
     files["README.md"] = (
         "# navsvc\n\n"
         "A small metrics ingestion service: read a stream, decode it, run the\n"
@@ -1136,6 +1164,11 @@ def build(out: pathlib.Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="fixtures/repos/navsvc")
+    ap.add_argument(
+        "--defect",
+        choices=DEFECTS,
+        help="generate the variant carrying this defect (for a bug-fix case)",
+    )
     ap.add_argument("--no-git", action="store_true")
     args = ap.parse_args()
 
@@ -1144,7 +1177,7 @@ def main() -> None:
         import shutil
 
         shutil.rmtree(out)
-    build(out)
+    build(out, args.defect)
 
     if not args.no_git:
         env = {

@@ -1,0 +1,18 @@
+diff --git a/internal/ingest/decoder.go b/internal/ingest/decoder.go
+index 6e57643..e3c7654 100644
+--- a/internal/ingest/decoder.go
++++ b/internal/ingest/decoder.go
+@@ -570,8 +570,11 @@ func (jsonlDecoder) DecodeLine(line []byte) (api.Record, bool) {
+ 			}
+ 			record.Value = parsed
+ 		case "depth":
+-			// TODO(navsvc): wire this through once Record.Depth is used.
+-			continue
++			depth, err := strconv.Atoi(value)
++			if err != nil {
++				continue
++			}
++			record.Depth = depth
+ 		default:
+ 			record.Labels[key] = value
+ 		}
