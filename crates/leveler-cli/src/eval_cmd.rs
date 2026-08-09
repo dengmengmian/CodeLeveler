@@ -541,6 +541,35 @@ fn scrub_command_env(command: &mut std::process::Command) {
 /// run is hours long; without it, an interrupt anywhere before the final write
 /// loses every completed case. The file is append-only and self-describing, so
 /// a killed run's cases can still be recovered and compared.
+/// Serial number for one `run_eval_case` invocation in this process.
+///
+/// Workspace identity has to be per *execution*, not per case: `compare` runs
+/// two models and `ablate` runs control and treatment, each calling `run_eval`
+/// again in the same process, so `case + pid + repetition` still collides.
+static EXECUTION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_execution_seq() -> u64 {
+    EXECUTION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Where one case execution does its work.
+///
+/// Every execution gets its own directory. The path used to be
+/// `<case>-<pid>`, and `run_eval_case` wipes its directory on entry, so three
+/// repetitions of a case in one process each deleted the previous one's tree —
+/// including under `LEVELER_EVAL_KEEP_WORKSPACE=1`, which only governs cleanup
+/// at the end. Nothing noticed while a run was scored by its exit status, and
+/// it becomes fatal the moment anything needs the tree a *particular* run left
+/// behind, which per-obligation implementation coverage does.
+///
+/// The case id and pid stay in the name because they are what a human looks
+/// for; `exec` and `r` are what make it unique.
+fn case_workspace(case_id: &str, pid: u32, execution: u64, repetition: u32) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "leveler-eval-{case_id}-{pid}-exec{execution}-r{repetition}"
+    ))
+}
+
 /// Put the answers out of reach of every command the agent can run.
 ///
 /// A benchmark keeps its answer key on the same machine as the thing it is
@@ -986,7 +1015,12 @@ async fn run_eval_case(
     //  - synthetic: an empty repo seeded entirely from `case.files`.
     //  - repo:      clone a real git repo, then overlay `case.files` on top so
     //               the agent must locate the relevant code in a full codebase.
-    let dir = std::env::temp_dir().join(format!("leveler-eval-{}-{}", case.id, std::process::id()));
+    let dir = case_workspace(
+        &case.id,
+        std::process::id(),
+        next_execution_seq(),
+        repetition,
+    );
     let _ = std::fs::remove_dir_all(&dir);
 
     let overlay_files = |dir: &std::path::Path| -> Result<(), String> {
@@ -1252,7 +1286,17 @@ async fn run_eval_case(
     if std::env::var_os("LEVELER_EVAL_KEEP_WORKSPACE").is_none() {
         let _ = std::fs::remove_dir_all(&dir);
     } else {
-        println!("  kept workspace: {}", dir.display());
+        // Deterministic mapping for offline analysis: a later scorer must never
+        // have to guess which directory belongs to which run.
+        println!(
+            "  kept workspace: case={} repetition={} session={} path={}",
+            case.id,
+            repetition,
+            session_id
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |s| s.to_string()),
+            dir.display()
+        );
     }
     // First-cause attribution receives the structured budget marker rather
     // than parsing a debug-formatted outcome note.
@@ -1627,6 +1671,7 @@ mod attribution_provenance_tests {
     //! `ProviderProtocol`. These lock the mapping trio + the attribution
     //! chain, all from typed errors — never vendor message text.
 
+    use super::{case_workspace, next_execution_seq};
     use leveler_eval::{FailureCategory, TerminationClass, TrajectorySignals};
     use leveler_model::{ModelError, ModelErrorKind};
 
@@ -1734,6 +1779,90 @@ mod attribution_provenance_tests {
             leveler_eval::attribute_failure(false, false, cause, &localization_shaped),
             Some(FailureCategory::ProviderProtocol)
         );
+    }
+
+    /// C2-R1 — one workspace per case *execution*, not per case.
+    ///
+    /// The path was `<case>-<pid>`, and `run_eval_case` wipes its directory on
+    /// entry, so three repetitions in one process each deleted the previous
+    /// one's tree — even under `LEVELER_EVAL_KEEP_WORKSPACE=1`, which only
+    /// governs cleanup at the end. Invisible while a run is scored by its exit
+    /// status; fatal as soon as anything needs the tree a particular run left
+    /// behind, which per-obligation implementation coverage does.
+    #[test]
+    fn repetitions_of_one_case_do_not_share_a_workspace() {
+        let paths: Vec<_> = (1..=3)
+            .map(|rep| case_workspace("n3-caller", 4242, 1, rep))
+            .collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "repetitions collided: {paths:?}");
+        for (rep, path) in (1..=3).zip(&paths) {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.contains("n3-caller"),
+                "case id must stay legible: {name}"
+            );
+            assert!(name.contains("4242"), "pid must stay legible: {name}");
+            assert!(
+                name.ends_with(&format!("-r{rep}")),
+                "repetition must be recoverable from the path: {name}"
+            );
+        }
+    }
+
+    /// `compare` runs two models and `ablate` runs control and treatment, each
+    /// re-entering `run_eval` in the same process. Keying on case + pid +
+    /// repetition would still collide there, which is why identity is per
+    /// execution.
+    #[test]
+    fn separate_run_invocations_do_not_share_a_workspace() {
+        assert_ne!(
+            case_workspace("n3-caller", 4242, 1, 1),
+            case_workspace("n3-caller", 4242, 2, 1),
+            "two run_eval invocations must not reuse one workspace"
+        );
+        assert_ne!(
+            case_workspace("n3-caller", 4242, 1, 1),
+            case_workspace("n4-contract", 4242, 1, 1)
+        );
+    }
+
+    /// The sequence is monotonic per process, so every execution gets a fresh
+    /// identity without call sites having to coordinate.
+    #[test]
+    fn execution_sequence_never_repeats() {
+        let seen: std::collections::HashSet<u64> = (0..8).map(|_| next_execution_seq()).collect();
+        assert_eq!(seen.len(), 8, "execution sequence handed out a duplicate");
+    }
+
+    /// The isolation is real on disk, not only in the name: a kept tree from
+    /// one execution must survive the next execution's entry wipe. This is the
+    /// exact behaviour that destroyed the first R1 replay's data.
+    #[test]
+    fn an_earlier_executions_kept_tree_survives_the_next_one() {
+        let first = case_workspace("iso-probe", std::process::id(), 901, 1);
+        let second = case_workspace("iso-probe", std::process::id(), 902, 2);
+        for path in [&first, &second] {
+            std::fs::remove_dir_all(path).ok();
+        }
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("final.txt"), "run one output\n").unwrap();
+
+        // What `run_eval_case` does on entry for the next execution.
+        let _ = std::fs::remove_dir_all(&second);
+        std::fs::create_dir_all(&second).unwrap();
+
+        assert!(
+            first.join("final.txt").exists(),
+            "the previous execution's kept tree was destroyed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("final.txt")).unwrap(),
+            "run one output\n"
+        );
+        for path in [&first, &second] {
+            std::fs::remove_dir_all(path).ok();
+        }
     }
 
     /// C2.3C §31 — a cloned workspace must not carry a path back to the
