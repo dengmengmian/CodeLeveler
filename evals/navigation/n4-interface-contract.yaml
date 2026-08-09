@@ -98,3 +98,26 @@ expect:
       go vet ./internal/testutil/ > /dev/null
       git diff --quiet -- legacy/
       go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNDER_SPECIFIED
+    critical_observable: >-
+      What a null sink reports as its accepted count.
+    oracle_interpretation: >-
+      A null sink fed 3 records must print `wrote 3 records`.
+    rationale: >-
+      The task says the count is what the sink "actually accepted", which reads
+      as 3, and in the same breath that a sink "is free to reject or coalesce"
+      and the footer reports "what was really written", which reads as 0 for a
+      sink that writes nowhere. Both are defensible and the hidden acceptance
+      silently picks one. The intended contract has since been decided
+      (accepted-count; a null sink accepts what it discards) but is NOT APPLIED
+      here — repairing the wording belongs to BV1.

@@ -93,3 +93,23 @@ expect:
       # the dead pre-1.0 package must be left alone
       git diff --quiet -- legacy/
       go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Which capitalisation the folded row is printed under.
+    oracle_interpretation: >-
+      The merged row prints as `requests` — lower-cased.
+    rationale: >-
+      The task alone does not say which casing wins, but the repository's own
+      maintained test TestNormalizeLowercasesNames asserts normalize yields
+      "requests". Since the task also requires `go test ./...` to pass, only the
+      lower-cased reading is consistent with the suite.

@@ -63,3 +63,24 @@ expect:
       [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/cap.conf" --summary | grep -c 'count=')" -eq 25 ]
       git diff --quiet -- legacy/
       go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      What `output.max_records = 0` means, and whether the cap can overshoot a
+      batch.
+    oracle_interpretation: >-
+      Zero means unlimited; the cap is exact regardless of batch size; --summary
+      is unaffected.
+    rationale: >-
+      The task states "absent or zero, behaviour is unchanged", "at most that
+      many", and that --summary does not write to a sink. All three assertions
+      are quoted requirements.

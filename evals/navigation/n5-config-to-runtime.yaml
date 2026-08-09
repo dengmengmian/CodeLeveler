@@ -66,3 +66,23 @@ expect:
       if < "$d/in.jsonl" "$d/navsvc" "$d/bad.conf" --summary > /dev/null 2>&1; then exit 1; fi
       git diff --quiet -- legacy/
       go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Whether the threshold applies only where filtering already runs, and how a
+      negative threshold is handled.
+    oracle_interpretation: >-
+      min_value drops records below it only when the filter stage is enabled; a
+      negative value makes the run exit non-zero.
+    rationale: >-
+      Both points are stated as explicit requirements in the task, including the
+      "a run that has not enabled filtering is unaffected" clause.

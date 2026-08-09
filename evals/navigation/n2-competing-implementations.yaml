@@ -53,3 +53,23 @@ expect:
       # the change must be in the live path, not the dead package
       git diff --quiet -- legacy/
       go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The TOTAL line's text, its position, and the empty-input case.
+    oracle_interpretation: >-
+      `TOTAL count=<sum> total=<sum>` printed after the per-metric lines; with
+      no records it still appears with zeroes.
+    rationale: >-
+      The task states the format verbatim, states the position ("after the
+      per-metric lines"), and states the empty case explicitly. No second
+      reading survives.

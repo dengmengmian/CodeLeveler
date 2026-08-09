@@ -118,3 +118,25 @@ expect:
       go test ./internal/ingest/ > /dev/null
       git diff --quiet -- legacy/
       go test ./internal/pipeline/ ./internal/report/ ./internal/config/ > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Whether a jsonl `depth` field reaches Record.Depth.
+    oracle_interpretation: >-
+      depth 3 decodes to Depth 3; a missing depth stays 0; a non-integer depth
+      keeps the record; depth does not also appear in Labels.
+    rationale: >-
+      The first three are stated in the task verbatim. The fourth is not stated,
+      but follows the decoder's own structure: recognised keys are special-cased
+      and only unrecognised keys fall through to Labels, and the broken variant
+      already keeps depth out of Labels. Noted as the one assertion a reader
+      must take from the code rather than the task.

@@ -56,3 +56,21 @@ expect:
       # the dead package and the example are not where this lives
       git diff --quiet -- legacy/ examples/
       go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The row name for an env-labelled record, and the sort order.
+    oracle_interpretation: >-
+      `<name>{env=<value>}`, rows sorted by the printed name.
+    rationale: >-
+      The task gives the exact row format and says rows stay sorted "by the name
+      they are printed under".

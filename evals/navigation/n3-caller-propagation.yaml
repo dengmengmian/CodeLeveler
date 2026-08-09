@@ -124,3 +124,24 @@ expect:
       go test ./internal/report/ > /dev/null
       git diff --quiet -- legacy/
       go test ./internal/pipeline/ ./internal/config/ > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Whether report.Distinct — not only the summary lines — skips invalid
+      records.
+    oracle_interpretation: >-
+      Distinct(batches) counts valid records only.
+    rationale: >-
+      The task says the rule "applies to everything the report package answers
+      about a set of batches, not only the per-metric summary lines", which
+      names the second consumer without ambiguity. This case's defect is not
+      semantic — see the maintained-checks gate.
