@@ -6,7 +6,16 @@
 
 # C2 FINAL: FAIL
 
-判在 §38 的硬闸门：**FalseCompletion = 2**。N3 与 N4 都宣布完成、引擎自验通过，而独立隐藏验收失败。
+> ### ⚠ 本文件的 Top Failure 与 NEXT 已于 2026-08-09 更正
+>
+> 初版把 Top Failure 记为 `COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE`、NEXT 记为
+> Completion Evidence Gate。随后的 N3/N4 **3×3 control variance 证伪了那个假设** ——
+> 失败的运行**持有**已执行的生产路径行为证据，而 N3 两次成功的运行**一次都没有**。
+> 详见 `docs/C2_COMPLETION_EVIDENCE_CONTROL_VARIANCE.md`。
+>
+> **`C2 FINAL: FAIL` 不变**，但失败的归因与下一步已经改变（见 §Final Verdict / §NEXT）。
+
+判在 §38 的硬闸门：**FalseCompletion = 2**（单次 clean baseline；3×3 control 中另计 3 次）。N3 与 N4 都宣布完成、引擎自验通过，而独立隐藏验收失败。
 
 按 §46，这是必须停下的情形 —— **未进入 PHASE D，未写一行 C2.3D 生产代码**。
 
@@ -119,28 +128,68 @@ Agent 的三个补丁只触及 `sink.go` / `file.go` / `main.go`，**没有任�
 | 任务要求的可观察行为 | **从未实现** |
 | 引擎自验 | PASS（新行为没有既有测试，build + 现有测试抓不到） |
 
-**分类：不是导航失败，也不是 `CORRECT_PATCH_REVERTED`**（无撤销、无目标转移）。它是**在需求未被满足的情况下宣布完成**。
+**分类：不是导航失败，也不是 `CORRECT_PATCH_REVERTED`**（无撤销、无目标转移）。
+
+> **更正（control variance 之后）**：初版把它描述为"在没有行为证据的情况下宣布完成"。
+> 3×3 control 显示 N4 的失败运行**都执行过产物二进制并观察了输出**（候选 2 / 3）。
+> 准确描述是：证据真实且执行正确，但**观察的是 stdout，而需求的 footer 在 stderr** ——
+> Requirement / Obligation Coverage mismatch，不是证据缺失。
 
 ## Top Failure Class
 
-N3 与 N4 的表层机制不同（一个撤销正确解、一个从未实现需求），但**结果同构**：
+### 初版结论（已撤销）
+
+初版把 N3 与 N4 归为同一个类别：
 
 ```
-证据完整（Target 8/8, Impact FullyRead 满）
-  → 引擎自验 PASS
-  → Agent 宣布完成
-  → 独立隐藏验收 FAIL
+TOP FAILURE CLASS: COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE
 ```
 
-**TOP FAILURE CLASS: `COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE`**
+理由是两者都"证据完整 → 引擎自验绿 → 宣布完成 → 隐藏验收失败"，因而推断 Agent 把
+"build + 既有测试通过"当成了需求已满足的证据。
 
-共同根因是**完成判定**，不是导航：Agent 把"构建通过 + 既有测试通过"当成了"需求已满足"的证据。对一个**新增行为**而言，既有测试天然无法证伪 —— 这正是 C1 的 verifier 设计边界。
+### 为什么撤销
 
-这也解释了为什么 `NAV_POST_LOCALIZATION_COMMITMENT` 不再是 Top-1：N6 撤销后它只剩 N3 一个证据点，而 N4 属于另一种机制。
+N3/N4 各 3 次 control variance（按 `session_id` 对齐）给出的行为证据计数：
 
-**因此 §18 进入 PHASE D 的条件不成立。** Evidence-to-Edit Commitment 只能覆盖 N3，覆盖不了 N4。硬上会重蹈 C2.3B 的覆辙 —— 针对一个未经证实的 Top-1 改生产。
+| Case | rep | 结果 | 行为证据候选 |
+| --- | ---: | --- | ---: |
+| N3 | 1 | PASS | **0** |
+| N3 | 2 | PASS | **0** |
+| N3 | 3 | FAIL | 3 |
+| N4 | 1 | FAIL | 2 |
+| N4 | 2 | FAIL | 3 |
+| N4 | 3 | PASS | 4 |
 
----
+**失败的运行并不缺行为证据 —— 它们构建二进制、喂输入、观察输出。而 N3 两次成功的运行
+一次都没有执行过产物。** Evidence Presence 对成败没有正判别力，在 N3 上方向相反。
+
+```
+COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE = FALSIFIED
+```
+
+**不得实现 Completion Evidence Presence Gate**：它会漏掉 N4 的两次失败（证据已存在
+且成功执行），并误触发 N3 的两次成功（无行为证据却做对了）。
+
+### 准确的根因
+
+两者都是 **Requirement / Obligation Coverage mismatch**，不是证据缺失：
+
+- **N3**：证据真实，但遗漏的 obligation（`report.Distinct`）**不经过所观察的 CLI surface**。
+- **N4**：证据真实且执行正确，但观察的是 **stdout**，而需求的 footer 在 **stderr**。
+
+### 另一条必须记录的边界
+
+**Path coverage 不能代理 obligation coverage。** N3 的 `required_impact_paths` 是
+2/2 touch、2/2 FullyRead、两个文件都被修改，最终仍因 `aggregate.go` 的 guard 被撤销
+而失败。`required_paths` 今后只能作为 supporting / diagnostic metadata。
+
+### 一个开放问题（不下结论）
+
+N3 两次 PASS 没有执行任何产物级 probe 却实现正确 —— 成功可能来自**实现本身覆盖了
+全部 obligation**，而非存在独立的行为证据。后续必须分别测量
+**Implementation Obligation Coverage** 与 **Evidence Obligation Coverage**，
+找出哪一层能区分 PASS/FAIL，**不要预设答案是 evidence**。
 
 ## False Completion
 
@@ -156,7 +205,8 @@ C1 的 `False Completion = 0` 是产品级硬不变量。C2 的干净 baseline �
 
 | 阶段 | 状态 | 原因 |
 | --- | --- | --- |
-| PHASE D — Evidence-to-Edit Treatment | **未执行** | §18 门槛不成立：Top-1 已变，且 N3/N4 机制不同。另外 §20 要求的 N3/N4 各 3 次 variance 也未跑 |
+| PHASE D — Evidence-to-Edit Treatment | **未执行** | §18 门槛不成立：Top-1 已变，且 N3/N4 机制不同 |
+| Completion Evidence Gate | **未实现，且不应实现** | N3/N4 各 3 次 variance 已跑完并证伪其前提（Evidence Presence 无判别力） |
 | PHASE E — Read Evidence Engineering | **未执行** | 停在 PHASE C |
 | PHASE F — C2 Final Regression | **未执行** | C1 代表集、yq、ripgrep 均未重跑 |
 | N1/N2/N3/N5/N7/N8 参考补丁 | 部分 | N3 缺参考补丁；其余五个由真实通过运行经验性验证 |
@@ -175,7 +225,7 @@ C1 的 `False Completion = 0` 是产品级硬不变量。C2 的干净 baseline �
 
 **2. 能不能找到明显影响面、避免 half-fix？** —— **能找到。** Required Impact Path Touch 8/8，FullyRead 18/19（1 条 PARTIAL 是 N6 对大文件的区间读取，属正确行为）。MissedImpactPaths = 0。**但"找到"不等于"落实"** —— 见问题 3。
 
-**3. 拿到正确证据后能不能稳定落实成 final edit？** —— **不能。** 8 个 case 中 2 个失败，且都在证据完整之后：N3 撤销了正确补丁，N4 从未实现所要求的行为。两者都宣布了完成。
+**3. 拿到正确证据后能不能稳定落实成 final edit？** —— **不能，但原因不是初版写的那个。** 8 个 case 中 2 个失败，且都在定位与影响面完整之后。3×3 control 进一步显示：失败运行**持有**已执行的生产路径证据，而 N3 两次成功的运行**一次都没有**。真正的缺口是**证据与需求的对应关系**（N3 漏了不经 CLI 的 `Distinct`；N4 观察 stdout 而需求在 stderr），不是证据的有无。这一层目前**无法测量** —— 见 `docs/C2_COMPLETION_EVIDENCE_CONTROL_VARIANCE.md`。
 
 **4. read evidence 是否存在 blocking correctness hole？** —— **未知。** PHASE E 未执行。已知的相关事实是覆盖率语义已收口（失败读取不计证据、截断不误算整读），但未做行业对照与完整审计。
 
@@ -187,12 +237,21 @@ C1 的 `False Completion = 0` 是产品级硬不变量。C2 的干净 baseline �
 
 # C2 FINAL: FAIL
 
-**TOP FAILURE CLASS: `COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE`**
+```
+FALSIFIED:        COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE
+CURRENT BLOCKER:  REQUIREMENT_TO_EVIDENCE_ALIGNMENT
+```
+
+`REQUIREMENT_TO_EVIDENCE_ALIGNMENT` 是**下一个研究问题**，不是已被证明的生产修复方案。
 
 ## NEXT
 
-**一个由证据决定的 C2 blocker：Completion Evidence Gate** —— Agent 在宣布完成前，必须持有该次任务**所要求的行为**本身的证据，而不是"构建通过 + 既有测试通过"。N3 与 N4 都会被这条挡住，且它不需要触碰导航、read_file、compaction 或 verifier 语义。
+**C2-R1 — Requirement Coverage & Evidence Alignment Baseline**（measurement-only）
 
-**在实施前必须先做**（吸取 C2.2/C2.3B/N6 的教训）：N3 与 N4 各 3 次 control variance，确认失败可复现且频率足够支撑因果实验。
+```
+STATUS: NOT STARTED
+```
+
+前置条件见 `docs/C2_COMPLETION_EVIDENCE_CONTROL_VARIANCE.md` §9。
 
 不开始 NEXT。
