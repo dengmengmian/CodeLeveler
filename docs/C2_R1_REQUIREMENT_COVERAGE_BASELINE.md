@@ -279,6 +279,17 @@ Discriminative Power      INCONCLUSIVE
 C2-R1: INCONCLUSIVE — insufficient PASS samples
 ```
 
+判别问题无法回答的完整原因（第一条为本轮结论，后两条由 C2-SR 补充）：
+
+```
+- PASS = 0                          单一 outcome class，判别力在数学上不可计算
+- N3 INVALID / UNSATISFIABLE        隐藏验收与任务约束不能同时成立
+- N4 SEMANTICALLY UNDER-SPECIFIED   唯一判别点落在任务文本未消歧之处
+```
+
+**不因 benchmark 缺陷把 R1 改写成 FAIL** —— 判别问题本来就没有被回答出来，
+新增的两条只是让"为什么没回答出来"更完整。
+
 > All six observed FAIL runs contain genuine unsatisfied implementation obligations.
 > However, because this replay produced zero PASS runs, the dataset contains only one
 > outcome class and cannot establish whether Implementation Coverage, Evidence Coverage,

@@ -4,7 +4,19 @@
 
 ## Executive Verdict
 
-# C2 FINAL: FAIL
+# C2 PRODUCT VERDICT: NOT CURRENTLY ADJUDICABLE
+
+```
+Reason: BENCHMARK VALIDITY BLOCKER
+
+Localization / Impact measurements:
+  historically promising, but final acceptance must wait for valid N1-N8 cases.
+```
+
+> **原判 `C2 FINAL: FAIL` 已于 2026-08-09 撤下** —— 不是改判 PASS，而是当前不可裁决。
+> 该判定建立在硬闸门 FalseCompletion = 2 上，而这 2 例（N3、N4）的 case 本身失效，
+> 至少有一部分"失败"来自尺子而非产品。维持 FAIL 会把尺子的缺陷算到产品头上。
+> 全文以下内容保留为**历史判定记录**，其中依赖 N3/N4 隐藏验收的结论均不再成立。
 
 > ### ⚠⚠ 判定依据已受损（C2-SR，2026-08-09）
 >
@@ -282,11 +294,13 @@ implementation gap，但 discriminative hypothesis 尚未成立（PASS = 0，无
 
 ```
 C2-R1: CLOSED (INCONCLUSIVE)
-C2-SR: CLOSED (INCONCLUSIVE — benchmark validity, not agent capability)
+C2-SR: ABORTED / NOT CLASSIFIABLE — benchmark validity not established
+NEXT:  C2-BV — Benchmark Validity Repair
 ```
 
-C2-SR 已完成 scope reclassification，结论是 N3/N4 **无法**归入 C2/C3/C4：两个 case 的判别点
-本身失效。在任何能力结论之前需先修 N3、消歧 N4、补齐五个 `UNVERIFIED` case 的参考补丁，
-并补一道"参考实现须在该包既有测试下同时通过"的闸门。
+C2-SR 中止而非得出结论：不是数据太少，是尺子失效，分类在修好 benchmark 之前无法进行。
+C2-BV 要把 case validity 从两项升级为六项合取（broken FAIL、reference 满足完整任务、
+既有测试通过、隐藏验收通过、显式约束被尊重、需求语义无歧义），并把 N1–N8 全部补齐 ——
+`reference PASS` 必须指完整 case PASS，不是单条 oracle PASS。
 
-见 `docs/C2_SCOPE_RECLASSIFICATION.md`。不开始 C3。
+见 `docs/C2_SCOPE_RECLASSIFICATION.md`。不开始 C2-BV，不开始 C3。

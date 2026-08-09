@@ -225,8 +225,15 @@ new contract"* 在最终汇报中消失了。
 ## Stage Boundary Decision
 
 ```
-DECISION E — INCONCLUSIVE
+C2-SR: ABORTED / NOT CLASSIFIABLE
+
+Reason: BENCHMARK VALIDITY NOT ESTABLISHED
 ```
+
+分类阶段**中止**而非得出"证据不足"的结论 —— 差别在于：不是数据太少，而是**尺子失效**，
+分类工作在修好 benchmark 之前无法进行。
+
+**现在不能拿 N3/N4 给产品能力分层。**
 
 不选 `TRANSFER_TO_C3`：没有任何一次失败能被归到 implementation/edit 机制 —— N3 的偏差由
 case 的内部矛盾驱动，N4 的偏差由规格欠定驱动。**在无效证据上转阶段，会把 C3 建立在一个
@@ -241,14 +248,23 @@ case 的内部矛盾驱动，N4 的偏差由规格欠定驱动。**在无效证�
 ## C2 Status
 
 ```
-C2 FINAL: FAIL —— 判定依据已受损，未翻转
+C2 PRODUCT VERDICT: NOT CURRENTLY ADJUDICABLE
+
+Reason: BENCHMARK VALIDITY BLOCKER
 ```
 
-`C2 FINAL: FAIL` 判在 §38 硬闸门 **FalseCompletion = 2**，而这 2 例正是 N3 与 N4。
+原判 `C2 FINAL: FAIL` 建立在 §38 硬闸门 **FalseCompletion = 2** 上，而这 2 例正是 N3 与 N4。
 N3 的隐藏验收现已判定不可满足，其 FalseCompletion 标签不成立；N4 的判别点欠定。
 
-**不单方面把 C2 改判 PASS** —— 那是过度伸张：证据受损只说明当前 FAIL 站不住，不说明
-C2 目标已达成。C2 的最终状态必须在修好 N3、消歧 N4 之后重新推导。
+**既不维持 FAIL，也不改判 PASS。** 维持 FAIL 会把尺子的缺陷算到产品头上；改判 PASS 是过度
+伸张 —— 证据受损只说明当前判定站不住，不说明 C2 目标已达成。准确的状态是**当前不可裁决**。
+
+Localization / Impact Discovery / Eval Integrity 的历史测量结果依然乐观
+（Target Recall 8/8、Impact Path Touch 8/8、`ForbiddenPathsEdited = 0`），
+但**最终验收必须等到 N1–N8 全部成为有效 case 之后**。
+
+Completion Evidence Presence 与 Path-Coverage-as-Proxy 两个假设仍然是 FALSIFIED ——
+它们的证伪不依赖 N3/N4 隐藏验收的正确性。
 
 保持不变的事实：Localization / Impact Discovery / Eval Integrity 三项 PASS；
 `ForbiddenPathsEdited = 0`；Completion Evidence Presence 与 Path-Coverage-as-Proxy 两个假设
@@ -278,20 +294,49 @@ NONE
 ## NEXT
 
 ```
-BENCHMARK VALIDITY REPAIR
+C2-BV — Benchmark Validity Repair
 ```
 
-在任何能力结论之前需要：
+这不是 Coding Agent 的产品工作，是 **Eval Integrity 的延伸**。
 
-1. 修 N3 —— 要么让既有测试与新需求相容，要么去掉"不得改既有测试"这条约束。
-   修复后必须过 `check_fixture_validity.py` 的**两个**方向。
-2. 消歧 N4 —— 任务文本必须明确 null sink 该报多少，否则把判别点从 null sink 移开。
-3. 补齐 N1/N2/N5/N7/N8 的参考补丁 —— 五个 case 目前仍是 `UNVERIFIED`（只验证了
-   fails-untouched 一半），与 N3 出问题前的状态完全相同。
-4. 补一道闸门：case 的隐藏验收必须在**该包既有测试**下与参考实现同时通过，
-   而不只是单条 obligation 测试通过。
+### Case Validity 的定义必须升级
 
-**不在此处开始 C3，也不开始上述修复。**
+现有闸门只验证两点，**不足以**防住 N3 这类缺陷：
+
+```
+untouched  → FAIL
+reference  → hidden oracle PASS
+```
+
+必须升级为六项合取：
+
+```
+Case Validity =
+      Broken State Demonstrably Fails
+  AND Reference Solution Satisfies Full Task
+  AND Maintained Repository Tests Pass
+  AND Hidden Acceptance Passes
+  AND Explicit Task Constraints Are Respected
+  AND Requirement Semantics Are Unambiguous
+```
+
+N3 恰恰卡在第 3 与第 5 项（参考实现打破既有测试 ⊕ 任务禁止改测试），N4 卡在第 6 项。
+**`reference PASS` 必须指完整 case PASS，不是单条 oracle PASS。**
+
+### 范围
+
+1. **N3 satisfiability repair** —— 修 fixture 本身，让既有测试的"正常记录"显式带
+   `Valid: true`。既有测试仍在、仍禁止 Agent 改测试，但不再与新 contract 冲突。
+2. **N4 semantic disambiguation** —— 二选一写死，不保留当前的模糊表达：
+   - 若 intended contract 是"Sink 接受的数量"，任务文本须明写
+     *"A null sink still accepts the records even though it discards their output"*，
+     此时 oracle 取 `3` 才合法；
+   - 若是"真实产生输出的数量"，则把 oracle 改成 null sink = 0。
+3. **N1–N8 全部补齐双向 validity** —— N1/N2/N5/N7/N8 目前只有 `untouched FAIL`，
+   与 N3 出事前的状态完全相同。**当前 C2 的 6/8 baseline 尚不能作为 stage acceptance 依据。**
+4. **Tripwire** —— 把上述六项做成硬闸门，防止同类事故第四次发生。
+
+**不在此处开始 C2-BV，也不开始 C3。**
 
 ```
 C3: NOT STARTED
