@@ -2,6 +2,47 @@
 
 日期：2026-08-09。分支 `feat/coding-context-efficiency-c2`。**纯审计，未改动生产代码。**
 
+> [!WARNING]
+> ## Historical Architecture Audit — Treatment Hypothesis Superseded
+>
+> 本文档的**架构审计事实仍然有效**，包括：
+>
+> - 当前 completion path 不区分 `verification succeeded` 与 `requested behavior demonstrated`
+> - `VerificationReport` 没有 requirement coverage / relevance 语义
+> - `ScopePolicy::{Exact,Auto}` 表达 verification authority，而非 requirement coverage
+> - generic repository gates 无法保证新增需求已经满足
+>
+> 但本文档基于这些事实提出的后续方向：
+>
+> `存在已执行的 targeted behavioral evidence → completion eligibility`
+>
+> 已被后续 N3/N4 3×3 Control Variance **证伪**。实测（按 `session_id` 对齐）：
+>
+> | Case | rep | 结果 | behavioral evidence candidates |
+> | --- | ---: | --- | ---: |
+> | N3 | 1 | PASS | **0** |
+> | N3 | 2 | PASS | **0** |
+> | N3 | 3 | FAIL | 3 |
+> | N4 | 1 | FAIL | 2 |
+> | N4 | 2 | FAIL | 3 |
+> | N4 | 3 | PASS | 4 |
+>
+> 因此：
+>
+> **Evidence Presence ≠ Requirement Coverage**
+>
+> 本文档只作为 **PHASE B architecture snapshot** 保留，不再作为
+> Completion Evidence Gate 的设计依据。
+>
+> 当前 authoritative conclusion：
+>
+> - `COMPLETION_WITHOUT_BEHAVIORAL_EVIDENCE = FALSIFIED`
+> - `CURRENT BLOCKER = REQUIREMENT_TO_EVIDENCE_ALIGNMENT`
+> - `C2-R1 = NOT STARTED`
+>
+> 见 `docs/C2_COMPLETION_EVIDENCE_CONTROL_VARIANCE.md` 与
+> `docs/C2_FINAL_ACCEPTANCE.md`。
+
 ---
 
 ## 1. 追踪结果：谁允许 "generic green" 变成 "task done"
@@ -57,6 +98,10 @@ match health.verdict() {
 ---
 
 ## 3. 最重要的发现：这是一个有实测依据的刻意决定
+
+> **Historical hypothesis:** 本节关于"存在 targeted evidence 即可提高 completion 门槛"的设计方向，
+> 已被后续 3×3 Control Variance 证伪；以下内容保留用于解释当时的推导过程，不代表当前设计结论。
+> 本节引用的 ESM 历史案例与"不得重新引入模型自拟 acceptance 作为 verdict 输入"这一约束**仍然有效**。
 
 `verifier/outcome.rs` 的模块文档原文：
 
@@ -125,10 +170,16 @@ Completed
 
 **共同点：通过的检查与任务要求的行为之间没有交集，而系统无法察觉这一点。**
 
+> **更正（3×3 Control 之后）**：本节写于假设"失败源于缺少行为证据"时。Control 数据显示，
+> N4 的失败运行**确实构建并运行了产物、观察了输出**（候选 2 / 3），只是观察的是 stdout 而
+> 需求的 footer 在 stderr；N3 的失败运行同样跑过 CLI，漏的是不经该 surface 的 `report.Distinct`。
+> 所以准确说法不是"Agent 从未取证"，而是**取到的证据与需求不对应**。
+> 本节关于 `gate_plan → 通用检查 → Verified` 这条链路的描述仍然成立。
+
 ---
 
 ## 6. 本审计未做的事
 
 - 未改动任何生产代码。
 - 未修改 verifier 语义、C1.2 的显式验证权威、或 `CompletionVerdict` 的取值。
-- 未实现 Completion Evidence Gate —— 按 PHASE A 的门槛，先等 N3/N4 control variance。
+- 未实现 Completion Evidence Gate —— 按 PHASE A 的门槛先等 control variance；variance 完成后该方向已被证伪，**不应实现**。
