@@ -38,7 +38,10 @@ import tempfile
 
 import yaml
 
-OBLIGATIONS_DIR = "evals/navigation/obligations"
+# Obligation files are benchmark-author metadata, not eval cases. They live
+# outside `evals/` because EvaluationCase::load_dir walks that tree recursively
+# and requires every *.yaml below it to parse as a case.
+OBLIGATIONS_DIR = "fixtures/navigation-obligations"
 CASES_DIR = "evals/navigation"
 REFERENCE_DIR = "evals/navigation/reference"
 

@@ -130,6 +130,38 @@ case 侧新增 `validity:` metadata（`maintained_checks` / `constraints` /
 
 实测 **7/7 通过**。
 
+### Loader Compatibility —— 以及它立刻抓到的一个真实破坏
+
+新增的 `validity:` metadata 必须对真实 Eval loader 透明。这一点**不接受静态推断**
+（"`EvaluationCase` 没有 `deny_unknown_fields`，所以应该会忽略"），而是跑真实 loader：
+
+`crates/leveler-eval/src/lib.rs::navigation_cases_still_load_with_benchmark_validity_metadata`
+用 `EvaluationCase::load_dir` 加载 `evals/navigation`，断言 8 个 case 全部到齐且
+`task` / `expect` / navigation metadata 未受影响；再用 `EvaluationCase::load` 加载一个
+只带 `validity:` 的最小 case。
+
+**这条测试一加上就红了，而且不是因为 `validity:`。**
+
+`EvaluationCase::load_dir` **递归**遍历目录，并要求其下**每个** `.yaml` 都解析成合法 case。
+`f8b83ea` 把 obligation metadata 放在 `evals/navigation/obligations/`，于是全树加载直接失败：
+
+```
+Parse("missing field `id` at line 11 column 1")
+```
+
+受影响的既有测试有两个 —— `scenario_suite_parses_and_ids_are_unique_across_the_tree` 与
+`root_suite_is_recursive_and_covers_all_first_class_languages`。**它们从 `f8b83ea` 起就是红的，
+并且已经推到 origin**：那次提交只跑了 Python 侧的 oracle 证明，没有跑 `cargo test`。
+
+修复：obligation 文件不是 eval case，移出 case 树到 `fixtures/navigation-obligations/`
+（`scripts/check_obligation_oracles.py` 的 `OBLIGATIONS_DIR` 同步更新）。
+修复后 `cargo test -p leveler-eval --lib` **58 passed / 0 failed**，
+4 条 obligation oracle 在新路径仍全部 PROVEN。
+
+> 这正是本阶段的论点自证一次：**静态推断不是证据。** 我原本准备以
+> "serde 结构上会忽略未知字段"结案，而真实 loader 一跑就暴露了一个与该推断无关、
+> 但已经影响 origin 的破坏。
+
 ## N1-N8 Pre-Repair Matrix
 
 ```
@@ -230,7 +262,13 @@ NONE
 ```
 
 未改动 leveler-agent、Verifier、Runtime、ToolHost、navigation、`read_file`、
-compaction、provider、completion 逻辑。本阶段也未改 N3 fixture、N4 task/expect/reference，
+compaction、provider、completion 逻辑。
+
+Eval 侧的改动有三处，都不属于 Agent 产品行为：case 的 `validity:` metadata、
+`crates/leveler-eval` 里新增的 loader regression（**仅测试**，`EvaluationCase` 本身未改）、
+以及把 obligation metadata 移出 case 树。工作区闸门：`cargo fmt --check` ✅ ·
+`cargo check --workspace --all-targets` ✅ 0 error / 0 warning ·
+`cargo test -p leveler-eval --lib` ✅ 58 passed / 0 failed。本阶段也未改 N3 fixture、N4 task/expect/reference，
 未新增任何 reference patch。**未运行任何模型。**
 
 ## NEXT

@@ -2421,6 +2421,50 @@ expect: { program: cargo, args: [test] }
     }
 
     #[test]
+    fn navigation_cases_still_load_with_benchmark_validity_metadata() {
+        // Every navigation case carries a `validity:` block describing what the
+        // case discriminates on, so the offline preflight can refuse a case that
+        // cannot be passed or that admits two readings. It is benchmark-author
+        // metadata and must stay invisible here: the loader has to keep reading
+        // these cases exactly as before. Asserting that from the serde
+        // attributes alone is not enough — this runs the real loader.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/navigation");
+        let cases = EvaluationCase::load_dir(&root).expect("evals/navigation must parse");
+        assert_eq!(cases.len(), 8, "navigation suite is N1-N8");
+        for case in &cases {
+            assert!(!case.task.trim().is_empty(), "{} lost its task", case.id);
+            assert!(
+                !case.expect.program.is_empty(),
+                "{} lost its expect command",
+                case.id
+            );
+            assert!(
+                !case.relevant_paths.is_empty(),
+                "{} lost its navigation metadata",
+                case.id
+            );
+        }
+
+        // An unknown top-level key is ignored rather than rejected, so a case
+        // that carries nothing but validity metadata still loads.
+        let probe = std::env::temp_dir().join(format!(
+            "leveler-validity-probe-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &probe,
+            "id: probe\nname: probe\ntask: do something\n\
+             validity:\n  semantics:\n    status: UNAMBIGUOUS\n\
+             expect:\n  program: \"true\"\n",
+        )
+        .expect("write probe case");
+        let loaded = EvaluationCase::load(&probe).expect("a case with validity metadata must load");
+        let _ = std::fs::remove_file(&probe);
+        assert_eq!(loaded.id, "probe");
+        assert_eq!(loaded.expect.program, "true");
+    }
+
+    #[test]
     fn scenario_suite_parses_and_ids_are_unique_across_the_tree() {
         // Scenario cases (evals/scenarios/**) must parse under the same schema
         // and never collide with an id anywhere else in the tree — a duplicate
