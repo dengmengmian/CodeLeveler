@@ -38,35 +38,35 @@ pub(crate) struct PlanGate {
     pub(crate) required: bool,
     /// A structured plan already exists.
     pub(crate) plan_started: bool,
-    /// Read-only exploration rounds already spent before the plan.
-    pub(crate) explore_rounds_used: u32,
-    pub(crate) explore_rounds_allowed: u32,
-    /// Whether `tool` is one of the read-only explore tools.
+    /// Whether `tool` is one of the read-only explore / navigation tools.
     pub(crate) tool_is_explore: bool,
     /// Whether `tool` is exempt outright (planning itself, and the two ways to
     /// ask the human something — a gate must never mute those).
     pub(crate) tool_is_exempt: bool,
 }
 
+/// Product gate for multi-step work that expects a structured plan.
+///
+/// C2.3A invariant: a missing plan may still block *mutations*, but it must
+/// never deny Search / Read / Symbol / Reference (or other explore tools).
+/// Plan is an execution aid, not a license to navigate code.
 pub(crate) fn plan_gate(facts: &PlanGate) -> GateVerdict {
     if !facts.required || facts.plan_started || facts.tool_is_exempt {
         return GateVerdict::Allow;
     }
-    let explore_budget_left = facts.explore_rounds_used < facts.explore_rounds_allowed;
-    if facts.tool_is_explore && explore_budget_left {
+    // Navigation stays open without a plan. Soft plan nudges live in the drive
+    // loop and never strip tools or force ToolChoice.
+    if facts.tool_is_explore {
         return GateVerdict::Allow;
     }
-    GateVerdict::Refuse(if explore_budget_left {
+    GateVerdict::Refuse(
         "This task has multiple independently verifiable steps. Call \
          update_plan first with one in_progress step and the remaining \
          steps pending; a prose checklist does not satisfy the plan gate. \
-         Read-only explore tools (read/grep/list/search) are allowed before the plan."
-            .to_string()
-    } else {
-        "Explore budget used. Call update_plan with one in_progress step \
-         and remaining steps pending before any further tools."
-            .to_string()
-    })
+         Read-only navigation tools (read/grep/list/search/symbol/refs) \
+         remain available while you gather evidence."
+            .to_string(),
+    )
 }
 
 /// Consecutive-search cap: act on what you already found (spec §17).
@@ -103,12 +103,10 @@ pub(crate) fn loop_guard(tool: &str, repeats: u32) -> GateVerdict {
 mod tests {
     use super::*;
 
-    fn facts(_tool: &str, explore: bool, used: u32) -> PlanGate {
+    fn facts(explore: bool) -> PlanGate {
         PlanGate {
             required: true,
             plan_started: false,
-            explore_rounds_used: used,
-            explore_rounds_allowed: 2,
             tool_is_explore: explore,
             tool_is_exempt: false,
         }
@@ -116,37 +114,41 @@ mod tests {
 
     #[test]
     fn the_plan_gate_is_silent_when_not_required() {
-        let mut f = facts("apply_patch", false, 0);
+        let mut f = facts(false);
         f.required = false;
         assert_eq!(plan_gate(&f), GateVerdict::Allow);
     }
 
     #[test]
     fn the_plan_gate_is_silent_once_a_plan_exists() {
-        let mut f = facts("apply_patch", false, 0);
+        let mut f = facts(false);
         f.plan_started = true;
         assert_eq!(plan_gate(&f), GateVerdict::Allow);
     }
 
     #[test]
     fn a_write_before_the_plan_is_refused_with_a_next_step() {
-        let verdict = plan_gate(&facts("apply_patch", false, 0));
+        let verdict = plan_gate(&facts(false));
         match verdict {
             GateVerdict::Refuse(msg) => {
                 assert!(
                     msg.contains("update_plan"),
                     "the refusal must say what to do: {msg}"
                 );
+                assert!(
+                    msg.contains("navigation") || msg.contains("remain available"),
+                    "refusal must leave navigation open in the message: {msg}"
+                );
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
+    /// C2.3A: missing plan never blocks read/search/symbol-class tools, no
+    /// matter how many explore rounds already ran.
     #[test]
-    fn reading_is_allowed_while_explore_budget_remains_then_refused() {
-        assert_eq!(plan_gate(&facts("read_file", true, 0)), GateVerdict::Allow);
-        assert_eq!(plan_gate(&facts("read_file", true, 1)), GateVerdict::Allow);
-        assert!(plan_gate(&facts("read_file", true, 2)).refused());
+    fn navigation_stays_open_without_a_plan() {
+        assert_eq!(plan_gate(&facts(true)), GateVerdict::Allow);
     }
 
     /// A gate must never be able to silence the ways of asking the human, or a
@@ -154,7 +156,7 @@ mod tests {
     #[test]
     fn asking_the_user_is_never_gated() {
         for tool in ["update_plan", "ask_user", "request_user_input"] {
-            let mut f = facts(tool, false, 99);
+            let mut f = facts(false);
             f.tool_is_exempt = true;
             assert_eq!(
                 plan_gate(&f),

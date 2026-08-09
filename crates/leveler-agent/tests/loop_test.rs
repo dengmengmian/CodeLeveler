@@ -4325,10 +4325,13 @@ async fn complex_task_allows_readonly_explore_before_plan() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// C2.3A: after the old explore-budget threshold, the model keeps the full
+/// navigation tool table and Auto tool choice. A soft plan nudge may appear
+/// once; continuing to read is legal; voluntary update_plan still works.
 #[tokio::test]
-async fn exhausted_plan_explore_budget_restricts_the_next_request_until_plan_succeeds() {
+async fn past_explore_threshold_navigation_tools_stay_available_with_soft_plan_nudge() {
     let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-plan-repair-{}",
+        "leveler-agent-plan-nudge-{}",
         std::process::id() as u64 * 31 + 53
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -4339,8 +4342,9 @@ async fn exhausted_plan_explore_budget_restricts_the_next_request_until_plan_suc
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "a.txt"})),
         assistant_tool_call("r2", "read_file", serde_json::json!({"path": "b.txt"})),
+        // Round 3: past the old PLAN_EXPLORE_ROUNDS=2 wall — still reading.
         assistant_tool_call("r3", "read_file", serde_json::json!({"path": "a.txt"})),
-        assistant_tool_call("r4", "read_file", serde_json::json!({"path": "b.txt"})),
+        assistant_tool_call("r4", "grep", serde_json::json!({"pattern": "a"})),
         assistant_tool_call(
             "p1",
             "update_plan",
@@ -4363,10 +4367,11 @@ async fn exhausted_plan_explore_budget_restricts_the_next_request_until_plan_suc
     )
     .with_structure(true);
 
+    let mut events = Vec::new();
     let outcome = executor
         .run(
             "1. inspect the implementation\n2. edit it\n3. verify the change",
-            &mut |_| {},
+            &mut |e| events.push(e),
             &mut NoopSink,
             CancellationToken::new(),
         )
@@ -4375,43 +4380,92 @@ async fn exhausted_plan_explore_budget_restricts_the_next_request_until_plan_suc
     assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
 
     let requests = runtime.recorded_requests();
-    assert_eq!(requests.len(), 6);
-    for repair in &requests[2..=4] {
-        assert_eq!(repair.tool_choice, ToolChoice::Tool("update_plan".into()));
+    assert!(
+        requests.len() >= 5,
+        "expected explore + plan + close rounds, got {}",
+        requests.len()
+    );
+
+    // Every request keeps Auto tool_choice and the full navigation surface —
+    // never tools=[update_plan] only.
+    for (i, req) in requests.iter().enumerate() {
         assert_eq!(
-            repair
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["update_plan"]
+            req.tool_choice,
+            ToolChoice::Auto,
+            "request {i} must not force update_plan: {req:?}"
+        );
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"read_file")
+                && names.contains(&"grep")
+                && names.contains(&"find_symbol")
+                && names.contains(&"find_references")
+                && names.contains(&"update_plan")
+                && names.contains(&"apply_patch"),
+            "request {i} must expose navigation + plan + edit tools, got {names:?}"
+        );
+        assert!(
+            names.len() > 1,
+            "request {i} must not collapse to only update_plan"
         );
     }
 
-    let after_plan = &requests[5];
-    assert_eq!(after_plan.tool_choice, ToolChoice::Auto);
-    assert!(
-        after_plan.tools.len() > requests[4].tools.len()
-            && after_plan.tools.iter().any(|tool| tool.name == "read_file")
-            && after_plan
-                .tools
+    // Soft plan nudge appears exactly once as a user message after the
+    // explore threshold (not as a forced tool round).
+    let nudge_hits: usize = requests
+        .iter()
+        .map(|req| {
+            req.messages
                 .iter()
-                .any(|tool| tool.name == "apply_patch"),
-        "full tool registry must be restored after a successful plan: {:?}",
-        after_plan
-            .tools
+                .filter(|m| {
+                    m.role == leveler_model::Role::User
+                        && m.text_content()
+                            .contains("continue exploring with search/read/symbol/reference")
+                })
+                .count()
+        })
+        .sum();
+    assert!(
+        nudge_hits >= 1,
+        "soft plan nudge must appear at least once in model-visible messages"
+    );
+
+    // Post-threshold reads and greps must succeed (not plan_gate denials).
+    let nav_ok = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolResult {
+                    id,
+                    is_error: false,
+                    ..
+                } if matches!(id.as_str(), "r3" | "r4")
+            )
+        })
+        .count();
+    assert_eq!(
+        nav_ok, 2,
+        "r3/r4 navigation after threshold must succeed: {events:?}"
+    );
+
+    // Voluntary update_plan still works.
+    assert!(
+        events
             .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
+            .any(|e| matches!(e, AgentEvent::PlanUpdated { .. })),
+        "voluntary update_plan must still advance plan state: {events:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// C2.3A: a text-only reply after explore rounds must NOT enter a forced
+/// update_plan repair loop. The drive may close normally (Answered).
 #[tokio::test]
-async fn plan_repair_text_only_response_is_retried_until_update_plan_succeeds() {
+async fn text_only_after_explore_does_not_force_plan_repair() {
     let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-plan-text-repair-{}",
+        "leveler-agent-plan-text-no-repair-{}",
         std::process::id() as u64 * 31 + 59
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -4422,19 +4476,7 @@ async fn plan_repair_text_only_response_is_retried_until_update_plan_succeeds() 
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "a.txt"})),
         assistant_tool_call("r2", "read_file", serde_json::json!({"path": "b.txt"})),
-        assistant_text("I have enough context and will proceed."),
-        assistant_tool_call(
-            "p1",
-            "update_plan",
-            serde_json::json!({
-                "plan": [
-                    {"step": "inspect", "status": "completed"},
-                    {"step": "edit", "status": "in_progress"},
-                    {"step": "verify", "status": "pending"}
-                ]
-            }),
-        ),
-        assistant_text("done"),
+        assistant_text("I have enough context to describe the code."),
     ]));
     let executor = Executor::new(
         runtime.clone(),
@@ -4455,22 +4497,25 @@ async fn plan_repair_text_only_response_is_retried_until_update_plan_succeeds() 
         .await
         .unwrap();
 
+    // Must not loop on forced plan repair: text-only ends the turn.
     assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
-    assert_eq!(outcome.rounds, 5);
+    assert!(
+        outcome.rounds <= 4,
+        "must not spin on plan repair; rounds={}",
+        outcome.rounds
+    );
     let requests = runtime.recorded_requests();
-    assert_eq!(
-        requests[2].tool_choice,
-        ToolChoice::Tool("update_plan".into())
-    );
-    assert_eq!(requests[2].tools.len(), 1);
-    assert_eq!(requests[2].tools[0].name, "update_plan");
-    assert_eq!(
-        requests[3].tool_choice,
-        ToolChoice::Tool("update_plan".into())
-    );
-    assert_eq!(requests[3].tools.len(), 1);
-    assert_eq!(requests[3].tools[0].name, "update_plan");
-    assert_eq!(requests[4].tool_choice, ToolChoice::Auto);
+    for (i, req) in requests.iter().enumerate() {
+        assert_eq!(req.tool_choice, ToolChoice::Auto, "request {i}");
+        assert!(
+            req.tools.iter().any(|t| t.name == "read_file"),
+            "request {i} must keep navigation tools"
+        );
+        assert!(
+            req.tools.len() > 1,
+            "request {i} must not be update_plan-only"
+        );
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }
