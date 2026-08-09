@@ -1,0 +1,141 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..1875cbe 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -75,6 +75,11 @@ func run(args []string) error {
+ 	}
+ 	if summarize {
+ 		fmt.Print(report.Aggregate(collected))
++		return nil
+ 	}
++	if err := out.Close(); err != nil {
++		return err
++	}
++	fmt.Fprintf(os.Stderr, "wrote %d records\n", out.RecordsWritten())
+ 	return nil
+ }
+diff --git a/internal/sink/file.go b/internal/sink/file.go
+index c99e2a6..c647928 100644
+--- a/internal/sink/file.go
++++ b/internal/sink/file.go
+@@ -9,14 +9,15 @@ import (
+ )
+ 
+ type fileSink struct {
+-	file *os.File
+-	out  *bufio.Writer
++	file    *os.File
++	out     *bufio.Writer
++	written int
+ }
+ 
+ func newFileSink() Sink {
+ 	f, err := os.CreateTemp("", "navsvc-*.out")
+ 	if err != nil {
+-		return nullSink{}
++		return &nullSink{}
+ 	}
+ 	return &fileSink{file: f, out: bufio.NewWriter(f)}
+ }
+@@ -26,6 +27,7 @@ func (s *fileSink) Write(batch api.Batch) error {
+ 		if _, err := fmt.Fprintln(s.out, api.Encode(record)); err != nil {
+ 			return err
+ 		}
++		s.written++
+ 	}
+ 	return nil
+ }
+@@ -36,3 +38,5 @@ func (s *fileSink) Close() error {
+ 	}
+ 	return s.file.Close()
+ }
++
++func (s *fileSink) RecordsWritten() int { return s.written }
+diff --git a/internal/sink/null.go b/internal/sink/null.go
+index d12665d..33871ac 100644
+--- a/internal/sink/null.go
++++ b/internal/sink/null.go
+@@ -3,7 +3,12 @@ package sink
+ import "navsvc/pkg/api"
+ 
+ // nullSink discards everything. Used by `output.sink = null` for dry runs.
+-type nullSink struct{}
++type nullSink struct{ written int }
+ 
+-func (nullSink) Write(api.Batch) error { return nil }
+-func (nullSink) Close() error          { return nil }
++func (s *nullSink) Write(b api.Batch) error {
++	s.written += len(b.Records)
++	return nil
++}
++
++func (s *nullSink) RecordsWritten() int { return s.written }
++func (s *nullSink) Close() error { return nil }
+diff --git a/internal/sink/sink.go b/internal/sink/sink.go
+index 30676be..51f0a32 100644
+--- a/internal/sink/sink.go
++++ b/internal/sink/sink.go
+@@ -10,6 +10,8 @@ import "navsvc/pkg/api"
+ type Sink interface {
+ 	Write(batch api.Batch) error
+ 	Close() error
++	// RecordsWritten reports how many records this sink accepted.
++	RecordsWritten() int
+ }
+ 
+ // For resolves a configured sink name to its implementation. Like stages,
+@@ -25,5 +27,5 @@ func For(name string) (Sink, bool) {
+ var sinks = map[string]func() Sink{
+ 	"stdout": func() Sink { return newStdoutSink() },
+ 	"file":   func() Sink { return newFileSink() },
+-	"null":   func() Sink { return nullSink{} },
++	"null":   func() Sink { return &nullSink{} },
+ }
+diff --git a/internal/sink/stdout.go b/internal/sink/stdout.go
+index e787484..5205a2c 100644
+--- a/internal/sink/stdout.go
++++ b/internal/sink/stdout.go
+@@ -9,7 +9,8 @@ import (
+ )
+ 
+ type stdoutSink struct {
+-	out *bufio.Writer
++	out     *bufio.Writer
++	written int
+ }
+ 
+ func newStdoutSink() Sink {
+@@ -21,8 +22,11 @@ func (s *stdoutSink) Write(batch api.Batch) error {
+ 		if _, err := fmt.Fprintln(s.out, api.Encode(record)); err != nil {
+ 			return err
+ 		}
++		s.written++
+ 	}
+ 	return nil
+ }
+ 
+ func (s *stdoutSink) Close() error { return s.out.Flush() }
++
++func (s *stdoutSink) RecordsWritten() int { return s.written }
+diff --git a/internal/testutil/fakesink.go b/internal/testutil/fakesink.go
+index b76b3ee..6a3bbbe 100644
+--- a/internal/testutil/fakesink.go
++++ b/internal/testutil/fakesink.go
+@@ -7,13 +7,17 @@ import "navsvc/pkg/api"
+ type FakeSink struct {
+ 	Batches []api.Batch
+ 	Closed  bool
++	written int
+ }
+ 
+ func (f *FakeSink) Write(batch api.Batch) error {
+ 	f.Batches = append(f.Batches, batch)
++	f.written += len(batch.Records)
+ 	return nil
+ }
+ 
++func (f *FakeSink) RecordsWritten() int { return f.written }
++
+ func (f *FakeSink) Close() error {
+ 	f.Closed = true
+ 	return nil
