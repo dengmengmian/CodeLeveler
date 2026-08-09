@@ -1,0 +1,100 @@
+# N4 — Interface / contract. Sink is an interface with three registered
+# implementations plus a test double. The task changes the contract, so the
+# work is finding every implementation — which the registry hides behind
+# constructor funcs, and which the test double satisfies structurally.
+#
+# Difficulty: `rg "Sink"` returns the interface, the registry, three impls, a
+# test double and main.go, without saying which of them must change. The
+# decision needs the interface's doc contract, not a name match.
+id: n4-interface-contract
+name: "[nav] sinks must report how much they wrote"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - internal/sink/sink.go
+required_impact_paths:
+  - internal/sink/sink.go
+  - internal/sink/stdout.go
+  - internal/sink/file.go
+  - internal/sink/null.go
+  - internal/testutil/fakesink.go
+distractor_paths:
+  - internal/report/summary.go
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+files:
+  internal/testutil/fakesink.go: |
+    package testutil
+
+    import (
+    	"navsvc/internal/sink"
+    	"navsvc/pkg/api"
+    )
+
+    // FakeSink records everything written to it, for tests that assert on
+    // output without touching the filesystem.
+    type FakeSink struct {
+    	Batches []api.Batch
+    	Closed  bool
+    }
+
+    // FakeSink must satisfy the sink contract, or tests would be asserting
+    // against something the service could never use.
+    var _ sink.Sink = (*FakeSink)(nil)
+
+    func (f *FakeSink) Write(batch api.Batch) error {
+    	f.Batches = append(f.Batches, batch)
+    	return nil
+    }
+
+    func (f *FakeSink) Close() error {
+    	f.Closed = true
+    	return nil
+    }
+task: |
+  Operators running `navsvc` in a pipe have no way to tell whether a run wrote
+  anything. We want the command to end with a one-line footer on stderr:
+
+      wrote N records
+
+  where N is the number of records the output sink actually accepted across
+  the whole run.
+
+  The count has to come from the sink itself rather than being recomputed by
+  the caller — a sink is free to reject or coalesce records, and the footer
+  must report what was really written.
+
+  This is a change to what a sink is, so make it part of the sink contract.
+  The footer appears only when the command is writing to a sink, not in
+  `--summary` mode.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n4.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\noutput.sink = null\n' > "$d/null.conf"
+      printf '{"name":"a","value":1}\n{"name":"b","value":2}\n{"name":"c","value":3}\n' > "$d/in.jsonl"
+      # the footer reports the sink's own count, on stderr, for a sink that
+      # writes nowhere
+      err="$(< "$d/in.jsonl" "$d/navsvc" "$d/null.conf" 2>&1 >/dev/null)"
+      printf '%s\n' "$err" | grep -qx 'wrote 3 records'
+      # stdout sink still writes its records, and reports the same count
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/out.conf"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/out.conf" 2>/dev/null)"
+      [ "$(printf '%s\n' "$out" | grep -c '=')" -eq 3 ]
+      err2="$(< "$d/in.jsonl" "$d/navsvc" "$d/out.conf" 2>&1 >/dev/null)"
+      printf '%s\n' "$err2" | grep -qx 'wrote 3 records'
+      # summary mode has no footer
+      < "$d/in.jsonl" "$d/navsvc" "$d/out.conf" --summary 2>&1 >/dev/null | grep -q 'wrote' && exit 1
+      # every implementation, including the test double, satisfies the contract
+      go build ./... > /dev/null
+      go vet ./internal/testutil/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null

@@ -1,0 +1,68 @@
+# N5 — Config to runtime. A new option has to travel definition → parse →
+# validate → runtime struct → the stage that acts on it → behaviour. Dropping
+# any middle link still compiles and still passes the existing tests; only the
+# end-to-end behaviour changes.
+#
+# Difficulty: four files in two packages, none of which the task names, and the
+# option's effect is applied by a registered stage rather than at a call site.
+id: n5-config-to-runtime
+name: "[nav] a minimum-value floor that reaches the pipeline"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - internal/config/config.go
+  - internal/pipeline/filter.go
+required_impact_paths:
+  - internal/config/config.go
+  - internal/config/load.go
+  - internal/config/validate.go
+  - internal/pipeline/filter.go
+distractor_paths:
+  - internal/config/defaults.go
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files: {}
+task: |
+  Users ingesting noisy exporters want to discard near-zero readings before
+  they reach the output.
+
+  Add a configuration option `pipeline.min_value`. When it is set, the
+  pipeline's existing filtering step also drops any record whose value is
+  below that threshold. When it is absent, behaviour is unchanged.
+
+  Requirements:
+
+  - Configuration files that do not mention it keep working exactly as today.
+  - A negative threshold is a configuration error, reported like other invalid
+    configuration is reported.
+  - The threshold only applies where record filtering already happens; a run
+    that has not enabled filtering is unaffected.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n5.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf '{"name":"lo","value":1}\n{"name":"hi","value":50}\n' > "$d/in.jsonl"
+      # threshold reaches the pipeline and drops the low reading
+      printf 'input.format = jsonl\npipeline.stages = filter\npipeline.drop_invalid = true\npipeline.min_value = 10\n' > "$d/on.conf"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/on.conf" --summary)"
+      printf '%s\n' "$out" | grep -qx 'hi count=1 total=50'
+      printf '%s\n' "$out" | grep -q 'lo ' && exit 1
+      # absent option: unchanged
+      printf 'input.format = jsonl\npipeline.stages = filter\npipeline.drop_invalid = true\n' > "$d/off.conf"
+      < "$d/in.jsonl" "$d/navsvc" "$d/off.conf" --summary | grep -qx 'lo count=1 total=1'
+      # filtering not enabled: unaffected even with a threshold set
+      printf 'input.format = jsonl\npipeline.stages = normalize\npipeline.min_value = 10\n' > "$d/nofilter.conf"
+      < "$d/in.jsonl" "$d/navsvc" "$d/nofilter.conf" --summary | grep -qx 'lo count=1 total=1'
+      # negative threshold is rejected like other bad configuration
+      printf 'input.format = jsonl\npipeline.min_value = -1\n' > "$d/bad.conf"
+      if < "$d/in.jsonl" "$d/navsvc" "$d/bad.conf" --summary > /dev/null 2>&1; then exit 1; fi
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null

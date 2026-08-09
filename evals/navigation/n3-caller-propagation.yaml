@@ -1,0 +1,126 @@
+# N3 — Caller propagation. The task changes what Summary.Observe counts.
+# report.Distinct answers a different question over the same records and has
+# to make the same decision, but it does not call Observe — so a fix that
+# only touches Observe still compiles and still passes the existing tests.
+#
+# Difficulty: nothing in the compiler or the current suite points at Distinct.
+# Finding it requires asking who else consumes Record.Valid, or who else the
+# command calls in internal/report.
+id: n3-caller-propagation
+name: "[nav] invalid records must not be counted anywhere"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - internal/report/summary.go
+required_impact_paths:
+  - internal/report/summary.go
+  - internal/report/aggregate.go
+distractor_paths:
+  - internal/pipeline/filter.go
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/report/aggregate.go: |
+    package report
+
+    import "navsvc/pkg/api"
+
+    // Aggregate is the entry point the command uses: it observes every batch
+    // and returns the rendered report.
+    func Aggregate(batches []api.Batch) string {
+    	summary := NewSummary()
+    	for _, batch := range batches {
+    		summary.Observe(batch)
+    	}
+    	return summary.Render()
+    }
+
+    // Distinct reports how many distinct names a set of batches contains.
+    // Used by the CLI's --names-only mode.
+    func Distinct(batches []api.Batch) int {
+    	seen := map[string]struct{}{}
+    	for _, batch := range batches {
+    		for _, record := range batch.Records {
+    			seen[record.Name] = struct{}{}
+    		}
+    	}
+    	return len(seen)
+    }
+  cmd/navsvc/names.go: |
+    package main
+
+    import (
+    	"fmt"
+
+    	"navsvc/internal/report"
+    	"navsvc/pkg/api"
+    )
+
+    // printNames backs the --names-only flag: how many distinct metric names
+    // the input carried.
+    func printNames(batches []api.Batch) {
+    	fmt.Printf("names=%d\n", report.Distinct(batches))
+    }
+task: |
+  A decoder marks a record `Valid = false` when it could read the record's
+  shape but not its contents — a metric line whose value column is garbage,
+  for example. Those records currently reach the report and are counted as if
+  they were real observations, which inflates every number we publish.
+
+  Reporting must ignore records that are not valid. This applies to everything
+  the report package answers about a set of batches, not only the per-metric
+  summary lines.
+
+  Note that the pipeline's `filter` stage is opt-in configuration and users
+  routinely run without it; reporting must be correct regardless.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n3.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      cat > "$d/n3_test.go" <<'GO'
+      package report
+
+      import (
+      	"strings"
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func batches() []api.Batch {
+      	return []api.Batch{{Records: []api.Record{
+      		{Name: "a", Value: 1, Valid: true},
+      		{Name: "a", Value: 99, Valid: false},
+      		{Name: "ghost", Value: 5, Valid: false},
+      	}}}
+      }
+
+      func TestSummarySkipsInvalid(t *testing.T) {
+      	out := Aggregate(batches())
+      	if !strings.Contains(out, "a count=1 total=1") {
+      		t.Fatalf("invalid record still counted: %q", out)
+      	}
+      	if strings.Contains(out, "ghost") {
+      		t.Fatalf("an entirely invalid name reached the report: %q", out)
+      	}
+      }
+
+      func TestDistinctSkipsInvalid(t *testing.T) {
+      	if got := Distinct(batches()); got != 1 {
+      		t.Fatalf("Distinct counted invalid records: want 1, got %d", got)
+      	}
+      }
+      GO
+      cp "$d/n3_test.go" internal/report/zz_hidden_n3_test.go
+      trap 'rm -f internal/report/zz_hidden_n3_test.go; rm -rf "$d"' EXIT
+      go build ./... > /dev/null
+      go test ./internal/report/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./internal/pipeline/ ./internal/config/ > /dev/null

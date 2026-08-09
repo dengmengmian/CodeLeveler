@@ -1,0 +1,65 @@
+# N7 — Cross-package. The change spans config (a new option), sink (the thing
+# that enforces it) and cmd (the wiring that hands it over). No single package
+# contains the answer, and the option reaches the sink through a registry that
+# currently constructs sinks with no arguments — so the seam has to be found,
+# not just filled in.
+#
+# Difficulty: the sink registry's `map[string]func() Sink` is the obstacle;
+# a naive change to one sink leaves the other two unable to receive the limit.
+id: n7-cross-package
+name: "[nav] a per-run output cap that reaches every sink"
+repo: fixtures/repos/navsvc
+max_rounds: 70
+relevant_paths:
+  - internal/sink/sink.go
+  - internal/config/config.go
+required_impact_paths:
+  - internal/config/config.go
+  - internal/config/load.go
+  - internal/sink/sink.go
+  - cmd/navsvc/main.go
+distractor_paths:
+  - internal/pipeline/filter.go
+  - internal/report/aggregate.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+  - legacy/oldpipeline.go
+files: {}
+task: |
+  When someone points `navsvc` at a huge file to see what is in it, they
+  currently have to kill it or pipe it through `head`.
+
+  Add a configuration option `output.max_records`. When set to a positive
+  number, the run writes at most that many records to the output and then
+  stops writing — it should not keep streaming into a sink that is being
+  ignored. When it is absent or zero, behaviour is unchanged.
+
+  The cap is about what reaches the output, so it must hold for every sink we
+  support, not just the default one. `--summary` mode does not write to a sink
+  and is not affected.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n7.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      : > "$d/in.jsonl"
+      for i in $(seq 1 25); do printf '{"name":"m%s","value":%s}\n' "$i" "$i" >> "$d/in.jsonl"; done
+      # cap applies to the default sink, and batching must not let it overshoot
+      printf 'input.format = jsonl\ninput.batch_size = 4\noutput.sink = stdout\noutput.max_records = 7\n' > "$d/cap.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/cap.conf" 2>/dev/null | grep -c '=')" -eq 7 ]
+      # absent: unchanged
+      printf 'input.format = jsonl\ninput.batch_size = 4\noutput.sink = stdout\n' > "$d/nocap.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/nocap.conf" 2>/dev/null | grep -c '=')" -eq 25 ]
+      # zero means unlimited, not "write nothing"
+      printf 'input.format = jsonl\noutput.sink = stdout\noutput.max_records = 0\n' > "$d/zero.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/zero.conf" 2>/dev/null | grep -c '=')" -eq 25 ]
+      # summary mode is untouched by the cap
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/cap.conf" --summary | grep -c 'count=')" -eq 25 ]
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
