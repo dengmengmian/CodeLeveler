@@ -350,6 +350,90 @@ pub fn expand_tool_category(registry: &mut ToolRegistry, category: &str) {
 }
 
 #[cfg(test)]
+mod c2_3b_navigation_contract {
+    //! C2.3B §30 E/G — the navigation guidance may clarify *when* to use a
+    //! tool; it may not change what the tool accepts or promise less than it
+    //! delivers.
+
+    /// G: schemas stay compatible. `read_file` still takes an optional
+    /// inclusive range, and no navigation wording added or removed a field.
+    #[test]
+    fn read_file_schema_is_unchanged_by_the_navigation_guidance() {
+        let registry = crate::full_registry();
+        let read = registry
+            .definitions()
+            .into_iter()
+            .find(|d| d.name == "read_file")
+            .expect("read_file registered");
+        let props = read.input_schema["properties"]
+            .as_object()
+            .expect("object schema");
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("start_line"));
+        assert!(props.contains_key("end_line"));
+        let required = read.input_schema["required"].as_array().expect("required");
+        assert_eq!(
+            required.len(),
+            1,
+            "only `path` may be required: {required:?}"
+        );
+        assert_eq!(required[0], "path");
+    }
+
+    /// E: `read_file`'s contract is a *range*, not a cap. The description must
+    /// keep whole-file reads available and must never argue from token cost —
+    /// C2.3B forbids turning navigation guidance into a budget lecture.
+    #[test]
+    fn read_file_description_keeps_whole_file_reads_available() {
+        let registry = crate::full_registry();
+        let read = registry
+            .definitions()
+            .into_iter()
+            .find(|d| d.name == "read_file")
+            .expect("read_file registered");
+        let text = read.description.to_lowercase();
+        assert!(
+            text.contains("omit the range to read the whole file"),
+            "reading a whole file must stay a stated option: {}",
+            read.description
+        );
+        for banned in ["token", "never read the whole", "avoid reading whole"] {
+            assert!(
+                !text.contains(banned),
+                "tool descriptions must not carry {banned:?}: {}",
+                read.description
+            );
+        }
+    }
+
+    /// The locate-first entry point has to be discoverable from the tool table
+    /// alone, not only from the system prompt.
+    #[test]
+    fn search_tools_say_what_they_are_for() {
+        let registry = crate::full_registry();
+        let by_name: std::collections::HashMap<_, _> = registry
+            .definitions()
+            .into_iter()
+            .map(|d| (d.name.clone(), d.description))
+            .collect();
+        assert!(
+            by_name["grep"].contains("do not yet know which file"),
+            "grep must name the unknown-location case: {}",
+            by_name["grep"]
+        );
+        assert!(
+            by_name["find_symbol"].contains("DEFINED"),
+            "find_symbol must stay distinguishable from grep"
+        );
+        assert!(
+            by_name["find_references"].contains("call sites"),
+            "find_references must stay the impact-surface tool: {}",
+            by_name["find_references"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
