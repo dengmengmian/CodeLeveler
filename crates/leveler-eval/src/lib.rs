@@ -57,6 +57,17 @@ pub struct EvaluationCase {
     /// a half-fix. Reading a path counts, and so does editing it.
     #[serde(default)]
     pub required_impact_paths: Vec<String>,
+    /// Paths that look like the answer but are not: a deprecated copy, an
+    /// example, a fixture, a same-named helper. METRICS ONLY. Reading one is
+    /// normal navigation — considering a candidate and ruling it out is what
+    /// good localisation looks like — so this is measured, never penalised.
+    #[serde(default)]
+    pub distractor_paths: Vec<String>,
+    /// Paths that a correct run must not modify. METRICS ONLY. Editing one is
+    /// a localisation error the hidden acceptance may or may not catch, and it
+    /// is reported either way.
+    #[serde(default)]
+    pub forbidden_edit_paths: Vec<String>,
     /// The engine terminal outcome this case requires (default: a verified
     /// completion). A weak-verification case whose CORRECT product semantics
     /// is `CompletedUnverified` declares that here — and is then also failed
@@ -65,6 +76,28 @@ pub struct EvaluationCase {
     pub expected_outcome: ExpectedOutcome,
     /// A command that must succeed for the case to pass (run in the repo).
     pub expect: ExpectCommand,
+}
+
+impl EvaluationCase {
+    /// Everything the agent is allowed to see about this case. The hidden
+    /// navigation metadata — relevant, impact, distractor and forbidden paths
+    /// — exists to score a run, and a run that could read it would be scoring
+    /// itself. Keeping the model-visible surface to one function makes that
+    /// checkable instead of assumed.
+    pub fn model_visible_input(&self) -> &str {
+        &self.task
+    }
+
+    /// Every hidden path this case declares, for leak checking.
+    pub fn hidden_metadata_paths(&self) -> Vec<&str> {
+        self.relevant_paths
+            .iter()
+            .chain(&self.required_impact_paths)
+            .chain(&self.distractor_paths)
+            .chain(&self.forbidden_edit_paths)
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// The engine terminal outcome a case expects. `Completed` is the default and
@@ -1125,6 +1158,18 @@ pub struct TrajectorySignals {
     /// the collector so these signals remain a cheap `Copy` value.
     pub relevant_paths_touched: u32,
     pub impact_paths_touched: u32,
+    /// Relevant / impact paths the run had already reached when it made its
+    /// first edit. Coverage *after* the fact can be verification-driven; this
+    /// is what it knew before it committed to a change.
+    pub relevant_paths_before_edit: u32,
+    pub impact_paths_before_edit: u32,
+    /// Distractors the run looked at, and forbidden paths it modified. The
+    /// first is diagnostic, the second is an error.
+    pub distractor_paths_read: u32,
+    pub forbidden_paths_edited: u32,
+    /// An impact path first reached only after a verification failure — the
+    /// run completed, but the compiler found the surface, not the navigation.
+    pub verification_driven_impact_discovery: bool,
     /// Reads that named no line range (whole-file intent) versus reads that
     /// asked for a bounded region. The ratio is the navigation shape: reading
     /// the right region, or reading the file and hoping.
@@ -1258,6 +1303,87 @@ pub enum EvalError {
     Io(String),
     #[error("parse error: {0}")]
     Parse(String),
+}
+
+#[cfg(test)]
+mod hidden_metadata_leakage {
+    //! C2.3C §37 A/B/C — the navigation metadata scores a run. A run that
+    //! could read it would be grading its own exam, and the whole suite would
+    //! measure nothing. One function defines what the agent may see; these
+    //! tests hold everything else outside it.
+
+    use super::*;
+
+    fn navigation_case() -> EvaluationCase {
+        EvaluationCase {
+            id: "n-leak".into(),
+            name: "leak probe".into(),
+            repo: None,
+            base_ref: None,
+            files: std::collections::BTreeMap::new(),
+            recovery: false,
+            task: "Counting a stream reports one document too few.".into(),
+            max_rounds: 10,
+            relevant_paths: vec!["ZZRELEVANTZZ/stream.go".into()],
+            required_impact_paths: vec!["ZZIMPACTZZ/consumer.go".into()],
+            distractor_paths: vec!["ZZDISTRACTORZZ/legacy.go".into()],
+            forbidden_edit_paths: vec!["ZZFORBIDDENZZ/generated.go".into()],
+            expected_outcome: ExpectedOutcome::default(),
+            expect: ExpectCommand {
+                program: "true".into(),
+                args: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn no_hidden_path_reaches_the_model_visible_input() {
+        let case = navigation_case();
+        let visible = case.model_visible_input();
+        for hidden in case.hidden_metadata_paths() {
+            assert!(
+                !visible.contains(hidden),
+                "hidden metadata leaked into the task text: {hidden}"
+            );
+        }
+        // And the sentinel families, in case a path is ever reformatted.
+        for marker in ["ZZRELEVANT", "ZZIMPACT", "ZZDISTRACTOR", "ZZFORBIDDEN"] {
+            assert!(!visible.contains(marker), "{marker} reached the agent");
+        }
+    }
+
+    /// The workspace the agent explores is built from `files` (and `repo`).
+    /// Hidden metadata must not create, name, or hint at a file.
+    #[test]
+    fn hidden_paths_do_not_materialize_into_the_workspace() {
+        let case = navigation_case();
+        for hidden in case.hidden_metadata_paths() {
+            assert!(
+                !case.files.contains_key(hidden),
+                "a hidden path must not be materialized by declaring it: {hidden}"
+            );
+        }
+    }
+
+    /// All four lists default to empty, so every existing case keeps parsing
+    /// and keeps meaning what it meant (§39).
+    #[test]
+    fn navigation_metadata_is_optional_for_existing_cases() {
+        let yaml = r#"
+id: legacy
+name: an older case
+task: do the thing
+expect:
+  program: "true"
+  args: []
+"#;
+        let case: EvaluationCase = serde_yaml::from_str(yaml).expect("legacy case still parses");
+        assert!(case.relevant_paths.is_empty());
+        assert!(case.required_impact_paths.is_empty());
+        assert!(case.distractor_paths.is_empty());
+        assert!(case.forbidden_edit_paths.is_empty());
+        assert_eq!(case.model_visible_input(), "do the thing");
+    }
 }
 
 #[cfg(test)]

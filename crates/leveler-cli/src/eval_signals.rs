@@ -8,7 +8,7 @@
 //! gap** between feedback events from the same stream, using wall-clock
 //! timestamps at observation time.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use leveler_agent::AgentEvent;
@@ -44,6 +44,21 @@ pub(crate) struct SignalCollector {
     /// diagnosed with.
     relevant_seen: HashSet<String>,
     impact_seen: HashSet<String>,
+    /// Distractors looked at, forbidden paths modified, and the snapshot of
+    /// coverage taken at the moment of the first edit.
+    distractor: Vec<String>,
+    forbidden: Vec<String>,
+    distractor_seen: HashSet<String>,
+    forbidden_edited: HashSet<String>,
+    coverage_at_first_edit: Option<(u32, u32)>,
+    /// Paths a call *named*, held until its result comes back. Evidence is
+    /// what a tool returned, not what it was asked for: a read that errored
+    /// leaves the agent exactly as blind as never calling it (§24).
+    pending_coverage: HashMap<String, (Vec<String>, Vec<String>, Vec<String>)>,
+    /// Set once a verification-class command has failed, so an impact path
+    /// first reached afterwards can be attributed to the compiler rather than
+    /// to navigation.
+    verification_failed: bool,
     /// Tool-call ids of verification-class `run_command`s, to mark
     /// `verification_ran` when one succeeds.
     verify_calls: HashSet<String>,
@@ -80,12 +95,29 @@ impl SignalCollector {
         relevant_paths: impl IntoIterator<Item = String>,
         impact_paths: impl IntoIterator<Item = String>,
     ) -> Self {
+        Self::with_navigation_paths(relevant_paths, impact_paths, Vec::new(), Vec::new())
+    }
+
+    /// The full metrics-only path model a navigation case declares.
+    pub(crate) fn with_navigation_paths(
+        relevant_paths: impl IntoIterator<Item = String>,
+        impact_paths: impl IntoIterator<Item = String>,
+        distractor_paths: impl IntoIterator<Item = String>,
+        forbidden_edit_paths: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self {
             signals: TrajectorySignals::default(),
             impact: impact_paths.into_iter().collect(),
             relevant: relevant_paths.into_iter().collect(),
             relevant_seen: HashSet::new(),
             impact_seen: HashSet::new(),
+            distractor: distractor_paths.into_iter().collect(),
+            forbidden: forbidden_edit_paths.into_iter().collect(),
+            distractor_seen: HashSet::new(),
+            forbidden_edited: HashSet::new(),
+            coverage_at_first_edit: None,
+            pending_coverage: HashMap::new(),
+            verification_failed: false,
             verify_calls: HashSet::new(),
             error_streak: None,
             started: Instant::now(),
@@ -166,15 +198,33 @@ impl SignalCollector {
                 // reads it or patches it. `arguments` is the raw JSON, so a
                 // path inside an apply_patch body counts the same as a
                 // `path` argument.
-                for path in &self.relevant {
-                    if arguments.contains(path.as_str()) {
-                        self.relevant_seen.insert(path.clone());
+                let named = |group: &Vec<String>| -> Vec<String> {
+                    group
+                        .iter()
+                        .filter(|p| arguments.contains(p.as_str()))
+                        .cloned()
+                        .collect()
+                };
+                self.pending_coverage.insert(
+                    id.clone(),
+                    (
+                        named(&self.relevant),
+                        named(&self.impact),
+                        named(&self.distractor),
+                    ),
+                );
+                if matches!(name.as_str(), "apply_patch" | "replace") {
+                    for path in &self.forbidden {
+                        if arguments.contains(path.as_str()) {
+                            self.forbidden_edited.insert(path.clone());
+                        }
                     }
-                }
-                for path in &self.impact {
-                    if arguments.contains(path.as_str()) {
-                        self.impact_seen.insert(path.clone());
-                    }
+                    // Freeze what the run knew when it first committed to a
+                    // change; anything after this is recovery, not planning.
+                    self.coverage_at_first_edit.get_or_insert((
+                        self.relevant_seen.len() as u32,
+                        self.impact_seen.len() as u32,
+                    ));
                 }
                 if !self.signals.touched_relevant_files
                     && self.relevant.iter().any(|p| arguments.contains(p.as_str()))
@@ -254,6 +304,9 @@ impl SignalCollector {
                     }
                 }
                 if *is_error {
+                    if self.verify_calls.contains(id) {
+                        self.verification_failed = true;
+                    }
                     if preview.contains(LOOP_GUARD_MARKER) {
                         self.signals.loop_guard_trips += 1;
                     }
@@ -271,6 +324,21 @@ impl SignalCollector {
                     if self.verify_calls.contains(id) {
                         self.signals.verification_ran = true;
                     }
+                }
+                // Coverage lands here, once, and only for a call that returned.
+                if let Some((relevant, impact, distractor)) = self.pending_coverage.remove(id)
+                    && !*is_error
+                {
+                    self.relevant_seen.extend(relevant);
+                    for path in impact {
+                        // An impact path first reached after a check already
+                        // failed was found by the compiler, not by navigation.
+                        if self.verification_failed && !self.impact_seen.contains(&path) {
+                            self.signals.verification_driven_impact_discovery = true;
+                        }
+                        self.impact_seen.insert(path);
+                    }
+                    self.distractor_seen.extend(distractor);
                 }
             }
             AgentEvent::Compacted { .. } => self.signals.compactions += 1,
@@ -318,11 +386,24 @@ impl SignalCollector {
         self.signals.context_overflow = context_overflow;
         self.signals.relevant_paths_touched = self.relevant_seen.len() as u32;
         self.signals.impact_paths_touched = self.impact_seen.len() as u32;
+        self.signals.distractor_paths_read = self.distractor_seen.len() as u32;
+        self.signals.forbidden_paths_edited = self.forbidden_edited.len() as u32;
+        let (relevant_before, impact_before) = self.coverage_at_first_edit.unwrap_or((
+            self.relevant_seen.len() as u32,
+            self.impact_seen.len() as u32,
+        ));
+        self.signals.relevant_paths_before_edit = relevant_before;
+        self.signals.impact_paths_before_edit = impact_before;
         self.signals
     }
 
     /// Impact-surface paths the run never reached. Empty is the good case; a
     /// non-empty list on a case the agent called done is the half-fix, named.
+    #[cfg(test)]
+    pub(crate) fn clone_signals(&self) -> TrajectorySignals {
+        self.signals
+    }
+
     pub(crate) fn missed_impact_paths(&self) -> Vec<String> {
         let mut missed: Vec<String> = self
             .impact
@@ -586,6 +667,19 @@ mod tests {
         assert_eq!(c.finish(false).first_relevant_file_round, Some(5));
     }
 
+    /// A tool call that returned successfully. Coverage is credited from the
+    /// result, so a test that only emits the call is modelling a call whose
+    /// outcome nobody ever saw.
+    fn ok_call(c: &mut SignalCollector, id: &str, name: &str, args: serde_json::Value) {
+        c.observe_agent(&call(id, name, args));
+        c.observe_agent(&AgentEvent::ToolResult {
+            id: id.to_string(),
+            name: name.to_string(),
+            is_error: false,
+            preview: "ok".to_string(),
+        });
+    }
+
     /// Coverage, not just first contact: the run's recall over the paths a
     /// correct fix has to reach. A run that finds one of three relevant files
     /// and stops has `touched_relevant_files = true` and is still two thirds
@@ -597,17 +691,19 @@ mod tests {
             vec!["cmd/root.go".to_string(), "pkg/yqlib/stream.go".to_string()],
         );
         c.observe_agent(&AgentEvent::StreamAttemptStarted);
-        c.observe_agent(&call(
+        ok_call(
+            &mut c,
             "c1",
             "read_file",
             serde_json::json!({"path": "cmd/root.go"}),
-        ));
+        );
         c.observe_agent(&AgentEvent::StreamAttemptStarted);
-        c.observe_agent(&call(
+        ok_call(
+            &mut c,
             "c2",
             "read_file",
             serde_json::json!({"path": "cmd/root.go"}),
-        ));
+        );
         assert_eq!(
             c.missed_impact_paths(),
             vec!["pkg/yqlib/stream.go".to_string()],
@@ -628,11 +724,12 @@ mod tests {
         let mut c =
             SignalCollector::with_paths(Vec::new(), vec!["internal/report/scan.go".to_string()]);
         c.observe_agent(&AgentEvent::StreamAttemptStarted);
-        c.observe_agent(&call(
+        ok_call(
+            &mut c,
             "e1",
             "apply_patch",
             serde_json::json!({"patch": "*** Update File: internal/report/scan.go"}),
-        ));
+        );
         assert!(c.missed_impact_paths().is_empty());
         assert_eq!(c.finish(false).impact_paths_touched, 1);
     }
@@ -658,6 +755,193 @@ mod tests {
         let s = c.finish(false);
         assert_eq!(s.broad_reads, 1);
         assert_eq!(s.narrow_reads, 2);
+    }
+
+    /// C2.3C §37 E — a read that came back as an error is not evidence. A run
+    /// that tried to open the right file and failed has not seen it, and a
+    /// coverage metric that counts the attempt would score blindness as
+    /// insight.
+    #[test]
+    fn a_failed_read_does_not_count_as_coverage() {
+        let mut c = SignalCollector::with_navigation_paths(
+            vec!["internal/dispatch/router.go".to_string()],
+            vec!["internal/dispatch/router.go".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call(
+            "miss",
+            "read_file",
+            serde_json::json!({"path": "internal/dispatch/router.go"}),
+        ));
+        c.observe_agent(&AgentEvent::ToolResult {
+            id: "miss".to_string(),
+            name: "read_file".to_string(),
+            is_error: true,
+            preview: "file not found: internal/dispatch/router.go".to_string(),
+        });
+        let s = c.finish(false);
+        assert_eq!(
+            s.relevant_paths_touched, 0,
+            "a failed read must not register as having reached the file"
+        );
+        assert_eq!(s.impact_paths_touched, 0);
+    }
+
+    /// C2.3C §37 I — looking at a distractor is normal navigation; editing a
+    /// forbidden path is a localisation error. The two must never collapse
+    /// into one number.
+    #[test]
+    fn reading_a_distractor_is_not_the_same_as_editing_a_forbidden_path() {
+        let mut c = SignalCollector::with_navigation_paths(
+            Vec::new(),
+            Vec::new(),
+            vec!["legacy/old_router.go".to_string()],
+            vec!["legacy/old_router.go".to_string()],
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        ok_call(
+            &mut c,
+            "look",
+            "read_file",
+            serde_json::json!({"path": "legacy/old_router.go"}),
+        );
+        let s = c.clone_signals();
+        assert_eq!(s.distractor_paths_read, 0, "counted at finish, not inline");
+
+        ok_call(
+            &mut c,
+            "peek",
+            "read_file",
+            serde_json::json!({"path": "legacy/old_router.go"}),
+        );
+        let s = c.finish(false);
+        assert_eq!(s.distractor_paths_read, 1, "a distinct distractor, read");
+        assert_eq!(
+            s.forbidden_paths_edited, 0,
+            "reading a forbidden path is exploration, not an error"
+        );
+    }
+
+    #[test]
+    fn editing_a_forbidden_path_is_recorded_as_an_error() {
+        let mut c = SignalCollector::with_navigation_paths(
+            Vec::new(),
+            Vec::new(),
+            vec!["legacy/old_router.go".to_string()],
+            vec!["legacy/old_router.go".to_string()],
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        ok_call(
+            &mut c,
+            "bad",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Update File: legacy/old_router.go"}),
+        );
+        assert_eq!(c.finish(false).forbidden_paths_edited, 1);
+    }
+
+    /// C2.3C §30 — completing a task after the compiler pointed at the missing
+    /// caller is a different capability from finding it first. The scorecard
+    /// has to be able to tell them apart.
+    #[test]
+    fn impact_found_only_after_a_failed_check_is_attributed_to_verification() {
+        let mut c = SignalCollector::with_navigation_paths(
+            Vec::new(),
+            vec!["internal/report/scan.go".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call(
+            "build",
+            "run_command",
+            serde_json::json!({"program": "go", "args": ["build", "./..."]}),
+        ));
+        c.observe_agent(&AgentEvent::ToolResult {
+            id: "build".to_string(),
+            name: "run_command".to_string(),
+            is_error: true,
+            preview: "scan.go:12: not enough arguments".to_string(),
+        });
+        ok_call(
+            &mut c,
+            "late",
+            "read_file",
+            serde_json::json!({"path": "internal/report/scan.go"}),
+        );
+        let s = c.finish(false);
+        assert_eq!(s.impact_paths_touched, 1);
+        assert!(
+            s.verification_driven_impact_discovery,
+            "the compiler found this surface, not the navigation"
+        );
+    }
+
+    /// The same path reached before any edit is navigation, not recovery.
+    #[test]
+    fn impact_found_before_the_first_check_is_not_verification_driven() {
+        let mut c = SignalCollector::with_navigation_paths(
+            Vec::new(),
+            vec!["internal/report/scan.go".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        ok_call(
+            &mut c,
+            "early",
+            "read_file",
+            serde_json::json!({"path": "internal/report/scan.go"}),
+        );
+        let s = c.finish(false);
+        assert_eq!(s.impact_paths_touched, 1);
+        assert!(!s.verification_driven_impact_discovery);
+    }
+
+    /// C2.3C §20 — coverage at the moment of the first edit, separate from
+    /// coverage at the end. A run that edits on one of three impact paths and
+    /// discovers the rest afterwards must not report as if it knew all three.
+    #[test]
+    fn coverage_before_the_first_edit_is_frozen_at_that_edit() {
+        let mut c = SignalCollector::with_navigation_paths(
+            Vec::new(),
+            vec!["a.go".to_string(), "b.go".to_string(), "c.go".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        ok_call(
+            &mut c,
+            "r1",
+            "read_file",
+            serde_json::json!({"path": "a.go"}),
+        );
+        ok_call(
+            &mut c,
+            "e1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Update File: a.go"}),
+        );
+        ok_call(
+            &mut c,
+            "r2",
+            "read_file",
+            serde_json::json!({"path": "b.go"}),
+        );
+        ok_call(
+            &mut c,
+            "r3",
+            "read_file",
+            serde_json::json!({"path": "c.go"}),
+        );
+        let s = c.finish(false);
+        assert_eq!(s.impact_paths_touched, 3, "all three reached eventually");
+        assert_eq!(
+            s.impact_paths_before_edit, 1,
+            "only one was known when it committed to the change"
+        );
     }
 
     /// Never reached: absent, never a fabricated round number.
