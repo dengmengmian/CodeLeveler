@@ -84,18 +84,9 @@ pub(crate) struct SignalCollector {
 }
 
 impl SignalCollector {
+    #[cfg(test)]
     pub(crate) fn new(relevant_paths: impl IntoIterator<Item = String>) -> Self {
-        Self::with_paths(relevant_paths, Vec::new())
-    }
-
-    /// Both metrics-only path sets: where the defect lives, and what a complete
-    /// change has to reach. Kept separate because a run can locate perfectly
-    /// and still half-fix.
-    pub(crate) fn with_paths(
-        relevant_paths: impl IntoIterator<Item = String>,
-        impact_paths: impl IntoIterator<Item = String>,
-    ) -> Self {
-        Self::with_navigation_paths(relevant_paths, impact_paths, Vec::new(), Vec::new())
+        Self::with_navigation_paths(relevant_paths, Vec::new(), Vec::new(), Vec::new())
     }
 
     /// The full metrics-only path model a navigation case declares.
@@ -686,9 +677,11 @@ mod tests {
     /// blind — that is exactly the half-fix this metric exists to expose.
     #[test]
     fn relevant_and_impact_coverage_are_tracked_per_path() {
-        let mut c = SignalCollector::with_paths(
+        let mut c = SignalCollector::with_navigation_paths(
             vec!["cmd/root.go".to_string(), "cmd/utils.go".to_string()],
             vec!["cmd/root.go".to_string(), "pkg/yqlib/stream.go".to_string()],
+            Vec::new(),
+            Vec::new(),
         );
         c.observe_agent(&AgentEvent::StreamAttemptStarted);
         ok_call(
@@ -721,8 +714,12 @@ mod tests {
     /// that patched a caller it found through a search has covered it.
     #[test]
     fn an_edit_covers_an_impact_path_too() {
-        let mut c =
-            SignalCollector::with_paths(Vec::new(), vec!["internal/report/scan.go".to_string()]);
+        let mut c = SignalCollector::with_navigation_paths(
+            Vec::new(),
+            vec!["internal/report/scan.go".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
         c.observe_agent(&AgentEvent::StreamAttemptStarted);
         ok_call(
             &mut c,

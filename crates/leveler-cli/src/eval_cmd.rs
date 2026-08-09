@@ -13,7 +13,7 @@ use leveler_model::{ModelRef, ModelRuntime};
 use leveler_project::Layout;
 
 use crate::cli::EvalCommand;
-use crate::common::{build_approver, resolve_model};
+use crate::common::resolve_model;
 use crate::output::Line;
 
 pub(crate) async fn cmd_eval(
@@ -541,6 +541,41 @@ fn scrub_command_env(command: &mut std::process::Command) {
 /// run is hours long; without it, an interrupt anywhere before the final write
 /// loses every completed case. The file is append-only and self-describing, so
 /// a killed run's cases can still be recovered and compared.
+/// Put the answers out of reach of every command the agent can run.
+///
+/// A benchmark keeps its answer key on the same machine as the thing it is
+/// grading: case definitions with their hidden relevant/impact paths, the
+/// hidden acceptance scripts, the pristine fixture a workspace was cloned
+/// from, and this run's own event log. `read_file` already refuses paths
+/// outside the workspace — but an eval run was observed reaching all of it
+/// with `cat`, `git -C`, `python3` and `sqlite3` after finding the host path,
+/// which is what a tool-layer guard cannot prevent.
+///
+/// So the boundary moves below the command, into the sandbox profile, where it
+/// is enforced on the resolved path and does not care which tool asked. The
+/// workspace, the toolchain and the scratch space are untouched; agents keep
+/// full `git log`/`show`/`blame`/`diff` and normal builds inside the clone.
+///
+/// Sealed once, before any case runs; every command built afterwards carries it.
+fn seal_eval_answer_keys() {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    // The repository this harness was launched from: cases, fixtures, hidden
+    // acceptance, and the source of the agent grading itself.
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    // Session/event storage — the run's own transcript, which carries the task,
+    // the tool history, and enough to reconstruct the setup. Sealed by the
+    // subdirectory, not by `~/.leveler` as a whole: the toolchain cache lives
+    // in that tree too, and sealing it stops `go build` from working at all.
+    if let Some(home) = std::env::var_os("HOME") {
+        let leveler = std::path::Path::new(&home).join(".leveler");
+        roots.push(leveler.join("projects"));
+        roots.push(leveler.join("config.toml"));
+    }
+    leveler_execution::seal_read_denials(roots);
+}
+
 async fn run_eval(
     config_dir: &std::path::Path,
     model: &ModelRef,
@@ -551,6 +586,7 @@ async fn run_eval(
     overrides: Option<&ExecutionOverrides>,
     checkpoint: Option<&std::path::Path>,
 ) -> leveler_eval::EvalReport {
+    seal_eval_answer_keys();
     let mut results = Vec::new();
     for case in cases {
         for repetition in 1..=repetitions {
@@ -645,7 +681,7 @@ async fn run_bare_case(
             model,
             PermissionProfile::Assisted,
             false,
-            build_approver(true),
+            std::sync::Arc::new(leveler_execution::EvalApprove),
             Arc::new(leveler_agent::AutoClarify),
         )
         .await
@@ -1084,7 +1120,7 @@ async fn run_eval_case(
                             model,
                             PermissionProfile::Assisted,
                             &case.task,
-                            build_approver(true),
+                            std::sync::Arc::new(leveler_execution::EvalApprove),
                             false,
                             &mut |e| {
                                 collector.observe_agent(&e);

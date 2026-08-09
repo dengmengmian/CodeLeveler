@@ -1,5 +1,22 @@
 # C2.3C NAVIGATION CAPABILITY EVAL — Baseline
 
+> ## ⚠ INVALIDATED DUE TO EVAL DATA LEAKAGE
+>
+> 本文档记录的 baseline（**6/8**、Target Recall 8/8、Impact 19/19 FullyRead）
+> **全部作废**。后续发现 Eval Agent 可以通过 shell + 权限升级读取隐藏的 case
+> 定义与隐藏验收 —— 详见 `docs/C2_3C_S_EVAL_SANDBOX_INTEGRITY.md`。
+>
+> 这些数字只能作为 **HISTORICAL / CONTAMINATED** 证据保留，
+> **禁止与干净数据合并计算**。
+>
+> 另外，本文档 §9 声称"8 个 case 的隐藏验收在未修改 fixture 上 8/8 失败"
+> **是用错误方法得到的**（检查脚本破坏了 heredoc）。逐字复验后：
+> **7/8 有效，N6 是无效 fixture** —— 它描述的缺陷在原始 fixture 中并不存在。
+> 因此本文档关于 N6 的 `TARGET_ABANDONED` 结论同样不成立。
+>
+> 干净 baseline 待 C2.3C-F（N6 fixture 修正）后重新建立。
+
+
 日期：2026-08-09。分支 `feat/coding-context-efficiency-c2`。模型 `deepseek/deepseek-v4-flash`，默认产品行为，无 ablation。
 
 **BASELINE CAPABILITY: 6/8。** 更重要的是这句：**八个 case 全部达成 relevant 与 impact 满召回 —— 包括两个失败的。两次失败都发生在定位之后。**

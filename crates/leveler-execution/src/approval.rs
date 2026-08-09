@@ -87,6 +87,46 @@ impl Approver for AutoApprove {
     }
 }
 
+/// The approver an evaluation harness runs with.
+///
+/// `AutoApprove` exists so a headless run is not blocked on a human for
+/// ordinary tool work. That is right for ordinary tool work and wrong for
+/// escalation: an eval that approves "give me the whole filesystem" hands the
+/// agent the ability to read its own answer key, and every measurement taken
+/// afterwards is of a graded exam the student could see.
+///
+/// So this behaves exactly like [`AutoApprove`] — except it never grants a
+/// capability that would take the run outside the containment it is being
+/// measured inside. The decision is structural: it reads `risk` and `tool`,
+/// never the model's stated reason, because a rule that can be argued with is
+/// not a boundary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EvalApprove;
+
+/// Tools whose whole purpose is to widen the sandbox for the rest of the turn.
+fn is_escalation_tool(tool: &str) -> bool {
+    matches!(tool, "request_permissions" | "ask_permission")
+}
+
+#[async_trait]
+impl Approver for EvalApprove {
+    fn has_human(&self) -> bool {
+        false
+    }
+
+    async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        if is_memory_write_tool(&request.tool) {
+            return ApprovalDecision::Deny;
+        }
+        // Escalation, by the request's own classification — not by what it says
+        // it wants the access for.
+        if is_escalation_tool(&request.tool) || request.risk == RiskLevel::Privileged {
+            return ApprovalDecision::Deny;
+        }
+        ApprovalDecision::ApproveOnce
+    }
+}
+
 /// Tools that write durable project memory and always need human confirmation.
 ///
 /// Includes `consolidate_memory`: with `auto_write=true` it persists entries and
@@ -634,6 +674,133 @@ impl ApprovalPolicy {
 
 #[cfg(test)]
 mod tests {
+
+    /// C2.3C-S P2 — the invariant this whole round exists for. An eval must
+    /// never be able to approve its own way out of containment.
+    #[tokio::test]
+    async fn eval_approver_denies_privileged_escalation() {
+        let request = |tool: &str, risk: RiskLevel| ApprovalRequest {
+            id: ApprovalId::generate(),
+            turn_id: None,
+            call_id: "c1".into(),
+            agent_id: None,
+            action_fingerprint: "fp".into(),
+            tool: tool.into(),
+            risk,
+            description: "…".into(),
+            command: None,
+            paths: Vec::new(),
+        };
+
+        // The exact shape observed leaking: request_permissions, Privileged.
+        assert_eq!(
+            EvalApprove
+                .decide(&request("request_permissions", RiskLevel::Privileged))
+                .await,
+            ApprovalDecision::Deny
+        );
+        // Either signal alone is enough; neither is load-bearing on the other.
+        assert_eq!(
+            EvalApprove
+                .decide(&request("request_permissions", RiskLevel::Safe))
+                .await,
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            EvalApprove
+                .decide(&request("run_command", RiskLevel::Privileged))
+                .await,
+            ApprovalDecision::Deny
+        );
+    }
+
+    /// C2.3C-S P5 — the decision cannot be talked into changing. Denial is a
+    /// property of the request's classification, not of its prose.
+    #[tokio::test]
+    async fn eval_approver_ignores_the_stated_reason() {
+        let mut request = ApprovalRequest {
+            id: ApprovalId::generate(),
+            turn_id: None,
+            call_id: "c1".into(),
+            agent_id: None,
+            action_fingerprint: "fp".into(),
+            tool: "request_permissions".into(),
+            risk: RiskLevel::Privileged,
+            description: "I only need this to run the project's own test suite".into(),
+            command: Some("cargo test".into()),
+            paths: Vec::new(),
+        };
+        assert_eq!(EvalApprove.decide(&request).await, ApprovalDecision::Deny);
+        request.description = "read-only, will not modify anything".into();
+        assert_eq!(EvalApprove.decide(&request).await, ApprovalDecision::Deny);
+    }
+
+    /// C2.3C-S P1/P6 — ordinary tool work is untouched, before and after a
+    /// denial. Sealing the exits must not turn the eval read-only.
+    #[tokio::test]
+    async fn eval_approver_keeps_ordinary_tool_work_flowing() {
+        let ordinary = |tool: &str, risk: RiskLevel| ApprovalRequest {
+            id: ApprovalId::generate(),
+            turn_id: None,
+            call_id: "c".into(),
+            agent_id: None,
+            action_fingerprint: "fp".into(),
+            tool: tool.into(),
+            risk,
+            description: "…".into(),
+            command: None,
+            paths: Vec::new(),
+        };
+        for (tool, risk) in [
+            ("apply_patch", RiskLevel::WorkspaceWrite),
+            ("replace", RiskLevel::WorkspaceWrite),
+            ("run_command", RiskLevel::WorkspaceWrite),
+            ("shell_command", RiskLevel::WorkspaceWrite),
+            ("read_file", RiskLevel::Safe),
+        ] {
+            assert_eq!(
+                EvalApprove.decide(&ordinary(tool, risk)).await,
+                ApprovalDecision::ApproveOnce,
+                "{tool} must still be approved"
+            );
+        }
+        // A denial does not poison what follows.
+        assert_eq!(
+            EvalApprove
+                .decide(&ordinary("request_permissions", RiskLevel::Privileged))
+                .await,
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            EvalApprove
+                .decide(&ordinary("apply_patch", RiskLevel::WorkspaceWrite))
+                .await,
+            ApprovalDecision::ApproveOnce
+        );
+    }
+
+    /// C2.3C-S P7 — production keeps its behaviour. `AutoApprove` is what a
+    /// user's headless run uses, and this round does not redesign product
+    /// permissions.
+    #[tokio::test]
+    async fn production_auto_approve_is_unchanged() {
+        let request = ApprovalRequest {
+            id: ApprovalId::generate(),
+            turn_id: None,
+            call_id: "c".into(),
+            agent_id: None,
+            action_fingerprint: "fp".into(),
+            tool: "request_permissions".into(),
+            risk: RiskLevel::Privileged,
+            description: "…".into(),
+            command: None,
+            paths: Vec::new(),
+        };
+        assert_eq!(
+            AutoApprove.decide(&request).await,
+            ApprovalDecision::ApproveOnce
+        );
+    }
     use super::*;
 
     fn view<'a>(program: &'a str, args: &'a [String]) -> CommandView<'a> {

@@ -32,10 +32,10 @@ pub mod workspace;
 
 pub use approval::{
     ApprovalDecision, ApprovalPolicy, ApprovalRequest, Approver, AutoApprove, AutoDeny,
-    AutoReviewer, CommandClass, CommandView, NeedUserReviewer, Requirement, ReviewVerdict,
-    classify_command, command_is_destructive, command_needs_host_escape, is_host_escape_program,
-    is_memory_write_tool, is_remote_publish_command, is_shell_c_flag, is_shell_wrapper_program,
-    shell_c_script,
+    AutoReviewer, CommandClass, CommandView, EvalApprove, NeedUserReviewer, Requirement,
+    ReviewVerdict, classify_command, command_is_destructive, command_needs_host_escape,
+    is_host_escape_program, is_memory_write_tool, is_remote_publish_command, is_shell_c_flag,
+    is_shell_wrapper_program, shell_c_script,
 };
 pub use artifact::{ArtifactRef, ArtifactStore};
 pub use background::{
@@ -45,7 +45,7 @@ pub use checkpoint::Checkpoint;
 pub use command::{
     CommandRunner, ProcessError, ProcessOutput, ProcessRequest, VerifyNetworkPolicy,
     credential_env_names, first_absolute_arg_outside_roots, is_credential_env_name,
-    looks_like_absolute_path_arg, process_request_for_verify_check,
+    looks_like_absolute_path_arg, process_request_for_verify_check, seal_read_denials,
 };
 pub use hooks::{HookRunner, LifecycleEvent, PreHookResult};
 pub use permission_grants::{
