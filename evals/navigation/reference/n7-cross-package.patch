@@ -1,0 +1,75 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..76eeb24 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -62,12 +62,27 @@ func run(args []string) error {
+ 	reader := ingest.NewReader(cfg.Input, cfg.Input.Path)
+ 
+ 	var collected []api.Batch
++	written := 0
+ 	err = reader.Read(input, func(batch api.Batch) error {
+ 		batch = pipe.Apply(batch)
+ 		if summarize {
+ 			collected = append(collected, batch)
+ 			return nil
+ 		}
++		// The cap is about what reaches the output, whichever sink is
++		// selected, so it is enforced here rather than in each sink. A batch
++		// may straddle the limit; trim it instead of overshooting, and once
++		// the cap is reached stop writing entirely.
++		if limit := cfg.Output.MaxRecords; limit > 0 {
++			remaining := limit - written
++			if remaining <= 0 {
++				return nil
++			}
++			if len(batch.Records) > remaining {
++				batch.Records = batch.Records[:remaining]
++			}
++		}
++		written += len(batch.Records)
+ 		return out.Write(batch)
+ 	})
+ 	if err != nil {
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 0010397..ba515d5 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -23,4 +23,7 @@ type PipelineConfig struct {
+ type OutputConfig struct {
+ 	Sink   string
+ 	Pretty bool
++	// MaxRecords, when positive, caps how many records reach the sink over
++	// the whole run. Zero means unlimited.
++	MaxRecords int
+ }
+diff --git a/internal/config/load.go b/internal/config/load.go
+index bcc5136..7facb5d 100644
+--- a/internal/config/load.go
++++ b/internal/config/load.go
+@@ -62,6 +62,12 @@ func assign(cfg *Config, key, value string) error {
+ 			return fmt.Errorf("pipeline.max_depth: %w", err)
+ 		}
+ 		cfg.Pipeline.MaxDepth = n
++	case "output.max_records":
++		n, err := strconv.Atoi(value)
++		if err != nil {
++			return fmt.Errorf("output.max_records: %w", err)
++		}
++		cfg.Output.MaxRecords = n
+ 	case "output.sink":
+ 		cfg.Output.Sink = value
+ 	case "output.pretty":
+diff --git a/internal/config/validate.go b/internal/config/validate.go
+index b63923e..d6b2050 100644
+--- a/internal/config/validate.go
++++ b/internal/config/validate.go
+@@ -10,6 +10,9 @@ func Validate(cfg Config) error {
+ 	if cfg.Pipeline.MaxDepth < 0 {
+ 		return fmt.Errorf("pipeline.max_depth must not be negative")
+ 	}
++	if cfg.Output.MaxRecords < 0 {
++		return fmt.Errorf("output.max_records must not be negative")
++	}
+ 	switch cfg.Input.Format {
+ 	case "jsonl", "csv":
+ 	default:
