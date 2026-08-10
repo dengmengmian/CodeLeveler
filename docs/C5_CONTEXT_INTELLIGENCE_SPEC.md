@@ -1,5 +1,9 @@
 # C5 Context Intelligence
 
+> **C5 CLOSED（2026-08-11）** —— 最终状态与重新打开条件见 `docs/C5_CLOSEOUT.md`。
+> S3 = EXPERIMENTAL / NOT PROMOTED；S4 = DEFERRED（前置压力未被证实）。
+> 本文其余内容保留为设计记录；其中 S3-S5 的迁移计划已被 closeout 取代。
+
 日期：2026-08-10。基线 `d3e655d`（main，C1–C4 CLOSED + ICG CONDITIONAL PASS 之后）。
 **SPECIFICATION ONLY —— 本阶段零生产代码改动。**
 

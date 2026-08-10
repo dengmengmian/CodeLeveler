@@ -75,12 +75,17 @@ rounds: control 19.2 vs ablated 21.2 (+1.9)
 > 实为累计口径 —— 现有全部 benchmark 任务的真实转录都远小于任何折叠阈值，
 > 也就是说**历史上 compaction 在 eval 面上从未触发过**。
 
-## Decision
+## Decision（C5-S5 Closeout 改判，2026-08-11）
 
 ```
-S3 STATUS: REMAINS OPEN — MECHANISM NOT EXERCISED
-生产默认: Disabled（未翻转，本来就等判决）
+S3 STATUS: EXPERIMENTAL / NOT PROMOTED
+生产默认: Disabled（长期状态，非待判决）
 ```
+
+含义精确区分：**不是"S3 被证明有效"，也不是"S3 失败"** —— 工程实现完成且被
+15 条确定性契约钉住，但产品价值未被证明（E2 两轮 reality check 未能展示折叠压力），
+因此不晋升 production。机制留在 ablation seam 后，重新打开条件见
+`docs/C5_CLOSEOUT.md`。
 
 机制的确定性正确性已证（15 条新单测：12 决策核 + 3 resolver；全 workspace 绿）；
 真实负载证据缺一个**能自然产生 >256k 转录**的 VALID case。不硬造、不降档凑触发
