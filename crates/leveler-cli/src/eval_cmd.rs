@@ -471,9 +471,17 @@ fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, b
             o.repeated_read_guard = Some(false);
             (true, false)
         }
+        // C5-S3: control = static budget (production default OFF); ablated =
+        // the adaptive candidate ON. Note the direction: this knob measures a
+        // CANDIDATE, so "ablated" is the arm with the mechanism enabled.
+        "adaptive_context" => {
+            o.adaptive_context = Some(true);
+            (false, true)
+        }
         _ => anyhow::bail!(
             "unknown knob `{knob}` — expected one of: explicit_plan, \
-             completion_evidence, repeated_read_guard, progress_guards"
+             completion_evidence, repeated_read_guard, progress_guards, \
+             adaptive_context"
         ),
     };
     Ok((o, before, after))
