@@ -27,10 +27,18 @@ pub struct ModelCapabilities {
     pub vision: bool,
 }
 
-/// Hard numeric limits for the model.
+/// Hard numeric limits for the model. These describe FACTS about the model —
+/// what the provider accepts and what the model can do — never runtime policy.
+/// How the runtime USES these facts (fold thresholds, budgets) is
+/// `ContextPolicy` in the engine's policy resolver (C5-S1 separation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelLimits {
     pub context_window: u32,
+    /// A QUALITY declaration, not a runtime cap (C5-S1 migration note): the
+    /// point past which long-context recall is expected to degrade. Policy
+    /// may knowingly exceed it; nothing may treat it as a hard limit and
+    /// refuse a request. Until a model carries a measured `context_quality`,
+    /// this is the configured best estimate.
     pub reliable_context: u32,
     pub max_output_tokens: u32,
     pub max_tool_schema_bytes: usize,
@@ -40,6 +48,17 @@ pub struct ModelLimits {
     /// models with small reliable contexts.
     #[serde(default)]
     pub max_tool_output_bytes: Option<usize>,
+}
+
+/// Measured long-context quality for a model. Only ever filled from a real
+/// measurement — `measured_at` names when and forces the question "how do you
+/// know?" at review time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextQuality {
+    /// Estimated tokens at which recall degradation was first observed.
+    pub degradation_onset: u32,
+    /// ISO date of the measurement (plus a short method note if useful).
+    pub measured_at: String,
 }
 
 /// How the provider expects a reasoning request to be spelled on the wire.
@@ -158,6 +177,12 @@ pub struct ModelProfile {
     pub protocol: ProtocolKind,
     pub capabilities: ModelCapabilities,
     pub limits: ModelLimits,
+    /// Measured long-context quality, when someone has actually measured it
+    /// (C5 spec §Model Capability Layer). Absent means "not measured" — the
+    /// field must never be filled from guesswork, which is why it carries its
+    /// measurement date. Consumers fall back to `limits.reliable_context`.
+    #[serde(default)]
+    pub context_quality: Option<ContextQuality>,
     #[serde(default)]
     pub reasoning: ReasoningConfig,
     #[serde(default)]
@@ -291,6 +316,7 @@ mod tests {
                 max_parallel_tool_calls: 16,
                 max_tool_output_bytes: None,
             },
+            context_quality: None,
             reasoning: ReasoningConfig {
                 style: ReasoningStyle::ThinkingFlag,
                 effort: Some(ReasoningEffort::High),

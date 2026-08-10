@@ -413,6 +413,7 @@ impl GlobalConfig {
                                 .unwrap_or(usize::from(!m.parallel_tool_calls)),
                             max_tool_output_bytes: m.max_tool_output_bytes,
                         },
+                        context_quality: None,
                         reasoning: ReasoningConfig {
                             style: m.reasoning_style,
                             effort: m.reasoning_effort,

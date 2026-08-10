@@ -741,7 +741,7 @@ impl TaskEngine {
                 &log,
                 summary.as_deref(),
                 objective_hint,
-                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
+                u64::from(crate::ContextPolicy::chat_default().initial_budget),
             )
             .await?;
         if context.compacted {
@@ -840,7 +840,7 @@ impl TaskEngine {
                 &log,
                 summary.as_deref(),
                 Some(spec.runtime.goal.as_str()),
-                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
+                u64::from(crate::ContextPolicy::chat_default().initial_budget),
             )
             .await?;
         if context.compacted {
@@ -879,7 +879,9 @@ impl TaskEngine {
         raw: &[leveler_model::Message],
         cancellation: &CancellationToken,
     ) -> Option<String> {
-        if leveler_agent::estimate_tokens(raw) <= leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD {
+        if leveler_agent::estimate_tokens(raw)
+            <= u64::from(crate::ContextPolicy::chat_default().initial_budget)
+        {
             return None;
         }
         leveler_agent::summarize_with_model(
@@ -1132,7 +1134,7 @@ impl TaskEngine {
                 log,
                 None,
                 Some(goal),
-                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
+                u64::from(crate::ContextPolicy::chat_default().initial_budget),
             )
             .await?;
         Ok(bound_goal_history(context.prior, GOAL_HISTORY_MAX))
@@ -1258,7 +1260,7 @@ impl TaskEngine {
                 log,
                 summary.as_deref(),
                 Some(spec.runtime.goal.as_str()),
-                leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD,
+                u64::from(crate::ContextPolicy::chat_default().initial_budget),
             )
             .await?;
         if context.compacted {

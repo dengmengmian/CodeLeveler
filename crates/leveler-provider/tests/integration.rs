@@ -57,6 +57,7 @@ fn model_config() -> ModelConfigFile {
                 max_parallel_tool_calls: 1,
                 max_tool_output_bytes: None,
             },
+            context_quality: None,
             reasoning: Default::default(),
             compatibility: Default::default(),
             instructions: None,

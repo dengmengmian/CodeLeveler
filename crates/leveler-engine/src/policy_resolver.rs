@@ -52,12 +52,79 @@ pub struct ExecutionOverrides {
     pub max_tool_output_bytes: Option<usize>,
 }
 
+/// How this runtime USES a model's context capability (C5-S1). The capability
+/// itself — window size, output ceiling — lives in `ModelLimits` and describes
+/// facts; this describes policy. S1 is a structural migration: every value
+/// here reproduces the pre-S1 behavior exactly, and the single-variant enums
+/// name today's behavior so later stages can add alternatives behind the same
+/// seam instead of new call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextPolicy {
+    /// Fold threshold at task start (estimated tokens). Governs when held
+    /// context is compacted — never how much may be read. `0` disables.
+    pub initial_budget: u32,
+    /// Ceiling this task may expand the fold threshold to. S1: always equal
+    /// to `initial_budget`; adaptive expansion is C5-S3.
+    pub max_budget: u32,
+    pub compaction: CompactionPolicy,
+    pub retention: RetentionPolicy,
+}
+
+/// How folding happens. One variant today: anchored spans folded into a
+/// handoff briefing, merged incrementally on refold (`compaction.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionPolicy {
+    AnchoredBriefing,
+}
+
+/// What survives a fold. One variant today: the briefing carries decisions,
+/// failed attempts, paths and constraints; file content is summarized rather
+/// than pointed at. Fingerprinted read pointers are C5-S4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionPolicy {
+    BriefingOnly,
+}
+
+impl ContextPolicy {
+    /// The task-execution policy for a model: fold at the profile's declared
+    /// reliable context, exactly as before S1. `reliable_context` is a model
+    /// QUALITY declaration (recall degrades past it), not a hard cap — the
+    /// policy chooses to fold there; it does not refuse to exceed it.
+    pub fn for_profile(profile: &ModelProfile) -> Self {
+        Self {
+            initial_budget: profile.limits.reliable_context,
+            max_budget: profile.limits.reliable_context,
+            compaction: CompactionPolicy::AnchoredBriefing,
+            retention: RetentionPolicy::BriefingOnly,
+        }
+    }
+
+    /// The interactive-chat policy: the conservative pre-request threshold the
+    /// chat path has always used. Same value as
+    /// `leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD`, now resolved through
+    /// the same seam as the task policy so the two units cannot drift apart
+    /// unnoticed (C2.1 recorded them diverging: 24k vs the task budget).
+    pub fn chat_default() -> Self {
+        Self {
+            initial_budget: leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD as u32,
+            max_budget: leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD as u32,
+            compaction: CompactionPolicy::AnchoredBriefing,
+            retention: RetentionPolicy::BriefingOnly,
+        }
+    }
+}
+
 /// The fully resolved execution configuration for one executor. For the
 /// numeric budget fields `0` means unlimited, matching executor semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedExecutionPolicy {
     pub max_output_tokens: u32,
+    /// Compatibility mirror of `context.initial_budget` (C5-S1 migration):
+    /// existing consumers keep reading this field; it is always populated
+    /// from `context`. New code should read `context` directly.
     pub context_budget: u32,
+    /// How this executor uses the model's context capability.
+    pub context: ContextPolicy,
     pub max_parallel_tools: usize,
     pub max_search_calls_per_step: usize,
     pub max_files_per_step: usize,
@@ -109,9 +176,11 @@ pub fn resolve_execution_policy(
     };
     let max_parallel_tools = min_nonzero(&[role_parallel, o.max_parallel_tools.unwrap_or(0)]);
 
+    let context = ContextPolicy::for_profile(profile);
     ResolvedExecutionPolicy {
         max_output_tokens: profile.limits.max_output_tokens,
-        context_budget: profile.limits.reliable_context,
+        context_budget: context.initial_budget,
+        context,
         max_parallel_tools,
         max_search_calls_per_step: o.max_search_calls_per_step.unwrap_or(0),
         max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
@@ -195,6 +264,52 @@ mod tests {
             48 * 1024,
             "no profile/override opinion → today's central cap, zero drift"
         );
+    }
+
+    #[test]
+    fn context_policy_migration_is_behavior_identical() {
+        // C5-S1 is a structural migration: the new ContextPolicy must resolve
+        // to exactly the values the old flat field carried, and the compat
+        // mirror must never drift from it.
+        let p = profile();
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(r.context.initial_budget, p.limits.reliable_context);
+        assert_eq!(
+            r.context_budget, r.context.initial_budget,
+            "the compat mirror must equal the policy value"
+        );
+        assert_eq!(
+            r.context.max_budget, r.context.initial_budget,
+            "S1 has no expansion: max == initial until C5-S3"
+        );
+        assert_eq!(r.context.compaction, CompactionPolicy::AnchoredBriefing);
+        assert_eq!(r.context.retention, RetentionPolicy::BriefingOnly);
+    }
+
+    #[test]
+    fn chat_policy_pins_the_historical_pre_request_threshold() {
+        // The chat path folded at 24k before S1; routing it through the same
+        // seam must not move the number. If someone changes the threshold,
+        // this failure forces them to say so.
+        let chat = ContextPolicy::chat_default();
+        assert_eq!(
+            u64::from(chat.initial_budget),
+            leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD
+        );
+        assert_eq!(chat.initial_budget, 24_000);
+        assert_eq!(chat.max_budget, chat.initial_budget);
+    }
+
+    #[test]
+    fn model_limits_carry_no_runtime_policy() {
+        // Capability purity: a profile deserialized without any policy-ish
+        // key still yields a full ContextPolicy from the resolver — policy is
+        // derived, never stored on the model. And context_quality is absent
+        // unless measured.
+        let p = profile();
+        assert!(p.context_quality.is_none(), "unmeasured must stay None");
+        let r = resolve_execution_policy(&p, ExecutionRole::Worker, &goal_turn(), None);
+        assert_eq!(r.context.initial_budget, p.limits.reliable_context);
     }
 
     #[test]
