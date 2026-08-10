@@ -1,11 +1,17 @@
 # C5-S3 Adaptive Context
 
+> **Final C5 status（2026-08-11）：S3 = EXPERIMENTAL / NOT PROMOTED，生产默认 DISABLED。**
+> 下方的 S3 阶段评估在当时以 `MECHANISM NOT EXERCISED / REMAINS OPEN` 收束 ——
+> 那是一个**历史性的阶段 verdict**，随后被 E2 reality check 之后的 C5-S5 closeout 取代。
+> 最终权威状态见 `docs/C5_CLOSEOUT.md`。
+
 日期：2026-08-10。基线 `f190a4e` → 实现 `34d8386` + 旋钮 `eab1a5c`。
 
-**结论前置：机制已实现并被确定性契约钉住；A/B（4 个 VALID 长任务 × 2 臂 × 3 reps）双臂
-功能 100% 无回归；但两臂 24 run 的 expansion=compaction=**0** —— 现有 VALID suite 的单请求
-转录从未逼近 256k 档，决策点从未到来。按本阶段铁律：`MECHANISM NOT EXERCISED`，
-**S3 REMAINS OPEN**，生产默认保持 Disabled。**
+**结论前置（historical S3-stage verdict）：机制已实现并被确定性契约钉住；A/B（4 个 VALID
+长任务 × 2 臂 × 3 reps）双臂功能 100% 无回归；但两臂 24 run 的 expansion=compaction=**0**
+—— 现有 VALID suite 的单请求转录从未逼近 256k 档，决策点从未到来。按本阶段铁律记
+`MECHANISM NOT EXERCISED`，**当时阶段状态为 REMAINS OPEN**（现有 benchmark 从未触发
+机制，价值无法判定）。C5-S5 随后以 `S3 EXPERIMENTAL / NOT PROMOTED` 关闭里程碑。**
 
 ## Runtime State Model / Policy vs State
 
@@ -50,8 +56,10 @@ ablated=候选 ON —— 方向显式：此旋钮测的是候选）。OFF 逐字
 ## Eval Validity / Baseline vs Candidate
 
 **Deviation（如实记录）**：E1–E4 bespoke 形状未新造（上下文预算内不可行），载具改为既有
-**VALID** 的 4 个最长任务：icg-3（中位对照）/icg-5/c4-r7/c4-r8（80 轮）。E1–E4 仍是 S3 收口的
-待办，尤其 **C5-E2 history-dependent** —— 它正是能把转录推过 256k 的形状。
+**VALID** 的 4 个最长任务：icg-3（中位对照）/icg-5/c4-r7/c4-r8（80 轮）。当时预期
+**C5-E2 history-dependent** 能把转录推过 256k —— **后续事实：E2 随后建成并跑了两轮
+VALID shape（96 adapters / 1.1MB），仍未产生 >256k 压力**，见
+`docs/C5_E2_HISTORY_DEPENDENT_CASE.md`。
 
 ## Functional Results（冻结 `eab1a5c`，24/24 完成）
 
@@ -91,9 +99,18 @@ S3 STATUS: EXPERIMENTAL / NOT PROMOTED
 真实负载证据缺一个**能自然产生 >256k 转录**的 VALID case。不硬造、不降档凑触发
 （把 tier 调小到 32k 能"触发"，但那测的不是产品行为）。
 
-## Remaining Risks / S4 Inputs
+## Deferred Questions after C5 Closeout
 
-- 收口 S3 需要 C5-E2 形状：多大文件读取/百步级任务，转录自然过 256k，六项闸门 VALID。
-  scale-s1500 fixture 是现成底材（目前 UNVERIFIED，需补 reference）。
-- compaction 在真实 eval 面从未触发 → S4（指针化保留）的收益验证同样需要 E2 形状先行。
-- flash 的 safe-ceiling 算术（655k < 786k）值得在 S4 前单独澄清 window 语义。
+本节原为"Remaining Risks / S4 Inputs"（把 E2 写作待办）；那些事项已被实际历史处理：
+
+- **E2 已执行**：两轮 VALID shape（telemetryd-e2，1500 files / 96 relevant adapters /
+  1.1MB relevant source），6 个候选 probe，0 compaction / 0 expansion —— agent 以
+  grep + 范围读把有效转录控制在约 12–16 万 token，>256k 压力未自然出现。
+- **S4 Pointer Retention 已 DEFERRED**：仅当未来真实 Dogfooding 出现
+  `transcript > 256k → 自然 Compact → 有意义的 post-fold 重读 / RepeatedReadGuard 压力`
+  时重新评估。
+- **flash safe-ceiling 语义**（window 1M − max_output 384k ≈ 655k < reliable 786k）保留为
+  开放问题 —— **不是当前 C5 blocker**，仅在未来 C5-R1 重新打开时需要继续澄清。
+
+重新打开条件与 `docs/C5_CLOSEOUT.md` 一致：由真实使用数据触发（自然折叠 + 折叠后大量
+重读）→ 开 **C5-R1 — Adaptive Context Revalidation**，并把该真实任务脱敏后做成新的 E2。
