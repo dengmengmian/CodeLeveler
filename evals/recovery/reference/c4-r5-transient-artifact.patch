@@ -1,0 +1,14 @@
+diff --git a/cmd/navsvc/main_backup.go b/cmd/navsvc/main_backup.go
+deleted file mode 100644
+index db4b0b5..0000000
+--- a/cmd/navsvc/main_backup.go
++++ /dev/null
+@@ -1,8 +0,0 @@
+-package main
+-
+-// main_backup.go — emergency copy taken by the deploy script before the
+-// last rollout. TODO(ops): remove after the rollout settles.
+-
+-func main() {
+-	panic("backup copy — not the real entrypoint")
+-}

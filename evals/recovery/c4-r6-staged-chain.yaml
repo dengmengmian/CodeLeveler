@@ -1,0 +1,135 @@
+# C4-R6 — Staged recovery chain. Two defects, but only one visible: the
+# compile error in report masks the pipeline behaviour bug, because tests
+# cannot run until the tree builds. Repairing the first failure EXPOSES the
+# second. Measured: continuing through layered failures, not one repair.
+id: c4-r6-staged-chain
+name: "[recovery] fixing the build reveals a red suite behind it"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+recovery: true
+relevant_paths:
+  - internal/report/summary.go
+  - internal/pipeline/filter.go
+required_impact_paths:
+  - internal/report/summary.go
+  - internal/pipeline/filter.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/report/summary.go: |
+    package report
+
+    import (
+    	"fmt"
+    	"sort"
+    	"strings"
+
+    	"navsvc/pkg/api"
+    )
+
+    // Summary accumulates per-name statistics across every batch that ran.
+    type Summary struct {
+    	counts map[string]int
+    	totals map[string]float64
+    }
+
+    // NewSummary returns an empty summary ready to observe batches.
+    func NewSummary() *Summary {
+    	return &Summary{
+    		counts: map[string]int{},
+    		totals: map[string]float64{},
+    	}
+    }
+
+    // Observe folds one batch into the running totals.
+    func (s *Summary) Observe(batch api.Batch) {
+    	for _, record := range batch.Records {
+    		s.count[record.Name]++
+    		s.totals[record.Name] += record.Value
+    	}
+    }
+
+    // Render produces the human-readable report, one line per name, sorted.
+    func (s *Summary) Render() string {
+    	names := make([]string, 0, len(s.counts))
+    	for name := range s.counts {
+    		names = append(names, name)
+    	}
+    	sort.Strings(names)
+
+    	var b strings.Builder
+    	for _, name := range names {
+    		fmt.Fprintf(&b, "%s count=%d total=%g\n", name, s.counts[name], s.totals[name])
+    	}
+    	return b.String()
+    }
+
+  internal/pipeline/filter.go: |
+    package pipeline
+
+    import (
+    	"navsvc/internal/config"
+    	"navsvc/pkg/api"
+    )
+
+    // filterStage removes records a decoder marked unusable.
+    type filterStage struct{}
+
+    func (filterStage) Name() string { return "filter" }
+
+    func (filterStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+    	if !cfg.DropInvalid {
+    		return batch
+    	}
+    	kept := batch.Records[:0]
+    	for _, record := range batch.Records {
+    		if record.Value != 0 {
+    			kept = append(kept, record)
+    		}
+    	}
+    	batch.Records = kept
+    	return batch
+    }
+
+task: |
+  A botched merge left the tree in a bad state. `go build ./...` fails in
+  `internal/report`. Fixing the build is not the end of it: once the tree
+  compiles, run the tests — the pipeline package has a real behaviour
+  regression behind the compile error (the filter stage selects on the
+  wrong field; validity decides, not the value). Keep going until the
+  whole suite is green.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go build ./... > /dev/null
+      go test ./internal/report/ ./internal/pipeline/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Both layers repaired: the tree compiles AND the pipeline behaviour
+      regression hiding behind the compile error is fixed.
+    oracle_interpretation: >-
+      Build green and the full maintained suite green, tests untouched.
+    rationale: >-
+      The task announces the second failure explicitly and states the
+      filter rule, so nothing depends on guessing; the difficulty is
+      sustaining the repair chain, not interpretation.

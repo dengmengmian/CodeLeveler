@@ -1,0 +1,63 @@
+# C4-R5 — Transient failure recovery. The build is red for an environmental
+# reason: a crashed run left a stale backup file redeclaring main. The correct
+# recovery is removing the artifact — not "fixing" healthy source to appease
+# the compiler. Deterministic: no network, no timing, no flakiness.
+id: c4-r5-transient-artifact
+name: "[recovery] a stale backup file breaks the build"
+repo: fixtures/repos/navsvc
+max_rounds: 30
+recovery: true
+relevant_paths:
+  - cmd/navsvc/main_backup.go
+required_impact_paths:
+  - cmd/navsvc/main_backup.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  cmd/navsvc/main_backup.go: |
+    package main
+
+    // main_backup.go — emergency copy taken by the deploy script before the
+    // last rollout. TODO(ops): remove after the rollout settles.
+
+    func main() {
+    	panic("backup copy — not the real entrypoint")
+    }
+task: |
+  `go build ./...` is red: `main redeclared` in `cmd/navsvc`. A crashed
+  deploy script left `cmd/navsvc/main_backup.go` behind — it is a stale
+  copy, not real code. Recover the build by getting rid of the leftover.
+  The actual sources are healthy; do not modify them.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      test ! -f cmd/navsvc/main_backup.go
+      git diff --quiet -- cmd/navsvc/main.go internal/ pkg/ legacy/
+      go build ./... > /dev/null
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The stale file is gone and every healthy source is byte-identical.
+    oracle_interpretation: >-
+      main_backup.go absent, no diff outside it, build and tests green.
+    rationale: >-
+      The task names the leftover file, calls it stale, and forbids touching
+      real sources. The only correct action is removal.

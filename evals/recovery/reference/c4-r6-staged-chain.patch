@@ -1,0 +1,26 @@
+diff --git a/internal/pipeline/filter.go b/internal/pipeline/filter.go
+index 0f3c92c..91cc1d2 100644
+--- a/internal/pipeline/filter.go
++++ b/internal/pipeline/filter.go
+@@ -16,7 +16,7 @@ func (filterStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+ 	}
+ 	kept := batch.Records[:0]
+ 	for _, record := range batch.Records {
+-		if record.Value != 0 {
++		if record.Valid {
+ 			kept = append(kept, record)
+ 		}
+ 	}
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index e591d2e..79f23c9 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -25,7 +25,7 @@ func NewSummary() *Summary {
+ // Observe folds one batch into the running totals.
+ func (s *Summary) Observe(batch api.Batch) {
+ 	for _, record := range batch.Records {
+-		s.count[record.Name]++
++		s.counts[record.Name]++
+ 		s.totals[record.Name] += record.Value
+ 	}
+ }
