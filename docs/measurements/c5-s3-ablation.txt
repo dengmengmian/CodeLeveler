@@ -1,0 +1,159 @@
+warning: variable does not need to be mutable
+   --> crates/leveler-agent/src/compaction.rs:305:9
+    |
+305 |     let mut split = |s: &str| -> (u64, u64) {
+    |         ----^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+! ! 忽略了仓库内 /Users/mengmian/Develop/app/codeleveler/.leveler/permissions.yaml（未信任）
+  它可以执行命令或授予免批准权限。确认内容后运行：leveler trust
+[2m2026-08-10T11:58:14.069956Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  mode: direct
+  ablation: adaptive_context = false (control) vs true (ablated), single variable
+▶ eval [recovery] five output/report improvements land together (c4-r7-long-multistep, run 1/3)
+[2m2026-08-10T11:58:14.378493Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r7-long-multistep repetition=1 session=4fdae6ee-47f7-45ea-829b-964234f62f18 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r7-long-multistep-21786-exec1-r1
+  ✓ c4-r7-long-multistep#1 — Completed
+▶ eval [recovery] five output/report improvements land together (c4-r7-long-multistep, run 2/3)
+[2m2026-08-10T12:00:07.145317Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r7-long-multistep repetition=2 session=48f34656-21c9-43c7-a6ee-c606e944944e path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r7-long-multistep-21786-exec2-r2
+  ✓ c4-r7-long-multistep#2 — Completed
+▶ eval [recovery] five output/report improvements land together (c4-r7-long-multistep, run 3/3)
+[2m2026-08-10T12:01:21.285031Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r7-long-multistep repetition=3 session=c185e7a5-e720-40c1-a47e-4c56f21bd42e path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r7-long-multistep-21786-exec3-r3
+  ✓ c4-r7-long-multistep#3 — Completed
+▶ eval [recovery] fix the build, then ship --stats (c4-r8-recovery-heavy-long, run 1/3)
+[2m2026-08-10T12:02:27.733861Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r8-recovery-heavy-long repetition=1 session=00ade2e3-46e5-428c-89f6-4a7cb27a2670 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r8-recovery-heavy-long-21786-exec4-r1
+  ✓ c4-r8-recovery-heavy-long#1 — Completed
+▶ eval [recovery] fix the build, then ship --stats (c4-r8-recovery-heavy-long, run 2/3)
+[2m2026-08-10T12:04:25.000282Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r8-recovery-heavy-long repetition=2 session=e5a43be4-289d-439f-89e4-647fc308a679 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r8-recovery-heavy-long-21786-exec5-r2
+  ✓ c4-r8-recovery-heavy-long#2 — Completed
+▶ eval [recovery] fix the build, then ship --stats (c4-r8-recovery-heavy-long, run 3/3)
+[2m2026-08-10T12:05:33.521527Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r8-recovery-heavy-long repetition=3 session=70486e21-4598-4f21-9f87-5b174d457f1c path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r8-recovery-heavy-long-21786-exec6-r3
+  ✓ c4-r8-recovery-heavy-long#3 — Completed
+▶ eval [icg] records carry a unit from input to output (icg-3-cross-module, run 1/3)
+[2m2026-08-10T12:07:30.319451Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-3-cross-module repetition=1 session=fe345c2f-fa8c-45df-b63c-1f8733fb365f path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-3-cross-module-21786-exec7-r1
+  ✓ icg-3-cross-module#1 — Completed
+▶ eval [icg] records carry a unit from input to output (icg-3-cross-module, run 2/3)
+[2m2026-08-10T12:08:25.422881Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-3-cross-module repetition=2 session=02ae3fe4-f825-4b48-9d21-c08f96f976c2 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-3-cross-module-21786-exec8-r2
+  ✓ icg-3-cross-module#2 — Completed
+▶ eval [icg] records carry a unit from input to output (icg-3-cross-module, run 3/3)
+[2m2026-08-10T12:08:58.420402Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-3-cross-module repetition=3 session=60f53d59-7953-4b29-8184-1f0a0a972585 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-3-cross-module-21786-exec9-r3
+  ✓ icg-3-cross-module#3 — Completed
+▶ eval [icg] the observability batch: grouping, totals, stats, hygiene (icg-5-long-task, run 1/3)
+[2m2026-08-10T12:09:28.231012Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-5-long-task repetition=1 session=92430738-fa38-4949-a0c2-73767a3ba6d7 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-5-long-task-21786-exec10-r1
+  ✓ icg-5-long-task#1 — Completed
+▶ eval [icg] the observability batch: grouping, totals, stats, hygiene (icg-5-long-task, run 2/3)
+[2m2026-08-10T12:11:55.487457Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-5-long-task repetition=2 session=892afe44-b813-4cdc-b6d9-a6c3e1f56f8f path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-5-long-task-21786-exec11-r2
+  ✓ icg-5-long-task#2 — Completed
+▶ eval [icg] the observability batch: grouping, totals, stats, hygiene (icg-5-long-task, run 3/3)
+[2m2026-08-10T12:14:43.960879Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-5-long-task repetition=3 session=312f7039-e06d-450e-baa4-4f4a6b135b16 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-5-long-task-21786-exec12-r3
+  ✓ icg-5-long-task#3 — Completed
+▶ eval [recovery] five output/report improvements land together (c4-r7-long-multistep, run 1/3)
+[2m2026-08-10T12:17:48.153834Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r7-long-multistep repetition=1 session=8e5356b0-b5c9-403a-b279-582d9fbb942e path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r7-long-multistep-21786-exec13-r1
+  ✓ c4-r7-long-multistep#1 — Completed
+▶ eval [recovery] five output/report improvements land together (c4-r7-long-multistep, run 2/3)
+[2m2026-08-10T12:19:24.843410Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r7-long-multistep repetition=2 session=1944fd3a-9316-4bf8-ba95-b380561fb72b path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r7-long-multistep-21786-exec14-r2
+  ✓ c4-r7-long-multistep#2 — Completed
+▶ eval [recovery] five output/report improvements land together (c4-r7-long-multistep, run 3/3)
+[2m2026-08-10T12:21:19.466885Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r7-long-multistep repetition=3 session=cab3d5d4-820f-4d66-813f-0b4526309c1b path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r7-long-multistep-21786-exec15-r3
+  ✓ c4-r7-long-multistep#3 — Completed
+▶ eval [recovery] fix the build, then ship --stats (c4-r8-recovery-heavy-long, run 1/3)
+[2m2026-08-10T12:22:35.561627Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r8-recovery-heavy-long repetition=1 session=c89898a1-4c66-4e28-8f64-8a1ad988640e path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r8-recovery-heavy-long-21786-exec16-r1
+  ✓ c4-r8-recovery-heavy-long#1 — Completed
+▶ eval [recovery] fix the build, then ship --stats (c4-r8-recovery-heavy-long, run 2/3)
+[2m2026-08-10T12:23:43.545656Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r8-recovery-heavy-long repetition=2 session=87c074db-0f6d-4ca0-9e79-efadbbb41b39 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r8-recovery-heavy-long-21786-exec17-r2
+  ✓ c4-r8-recovery-heavy-long#2 — Completed
+▶ eval [recovery] fix the build, then ship --stats (c4-r8-recovery-heavy-long, run 3/3)
+[2m2026-08-10T12:24:58.581434Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c4-r8-recovery-heavy-long repetition=3 session=01299f67-59a7-4540-8412-4482567437bd path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c4-r8-recovery-heavy-long-21786-exec18-r3
+  ✓ c4-r8-recovery-heavy-long#3 — Completed
+▶ eval [icg] records carry a unit from input to output (icg-3-cross-module, run 1/3)
+[2m2026-08-10T12:26:06.576883Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-3-cross-module repetition=1 session=c2a0ff10-6a86-4f0c-8341-2c02875b7ac2 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-3-cross-module-21786-exec19-r1
+  ✓ icg-3-cross-module#1 — Completed
+▶ eval [icg] records carry a unit from input to output (icg-3-cross-module, run 2/3)
+[2m2026-08-10T12:26:41.860247Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-3-cross-module repetition=2 session=51468219-b0b3-49d6-bc6a-8ef2caed09d7 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-3-cross-module-21786-exec20-r2
+  ✓ icg-3-cross-module#2 — Completed
+▶ eval [icg] records carry a unit from input to output (icg-3-cross-module, run 3/3)
+[2m2026-08-10T12:27:29.972967Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-3-cross-module repetition=3 session=eac72178-3c95-4abd-9e1f-4b6d065765e0 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-3-cross-module-21786-exec21-r3
+  ✓ icg-3-cross-module#3 — Completed
+▶ eval [icg] the observability batch: grouping, totals, stats, hygiene (icg-5-long-task, run 1/3)
+[2m2026-08-10T12:28:29.593727Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-5-long-task repetition=1 session=47514ce3-9797-4071-b864-f55054e27b27 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-5-long-task-21786-exec22-r1
+  ✓ icg-5-long-task#1 — Completed
+▶ eval [icg] the observability batch: grouping, totals, stats, hygiene (icg-5-long-task, run 2/3)
+[2m2026-08-10T12:31:41.352835Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-5-long-task repetition=2 session=ae47ea32-fdca-4f3c-a02e-e7458db572cd path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-5-long-task-21786-exec23-r2
+  ✓ icg-5-long-task#2 — Completed
+▶ eval [icg] the observability batch: grouping, totals, stats, hygiene (icg-5-long-task, run 3/3)
+[2m2026-08-10T12:34:16.088060Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=icg-5-long-task repetition=3 session=0fa22038-5607-4ac7-a1f5-730356b2bea2 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-icg-5-long-task-21786-exec24-r3
+  ✓ icg-5-long-task#3 — Completed
+
+Eval: deepseek/deepseek-v4-flash
+  ✓ c4-r7-long-multistep     run=1 steps=27 tokens=720759/10243 latency=112801ms reads=15 searches=3 edits=8/1err (patch=8 replace=0 first@r9) Completed termination=completed
+  ✓ c4-r7-long-multistep     run=2 steps=18 tokens=361363/6643 latency=74199ms reads=17 searches=1 edits=5/0err (patch=5 replace=0 first@r9) Completed termination=completed
+  ✓ c4-r7-long-multistep     run=3 steps=19 tokens=363935/6077 latency=66406ms reads=10 searches=2 edits=4/0err (patch=4 replace=0 first@r7) Completed termination=completed
+  ✓ c4-r8-recovery-heavy-long run=1 steps=22 tokens=666000/11371 latency=117291ms reads=16 searches=3 edits=5/0err (patch=5 replace=0 first@r9) Completed termination=completed
+  ✓ c4-r8-recovery-heavy-long run=2 steps=18 tokens=470391/6154 latency=68529ms reads=12 searches=1 edits=3/0err (patch=3 replace=0 first@r7) Completed termination=completed
+  ✓ c4-r8-recovery-heavy-long run=3 steps=23 tokens=701324/11656 latency=116785ms reads=18 searches=2 edits=3/0err (patch=3 replace=0 first@r13) Completed termination=completed
+  ✓ icg-3-cross-module       run=1 steps=23 tokens=660856/4098 latency=55083ms reads=13 searches=4 edits=5/2err (patch=5 replace=0 first@r9) Completed termination=completed
+  ✓ icg-3-cross-module       run=2 steps=12 tokens=310151/2604 latency=33027ms reads=7 searches=4 edits=3/1err (patch=3 replace=0 first@r6) Completed termination=completed
+  ✓ icg-3-cross-module       run=3 steps=9 tokens=218670/2163 latency=29815ms reads=3 searches=4 edits=1/0err (patch=1 replace=0 first@r4) Completed termination=completed
+  ✓ icg-5-long-task          run=1 steps=21 tokens=656522/15956 latency=147172ms reads=17 searches=4 edits=2/0err (patch=2 replace=0 first@r10) Completed termination=completed
+  ✓ icg-5-long-task          run=2 steps=17 tokens=503334/19299 latency=168531ms reads=18 searches=4 edits=1/0err (patch=1 replace=0 first@r10) Completed termination=completed
+  ✓ icg-5-long-task          run=3 steps=22 tokens=681598/21280 latency=184185ms reads=18 searches=2 edits=5/0err (patch=5 replace=0 first@r9) Completed termination=completed
+  → 12/12 passed (100% completion, 100% completion accuracy), avg 19.2 steps
+  → self-recovered edit cases: 3 (c4-r7-long-multistep, icg-3-cross-module, icg-3-cross-module)
+  → avg 29.3 tool calls · loop rate 0% · validation rate 100%
+  → avg TTFF 57ms · max silent duration 6887ms
+  → recovery rate 100% (over injected-failure cases)
+  ★ Agent Quality Score: 100/100 (over measured components)
+
+Eval: deepseek/deepseek-v4-flash
+  ✓ c4-r7-long-multistep     run=1 steps=28 tokens=624456/9298 latency=96643ms reads=21 searches=2 edits=8/0err (patch=8 replace=0 first@r8) Completed termination=completed
+  ✓ c4-r7-long-multistep     run=2 steps=21 tokens=531905/11532 latency=114668ms reads=20 searches=3 edits=4/0err (patch=4 replace=0 first@r9) Completed termination=completed
+  ✓ c4-r7-long-multistep     run=3 steps=23 tokens=544351/6932 latency=76053ms reads=17 searches=2 edits=6/0err (patch=6 replace=0 first@r8) Completed termination=completed
+  ✓ c4-r8-recovery-heavy-long run=1 steps=18 tokens=507166/6111 latency=67989ms reads=15 searches=2 edits=3/0err (patch=3 replace=0 first@r6) Completed termination=completed
+  ✓ c4-r8-recovery-heavy-long run=2 steps=22 tokens=656956/6506 latency=75048ms reads=15 searches=2 edits=3/0err (patch=3 replace=0 first@r11) Completed termination=completed
+  ✓ c4-r8-recovery-heavy-long run=3 steps=18 tokens=349771/5947 latency=67946ms reads=13 searches=4 edits=1/0err (patch=1 replace=0 first@r10) Completed termination=completed
+  ✓ icg-3-cross-module       run=1 steps=11 tokens=269626/2429 latency=35331ms reads=7 searches=5 edits=1/0err (patch=1 replace=0 first@r7) Completed termination=completed
+  ✓ icg-3-cross-module       run=2 steps=17 tokens=467090/3822 latency=48024ms reads=9 searches=6 edits=1/0err (patch=1 replace=0 first@r8) Completed termination=completed
+  ✓ icg-3-cross-module       run=3 steps=20 tokens=571779/4902 latency=59713ms reads=13 searches=7 edits=2/1err (patch=2 replace=0 first@r11) Completed termination=completed
+  ✓ icg-5-long-task          run=1 steps=27 tokens=909361/21371 latency=191790ms reads=20 searches=3 edits=7/0err (patch=7 replace=0 first@r9) Completed termination=completed
+  ✓ icg-5-long-task          run=2 steps=19 tokens=567669/15803 latency=154635ms reads=21 searches=3 edits=1/0err (patch=1 replace=0 first@r10) Completed termination=completed
+  ✓ icg-5-long-task          run=3 steps=30 tokens=997077/14415 latency=146003ms reads=18 searches=2 edits=6/1err (patch=6 replace=0 first@r7) Completed termination=completed
+  → 12/12 passed (100% completion, 100% completion accuracy), avg 21.2 steps
+  → self-recovered edit cases: 2 (icg-3-cross-module, icg-5-long-task)
+  → avg 32.3 tool calls · loop rate 0% · validation rate 100%
+  → avg TTFF 65ms · max silent duration 6978ms
+  → recovery rate 100% (over injected-failure cases)
+  ★ Agent Quality Score: 100/100 (over measured components)
+
+Ablation: adaptive_context
+  control (adaptive_context=false) : 100%
+  ablated (adaptive_context=true) : 100%
+  rate delta : +0.0pp
+  saved by knob : (none)
+  hurt by knob  : (none)
+  rounds over 12 paired case(s): control 19.2, ablated 21.2, delta +1.9
