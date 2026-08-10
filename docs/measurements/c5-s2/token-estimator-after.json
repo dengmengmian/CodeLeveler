@@ -1,0 +1,123 @@
+{
+ "rows": [
+  {
+   "sample": "rust-source/small",
+   "estimate": 2014,
+   "actual": 2064,
+   "error_pct": -2.4,
+   "kind": "text"
+  },
+  {
+   "sample": "rust-source/medium",
+   "estimate": 8030,
+   "actual": 7628,
+   "error_pct": 5.3,
+   "kind": "text"
+  },
+  {
+   "sample": "rust-source/large",
+   "estimate": 30292,
+   "actual": 28930,
+   "error_pct": 4.7,
+   "kind": "text"
+  },
+  {
+   "sample": "ts-web/small",
+   "estimate": 2024,
+   "actual": 2030,
+   "error_pct": -0.3,
+   "kind": "text"
+  },
+  {
+   "sample": "ts-web/medium",
+   "estimate": 8024,
+   "actual": 8021,
+   "error_pct": 0.0,
+   "kind": "text"
+  },
+  {
+   "sample": "ts-web/large",
+   "estimate": 30057,
+   "actual": 31271,
+   "error_pct": -3.9,
+   "kind": "text"
+  },
+  {
+   "sample": "json-config/small",
+   "estimate": 3200,
+   "actual": 2763,
+   "error_pct": 15.8,
+   "kind": "tool"
+  },
+  {
+   "sample": "json-config/medium",
+   "estimate": 12801,
+   "actual": 10960,
+   "error_pct": 16.8,
+   "kind": "tool"
+  },
+  {
+   "sample": "json-config/large",
+   "estimate": 48014,
+   "actual": 35552,
+   "error_pct": 35.1,
+   "kind": "tool"
+  },
+  {
+   "sample": "tool-output/small",
+   "estimate": 3201,
+   "actual": 3105,
+   "error_pct": 3.1,
+   "kind": "tool"
+  },
+  {
+   "sample": "tool-output/medium",
+   "estimate": 11087,
+   "actual": 11280,
+   "error_pct": -1.7,
+   "kind": "tool"
+  },
+  {
+   "sample": "mixed-docs/small",
+   "estimate": 2900,
+   "actual": 2940,
+   "error_pct": -1.4,
+   "kind": "text"
+  },
+  {
+   "sample": "mixed-docs/medium",
+   "estimate": 13589,
+   "actual": 13224,
+   "error_pct": 2.8,
+   "kind": "text"
+  },
+  {
+   "sample": "mixed-docs/large",
+   "estimate": 52543,
+   "actual": 51041,
+   "error_pct": 2.9,
+   "kind": "text"
+  },
+  {
+   "sample": "cjk-heavy/small",
+   "estimate": 3659,
+   "actual": 3429,
+   "error_pct": 6.7,
+   "kind": "text"
+  },
+  {
+   "sample": "cjk-heavy/medium",
+   "estimate": 14333,
+   "actual": 13866,
+   "error_pct": 3.4,
+   "kind": "text"
+  },
+  {
+   "sample": "cjk-heavy/large",
+   "estimate": 53109,
+   "actual": 51873,
+   "error_pct": 2.4,
+   "kind": "text"
+  }
+ ]
+}

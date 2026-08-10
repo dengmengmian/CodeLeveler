@@ -1,0 +1,184 @@
+{
+ "calls": 11,
+ "input_total": 5360841,
+ "probes": [
+  {
+   "target": 128000,
+   "seed": 1,
+   "input_tokens": 158376,
+   "cached": 0,
+   "output_tokens": 300,
+   "latency_s": 8.3,
+   "recall": {
+    "early": false,
+    "p25": false,
+    "p50": false,
+    "p75": false,
+    "late": false
+   },
+   "overall": 0
+  },
+  {
+   "target": 128000,
+   "seed": 1,
+   "input_tokens": 127567,
+   "cached": 0,
+   "output_tokens": 86,
+   "latency_s": 13.6,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 128000,
+   "seed": 2,
+   "input_tokens": 127491,
+   "cached": 0,
+   "output_tokens": 85,
+   "latency_s": 12.5,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 256000,
+   "seed": 1,
+   "input_tokens": 254870,
+   "cached": 2560,
+   "output_tokens": 86,
+   "latency_s": 31.1,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 256000,
+   "seed": 2,
+   "input_tokens": 254858,
+   "cached": 0,
+   "output_tokens": 85,
+   "latency_s": 28.4,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 512000,
+   "seed": 1,
+   "input_tokens": 509536,
+   "cached": 3200,
+   "output_tokens": 86,
+   "latency_s": 62.7,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 512000,
+   "seed": 2,
+   "input_tokens": 509478,
+   "cached": 2560,
+   "output_tokens": 85,
+   "latency_s": 115.9,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 768000,
+   "seed": 1,
+   "input_tokens": 764167,
+   "cached": 4992,
+   "output_tokens": 86,
+   "latency_s": 114.2,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 768000,
+   "seed": 2,
+   "input_tokens": 764179,
+   "cached": 4992,
+   "output_tokens": 85,
+   "latency_s": 110.1,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 950000,
+   "seed": 1,
+   "input_tokens": 945119,
+   "cached": 10112,
+   "output_tokens": 86,
+   "latency_s": 30.2,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "target": 950000,
+   "seed": 2,
+   "input_tokens": 945200,
+   "cached": 10112,
+   "output_tokens": 85,
+   "latency_s": 28.6,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  }
+ ],
+ "method": "c5-s2-long-context-recall-v1: deterministic code-like corpus, 5 positional needles (2%,25%,50%,75%,97%), exact-match, thinking disabled, max_tokens=300",
+ "note_probe_0": "INVALID: thinking-mode default consumed the output budget; disabled for all subsequent probes"
+}

@@ -298,33 +298,126 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
     // keeps compaction firing on image-heavy conversations when the gateway
     // reports no usage.
     const IMAGE_BYTE_EQUIV: u64 = 4096;
-    let mut ascii_bytes: u64 = 0;
+    let mut ascii_text: u64 = 0;
+    let mut ascii_tool: u64 = 0;
     let mut wide_bytes: u64 = 0;
     let mut flat: u64 = 0;
-    let mut count = |s: &str| {
+    let mut split = |s: &str| -> (u64, u64) {
         let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
-        ascii_bytes += ascii;
-        wide_bytes += s.len() as u64 - ascii;
+        (ascii, s.len() as u64 - ascii)
     };
     for part in messages.iter().flat_map(|m| &m.content) {
         match part {
-            ContentPart::Text { text } => count(text),
-            ContentPart::ToolCall { call } => {
-                count(&call.name);
-                count(&call.arguments.to_string());
+            ContentPart::Text { text } => {
+                let (a, w) = split(text);
+                ascii_text += a;
+                wide_bytes += w;
             }
-            ContentPart::ToolResult { result } => count(&result.content),
+            // Tool payloads are JSON/log shaped — brackets, quotes, repeated
+            // keys, hex ids — and tokenize far denser than prose: measured
+            // ~2.5–2.9 bytes/token against DeepSeek-reported usage (C5-S2,
+            // docs/C5_S2_MEASUREMENT_CALIBRATION.md), where a flat ÷4
+            // under-counted tool-heavy transcripts by 27–38% and fired
+            // compaction only after the request was already oversized.
+            // Weighted at 2.5 so the residual error sits on the safe
+            // (slightly over-estimating) side.
+            ContentPart::ToolCall { call } => {
+                let (a, w) = split(&call.name);
+                ascii_tool += a;
+                wide_bytes += w;
+                let (a, w) = split(&call.arguments.to_string());
+                ascii_tool += a;
+                wide_bytes += w;
+            }
+            ContentPart::ToolResult { result } => {
+                let (a, w) = split(&result.content);
+                ascii_tool += a;
+                wide_bytes += w;
+            }
             ContentPart::Image { .. } => flat += IMAGE_BYTE_EQUIV / 4,
             _ => {}
         }
     }
-    ascii_bytes / 4 + wide_bytes / 3 + flat
+    ascii_text / 4 + ascii_tool * 2 / 5 + wide_bytes / 3 + flat
 }
 
 #[cfg(test)]
 mod estimate_tests {
     use super::*;
     use leveler_model::Role;
+
+    #[test]
+    fn tool_payloads_are_weighted_denser_than_prose() {
+        // Measured against DeepSeek-reported usage (C5-S2): tool payloads
+        // tokenize at ~2.5-2.9 bytes/token vs prose's ~4. The same bytes as
+        // a tool result must therefore estimate higher than as plain text.
+        let body = "{\"path\":\"src/lib.rs\",\"exit\":0}".repeat(100);
+        let as_text = estimate_tokens(&[Message::text(Role::User, body.clone())]);
+        let as_tool = estimate_tokens(&[Message {
+            role: Role::User,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new("c"),
+                    content: body,
+                    is_error: false,
+                },
+            }],
+        }]);
+        assert!(
+            as_tool > as_text * 3 / 2,
+            "tool weighting missing: text={as_text} tool={as_tool}"
+        );
+    }
+
+    /// Frozen calibration regressions (C5-S2). Each fixture is the exact byte
+    /// sequence measured against DeepSeek `prompt_tokens` on 2026-08-10
+    /// (framing-corrected); the tolerance encodes the acceptance gate: never
+    /// under-estimate by more than 10%, over-estimation bounded at 40%.
+    /// Raw data: docs/measurements/c5-s2/.
+    #[test]
+    fn calibration_fixtures_stay_within_measured_tolerance() {
+        for (fixture, actual, tool) in [
+            (
+                include_str!("../tests/fixtures/calib-rust-small.txt"),
+                2064u64,
+                false,
+            ),
+            (
+                include_str!("../tests/fixtures/calib-json-small.txt"),
+                2763,
+                true,
+            ),
+            (
+                include_str!("../tests/fixtures/calib-tool-small.txt"),
+                3105,
+                true,
+            ),
+        ] {
+            let message = if tool {
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: leveler_core::ToolCallId::new("c"),
+                            content: fixture.to_string(),
+                            is_error: false,
+                        },
+                    }],
+                }
+            } else {
+                Message::text(Role::User, fixture.to_string())
+            };
+            let est = estimate_tokens(&[message]);
+            assert!(
+                est * 10 >= actual * 9,
+                "under-estimates measured ground truth by >10%: est={est} actual={actual}"
+            );
+            assert!(
+                est * 10 <= actual * 14,
+                "over-estimates measured ground truth by >40%: est={est} actual={actual}"
+            );
+        }
+    }
 
     #[test]
     fn cjk_text_is_not_underestimated() {
