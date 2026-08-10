@@ -1,0 +1,19 @@
+diff --git a/internal/ingest/decoder.go b/internal/ingest/decoder.go
+index d79ec26..e3c7654 100644
+--- a/internal/ingest/decoder.go
++++ b/internal/ingest/decoder.go
+@@ -1010,13 +1010,7 @@ func (csvDecoder) DecodeLine(line []byte) (api.Record, bool) {
+ 	} else {
+ 		record.Value = value
+ 	}
+-	extras := columns[2:]
+-	if len(extras) > 0 {
+-		// Exporters sometimes end a line with a trailing comma; drop the
+-		// empty final field it produces.
+-		extras = extras[:len(extras)-1]
+-	}
+-	for _, column := range extras {
++	for _, column := range columns[2:] {
+ 		key, labelValue, ok := strings.Cut(column, "=")
+ 		if !ok {
+ 			continue

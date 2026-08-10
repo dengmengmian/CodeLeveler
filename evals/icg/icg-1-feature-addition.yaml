@@ -1,0 +1,67 @@
+# ICG-1 — Feature addition (C2+C3 composed). The task is a product ask with no
+# file named anywhere: entry discovery, architecture understanding, multi-file
+# change and a new test are all on the agent.
+id: icg-1-feature-addition
+name: "[icg] add a --names-only mode"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - cmd/navsvc/main.go
+required_impact_paths:
+  - cmd/navsvc/main.go
+  - internal/report/aggregate.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+task: |
+  Operators exploring an unfamiliar exporter dump just want to know which
+  metrics are in it. Add a `--names-only` mode: `navsvc <config>
+  --names-only` prints the distinct metric names of the run, sorted, one
+  per line, and nothing else. Records the decoder marked not valid still
+  count for this — the operator wants to see every name that appeared.
+
+  Normal output and `--summary` behave exactly as before. Cover the new
+  behaviour with a test.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/icg1.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf '{"name":"b","value":1}\n{"name":"a","value":2}\n{"name":"b","value":"zz"}\n' > "$d/in.jsonl"
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/c.conf"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --names-only)"
+      [ "$out" = "a
+      b" ] || { printf 'names-only wrong: %s\n' "$out" >&2; exit 1; }
+      # other modes unchanged
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" 2>/dev/null | head -1)" = "b=1" ]
+      < "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary | grep -qx 'a count=1 total=2'
+      # the new behaviour is covered by a test the agent added
+      grep -rln --include='*_test.go' -- "names-only\|NamesOnly\|namesOnly" . | grep -q .
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The exact --names-only output (sorted, one per line, invalid records
+      included), other modes untouched, and a test covering it.
+    oracle_interpretation: >-
+      Sorted distinct names only; normal and summary output unchanged; some
+      *_test.go references the new mode.
+    rationale: >-
+      Format, sorting, the invalid-records rule and the test requirement are
+      each a stated sentence. No surface is named — discovery is the point.

@@ -220,6 +220,40 @@ def check(path: str) -> dict:
     gates = dict.fromkeys(("G1", "G2", "G3", "G4", "G5", "G6"), SKIP)
     reasons: list[str] = []
 
+    # A negative case measures honest failure: the task is deliberately
+    # unsatisfiable and the pass condition is leaving the tree undamaged. Its
+    # gates invert accordingly: the untouched workspace MUST pass (doing
+    # nothing is the correct outcome), and the sincere naive fix — shipped as
+    # the reference patch — MUST break the maintained checks, proving the
+    # contradiction is real and not merely asserted.
+    if (case.get("validity") or {}).get("negative"):
+        with tempfile.TemporaryDirectory(prefix="fixture-validity-") as tmp:
+            untouched = os.path.join(tmp, "untouched")
+            materialize(case, untouched)
+            gates["G1"] = PASS if run_acceptance(case, untouched) == 0 else FAIL
+            if gates["G1"] == FAIL:
+                reasons.append("NEGATIVE_UNTOUCHED_FAILS")
+            attempt = os.path.join(tmp, "attempt")
+            materialize(case, attempt)
+            applied, why = apply_reference(case_id, attempt)
+            if not applied:
+                gates["G4"] = FAIL
+                reasons.append(f"NEGATIVE_ATTEMPT_MISSING: {why}")
+            else:
+                ok, _ = run_maintained(case, attempt)
+                gates["G4"] = FAIL if ok else PASS
+                if gates["G4"] == FAIL:
+                    reasons.append("NEGATIVE_TASK_IS_SATISFIABLE")
+            semantics, _ = check_semantics(case)
+            gates["G6"] = PASS if semantics == "UNAMBIGUOUS" else FAIL
+            if gates["G6"] == FAIL:
+                reasons.append("SEMANTICS_" + semantics)
+            gates["G3"] = gates["G5"] = SKIP
+            gates["G2"] = PASS if all(
+                gates[g] == PASS for g in ("G1", "G4", "G6")) else FAIL
+            status = VALID if gates["G2"] == PASS else INVALID
+            return dict(case=case_id, gates=gates, status=status, reasons=reasons)
+
     with tempfile.TemporaryDirectory(prefix="fixture-validity-") as tmp:
         # G1 — the broken state must actually fail.
         broken = os.path.join(tmp, "broken")

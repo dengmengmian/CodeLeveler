@@ -1,0 +1,98 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..cc6b9f6 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -22,10 +22,13 @@ func main() {
+ func run(args []string) error {
+ 	configPath := ""
+ 	summarize := false
++	namesOnly := false
+ 	for _, arg := range args {
+ 		switch {
+ 		case arg == "--summary":
+ 			summarize = true
++		case arg == "--names-only":
++			namesOnly = true
+ 		case configPath == "":
+ 			configPath = arg
+ 		}
+@@ -64,6 +67,10 @@ func run(args []string) error {
+ 	var collected []api.Batch
+ 	err = reader.Read(input, func(batch api.Batch) error {
+ 		batch = pipe.Apply(batch)
++		if namesOnly {
++			collected = append(collected, batch)
++			return nil
++		}
+ 		if summarize {
+ 			collected = append(collected, batch)
+ 			return nil
+@@ -73,6 +80,12 @@ func run(args []string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if namesOnly {
++		for _, name := range report.Names(collected) {
++			fmt.Println(name)
++		}
++		return nil
++	}
+ 	if summarize {
+ 		fmt.Print(report.Aggregate(collected))
+ 	}
+diff --git a/internal/report/names.go b/internal/report/names.go
+new file mode 100644
+index 0000000..dc1ebd6
+--- /dev/null
++++ b/internal/report/names.go
+@@ -0,0 +1,24 @@
++package report
++
++import (
++	"sort"
++
++	"navsvc/pkg/api"
++)
++
++// Names returns the distinct record names across the batches, sorted. Invalid
++// records still count: the caller wants every name that appeared.
++func Names(batches []api.Batch) []string {
++	seen := map[string]struct{}{}
++	for _, batch := range batches {
++		for _, record := range batch.Records {
++			seen[record.Name] = struct{}{}
++		}
++	}
++	names := make([]string, 0, len(seen))
++	for name := range seen {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	return names
++}
+diff --git a/internal/report/names_test.go b/internal/report/names_test.go
+new file mode 100644
+index 0000000..466bdd1
+--- /dev/null
++++ b/internal/report/names_test.go
+@@ -0,0 +1,20 @@
++package report
++
++import (
++	"testing"
++
++	"navsvc/pkg/api"
++)
++
++// Covers the --names-only mode's counting rule: sorted, distinct, and invalid
++// records still contribute their name.
++func TestNamesOnlyIncludesInvalidRecords(t *testing.T) {
++	names := Names([]api.Batch{{Records: []api.Record{
++		{Name: "b", Value: 1, Valid: true},
++		{Name: "a", Value: 2, Valid: true},
++		{Name: "b", Valid: false},
++	}}})
++	if len(names) != 2 || names[0] != "a" || names[1] != "b" {
++		t.Fatalf("want [a b], got %v", names)
++	}
++}

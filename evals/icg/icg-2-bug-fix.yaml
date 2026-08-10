@@ -1,0 +1,68 @@
+# ICG-2 — Bug fix (C2+C3+verification composed). A user-visible symptom, no
+# file named: the defect hides mid-way through a 1000-line decoder behind a
+# plausible-looking "defensive" guard. Root-causing it is the work; the fix is
+# two lines once found.
+id: icg-2-bug-fix
+name: "[icg] the last CSV label on a line disappears"
+repo: fixtures/repos/navsvc-icg2
+max_rounds: 60
+recovery: true
+relevant_paths:
+  - internal/ingest/decoder.go
+required_impact_paths:
+  - internal/ingest/decoder.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+task: |
+  A user reports that CSV label data is silently vanishing:
+
+  "A line like `req,5,env=prod` comes out as just `req=5` — the env label
+  is gone. If I add another label after it, the FIRST one shows up and the
+  last one vanishes instead. It's always exactly the last label on the
+  line. JSON-lines input is fine."
+
+  Find the root cause and fix it. Real trailing empty fields (a line
+  ending in a bare comma) must still be tolerated — they produce no label
+  either way.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/icg2.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = csv\noutput.sink = stdout\n' > "$d/c.conf"
+      printf 'req,5,env=prod\n' > "$d/one.csv"
+      [ "$(< "$d/one.csv" "$d/navsvc" "$d/c.conf" 2>/dev/null)" = "req=5 env=prod" ]
+      printf 'req,5,env=prod,host=a1\n' > "$d/two.csv"
+      [ "$(< "$d/two.csv" "$d/navsvc" "$d/c.conf" 2>/dev/null)" = "req=5 env=prod host=a1" ]
+      printf 'req,5,env=prod,\n' > "$d/trail.csv"
+      [ "$(< "$d/trail.csv" "$d/navsvc" "$d/c.conf" 2>/dev/null)" = "req=5 env=prod" ]
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The last CSV label survives, multiple labels all survive, and a real
+      trailing comma still produces no label.
+    oracle_interpretation: >-
+      One, two and trailing-comma label lines each encode with every real
+      label present.
+    rationale: >-
+      The user report pins the exact symptom and the task pins the
+      trailing-comma tolerance the buggy guard pretended to provide. The
+      difficulty is localization inside a large file, not interpretation.

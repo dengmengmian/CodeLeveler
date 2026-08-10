@@ -844,7 +844,7 @@ func run(args []string) error {
 # needs X to actually be broken; a fixture where the described behaviour
 # already works makes its hidden acceptance pass untouched and measures
 # nothing. Each defect is a named, minimal removal from the healthy source.
-DEFECTS = ("jsonl-depth",)
+DEFECTS = ("jsonl-depth", "csv-last-label")
 
 
 def large_decoder(defect: str | None = None) -> str:
@@ -1034,6 +1034,35 @@ func (csvDecoder) DecodeLine(line []byte) (api.Record, bool) {
         text = text.replace(depth_case, '''		case "depth":
 			// TODO(navsvc): wire this through once Record.Depth is used.
 			continue
+''', 1)
+
+    if defect == "csv-last-label":
+        # ICG-2's bug: a well-meant guard against lines ending in a trailing
+        # comma drops the last REAL column instead. Any label that happens to
+        # be last on its CSV line silently disappears; jsonl is unaffected.
+        # Looks like defensive code, reads plausibly in review.
+        label_loop = '''	for _, column := range columns[2:] {
+		key, labelValue, ok := strings.Cut(column, "=")
+		if !ok {
+			continue
+		}
+		record.Labels[strings.TrimSpace(key)] = strings.TrimSpace(labelValue)
+	}
+'''
+        assert label_loop in text, "healthy decoder must carry the label loop"
+        text = text.replace(label_loop, '''	extras := columns[2:]
+	if len(extras) > 0 {
+		// Exporters sometimes end a line with a trailing comma; drop the
+		// empty final field it produces.
+		extras = extras[:len(extras)-1]
+	}
+	for _, column := range extras {
+		key, labelValue, ok := strings.Cut(column, "=")
+		if !ok {
+			continue
+		}
+		record.Labels[strings.TrimSpace(key)] = strings.TrimSpace(labelValue)
+	}
 ''', 1)
     return text
 
