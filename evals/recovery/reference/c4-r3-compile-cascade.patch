@@ -1,0 +1,30 @@
+diff --git a/internal/sink/file.go b/internal/sink/file.go
+index c99e2a6..be11665 100644
+--- a/internal/sink/file.go
++++ b/internal/sink/file.go
+@@ -36,3 +36,5 @@ func (s *fileSink) Close() error {
+ 	}
+ 	return s.file.Close()
+ }
++
++func (s *fileSink) Describe() string { return "temp file" }
+diff --git a/internal/sink/null.go b/internal/sink/null.go
+index d12665d..89b5904 100644
+--- a/internal/sink/null.go
++++ b/internal/sink/null.go
+@@ -7,3 +7,5 @@ type nullSink struct{}
+ 
+ func (nullSink) Write(api.Batch) error { return nil }
+ func (nullSink) Close() error          { return nil }
++
++func (nullSink) Describe() string { return "discards records" }
+diff --git a/internal/sink/stdout.go b/internal/sink/stdout.go
+index e787484..39558a7 100644
+--- a/internal/sink/stdout.go
++++ b/internal/sink/stdout.go
+@@ -26,3 +26,5 @@ func (s *stdoutSink) Write(batch api.Batch) error {
+ }
+ 
+ func (s *stdoutSink) Close() error { return s.out.Flush() }
++
++func (s *stdoutSink) Describe() string { return "standard output" }

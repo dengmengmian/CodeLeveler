@@ -1,0 +1,109 @@
+# C4-R3 — Multi-file compile cascade. An interface change half-landed: the
+# contract is already updated, none of the implementations are. The compiler
+# reports errors across several files; the fix must clear the whole cascade,
+# not silence one error. Starting module named to keep navigation out of it.
+id: c4-r3-compile-cascade
+name: "[recovery] Sink gained Describe() and nothing implements it"
+repo: fixtures/repos/navsvc
+max_rounds: 50
+recovery: true
+relevant_paths:
+  - internal/sink/sink.go
+required_impact_paths:
+  - internal/sink/stdout.go
+  - internal/sink/file.go
+  - internal/sink/null.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+files:
+  internal/sink/sink.go: |
+    package sink
+
+    import "navsvc/pkg/api"
+
+    // Sink receives batches after the pipeline has run.
+    //
+    // Write is called once per batch; Close exactly once at the end of the
+    // run. Describe reports a short human-readable description of where the
+    // sink puts records — surfaced in diagnostics.
+    type Sink interface {
+    	Write(batch api.Batch) error
+    	Close() error
+    	Describe() string
+    }
+
+    // For resolves a sink by its configuration name.
+    func For(name string) (Sink, bool) {
+    	switch name {
+    	case "", "stdout":
+    		return newStdoutSink(), true
+    	case "file":
+    		return newFileSink(), true
+    	case "null":
+    		return nullSink{}, true
+    	}
+    	return nil, false
+    }
+task: |
+  A contract change half-landed in `internal/sink`: the `Sink` interface
+  gained `Describe() string` (a short human-readable description of where
+  the sink puts records), but none of the implementations were updated, so
+  `go build ./...` fails across the package.
+
+  Finish the change: every sink implements `Describe` with a sensible
+  description — stdout writes to standard output, file to a temp file, null
+  discards records.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cat > internal/sink/zz_hidden_r3_test.go <<'GO'
+      package sink
+
+      import "testing"
+
+      func TestEverySinkDescribesItself(t *testing.T) {
+      	for _, name := range []string{"stdout", "file", "null"} {
+      		s, ok := For(name)
+      		if !ok {
+      			t.Fatalf("sink %q missing", name)
+      		}
+      		if s.Describe() == "" {
+      			t.Fatalf("%s: Describe must not be empty", name)
+      		}
+      		_ = s.Close()
+      	}
+      }
+      GO
+      trap 'rm -f internal/sink/zz_hidden_r3_test.go' EXIT
+      go build ./... > /dev/null
+      go test ./internal/sink/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The whole compile cascade cleared: every sink implements Describe and
+      returns a non-empty description.
+    oracle_interpretation: >-
+      Build green, each registry sink's Describe() non-empty.
+    rationale: >-
+      The interface is already in the tree and the task restates its
+      contract; the work is finishing the propagation the compiler is
+      already pointing at, file by file.

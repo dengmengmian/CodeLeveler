@@ -1,0 +1,13 @@
+diff --git a/internal/pipeline/filter.go b/internal/pipeline/filter.go
+index 0f3c92c..91cc1d2 100644
+--- a/internal/pipeline/filter.go
++++ b/internal/pipeline/filter.go
+@@ -16,7 +16,7 @@ func (filterStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+ 	}
+ 	kept := batch.Records[:0]
+ 	for _, record := range batch.Records {
+-		if record.Value != 0 {
++		if record.Valid {
+ 			kept = append(kept, record)
+ 		}
+ 	}

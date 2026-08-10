@@ -1,0 +1,82 @@
+# C4-R4 — Behavioral verification recovery. Build green, one maintained test
+# red with an exact expected/actual ("want 1 record kept, got 0"). The stage
+# filters on the wrong field entirely — value instead of validity — so the
+# repair has to come from reading that evidence, not from syntax.
+id: c4-r4-behavior-recovery
+name: "[recovery] the filter stage keeps the wrong records"
+repo: fixtures/repos/navsvc
+max_rounds: 40
+recovery: true
+relevant_paths:
+  - internal/pipeline/filter.go
+required_impact_paths:
+  - internal/pipeline/filter.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/pipeline/filter.go: |
+    package pipeline
+
+    import (
+    	"navsvc/internal/config"
+    	"navsvc/pkg/api"
+    )
+
+    // filterStage removes records a decoder marked unusable.
+    type filterStage struct{}
+
+    func (filterStage) Name() string { return "filter" }
+
+    func (filterStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+    	if !cfg.DropInvalid {
+    		return batch
+    	}
+    	kept := batch.Records[:0]
+    	for _, record := range batch.Records {
+    		if record.Value != 0 {
+    			kept = append(kept, record)
+    		}
+    	}
+    	batch.Records = kept
+    	return batch
+    }
+
+task: |
+  `go test ./...` is red in `internal/pipeline`: with `drop_invalid`
+  enabled, the filter stage is dropping valid zero-value records and
+  keeping invalid ones — it filters on the wrong thing. The test pins the
+  intended behaviour: validity decides, not the value. Fix the stage.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go build ./... > /dev/null
+      go test ./internal/pipeline/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: pass
+    tests: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The filter keeps valid records and drops invalid ones again.
+    oracle_interpretation: >-
+      The maintained pipeline suite is green with tests untouched.
+    rationale: >-
+      The failing test states the count it expects and the task states the
+      rule ("validity decides, not the value"). One reading.
