@@ -904,6 +904,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_later_failing_file_leaves_the_earlier_matching_file_untouched() {
+        // Every operation is planned before the first byte is written, so a
+        // patch whose second file cannot apply must leave the first — which
+        // matched perfectly — exactly as it was.
+        let (context, dir) = ctx();
+        let second = dir.join("src/second.rs");
+        std::fs::write(&second, "second-original\n").unwrap();
+        let before = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+
+        let patch = "*** Begin Patch\n\
+                     *** Update File: src/lib.rs\n-fn a() {}\n+fn a() { edited(); }\n\
+                     *** Update File: src/second.rs\n-no such line\n+x\n\
+                     *** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+            before,
+            "the matching file must not be written when a later file fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "second-original\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rollback_that_would_clobber_a_concurrent_write_fails_loudly() {
+        use fs2::FileExt;
+
+        // File A commits, file B turns out stale — and between the two an
+        // external writer also rewrote A. Rolling A back would now discard
+        // that write, so rollback must refuse loudly and leave the external
+        // content in place rather than quietly "restoring" over it.
+        let (context, dir) = ctx();
+        let second = dir.join("src/second.rs");
+        std::fs::write(&second, "second-original\n").unwrap();
+
+        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &second);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let patch = "*** Begin Patch\n\
+                     *** Update File: src/lib.rs\n-fn a() {}\n+fn a() { edited(); }\n\
+                     *** Delete File: src/second.rs\n\
+                     *** End Patch";
+        // A failed rollback is surfaced as a ToolError, not a ToolOutput —
+        // capture the Result instead of unwrapping it.
+        let task = tokio::spawn({
+            let context = context.clone();
+            async move {
+                ApplyPatchTool
+                    .execute(
+                        serde_json::json!({ "patch": patch }),
+                        context,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let now = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+                if now.contains("edited()") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first operation should commit before the second lock");
+
+        std::fs::write(dir.join("src/lib.rs"), "external-lib-change\n").unwrap();
+        std::fs::write(&second, "external-change\n").unwrap();
+        FileExt::unlock(&lock).unwrap();
+        drop(lock);
+
+        let message = match task.await.unwrap() {
+            Ok(out) => {
+                assert!(out.is_error, "the stale delete must reject the patch");
+                out.content
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("rollback"),
+            "the failure must say rollback could not complete: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+            "external-lib-change\n",
+            "rollback must not overwrite the concurrent writer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "external-change\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_later_op_rolls_back_a_committed_move_completely() {
+        use fs2::FileExt;
+
+        // A move is Create(dest) + Remove(source). When a later operation
+        // fails, rollback must restore the source and remove the destination:
+        // no half-moved pair, no lost file.
+        let (context, dir) = ctx();
+        let second = dir.join("src/second.rs");
+        std::fs::write(&second, "second-original\n").unwrap();
+        let before = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+
+        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &second);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let patch = "*** Begin Patch\n\
+                     *** Update File: src/lib.rs\n*** Move to: src/moved.rs\n fn a() {}\n fn b() {}\n\
+                     *** Delete File: src/second.rs\n\
+                     *** End Patch";
+        let task = tokio::spawn({
+            let context = context.clone();
+            async move {
+                ApplyPatchTool
+                    .execute(
+                        serde_json::json!({ "patch": patch }),
+                        context,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !dir.join("src/moved.rs").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the move should commit before the second lock");
+
+        std::fs::write(&second, "external-change\n").unwrap();
+        FileExt::unlock(&lock).unwrap();
+        drop(lock);
+
+        let out = task.await.unwrap();
+        assert!(out.is_error, "the stale delete must reject the patch");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+            before,
+            "the moved-away source must be restored"
+        );
+        assert!(
+            !dir.join("src/moved.rs").exists(),
+            "the move destination must be removed on rollback"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "external-change\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_the_formatter_rewrites_the_file_is_not_stale() {
+        // The formatter rewrites what the patch wrote; its output — not the
+        // patch's bytes — must become the authoritative file state, or every
+        // follow-up edit against the (formatted) tree trips the stale guard.
+        if std::process::Command::new("gofmt")
+            .arg("-h")
+            .output()
+            .is_err()
+        {
+            return; // gofmt not installed — skip
+        }
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("main.go", "package main\n\nfunc main() {\n}\n")],
+        );
+        let context = context.with_auto_format(true);
+
+        // The patch writes deliberately misformatted Go; gofmt normalizes it.
+        let first = "*** Begin Patch\n*** Update File: main.go\n func main() {\n+\tx   :=   1\n+\t_ = x\n }\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": first }),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let formatted = std::fs::read_to_string(dir.join("main.go")).unwrap();
+        assert!(
+            formatted.contains("x := 1"),
+            "gofmt should have normalized the spacing: {formatted}"
+        );
+
+        // The second patch is written against the FORMATTED content.
+        let second =
+            "*** Begin Patch\n*** Update File: main.go\n-\tx := 1\n+\tx := 2\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": second }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.is_error,
+            "an edit against the formatter's output must not be stale: {}",
+            out.content
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("main.go"))
+                .unwrap()
+                .contains("x := 2")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn enforces_max_files_per_step() {
         let (context, dir) = ctx();
         let context = context.with_policy_limits(2, true); // cap at 2 files
