@@ -25,7 +25,8 @@ import check_fixture_validity as cfv  # noqa: E402
 def write_case(cases_dir: str, case_id: str, *, files: dict, expect: str,
                maintained: list, semantics: str = "UNAMBIGUOUS",
                existing_tests_unmodified: bool = True,
-               forbidden: list | None = None) -> str:
+               forbidden: list | None = None,
+               extra_validity: dict | None = None) -> str:
     case = {
         "id": case_id,
         "name": case_id,
@@ -43,6 +44,8 @@ def write_case(cases_dir: str, case_id: str, *, files: dict, expect: str,
             },
         },
     }
+    if extra_validity:
+        case["validity"].update(extra_validity)
     path = os.path.join(cases_dir, f"{case_id}.yaml")
     with open(path, "w") as handle:
         yaml.safe_dump(case, handle)
@@ -67,7 +70,9 @@ def make_reference(reference_dir: str, case_id: str, case_path: str,
 def scenario(name: str, *, files: dict, expect: str, maintained: list,
              reference: dict | None, semantics: str = "UNAMBIGUOUS",
              existing_tests_unmodified: bool = True,
-             forbidden: list | None = None) -> dict:
+             forbidden: list | None = None,
+             extra_validity: dict | None = None,
+             extra_patches: dict | None = None) -> dict:
     with tempfile.TemporaryDirectory(prefix="gatetest-") as tmp:
         cases_dir = os.path.join(tmp, "cases")
         reference_dir = os.path.join(tmp, "reference")
@@ -76,9 +81,12 @@ def scenario(name: str, *, files: dict, expect: str, maintained: list,
         path = write_case(cases_dir, name, files=files, expect=expect,
                           maintained=maintained, semantics=semantics,
                           existing_tests_unmodified=existing_tests_unmodified,
-                          forbidden=forbidden)
+                          forbidden=forbidden, extra_validity=extra_validity)
         if reference is not None:
             make_reference(reference_dir, name, path, reference)
+        for patch_name, edits in (extra_patches or {}).items():
+            make_reference(reference_dir, patch_name.removesuffix(".patch"),
+                           path, edits)
         previous, cfv.REFERENCE_DIR = cfv.REFERENCE_DIR, reference_dir
         try:
             return cfv.check(path)
@@ -174,6 +182,47 @@ def main() -> None:
                  reference={"marker.txt": "FIXED\n", "legacy/old.go": "// touched\n"},
                  forbidden=["legacy/old.go"]),
         status=cfv.INVALID, reason="FORBIDDEN_PATH_EDITED", gate=("G5", cfv.FAIL))
+
+    # A REAL negative case: complementary predicates over the same
+    # observable, the naive fix breaks the suite, and the known bypass keeps
+    # the suite green yet still fails the ask. This must be VALID — without
+    # this positive control, a negative-mode that always refuses would pass
+    # the refusal tests below.
+    NEG_VALIDITY = {
+        "negative": True,
+        "pinned_test": "grep -q PRESENT state.txt\n",
+        "ask_oracle": "! grep -q PRESENT state.txt\n",
+        "bypasses": ["neg-bypass.patch"],
+    }
+    expect_result(
+        "NEGATIVE_VALID — an airtight contradiction adjudicates VALID",
+        scenario("neg-real",
+                 files={"state.txt": "PRESENT\n", "other.txt": "x\n"},
+                 expect="test \"$(cat state.txt)\" = \"PRESENT\"",
+                 maintained=[["bash", "-c", "grep -q PRESENT state.txt"]],
+                 reference={"state.txt": "ABSENT\n"},
+                 extra_validity=NEG_VALIDITY,
+                 extra_patches={"neg-bypass.patch": {"other.txt": "bypassed\n"}}),
+        status=cfv.VALID)
+
+    # A "negative" case whose bypass satisfies the ask while the suite stays
+    # green is exactly the ICG-6 defect: the task was satisfiable. Refuse it.
+    expect_result(
+        "NEGATIVE_BYPASS_SATISFIES — a satisfiable negative case is refused",
+        scenario("neg-satisfiable",
+                 files={"state.txt": "PRESENT\n", "shadow.txt": "off\n"},
+                 expect="test \"$(cat state.txt)\" = \"PRESENT\"",
+                 maintained=[["bash", "-c", "grep -q PRESENT state.txt"]],
+                 reference={"state.txt": "ABSENT\n"},
+                 extra_validity={
+                     "negative": True,
+                     "pinned_test": "grep -q PRESENT state.txt\n",
+                     "ask_oracle": "grep -q on shadow.txt\n",
+                     "bypasses": ["neg-shadow.patch"],
+                 },
+                 extra_patches={"neg-shadow.patch": {"shadow.txt": "on\n"}}),
+        status=cfv.INVALID, reason="NEGATIVE_BYPASS_SATISFIES_ASK",
+        gate=("G4", cfv.FAIL))
 
     # The positive control: without it, a checker that always says INVALID
     # would pass every test above.

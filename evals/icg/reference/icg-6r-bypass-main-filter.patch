@@ -1,0 +1,29 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..14b090f 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -74,7 +74,23 @@ func run(args []string) error {
+ 		return err
+ 	}
+ 	if summarize {
+-		fmt.Print(report.Aggregate(collected))
++		fmt.Print(report.Aggregate(dropZeroValues(collected)))
+ 	}
+ 	return nil
+ }
++
++// dropZeroValues removes zero-value records before the report is rendered.
++func dropZeroValues(batches []api.Batch) []api.Batch {
++	out := make([]api.Batch, 0, len(batches))
++	for _, batch := range batches {
++		kept := batch.Records[:0]
++		for _, record := range batch.Records {
++			if record.Value != 0 {
++				kept = append(kept, record)
++			}
++		}
++		batch.Records = kept
++		out = append(out, batch)
++	}
++	return out
++}
