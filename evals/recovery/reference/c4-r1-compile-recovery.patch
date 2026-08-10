@@ -1,0 +1,13 @@
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index e591d2e..79f23c9 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -25,7 +25,7 @@ func NewSummary() *Summary {
+ // Observe folds one batch into the running totals.
+ func (s *Summary) Observe(batch api.Batch) {
+ 	for _, record := range batch.Records {
+-		s.count[record.Name]++
++		s.counts[record.Name]++
+ 		s.totals[record.Name] += record.Value
+ 	}
+ }

@@ -231,6 +231,24 @@ def check(path: str) -> dict:
             return dict(case=case_id, gates=gates, status=INVALID, reasons=reasons)
         gates["G1"] = PASS
 
+        # Recovery ground truth — a recovery case must start from the failure
+        # shape it claims, or it scores recovery from something else entirely
+        # ("only baseline non-zero" is how that mistake ships). Declared as
+        # validity.recovery_baseline: {build: fail|pass, tests: fail|pass}.
+        shape = (case.get("validity") or {}).get("recovery_baseline") or {}
+        for check_name, command in (("build", ["go", "build", "./..."]),
+                                    ("tests", ["go", "test", "./..."])):
+            want = shape.get(check_name)
+            if want is None:
+                continue
+            done = subprocess.run(command, cwd=broken, env=_env(), capture_output=True)
+            got = "pass" if done.returncode == 0 else "fail"
+            if got != want:
+                gates["G1"] = FAIL
+                reasons.append(
+                    f"RECOVERY_BASELINE_SHAPE: {check_name} is {got}, case claims {want}")
+                return dict(case=case_id, gates=gates, status=INVALID, reasons=reasons)
+
         # G6 — attestation, independent of any reference.
         semantics, _ = check_semantics(case)
         gates["G6"] = PASS if semantics == "UNAMBIGUOUS" else FAIL

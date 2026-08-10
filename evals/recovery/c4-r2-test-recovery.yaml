@@ -1,0 +1,95 @@
+# C4-R2 — Test failure recovery. The build is green; a maintained test is
+# red and names exactly what it expected. Measured: repair driven by test
+# evidence, fixing the product code — tests are off limits.
+id: c4-r2-test-recovery
+name: "[recovery] TestNormalizeLowercasesNames is red"
+repo: fixtures/repos/navsvc
+max_rounds: 40
+recovery: true
+relevant_paths:
+  - internal/pipeline/transform.go
+required_impact_paths:
+  - internal/pipeline/transform.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/pipeline/transform.go: |
+    package pipeline
+
+    import (
+    	"strings"
+
+    	"navsvc/internal/config"
+    	"navsvc/pkg/api"
+    )
+
+    // normalizeStage lowercases names and trims label whitespace so downstream
+    // aggregation groups equivalent records together.
+    type normalizeStage struct{}
+
+    func (normalizeStage) Name() string { return "normalize" }
+
+    func (normalizeStage) Run(batch api.Batch, _ config.PipelineConfig) api.Batch {
+    	for i := range batch.Records {
+    		batch.Records[i].Name = strings.TrimSpace(batch.Records[i].Name)
+    		for k, v := range batch.Records[i].Labels {
+    			batch.Records[i].Labels[k] = strings.TrimSpace(v)
+    		}
+    	}
+    	return batch
+    }
+
+    // flattenStage collapses records nested deeper than the configured maximum
+    // onto that maximum, so a pathological document cannot produce unbounded
+    // depth downstream.
+    type flattenStage struct{}
+
+    func (flattenStage) Name() string { return "flatten" }
+
+    func (flattenStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+    	for i := range batch.Records {
+    		if batch.Records[i].Depth > cfg.MaxDepth {
+    			batch.Records[i].Depth = cfg.MaxDepth
+    		}
+    	}
+    	return batch
+    }
+
+task: |
+  `go test ./...` is red: `TestNormalizeLowercasesNames` in
+  `internal/pipeline` fails. The test is correct — it pins the normalize
+  stage's contract. Fix the product code so the suite is green.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go build ./... > /dev/null
+      go test ./internal/pipeline/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: pass
+    tests: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The failing maintained test goes green via a product-code change.
+    oracle_interpretation: >-
+      go build green and the whole maintained suite green, tests untouched.
+    rationale: >-
+      The failing test asserts the exact expected output ("requests"); the
+      task says the test is correct and forbids editing it. One reading.

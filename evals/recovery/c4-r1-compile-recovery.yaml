@@ -1,0 +1,99 @@
+# C4-R1 — Compile failure recovery. The workspace starts genuinely red: the
+# build fails in a named file. Measured: diagnose from compiler feedback,
+# repair, re-verify, end green — not first-try authoring.
+id: c4-r1-compile-recovery
+name: "[recovery] the build is broken in summary.go"
+repo: fixtures/repos/navsvc
+max_rounds: 40
+recovery: true
+relevant_paths:
+  - internal/report/summary.go
+required_impact_paths:
+  - internal/report/summary.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+files:
+  internal/report/summary.go: |
+    package report
+
+    import (
+    	"fmt"
+    	"sort"
+    	"strings"
+
+    	"navsvc/pkg/api"
+    )
+
+    // Summary accumulates per-name statistics across every batch that ran.
+    type Summary struct {
+    	counts map[string]int
+    	totals map[string]float64
+    }
+
+    // NewSummary returns an empty summary ready to observe batches.
+    func NewSummary() *Summary {
+    	return &Summary{
+    		counts: map[string]int{},
+    		totals: map[string]float64{},
+    	}
+    }
+
+    // Observe folds one batch into the running totals.
+    func (s *Summary) Observe(batch api.Batch) {
+    	for _, record := range batch.Records {
+    		s.count[record.Name]++
+    		s.totals[record.Name] += record.Value
+    	}
+    }
+
+    // Render produces the human-readable report, one line per name, sorted.
+    func (s *Summary) Render() string {
+    	names := make([]string, 0, len(s.counts))
+    	for name := range s.counts {
+    		names = append(names, name)
+    	}
+    	sort.Strings(names)
+
+    	var b strings.Builder
+    	for _, name := range names {
+    		fmt.Fprintf(&b, "%s count=%d total=%g\n", name, s.counts[name], s.totals[name])
+    	}
+    	return b.String()
+    }
+task: |
+  `go build ./...` is red — a half-landed refactor broke
+  `internal/report/summary.go`. Get the build green again with the summary
+  behaving as its tests expect. Nothing else was touched.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go build ./... > /dev/null
+      go test ./internal/report/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The build compiles again and the summary's maintained behaviour holds.
+    oracle_interpretation: >-
+      go build green, report tests green, legacy untouched.
+    rationale: >-
+      A compile error with the compiler naming the line; the fix is the
+      field the rest of the file already uses. No second reading.

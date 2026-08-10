@@ -1,0 +1,13 @@
+diff --git a/internal/pipeline/transform.go b/internal/pipeline/transform.go
+index 0e9b492..f80018f 100644
+--- a/internal/pipeline/transform.go
++++ b/internal/pipeline/transform.go
+@@ -15,7 +15,7 @@ func (normalizeStage) Name() string { return "normalize" }
+ 
+ func (normalizeStage) Run(batch api.Batch, _ config.PipelineConfig) api.Batch {
+ 	for i := range batch.Records {
+-		batch.Records[i].Name = strings.TrimSpace(batch.Records[i].Name)
++		batch.Records[i].Name = strings.ToLower(strings.TrimSpace(batch.Records[i].Name))
+ 		for k, v := range batch.Records[i].Labels {
+ 			batch.Records[i].Labels[k] = strings.TrimSpace(v)
+ 		}
