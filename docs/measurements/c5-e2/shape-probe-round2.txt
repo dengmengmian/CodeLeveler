@@ -1,0 +1,67 @@
+warning: variable does not need to be mutable
+   --> crates/leveler-agent/src/compaction.rs:305:9
+    |
+305 |     let mut split = |s: &str| -> (u64, u64) {
+    |         ----^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+! ! 忽略了仓库内 /Users/mengmian/Develop/app/codeleveler/.leveler/permissions.yaml（未信任）
+  它可以执行命令或授予免批准权限。确认内容后运行：leveler trust
+[2m2026-08-10T14:46:36.668190Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  mode: direct
+  ablation: adaptive_context = false (control) vs true (ablated), single variable
+▶ eval [context] every feed adapter describes its own dialect (c5-e2-history-dependent, run 1/3)
+[2m2026-08-10T14:46:38.113563Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c5-e2-history-dependent repetition=1 session=1f975acb-612a-4d80-be3a-33cec55097ae path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c5-e2-history-dependent-54302-exec1-r1
+  ✓ c5-e2-history-dependent#1 — Completed
+▶ eval [context] every feed adapter describes its own dialect (c5-e2-history-dependent, run 2/3)
+[2m2026-08-10T14:59:47.634531Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c5-e2-history-dependent repetition=2 session=e1dc9d62-6d5e-4699-938c-686961e82866 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c5-e2-history-dependent-54302-exec2-r2
+  ✓ c5-e2-history-dependent#2 — Completed
+▶ eval [context] every feed adapter describes its own dialect (c5-e2-history-dependent, run 3/3)
+[2m2026-08-10T15:11:22.047433Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c5-e2-history-dependent repetition=3 session=3d8581b2-d43d-4b83-8ed9-93236bbe7d55 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c5-e2-history-dependent-54302-exec3-r3
+  ✓ c5-e2-history-dependent#3 — Completed
+▶ eval [context] every feed adapter describes its own dialect (c5-e2-history-dependent, run 1/3)
+[2m2026-08-10T15:25:13.309027Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c5-e2-history-dependent repetition=1 session=197e0ab7-6223-4db8-8cbd-23bdefb190c4 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c5-e2-history-dependent-54302-exec4-r1
+  ✓ c5-e2-history-dependent#1 — Completed
+▶ eval [context] every feed adapter describes its own dialect (c5-e2-history-dependent, run 2/3)
+[2m2026-08-10T15:38:02.335756Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c5-e2-history-dependent repetition=2 session=1c21a51d-8c08-4688-b543-d25eef888f57 path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c5-e2-history-dependent-54302-exec5-r2
+  ✓ c5-e2-history-dependent#2 — Completed
+▶ eval [context] every feed adapter describes its own dialect (c5-e2-history-dependent, run 3/3)
+[2m2026-08-10T15:46:00.452480Z[0m [33m WARN[0m [2mleveler_app[0m[2m:[0m provider `kimi` has no usable API key: environment variable `KIMI_API_KEY` is required but not set
+  kept workspace: case=c5-e2-history-dependent repetition=3 session=674a0042-e16a-4a5d-ba28-149eded2d30f path=/var/folders/g0/y83xmxsj4dg0h7m0srkrcwfh0000gn/T/leveler-eval-c5-e2-history-dependent-54302-exec6-r3
+  ✓ c5-e2-history-dependent#3 — Completed
+
+Eval: deepseek/deepseek-v4-flash
+  ✓ c5-e2-history-dependent  run=1 steps=71 tokens=5375795/68049 latency=789357ms reads=14 searches=5 edits=25/1err (patch=16 replace=9 first@r24) Completed termination=completed
+  ✓ c5-e2-history-dependent  run=2 steps=53 tokens=5014740/66598 latency=694289ms reads=14 searches=3 edits=101/2err (patch=5 replace=96 first@r20) Completed termination=completed
+  ✓ c5-e2-history-dependent  run=3 steps=51 tokens=4039031/78610 latency=831245ms reads=15 searches=11 edits=15/1err (patch=15 replace=0 first@r19) Completed termination=completed
+  → 3/3 passed (100% completion, 100% completion accuracy), avg 58.3 steps
+  → self-recovered edit cases: 3 (c5-e2-history-dependent, c5-e2-history-dependent, c5-e2-history-dependent)
+  → avg 105.3 tool calls · loop rate 0% · validation rate 100%
+  → avg TTFF 69ms · max silent duration 57412ms
+  ★ Agent Quality Score: 100/100 (over measured components)
+
+Eval: deepseek/deepseek-v4-flash
+  ✓ c5-e2-history-dependent  run=1 steps=45 tokens=3455532/79349 latency=769013ms reads=11 searches=1 edits=15/1err (patch=15 replace=0 first@r17) Completed termination=completed
+  ✓ c5-e2-history-dependent  run=2 steps=34 tokens=2049504/23589 latency=477978ms reads=15 searches=6 edits=4/0err (patch=4 replace=0 first@r11) Completed termination=completed
+  ✓ c5-e2-history-dependent  run=3 steps=41 tokens=3108895/50203 latency=605833ms reads=11 searches=6 edits=15/1err (patch=15 replace=0 first@r17) Completed termination=completed
+  → 3/3 passed (100% completion, 100% completion accuracy), avg 40.0 steps
+  → self-recovered edit cases: 2 (c5-e2-history-dependent, c5-e2-history-dependent)
+  → avg 51.3 tool calls · loop rate 0% · validation rate 100%
+  → avg TTFF 55ms · max silent duration 73267ms
+  ★ Agent Quality Score: 100/100 (over measured components)
+
+Ablation: adaptive_context
+  control (adaptive_context=false) : 100%
+  ablated (adaptive_context=true) : 100%
+  rate delta : +0.0pp
+  saved by knob : (none)
+  hurt by knob  : (none)
+  rounds over 3 paired case(s): control 58.3, ablated 40.0, delta -18.3
