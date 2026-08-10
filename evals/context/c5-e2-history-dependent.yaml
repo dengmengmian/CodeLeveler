@@ -40,7 +40,7 @@ expect:
     , imports.rstrip(\"\\n\")).replace(\"ROWS_SLOT\", rows)\nopen(sys.argv[2], \"w\").write(out)\nPY\n\
     go test ./internal/adapters/ -run TestEveryAdapterSnapshotIsTruthful -count=1 > /dev/null\ngo build\
     \ -o \"$d/telemetryd\" ./cmd/telemetryd\n\"$d/telemetryd\" inventory > \"$d/inv.txt\"\n[ \"$(wc -l\
-    \ < \"$d/inv.txt\")\" -eq 56 ]\ngrep -qE '^feed01 fallback=[a-z_0-9]+ ordering=[a-z_]+ aliases=[0-9]+\
+    \ < \"$d/inv.txt\")\" -eq 96 ]\ngrep -qE '^feed01 fallback=[a-z_0-9]+ ordering=[a-z_]+ aliases=[0-9]+\
     \ scale=[0-9]+$' \"$d/inv.txt\"\nsort -c \"$d/inv.txt\"\ngit diff --quiet -- docs/pipeline.md\ngo\
     \ test ./... > /dev/null\n"
 validity:
@@ -57,7 +57,7 @@ validity:
     status: UNAMBIGUOUS
     critical_observable: Whether every adapter's Snapshot claims match what its Parse actually does, verified
       behaviorally per adapter, plus the exact inventory output shape.
-    oracle_interpretation: For each of the 56 adapters the claimed fallback/ordering/aliases/scale are
+    oracle_interpretation: For each of the 96 adapters the claimed fallback/ordering/aliases/scale are
       cross-checked by driving Parse with discriminating probes; the inventory prints 56 sorted lines
       in the stated format.
     rationale: The task states the truthfulness requirement, points at the Summary field contract, and

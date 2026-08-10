@@ -40,7 +40,7 @@ import gen_scale_repos as scale
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MODULE = "telemetryd"
-ADAPTER_COUNT = 56
+ADAPTER_COUNT = 96
 SEED = 20260810
 
 FALLBACKS = ("zero", "skip", "last_seen", "neg1")
@@ -242,12 +242,15 @@ def adapter_source(name: str, q: dict) -> str:
     if needs_sort:
         imports.append('"sort"')
     imports_block = "\n\t".join(sorted(imports))
-    scale_code = (
-        "\t\t// This feed reports in raw units.\n"
-        if q["scale"] == 1 else
-        f"\t\t// This feed reports in 1/{q['scale']} units; normalize on ingest.\n"
-        f"\t\tvalue *= {q['scale']}\n"
-    )
+    scale_code = "\t\tvalue *= unitFactor\n"
+    missing_bodies = {
+        "zero": "\treturn 0, true",
+        "skip": "\treturn 0, false",
+        "last_seen": "\treturn lastSeen[metric], true",
+        "neg1": "\treturn -1, true",
+    }
+    missing_body = missing_bodies[q["fallback"]]
+    last_arg = "lastSeen" if q["fallback"] == "last_seen" else "nil"
     last_decl = "\tlastSeen := map[string]int64{}\n" if needs_last else ""
     last_track = "\t\tlastSeen[metric] = value\n" if needs_last else ""
     helpers = f"""
@@ -274,9 +277,6 @@ func canonicalMetric(raw string) string {{
 \treturn raw
 }}
 
-var metricAliases = map[string]string{{
-{alias_lines}
-}}
 
 // ingest statistics ------------------------------------------------------------
 
@@ -309,6 +309,22 @@ func (s *Stats) note(accepted, renamed bool) {{
         accept_rate=round(rnd_local(name).uniform(0.5, 0.95), 2),
         batch_limit=rnd_local(name).choice((64, 128, 256, 512, 1024)),
     )
+    tail_facts = f"""
+// dialect tables ---------------------------------------------------------------
+// (kept at the tail with the rest of the feed's tuning data)
+
+var metricAliases = map[string]string{{
+{alias_lines}
+}}
+
+// unitFactor is this feed's ingest multiplier; see Parse.
+const unitFactor int64 = {q['scale']}
+
+// missingValue resolves a blank count for this feed's dialect; see Parse.
+func missingValue(lastSeen map[string]int64, metric string) (int64, bool) {{
+{missing_body}
+}}
+"""
     return f"""package {name}
 
 // Feed adapter "{name}". Every feed speaks the shared line protocol
@@ -372,23 +388,13 @@ func Parse(lines []string) []Event {{
 // Spec placeholder: the unified inventory work adds this adapter's
 // self-description here. See internal/adapterspec.
 var _ = adapterspec.Summary{{}}
-{helpers}{extra}"""
+{helpers}{extra}{tail_facts}"""
 
 
 def adapter_test(name: str, q: dict) -> str:
     """A local maintained test pinning ONE visible aspect (so the suite is
     meaningful) without disclosing the whole dialect."""
     a, b = sorted(q["aliases"].items())[0]
-    extra = EXTRA_TEMPLATE.format(
-        backoff=", ".join(str(v) for v in sorted(rnd_local(name).sample(
-            (100, 250, 500, 1000, 2000, 5000, 10000, 30000), 5))),
-        stale_min=rnd_local(name).randrange(2, 30),
-        stale_secs=rnd_local(name).randrange(2, 30) * 60,
-        drop_rate=round(rnd_local(name).uniform(0.01, 0.2), 2),
-        rename_rate=round(rnd_local(name).uniform(0.1, 0.9), 2),
-        accept_rate=round(rnd_local(name).uniform(0.5, 0.95), 2),
-        batch_limit=rnd_local(name).choice((64, 128, 256, 512, 1024)),
-    )
     return f"""package {name}
 
 import "testing"
