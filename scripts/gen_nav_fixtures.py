@@ -1079,10 +1079,13 @@ import (
 )
 
 func TestSummaryCountsPerName(t *testing.T) {
+	// These are ordinary, well-formed observations. Valid is set explicitly:
+	// leaving it to Go's zero value would accidentally mark them invalid, and
+	// this test is about counting, not about validity semantics.
 	out := Aggregate([]api.Batch{{Records: []api.Record{
-		{Name: "a", Value: 1},
-		{Name: "a", Value: 2},
-		{Name: "b", Value: 5},
+		{Name: "a", Value: 1, Valid: true},
+		{Name: "a", Value: 2, Valid: true},
+		{Name: "b", Value: 5, Valid: true},
 	}}})
 	if !strings.Contains(out, "a count=2 total=3") {
 		t.Fatalf("unexpected report: %q", out)
