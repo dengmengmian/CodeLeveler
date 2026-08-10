@@ -4,19 +4,32 @@
 
 ## Executive Verdict
 
-# C2 PRODUCT VERDICT: NOT CURRENTLY ADJUDICABLE
+# C2 STATUS: CLOSED — navigation/context objectives satisfied
 
 ```
-Reason: BENCHMARK VALIDITY BLOCKER
+裁决依据（C2-BV2，2026-08-10，冻结 HEAD 797b72e）：
 
-Localization / Impact measurements:
-  historically promising, but final acceptance must wait for valid N1-N8 cases.
+Benchmark:          VALID 8/8（六项闸门，run 前重证）
+Product benchmark:  24/24 functional PASS（N1-N8 × 3，预先固定，独立隐藏验收）
+FalseCompletion:    0/24
+Target Recall:      24/24
+Impact Touch:       24/24（MissedImpactPaths = 0）
+ForbiddenEdits:     0/24
+Benchmark incidents: NONE
+Answer-key leakage:  NONE
+
+Product correctness: 仅在上述 24-run 范围内声称。
+C3: NOT STARTED
+NEXT: C3 — Implementation / Edit Reliability
 ```
 
-> **原判 `C2 FINAL: FAIL` 已于 2026-08-09 撤下** —— 不是改判 PASS，而是当前不可裁决。
-> 该判定建立在硬闸门 FalseCompletion = 2 上，而这 2 例（N3、N4）的 case 本身失效，
-> 至少有一部分"失败"来自尺子而非产品。维持 FAIL 会把尺子的缺陷算到产品头上。
-> 全文以下内容保留为**历史判定记录**，其中依赖 N3/N4 隐藏验收的结论均不再成立。
+完整测量记录见 `docs/C2_BV2_TRUSTWORTHY_PRODUCT_BASELINE.md`；
+raw result set `evals/baselines/c2-bv2-navigation.json`（hash 已锁定）。
+
+> **裁决历史**：初判 `FAIL`（FalseCompletion = 2）→ 发现该 2 例所在 case 失效，改
+> `NOT CURRENTLY ADJUDICABLE`（2026-08-09）→ BV0/BV1 把 benchmark 修到 8/8 VALID →
+> BV2 在有效尺子上完成首次可信 24-run 测量，据此关闭。
+> 全文以下内容保留为**历史判定记录**，其中依赖旧 N3/N4 隐藏验收的结论均不再成立。
 
 > ### ⚠⚠ 判定依据已受损（C2-SR，2026-08-09）
 >
@@ -293,14 +306,16 @@ implementation gap，但 discriminative hypothesis 尚未成立（PASS = 0，无
 **BENCHMARK VALIDITY REPAIR**
 
 ```
-C2-R1: CLOSED (INCONCLUSIVE)
-C2-SR: ABORTED / NOT CLASSIFIABLE — benchmark validity not established
-NEXT:  C2-BV — Benchmark Validity Repair
+C2-R1:  CLOSED (INCONCLUSIVE)
+C2-SR:  ABORTED / NOT CLASSIFIABLE — benchmark validity not established
+C2-BV0: CLOSED — six-gate tripwire, pre-repair matrix VALID 1/8
+C2-BV1: CLOSED — benchmark repaired to VALID 8/8
+C2-BV2: CLOSED — 24/24 PASS, FalseCompletion 0/24 → C2 CLOSED
+NEXT:   C3 — Implementation / Edit Reliability
 ```
 
-C2-SR 中止而非得出结论：不是数据太少，是尺子失效，分类在修好 benchmark 之前无法进行。
-C2-BV 要把 case validity 从两项升级为六项合取（broken FAIL、reference 满足完整任务、
-既有测试通过、隐藏验收通过、显式约束被尊重、需求语义无歧义），并把 N1–N8 全部补齐 ——
-`reference PASS` 必须指完整 case PASS，不是单条 oracle PASS。
+链条：C2-SR 发现尺子失效 → BV0 造六项闸门并测出修复前 1/8 → BV1 修到 8/8（N3 可满足性、
+N4 语义消歧、五个 case 首次获得可解证明）→ BV2 在冻结 HEAD 上完成预先固定的 24-run 测量。
 
-见 `docs/C2_SCOPE_RECLASSIFICATION.md`。不开始 C2-BV，不开始 C3。
+见 `docs/C2_SCOPE_RECLASSIFICATION.md` / `docs/C2_BV_BENCHMARK_VALIDITY_BASELINE.md` /
+`docs/C2_BV2_TRUSTWORTHY_PRODUCT_BASELINE.md`。不开始 C3。
