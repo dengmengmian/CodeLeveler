@@ -50,6 +50,9 @@ pub struct ExecutionOverrides {
     pub repeated_read_guard: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tool_output_bytes: Option<usize>,
+    /// C5-S3 ablation knob: switch the candidate adaptive-context behavior on.
+    /// Production default stays Disabled until the eval verdict flips it.
+    pub adaptive_context: Option<bool>,
 }
 
 /// How this runtime USES a model's context capability (C5-S1). The capability
@@ -68,6 +71,8 @@ pub struct ContextPolicy {
     pub max_budget: u32,
     pub compaction: CompactionPolicy,
     pub retention: RetentionPolicy,
+    /// C5-S3: whether the fold threshold may climb during the task.
+    pub expansion: ExpansionPolicy,
 }
 
 /// How folding happens. One variant today: anchored spans folded into a
@@ -85,6 +90,37 @@ pub enum RetentionPolicy {
     BriefingOnly,
 }
 
+/// Whether the fold threshold may climb during a task (C5-S3).
+///
+/// `Disabled` reproduces the S2 static behavior exactly. `Adaptive` lets the
+/// executor raise the threshold one tier at a time in response to
+/// authoritative runtime evidence (re-read pressure after a fold, a repair
+/// turn) — expansion preserves the request prefix, folding rewrites it, so an
+/// eligible expansion is always preferred over a compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpansionPolicy {
+    Disabled,
+    Adaptive,
+}
+
+/// The deterministic budget ladder for a model: strictly increasing tiers,
+/// clamped to the model's declared quality bound. Production never climbs
+/// past `reliable_context` — the window headroom above it (max_output_tokens,
+/// tool schema, framing) has no verified safe-input ceiling yet, so crossing
+/// the quality boundary is reachable only through the eval override seam.
+/// A small-window model simply gets a one-tier ladder.
+pub fn expansion_tiers(profile: &ModelProfile) -> Vec<u32> {
+    let ceiling = profile.limits.reliable_context;
+    let mut tiers: Vec<u32> = [256 * 1024, 512 * 1024, ceiling]
+        .into_iter()
+        .filter(|&t| t > 0)
+        .map(|t| t.min(ceiling))
+        .collect();
+    tiers.sort_unstable();
+    tiers.dedup();
+    tiers
+}
+
 impl ContextPolicy {
     /// The task-execution policy for a model: fold at the profile's declared
     /// reliable context, exactly as before S1. `reliable_context` is a model
@@ -96,6 +132,7 @@ impl ContextPolicy {
             max_budget: profile.limits.reliable_context,
             compaction: CompactionPolicy::AnchoredBriefing,
             retention: RetentionPolicy::BriefingOnly,
+            expansion: ExpansionPolicy::Disabled,
         }
     }
 
@@ -110,6 +147,7 @@ impl ContextPolicy {
             max_budget: leveler_agent::PRE_REQUEST_COMPACT_THRESHOLD as u32,
             compaction: CompactionPolicy::AnchoredBriefing,
             retention: RetentionPolicy::BriefingOnly,
+            expansion: ExpansionPolicy::Disabled,
         }
     }
 }
@@ -176,7 +214,13 @@ pub fn resolve_execution_policy(
     };
     let max_parallel_tools = min_nonzero(&[role_parallel, o.max_parallel_tools.unwrap_or(0)]);
 
-    let context = ContextPolicy::for_profile(profile);
+    let mut context = ContextPolicy::for_profile(profile);
+    if o.adaptive_context.unwrap_or(false) {
+        context.expansion = ExpansionPolicy::Adaptive;
+        // Candidate shape under ablation: start at the smallest tier and let
+        // evidence climb the ladder. Disabled keeps initial == reliable.
+        context.initial_budget = expansion_tiers(profile)[0];
+    }
     ResolvedExecutionPolicy {
         max_output_tokens: profile.limits.max_output_tokens,
         context_budget: context.initial_budget,
@@ -310,6 +354,47 @@ mod tests {
         assert!(p.context_quality.is_none(), "unmeasured must stay None");
         let r = resolve_execution_policy(&p, ExecutionRole::Worker, &goal_turn(), None);
         assert_eq!(r.context.initial_budget, p.limits.reliable_context);
+    }
+
+    #[test]
+    fn expansion_tiers_clamp_and_dedup_for_small_models() {
+        // A model smaller than the ladder's steps degenerates to one tier;
+        // no tier ever exceeds the quality bound.
+        let mut small = profile();
+        small.limits.reliable_context = 128 * 1024;
+        assert_eq!(expansion_tiers(&small), vec![128 * 1024]);
+        let mut mid = profile();
+        mid.limits.reliable_context = 512 * 1024;
+        assert_eq!(expansion_tiers(&mid), vec![256 * 1024, 512 * 1024]);
+        let mut large = profile();
+        large.limits.reliable_context = 786_432;
+        assert_eq!(
+            expansion_tiers(&large),
+            vec![256 * 1024, 512 * 1024, 786_432]
+        );
+    }
+
+    #[test]
+    fn adaptive_override_starts_small_and_default_stays_static() {
+        let p = profile();
+        let plain = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(plain.context.expansion, ExpansionPolicy::Disabled);
+        assert_eq!(plain.context.initial_budget, p.limits.reliable_context);
+
+        let overrides = ExecutionOverrides {
+            adaptive_context: Some(true),
+            ..Default::default()
+        };
+        let adaptive =
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&overrides));
+        assert_eq!(adaptive.context.expansion, ExpansionPolicy::Adaptive);
+        assert_eq!(
+            adaptive.context.initial_budget,
+            expansion_tiers(&p)[0],
+            "the candidate starts at the smallest tier"
+        );
+        // The compatibility mirror follows INITIAL, never a live budget.
+        assert_eq!(adaptive.context_budget, adaptive.context.initial_budget);
     }
 
     #[test]

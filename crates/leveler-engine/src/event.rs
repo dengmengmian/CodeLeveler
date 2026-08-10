@@ -218,6 +218,15 @@ pub enum EngineEvent {
         from: usize,
         to: usize,
     },
+    /// C5-S3: the context fold threshold climbed one tier on authoritative
+    /// evidence. Durable so a resumed task replays to the same budget instead
+    /// of silently shrinking back to its initial tier.
+    ContextExpanded {
+        from: u32,
+        to: u32,
+        reason: String,
+        crossed_reliable: bool,
+    },
     /// The harness started an advisory (tool-free) model call during closeout —
     /// a completeness audit or a compaction summary. Transient UI hint only, so a
     /// status line can name the wait instead of a bare "waiting for model". `kind`
@@ -472,6 +481,7 @@ impl EngineEvent {
             | EngineEvent::TaskFinished { .. }
             | EngineEvent::TokenUsage { .. }
             | EngineEvent::Compacted { .. }
+            | EngineEvent::ContextExpanded { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }
@@ -646,6 +656,7 @@ impl EngineEvent {
             | EngineEvent::ReviewFinding { .. }
             | EngineEvent::ReviewFailed { .. }
             | EngineEvent::AdvisoryStarted { .. }
+            | EngineEvent::ContextExpanded { .. }
             | EngineEvent::CommandProgress { .. } => return None,
         })
     }
@@ -840,6 +851,17 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 cached_input_tokens,
             },
             A::Compacted { from, to } => EngineEvent::Compacted { from, to },
+            A::ContextExpanded {
+                from,
+                to,
+                reason,
+                crossed_reliable,
+            } => EngineEvent::ContextExpanded {
+                from,
+                to,
+                reason: reason.to_string(),
+                crossed_reliable,
+            },
             A::AdvisoryStarted { kind } => EngineEvent::AdvisoryStarted {
                 kind: kind.as_key().to_string(),
             },

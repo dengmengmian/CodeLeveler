@@ -318,6 +318,17 @@ impl Executor {
             }};
         }
 
+        // C5-S3: the live fold threshold. Policy stays immutable; this state
+        // climbs the tier ladder on evidence and is durably reconstructed by
+        // the engine from ContextExpanded events (restored_context_budget).
+        let mut context_state = crate::context_budget::ContextBudgetState::new(
+            self.policy
+                .restored_context_budget
+                .unwrap_or(self.policy.context_budget)
+                .max(self.policy.context_budget),
+            self.policy.repair_expansion_evidence,
+        );
+
         loop {
             // Mid-turn user input goes in at the top of the round, before the
             // model is asked anything: a correction that arrives after the work
@@ -2234,16 +2245,51 @@ impl Executor {
             // compaction would silently never fire. The persisted transcript
             // (sink) is untouched — only what we resend shrinks.
             let context_tokens = used_tokens.max(estimate_tokens(&messages));
-            if self.policy.context_budget > 0
-                && context_tokens > self.policy.context_budget as u64
-                && has_next_round
+            // C5-S3 decision point: over-budget pressure is WHEN we decide,
+            // evidence is WHY the budget may grow. An eligible expansion keeps
+            // the request prefix (cache-preserving); folding rewrites it — so
+            // expand-before-compact whenever the evidence supports it.
+            let guard_trips = self.tool_context.read_guard.total_trips();
+            let context_action = if has_next_round {
+                crate::context_budget::decide_context_action(
+                    self.policy.adaptive_context,
+                    &self.policy.context_tiers,
+                    self.policy.reliable_context,
+                    &context_state,
+                    context_tokens,
+                    guard_trips,
+                )
+            } else {
+                crate::context_budget::ContextAction::Keep
+            };
+            if let crate::context_budget::ContextAction::Expand {
+                from,
+                to,
+                reason,
+                crossed_reliable,
+            } = context_action
             {
+                observer(AgentEvent::ContextExpanded {
+                    from,
+                    to,
+                    reason: reason.as_str(),
+                    crossed_reliable,
+                });
+                crate::context_budget::apply_expansion(
+                    &mut context_state,
+                    to,
+                    reason,
+                    crossed_reliable,
+                    guard_trips,
+                );
+            }
+            if context_action == crate::context_budget::ContextAction::Compact {
                 let before = messages.len();
-                // Cap the retained working set at half the context budget so a
+                // Cap the retained working set at half the live budget so a
                 // huge recent tool output can't keep the fold over the window;
                 // the other half leaves room for the head, summary, and next
-                // response. (context_budget > 0 is guaranteed by the guard above.)
-                let keep_recent_tokens = self.policy.context_budget as u64 / 2;
+                // response. (current_budget > 0 is guaranteed by the decision.)
+                let keep_recent_tokens = context_state.current_budget as u64 / 2;
                 // Name this extra round trip so the UI shows "compacting…" instead
                 // of a bare "waiting for model" during the summary call.
                 observer(AgentEvent::AdvisoryStarted {
@@ -2258,7 +2304,7 @@ impl Executor {
                             leveler_execution::LifecycleEvent::PreCompact,
                             &format!(
                                 r#"{{"context_tokens":{context_tokens},"budget":{}}}"#,
-                                self.policy.context_budget
+                                context_state.current_budget
                             ),
                             &cancellation,
                         )
@@ -2297,6 +2343,7 @@ impl Executor {
                         to: messages.len(),
                     });
                 }
+                crate::context_budget::apply_compaction(&mut context_state, guard_trips);
             }
 
             // Persist the exact next-request context through the engine event

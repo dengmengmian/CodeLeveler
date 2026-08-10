@@ -131,6 +131,15 @@ pub enum AgentEvent {
     /// The in-memory transcript was auto-compacted to fit the context window,
     /// shrinking from `from` to `to` messages.
     Compacted { from: usize, to: usize },
+    /// C5-S3: the fold threshold climbed one tier on authoritative evidence.
+    /// Persisted (via the engine event log) so a resumed task replays to the
+    /// same budget instead of shrinking back to the initial tier.
+    ContextExpanded {
+        from: u32,
+        to: u32,
+        reason: &'static str,
+        crossed_reliable: bool,
+    },
     /// The model updated its structured plan via the `update_plan` tool. The
     /// full step list replaces any previous plan (not a delta).
     PlanUpdated { steps: Vec<PlanStep> },
@@ -722,7 +731,7 @@ pub trait SteeringSource: Send + Sync {
 /// Grouped as one value so a caller — or an agent definition — can carry a
 /// complete policy instead of setting a dozen independent knobs and hoping they
 /// are consistent. The loop reads it; it never derives policy of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPolicy {
     // ── Loop shape ──────────────────────────────────────────────────────────
     /// Max search-tool calls allowed within a single step/round (0 = off);
@@ -738,7 +747,23 @@ pub struct TurnPolicy {
     /// The usable context window in tokens (0 = disabled). When the last
     /// request's reported token count exceeds this, the in-memory transcript is
     /// compacted before the next round so a long task never overflows.
+    /// C5-S3 note: this stays the INITIAL fold threshold (the resolver's
+    /// compatibility mirror). The live threshold is `ContextBudgetState` in
+    /// the drive loop; adaptive expansion never mutates this field.
     pub context_budget: u32,
+    /// C5-S3: allow the fold threshold to climb the tier ladder on evidence.
+    pub adaptive_context: bool,
+    /// The resolver's budget ladder (sorted, deduped, clamped). Empty when
+    /// adaptive context is off.
+    pub context_tiers: Vec<u32>,
+    /// The model's quality boundary: plain evidence never expands past it.
+    pub reliable_context: u32,
+    /// One-shot strong-evidence grant from the engine (a repair turn whose
+    /// failure evidence may reference folded state).
+    pub repair_expansion_evidence: bool,
+    /// Budget the engine recovered from prior `ContextExpanded` events, so a
+    /// resumed task does not silently shrink back to the initial tier.
+    pub restored_context_budget: Option<u32>,
 
     // ── Completion gates ────────────────────────────────────────────────────
     /// The run ends only when the model explicitly calls
@@ -772,6 +797,11 @@ impl Default for TurnPolicy {
             require_explicit_plan: false,
             reasoning_effort: None,
             context_budget: 0,
+            adaptive_context: false,
+            context_tiers: Vec::new(),
+            reliable_context: 0,
+            repair_expansion_evidence: false,
+            restored_context_budget: None,
             goal_mode: false,
             // Matches the historical `Executor::new` default — the gate is ON.
             goal_todo_gate: true,
@@ -1137,6 +1167,14 @@ impl Executor {
                 reasoning_effort: child_policy.reasoning_effort,
                 // …the rest is inherited or deliberately reset for a child.
                 context_budget: self.policy.context_budget,
+                // Sub-agents keep the static behavior in S3 v1: a child's
+                // transcript is short-lived and expansion evidence is a
+                // top-level task concern.
+                adaptive_context: false,
+                context_tiers: Vec::new(),
+                reliable_context: self.policy.reliable_context,
+                repair_expansion_evidence: false,
+                restored_context_budget: None,
                 max_concurrent_agents: self.policy.max_concurrent_agents,
                 max_total_agents: self.policy.max_total_agents,
                 // Children never advertise spawn_agent (depth already blocks it).
@@ -1200,6 +1238,34 @@ impl Executor {
     /// window. Ignored when zero.
     pub fn with_context_budget(mut self, context_budget: u32) -> Self {
         self.policy.context_budget = context_budget;
+        self
+    }
+
+    /// C5-S3: enable adaptive expansion with the resolver's tier ladder and
+    /// the model's quality boundary. Off (the default) reproduces the static
+    /// S2 behavior exactly.
+    pub fn with_context_expansion(
+        mut self,
+        adaptive: bool,
+        tiers: Vec<u32>,
+        reliable_context: u32,
+    ) -> Self {
+        self.policy.adaptive_context = adaptive;
+        self.policy.context_tiers = tiers;
+        self.policy.reliable_context = reliable_context;
+        self
+    }
+
+    /// C5-S3: one-shot strong-evidence grant for a repair turn.
+    pub fn with_repair_expansion_evidence(mut self, granted: bool) -> Self {
+        self.policy.repair_expansion_evidence = granted;
+        self
+    }
+
+    /// C5-S3: budget recovered from prior `ContextExpanded` events, so a
+    /// resumed or follow-on turn does not shrink back to the initial tier.
+    pub fn with_restored_context_budget(mut self, restored: Option<u32>) -> Self {
+        self.policy.restored_context_budget = restored;
         self
     }
 

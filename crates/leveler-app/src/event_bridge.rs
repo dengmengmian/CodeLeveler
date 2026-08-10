@@ -285,6 +285,14 @@ impl EventBridge {
                     message: format!("上下文已压缩 {from} → {to} 条"),
                 });
             }
+            AgentEvent::ContextExpanded {
+                from, to, reason, ..
+            } => {
+                let _ = self.events.send(RuntimeEvent::Notification {
+                    level: NotificationLevel::Info,
+                    message: format!("上下文预算已扩张 {from} → {to} tokens（{reason}）"),
+                });
+            }
             AgentEvent::ContextSnapshot { .. } => {
                 // Engine durability metadata; no standalone UI cell.
             }

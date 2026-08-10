@@ -83,6 +83,19 @@ impl RepeatedReadGuard {
     pub fn tripped_fingerprint(&self, key: &str, fingerprint: u64) -> bool {
         self.record_fingerprint(key, fingerprint) > self.threshold
     }
+
+    /// Total wasteful repeats recorded so far: for every tracked range, how
+    /// many reads exceeded the threshold on unchanged content. This is the
+    /// authoritative re-read-pressure signal C5-S3's expansion decision
+    /// consumes — a rising count after a compaction means the fold dropped
+    /// something the model still needs.
+    pub fn total_trips(&self) -> u32 {
+        let reads = self.reads.lock().unwrap();
+        reads
+            .values()
+            .map(|(_, count)| count.saturating_sub(self.threshold))
+            .sum()
+    }
 }
 
 /// Fingerprints of files as the agent last saw them, so a write can tell whether

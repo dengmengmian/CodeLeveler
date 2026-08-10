@@ -12,6 +12,7 @@
 mod authorization;
 mod budget;
 mod compaction;
+pub mod context_budget;
 mod executor;
 mod injected_tools;
 pub mod named_agent;

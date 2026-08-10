@@ -137,6 +137,27 @@ impl<'a> EventLog<'a> {
         }
     }
 
+    /// The highest fold threshold this session has durably expanded to
+    /// (C5-S3). Budgets only climb within a task, so the LAST
+    /// `ContextExpanded` event carries the maximum; `None` means the session
+    /// never expanded and the initial tier stands.
+    pub async fn max_expanded_context_budget(&self) -> Result<Option<u32>, EngineError> {
+        let Some(row) = self
+            .store
+            .load_last_by_type(&self.session_id, "context_expanded", None)
+            .await?
+        else {
+            return Ok(None);
+        };
+        check_version(&row)?;
+        match EngineEvent::from_payload(&row.payload)? {
+            EngineEvent::ContextExpanded { to, .. } => Ok(Some(to)),
+            _ => Err(EngineError::Corrupt(
+                "context_expanded row carried a different event".into(),
+            )),
+        }
+    }
+
     /// Tool calls with a persisted `ToolCallStarted` but no matching
     /// `ToolCallFinished`: the crash window M5 reconciles on resume. Returned in
     /// the order they were started. `pending_approval` marks a call that crashed

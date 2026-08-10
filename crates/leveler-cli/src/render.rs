@@ -53,6 +53,14 @@ fn render_event_text(event: AgentEvent) {
                 console::style("⋯").yellow()
             );
         }
+        AgentEvent::ContextExpanded {
+            from, to, reason, ..
+        } => {
+            println!(
+                "  {} context budget expanded {from} → {to} tokens ({reason})",
+                console::style("⤢").yellow()
+            );
+        }
         AgentEvent::ContextSnapshot { .. } => {}
         AgentEvent::PlanUpdated { steps } => {
             println!("{} plan", console::style("☰").blue());
@@ -247,6 +255,15 @@ fn render_event_jsonl(event: AgentEvent) {
         }),
         AgentEvent::Compacted { from, to } => serde_json::json!({
             "type": "compacted", "from": from, "to": to,
+        }),
+        AgentEvent::ContextExpanded {
+            from,
+            to,
+            reason,
+            crossed_reliable,
+        } => serde_json::json!({
+            "type": "context_expanded", "from": from, "to": to,
+            "reason": reason, "crossed_reliable": crossed_reliable,
         }),
         AgentEvent::ContextSnapshot { messages } => serde_json::json!({
             "type": "context_snapshot", "messages": messages,

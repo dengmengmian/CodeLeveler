@@ -139,6 +139,11 @@ pub struct TurnRunner<'a> {
     pub factory: &'a ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
+    /// C5-S3: the highest fold threshold any prior turn of this task expanded
+    /// to (seeded from replayed `ContextExpanded` events on resume, updated
+    /// live as this runner forwards them). Later turns start from it instead
+    /// of shrinking back to the initial tier.
+    pub expanded_context_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl TurnRunner<'_> {
@@ -153,6 +158,7 @@ impl TurnRunner<'_> {
         observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<TurnRecordedOutcome, EngineError> {
+        let is_repair_turn = matches!(kind, TurnKind::Repair { .. });
         let payload = match &kind {
             TurnKind::Node { node_id } => Some(format!(r#"{{"node_id":"{node_id}"}}"#)),
             TurnKind::Repair { attempt } => Some(format!(r#"{{"attempt":{attempt}}}"#)),
@@ -227,10 +233,18 @@ impl TurnRunner<'_> {
             TurnInput::Resume(_) => None,
         };
         let exec = async {
+            let restored = {
+                let value = self
+                    .expanded_context_budget
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                (value > 0).then_some(value)
+            };
             let mut executor: Executor = self
                 .factory
                 .build(profile, task_text.as_deref())
                 .await?
+                .with_repair_expansion_evidence(is_repair_turn)
+                .with_restored_context_budget(restored)
                 .with_approver(Arc::new(RecordingApprover {
                     inner: self.approver.clone(),
                     events: events.clone(),
@@ -282,7 +296,11 @@ impl TurnRunner<'_> {
                     executor = executor.with_seeded_progress(progress);
                 }
             }
+            let expanded_budget = self.expanded_context_budget.clone();
             let mut forward = |event: leveler_agent::AgentEvent| {
+                if let leveler_agent::AgentEvent::ContextExpanded { to, .. } = &event {
+                    expanded_budget.fetch_max(*to, std::sync::atomic::Ordering::Relaxed);
+                }
                 events.emit(EngineEvent::from(event));
             };
             let result = match input {

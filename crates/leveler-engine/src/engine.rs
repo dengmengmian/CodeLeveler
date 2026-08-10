@@ -610,6 +610,7 @@ impl TaskEngine {
             session_id.clone(),
             token.clone(),
         );
+        let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
             token: token.clone(),
@@ -618,6 +619,9 @@ impl TaskEngine {
             factory: &self.factory,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
+            expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                expanded_seed,
+            )),
         };
         log.append(
             None,
@@ -748,6 +752,7 @@ impl TaskEngine {
             log.append(None, context.snapshot_event(), observer).await?;
         }
         let prior = context.prior;
+        let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
             token: token.clone(),
@@ -756,6 +761,9 @@ impl TaskEngine {
             factory: &self.factory,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
+            expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                expanded_seed,
+            )),
         };
         let result = async {
             let recorded = runner
@@ -847,6 +855,7 @@ impl TaskEngine {
             log.append(None, context.snapshot_event(), observer).await?;
         }
         let prior = context.prior;
+        let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
             token: token.clone(),
@@ -855,6 +864,9 @@ impl TaskEngine {
             factory: &self.factory,
             approver: self.approver.clone(),
             clarifier: self.clarifier.clone(),
+            expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                expanded_seed,
+            )),
         };
 
         // Reconcile the crash window before continuing: a tool that started but
