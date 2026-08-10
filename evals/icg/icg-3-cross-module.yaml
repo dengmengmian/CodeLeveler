@@ -1,0 +1,71 @@
+# ICG-3 — Cross-module contract change (C2 impact + C3 propagation). A new
+# field travels the whole pipeline: input type, decoder, encoder. No surface
+# is named; the impact chain is the agent's to discover, and missing any hop
+# leaves the feature silently half-alive.
+id: icg-3-cross-module
+name: "[icg] records carry a unit from input to output"
+repo: fixtures/repos/navsvc
+max_rounds: 70
+relevant_paths:
+  - pkg/api/types.go
+required_impact_paths:
+  - pkg/api/types.go
+  - pkg/api/encode.go
+  - internal/ingest/decoder.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+task: |
+  Metrics have units and we currently throw them away. JSON-lines input may
+  carry an optional string field `unit` (for example `"unit":"ms"`).
+
+  Carry it through: a record remembers its unit, and the canonical encoded
+  output line appends ` unit=<u>` at the very end (after any labels) when
+  the unit is non-empty. A record without a unit encodes exactly as today.
+  The unit must not appear as a label, and `--summary` output is unchanged.
+  CSV input has no unit column and is unaffected.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/icg3.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/c.conf"
+      printf '{"name":"lat","value":9,"unit":"ms","zone":"eu"}\n' > "$d/u.jsonl"
+      [ "$(< "$d/u.jsonl" "$d/navsvc" "$d/c.conf" 2>/dev/null)" = "lat=9 zone=eu unit=ms" ]
+      printf '{"name":"lat","value":9}\n' > "$d/n.jsonl"
+      [ "$(< "$d/n.jsonl" "$d/navsvc" "$d/c.conf" 2>/dev/null)" = "lat=9" ]
+      # summary untouched, unit not a label
+      < "$d/u.jsonl" "$d/navsvc" "$d/c.conf" --summary | grep -qx 'lat count=1 total=9'
+      printf 'input.format = csv\noutput.sink = stdout\n' > "$d/csv.conf"
+      printf 'lat,9,env=prod\n' > "$d/c.csv"
+      [ "$(< "$d/c.csv" "$d/navsvc" "$d/csv.conf" 2>/dev/null)" = "lat=9 env=prod" ]
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The unit surviving decoder → record → encoder, its exact position in
+      the output line, the no-unit case unchanged, and unit not leaking
+      into labels.
+    oracle_interpretation: >-
+      unit=ms appended last when present; absent unit encodes as today;
+      summary and CSV untouched.
+    rationale: >-
+      Field name, output position ("at the very end, after any labels"),
+      the empty-unit rule and both exemptions are stated sentences. The
+      work is discovering and completing the propagation chain.

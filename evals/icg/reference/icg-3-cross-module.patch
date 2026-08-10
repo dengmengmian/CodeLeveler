@@ -1,0 +1,40 @@
+diff --git a/internal/ingest/decoder.go b/internal/ingest/decoder.go
+index e3c7654..eeaa286 100644
+--- a/internal/ingest/decoder.go
++++ b/internal/ingest/decoder.go
+@@ -575,6 +575,8 @@ func (jsonlDecoder) DecodeLine(line []byte) (api.Record, bool) {
+ 				continue
+ 			}
+ 			record.Depth = depth
++		case "unit":
++			record.Unit = strings.Trim(value, "\"")
+ 		default:
+ 			record.Labels[key] = value
+ 		}
+diff --git a/pkg/api/encode.go b/pkg/api/encode.go
+index aee3c28..192e6d1 100644
+--- a/pkg/api/encode.go
++++ b/pkg/api/encode.go
+@@ -20,5 +20,8 @@ func Encode(r Record) string {
+ 			fmt.Fprintf(&b, " %s=%s", k, r.Labels[k])
+ 		}
+ 	}
++	if r.Unit != "" {
++		fmt.Fprintf(&b, " unit=%s", r.Unit)
++	}
+ 	return b.String()
+ }
+diff --git a/pkg/api/types.go b/pkg/api/types.go
+index 082d938..527cf1b 100644
+--- a/pkg/api/types.go
++++ b/pkg/api/types.go
+@@ -9,6 +9,9 @@ type Record struct {
+ 	Depth int
+ 	// Valid is false when a decoder could parse the shape but not the content.
+ 	Valid bool
++	// Unit is the metric's unit as given by the input ("ms", "bytes"); empty
++	// when the input carried none.
++	Unit string
+ }
+ 
+ // Batch is a decoded group of records handed to the pipeline as a unit.

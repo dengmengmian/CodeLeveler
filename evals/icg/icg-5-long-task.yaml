@@ -1,0 +1,87 @@
+# ICG-5 — Long integrated task (C2+C3+C4). Four product asks in one batch,
+# no file named, several touching the same rendering path so later work can
+# destroy earlier work. The acceptance checks everything at once, including
+# the stated interactions.
+id: icg-5-long-task
+name: "[icg] the observability batch: grouping, totals, stats, hygiene"
+repo: fixtures/repos/navsvc
+max_rounds: 90
+relevant_paths:
+  - internal/report/summary.go
+required_impact_paths:
+  - internal/report/summary.go
+  - cmd/navsvc/main.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+task: |
+  The observability team's backlog, to land together:
+
+  1. Records the decoder marked not valid must not appear as summary rows
+     at all — though they still count in the stats of item 4.
+  2. When a record carries an `env` label, its summary row is reported
+     separately as `<name>{env=<value>}`; records without the label keep
+     their plain name. Rows stay sorted by the name they are printed
+     under; the `count=`/`total=` format is unchanged.
+  3. The summary ends with one extra line `TOTAL count=<sum> total=<sum>`
+     summing every row above it — present (with zeroes) even when nothing
+     was observed.
+  4. A `--stats` flag: with `--summary --stats`, after everything else,
+     print exactly one final line `records=<N> invalid=<M> distinct=<K>`
+     where N counts every record that reached the report stage, M counts
+     those the decoder marked not valid, and K counts distinct incoming
+     record names among valid records — grouping from item 2 does not
+     change K. Without `--stats`, output is unchanged.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/icg5.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/c.conf"
+      printf '{"name":"req","value":1,"env":"prod"}\n{"name":"req","value":4,"env":"dev"}\n{"name":"plain","value":9}\n{"name":"g","value":"zz"}\n' > "$d/in.jsonl"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary --stats)"
+      printf '%s\n' "$out" | grep -qx 'plain count=1 total=9'
+      printf '%s\n' "$out" | grep -qx 'req{env=dev} count=1 total=4'
+      printf '%s\n' "$out" | grep -qx 'req{env=prod} count=1 total=1'
+      # the invalid record is not a row and not in TOTAL
+      printf '%s\n' "$out" | grep -q '^g ' && exit 1
+      printf '%s\n' "$out" | grep -qx 'TOTAL count=3 total=14'
+      # stats: N counts everything incl. the invalid record; K = distinct
+      # incoming valid names (req, plain) — grouping does not change it
+      printf '%s\n' "$out" | tail -1 | grep -qx 'records=4 invalid=1 distinct=2'
+      # ordering: TOTAL after rows, stats line last
+      [ "$(printf '%s\n' "$out" | tail -2 | head -1)" = "TOTAL count=3 total=14" ]
+      # without --stats: no stats line
+      < "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary | grep -q 'records=' && exit 1
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      All four obligations alive at once in one output: validity hygiene,
+      grouping, TOTAL over the printed rows, and the three-counter stats
+      line with its stated independence from grouping.
+    oracle_interpretation: >-
+      Grouped rows exact; invalid records excluded from rows and TOTAL yet
+      counted by stats; TOTAL second-to-last; stats line last with N=4 M=1
+      K=2; no line without the flag.
+    rationale: >-
+      Every counter and interaction is a stated sentence, including "K
+      counts distinct incoming record names" and "grouping does not change
+      K" — the ambiguity that sank the original N4 is pre-empted, and the
+      wordings reuse forms proven unambiguous in earlier suites.

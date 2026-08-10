@@ -1,0 +1,75 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..9a418cf 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -22,10 +22,13 @@ func main() {
+ func run(args []string) error {
+ 	configPath := ""
+ 	summarize := false
++	stats := false
+ 	for _, arg := range args {
+ 		switch {
+ 		case arg == "--summary":
+ 			summarize = true
++		case arg == "--stats":
++			stats = true
+ 		case configPath == "":
+ 			configPath = arg
+ 		}
+@@ -75,6 +78,21 @@ func run(args []string) error {
+ 	}
+ 	if summarize {
+ 		fmt.Print(report.Aggregate(collected))
++		if stats {
++			records, invalid := 0, 0
++			distinct := map[string]struct{}{}
++			for _, batch := range collected {
++				for _, record := range batch.Records {
++					records++
++					if !record.Valid {
++						invalid++
++						continue
++					}
++					distinct[record.Name] = struct{}{}
++				}
++			}
++			fmt.Printf("records=%d invalid=%d distinct=%d\n", records, invalid, len(distinct))
++		}
+ 	}
+ 	return nil
+ }
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index 79f23c9..33e2cda 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -25,8 +25,15 @@ func NewSummary() *Summary {
+ // Observe folds one batch into the running totals.
+ func (s *Summary) Observe(batch api.Batch) {
+ 	for _, record := range batch.Records {
+-		s.counts[record.Name]++
+-		s.totals[record.Name] += record.Value
++		if !record.Valid {
++			continue
++		}
++		key := record.Name
++		if env, ok := record.Labels["env"]; ok {
++			key = record.Name + "{env=" + env + "}"
++		}
++		s.counts[key]++
++		s.totals[key] += record.Value
+ 	}
+ }
+ 
+@@ -39,8 +46,12 @@ func (s *Summary) Render() string {
+ 	sort.Strings(names)
+ 
+ 	var b strings.Builder
++	count, total := 0, 0.0
+ 	for _, name := range names {
+ 		fmt.Fprintf(&b, "%s count=%d total=%g\n", name, s.counts[name], s.totals[name])
++		count += s.counts[name]
++		total += s.totals[name]
+ 	}
++	fmt.Fprintf(&b, "TOTAL count=%d total=%g\n", count, total)
+ 	return b.String()
+ }

@@ -1,0 +1,128 @@
+# ICG-4 — Verification failure recovery (C4 composed with C2 discovery). The
+# suite is red in two independent places after a bad merge; the task names no
+# file and no test. The agent must run verification, read the failures, find
+# both defects, fix both, and iterate until green.
+id: icg-4-verification-recovery
+name: "[icg] the suite is red after a bad merge — make it green"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+recovery: true
+relevant_paths:
+  - internal/pipeline/transform.go
+  - internal/pipeline/filter.go
+required_impact_paths:
+  - internal/pipeline/transform.go
+  - internal/pipeline/filter.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/pipeline/transform.go: |
+    package pipeline
+
+    import (
+    	"strings"
+
+    	"navsvc/internal/config"
+    	"navsvc/pkg/api"
+    )
+
+    // normalizeStage lowercases names and trims label whitespace so downstream
+    // aggregation groups equivalent records together.
+    type normalizeStage struct{}
+
+    func (normalizeStage) Name() string { return "normalize" }
+
+    func (normalizeStage) Run(batch api.Batch, _ config.PipelineConfig) api.Batch {
+    	for i := range batch.Records {
+    		batch.Records[i].Name = strings.TrimSpace(batch.Records[i].Name)
+    		for k, v := range batch.Records[i].Labels {
+    			batch.Records[i].Labels[k] = strings.TrimSpace(v)
+    		}
+    	}
+    	return batch
+    }
+
+    // flattenStage collapses records nested deeper than the configured maximum
+    // onto that maximum, so a pathological document cannot produce unbounded
+    // depth downstream.
+    type flattenStage struct{}
+
+    func (flattenStage) Name() string { return "flatten" }
+
+    func (flattenStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+    	for i := range batch.Records {
+    		if batch.Records[i].Depth > cfg.MaxDepth {
+    			batch.Records[i].Depth = cfg.MaxDepth
+    		}
+    	}
+    	return batch
+    }
+
+  internal/pipeline/filter.go: |
+    package pipeline
+
+    import (
+    	"navsvc/internal/config"
+    	"navsvc/pkg/api"
+    )
+
+    // filterStage removes records a decoder marked unusable.
+    type filterStage struct{}
+
+    func (filterStage) Name() string { return "filter" }
+
+    func (filterStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+    	if !cfg.DropInvalid {
+    		return batch
+    	}
+    	kept := batch.Records[:0]
+    	for _, record := range batch.Records {
+    		if record.Value != 0 {
+    			kept = append(kept, record)
+    		}
+    	}
+    	batch.Records = kept
+    	return batch
+    }
+
+task: |
+  Yesterday's merge went badly and `go test ./...` is now failing — more
+  than one thing is broken. The tests themselves are correct: they pin the
+  intended behaviour. Diagnose the failures, fix the product code, and
+  keep going until the whole suite is green.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go build ./... > /dev/null
+      go test ./internal/pipeline/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: pass
+    tests: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Both independent regressions repaired, discovered from test evidence
+      alone, converging on a fully green suite.
+    oracle_interpretation: >-
+      The maintained suite is green with tests untouched.
+    rationale: >-
+      The failing tests state their expectations exactly; the task says the
+      tests are right and there is more than one failure. The work is
+      evidence-driven repair, not interpretation.
