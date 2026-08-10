@@ -1,6 +1,6 @@
 {
- "calls": 11,
- "input_total": 5360841,
+ "calls": 15,
+ "input_total": 8270174,
  "probes": [
   {
    "target": 128000,
@@ -177,8 +177,80 @@
     "late": true
    },
    "overall": 5
+  },
+  {
+   "model": "deepseek-v4-flash",
+   "target": 512000,
+   "seed": 1,
+   "input_tokens": 509536,
+   "cached": 0,
+   "output_tokens": 86,
+   "latency_s": 9.2,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "model": "deepseek-v4-flash",
+   "target": 512000,
+   "seed": 2,
+   "input_tokens": 509478,
+   "cached": 0,
+   "output_tokens": 85,
+   "latency_s": 36.0,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "model": "deepseek-v4-flash",
+   "target": 950000,
+   "seed": 1,
+   "input_tokens": 945119,
+   "cached": 4352,
+   "output_tokens": 86,
+   "latency_s": 15.2,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
+  },
+  {
+   "model": "deepseek-v4-flash",
+   "target": 950000,
+   "seed": 2,
+   "input_tokens": 945200,
+   "cached": 4352,
+   "output_tokens": 85,
+   "latency_s": 100.6,
+   "recall": {
+    "early": true,
+    "p25": true,
+    "p50": true,
+    "p75": true,
+    "late": true
+   },
+   "overall": 5
   }
  ],
  "method": "c5-s2-long-context-recall-v1: deterministic code-like corpus, 5 positional needles (2%,25%,50%,75%,97%), exact-match, thinking disabled, max_tokens=300",
- "note_probe_0": "INVALID: thinking-mode default consumed the output budget; disabled for all subsequent probes"
+ "note_probe_0": "INVALID: thinking-mode default consumed the output budget; disabled for all subsequent probes",
+ "models": {
+  "deepseek-v4-pro": "128k-945k, 2 seeds/point, all 5/5",
+  "deepseek-v4-flash": "512k+945k, 2 seeds/point, all 5/5"
+ }
 }

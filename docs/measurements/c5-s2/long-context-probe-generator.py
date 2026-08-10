@@ -11,7 +11,7 @@ API = "https://api.deepseek.com/chat/completions"
 _cfg = open(os.path.expanduser("~/.leveler/config.toml")).read()
 KEY = re.search(r'\[providers\.deepseek\].*?^api_key\s*=\s*"([^"]+)"', _cfg, re.S | re.M).group(1)
 urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
-MODEL = "deepseek-v4-pro"
+MODEL = sys.argv[3] if len(sys.argv) > 3 else "deepseek-v4-pro"
 STATE = sys.argv[1]  # json state file for budget accounting across invocations
 
 # ~3.6 bytes/token for this generator's mix (verified against actual usage on
@@ -69,7 +69,7 @@ def probe(target_tokens, seed):
     for pos, val in needles.items():
         m = re.search(rf"RECALL_KEY_{pos.upper()}\s*=\s*\"?([0-9a-f]{{16}})\"?", text)
         score[pos] = bool(m and m.group(1) == val)
-    return dict(target=target_tokens, seed=seed,
+    return dict(model=MODEL, target=target_tokens, seed=seed,
                 input_tokens=u["prompt_tokens"], cached=u.get("prompt_cache_hit_tokens", 0),
                 output_tokens=u["completion_tokens"], latency_s=round(time.time() - t0, 1),
                 recall=score, overall=sum(score.values()),

@@ -77,6 +77,16 @@ exact-match 自动评分，`thinking: disabled`，`max_tokens=300`，ToolChoice 
 | 768k | 1,2 | 764,167 / 764,179 | 5/5 · 5/5 | 全位置 ✓ |
 | **950k** | 1,2 | **945,119 / 945,200** | **5/5 · 5/5** | 全位置 ✓（窗口的 90%） |
 
+**deepseek-v4-flash 补测**（同仪器、同 seed 语料，压顶部两档 + 中位对照）：
+
+| target | seeds | actual input | recall |
+| ---: | :---: | ---: | :---: |
+| 512k | 1,2 | 509,536 / 509,478 | 5/5 · 5/5 |
+| **950k** | 1,2 | 945,119 / 945,200 | **5/5 · 5/5** |
+
+flash 结论同 pro：**NOT OBSERVED**，`context_quality` 同样保持 None。
+两个工作模型在单针召回维度均干净到窗口 90%。
+
 cached_input_tokens 全程 0（每探针独立语料，无前缀复用）——无缓存混杂。
 
 ## Recall Curve
@@ -93,7 +103,8 @@ provider-reported input tokens (≈90% of the 1,048,576 window),
 2 independent seeds per point, 5 positional needles per probe.
 ```
 
-无边界可加密（没有 first_bad），依预算纪律停止：**11/16 调用、5,360,841/10M input tokens**。
+无边界可加密（没有 first_bad），依预算纪律停止：**15/16 调用、8,270,174/10M input tokens**
+（pro 11 + flash 4）。
 
 ## ContextQuality Decision
 
@@ -115,13 +126,14 @@ populated: NO — kept None
 | 段 | 调用 | input tokens | output tokens |
 | --- | ---: | ---: | ---: |
 | S2-A 校准（framing 探针 + 17 样本） | 19 | ≈332k | 19 |
-| S2-B 长上下文（含 1 无效试点） | 11 | 5,360,841 | ≈3.3k |
+| S2-B 长上下文 pro（含 1 无效试点） | 11 | 5,360,841 | ≈3.3k |
+| S2-B 长上下文 flash 补测 | 4 | 2,909,333 | ≈1.2k |
 
 ## S3 Inputs（已测事实，供 S3 消费）
 
 1. estimator 全域无系统性低估（max under -3.9%）——S3 的阈值可以信任计量单位。
 2. tool 载荷密度 2.5–2.9 bytes/token；纯 JSON 会被高估至 +35%（安全侧）。
-3. **deepseek-v4-pro 单针精确召回到 945k 无退化**——786,432 的 fallback 在该维度保守；
+3. **deepseek-v4-pro 与 v4-flash 单针精确召回到 945k 均无退化**——786,432 的 fallback 在该维度保守；
    S3 的 max_budget 档位设计可据此考虑上探（策略决定，另测更难任务形态后再定亦可）。
 4. 长上下文延迟：~62-116s @512-768k，~30s @950k（波动大，provider 侧因素）；
    逐轮全前缀重复计费的成本曲线数据在 raw JSON。
