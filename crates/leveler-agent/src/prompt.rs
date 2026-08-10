@@ -178,14 +178,16 @@ impl PromptBuilder {
         );
         if self.require_explicit_plan {
             prompt.push_str(
-                "\n\nBefore calling any tool, decide if this is multi-step work \
-                 (several independently checkable pieces, multi-file changes, or \
-                 migrate/architecture work). If yes: after optional read-only \
-                 explore, your first substantive action must be update_plan with \
-                 one in_progress step and the rest pending (statuses: \
-                 pending/in_progress/completed) — not a prose checklist alone — \
-                 then follow and revise that plan via update_plan. If a single \
-                 action covers the request, skip update_plan and just do the task.",
+                "\n\nIf this is multi-step work (several independently checkable \
+                 pieces, multi-file changes, or migrate/architecture work), call \
+                 update_plan with one in_progress step and the rest pending \
+                 (statuses: pending/in_progress/completed) — not a prose checklist \
+                 alone — before you start changing files, then follow and revise \
+                 it via update_plan. Locating and reading code needs no plan: \
+                 investigate as long as the evidence still changes your \
+                 understanding, and write the plan once you know what the work \
+                 actually is. If a single action covers the request, skip \
+                 update_plan and just do the task.",
             );
             // Zero-cost guidance, unlike the removed MissingEvidence nudge: it
             // costs no extra round, and a model that verifies inside the turn
@@ -391,12 +393,12 @@ mod tests {
     fn structural_guidance_is_opt_in() {
         let base = PromptBuilder::new().build();
 
-        assert!(!base.contains("Before calling any tool"));
+        assert!(!base.contains("before you start changing files"));
         assert!(!base.contains("do NOT declare the task complete"));
 
         let prompt = PromptBuilder::new().require_explicit_plan(true).build();
 
-        assert!(prompt.contains("Before calling any tool"));
+        assert!(prompt.contains("before you start changing files"));
         assert!(prompt.contains("do NOT declare the task complete"));
     }
 
@@ -522,7 +524,43 @@ mod tests {
         assert!(BASE_PROMPT.contains("You are CodeLeveler"));
     }
 
+    /// C2.3B §30 A/B/C — navigation discipline is HARNESS baseline behavior:
+    /// it ships in `prompts/base.md`, so every production request carries it,
+    /// and every provider gets the same principles. A model profile that
+
+    /// C2.3B §2/§6 — broader reads must stay legitimate. The guidance may not
+    /// forbid whole-file reads or argue from token cost: the goal is evidence
+
+    /// C2.3B §4 — a known location must not cost a ceremonial search. The
+    /// guidance has to state the KNOWN case, or "search first" degrades into
+
+    /// C2.3B §30 D/F — C2.3A's contract is untouched: the plan block may ask
+    /// for a plan before *mutations*, but nothing in the prompt may frame
+    /// navigation as optional or as a lesser action, and no guidance may force
+    /// a tool choice.
+    #[test]
+    fn plan_guidance_does_not_demote_navigation() {
+        let prompt = PromptBuilder::new().require_explicit_plan(true).build();
+        assert!(
+            prompt.contains("update_plan"),
+            "multi-step mutation still expects a plan"
+        );
+        for demoting in ["optional read-only explore", "first substantive action"] {
+            assert!(
+                !prompt.contains(demoting),
+                "C2.3A removed the navigation wall; the prompt must not rebuild it: {demoting:?}"
+            );
+        }
+        assert!(
+            prompt.contains("before you start changing files"),
+            "the plan requirement must be scoped to mutation: {prompt}"
+        );
+    }
+
+    /// C2.3B §15 — the dual of "re-read when a recollection may be stale":
+
     /// Analysis/review answers must not promote "tests passed" into unearned
+
     /// performance or "no regression" claims (evidence discipline).
     #[test]
     fn base_prompt_requires_evidence_layers_for_analysis_claims() {
@@ -678,7 +716,8 @@ mod tests {
         let prompt = PromptBuilder::new().require_explicit_plan(true).build();
         assert!(
             prompt.contains("update_plan")
-                && prompt.contains("first substantive action must be update_plan"),
+                && prompt.contains("not a prose checklist")
+                && prompt.contains("before you start changing files"),
             "multi-step work must route into the tracked checklist, not prose: {prompt}"
         );
         assert!(

@@ -350,6 +350,73 @@ pub fn expand_tool_category(registry: &mut ToolRegistry, category: &str) {
 }
 
 #[cfg(test)]
+mod navigation_tool_contract {
+    //! The tool table is what an eval measures navigation against, so the
+    //! parts a benchmark depends on are pinned here: `read_file`'s range is
+    //! optional, and its description states plainly what each form returns.
+    //! C2.3B's behavioural wording was removed after A/B showed it cost more
+    //! than it bought; what stays is capability, not advice.
+
+    #[test]
+    fn read_file_takes_an_optional_range_and_says_what_each_form_returns() {
+        let registry = crate::full_registry();
+        let read = registry
+            .definitions()
+            .into_iter()
+            .find(|d| d.name == "read_file")
+            .expect("read_file registered");
+
+        let props = read.input_schema["properties"]
+            .as_object()
+            .expect("object schema");
+        assert!(props.contains_key("path"));
+        assert!(props.contains_key("start_line"));
+        assert!(props.contains_key("end_line"));
+        let required = read.input_schema["required"].as_array().expect("required");
+        assert_eq!(
+            required.len(),
+            1,
+            "only `path` may be required: {required:?}"
+        );
+        assert_eq!(required[0], "path");
+
+        assert!(
+            read.description
+                .contains("omitting both returns the whole file"),
+            "both read shapes must be discoverable from the tool alone: {}",
+            read.description
+        );
+        // Descriptions state capability. Steering belongs in the prompt, where
+        // it can be measured and reverted; C2.3B is the reason that matters.
+        for advisory in [
+            "first thing to reach for",
+            "where to start reading",
+            "token",
+        ] {
+            assert!(
+                !read.description.to_lowercase().contains(advisory),
+                "tool descriptions must not carry navigation advice: {advisory:?}"
+            );
+        }
+    }
+
+    /// The three localisation tools must stay distinguishable, or a navigation
+    /// eval cannot tell "used the wrong tool" from "did not look".
+    #[test]
+    fn localisation_tools_stay_distinguishable() {
+        let registry = crate::full_registry();
+        let by_name: std::collections::HashMap<_, _> = registry
+            .definitions()
+            .into_iter()
+            .map(|d| (d.name.clone(), d.description))
+            .collect();
+        assert!(by_name["grep"].contains("pattern"));
+        assert!(by_name["find_symbol"].contains("DEFINED"));
+        assert!(by_name["find_references"].contains("call sites"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

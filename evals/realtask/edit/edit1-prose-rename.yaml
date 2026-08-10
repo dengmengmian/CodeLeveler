@@ -1,0 +1,85 @@
+# EDIT1 — The dogfood incident as a case: a short Markdown file needs one
+# sentence changed AND the file renamed to keep the docs convention
+# (filename = slugified H1). Measures the real edit-tool behavior on prose:
+# read-before-edit, apply_patch vs replace selection, mismatch/malformed
+# retries, self-recovery. The docs lint (scripts/check_docs.sh) is the
+# repo's own verification gate via .leveler/config.yaml.
+id: edit1-prose-rename
+name: "[edit] rename the release checklist note and fix its opening sentence"
+max_rounds: 60
+files:
+  .leveler/config.yaml: |
+    verify:
+      test:
+        program: bash
+        args: ["scripts/check_docs.sh"]
+  scripts/check_docs.sh: |
+    #!/bin/bash
+    # Docs convention: every note under docs/ must be named after its H1:
+    # lowercase, spaces -> '-', punctuation dropped. Fails loudly otherwise.
+    set -euo pipefail
+    status=0
+    for f in docs/*.md; do
+      h1="$(sed -n 's/^# //p' "$f" | head -1)"
+      if [ -z "$h1" ]; then
+        echo "no H1 in $f" >&2
+        status=1
+        continue
+      fi
+      slug="$(printf '%s' "$h1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//')"
+      base="$(basename "$f" .md)"
+      if [ "$base" != "$slug" ]; then
+        echo "$f: filename '$base' does not match H1 slug '$slug'" >&2
+        status=1
+      fi
+    done
+    exit $status
+  docs/deployment-checklist.md: |
+    # Deployment Checklist
+
+    Run this checklist before every production deployment of the service.
+
+    - [ ] All CI gates green on the release branch
+    - [ ] Changelog entry drafted and reviewed
+    - [ ] Database migrations rehearsed against a staging snapshot
+    - [ ] On-call engineer notified of the rollout window
+    - [ ] Rollback command verified in staging
+  docs/incident-response.md: |
+    # Incident Response
+
+    Follow this guide when an incident is declared.
+
+    - Page the on-call engineer
+    - Open an incident channel
+    - Start the incident timeline document
+task: |
+  The team renamed the "Deployment Checklist" to "Release Checklist" — the
+  process now covers every release, not only production deployments.
+
+  Update the note in docs/ accordingly:
+  - The title becomes "Release Checklist".
+  - The opening sentence must now read: "Run this checklist before every
+    release of the service." (it currently talks about production
+    deployments).
+  - The checklist items themselves stay unchanged.
+  - Keep the docs naming convention intact: notes are named after their
+    title (see scripts/check_docs.sh) — so the file must move along with
+    the rename.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      # The repo's own docs lint must pass.
+      bash scripts/check_docs.sh
+      # Hidden acceptance: BOTH the content and the filename moved.
+      [ -f docs/release-checklist.md ]
+      [ ! -f docs/deployment-checklist.md ]
+      grep -qx '# Release Checklist' docs/release-checklist.md
+      grep -qx 'Run this checklist before every release of the service.' docs/release-checklist.md
+      # The five checklist items survived byte-for-byte.
+      [ "$(grep -c '^- \[ \]' docs/release-checklist.md)" -eq 5 ]
+      grep -qx -- '- \[ \] Rollback command verified in staging' docs/release-checklist.md
+      # The unrelated note is untouched.
+      grep -qx '# Incident Response' docs/incident-response.md

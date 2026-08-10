@@ -1,0 +1,142 @@
+# N6 — Large-file localisation. Runs against `navsvc-n6`, the variant whose
+# jsonl decoder drops the `depth` field (see `--defect jsonl-depth`). The first
+# version of this case pointed at the healthy fixture, where the described
+# behaviour already worked: the hidden acceptance passed untouched and the case
+# measured nothing. `scripts/check_fixture_validity.py` now refuses that.
+#
+# decoder.go is ~1030 lines. The live jsonl
+# decoder sits near line 510, between 33 exporter-revision helpers before it
+# and 27 collector-normalisation helpers after it, all of which parse or trim
+# fields and none of which are on the path.
+#
+# Difficulty: the first 200 lines are helpers, so a top-of-file read finds
+# nothing; `rg "depth"` returns pkg/api/types.go, the flatten stage and the
+# config field before it returns anything in decoder.go. Reading the whole
+# file is allowed and is not scored as an error.
+id: n6-large-file-region
+name: "[nav] JSON input never carries record depth"
+repo: fixtures/repos/navsvc-n6
+max_rounds: 60
+relevant_paths:
+  - internal/ingest/decoder.go
+required_impact_paths:
+  - internal/ingest/decoder.go
+distractor_paths:
+  - internal/pipeline/transform.go
+  - internal/config/config.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/pipeline/depth_report.go: |
+    package pipeline
+
+    import "navsvc/pkg/api"
+
+    // MaxObservedDepth reports the deepest nesting level seen in a batch.
+    // Used by operators tuning pipeline.max_depth.
+    func MaxObservedDepth(batch api.Batch) int {
+    	deepest := 0
+    	for _, record := range batch.Records {
+    		if record.Depth > deepest {
+    			deepest = record.Depth
+    		}
+    	}
+    	return deepest
+    }
+task: |
+  Our JSON-lines input carries a `depth` field saying how deeply a record was
+  nested in its source document. Operators use it to tune the pipeline, and it
+  is what the `flatten` stage clamps.
+
+  It is always zero. A record like
+
+      {"name":"a","value":1,"depth":3}
+
+  comes out of ingestion with depth 0, so `flatten` never has anything to do
+  and the depth-based tuning advice we give people is useless. The equivalent
+  CSV path is not affected — this is specific to JSON-lines input.
+
+  Make JSON-lines input carry the depth it was given. A record without a
+  `depth` field keeps depth 0, and a `depth` that is not an integer must not
+  make the whole record fail to parse.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n6.XXXXXX")"
+      trap 'rm -f internal/ingest/zz_hidden_n6_test.go; rm -rf "$d"' EXIT
+      cat > internal/ingest/zz_hidden_n6_test.go <<'GO'
+      package ingest
+
+      import "testing"
+
+      func TestJSONLCarriesDepth(t *testing.T) {
+      	r, ok := decoderFor("jsonl").DecodeLine([]byte(`{"name":"a","value":1,"depth":3}`))
+      	if !ok {
+      		t.Fatal("record should decode")
+      	}
+      	if r.Depth != 3 {
+      		t.Fatalf("depth lost: want 3, got %d", r.Depth)
+      	}
+      	if r.Name != "a" || r.Value != 1 {
+      		t.Fatalf("other fields disturbed: %+v", r)
+      	}
+      	if _, present := r.Labels["depth"]; present {
+      		t.Fatal("depth must not also land in labels")
+      	}
+      }
+
+      func TestJSONLWithoutDepthStaysZero(t *testing.T) {
+      	r, ok := decoderFor("jsonl").DecodeLine([]byte(`{"name":"a","value":1}`))
+      	if !ok || r.Depth != 0 {
+      		t.Fatalf("want depth 0, got %+v", r)
+      	}
+      }
+
+      func TestJSONLBadDepthDoesNotDropTheRecord(t *testing.T) {
+      	r, ok := decoderFor("jsonl").DecodeLine([]byte(`{"name":"a","value":1,"depth":"x"}`))
+      	if !ok {
+      		t.Fatal("a bad depth must not discard the whole record")
+      	}
+      	if r.Name != "a" {
+      		t.Fatalf("name lost: %+v", r)
+      	}
+      }
+
+      func TestCSVPathUnchanged(t *testing.T) {
+      	r, ok := decoderFor("csv").DecodeLine([]byte("a,1,env=prod"))
+      	if !ok || r.Name != "a" || r.Labels["env"] != "prod" {
+      		t.Fatalf("csv decoding disturbed: %+v", r)
+      	}
+      }
+      GO
+      go build ./... > /dev/null
+      go test ./internal/ingest/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./internal/pipeline/ ./internal/report/ ./internal/config/ > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Whether a jsonl `depth` field reaches Record.Depth.
+    oracle_interpretation: >-
+      depth 3 decodes to Depth 3; a missing depth stays 0; a non-integer depth
+      keeps the record; depth does not also appear in Labels.
+    rationale: >-
+      The first three are stated in the task verbatim. The fourth is not stated,
+      but follows the decoder's own structure: recognised keys are special-cased
+      and only unrecognised keys fall through to Labels, and the broken variant
+      already keeps depth out of Labels. Noted as the one assertion a reader
+      must take from the code rather than the task.

@@ -1,0 +1,69 @@
+# C1.4 exploration scale ladder — S100.
+# One repository family, one defect, one fix, rendered at four sizes; the
+# dependency chain to the bug (cmd -> pipeline -> sink interface -> rollup
+# impl -> window helper) is identical at every scale, so a difference in
+# outcome is a difference in SCALE, not in difficulty. Generate the tree with
+# `python3 scripts/gen_scale_repos.py 100` (deterministic, not committed).
+# Budget is deliberately the same at every rung.
+id: scale-s100
+name: "[scale] telemetryd window boundary, ~100-file repository"
+repo: fixtures/repos/scale-s100
+max_rounds: 100
+# Metrics only — never rendered into the task or shown to the agent.
+relevant_paths:
+  - internal/window/window.go
+task: |
+  Bug report from the on-call team:
+
+  "Our per-minute report puts events in the wrong bucket. An event recorded a
+  second BEFORE a minute boundary shows up in the NEXT minute's row, so the
+  traffic spike we were paging on appears one window late. Events well inside
+  a window are fine. An event exactly on the boundary looks right."
+
+  Expected behavior: a window covers [start, start+width) — an instant belongs
+  to the window that has already started at that instant, and an instant
+  exactly on a boundary starts the next window. Nothing else about the report
+  changes.
+
+  Acceptance criteria:
+  - `go test ./...` passes.
+  - The boundary rule is covered by a test (the current tests only exercise
+    instants in the middle of a window).
+  - The command-line report reflects the rule end to end.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go test ./... > /dev/null
+      d="$(mktemp -d "${TMPDIR:-/tmp}/telemetryd-accept.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/telemetryd" ./cmd/telemetryd
+      cat > "$d/events.txt" <<'EVENTS'
+      0 hits 1
+      59 hits 2
+      60 hits 4
+      61 hits 8
+      119 misses 16
+      120 misses 32
+      EVENTS
+      out="$("$d/telemetryd" "$d/events.txt")"
+      [ "$(sed -n '1p' <<<"$out")" = "t=0 hits 3" ]
+      [ "$(sed -n '2p' <<<"$out")" = "t=60 hits 12" ]
+      [ "$(sed -n '3p' <<<"$out")" = "t=60 misses 16" ]
+      [ "$(sed -n '4p' <<<"$out")" = "t=120 misses 32" ]
+      [ "$(wc -l <<<"$out")" -eq 4 ]
+      # The real implementation was found: every change is in the windowing
+      # package (docs may follow). A distractor package edited instead — or as
+      # well — fails here.
+      changed="$(git status --porcelain | awk '{print $2}')"
+      [ -n "$changed" ]
+      while read -r path; do
+        case "$path" in
+          internal/window/*|docs/*) ;;
+          *) echo "changed outside the windowing package: $path" >&2; exit 1 ;;
+        esac
+      done <<<"$changed"
+      # The boundary rule is locked by a test, not just implemented.
+      grep -q '_test.go' <<<"$changed"

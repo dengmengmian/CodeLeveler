@@ -1,0 +1,75 @@
+# N2 — Competing implementations. Two summarisers exist. legacy.SummarizeRecords
+# is the closer lexical match to how the task is phrased ("summarize records")
+# and produces the same line format; internal/report is what the command
+# actually calls. Only changing the live one changes behaviour.
+#
+# Difficulty: `rg -n "count="` returns both; `rg -n "Summarize"` returns ONLY
+# the dead one. The live path is reached through cmd/navsvc/main.go →
+# report.Aggregate → Summary.Render, i.e. by following the call, not the name.
+id: n2-competing-implementations
+name: "[nav] add a grand-total line to the summary"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - internal/report/summary.go
+required_impact_paths:
+  - internal/report/summary.go
+distractor_paths:
+  - legacy/oldsummary.go
+  - examples/example_summary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+files: {}
+task: |
+  When we summarize records the per-metric lines are useful, but people keep
+  asking "so what's the overall total?" and adding the column up by hand.
+
+  After the per-metric lines, print one final line:
+
+      TOTAL count=<sum of all counts> total=<sum of all totals>
+
+  The per-metric lines must keep their current format and ordering exactly.
+  With no records at all, the TOTAL line should still appear, with zeroes.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n2.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\n' > "$d/c.conf"
+      printf '{"name":"a","value":1}\n{"name":"a","value":2}\n{"name":"b","value":5}\n' > "$d/in.jsonl"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary)"
+      # existing rows unchanged, in order, then the new line last
+      [ "$(printf '%s\n' "$out" | sed -n 1p)" = "a count=2 total=3" ]
+      [ "$(printf '%s\n' "$out" | sed -n 2p)" = "b count=1 total=5" ]
+      [ "$(printf '%s\n' "$out" | sed -n 3p)" = "TOTAL count=3 total=8" ]
+      # empty input still reports a total
+      printf '' | "$d/navsvc" "$d/c.conf" --summary | grep -qx 'TOTAL count=0 total=0'
+      # the change must be in the live path, not the dead package
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The TOTAL line's text, its position, and the empty-input case.
+    oracle_interpretation: >-
+      `TOTAL count=<sum> total=<sum>` printed after the per-metric lines; with
+      no records it still appears with zeroes.
+    rationale: >-
+      The task states the format verbatim, states the position ("after the
+      per-metric lines"), and states the empty case explicitly. No second
+      reading survives.

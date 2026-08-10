@@ -6,6 +6,13 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Executor plan gate (C2.3A): a missing structured plan no longer strips
+  navigation tools or forces `ToolChoice=update_plan` after explore rounds.
+  Multi-step tasks still require `update_plan` before mutations; after a few
+  plan-less explore rounds the drive injects a one-time soft advisory only.
+  Round budget, loop guard, and search budget are unchanged.
+
 ### Security
 - In-repo `.leveler/hooks.yaml` and `.leveler/permissions.yaml` no longer take
   effect just because a repository ships them. Hooks run commands before every

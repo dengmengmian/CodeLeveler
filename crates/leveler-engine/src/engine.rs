@@ -1883,6 +1883,7 @@ mod gate_plan_tests {
                 kind: leveler_verifier::CheckKind::Test,
                 gating: true,
                 timeout_seconds: 600,
+                scope_policy: Default::default(),
             }],
         };
 

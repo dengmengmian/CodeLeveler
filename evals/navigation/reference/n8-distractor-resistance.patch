@@ -1,0 +1,29 @@
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index 79f23c9..84c0659 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -25,11 +25,22 @@ func NewSummary() *Summary {
+ // Observe folds one batch into the running totals.
+ func (s *Summary) Observe(batch api.Batch) {
+ 	for _, record := range batch.Records {
+-		s.counts[record.Name]++
+-		s.totals[record.Name] += record.Value
++		key := rowName(record)
++		s.counts[key]++
++		s.totals[key] += record.Value
+ 	}
+ }
+ 
++// rowName is the name a record is reported under. Records carrying an `env`
++// label are grouped per environment so operators running one exporter per
++// host can tell hosts apart; everything else keeps its plain name.
++func rowName(record api.Record) string {
++	if env, ok := record.Labels["env"]; ok {
++		return record.Name + "{env=" + env + "}"
++	}
++	return record.Name
++}
++
+ // Render produces the human-readable report, one line per name, sorted.
+ func (s *Summary) Render() string {
+ 	names := make([]string, 0, len(s.counts))

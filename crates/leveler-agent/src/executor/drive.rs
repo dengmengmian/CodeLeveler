@@ -107,15 +107,18 @@ impl Executor {
         progress.phase = TurnPhase::Active;
         let structured_plan_required =
             self.policy.require_explicit_plan && task_needs_structured_plan(&original_task);
-        // Complex tasks may use a few read-only explore rounds before plan.
-        const PLAN_EXPLORE_ROUNDS: u32 = 2;
+        // Soft plan nudge only: after this many explore rounds without a plan,
+        // inject an advisory once. Never used to strip tools or force ToolChoice
+        // (C2.3A — plan is an execution aid, not a navigation gate).
+        const PLAN_SOFT_NUDGE_AFTER_ROUNDS: u32 = 2;
         let mut plan_explore_rounds_used = 0u32;
+        let mut plan_soft_nudge_sent = false;
         let mut plan_state = self.seeded_plan.clone();
         let mut structured_plan_started = !plan_state.is_empty();
         // Short tasks: no host-seeded one-step plan shell. Plan UI appears only when
         // the model calls update_plan, or resume rehydrates a prior PlanUpdated.
-        // Complex tasks still require ModelExplicit update_plan before mutation
-        // (structured_plan_required + explore budget). HostImplicit remains for
+        // Complex tasks still require ModelExplicit update_plan before mutation;
+        // navigation tools stay available without a plan. HostImplicit remains for
         // resume of older sessions that already persisted that origin.
         // Task contract → user turn (never system prefix) so prefix cache stays stable.
         let task_contract = TaskContract::parse(&original_task);
@@ -455,21 +458,32 @@ impl Executor {
                 ));
             }
 
-            let mut request = ModelRequest::new(self.model.clone(), messages.clone());
-            let plan_repair_required = structured_plan_required
+            // C2.3A: after enough plan-less explore rounds, suggest updating the
+            // plan once — without removing navigation tools or forcing ToolChoice.
+            if structured_plan_required
                 && !structured_plan_started
-                && plan_explore_rounds_used >= PLAN_EXPLORE_ROUNDS;
-            if plan_repair_required {
-                request.tools = tools
-                    .iter()
-                    .filter(|tool| tool.name == "update_plan")
-                    .cloned()
-                    .collect();
-                request.tool_choice = ToolChoice::Tool("update_plan".to_string());
-            } else {
-                request.tools = tools.clone();
-                request.tool_choice = ToolChoice::Auto;
+                && plan_explore_rounds_used >= PLAN_SOFT_NUDGE_AFTER_ROUNDS
+                && !plan_soft_nudge_sent
+            {
+                let nudge = Message::text(
+                    Role::User,
+                    "If you already have a clear multi-step execution path, you may \
+                     call update_plan with one in_progress step and the rest pending. \
+                     If you still need to locate or understand code, continue exploring \
+                     with search/read/symbol/reference tools — a plan is not required \
+                     before further navigation.",
+                );
+                sink.append(std::slice::from_ref(&nudge)).await?;
+                messages.push(nudge);
+                plan_soft_nudge_sent = true;
             }
+
+            let mut request = ModelRequest::new(self.model.clone(), messages.clone());
+            // Full tool table + Auto for every normal navigation round. Plan is
+            // never a license to navigate: forced update_plan tool_choice and
+            // "tools = [update_plan]" are gone (C2.3A).
+            request.tools = tools.clone();
+            request.tool_choice = ToolChoice::Auto;
             request.max_output_tokens = Some(self.max_output_tokens);
             request.reasoning_effort = self.policy.reasoning_effort;
 
@@ -700,17 +714,6 @@ impl Executor {
                 ));
             }
 
-            if calls.is_empty() && plan_repair_required {
-                let feedback = Message::text(
-                    Role::User,
-                    "A structured plan is still required. Your text response did not satisfy \
-                     the plan gate. Call update_plan now; do not answer or continue in prose.",
-                );
-                sink.append(&[assistant, feedback.clone()]).await?;
-                messages.push(feedback);
-                continue;
-            }
-
             if calls.is_empty() {
                 // Unified closeout (executor/closeout.rs): a quiet round
                 // produces AT MOST one nudge — chosen by priority
@@ -878,13 +881,11 @@ impl Executor {
 
             for (index, call) in calls.into_iter().enumerate() {
                 // Complex tasks must register a structured plan before mutation.
-                // Read-only explore tools may run for PLAN_EXPLORE_ROUNDS first
-                // (W2-04). Clarification and permission requests stay available.
+                // Navigation/explore tools are never denied for a missing plan
+                // (C2.3A). Clarification and permission requests stay available.
                 if let gates::GateVerdict::Refuse(msg) = gates::plan_gate(&gates::PlanGate {
                     required: structured_plan_required,
                     plan_started: structured_plan_started,
-                    explore_rounds_used: plan_explore_rounds_used,
-                    explore_rounds_allowed: PLAN_EXPLORE_ROUNDS,
                     tool_is_explore: is_plan_explore_tool(&call.name),
                     tool_is_exempt: matches!(
                         call.name.as_str(),
@@ -2023,7 +2024,9 @@ impl Executor {
                         .any(|(_, n)| *n >= LOOP_GUARD_THRESHOLD),
                     had_calls: !call_snapshot.is_empty(),
                     all_denied: denied_calls_this_round == call_snapshot.len(),
-                    plan_repair: plan_repair_required,
+                    // Forced plan-repair rounds no longer exist (C2.3A); keep
+                    // the field false so all-refused streaks count normally.
+                    plan_repair: false,
                 })
             };
             if verdict == RoundVerdict::CloseoutThrash {
@@ -2159,11 +2162,10 @@ impl Executor {
             }
             // Per-round counters are zeroed at the top of the next model round.
 
-            // Count a spent explore round when complex tasks still lack a plan.
+            // Count explore rounds without a plan so a single soft nudge can
+            // fire later. Never caps navigation; not a hard budget.
             if structured_plan_required && !structured_plan_started {
-                plan_explore_rounds_used = plan_explore_rounds_used
-                    .saturating_add(1)
-                    .min(PLAN_EXPLORE_ROUNDS);
+                plan_explore_rounds_used = plan_explore_rounds_used.saturating_add(1);
             }
 
             // Goal mode: an explicit update_goal this round ends the run now that

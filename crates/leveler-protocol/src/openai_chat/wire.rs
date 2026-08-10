@@ -63,6 +63,11 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ChatContent>,
+    /// Reasoning echoed back on assistant tool-call messages when the provider
+    /// requires it (`CompatibilityConfig::passback_reasoning_content`). `Some`
+    /// even when empty — the provider validates the key's presence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ChatToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]

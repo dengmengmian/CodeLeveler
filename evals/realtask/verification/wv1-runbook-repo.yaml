@@ -1,0 +1,71 @@
+# WV1 — Weak verification: the repo is prose + shell scripts with no build
+# or test infrastructure and no .leveler verify config, so the engine has no
+# gate to run. The correct engine semantics for real work here is
+# CompletedUnverified — not Verified, and not a fabricated test pass. The
+# hidden acceptance checks the actual change independently, so a false
+# completion still cannot pass.
+# The case declares `expected_outcome: completed_unverified`: it PASSES when
+# the hidden acceptance holds AND the engine honestly reports
+# CompletedUnverified — and fails if the run is ever wrongly upgraded to a
+# verified completion.
+id: wv1-runbook-repo
+name: "[weak-verify] update the backup runbook's retention default"
+max_rounds: 40
+expected_outcome: completed_unverified
+files:
+  README.md: |
+    # ops-runbooks
+
+    Operational runbooks and helper scripts for the storage team. Plain
+    Markdown and bash — no build system, no test suite; scripts are reviewed
+    by humans and rehearsed in staging.
+  runbooks/backup-restore.md: |
+    # Backup and Restore
+
+    Nightly backups are taken by `scripts/backup.sh`.
+
+    Retention: backups are kept for 7 days by default; override with the
+    `RETENTION_DAYS` environment variable when running the script manually.
+
+    To restore, follow `runbooks/incident-response.md` first, then run the
+    restore procedure with the snapshot id.
+  runbooks/incident-response.md: |
+    # Incident Response
+
+    - Page the on-call engineer.
+    - Open an incident channel.
+    - Only then begin any restore procedure.
+  scripts/backup.sh: |
+    #!/bin/bash
+    # Nightly backup driver. Keeps RETENTION_DAYS days of snapshots.
+    set -euo pipefail
+    RETENTION_DAYS="${RETENTION_DAYS:-7}"
+    echo "pruning snapshots older than ${RETENTION_DAYS} days"
+    # (real pruning elided in this excerpt)
+  scripts/restore.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    echo "restoring snapshot $1"
+task: |
+  Compliance now requires 30 days of backup retention instead of 7.
+
+  Update the backup tooling and its documentation consistently:
+  - The script's default retention becomes 30 days (still overridable via
+    RETENTION_DAYS).
+  - The runbook's retention paragraph must match the new default.
+
+  Nothing else changes.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      grep -q 'RETENTION_DAYS="\${RETENTION_DAYS:-30}"' scripts/backup.sh
+      out="$(RETENTION_DAYS= bash -c 'unset RETENTION_DAYS; bash scripts/backup.sh')"
+      grep -q 'older than 30 days' <<<"$out"
+      grep -q '30 days' runbooks/backup-restore.md
+      ! grep -q 'kept for 7 days' runbooks/backup-restore.md
+      # unrelated files untouched
+      grep -qx '# Incident Response' runbooks/incident-response.md
+      grep -qx 'echo "restoring snapshot \$1"' scripts/restore.sh

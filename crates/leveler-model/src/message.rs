@@ -108,6 +108,16 @@ pub enum ToolChoice {
     Tool(String),
 }
 
+impl ToolChoice {
+    /// Whether this choice *forces* a tool call (`Required` or a named tool),
+    /// as opposed to leaving the decision to the model (`Auto`) or forbidding
+    /// calls (`None`). Some providers reject forced choices in thinking mode —
+    /// see `CompatibilityConfig::thinking_supports_forced_tool_choice`.
+    pub fn forces_tool_call(&self) -> bool {
+        matches!(self, Self::Required | Self::Tool(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,6 +5,8 @@
 //! runtime narrow the capability gap between models?
 #![forbid(unsafe_code)]
 
+pub mod read_coverage;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -41,8 +43,78 @@ pub struct EvaluationCase {
     /// completion and effort remain comparable across models.
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
+    /// Paths whose modification the fix is expected to involve. METRICS ONLY:
+    /// never rendered into the task, never shown to the agent — it exists so
+    /// a case that starts from a real repository (no `files` overlay) can
+    /// still report when the run first looked at the right code.
+    #[serde(default)]
+    pub relevant_paths: Vec<String>,
+    /// Paths a correct, complete change has to REACH — the callers, consumers,
+    /// interface definitions, configuration hops, or tests the edit's blast
+    /// radius covers. METRICS ONLY, exactly like `relevant_paths`: never
+    /// rendered into the task, never shown to the agent.
+    ///
+    /// `relevant_paths` answers "did it find the code?"; this answers "did it
+    /// see everything the change touches?" — the difference between a fix and
+    /// a half-fix. Reading a path counts, and so does editing it.
+    #[serde(default)]
+    pub required_impact_paths: Vec<String>,
+    /// Paths that look like the answer but are not: a deprecated copy, an
+    /// example, a fixture, a same-named helper. METRICS ONLY. Reading one is
+    /// normal navigation — considering a candidate and ruling it out is what
+    /// good localisation looks like — so this is measured, never penalised.
+    #[serde(default)]
+    pub distractor_paths: Vec<String>,
+    /// Paths that a correct run must not modify. METRICS ONLY. Editing one is
+    /// a localisation error the hidden acceptance may or may not catch, and it
+    /// is reported either way.
+    #[serde(default)]
+    pub forbidden_edit_paths: Vec<String>,
+    /// The engine terminal outcome this case requires (default: a verified
+    /// completion). A weak-verification case whose CORRECT product semantics
+    /// is `CompletedUnverified` declares that here — and is then also failed
+    /// if the engine wrongly upgrades the run to a verified completion.
+    #[serde(default)]
+    pub expected_outcome: ExpectedOutcome,
     /// A command that must succeed for the case to pass (run in the repo).
     pub expect: ExpectCommand,
+}
+
+impl EvaluationCase {
+    /// Everything the agent is allowed to see about this case. The hidden
+    /// navigation metadata — relevant, impact, distractor and forbidden paths
+    /// — exists to score a run, and a run that could read it would be scoring
+    /// itself. Keeping the model-visible surface to one function makes that
+    /// checkable instead of assumed.
+    pub fn model_visible_input(&self) -> &str {
+        &self.task
+    }
+
+    /// Every hidden path this case declares, for leak checking.
+    pub fn hidden_metadata_paths(&self) -> Vec<&str> {
+        self.relevant_paths
+            .iter()
+            .chain(&self.required_impact_paths)
+            .chain(&self.distractor_paths)
+            .chain(&self.forbidden_edit_paths)
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// The engine terminal outcome a case expects. `Completed` is the default and
+/// preserves the historical semantics (verified completion); every other value
+/// is an explicit opt-in by the case author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedOutcome {
+    /// The run must end as a verified completion.
+    #[default]
+    Completed,
+    /// The run must end as `CompletedUnverified`: real work, honestly not
+    /// endorsed because the project offers nothing to verify against. A run
+    /// that ends verified does NOT match — a wrongful upgrade must fail.
+    CompletedUnverified,
 }
 
 const fn default_max_rounds() -> u32 {
@@ -172,6 +244,76 @@ pub struct CaseResult {
     /// were observed (or legacy baseline). Never invented as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub silent_duration_ms: Option<u64>,
+    /// Edit-tool (apply_patch / replace) results observed / of those, errors.
+    /// `passed && edit_failures > 0` marks a self-recovered edit case — the
+    /// thrash is part of the record, not hidden by the eventual success.
+    #[serde(default)]
+    pub edit_attempts: u32,
+    #[serde(default)]
+    pub edit_failures: u32,
+    /// Exploration shape: read-class and search-class tool calls.
+    #[serde(default)]
+    pub read_calls: u32,
+    #[serde(default)]
+    pub search_calls: u32,
+    /// Edit-tool selection: how often each write tool was invoked.
+    #[serde(default)]
+    pub apply_patch_calls: u32,
+    #[serde(default)]
+    pub replace_calls: u32,
+    /// Round (stream-attempt count) of the first edit attempt; `None` when
+    /// the run never tried to edit. Convergence signal for exploration cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_edit_round: Option<u32>,
+    /// Exploration shape: distinct vs repeated reads and searches, and the
+    /// round the run first touched a case-relevant path.
+    #[serde(default)]
+    pub unique_files_read: u32,
+    #[serde(default)]
+    pub repeated_file_reads: u32,
+    #[serde(default)]
+    pub unique_search_queries: u32,
+    #[serde(default)]
+    pub repeated_search_queries: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_relevant_file_round: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_plan_round: Option<u32>,
+    /// Navigation coverage (C2.3C). Counts, not paths: how many of the case's
+    /// metrics-only lists the run reached, and how many it had reached when it
+    /// committed to its first edit. Credited only from successful tool results.
+    #[serde(default)]
+    pub relevant_paths_touched: u32,
+    #[serde(default)]
+    pub relevant_paths_before_edit: u32,
+    #[serde(default)]
+    pub impact_paths_touched: u32,
+    #[serde(default)]
+    pub impact_paths_before_edit: u32,
+    /// Distractors looked at (diagnostic) versus forbidden paths modified
+    /// (a localisation error).
+    #[serde(default)]
+    pub distractor_paths_read: u32,
+    #[serde(default)]
+    pub forbidden_paths_edited: u32,
+    /// Reads that asked for no line range versus a bounded one.
+    #[serde(default)]
+    pub broad_reads: u32,
+    #[serde(default)]
+    pub narrow_reads: u32,
+    /// An impact path first reached only after a check had already failed.
+    #[serde(default)]
+    pub verification_driven_impact_discovery: bool,
+    /// Impact paths the run never reached, by name — the half-fix, named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missed_impact_paths: Vec<String>,
+    /// Engine repair turns started (persisted `repair_started` events).
+    #[serde(default)]
+    pub repair_attempts: u32,
+    /// Whether the verification AFTER the last repair passed. `None` when no
+    /// repair ran (or the event log was unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_success: Option<bool>,
 }
 
 const fn default_repetition() -> u32 {
@@ -205,6 +347,10 @@ pub enum FailureCategory {
     Verification,
     Environment,
     Runtime,
+    /// The provider/model infrastructure killed the run before any
+    /// agent-capability outcome (e.g. a protocol-level `InvalidRequest`
+    /// rejection). Never booked against the agent's trajectory.
+    ProviderProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -924,20 +1070,33 @@ impl Ablation {
 /// Attribute a case's failure. `expect_passed` is ground truth (an independent
 /// command), `completed` is the runtime's own verdict.
 ///
-/// The first rule is the important one: when the expectation passes but the
-/// runtime says the task did not complete, the MODEL solved the task and the
-/// RUNTIME's verification gate was wrong (its checks could not run, or they are
-/// too strict). That is a framework failure — [`FailureCategory::Runtime`] —
-/// and must never be booked against the model as an understanding failure.
+/// `infrastructure_cause` is the category the CALLER derived from the
+/// structured provenance of an infrastructure death (`ModelErrorKind`,
+/// `AppError` / `EngineError` variants) — `Some` exactly when the run was
+/// killed by an error boundary rather than finishing. It is honored verbatim
+/// and outranks everything below: an infrastructure-truncated trajectory
+/// proves nothing about the agent OR the gate, so neither the Runtime rule
+/// nor the trajectory classifier may run over it. `TerminationClass` stays a
+/// pure execution boundary — `InfrastructureFailed` alone never implies
+/// provider protocol (storage, engine internals, and unreachable providers
+/// end there too).
+///
+/// When the expectation passes but the runtime says the task did not
+/// complete, the MODEL solved the task and the RUNTIME's verification gate
+/// was wrong — [`FailureCategory::Runtime`], never booked against the model.
 ///
 /// Returns `None` when the case passed.
 pub fn attribute_failure(
     completed: bool,
     expect_passed: bool,
+    infrastructure_cause: Option<FailureCategory>,
     signals: &TrajectorySignals,
 ) -> Option<FailureCategory> {
     if completed && expect_passed {
         return None;
+    }
+    if let Some(cause) = infrastructure_cause {
+        return Some(cause);
     }
     if expect_passed && !completed {
         return Some(FailureCategory::Runtime);
@@ -990,6 +1149,70 @@ pub struct TrajectorySignals {
     pub ttff_ms: Option<u64>,
     /// Longest inter-feedback silent gap in ms. `None` if <2 feedback events.
     pub max_silent_ms: Option<u64>,
+    /// Read-class tool calls (read_file / read_symbol). Exploration metric.
+    pub read_calls: u32,
+    /// Search-class tool calls (grep / find_files / find_symbol / list_files /
+    /// find_references / locate_hint). Exploration metric.
+    pub search_calls: u32,
+    /// `apply_patch` invocations (attempted, regardless of outcome).
+    pub apply_patch_calls: u32,
+    /// `replace` invocations (attempted, regardless of outcome).
+    pub replace_calls: u32,
+    /// The model round of the FIRST edit-tool call, counting rounds by
+    /// stream-attempt starts (retries inflate the count slightly — this is an
+    /// exploration-convergence signal, not an exact ledger). `None` when the
+    /// run never attempted an edit.
+    pub first_edit_round: Option<u32>,
+    /// Distinct file paths read, and reads that repeated a path already read.
+    /// Re-reading is not automatically waste (a file changes under an edit),
+    /// but a rising repeat share on a fixed task is the signature of an agent
+    /// re-deriving what it already saw.
+    pub unique_files_read: u32,
+    pub repeated_file_reads: u32,
+    /// Distinct search queries issued, and queries that repeated an earlier
+    /// one verbatim. The loop guard only catches an identical call producing
+    /// an identical result; this counts re-asking regardless of outcome.
+    pub unique_search_queries: u32,
+    pub repeated_search_queries: u32,
+    /// Round of the first read/search that named a case-relevant path — where
+    /// the run stopped hunting and started looking at the right code. `None`
+    /// when it never did.
+    pub first_relevant_file_round: Option<u32>,
+    /// Round of the first `update_plan` call — when a structured plan actually
+    /// existed. Taken from the tool call itself, never inferred from prose.
+    pub first_plan_round: Option<u32>,
+    /// How many of the case's `relevant_paths` / `required_impact_paths` the
+    /// run REACHED — a call naming that path returned successfully. Coverage,
+    /// not first contact: a run that finds one of three and stops looks
+    /// identical to a complete one on `touched_relevant_files` alone.
+    ///
+    /// **Path touch, not evidence coverage.** These count files the run got
+    /// *some* successful result for. They do not prove the returned text
+    /// contained the lines that matter: `read_file` with no range asks for the
+    /// whole file, and a byte ceiling can still return a prefix. Proving that
+    /// needs the returned range ([`read_coverage::returned_range`], which
+    /// requires the full result text) and, for evidence-level claims, a case
+    /// declaring which lines are the evidence. Report them under names that
+    /// say "touch".
+    pub relevant_paths_touched: u32,
+    pub impact_paths_touched: u32,
+    /// Relevant / impact paths the run had already reached when it made its
+    /// first edit. Coverage *after* the fact can be verification-driven; this
+    /// is what it knew before it committed to a change.
+    pub relevant_paths_before_edit: u32,
+    pub impact_paths_before_edit: u32,
+    /// Distractors the run looked at, and forbidden paths it modified. The
+    /// first is diagnostic, the second is an error.
+    pub distractor_paths_read: u32,
+    pub forbidden_paths_edited: u32,
+    /// An impact path first reached only after a verification failure — the
+    /// run completed, but the compiler found the surface, not the navigation.
+    pub verification_driven_impact_discovery: bool,
+    /// Reads that named no line range (whole-file intent) versus reads that
+    /// asked for a bounded region. The ratio is the navigation shape: reading
+    /// the right region, or reading the file and hoping.
+    pub broad_reads: u32,
+    pub narrow_reads: u32,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order
@@ -1040,6 +1263,32 @@ impl EvalReport {
         counts.into_iter().collect()
     }
 
+    /// Case ids that passed with at least one edit failure: the run recovered
+    /// from edit thrash on its own. Surfaced so the eventual success does not
+    /// hide the intermediate failures.
+    pub fn self_recovered_edit_ids(&self) -> Vec<String> {
+        self.cases
+            .iter()
+            .filter(|c| c.passed() && c.edit_failures > 0)
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    /// `(cases where a repair turn started, of those where the post-repair
+    /// verification passed)`.
+    pub fn repair_counts(&self) -> (usize, usize) {
+        let triggered: Vec<_> = self
+            .cases
+            .iter()
+            .filter(|c| c.repair_attempts > 0)
+            .collect();
+        let succeeded = triggered
+            .iter()
+            .filter(|c| c.repair_success == Some(true))
+            .count();
+        (triggered.len(), succeeded)
+    }
+
     /// Case ids whose repetitions disagree on passing — the flaky set that a
     /// completion-rate average silently hides.
     pub fn unstable_case_ids(&self) -> Vec<String> {
@@ -1061,6 +1310,30 @@ impl EvalReport {
     }
 }
 
+#[cfg(test)]
+mod expected_outcome_tests {
+    use super::*;
+
+    /// Legacy cases carry no `expected_outcome`; they must keep requiring a
+    /// verified completion.
+    #[test]
+    fn expected_outcome_defaults_to_completed() {
+        let case: EvaluationCase =
+            serde_yaml::from_str("id: x\nname: x\ntask: t\nexpect: { program: echo, args: [] }\n")
+                .unwrap();
+        assert_eq!(case.expected_outcome, ExpectedOutcome::Completed);
+    }
+
+    #[test]
+    fn expected_outcome_can_opt_into_completed_unverified() {
+        let case: EvaluationCase = serde_yaml::from_str(
+            "id: x\nname: x\ntask: t\nexpected_outcome: completed_unverified\nexpect: { program: echo, args: [] }\n",
+        )
+        .unwrap();
+        assert_eq!(case.expected_outcome, ExpectedOutcome::CompletedUnverified);
+    }
+}
+
 /// Eval harness errors.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
@@ -1068,6 +1341,87 @@ pub enum EvalError {
     Io(String),
     #[error("parse error: {0}")]
     Parse(String),
+}
+
+#[cfg(test)]
+mod hidden_metadata_leakage {
+    //! C2.3C §37 A/B/C — the navigation metadata scores a run. A run that
+    //! could read it would be grading its own exam, and the whole suite would
+    //! measure nothing. One function defines what the agent may see; these
+    //! tests hold everything else outside it.
+
+    use super::*;
+
+    fn navigation_case() -> EvaluationCase {
+        EvaluationCase {
+            id: "n-leak".into(),
+            name: "leak probe".into(),
+            repo: None,
+            base_ref: None,
+            files: std::collections::BTreeMap::new(),
+            recovery: false,
+            task: "Counting a stream reports one document too few.".into(),
+            max_rounds: 10,
+            relevant_paths: vec!["ZZRELEVANTZZ/stream.go".into()],
+            required_impact_paths: vec!["ZZIMPACTZZ/consumer.go".into()],
+            distractor_paths: vec!["ZZDISTRACTORZZ/legacy.go".into()],
+            forbidden_edit_paths: vec!["ZZFORBIDDENZZ/generated.go".into()],
+            expected_outcome: ExpectedOutcome::default(),
+            expect: ExpectCommand {
+                program: "true".into(),
+                args: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn no_hidden_path_reaches_the_model_visible_input() {
+        let case = navigation_case();
+        let visible = case.model_visible_input();
+        for hidden in case.hidden_metadata_paths() {
+            assert!(
+                !visible.contains(hidden),
+                "hidden metadata leaked into the task text: {hidden}"
+            );
+        }
+        // And the sentinel families, in case a path is ever reformatted.
+        for marker in ["ZZRELEVANT", "ZZIMPACT", "ZZDISTRACTOR", "ZZFORBIDDEN"] {
+            assert!(!visible.contains(marker), "{marker} reached the agent");
+        }
+    }
+
+    /// The workspace the agent explores is built from `files` (and `repo`).
+    /// Hidden metadata must not create, name, or hint at a file.
+    #[test]
+    fn hidden_paths_do_not_materialize_into_the_workspace() {
+        let case = navigation_case();
+        for hidden in case.hidden_metadata_paths() {
+            assert!(
+                !case.files.contains_key(hidden),
+                "a hidden path must not be materialized by declaring it: {hidden}"
+            );
+        }
+    }
+
+    /// All four lists default to empty, so every existing case keeps parsing
+    /// and keeps meaning what it meant (§39).
+    #[test]
+    fn navigation_metadata_is_optional_for_existing_cases() {
+        let yaml = r#"
+id: legacy
+name: an older case
+task: do the thing
+expect:
+  program: "true"
+  args: []
+"#;
+        let case: EvaluationCase = serde_yaml::from_str(yaml).expect("legacy case still parses");
+        assert!(case.relevant_paths.is_empty());
+        assert!(case.required_impact_paths.is_empty());
+        assert!(case.distractor_paths.is_empty());
+        assert!(case.forbidden_edit_paths.is_empty());
+        assert_eq!(case.model_visible_input(), "do the thing");
+    }
 }
 
 #[cfg(test)]
@@ -1096,6 +1450,31 @@ mod tests {
             is_recovery: false,
             ttff_ms: None,
             silent_duration_ms: None,
+            edit_attempts: 0,
+            edit_failures: 0,
+            read_calls: 0,
+            search_calls: 0,
+            apply_patch_calls: 0,
+            replace_calls: 0,
+            first_edit_round: None,
+            unique_files_read: 0,
+            repeated_file_reads: 0,
+            unique_search_queries: 0,
+            repeated_search_queries: 0,
+            first_relevant_file_round: None,
+            first_plan_round: None,
+            repair_attempts: 0,
+            repair_success: None,
+            relevant_paths_touched: 0,
+            relevant_paths_before_edit: 0,
+            impact_paths_touched: 0,
+            impact_paths_before_edit: 0,
+            distractor_paths_read: 0,
+            forbidden_paths_edited: 0,
+            broad_reads: 0,
+            narrow_reads: 0,
+            verification_driven_impact_discovery: false,
+            missed_impact_paths: Vec::new(),
         }
     }
 
@@ -1329,25 +1708,26 @@ mod tests {
         };
 
         assert_eq!(
-            attribute_failure(false, true, &solved_but_gate_failed),
+            attribute_failure(false, true, None, &solved_but_gate_failed),
             Some(FailureCategory::Runtime),
             "expect passed → the model solved it; the gate is what failed"
         );
         assert_eq!(
-            attribute_failure(true, true, &solved_but_gate_failed),
+            attribute_failure(true, true, None, &solved_but_gate_failed),
             None,
             "a passing case has no failure category"
         );
         // The model genuinely failed: ground truth says the task is not done, so
         // the trajectory classifier decides.
         assert_eq!(
-            attribute_failure(false, false, &solved_but_gate_failed),
+            attribute_failure(false, false, None, &solved_but_gate_failed),
             Some(FailureCategory::Understanding)
         );
         assert_eq!(
             attribute_failure(
                 true,
                 false,
+                None,
                 &TrajectorySignals {
                     env_failure: true,
                     ..Default::default()
@@ -1355,6 +1735,65 @@ mod tests {
             ),
             Some(FailureCategory::Environment),
             "completed but expectation failed → the model's own verdict was wrong"
+        );
+    }
+
+    /// The C1.1a ripgrep case hit exactly this: DeepSeek rejected the request
+    /// wire-level ("Thinking mode does not support this tool_choice") at step
+    /// 2 — tools had run, nothing was edited — and the trajectory classifier
+    /// booked it as "localization". The caller derives the category from the
+    /// structured error provenance and passes it in; the classifier never
+    /// runs over an infrastructure-truncated trajectory.
+    #[test]
+    fn an_infrastructure_killed_run_uses_the_provenance_category() {
+        // Localization-shaped trajectory: tool calls, no edits, relevant
+        // files never touched.
+        let killed_mid_exploration = TrajectorySignals {
+            tool_calls: 4,
+            ..Default::default()
+        };
+        // Provider wire rejection (e.g. ModelErrorKind::InvalidRequest).
+        assert_eq!(
+            attribute_failure(
+                false,
+                false,
+                Some(FailureCategory::ProviderProtocol),
+                &killed_mid_exploration
+            ),
+            Some(FailureCategory::ProviderProtocol),
+            "wire-level rejection must not be blamed on the agent"
+        );
+        // A non-provider infrastructure death (storage/engine internals) must
+        // NOT be booked as provider_protocol — the caller passes its own
+        // provenance category and it is honored verbatim.
+        assert_eq!(
+            attribute_failure(
+                false,
+                false,
+                Some(FailureCategory::Runtime),
+                &killed_mid_exploration
+            ),
+            Some(FailureCategory::Runtime)
+        );
+        // No infrastructure death → the trajectory classifier decides.
+        assert_eq!(
+            attribute_failure(false, false, None, &killed_mid_exploration),
+            Some(FailureCategory::Localization)
+        );
+    }
+
+    /// The infrastructure cause outranks the ground-truth-vs-gate rule: a run
+    /// the infrastructure killed proves nothing about the verification gate.
+    #[test]
+    fn infrastructure_cause_outranks_the_runtime_gate_rule() {
+        assert_eq!(
+            attribute_failure(
+                false,
+                true,
+                Some(FailureCategory::ProviderProtocol),
+                &TrajectorySignals::default()
+            ),
+            Some(FailureCategory::ProviderProtocol)
         );
     }
 
@@ -1698,6 +2137,31 @@ mod tests {
             is_recovery: false,
             ttff_ms: None,
             silent_duration_ms: None,
+            edit_attempts: 0,
+            edit_failures: 0,
+            read_calls: 0,
+            search_calls: 0,
+            apply_patch_calls: 0,
+            replace_calls: 0,
+            first_edit_round: None,
+            unique_files_read: 0,
+            repeated_file_reads: 0,
+            unique_search_queries: 0,
+            repeated_search_queries: 0,
+            first_relevant_file_round: None,
+            first_plan_round: None,
+            repair_attempts: 0,
+            repair_success: None,
+            relevant_paths_touched: 0,
+            relevant_paths_before_edit: 0,
+            impact_paths_touched: 0,
+            impact_paths_before_edit: 0,
+            distractor_paths_read: 0,
+            forbidden_paths_edited: 0,
+            broad_reads: 0,
+            narrow_reads: 0,
+            verification_driven_impact_discovery: false,
+            missed_impact_paths: Vec::new(),
         }
     }
 
@@ -1957,6 +2421,50 @@ expect: { program: cargo, args: [test] }
     }
 
     #[test]
+    fn navigation_cases_still_load_with_benchmark_validity_metadata() {
+        // Every navigation case carries a `validity:` block describing what the
+        // case discriminates on, so the offline preflight can refuse a case that
+        // cannot be passed or that admits two readings. It is benchmark-author
+        // metadata and must stay invisible here: the loader has to keep reading
+        // these cases exactly as before. Asserting that from the serde
+        // attributes alone is not enough — this runs the real loader.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/navigation");
+        let cases = EvaluationCase::load_dir(&root).expect("evals/navigation must parse");
+        assert_eq!(cases.len(), 8, "navigation suite is N1-N8");
+        for case in &cases {
+            assert!(!case.task.trim().is_empty(), "{} lost its task", case.id);
+            assert!(
+                !case.expect.program.is_empty(),
+                "{} lost its expect command",
+                case.id
+            );
+            assert!(
+                !case.relevant_paths.is_empty(),
+                "{} lost its navigation metadata",
+                case.id
+            );
+        }
+
+        // An unknown top-level key is ignored rather than rejected, so a case
+        // that carries nothing but validity metadata still loads.
+        let probe = std::env::temp_dir().join(format!(
+            "leveler-validity-probe-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &probe,
+            "id: probe\nname: probe\ntask: do something\n\
+             validity:\n  semantics:\n    status: UNAMBIGUOUS\n\
+             expect:\n  program: \"true\"\n",
+        )
+        .expect("write probe case");
+        let loaded = EvaluationCase::load(&probe).expect("a case with validity metadata must load");
+        let _ = std::fs::remove_file(&probe);
+        assert_eq!(loaded.id, "probe");
+        assert_eq!(loaded.expect.program, "true");
+    }
+
+    #[test]
     fn scenario_suite_parses_and_ids_are_unique_across_the_tree() {
         // Scenario cases (evals/scenarios/**) must parse under the same schema
         // and never collide with an id anywhere else in the tree — a duplicate
@@ -2025,6 +2533,31 @@ expect: { program: cargo, args: [test] }
                 is_recovery: false,
                 ttff_ms: None,
                 silent_duration_ms: None,
+                edit_attempts: 0,
+                edit_failures: 0,
+                read_calls: 0,
+                search_calls: 0,
+                apply_patch_calls: 0,
+                replace_calls: 0,
+                first_edit_round: None,
+                unique_files_read: 0,
+                repeated_file_reads: 0,
+                unique_search_queries: 0,
+                repeated_search_queries: 0,
+                first_relevant_file_round: None,
+                first_plan_round: None,
+                repair_attempts: 0,
+                repair_success: None,
+                relevant_paths_touched: 0,
+                relevant_paths_before_edit: 0,
+                impact_paths_touched: 0,
+                impact_paths_before_edit: 0,
+                distractor_paths_read: 0,
+                forbidden_paths_edited: 0,
+                broad_reads: 0,
+                narrow_reads: 0,
+                verification_driven_impact_discovery: false,
+                missed_impact_paths: Vec::new(),
             }
             .passed()
         );
@@ -2050,6 +2583,31 @@ expect: { program: cargo, args: [test] }
                 is_recovery: false,
                 ttff_ms: None,
                 silent_duration_ms: None,
+                edit_attempts: 0,
+                edit_failures: 0,
+                read_calls: 0,
+                search_calls: 0,
+                apply_patch_calls: 0,
+                replace_calls: 0,
+                first_edit_round: None,
+                unique_files_read: 0,
+                repeated_file_reads: 0,
+                unique_search_queries: 0,
+                repeated_search_queries: 0,
+                first_relevant_file_round: None,
+                first_plan_round: None,
+                repair_attempts: 0,
+                repair_success: None,
+                relevant_paths_touched: 0,
+                relevant_paths_before_edit: 0,
+                impact_paths_touched: 0,
+                impact_paths_before_edit: 0,
+                distractor_paths_read: 0,
+                forbidden_paths_edited: 0,
+                broad_reads: 0,
+                narrow_reads: 0,
+                verification_driven_impact_discovery: false,
+                missed_impact_paths: Vec::new(),
             }
             .passed()
         );

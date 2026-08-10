@@ -44,7 +44,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         context: &ProtocolContext,
         stream: bool,
     ) -> Result<EncodedRequest, ProtocolError> {
-        let messages = convert_messages(&request.messages);
+        let messages = convert_messages(&request.messages, context.passback_reasoning_content);
 
         let tools = request
             .tools
@@ -65,13 +65,24 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         // profile picks the spelling. `None` sends neither field, so a provider
         // that rejects them is unaffected.
         let effort = request.reasoning_effort.or(context.reasoning.effort);
-        let (thinking, reasoning_effort) = match context.reasoning.style {
-            ReasoningStyle::None => (None, None),
-            ReasoningStyle::OpenAiEffort => (None, effort.map(|e| e.as_wire().to_string())),
-            ReasoningStyle::ThinkingFlag => (
-                Some(Thinking { kind: "enabled" }),
-                effort.map(|e| e.as_wire().to_string()),
-            ),
+        let (thinking, reasoning_effort) = if !context.thinking_supports_forced_tool_choice
+            && request.tool_choice.forces_tool_call()
+        {
+            // The provider rejects a forced tool_choice while thinking, and for
+            // these providers thinking is the server-side default — omission
+            // does not avoid the rejection. Keep the ToolChoice contract and
+            // disable thinking explicitly for exactly this request; effort is a
+            // thinking knob, so it is dropped with it.
+            (Some(Thinking { kind: "disabled" }), None)
+        } else {
+            match context.reasoning.style {
+                ReasoningStyle::None => (None, None),
+                ReasoningStyle::OpenAiEffort => (None, effort.map(|e| e.as_wire().to_string())),
+                ReasoningStyle::ThinkingFlag => (
+                    Some(Thinking { kind: "enabled" }),
+                    effort.map(|e| e.as_wire().to_string()),
+                ),
+            }
         };
 
         let chat = ChatRequest {
@@ -272,7 +283,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
 }
 
 /// Convert unified messages to OpenAI chat messages.
-fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
+fn convert_messages(messages: &[Message], passback_reasoning: bool) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     for msg in messages {
         // Tool-result messages map to one `role: tool` message per result.
@@ -282,6 +293,7 @@ fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
                     out.push(ChatMessage {
                         role: "tool".to_string(),
                         content: Some(wire::ChatContent::Text(result.content.clone())),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         tool_call_id: Some(result.call_id.to_string()),
                     });
@@ -291,11 +303,13 @@ fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
         }
 
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut images: Vec<wire::ChatImageUrl> = Vec::new();
         for part in &msg.content {
             match part {
                 ContentPart::Text { text: t } => text.push_str(t),
+                ContentPart::Reasoning { text: t } => reasoning.push_str(t),
                 ContentPart::ToolCall { call } => tool_calls.push(ChatToolCall {
                     id: call.id.to_string(),
                     kind: "function".to_string(),
@@ -307,10 +321,19 @@ fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
                 ContentPart::Image { source } => images.push(wire::ChatImageUrl {
                     url: image_url(source),
                 }),
-                // Reasoning parts are not sent back upstream.
                 _ => {}
             }
         }
+
+        // Providers with the pass-back contract (DeepSeek thinking mode)
+        // validate that assistant tool-call messages carry a
+        // `reasoning_content` key: the captured reasoning, or the empty
+        // string when the round produced none (e.g. it ran with thinking
+        // explicitly disabled). Everyone else keeps the legacy wire — the
+        // key is never sent.
+        let reasoning_content =
+            (passback_reasoning && msg.role == Role::Assistant && !tool_calls.is_empty())
+                .then_some(reasoning);
 
         // Use the multimodal array form only when images are present.
         let content = if images.is_empty() {
@@ -329,6 +352,7 @@ fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
         out.push(ChatMessage {
             role: role_str(msg.role).to_string(),
             content,
+            reasoning_content,
             tool_calls,
             tool_call_id: None,
         });
@@ -390,6 +414,8 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             parallel_tool_calls: true,
             supports_temperature: true,
+            thinking_supports_forced_tool_choice: true,
+            passback_reasoning_content: false,
         }
     }
 
@@ -484,6 +510,187 @@ mod tests {
         let body = encode_with(&ctx_reasoning(ReasoningStyle::ThinkingFlag, None));
         assert_eq!(body["thinking"]["type"], "enabled");
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// Encode with tools attached and a specific tool choice — the shape the
+    /// executor sends on plan-repair rounds (forced `update_plan`).
+    fn encode_with_choice(context: &ProtocolContext, choice: ToolChoice) -> serde_json::Value {
+        let mut req = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-chat"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        req.tools = vec![ToolDefinition {
+            name: "update_plan".into(),
+            description: "plan".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        req.tool_choice = choice;
+        OpenAiChatAdapter::new()
+            .encode_request(&req, context, true)
+            .unwrap()
+            .body
+    }
+
+    #[test]
+    fn thinking_model_with_auto_choice_keeps_thinking_and_omits_tool_choice() {
+        let context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::Max));
+        let body = encode_with_choice(&context, ToolChoice::Auto);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "max");
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(body["tools"][0]["function"]["name"], "update_plan");
+    }
+
+    #[test]
+    fn non_reasoning_model_sends_required_choice_without_thinking() {
+        let body = encode_with_choice(&ctx(), ToolChoice::Required);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn incompatible_provider_disables_thinking_on_required_choice() {
+        // DeepSeek rejects forced tool_choice in thinking mode, and thinking is
+        // its server-side default — so the adapter must send an explicit
+        // disable, never downgrade the forced choice to auto.
+        let context = ProtocolContext {
+            thinking_supports_forced_tool_choice: false,
+            ..ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::Max))
+        };
+        let body = encode_with_choice(&context, ToolChoice::Required);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["tool_choice"], "required");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "effort is a thinking knob; it goes with it: {body}"
+        );
+        assert_eq!(body["tools"][0]["function"]["name"], "update_plan");
+    }
+
+    #[test]
+    fn incompatible_provider_disables_thinking_on_named_tool_choice() {
+        // Style None still gets the explicit disable: absence of the thinking
+        // field means "provider default", which for these providers is ON.
+        let context = ProtocolContext {
+            thinking_supports_forced_tool_choice: false,
+            ..ctx()
+        };
+        let body = encode_with_choice(&context, ToolChoice::Tool("update_plan".into()));
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "update_plan");
+    }
+
+    /// Encode a tool-loop continuation: user → assistant(reasoning? + tool
+    /// call) → tool result. The shape DeepSeek's thinking mode validates.
+    fn encode_tool_loop(context: &ProtocolContext, reasoning: Option<&str>) -> serde_json::Value {
+        let mut assistant_parts = Vec::new();
+        if let Some(text) = reasoning {
+            assistant_parts.push(ContentPart::Reasoning { text: text.into() });
+        }
+        assistant_parts.push(ContentPart::ToolCall {
+            call: ToolCall {
+                id: leveler_core::ToolCallId::new("call_1"),
+                name: "get_time".into(),
+                arguments: serde_json::json!({}),
+            },
+        });
+        let req = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-chat"),
+            vec![
+                Message::text(Role::User, "hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: assistant_parts,
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: leveler_core::ToolCallId::new("call_1"),
+                            content: "12:00".into(),
+                            is_error: false,
+                        },
+                    }],
+                },
+            ],
+        );
+        OpenAiChatAdapter::new()
+            .encode_request(&req, context, true)
+            .unwrap()
+            .body
+    }
+
+    #[test]
+    fn passback_echoes_captured_reasoning_on_assistant_tool_call_messages() {
+        let context = ProtocolContext {
+            passback_reasoning_content: true,
+            ..ctx()
+        };
+        let body = encode_tool_loop(&context, Some("check the clock"));
+        assert_eq!(body["messages"][1]["reasoning_content"], "check the clock");
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"],
+            "get_time"
+        );
+    }
+
+    #[test]
+    fn passback_sends_empty_reasoning_when_the_round_produced_none() {
+        // A round that ran with thinking disabled has no reasoning to echo —
+        // the provider still requires the key, and the empty string satisfies
+        // it (measured against DeepSeek 2026-08-07).
+        let context = ProtocolContext {
+            passback_reasoning_content: true,
+            ..ctx()
+        };
+        let body = encode_tool_loop(&context, None);
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn passback_off_keeps_the_legacy_wire_without_the_key() {
+        let body = encode_tool_loop(&ctx(), Some("check the clock"));
+        assert!(
+            body["messages"][1].get("reasoning_content").is_none(),
+            "default wire must be unchanged: {body}"
+        );
+    }
+
+    #[test]
+    fn passback_does_not_touch_plain_assistant_text_messages() {
+        let context = ProtocolContext {
+            passback_reasoning_content: true,
+            ..ctx()
+        };
+        let req = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-chat"),
+            vec![
+                Message::text(Role::User, "hi"),
+                Message::text(Role::Assistant, "hello"),
+                Message::text(Role::User, "again"),
+            ],
+        );
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&req, &context, true)
+            .unwrap()
+            .body;
+        assert!(
+            body["messages"][1].get("reasoning_content").is_none(),
+            "only tool-call messages carry the echo: {body}"
+        );
+    }
+
+    #[test]
+    fn compatible_provider_wire_is_unchanged_on_forced_choice() {
+        // Legacy/compatible profiles (flag defaults to true) keep the exact
+        // pre-existing wire: thinking + effort + the forced choice together.
+        let context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
+        let body = encode_with_choice(&context, ToolChoice::Required);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["tool_choice"], "required");
     }
 
     #[test]
@@ -616,7 +823,7 @@ mod tests {
                 },
             }],
         }];
-        let converted = convert_messages(&msgs);
+        let converted = convert_messages(&msgs, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("c1"));
@@ -643,7 +850,7 @@ mod tests {
                 },
             ],
         }];
-        let converted = convert_messages(&msgs);
+        let converted = convert_messages(&msgs, false);
         let json = serde_json::to_value(&converted[0]).unwrap();
         assert_eq!(json["content"][0]["type"], "text");
         assert_eq!(json["content"][1]["type"], "image_url");

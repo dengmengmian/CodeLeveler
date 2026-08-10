@@ -1,0 +1,179 @@
+# MF2 — Small feature propagation: due dates must travel the whole chain
+# (model type → validation → store ordering → renderer → CLI flag → tests).
+# Implementing only the struct field, or only the CLI flag, fails the hidden
+# end-to-end run.
+id: mf2-due-date-feature
+name: "[multifile] add due-date support across model, store, renderer and CLI"
+max_rounds: 80
+files:
+  go.mod: |
+    module tasklist
+
+    go 1.21
+  task/task.go: |
+    package task
+
+    // Task is one to-do item.
+    type Task struct {
+    	Title string
+    	Done  bool
+    }
+  task/store.go: |
+    package task
+
+    // Store keeps tasks in insertion order.
+    type Store struct {
+    	tasks []Task
+    }
+
+    func NewStore() *Store {
+    	return &Store{}
+    }
+
+    func (s *Store) Add(t Task) {
+    	s.tasks = append(s.tasks, t)
+    }
+
+    // List returns tasks in display order (currently: insertion order).
+    func (s *Store) List() []Task {
+    	out := make([]Task, len(s.tasks))
+    	copy(out, s.tasks)
+    	return out
+    }
+  task/store_test.go: |
+    package task
+
+    import "testing"
+
+    func TestStoreKeepsTasks(t *testing.T) {
+    	s := NewStore()
+    	s.Add(Task{Title: "write report"})
+    	s.Add(Task{Title: "review patch"})
+    	got := s.List()
+    	if len(got) != 2 || got[0].Title != "write report" {
+    		t.Fatalf("unexpected list: %+v", got)
+    	}
+    }
+  render/render.go: |
+    package render
+
+    import (
+    	"fmt"
+    	"strings"
+
+    	"tasklist/task"
+    )
+
+    // Lines renders one task per line for the terminal.
+    func Lines(tasks []task.Task) string {
+    	var b strings.Builder
+    	for _, t := range tasks {
+    		marker := " "
+    		if t.Done {
+    			marker = "x"
+    		}
+    		fmt.Fprintf(&b, "[%s] %s\n", marker, t.Title)
+    	}
+    	return b.String()
+    }
+  cmd/tasks/main.go: |
+    package main
+
+    import (
+    	"fmt"
+    	"os"
+    	"strings"
+
+    	"tasklist/render"
+    	"tasklist/task"
+    )
+
+    // Toy CLI: `tasks add <title>` appends to a plain-text file next to the
+    // binary invocation; `tasks list` prints the rendered list.
+    const dbFile = "tasks.txt"
+
+    func main() {
+    	if len(os.Args) < 2 {
+    		fmt.Fprintln(os.Stderr, "usage: tasks add <title> | tasks list")
+    		os.Exit(2)
+    	}
+    	switch os.Args[1] {
+    	case "add":
+    		if len(os.Args) < 3 {
+    			fmt.Fprintln(os.Stderr, "usage: tasks add <title>")
+    			os.Exit(2)
+    		}
+    		title := os.Args[2]
+    		f, err := os.OpenFile(dbFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+    		if err != nil {
+    			fmt.Fprintln(os.Stderr, err)
+    			os.Exit(1)
+    		}
+    		defer f.Close()
+    		fmt.Fprintln(f, title)
+    	case "list":
+    		data, err := os.ReadFile(dbFile)
+    		if err != nil && !os.IsNotExist(err) {
+    			fmt.Fprintln(os.Stderr, err)
+    			os.Exit(1)
+    		}
+    		store := task.NewStore()
+    		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+    			if line == "" {
+    				continue
+    			}
+    			store.Add(task.Task{Title: line})
+    		}
+    		fmt.Print(render.Lines(store.List()))
+    	default:
+    		fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
+    		os.Exit(2)
+    	}
+    }
+task: |
+  Feature request: due-date support for tasks.
+
+  As a user I want to attach an optional due date when adding a task:
+
+      tasks add "ship release" --due 2026-09-01
+
+  Requirements:
+  - The date format is YYYY-MM-DD. An invalid date (bad format or an
+    impossible date like 2026-02-31) must be rejected with a message on
+    stderr and exit code 2, and must not be stored.
+  - `tasks list` shows tasks with a due date as `[ ] <title> (due 2026-09-01)`.
+  - Tasks whose due date is strictly before 2100-01-01 are "dated"; dated
+    tasks are listed BEFORE undated ones, ordered by due date ascending;
+    undated tasks keep insertion order after them.
+  - Adding without --due keeps working exactly as before.
+  - `go test ./...` passes, and the new behavior (validation, ordering,
+    rendering) is covered by tests.
+
+  The stored file format is yours to choose as long as `tasks list` output
+  matches the rules above.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go test ./... > /dev/null
+      d="$(mktemp -d)"
+      cp -R . "$d/work"
+      cd "$d/work"
+      rm -f tasks.txt
+      go build -o tasks ./cmd/tasks
+      ./tasks add "undated chore"
+      ./tasks add "later item" --due 2026-12-01
+      ./tasks add "urgent item" --due 2026-08-15
+      # invalid dates: rejected, exit 2, not stored
+      if ./tasks add "bad" --due 2026-02-31 2>/dev/null; then exit 1; fi
+      if ./tasks add "bad2" --due tomorrow 2>/dev/null; then exit 1; fi
+      out="$(./tasks list)"
+      # dated tasks first, ascending; undated afterwards; rendering exact
+      [ "$(sed -n '1p' <<<"$out")" = "[ ] urgent item (due 2026-08-15)" ]
+      [ "$(sed -n '2p' <<<"$out")" = "[ ] later item (due 2026-12-01)" ]
+      [ "$(sed -n '3p' <<<"$out")" = "[ ] undated chore" ]
+      [ "$(wc -l <<<"$out")" -eq 3 ]
+      # behavior locked by tests, not only by the binary
+      grep -rqli 'due' --include='*_test.go' . > /dev/null

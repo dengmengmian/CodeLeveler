@@ -1,0 +1,76 @@
+# N8 — Distractor resistance. The task is phrased in the vocabulary of the dead
+# package: it says "summarize records", and legacy.SummarizeRecords is the only
+# symbol in the repo by that name. The live path is report.Aggregate, reached
+# from cmd/navsvc/main.go, and it takes a different shape entirely (batches of
+# records rather than parallel name/value slices).
+#
+# Difficulty: `rg -n "SummarizeRecords"` finds exactly one place, and it is the
+# wrong one. Getting this right needs the run to ask whether that function is
+# on any execution path — nothing else distinguishes it. A third lookalike sits
+# in examples/, excluded from the build by a build tag.
+id: n8-distractor-resistance
+name: "[nav] label-aware grouping in the summary"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - internal/report/summary.go
+required_impact_paths:
+  - internal/report/summary.go
+distractor_paths:
+  - legacy/oldsummary.go
+  - legacy/oldpipeline.go
+  - examples/example_summary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+  - legacy/oldpipeline.go
+  - examples/example_summary.go
+files: {}
+task: |
+  When we summarize records today, everything with the same name is folded
+  into one row regardless of where it came from. Operators running one
+  exporter per host cannot tell hosts apart in the output.
+
+  When a record carries an `env` label, group it separately: the row's name
+  becomes `<name>{env=<value>}`. Records without an `env` label keep their
+  plain name. Rows stay sorted by the name they are printed under, and the
+  `count=` / `total=` format does not change.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n8.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\n' > "$d/c.conf"
+      printf '{"name":"req","value":1,"env":"prod"}\n{"name":"req","value":2,"env":"prod"}\n{"name":"req","value":4,"env":"dev"}\n{"name":"plain","value":9}\n' > "$d/in.jsonl"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary)"
+      printf '%s\n' "$out" | grep -qx 'plain count=1 total=9'
+      printf '%s\n' "$out" | grep -qx 'req{env=dev} count=1 total=4'
+      printf '%s\n' "$out" | grep -qx 'req{env=prod} count=2 total=3'
+      # sorted by the printed name
+      [ "$(printf '%s\n' "$out" | sed -n 1p | cut -d' ' -f1)" = "plain" ]
+      # the dead package and the example are not where this lives
+      git diff --quiet -- legacy/ examples/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The row name for an env-labelled record, and the sort order.
+    oracle_interpretation: >-
+      `<name>{env=<value>}`, rows sorted by the printed name.
+    rationale: >-
+      The task gives the exact row format and says rows stay sorted "by the name
+      they are printed under".

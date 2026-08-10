@@ -213,6 +213,7 @@ mod tests {
                 kind: CheckKind::Build,
                 gating: true,
                 timeout_seconds: 30,
+                scope_policy: Default::default(),
             }],
         }
     }

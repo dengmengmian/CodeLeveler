@@ -11,6 +11,7 @@ mod common;
 mod completions_cmd;
 mod crash;
 mod eval_cmd;
+mod eval_commitment;
 mod eval_signals;
 mod info_cmds;
 mod init_cmd;

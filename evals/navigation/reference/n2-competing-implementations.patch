@@ -1,0 +1,19 @@
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index 79f23c9..b6b22fb 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -39,8 +39,14 @@ func (s *Summary) Render() string {
+ 	sort.Strings(names)
+ 
+ 	var b strings.Builder
++	count, total := 0, 0.0
+ 	for _, name := range names {
+ 		fmt.Fprintf(&b, "%s count=%d total=%g\n", name, s.counts[name], s.totals[name])
++		count += s.counts[name]
++		total += s.totals[name]
+ 	}
++	// Operators keep adding the column up by hand; close the report with the
++	// overall figures. Present even when nothing was observed.
++	fmt.Fprintf(&b, "TOTAL count=%d total=%g\n", count, total)
+ 	return b.String()
+ }

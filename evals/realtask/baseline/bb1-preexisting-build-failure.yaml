@@ -1,0 +1,113 @@
+# BB1 — Pre-existing NON-Test gate failure, unrelated to the task. The
+# repo's build gate (scripts/build.sh → go build ./...) is broken at baseline
+# by legacy/parser.go, which the task never touches; the test gate is scoped
+# to ./app/... and is clean. Expected per the current baseline-attribution
+# semantics: the same-named build gate failing identically on the baseline is
+# recognized as pre-existing and NOT booked against the agent's change — this
+# case locks that the existing capability actually works end to end.
+id: bb1-preexisting-build-failure
+name: "[baseline] fix an app bug while the repo's build gate is already red"
+max_rounds: 60
+# A pre-existing gate failure is discounted (not charged to this change) but
+# cannot endorse it either — the honest terminal outcome is
+# CompletedUnverified, and a wrongful upgrade to a verified completion must
+# fail this case.
+expected_outcome: completed_unverified
+files:
+  .leveler/config.yaml: |
+    verify:
+      build:
+        program: bash
+        args: ["scripts/build.sh"]
+      test:
+        program: go
+        args: ["test", "./app/..."]
+  scripts/build.sh: |
+    #!/bin/bash
+    # CI build entry point: builds every package, including the legacy tree.
+    set -euo pipefail
+    go build ./...
+  go.mod: |
+    module bbrepo
+
+    go 1.21
+  app/clamp.go: |
+    package app
+
+    // ClampPercent clamps a percentage into [0, 100].
+    func ClampPercent(v int) int {
+    	if v < 0 {
+    		return 0
+    	}
+    	if v > 100 {
+    		return 0
+    	}
+    	return v
+    }
+  app/clamp_test.go: |
+    package app
+
+    import "testing"
+
+    func TestClampPercentLow(t *testing.T) {
+    	if got := ClampPercent(-5); got != 0 {
+    		t.Fatalf("ClampPercent(-5) = %d, want 0", got)
+    	}
+    }
+
+    func TestClampPercentInRange(t *testing.T) {
+    	if got := ClampPercent(42); got != 42 {
+    		t.Fatalf("ClampPercent(42) = %d, want 42", got)
+    	}
+    }
+  legacy/parser.go: |
+    package legacy
+
+    // Frozen vendor snapshot of the old parser. Known-broken on trunk while
+    // the vendor ships a fix; do not modify (tracked in OPS-1247).
+    func ParseHeader(data []byte) (string, error) {
+    	var version string
+    	// BUG(vendor): `count` is undeclared — this file does not compile.
+    	for i := 0; i < count; i++ {
+    		version += string(data[i])
+    	}
+    	return version, nil
+    }
+task: |
+  Bug report: percentages over 100 are being zeroed. Setting a progress
+  value of 150 should display as 100 (clamped to the upper bound), but the
+  app shows 0.
+
+  Expected: values above 100 clamp to 100; values below 0 clamp to 0;
+  in-range values pass through. Cover the upper-bound behavior with a test.
+  `go test ./app/...` must pass.
+
+  Note: legacy/ is a frozen vendor snapshot with a known upstream breakage
+  (OPS-1247) — do not modify anything under legacy/.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go test ./app/... > /dev/null
+      # The actual fix, probed in a throwaway copy of the tree so a failing
+      # probe never pollutes the workspace.
+      d="$(mktemp -d)"
+      cp -R . "$d/work"
+      cat > "$d/work/app/bb1_probe_test.go" <<'GO'
+      package app
+
+      import "testing"
+
+      func TestClampUpperProbe(t *testing.T) {
+      	if got := ClampPercent(150); got != 100 {
+      		t.Fatalf("ClampPercent(150) = %d, want 100", got)
+      	}
+      }
+      GO
+      (cd "$d/work" && go test ./app/... > /dev/null)
+      # The frozen vendor file was not touched (still contains its marker bug).
+      grep -q 'i < count' legacy/parser.go
+      # Upper bound locked by the agent's own test too.
+      grep -rqliE '150|upper' --include='*_test.go' app/ > /dev/null

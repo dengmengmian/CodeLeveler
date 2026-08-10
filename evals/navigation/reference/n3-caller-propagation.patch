@@ -1,0 +1,28 @@
+diff --git a/internal/report/aggregate.go b/internal/report/aggregate.go
+index 7b34496..a7abc49 100644
+--- a/internal/report/aggregate.go
++++ b/internal/report/aggregate.go
+@@ -18,6 +18,9 @@ func Distinct(batches []api.Batch) int {
+ 	seen := map[string]struct{}{}
+ 	for _, batch := range batches {
+ 		for _, record := range batch.Records {
++			if !record.Valid {
++				continue
++			}
+ 			seen[record.Name] = struct{}{}
+ 		}
+ 	}
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index 79f23c9..0bd9fb3 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -25,6 +25,9 @@ func NewSummary() *Summary {
+ // Observe folds one batch into the running totals.
+ func (s *Summary) Observe(batch api.Batch) {
+ 	for _, record := range batch.Records {
++		if !record.Valid {
++			continue
++		}
+ 		s.counts[record.Name]++
+ 		s.totals[record.Name] += record.Value
+ 	}

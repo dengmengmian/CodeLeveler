@@ -174,6 +174,60 @@ pub fn process_request_for_verify_check(
 /// current macOS). If it disappears, switch to a `sandbox_init`-based wrapper.
 /// Wrap a command for OS sandbox (seatbelt/bwrap). Used by [`CommandRunner`] and
 /// background task spawn so both paths honor the same `ProcessRequest` fields.
+/// Host trees the sandbox must keep unreadable, from `LEVELER_SANDBOX_READ_DENY`
+/// (colon-separated absolute paths).
+///
+/// This exists for measurement integrity, not production security. An eval
+/// harness stores the answers — case definitions, hidden acceptance, the
+/// pristine fixture, its own event log — somewhere on the same machine the
+/// agent runs on, and a tool-layer guard on `read_file` does nothing when the
+/// model reaches for `cat`. Declaring the roots here pushes the boundary below
+/// the command, where it does not care which tool asked.
+///
+/// Relative entries are dropped: they would be resolved against each child's
+/// cwd, which is not a boundary anyone can reason about.
+pub(crate) fn parse_read_denials(raw: Option<&str>) -> Vec<PathBuf> {
+    raw.unwrap_or_default()
+        .split(':')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        // Seatbelt matches the *resolved* path, and on macOS the temp tree is
+        // reached through a symlink (`/var/folders` → `/private/var/folders`).
+        // A denial written in the unresolved form silently matches nothing —
+        // which is exactly the kind of quiet no-op a security rule must not be.
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect()
+}
+
+/// Process-wide denials, installed by a harness that knows where its answers
+/// live. Set once, before any command runs.
+static READ_DENIALS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Declare host trees no command in this process may read.
+///
+/// Idempotent and first-write-wins: a boundary that could be widened later by
+/// a second call would not be a boundary. Returns whether this call installed
+/// the set.
+pub fn seal_read_denials(roots: Vec<PathBuf>) -> bool {
+    let sealed: Vec<PathBuf> = roots
+        .into_iter()
+        .filter(|path| path.is_absolute())
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect();
+    READ_DENIALS.set(sealed).is_ok()
+}
+
+/// The denials configured for this process: whatever was sealed in-process,
+/// else `LEVELER_SANDBOX_READ_DENY` from the environment.
+pub(crate) fn configured_read_denials() -> Vec<PathBuf> {
+    if let Some(sealed) = READ_DENIALS.get() {
+        return sealed.clone();
+    }
+    parse_read_denials(std::env::var("LEVELER_SANDBOX_READ_DENY").ok().as_deref())
+}
+
 pub(crate) fn sandbox_command(
     program: &str,
     args: &[String],
@@ -183,7 +237,35 @@ pub(crate) fn sandbox_command(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
-    if !deny_network && write_root.is_none() {
+    let denials = configured_read_denials();
+    sandbox_command_with_read_denials(
+        program,
+        args,
+        deny_network,
+        write_root,
+        extra_read_roots,
+        scratch_root,
+        cache_write_roots,
+        &denials,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sandbox_command_with_read_denials(
+    program: &str,
+    args: &[String],
+    deny_network: bool,
+    write_root: Option<&Path>,
+    extra_read_roots: &[PathBuf],
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
+    read_denied_roots: &[PathBuf],
+) -> (String, Vec<String>) {
+    // Defense in depth. Without confinement to apply this would normally run
+    // the command bare — but once a harness has sealed host roots, "no
+    // confinement" must not mean "no denials". An approval bug upstream should
+    // cost us the write boundary, not the answer key.
+    if !deny_network && write_root.is_none() && read_denied_roots.is_empty() {
         return (program.to_string(), args.to_vec());
     }
     #[cfg(target_os = "macos")]
@@ -193,6 +275,7 @@ pub(crate) fn sandbox_command(
             args,
             deny_network,
             write_root,
+            read_denied_roots,
             extra_read_roots,
             scratch_root,
             cache_write_roots,
@@ -229,11 +312,13 @@ const SEATBELT_NETWORK: &str = include_str!("seatbelt_network.sbpl");
 
 /// Build the `sandbox-exec` argv on macOS (see [`sandbox_command`]).
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn macos_sandbox_command(
     program: &str,
     args: &[String],
     deny_network: bool,
     write_root: Option<&Path>,
+    read_denied_roots: &[PathBuf],
     extra_read_roots: &[PathBuf],
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
@@ -241,8 +326,18 @@ fn macos_sandbox_command(
     let Some(root) = write_root else {
         // No write confinement (full-access dropping only the network): keep the
         // long-standing open profile so that path is unchanged.
-        let profile = "(version 1)(allow default)(deny network*)".to_string();
-        let mut wrapped = vec!["-p".to_string(), profile, program.to_string()];
+        let mut profile = String::from("(version 1)(allow default)(deny network*)");
+        for i in 0..read_denied_roots.len() {
+            profile.push_str(&format!(
+                "(deny file-read* (subpath (param \"READ_DENIED_{i}\")) (literal (param \"READ_DENIED_{i}\")))"
+            ));
+        }
+        let mut wrapped = vec!["-p".to_string(), profile];
+        for (i, r) in read_denied_roots.iter().enumerate() {
+            wrapped.push(format!("-DREAD_DENIED_{i}={}", r.display()));
+        }
+        wrapped.push("--".to_string());
+        wrapped.push(program.to_string());
         wrapped.extend_from_slice(args);
         return ("/usr/bin/sandbox-exec".to_string(), wrapped);
     };
@@ -259,6 +354,18 @@ fn macos_sandbox_command(
     let mut policy = String::from(SEATBELT_BASE);
     policy.push_str("\n; unrestricted file reads, writes limited to approved roots\n");
     policy.push_str("(allow file-read*)\n");
+    // Ordered after the blanket allow on purpose: in SBPL the last matching
+    // rule wins, so these denials override it. Kernel-enforced on the resolved
+    // path, so a symlink, a nested shell, `git -C`, sqlite3 or a Python script
+    // all hit the same wall.
+    for i in 0..read_denied_roots.len() {
+        // `subpath` covers a directory and everything under it; `literal`
+        // catches a sealed root that is a single file. Emitting both means the
+        // caller does not have to know which it declared.
+        policy.push_str(&format!(
+            "(deny file-read* (subpath (param \"READ_DENIED_{i}\")) (literal (param \"READ_DENIED_{i}\")))\n"
+        ));
+    }
     policy.push_str("(allow file-write*");
     for i in 0..write_roots.len() {
         policy.push_str(&format!(" (subpath (param \"WRITABLE_ROOT_{i}\"))"));
@@ -289,6 +396,9 @@ fn macos_sandbox_command(
     }
     for (i, r) in cache_write_roots.iter().enumerate() {
         wrapped.push(format!("-DCACHE_ROOT_{i}={}", r.display()));
+    }
+    for (i, r) in read_denied_roots.iter().enumerate() {
+        wrapped.push(format!("-DREAD_DENIED_{i}={}", r.display()));
     }
     wrapped.push("--".to_string());
     wrapped.push(program.to_string());
@@ -1779,6 +1889,458 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
     }
 
+    /// Where a `rustc-wrapper` setting is planted, in Cargo precedence order:
+    /// the workspace's own `.cargo/config.toml` beats an outer ancestor's,
+    /// which beats the host `CARGO_HOME` config.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[derive(Default)]
+    struct WrapperLayers<'a> {
+        host_cargo_home: Option<&'a str>,
+        outer_ancestor: Option<&'a str>,
+        workspace_local: Option<&'a str>,
+    }
+
+    /// A crate under `<base>/outer/project`, plus fake wrappers planted at the
+    /// requested layers. Every fake wrapper fails, so the build can only
+    /// succeed when the sandbox declined to use the one Cargo would pick.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn wrapper_fixture(
+        layers: WrapperLayers<'_>,
+    ) -> Option<(tempfile::TempDir, PathBuf, CommandRunner)> {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return None;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let outer = base.path().join("outer");
+        let workspace = outer.join("project");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"wrapper-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let bin = base.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A stand-in for a wrapper whose runtime needs the sandbox cannot meet:
+        // it refuses to compile anything. No sccache install required.
+        let fake = |name: &str| -> String {
+            let path = bin.join(name);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho 'wrapper: error: Failed to create temp dir' >&2\nexit 1\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path.display().to_string()
+        };
+        let plant = |dir: &Path, wrapper: Option<&str>| {
+            let Some(name) = wrapper else { return };
+            let config_dir = dir.join(".cargo");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(
+                config_dir.join("config.toml"),
+                format!("[build]\nrustc-wrapper = \"{}\"\n", fake(name)),
+            )
+            .unwrap();
+        };
+        plant(&workspace, layers.workspace_local);
+        plant(&outer, layers.outer_ancestor);
+
+        let host_cargo = base.path().join("host-cargo");
+        std::fs::create_dir_all(&host_cargo).unwrap();
+        if let Some(name) = layers.host_cargo_home {
+            std::fs::write(
+                host_cargo.join("config.toml"),
+                format!("[build]\nrustc-wrapper = \"{}\"\n", fake(name)),
+            )
+            .unwrap();
+        }
+
+        let mut variables: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| {
+                name != "CARGO_HOME" && name != "RUSTC_WRAPPER" && name != "RUSTC_WORKSPACE_WRAPPER"
+            })
+            .collect();
+        variables.push(("CARGO_HOME".into(), host_cargo.into_os_string()));
+        variables.push((
+            "LEVELER_HOME".into(),
+            base.path().join("home").into_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        Some((
+            base,
+            workspace,
+            CommandRunner::with_environment(environment),
+        ))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn verify_build(workspace: &Path, runner: &CommandRunner) -> ProcessOutput {
+        let request = process_request_for_verify_check(
+            "cargo",
+            vec!["build".into(), "--quiet".into(), "--offline".into()],
+            workspace.to_path_buf(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run verify check")
+    }
+
+    /// A — the gap this closes: the cache is named ONLY by an ancestor
+    /// directory. Nothing is in the host CARGO_HOME config and nothing is in
+    /// the environment, so cleaning the copied config cannot help; the
+    /// decision has to come from what Cargo would actually pick here.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn an_ancestor_only_cache_wrapper_cannot_fail_a_verification_gate() {
+        let Some((_base, workspace, runner)) = wrapper_fixture(WrapperLayers {
+            outer_ancestor: Some("sccache"),
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            output.success(),
+            "an ancestor-only cache wrapper must not gate verification: {output:?}"
+        );
+    }
+
+    /// B — and the same placement for a wrapper we cannot prove is a cache is
+    /// honored, failure and all.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn an_ancestor_only_unknown_wrapper_is_still_inherited() {
+        let Some((_base, workspace, runner)) = wrapper_fixture(WrapperLayers {
+            outer_ancestor: Some("team-instrumenting-rustc"),
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            !output.success(),
+            "an unrecognized wrapper must still be honored: {output:?}"
+        );
+    }
+
+    /// C — precedence: an outer directory naming a cache says nothing once a
+    /// nearer one replaces it with a wrapper that carries build semantics.
+    /// Seeing "sccache" anywhere must never be enough to blank the setting.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_nearer_unknown_wrapper_wins_over_an_outer_cache() {
+        let Some((_base, workspace, runner)) = wrapper_fixture(WrapperLayers {
+            outer_ancestor: Some("sccache"),
+            workspace_local: Some("team-instrumenting-rustc"),
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            !output.success(),
+            "the nearest configuration decides, and it is not a cache: {output:?}"
+        );
+    }
+
+    /// D — the mirror image: an outer custom wrapper shadowed by a nearer
+    /// cache is effectively a cache, so it is neutralized.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_nearer_cache_wins_over_an_outer_unknown_wrapper() {
+        let Some((_base, workspace, runner)) = wrapper_fixture(WrapperLayers {
+            outer_ancestor: Some("team-instrumenting-rustc"),
+            workspace_local: Some("sccache"),
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            output.success(),
+            "the nearest configuration decides, and it is a cache: {output:?}"
+        );
+    }
+
+    /// The original shape still holds: a cache inherited through the host
+    /// CARGO_HOME config is neutralized too.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_host_cargo_home_cache_wrapper_is_neutralized() {
+        let Some((_base, workspace, runner)) = wrapper_fixture(WrapperLayers {
+            host_cargo_home: Some("sccache"),
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(output.success(), "{output:?}");
+    }
+
+    /// E — no wrapper anywhere: an ordinary build, unchanged.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_workspace_without_any_wrapper_builds_normally() {
+        let Some((_base, workspace, runner)) = wrapper_fixture(WrapperLayers::default()) else {
+            return;
+        };
+        let output = verify_build(&workspace, &runner).await;
+        assert!(output.success(), "{output:?}");
+    }
+
+    /// F — neutralizing a cache must never become a way to swallow real
+    /// compiler errors.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_real_compile_error_still_fails_the_gate() {
+        let Some((_base, workspace, runner)) = wrapper_fixture(WrapperLayers {
+            outer_ancestor: Some("sccache"),
+            ..Default::default()
+        }) else {
+            return;
+        };
+        std::fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() { this is not rust }\n",
+        )
+        .unwrap();
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            !output.success(),
+            "a broken source file must fail verification: {output:?}"
+        );
+    }
+
+    /// The verification temp contract, in one shape: a check gets a writable
+    /// temp root through TMPDIR/TMP/TEMP, that root lives outside the
+    /// workspace, and using it leaves the workspace untouched — so temp files
+    /// can never reach a diff, `modified_files`, or the gate's own scoping.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn verify_check_gets_a_dedicated_temp_root_outside_the_workspace() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let request = process_request_for_verify_check(
+            "bash",
+            vec![
+                "-c".into(),
+                // The portable idiom: an explicit template under $TMPDIR.
+                "d=\"$(mktemp -d \"$TMPDIR/leveler-verify.XXXXXX\")\"; \
+                 echo scratch > \"$d/file\"; \
+                 printf '%s\\n%s\\n%s\\n' \"$TMPDIR\" \"$TMP\" \"$TEMP\""
+                    .into(),
+            ],
+            fixture.workspace.clone(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        let output = fixture
+            .runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run verify check");
+        assert!(
+            output.success(),
+            "a verify script must be able to create temp files: {output:?}"
+        );
+
+        let seen: Vec<&str> = output.stdout.lines().collect();
+        assert_eq!(seen.len(), 3, "TMPDIR/TMP/TEMP all set: {seen:?}");
+        assert!(
+            seen.iter().all(|value| value == &seen[0]),
+            "all three must name the same temp root: {seen:?}"
+        );
+        let temp_root = std::path::Path::new(seen[0]);
+        assert!(
+            !temp_root.starts_with(&fixture.workspace),
+            "the temp root must live outside the workspace, got {temp_root:?}"
+        );
+        assert!(
+            std::fs::read_dir(&fixture.workspace)
+                .unwrap()
+                .next()
+                .is_none(),
+            "verification temp work must leave no trace in the workspace"
+        );
+    }
+
+    /// The temp root belongs to one check: it is gone once the check ends, and
+    /// a second check never inherits the first one's leftovers.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn verify_check_scratch_is_per_check_and_removed_afterwards() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let temp_root_of = async |fixture: &VerifySandboxFixture| -> String {
+            let request = process_request_for_verify_check(
+                "bash",
+                vec![
+                    "-c".into(),
+                    "echo marker > \"$TMPDIR/leftover\"; printf '%s' \"$TMPDIR\"".into(),
+                ],
+                fixture.workspace.clone(),
+                VerifyNetworkPolicy::InheritSession,
+            );
+            let output = fixture
+                .runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("run verify check");
+            assert!(output.success(), "{output:?}");
+            output.stdout.trim().to_string()
+        };
+
+        let first = temp_root_of(&fixture).await;
+        assert!(
+            !std::path::Path::new(&first).exists(),
+            "the check's temp root must be cleaned up when it ends: {first}"
+        );
+        let second = temp_root_of(&fixture).await;
+        assert_ne!(
+            first, second,
+            "each check gets its own temp root, never a shared dirty one"
+        );
+    }
+
+    /// Temp access is a grant, not a hole: everything outside the workspace and
+    /// the check's own temp root stays unwritable.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn verify_check_cannot_write_outside_its_granted_roots() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let canary = fixture.outside.join("canary");
+        let request = process_request_for_verify_check(
+            "bash",
+            vec![
+                "-c".into(),
+                "touch \"$1\"".into(),
+                "bash".into(),
+                canary.display().to_string(),
+            ],
+            fixture.workspace.clone(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        let output = fixture
+            .runner
+            .run(request, CancellationToken::new())
+            .await
+            .expect("run verify check");
+        assert!(
+            !output.success() && !canary.exists(),
+            "a path outside the workspace and temp root must stay unwritable: {output:?}"
+        );
+    }
+
+    /// KNOWN PLATFORM LIMITATION (macOS): `/usr/bin/mktemp` ignores `$TMPDIR`
+    /// and always targets the Darwin per-user temp directory, which the
+    /// sandbox does not grant. Tools that honor TMPDIR (language temp APIs,
+    /// or mktemp with an explicit template) work fine. This test pins both
+    /// halves so the difference stays visible instead of being rediscovered as
+    /// a "verifier bug" — closing it would mean granting write access to the
+    /// user's shared temp tree, which is a policy decision, not a fix.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_mktemp_without_a_template_bypasses_tmpdir() {
+        let Some(fixture) = verify_sandbox_fixture() else {
+            return;
+        };
+        let run = async |script: &str| {
+            let request = process_request_for_verify_check(
+                "bash",
+                vec!["-c".into(), script.to_string()],
+                fixture.workspace.clone(),
+                VerifyNetworkPolicy::InheritSession,
+            );
+            fixture
+                .runner
+                .run(request, CancellationToken::new())
+                .await
+                .expect("run verify check")
+        };
+
+        let bare = run("mktemp -d").await;
+        assert!(
+            !bare.success() && bare.stderr.contains("Operation not permitted"),
+            "bare `mktemp -d` reaches past TMPDIR into the shared temp tree: {bare:?}"
+        );
+        assert!(
+            !bare.stderr.contains("$TMPDIR"),
+            "and it never even consults TMPDIR: {bare:?}"
+        );
+
+        let templated = run("mktemp -d \"$TMPDIR/leveler.XXXXXX\"").await;
+        assert!(
+            templated.success(),
+            "an explicit TMPDIR template works under the same sandbox: {templated:?}"
+        );
+    }
+
+    /// Workspace + a sibling "outside" directory + a runner whose LEVELER_HOME
+    /// is private to this test. `None` when the platform sandbox is missing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    struct VerifySandboxFixture {
+        _base: tempfile::TempDir,
+        workspace: PathBuf,
+        outside: PathBuf,
+        runner: CommandRunner,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn verify_sandbox_fixture() -> Option<VerifySandboxFixture> {
+        #[cfg(target_os = "linux")]
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: bubblewrap is not installed");
+            return None;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("workspace");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut variables: Vec<_> = std::env::vars_os().collect();
+        variables.push((
+            "LEVELER_HOME".into(),
+            base.path().join("home").into_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        Some(VerifySandboxFixture {
+            _base: base,
+            workspace,
+            outside,
+            runner: CommandRunner::with_environment(environment),
+        })
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn confined_common_builds_use_private_temp_and_persistent_cache() {
@@ -2173,7 +2735,265 @@ mod tests {
         }
     }
 
+    /// C2.3C-S — measurement integrity. The eval harness must be able to put
+    /// specific host trees out of reach of *any* command the agent runs, not
+    /// just of `read_file`. A run that can `cat` its own case definition is
+    /// grading its own exam, and no amount of tool-layer guarding helps when
+    /// the model can pick a different tool.
+    ///
+    /// The rule has to sit below the command: a kernel-enforced path deny is
+    /// indifferent to whether the read came from cat, python, sqlite3,
+    /// `git -C`, a nested shell, or a symlink, which is exactly why this is not
+    /// a command blacklist.
+    #[test]
+    fn seatbelt_denies_reads_of_declared_host_roots() {
+        let root = std::path::Path::new("/tmp");
+        let scratch = tempfile::tempdir().expect("scratch");
+        let secret = std::path::PathBuf::from("/Users/someone/project/evals");
+        let (program, args) = sandbox_command_with_read_denials(
+            "cat",
+            &["/Users/someone/project/evals/case.yaml".into()],
+            true,
+            Some(root),
+            &[],
+            Some(scratch.path()),
+            &[],
+            std::slice::from_ref(&secret),
+        );
+        assert_eq!(program, "/usr/bin/sandbox-exec");
+        let policy = &args[1];
+        let allow_at = policy.find("(allow file-read*)").expect("broad read allow");
+        let deny_at = policy
+            .find("(deny file-read* (subpath (param \"READ_DENIED_0\"))")
+            .expect("read denial emitted");
+        assert!(
+            deny_at > allow_at,
+            "a deny only wins if it comes after the allow in SBPL: {policy}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DREAD_DENIED_0=/Users/someone/project/evals"),
+            "denied root passed as a -D param, never interpolated: {args:?}"
+        );
+    }
+
+    /// Without declared denials the profile is byte-for-byte what it was:
+    /// production reads stay unrestricted, and this change is inert there.
+    #[test]
+    fn no_declared_denials_leaves_the_read_policy_untouched() {
+        let root = std::path::Path::new("/tmp");
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (_, plain) = sandbox_command(
+            "cat",
+            &["x".into()],
+            true,
+            Some(root),
+            &[],
+            Some(scratch.path()),
+            &[],
+        );
+        let (_, empty_denials) = sandbox_command_with_read_denials(
+            "cat",
+            &["x".into()],
+            true,
+            Some(root),
+            &[],
+            Some(scratch.path()),
+            &[],
+            &[],
+        );
+        assert_eq!(plain, empty_denials);
+        assert!(!plain[1].contains("(deny file-read*"));
+    }
+
+    /// The denial list comes from the environment so only a harness that opts
+    /// in gets it; an unset or empty variable means "no denials".
+    #[test]
+    fn declared_read_denials_are_parsed_from_the_environment_value() {
+        assert!(parse_read_denials(None).is_empty());
+        assert!(parse_read_denials(Some("")).is_empty());
+        assert!(parse_read_denials(Some("   ")).is_empty());
+        assert_eq!(
+            parse_read_denials(Some("/a/b:/c/d")),
+            vec![
+                std::path::PathBuf::from("/a/b"),
+                std::path::PathBuf::from("/c/d")
+            ]
+        );
+        // Relative entries cannot be enforced against a child's cwd, so they
+        // are dropped rather than silently meaning something else.
+        assert_eq!(
+            parse_read_denials(Some("/a/b:relative/x:")),
+            vec![std::path::PathBuf::from("/a/b")]
+        );
+    }
+
+    /// C2.3C-S red team. Replays the escape an N6 eval run actually performed —
+    /// `cd ..`, absolute host paths, `git -C`, a nested shell, python, sqlite3,
+    /// a symlink — against a real `sandbox-exec`, and requires every one of them
+    /// to fail while ordinary in-workspace work keeps working.
+    ///
+    /// The point is that none of these are blocked by name. They fail because
+    /// the kernel refuses the resolved path, which is the only kind of boundary
+    /// that survives a model choosing a different tool.
     #[cfg(target_os = "macos")]
+    #[test]
+    fn declared_read_denials_survive_every_escape_the_eval_actually_used() {
+        let base = std::env::temp_dir().join(format!(
+            "leveler-readdeny-{}",
+            std::process::id() as u64 * 37 + 13
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        let secret = base.join("host");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(secret.join("case.yaml"), "hidden: answer\n").unwrap();
+        std::fs::write(workspace.join("own.txt"), "mine\n").unwrap();
+        std::os::unix::fs::symlink(&secret, workspace.join("peek")).ok();
+
+        let denied = parse_read_denials(Some(secret.to_str().unwrap()));
+        // Real runs give the command a private scratch root; git needs one.
+        let scratch = base.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let run = |cmd: &str| {
+            let (program, args) = sandbox_command_with_read_denials(
+                "/bin/sh",
+                &["-c".to_string(), cmd.to_string()],
+                true,
+                Some(workspace.as_path()),
+                &[],
+                Some(scratch.as_path()),
+                &[],
+                &denied,
+            );
+            std::process::Command::new(program)
+                .args(args)
+                .current_dir(&workspace)
+                .env("TMPDIR", &scratch)
+                .output()
+                .expect("sandbox-exec")
+        };
+
+        let case = secret.join("case.yaml");
+        let case = case.display();
+        for escape in [
+            format!("cat {case}"),
+            format!("head -1 {case}"),
+            format!("cd .. && cat host/case.yaml"),
+            format!("sh -c 'cat {case}'"),
+            format!("/usr/bin/python3 -c \"print(open('{case}').read())\""),
+            "cat peek/case.yaml".to_string(),
+            format!("grep -r hidden {}", secret.display()),
+        ] {
+            let out = run(&escape);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                !stdout.contains("hidden: answer"),
+                "escape leaked the file: {escape}\n{stdout}"
+            );
+        }
+
+        // ...while the workspace itself stays fully usable. Sealing the answer
+        // key must not cost the agent the evidence it legitimately navigates
+        // with: an eval that cannot run `git log` measures a crippled agent.
+        let ok = run("cat own.txt");
+        assert!(
+            String::from_utf8_lossy(&ok.stdout).contains("mine"),
+            "in-workspace reads must keep working: {:?}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+
+        // History is created the way the eval creates it — before the agent
+        // runs, outside the sandbox. `.git` stays write-protected inside it,
+        // which is long-standing behaviour this round does not touch.
+        for setup in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "a@b"],
+            vec!["config", "user.name", "a"],
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "seed"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&setup)
+                .current_dir(&workspace)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "fixture git setup failed ({setup:?}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        for capability in [
+            "git log --oneline",
+            "git show HEAD:own.txt",
+            "git blame own.txt",
+            "git diff HEAD",
+            "git status --porcelain",
+            "echo written > new.txt && cat new.txt",
+            "grep -r mine .",
+        ] {
+            let out = run(capability);
+            assert!(
+                out.status.success(),
+                "workspace capability must survive sealing ({capability}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(
+            String::from_utf8_lossy(&run("git log --oneline").stdout).contains("seed"),
+            "workspace history must be readable"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// C2.3C-S Layer B — the escape hatch closes when a harness has sealed
+    /// roots. Full-access with network normally skips `sandbox-exec` entirely;
+    /// that is exactly the state a granted `request_permissions` produces, so
+    /// it must still carry the denials.
+    #[test]
+    fn sealed_roots_survive_the_unconfined_execution_path() {
+        let secret = std::path::PathBuf::from("/Users/someone/project/evals");
+
+        // Nothing sealed: unchanged, command runs bare.
+        let (program, args) = sandbox_command_with_read_denials(
+            "cat",
+            &["x".into()],
+            false,
+            None,
+            &[],
+            None,
+            &[],
+            &[],
+        );
+        assert_eq!(program, "cat", "unsealed full access stays unwrapped");
+        assert_eq!(args, vec!["x".to_string()]);
+
+        // Sealed: the same call is wrapped and carries the denial.
+        let (program, args) = sandbox_command_with_read_denials(
+            "cat",
+            &["x".into()],
+            false,
+            None,
+            &[],
+            None,
+            &[],
+            std::slice::from_ref(&secret),
+        );
+        assert_eq!(program, "/usr/bin/sandbox-exec");
+        assert!(
+            args[1].contains("(deny file-read* (subpath (param \"READ_DENIED_0\"))"),
+            "sealed roots must survive the unconfined path: {}",
+            args[1]
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DREAD_DENIED_0=/Users/someone/project/evals")
+        );
+    }
+
     #[test]
     fn seatbelt_confines_writes_via_params() {
         let root = std::path::Path::new("/tmp");

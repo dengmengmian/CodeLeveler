@@ -18,6 +18,8 @@ mkdir -p "$dest_root"
 # name|git-url|pinned-ref   (ref must be a tag or full SHA present after clone)
 REPOS=(
   "ripgrep|https://github.com/BurntSushi/ripgrep|14.1.1"
+  # Second real-repo localization case (Go, ~477 files) — evals/realrepo/.
+  "yq|https://github.com/mikefarah/yq|v4.44.3"
   # The real-project TUI matrix (fixtures/matrix/README.md) drives these.
   # Pinned so a case starts from the same tree on every machine.
   "rust-csv|https://github.com/BurntSushi/rust-csv|1.4.0"

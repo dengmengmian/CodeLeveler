@@ -1,0 +1,100 @@
+# R1 (recast) — Post-turn verification failure that must drive Engine repair.
+# The previous design failed: the model swept the duplicated call sites in
+# the main turn, so the gate never fired. This design puts the first failure
+# surface where main-turn exploration cannot reliably foresee it: the
+# project's test gate runs a release-acceptance spec that ships base64-encoded
+# in .ci/acceptance.sh (an eval-only hidden-verification seam; the gate still
+# runs REAL go tests against the REAL workspace code). The task itself is the
+# visible whitespace bug; the acceptance spec additionally enforces the 0-100
+# range contract the task never mentions — a natural main-turn fix passes the
+# visible tests, completes, and then meets VerificationFailed → RepairStarted
+# → repair turn (evidence names the exact expectation) → reverify.
+id: r1-hidden-acceptance-repair
+name: "[repair] percent parser: whitespace fix meets a hidden range contract"
+max_rounds: 80
+files:
+  .leveler/config.yaml: |
+    verify:
+      build:
+        program: go
+        args: ["build", "./..."]
+      test:
+        program: bash
+        args: [".ci/acceptance.sh"]
+  .ci/acceptance.sh: |
+    #!/bin/bash
+    # Release acceptance for the percent parser. The acceptance spec is
+    # distributed in encoded form by release engineering; it materializes
+    # into a scratch copy of the tree and runs as ordinary go tests against
+    # the real code.
+    set -euo pipefail
+    SPEC_B64="cGFja2FnZSBwZXJjZW50CgppbXBvcnQgKAoJInN0cmluZ3MiCgkidGVzdGluZyIKKQoKZnVuYyBUZXN0UGFyc2VSZWplY3RzT3V0T2ZSYW5nZSh0ICp0ZXN0aW5nLlQpIHsKCWlmIHYsIGVyciA6PSBQYXJzZSgiMTUwJSIpOyBlcnIgPT0gbmlsIHx8ICFzdHJpbmdzLkNvbnRhaW5zKGVyci5FcnJvcigpLCAib3V0IG9mIHJhbmdlIikgewoJCXQuRmF0YWxmKGBQYXJzZSgiMTUwJSUiKSA9ICVkLCAldjsgd2FudCBhbiBlcnJvciBjb250YWluaW5nICJvdXQgb2YgcmFuZ2UiICh2YWxpZCBwZXJjZW50cyBhcmUgMC0xMDApYCwgdiwgZXJyKQoJfQoJaWYgXywgZXJyIDo9IFBhcnNlKCItNSUiKTsgZXJyID09IG5pbCB8fCAhc3RyaW5ncy5Db250YWlucyhlcnIuRXJyb3IoKSwgIm91dCBvZiByYW5nZSIpIHsKCQl0LkZhdGFsZihgUGFyc2UoIi01JSUiKSBtdXN0IGJlIHJlamVjdGVkIHdpdGggYW4gIm91dCBvZiByYW5nZSIgZXJyb3IsIGdvdCAldmAsIGVycikKCX0KCWlmIHYsIGVyciA6PSBQYXJzZSgiMTAwJSIpOyBlcnIgIT0gbmlsIHx8IHYgIT0gMTAwIHsKCQl0LkZhdGFsZihgUGFyc2UoIjEwMCUlIikgPSAlZCwgJXY7IHdhbnQgMTAwLCBuaWxgLCB2LCBlcnIpCgl9CglpZiB2LCBlcnIgOj0gUGFyc2UoIjAlIik7IGVyciAhPSBuaWwgfHwgdiAhPSAwIHsKCQl0LkZhdGFsZihgUGFyc2UoIjAlJSIpID0gJWQsICV2OyB3YW50IDAsIG5pbGAsIHYsIGVycikKCX0KfQo="
+    w="$(mktemp -d "${TMPDIR:-/tmp}/leveler-acceptance.XXXXXX")"
+    trap 'rm -rf "$w"' EXIT
+    cp -R ./percent ./go.mod "$w/"
+    python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.argv[1]))" "$SPEC_B64" > "$w/percent/acceptance_spec_test.go"
+    (cd "$w" && go test ./...)
+  go.mod: |
+    module pct
+
+    go 1.21
+  percent/percent.go: |
+    package percent
+
+    import (
+    	"fmt"
+    	"strconv"
+    	"strings"
+    )
+
+    // Parse reads a percent literal like "45%" into its integer value.
+    func Parse(s string) (int, error) {
+    	s, ok := strings.CutSuffix(s, "%")
+    	if !ok {
+    		return 0, fmt.Errorf("missing %% suffix: %q", s)
+    	}
+    	v, err := strconv.Atoi(s)
+    	if err != nil {
+    		return 0, fmt.Errorf("invalid percent: %q", s)
+    	}
+    	return v, nil
+    }
+  percent/percent_test.go: |
+    package percent
+
+    import "testing"
+
+    func TestParseBasics(t *testing.T) {
+    	if v, err := Parse("45%"); err != nil || v != 45 {
+    		t.Fatalf(`Parse("45%%") = %d, %v`, v, err)
+    	}
+    	if _, err := Parse("nope"); err == nil {
+    		t.Fatal("missing suffix must error")
+    	}
+    }
+
+    func TestParseTrimsSurroundingWhitespace(t *testing.T) {
+    	if v, err := Parse(" 45% "); err != nil || v != 45 {
+    		t.Fatalf(`Parse(" 45%% ") = %d, %v; want 45, nil`, v, err)
+    	}
+    	if v, err := Parse("7%\t"); err != nil || v != 7 {
+    		t.Fatalf(`Parse("7%%\t") = %d, %v; want 7, nil`, v, err)
+    	}
+    }
+task: |
+  Bug report: percent values copied out of spreadsheets fail to parse. The
+  copied text carries stray surrounding whitespace — " 45% " — and Parse
+  rejects it with a "missing % suffix" error.
+
+  Expected: surrounding whitespace is ignored; " 45% " parses as 45. The
+  existing test file already contains the failing regression tests.
+
+  Fix the behavior so the project's verification passes.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      go test ./... > /dev/null
+      bash .ci/acceptance.sh > /dev/null

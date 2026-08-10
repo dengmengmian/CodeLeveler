@@ -13,7 +13,7 @@ use leveler_model::{ModelRef, ModelRuntime};
 use leveler_project::Layout;
 
 use crate::cli::EvalCommand;
-use crate::common::{build_approver, resolve_model};
+use crate::common::resolve_model;
 use crate::output::Line;
 
 pub(crate) async fn cmd_eval(
@@ -541,6 +541,70 @@ fn scrub_command_env(command: &mut std::process::Command) {
 /// run is hours long; without it, an interrupt anywhere before the final write
 /// loses every completed case. The file is append-only and self-describing, so
 /// a killed run's cases can still be recovered and compared.
+/// Serial number for one `run_eval_case` invocation in this process.
+///
+/// Workspace identity has to be per *execution*, not per case: `compare` runs
+/// two models and `ablate` runs control and treatment, each calling `run_eval`
+/// again in the same process, so `case + pid + repetition` still collides.
+static EXECUTION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_execution_seq() -> u64 {
+    EXECUTION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Where one case execution does its work.
+///
+/// Every execution gets its own directory. The path used to be
+/// `<case>-<pid>`, and `run_eval_case` wipes its directory on entry, so three
+/// repetitions of a case in one process each deleted the previous one's tree —
+/// including under `LEVELER_EVAL_KEEP_WORKSPACE=1`, which only governs cleanup
+/// at the end. Nothing noticed while a run was scored by its exit status, and
+/// it becomes fatal the moment anything needs the tree a *particular* run left
+/// behind, which per-obligation implementation coverage does.
+///
+/// The case id and pid stay in the name because they are what a human looks
+/// for; `exec` and `r` are what make it unique.
+fn case_workspace(case_id: &str, pid: u32, execution: u64, repetition: u32) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "leveler-eval-{case_id}-{pid}-exec{execution}-r{repetition}"
+    ))
+}
+
+/// Put the answers out of reach of every command the agent can run.
+///
+/// A benchmark keeps its answer key on the same machine as the thing it is
+/// grading: case definitions with their hidden relevant/impact paths, the
+/// hidden acceptance scripts, the pristine fixture a workspace was cloned
+/// from, and this run's own event log. `read_file` already refuses paths
+/// outside the workspace — but an eval run was observed reaching all of it
+/// with `cat`, `git -C`, `python3` and `sqlite3` after finding the host path,
+/// which is what a tool-layer guard cannot prevent.
+///
+/// So the boundary moves below the command, into the sandbox profile, where it
+/// is enforced on the resolved path and does not care which tool asked. The
+/// workspace, the toolchain and the scratch space are untouched; agents keep
+/// full `git log`/`show`/`blame`/`diff` and normal builds inside the clone.
+///
+/// Sealed once, before any case runs; every command built afterwards carries it.
+fn seal_eval_answer_keys() {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    // The repository this harness was launched from: cases, fixtures, hidden
+    // acceptance, and the source of the agent grading itself.
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    // Session/event storage — the run's own transcript, which carries the task,
+    // the tool history, and enough to reconstruct the setup. Sealed by the
+    // subdirectory, not by `~/.leveler` as a whole: the toolchain cache lives
+    // in that tree too, and sealing it stops `go build` from working at all.
+    if let Some(home) = std::env::var_os("HOME") {
+        let leveler = std::path::Path::new(&home).join(".leveler");
+        roots.push(leveler.join("projects"));
+        roots.push(leveler.join("config.toml"));
+    }
+    leveler_execution::seal_read_denials(roots);
+}
+
 async fn run_eval(
     config_dir: &std::path::Path,
     model: &ModelRef,
@@ -551,6 +615,7 @@ async fn run_eval(
     overrides: Option<&ExecutionOverrides>,
     checkpoint: Option<&std::path::Path>,
 ) -> leveler_eval::EvalReport {
+    seal_eval_answer_keys();
     let mut results = Vec::new();
     for case in cases {
         for repetition in 1..=repetitions {
@@ -638,13 +703,14 @@ async fn run_bare_case(
     u32,
     String,
     leveler_eval::TerminationClass,
+    Option<leveler_eval::FailureCategory>,
 ) {
     let engine = match app
         .engine_for(
             model,
             PermissionProfile::Assisted,
             false,
-            build_approver(true),
+            std::sync::Arc::new(leveler_execution::EvalApprove),
             Arc::new(leveler_agent::AutoClarify),
         )
         .await
@@ -652,7 +718,8 @@ async fn run_bare_case(
         Ok(engine) => engine,
         Err(e) => {
             let termination = termination_from_app_error(&e);
-            return (None, false, 0, format!("engine: {e}"), termination);
+            let cause = infrastructure_cause_from_app_error(&e);
+            return (None, false, 0, format!("engine: {e}"), termination, cause);
         }
     };
     let spec = leveler_engine::TaskSpec {
@@ -675,7 +742,8 @@ async fn run_bare_case(
         Ok(id) => id,
         Err(e) => {
             let termination = termination_from_engine_error(&e);
-            return (None, false, 0, format!("session: {e}"), termination);
+            let cause = infrastructure_cause_from_engine_error(&e);
+            return (None, false, 0, format!("session: {e}"), termination, cause);
         }
     };
     let result = engine
@@ -695,19 +763,62 @@ async fn run_bare_case(
                 report.rounds,
                 format!("{:?}", report.outcome),
                 termination,
+                None,
             )
         }
         Err(e) => {
             let termination = termination_from_engine_error(&e);
+            let cause = infrastructure_cause_from_engine_error(&e);
             (
                 Some(session_id),
                 false,
                 0,
                 format!("error: {e}"),
                 termination,
+                cause,
             )
         }
     }
+}
+
+/// Count engine repair turns and whether verification passed after the last
+/// one, from the persisted event log. `repair_started` / `verification_finished`
+/// are the engine's own canonical rows — a repair is only reported when the
+/// engine actually started one.
+async fn repair_metrics_from_events(
+    db: &leveler_storage::Database,
+    session_id: &leveler_core::SessionId,
+) -> (u32, Option<bool>) {
+    let events = match leveler_storage::EventRepository::new(db)
+        .load(session_id)
+        .await
+    {
+        Ok(events) => events,
+        Err(_) => return (0, None),
+    };
+    let mut repairs = 0u32;
+    let mut last_repair_seq: Option<i64> = None;
+    for event in &events {
+        if event.event_type == "repair_started" {
+            repairs += 1;
+            last_repair_seq = Some(event.sequence);
+        }
+    }
+    let Some(repair_seq) = last_repair_seq else {
+        return (0, None);
+    };
+    // The first verification verdict AFTER the last repair is its outcome.
+    let post_repair_verdict = events
+        .iter()
+        .filter(|e| e.sequence > repair_seq && e.event_type == "verification_finished")
+        .find_map(|e| {
+            serde_json::from_str::<serde_json::Value>(&e.payload)
+                .ok()?
+                .get("payload")?
+                .get("passed")?
+                .as_bool()
+        });
+    (repairs, post_repair_verdict)
 }
 
 fn termination_from_stop_reason(reason: StopReason) -> leveler_eval::TerminationClass {
@@ -744,6 +855,72 @@ fn termination_from_model_error(
         leveler_model::ModelErrorKind::RateLimit => leveler_eval::TerminationClass::UsageLimited,
         leveler_model::ModelErrorKind::Cancelled => leveler_eval::TerminationClass::Incomplete,
         _ => leveler_eval::TerminationClass::InfrastructureFailed,
+    }
+}
+
+/// First-cause category for a run killed by a model-layer error, from the
+/// STRUCTURED kind — never from the vendor's message text. `Some` exactly for
+/// the kinds `termination_from_model_error` books as `InfrastructureFailed`,
+/// so the execution boundary and the attribution never disagree.
+fn infrastructure_cause_from_model_error(
+    error: &leveler_model::ModelError,
+) -> Option<leveler_eval::FailureCategory> {
+    use leveler_model::ModelErrorKind as K;
+    match error.kind {
+        // Not infrastructure boundaries (UsageLimited / Incomplete).
+        K::RateLimit | K::Cancelled => None,
+        // Wire/protocol contract violations: the provider rejected the request
+        // as invalid, or sent a body we could not decode.
+        K::InvalidRequest | K::Decode => Some(leveler_eval::FailureCategory::ProviderProtocol),
+        // Reachability, credentials, and provider-side behavior: the
+        // environment around the run, not the protocol contract.
+        K::Auth
+        | K::ProviderUnavailable
+        | K::Transport
+        | K::Timeout
+        | K::StreamInterrupted
+        | K::Truncated
+        | K::ContentFiltered
+        | K::Other => Some(leveler_eval::FailureCategory::Environment),
+    }
+}
+
+/// First-cause category for an app-layer death. Non-model failures are the
+/// harness/framework's own — never `ProviderProtocol`.
+fn infrastructure_cause_from_app_error(
+    error: &leveler_app::AppError,
+) -> Option<leveler_eval::FailureCategory> {
+    match error {
+        leveler_app::AppError::Model(error)
+        | leveler_app::AppError::Agent(leveler_agent::AgentError::Model(error)) => {
+            infrastructure_cause_from_model_error(error)
+        }
+        leveler_app::AppError::Agent(leveler_agent::AgentError::Cancelled) => None,
+        // Setup around the run: config, workspace, filesystem.
+        leveler_app::AppError::Config(_)
+        | leveler_app::AppError::GlobalConfig(_)
+        | leveler_app::AppError::Registry(_)
+        | leveler_app::AppError::Workspace(_)
+        | leveler_app::AppError::NotFound(_)
+        | leveler_app::AppError::Io { .. }
+        | leveler_app::AppError::RuntimeIdentity(_) => {
+            Some(leveler_eval::FailureCategory::Environment)
+        }
+        // Storage / engine internals / everything else: framework failure.
+        _ => Some(leveler_eval::FailureCategory::Runtime),
+    }
+}
+
+/// First-cause category for an engine-layer death — same policy as app errors.
+fn infrastructure_cause_from_engine_error(
+    error: &leveler_engine::EngineError,
+) -> Option<leveler_eval::FailureCategory> {
+    match error {
+        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Model(error)) => {
+            infrastructure_cause_from_model_error(error)
+        }
+        leveler_engine::EngineError::Agent(leveler_agent::AgentError::Cancelled) => None,
+        _ => Some(leveler_eval::FailureCategory::Runtime),
     }
 }
 
@@ -807,13 +984,43 @@ async fn run_eval_case(
         is_recovery: case.recovery,
         ttff_ms: None,
         silent_duration_ms: None,
+        edit_attempts: 0,
+        edit_failures: 0,
+        read_calls: 0,
+        search_calls: 0,
+        apply_patch_calls: 0,
+        replace_calls: 0,
+        first_edit_round: None,
+        unique_files_read: 0,
+        repeated_file_reads: 0,
+        unique_search_queries: 0,
+        repeated_search_queries: 0,
+        first_relevant_file_round: None,
+        first_plan_round: None,
+        relevant_paths_touched: 0,
+        relevant_paths_before_edit: 0,
+        impact_paths_touched: 0,
+        impact_paths_before_edit: 0,
+        distractor_paths_read: 0,
+        forbidden_paths_edited: 0,
+        broad_reads: 0,
+        narrow_reads: 0,
+        verification_driven_impact_discovery: false,
+        missed_impact_paths: Vec::new(),
+        repair_attempts: 0,
+        repair_success: None,
     };
 
     // Materialize the workspace. Two modes:
     //  - synthetic: an empty repo seeded entirely from `case.files`.
     //  - repo:      clone a real git repo, then overlay `case.files` on top so
     //               the agent must locate the relevant code in a full codebase.
-    let dir = std::env::temp_dir().join(format!("leveler-eval-{}-{}", case.id, std::process::id()));
+    let dir = case_workspace(
+        &case.id,
+        std::process::id(),
+        next_execution_seq(),
+        repetition,
+    );
     let _ = std::fs::remove_dir_all(&dir);
 
     let overlay_files = |dir: &std::path::Path| -> Result<(), String> {
@@ -865,6 +1072,15 @@ async fn run_eval_case(
         if let Some(base) = &case.base_ref {
             let _ = git(&["checkout", "--quiet", base]);
         }
+        // Drop the clone's origin. It points at the pristine fixture inside
+        // this repository, and a run that reads it can diff its way to the
+        // injected defect, or walk up to `evals/` and read the case file with
+        // its hidden relevant/impact/distractor paths. Observed: an N6 run
+        // followed exactly that path (`git remote -v` → `git -C <src> show` →
+        // `ls .../evals/`). `read_file` refuses paths outside the workspace;
+        // `shell_command` does not, so the breadcrumb has to go rather than
+        // the guard being trusted to hold.
+        let _ = git(&["remote", "remove", "origin"]);
         // Overlay the injected bug/failing test and commit it as the baseline.
         if let Err(e) = overlay_files(&dir) {
             return fail(e, leveler_eval::FailureCategory::Environment);
@@ -908,58 +1124,98 @@ async fn run_eval_case(
     };
     // Fold the event stream into trajectory signals for failure attribution
     // (L1 taskset doc §8); the overlay's paths proxy for "the relevant files".
-    let mut collector = crate::eval_signals::SignalCollector::new(case.files.keys().cloned());
+    let mut collector = crate::eval_signals::SignalCollector::with_navigation_paths(
+        case.files
+            .keys()
+            .cloned()
+            .chain(case.relevant_paths.iter().cloned()),
+        case.required_impact_paths.iter().cloned(),
+        case.distractor_paths.iter().cloned(),
+        case.forbidden_edit_paths.iter().cloned(),
+    );
+    // C1.5A ablation arm; `None` on every normal run (see eval_commitment).
+    let commitment = crate::eval_commitment::CommitmentNudge::from_environment().map(Arc::new);
     // Eval runs the direct tool loop only (orchestrate dual path removed).
-    let (session_id, completed, rounds, mut note, termination) = if no_verify_gate {
-        // Ablation: the SAME direct loop with ONE variable removed — the
-        // post-edit verification gate and the repair turn it drives.
-        run_bare_case(&app, model, case, &mut collector).await
-    } else {
-        let _ = direct; // flag retained for CLI compatibility; always direct.
-        match app.create_session(model, &case.task).await {
-            Ok(session_id) => {
-                let outcome = app
-                    .run_in_session_bounded(
-                        &session_id,
-                        model,
-                        PermissionProfile::Assisted,
-                        &case.task,
-                        build_approver(true),
-                        false,
-                        &mut |e| collector.observe_agent(&e),
-                        CancellationToken::new(),
-                        case.max_rounds,
-                    )
-                    .await;
-                match outcome {
-                    Ok(o) => {
-                        let termination = termination_from_stop_reason(o.stop_reason);
-                        (
-                            Some(session_id),
-                            o.stop_reason == StopReason::Completed,
-                            o.rounds,
-                            format!("{:?}", o.stop_reason),
-                            termination,
-                        )
-                    }
-                    Err(e) => {
-                        let termination = termination_from_app_error(&e);
-                        (
-                            Some(session_id),
+    // `infrastructure_cause` is the structured first-cause of an error-path
+    // death (None when the run finished on its own), fed to attribution so
+    // `InfrastructureFailed` alone never implies provider protocol.
+    let (session_id, completed, rounds, mut note, termination, infrastructure_cause) =
+        if no_verify_gate {
+            // Ablation: the SAME direct loop with ONE variable removed — the
+            // post-edit verification gate and the repair turn it drives.
+            run_bare_case(&app, model, case, &mut collector).await
+        } else {
+            let _ = direct; // flag retained for CLI compatibility; always direct.
+            match app.create_session(model, &case.task).await {
+                Ok(session_id) => {
+                    let outcome = app
+                        .run_in_session_bounded(
+                            &session_id,
+                            model,
+                            PermissionProfile::Assisted,
+                            &case.task,
+                            std::sync::Arc::new(leveler_execution::EvalApprove),
                             false,
-                            0,
-                            format!("error: {e}"),
-                            termination,
+                            &mut |e| {
+                                collector.observe_agent(&e);
+                                if let Some(nudge) = &commitment {
+                                    nudge.observe(&e);
+                                }
+                            },
+                            CancellationToken::new(),
+                            case.max_rounds,
+                            commitment
+                                .clone()
+                                .map(|n| n as std::sync::Arc<dyn leveler_agent::SteeringSource>),
                         )
+                        .await;
+                    match outcome {
+                        Ok(o) => {
+                            let termination = termination_from_stop_reason(o.stop_reason);
+                            // `completed` = the run ended in the terminal
+                            // outcome THIS CASE requires. Default: a verified
+                            // completion (historical semantics). A declared
+                            // `completed_unverified` case matches exactly that
+                            // stop reason — and fails on a wrongful upgrade to
+                            // a verified completion.
+                            let completed = match case.expected_outcome {
+                                leveler_eval::ExpectedOutcome::Completed => {
+                                    o.stop_reason == StopReason::Completed
+                                }
+                                leveler_eval::ExpectedOutcome::CompletedUnverified => {
+                                    o.stop_reason == StopReason::CompletedUnverified
+                                }
+                            };
+                            (
+                                Some(session_id),
+                                completed,
+                                o.rounds,
+                                format!("{:?}", o.stop_reason),
+                                termination,
+                                None,
+                            )
+                        }
+                        Err(e) => {
+                            let termination = termination_from_app_error(&e);
+                            let cause = infrastructure_cause_from_app_error(&e);
+                            (
+                                Some(session_id),
+                                false,
+                                0,
+                                format!("error: {e}"),
+                                termination,
+                                cause,
+                            )
+                        }
                     }
                 }
+                Err(e) => {
+                    let termination = termination_from_app_error(&e);
+                    let cause = infrastructure_cause_from_app_error(&e);
+                    (None, false, 0, format!("session: {e}"), termination, cause)
+                }
             }
-            Err(e) => {
-                let termination = termination_from_app_error(&e);
-                (None, false, 0, format!("session: {e}"), termination)
-            }
-        }
-    };
+        };
 
     // Usage and the observed round count both come from the persisted model
     // requests. `rounds` is 0 on the error paths above (the outcome that carries
@@ -987,6 +1243,18 @@ async fn run_eval_case(
     } else {
         (0, 0, 0)
     };
+
+    // Repair metrics come from the canonical persisted event log, not the
+    // AgentEvent stream (the engine-to-agent mapping drops RepairStarted): a
+    // repair only counts when the engine actually emitted the event.
+    let (repair_attempts, repair_success) = if let Some(session_id) = &session_id {
+        match app.open_database().await {
+            Ok(db) => repair_metrics_from_events(&db, session_id).await,
+            Err(_) => (0, None),
+        }
+    } else {
+        (0, None)
+    };
     let rounds = if rounds > 0 { rounds } else { observed_rounds };
 
     // Cost only when the model profile carries auditable pricing — never invented.
@@ -1012,9 +1280,29 @@ async fn run_eval_case(
         }
     };
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // Diagnostics: `LEVELER_EVAL_KEEP_WORKSPACE=1` leaves the case workspace on
+    // disk so a surprising verdict can be reproduced against the exact tree the
+    // gates saw. Off by default — a normal run still cleans up.
+    if std::env::var_os("LEVELER_EVAL_KEEP_WORKSPACE").is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        // Deterministic mapping for offline analysis: a later scorer must never
+        // have to guess which directory belongs to which run.
+        println!(
+            "  kept workspace: case={} repetition={} session={} path={}",
+            case.id,
+            repetition,
+            session_id
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |s| s.to_string()),
+            dir.display()
+        );
+    }
     // First-cause attribution receives the structured budget marker rather
     // than parsing a debug-formatted outcome note.
+    // Named before `finish` consumes the collector: a half-fix is only useful
+    // as a diagnosis if it says which path was missed.
+    let missed_impact_paths = collector.missed_impact_paths();
     let signals = collector.finish(termination == leveler_eval::TerminationClass::BudgetLimited);
     leveler_eval::CaseResult {
         id: case.id.clone(),
@@ -1027,7 +1315,12 @@ async fn run_eval_case(
         input_tokens,
         output_tokens,
         cost_usd_micros,
-        failure_category: leveler_eval::attribute_failure(completed, expect_passed, &signals),
+        failure_category: leveler_eval::attribute_failure(
+            completed,
+            expect_passed,
+            infrastructure_cause,
+            &signals,
+        ),
         failure_source: (!(completed && expect_passed))
             .then_some(leveler_eval::FailureSource::Auto),
         note,
@@ -1043,6 +1336,31 @@ async fn run_eval_case(
         is_recovery: case.recovery,
         ttff_ms: signals.ttff_ms,
         silent_duration_ms: signals.max_silent_ms,
+        edit_attempts: signals.edit_attempts,
+        edit_failures: signals.edit_failures,
+        read_calls: signals.read_calls,
+        search_calls: signals.search_calls,
+        apply_patch_calls: signals.apply_patch_calls,
+        replace_calls: signals.replace_calls,
+        first_edit_round: signals.first_edit_round,
+        unique_files_read: signals.unique_files_read,
+        repeated_file_reads: signals.repeated_file_reads,
+        unique_search_queries: signals.unique_search_queries,
+        repeated_search_queries: signals.repeated_search_queries,
+        first_relevant_file_round: signals.first_relevant_file_round,
+        first_plan_round: signals.first_plan_round,
+        relevant_paths_touched: signals.relevant_paths_touched,
+        relevant_paths_before_edit: signals.relevant_paths_before_edit,
+        impact_paths_touched: signals.impact_paths_touched,
+        impact_paths_before_edit: signals.impact_paths_before_edit,
+        distractor_paths_read: signals.distractor_paths_read,
+        forbidden_paths_edited: signals.forbidden_paths_edited,
+        broad_reads: signals.broad_reads,
+        narrow_reads: signals.narrow_reads,
+        verification_driven_impact_discovery: signals.verification_driven_impact_discovery,
+        missed_impact_paths,
+        repair_attempts,
+        repair_success,
     }
 }
 
@@ -1077,8 +1395,38 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
             .and_then(|value| value.as_str().map(str::to_string))
             .map(|value| format!(" termination={value}"))
             .unwrap_or_default();
+        // Exploration/edit/repair shape, only when the run did any of it —
+        // legacy runs and pure-answer cases keep the compact line.
+        let mut shape = String::new();
+        if c.read_calls + c.search_calls > 0 {
+            shape.push_str(&format!(
+                " reads={} searches={}",
+                c.read_calls, c.search_calls
+            ));
+        }
+        if c.edit_attempts > 0 {
+            shape.push_str(&format!(
+                " edits={}/{}err (patch={} replace={} first@r{})",
+                c.edit_attempts,
+                c.edit_failures,
+                c.apply_patch_calls,
+                c.replace_calls,
+                c.first_edit_round.unwrap_or(0)
+            ));
+        }
+        if c.repair_attempts > 0 {
+            shape.push_str(&format!(
+                " repair={}({})",
+                c.repair_attempts,
+                match c.repair_success {
+                    Some(true) => "pass",
+                    Some(false) => "fail",
+                    None => "?",
+                }
+            ));
+        }
         println!(
-            "  {mark} {:<24} run={} steps={} tokens={}/{} latency={}ms {}{}{}",
+            "  {mark} {:<24} run={} steps={} tokens={}/{} latency={}ms{shape} {}{}{}",
             c.id,
             c.repetition,
             c.rounds,
@@ -1099,6 +1447,20 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
         report.completion_accuracy() * 100.0,
         report.avg_rounds()
     );
+    let self_recovered = report.self_recovered_edit_ids();
+    if !self_recovered.is_empty() {
+        println!(
+            "  → self-recovered edit cases: {} ({})",
+            self_recovered.len(),
+            self_recovered.join(", ")
+        );
+    }
+    let (repair_triggered, repair_succeeded) = report.repair_counts();
+    if repair_triggered > 0 {
+        println!(
+            "  → engine repair: triggered in {repair_triggered} case(s), post-repair verification passed in {repair_succeeded}"
+        );
+    }
     // Headline agent-quality signal: the agent claimed "done" but the
     // independent check disagreed. Surface it prominently, never buried.
     let false_completions = report.false_completion_count();
@@ -1252,6 +1614,11 @@ mod ablation_tests {
             recovery: false,
             task: "do the thing".into(),
             max_rounds: 40,
+            relevant_paths: Vec::new(),
+            required_impact_paths: Vec::new(),
+            distractor_paths: Vec::new(),
+            forbidden_edit_paths: Vec::new(),
+            expected_outcome: Default::default(),
             expect: leveler_eval::ExpectCommand {
                 program: "true".into(),
                 args: vec![],
@@ -1294,5 +1661,283 @@ mod ablation_tests {
             "same step limits as the normal run"
         );
         assert_eq!(bare.runtime.kind, leveler_engine::ExecutionKind::Direct);
+    }
+}
+
+#[cfg(test)]
+mod attribution_provenance_tests {
+    //! `InfrastructureFailed` is an execution boundary, not a first cause:
+    //! only structured provider/protocol provenance may book
+    //! `ProviderProtocol`. These lock the mapping trio + the attribution
+    //! chain, all from typed errors — never vendor message text.
+
+    use super::{case_workspace, next_execution_seq};
+    use leveler_eval::{FailureCategory, TerminationClass, TrajectorySignals};
+    use leveler_model::{ModelError, ModelErrorKind};
+
+    fn model_error(kind: ModelErrorKind) -> ModelError {
+        ModelError::new(kind, "vendor text is irrelevant to attribution")
+    }
+
+    /// 1. A provider InvalidRequest is an infrastructure boundary AND a
+    ///    provider-protocol first cause — the ripgrep C1.1a failure.
+    #[test]
+    fn invalid_request_is_infrastructure_and_provider_protocol() {
+        let error = model_error(ModelErrorKind::InvalidRequest);
+        assert_eq!(
+            super::termination_from_model_error(&error),
+            TerminationClass::InfrastructureFailed
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_model_error(&error),
+            Some(FailureCategory::ProviderProtocol)
+        );
+    }
+
+    /// 2. A non-model app-layer death is the framework's own failure — never
+    ///    provider protocol, even though its termination is InfrastructureFailed.
+    #[test]
+    fn non_model_app_error_is_not_provider_protocol() {
+        let error = leveler_app::AppError::Engine("engine internals fell over".into());
+        assert_eq!(
+            super::termination_from_app_error(&error),
+            TerminationClass::InfrastructureFailed
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_app_error(&error),
+            Some(FailureCategory::Runtime)
+        );
+        // Setup-class app errors book as Environment, still not provider protocol.
+        let missing = leveler_app::AppError::NotFound("no such session".into());
+        assert_eq!(
+            super::infrastructure_cause_from_app_error(&missing),
+            Some(FailureCategory::Environment)
+        );
+    }
+
+    /// 3. A non-model engine-layer death: same policy.
+    #[test]
+    fn non_model_engine_error_is_not_provider_protocol() {
+        let error = leveler_engine::EngineError::Config("bad engine config".into());
+        assert_eq!(
+            super::termination_from_engine_error(&error),
+            TerminationClass::InfrastructureFailed
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_engine_error(&error),
+            Some(FailureCategory::Runtime)
+        );
+    }
+
+    /// 4. Reachability failures are environment, not protocol: the wire
+    ///    contract was never even exercised.
+    #[test]
+    fn unreachable_provider_is_environment_not_provider_protocol() {
+        for kind in [
+            ModelErrorKind::ProviderUnavailable,
+            ModelErrorKind::Transport,
+            ModelErrorKind::Timeout,
+            ModelErrorKind::Auth,
+        ] {
+            let error = model_error(kind);
+            assert_eq!(
+                super::termination_from_model_error(&error),
+                TerminationClass::InfrastructureFailed,
+                "{kind:?} stays an infrastructure boundary"
+            );
+            assert_eq!(
+                super::infrastructure_cause_from_model_error(&error),
+                Some(FailureCategory::Environment),
+                "{kind:?} must not be booked as provider_protocol"
+            );
+        }
+        // Non-infrastructure terminations carry no infrastructure cause.
+        assert_eq!(
+            super::infrastructure_cause_from_model_error(&model_error(ModelErrorKind::RateLimit)),
+            None
+        );
+        assert_eq!(
+            super::infrastructure_cause_from_model_error(&model_error(ModelErrorKind::Cancelled)),
+            None
+        );
+    }
+
+    /// 5. The original ripgrep shape end to end: a provider InvalidRequest
+    ///    reaching attribution through the app-error path still books
+    ///    provider_protocol, not the trajectory's localization shape.
+    #[test]
+    fn ripgrep_invalid_request_still_attributes_provider_protocol() {
+        let error = leveler_app::AppError::Agent(leveler_agent::AgentError::Model(model_error(
+            ModelErrorKind::InvalidRequest,
+        )));
+        let cause = super::infrastructure_cause_from_app_error(&error);
+        let localization_shaped = TrajectorySignals {
+            tool_calls: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            leveler_eval::attribute_failure(false, false, cause, &localization_shaped),
+            Some(FailureCategory::ProviderProtocol)
+        );
+    }
+
+    /// C2-R1 — one workspace per case *execution*, not per case.
+    ///
+    /// The path was `<case>-<pid>`, and `run_eval_case` wipes its directory on
+    /// entry, so three repetitions in one process each deleted the previous
+    /// one's tree — even under `LEVELER_EVAL_KEEP_WORKSPACE=1`, which only
+    /// governs cleanup at the end. Invisible while a run is scored by its exit
+    /// status; fatal as soon as anything needs the tree a particular run left
+    /// behind, which per-obligation implementation coverage does.
+    #[test]
+    fn repetitions_of_one_case_do_not_share_a_workspace() {
+        let paths: Vec<_> = (1..=3)
+            .map(|rep| case_workspace("n3-caller", 4242, 1, rep))
+            .collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "repetitions collided: {paths:?}");
+        for (rep, path) in (1..=3).zip(&paths) {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.contains("n3-caller"),
+                "case id must stay legible: {name}"
+            );
+            assert!(name.contains("4242"), "pid must stay legible: {name}");
+            assert!(
+                name.ends_with(&format!("-r{rep}")),
+                "repetition must be recoverable from the path: {name}"
+            );
+        }
+    }
+
+    /// `compare` runs two models and `ablate` runs control and treatment, each
+    /// re-entering `run_eval` in the same process. Keying on case + pid +
+    /// repetition would still collide there, which is why identity is per
+    /// execution.
+    #[test]
+    fn separate_run_invocations_do_not_share_a_workspace() {
+        assert_ne!(
+            case_workspace("n3-caller", 4242, 1, 1),
+            case_workspace("n3-caller", 4242, 2, 1),
+            "two run_eval invocations must not reuse one workspace"
+        );
+        assert_ne!(
+            case_workspace("n3-caller", 4242, 1, 1),
+            case_workspace("n4-contract", 4242, 1, 1)
+        );
+    }
+
+    /// The sequence is monotonic per process, so every execution gets a fresh
+    /// identity without call sites having to coordinate.
+    #[test]
+    fn execution_sequence_never_repeats() {
+        let seen: std::collections::HashSet<u64> = (0..8).map(|_| next_execution_seq()).collect();
+        assert_eq!(seen.len(), 8, "execution sequence handed out a duplicate");
+    }
+
+    /// The isolation is real on disk, not only in the name: a kept tree from
+    /// one execution must survive the next execution's entry wipe. This is the
+    /// exact behaviour that destroyed the first R1 replay's data.
+    #[test]
+    fn an_earlier_executions_kept_tree_survives_the_next_one() {
+        let first = case_workspace("iso-probe", std::process::id(), 901, 1);
+        let second = case_workspace("iso-probe", std::process::id(), 902, 2);
+        for path in [&first, &second] {
+            std::fs::remove_dir_all(path).ok();
+        }
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("final.txt"), "run one output\n").unwrap();
+
+        // What `run_eval_case` does on entry for the next execution.
+        let _ = std::fs::remove_dir_all(&second);
+        std::fs::create_dir_all(&second).unwrap();
+
+        assert!(
+            first.join("final.txt").exists(),
+            "the previous execution's kept tree was destroyed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("final.txt")).unwrap(),
+            "run one output\n"
+        );
+        for path in [&first, &second] {
+            std::fs::remove_dir_all(path).ok();
+        }
+    }
+
+    /// C2.3C §31 — a cloned workspace must not carry a path back to the
+    /// fixture it came from. An eval whose answer key is reachable from inside
+    /// the workspace measures the guard, not the agent.
+    #[test]
+    fn a_cloned_eval_workspace_keeps_no_pointer_to_its_source() {
+        let base = std::env::temp_dir().join(format!(
+            "leveler-eval-origin-{}",
+            std::process::id() as u64 * 31 + 7
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello\n").unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git")
+        };
+        run(&src, &["init", "-q"]);
+        run(&src, &["config", "user.email", "a@b"]);
+        run(&src, &["config", "user.name", "a"]);
+        run(&src, &["add", "-A"]);
+        run(&src, &["commit", "-qm", "seed"]);
+
+        std::process::Command::new("git")
+            .args(["clone", "--local", "--quiet"])
+            .arg(&src)
+            .arg(&dst)
+            .output()
+            .expect("clone");
+        let before = run(&dst, &["remote", "-v"]);
+        assert!(
+            String::from_utf8_lossy(&before.stdout).contains("src"),
+            "fixture precondition: a fresh clone names its origin"
+        );
+
+        // What the eval now does to it.
+        run(&dst, &["remote", "remove", "origin"]);
+
+        let after = run(&dst, &["remote", "-v"]);
+        assert!(
+            String::from_utf8_lossy(&after.stdout).trim().is_empty(),
+            "the workspace must not name its source: {}",
+            String::from_utf8_lossy(&after.stdout)
+        );
+        let config = std::fs::read_to_string(dst.join(".git/config")).unwrap();
+        assert!(
+            !config.contains(src.to_string_lossy().as_ref()),
+            "the source path must not survive in .git/config: {config}"
+        );
+
+        // C2.3C §15/§16 J — cutting the breadcrumb must not cut history. Real
+        // navigation uses `git log`/`show`/`blame` to ask why code looks the
+        // way it does; an anti-gaming fix that took those away would be
+        // measuring a crippled agent.
+        let log = run(&dst, &["log", "--oneline"]);
+        assert!(log.status.success(), "git log must still work");
+        assert!(
+            String::from_utf8_lossy(&log.stdout).contains("seed"),
+            "history must survive origin removal: {}",
+            String::from_utf8_lossy(&log.stdout)
+        );
+        let show = run(&dst, &["show", "HEAD:a.txt"]);
+        assert!(show.status.success(), "git show must still work");
+        assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "hello");
+        let blame = run(&dst, &["blame", "--porcelain", "a.txt"]);
+        assert!(blame.status.success(), "git blame must still work");
+        let status = run(&dst, &["status", "--porcelain"]);
+        assert!(status.status.success(), "git status must still work");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -16,6 +16,15 @@ files: {}
 # plumbing in a large codebase costs exploration rounds.
 max_rounds: 140
 
+# Metrics only — never rendered into the task, never shown to the agent, no
+# effect on tools. The three sites any honest `--total-count` has to reach:
+# where flags are declared (so it shows in --help), where they become
+# high-level arguments, and where search results are totalled and printed.
+relevant_paths:
+  - crates/core/flags/defs.rs
+  - crates/core/flags/hiargs.rs
+  - crates/core/main.rs
+
 task: |
   ripgrep currently has no way to print a single grand total of matching lines
   across ALL files searched in one invocation. Add a new global command-line

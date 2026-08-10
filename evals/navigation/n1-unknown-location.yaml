@@ -1,0 +1,115 @@
+# N1 — Unknown location. The task states a user-visible symptom and names no
+# file, symbol, package or command. The behaviour lives behind a registry: the
+# config value "normalize" is a map key in internal/pipeline/stage.go, so no
+# search for a word in the task reaches the implementation directly.
+#
+# Difficulty: grepping the symptom's vocabulary ("lower", "case", "normalize")
+# reaches legacy/oldpipeline.go first — NormalizeName there is a one-line
+# ToLower that looks exactly like the fix. It is dead code.
+id: n1-unknown-location
+name: "[nav] summary splits a metric across capitalisations"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - internal/pipeline/transform.go
+required_impact_paths:
+  - internal/pipeline/transform.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/pipeline/transform.go: |
+    package pipeline
+
+    import (
+    	"strings"
+
+    	"navsvc/internal/config"
+    	"navsvc/pkg/api"
+    )
+
+    // normalizeStage trims label whitespace so downstream aggregation groups
+    // equivalent records together.
+    type normalizeStage struct{}
+
+    func (normalizeStage) Name() string { return "normalize" }
+
+    func (normalizeStage) Run(batch api.Batch, _ config.PipelineConfig) api.Batch {
+    	for i := range batch.Records {
+    		batch.Records[i].Name = strings.TrimSpace(batch.Records[i].Name)
+    		for k, v := range batch.Records[i].Labels {
+    			batch.Records[i].Labels[k] = strings.TrimSpace(v)
+    		}
+    	}
+    	return batch
+    }
+
+    // flattenStage collapses records nested deeper than the configured maximum
+    // onto that maximum, so a pathological document cannot produce unbounded
+    // depth downstream.
+    type flattenStage struct{}
+
+    func (flattenStage) Name() string { return "flatten" }
+
+    func (flattenStage) Run(batch api.Batch, cfg config.PipelineConfig) api.Batch {
+    	for i := range batch.Records {
+    		if batch.Records[i].Depth > cfg.MaxDepth {
+    			batch.Records[i].Depth = cfg.MaxDepth
+    		}
+    	}
+    	return batch
+    }
+task: |
+  A user reports that our summary output double-counts metrics:
+
+  "I send the same metric with slightly different capitalisation depending on
+  which exporter emitted it — `Requests`, `requests`, `REQUESTS`. The summary
+  lists each of them on its own line with its own count, so I have to add them
+  up by hand. They're the same metric."
+
+  Make the summary treat names that differ only by capitalisation as one
+  metric. Whitespace around names is already handled and must stay handled.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n1.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\npipeline.stages = normalize\n' > "$d/c.conf"
+      printf '{"name":"Requests","value":1}\n{"name":"requests","value":2}\n{"name":"REQUESTS","value":4}\n' > "$d/in.jsonl"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary)"
+      # exactly one row, all three folded together
+      [ "$(printf '%s\n' "$out" | grep -c 'count=')" -eq 1 ]
+      printf '%s\n' "$out" | grep -qx 'requests count=3 total=7'
+      # whitespace handling must not regress
+      printf '{"name":"  spaced  ","value":1}\n' > "$d/w.jsonl"
+      < "$d/w.jsonl" "$d/navsvc" "$d/c.conf" --summary | grep -qx 'spaced count=1 total=1'
+      # the dead pre-1.0 package must be left alone
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Which capitalisation the folded row is printed under.
+    oracle_interpretation: >-
+      The merged row prints as `requests` — lower-cased.
+    rationale: >-
+      The task alone does not say which casing wins, but the repository's own
+      maintained test TestNormalizeLowercasesNames asserts normalize yields
+      "requests". Since the task also requires `go test ./...` to pass, only the
+      lower-cased reading is consistent with the suite.

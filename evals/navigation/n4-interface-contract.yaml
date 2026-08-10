@@ -1,0 +1,128 @@
+# N4 — Interface / contract. Sink is an interface with three registered
+# implementations plus a test double. The task changes the contract, so the
+# work is finding every implementation — which the registry hides behind
+# constructor funcs, and which the test double satisfies structurally.
+#
+# Difficulty: `rg "Sink"` returns the interface, the registry, three impls, a
+# test double and main.go, without saying which of them must change. The
+# decision needs the interface's doc contract, not a name match.
+id: n4-interface-contract
+name: "[nav] sinks must report how much they wrote"
+repo: fixtures/repos/navsvc
+max_rounds: 60
+relevant_paths:
+  - internal/sink/sink.go
+required_impact_paths:
+  - internal/sink/sink.go
+  - internal/sink/stdout.go
+  - internal/sink/file.go
+  - internal/sink/null.go
+  - internal/testutil/fakesink.go
+distractor_paths:
+  - internal/report/summary.go
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+files:
+  internal/testutil/fakesink.go: |
+    package testutil
+
+    import (
+    	"navsvc/internal/sink"
+    	"navsvc/pkg/api"
+    )
+
+    // FakeSink records everything written to it, for tests that assert on
+    // output without touching the filesystem.
+    type FakeSink struct {
+    	Batches []api.Batch
+    	Closed  bool
+    }
+
+    // FakeSink must satisfy the sink contract, or tests would be asserting
+    // against something the service could never use.
+    var _ sink.Sink = (*FakeSink)(nil)
+
+    func (f *FakeSink) Write(batch api.Batch) error {
+    	f.Batches = append(f.Batches, batch)
+    	return nil
+    }
+
+    func (f *FakeSink) Close() error {
+    	f.Closed = true
+    	return nil
+    }
+task: |
+  Operators running `navsvc` in a pipe have no way to tell whether a run wrote
+  anything. We want the command to end with a one-line footer on stderr:
+
+      wrote N records
+
+  where N is the number of records the output sink successfully accepted
+  across the whole run.
+
+  The count belongs to the sink itself — it is part of what a sink is, so
+  make it part of the sink contract rather than something the caller
+  recomputes.
+
+  For this contract, a successful `Write` accepts the records passed to it,
+  even when the sink intentionally discards their physical output; the null
+  sink therefore still counts the records it accepts. A `Write` that returns
+  an error contributes no accepted records.
+
+  The footer appears only when the command is writing to a sink, not in
+  `--summary` mode.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/n4.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf 'input.format = jsonl\noutput.sink = null\n' > "$d/null.conf"
+      printf '{"name":"a","value":1}\n{"name":"b","value":2}\n{"name":"c","value":3}\n' > "$d/in.jsonl"
+      # the footer reports the sink's own count, on stderr, for a sink that
+      # writes nowhere
+      err="$(< "$d/in.jsonl" "$d/navsvc" "$d/null.conf" 2>&1 >/dev/null)"
+      printf '%s\n' "$err" | grep -qx 'wrote 3 records'
+      # stdout sink still writes its records, and reports the same count
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/out.conf"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/out.conf" 2>/dev/null)"
+      [ "$(printf '%s\n' "$out" | grep -c '=')" -eq 3 ]
+      err2="$(< "$d/in.jsonl" "$d/navsvc" "$d/out.conf" 2>&1 >/dev/null)"
+      printf '%s\n' "$err2" | grep -qx 'wrote 3 records'
+      # summary mode has no footer
+      < "$d/in.jsonl" "$d/navsvc" "$d/out.conf" --summary 2>&1 >/dev/null | grep -q 'wrote' && exit 1
+      # every implementation, including the test double, satisfies the contract
+      go build ./... > /dev/null
+      go vet ./internal/testutil/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      What a null sink reports as its accepted count.
+    oracle_interpretation: >-
+      A null sink fed 3 records must print `wrote 3 records`.
+    rationale: >-
+      The original wording said both "actually accepted" (reads as 3) and
+      "what was really written" / "free to reject" (reads as 0 for a sink
+      that writes nowhere), and the hidden acceptance silently picked the
+      first. BV1 removed the second reading from the task: the contract is
+      accepted-count, a successful Write accepts the records passed to it,
+      the null sink counts what it deliberately discards, and a failed Write
+      contributes nothing. The task now states each of these directly, so
+      the oracle's interpretation is the only one the text supports.

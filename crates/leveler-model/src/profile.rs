@@ -107,6 +107,27 @@ pub struct CompatibilityConfig {
     /// deterministic `0.0` would get a hard 400. Set false to omit the field.
     #[serde(default = "default_true")]
     pub supports_temperature: bool,
+    /// Whether the provider accepts a *forced* `tool_choice` (`required` or a
+    /// named function) while thinking mode is active. DeepSeek's endpoint
+    /// rejects that combination with a hard 400 ("Thinking mode does not
+    /// support this tool_choice") — and thinking is its server-side *default*,
+    /// so omitting the `thinking` field does not avoid the rejection. Set
+    /// false to have the thinking-flag protocol adapter send an explicit
+    /// `thinking: {"type": "disabled"}` on exactly those requests, preserving
+    /// the forced ToolChoice contract instead of downgrading it.
+    #[serde(default = "default_true")]
+    pub thinking_supports_forced_tool_choice: bool,
+    /// Whether the provider requires `reasoning_content` echoed back on
+    /// assistant tool-call messages. DeepSeek's thinking mode validates the
+    /// tool-call *id*: an id it does not recognize as one of its own
+    /// thinking-mode generations (a foreign id, or an id generated while
+    /// thinking was explicitly disabled) is rejected with HTTP 400 ("The
+    /// `reasoning_content` in the thinking mode must be passed back to the
+    /// API") unless the message carries a `reasoning_content` key — the
+    /// captured reasoning, or the empty string when the round produced none.
+    /// Measured 2026-08-07. Default false: the field is never sent.
+    #[serde(default)]
+    pub passback_reasoning_content: bool,
 }
 
 fn default_true() -> bool {
@@ -122,6 +143,8 @@ impl Default for CompatibilityConfig {
             synthesize_tool_call_ids: false,
             drop_unsupported_fields: false,
             supports_temperature: true,
+            thinking_supports_forced_tool_choice: true,
+            passback_reasoning_content: false,
         }
     }
 }
@@ -278,6 +301,8 @@ mod tests {
                 // Non-default on purpose: a roundtrip that only ever sees the
                 // default value can't catch a field dropped from (de)serialization.
                 supports_temperature: false,
+                thinking_supports_forced_tool_choice: false,
+                passback_reasoning_content: true,
             },
             // Likewise non-default: a model's own prompt must survive the trip.
             instructions: Some("You are a terse agent.".to_string()),
@@ -286,6 +311,18 @@ mod tests {
         let json = serde_json::to_string(&profile).unwrap();
         let back: ModelProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(back, profile);
+    }
+
+    /// Every profile written before the flag existed must keep its exact
+    /// behavior: forced tool_choice stays compatible with thinking by default.
+    #[test]
+    fn legacy_compatibility_block_defaults_to_forced_choice_compatible() {
+        let compat: CompatibilityConfig = serde_json::from_value(serde_json::json!({
+            "synthesize_tool_call_ids": true
+        }))
+        .unwrap();
+        assert!(compat.thinking_supports_forced_tool_choice);
+        assert!(compat.supports_temperature);
     }
 
     /// `instructions` is optional: every existing model config predates it and

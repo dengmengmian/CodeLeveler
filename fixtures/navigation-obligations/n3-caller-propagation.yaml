@@ -1,0 +1,91 @@
+# C2-R1 obligation ground truth — METRICS ONLY.
+#
+# Never rendered into a task, never materialized into a workspace, never
+# readable by an agent. Read after a run by the offline scorer and by the
+# oracle harness, nothing else.
+#
+# One obligation = one thing about the product that is independently true or
+# false. N3's requirement ("reporting must ignore invalid records") lands on
+# two consumers that do not call each other, which is exactly why a single
+# whole-acceptance verdict cannot say which half failed.
+case: n3-caller-propagation
+obligations:
+  - id: summary_skips_invalid
+    behavior: >
+      Aggregate/Summary must not count records whose Valid is false, in either
+      the per-name count or the total.
+    behavioral_surface: report.Aggregate rendered output
+    source: user-stated
+    supporting_paths:
+      - internal/report/summary.go
+    # Independent oracle: exercises the behaviour directly, in the final tree.
+    oracle: |
+      package report
+
+      import (
+      	"strings"
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func TestObligationSummarySkipsInvalid(t *testing.T) {
+      	out := Aggregate([]api.Batch{{Records: []api.Record{
+      		{Name: "a", Value: 1, Valid: true},
+      		{Name: "a", Value: 99, Valid: false},
+      		{Name: "ghost", Value: 5, Valid: false},
+      	}}})
+      	if !strings.Contains(out, "a count=1 total=1") {
+      		t.Fatalf("invalid record counted: %q", out)
+      	}
+      	if strings.Contains(out, "ghost") {
+      		t.Fatalf("wholly invalid name reached the report: %q", out)
+      	}
+      }
+    oracle_package: internal/report
+    oracle_run: TestObligationSummarySkipsInvalid
+    # Evidence for this obligation has to observe the report rendering path.
+    evidence_surfaces:
+      - kind: package_test
+        package: internal/report
+      - kind: command_output
+        # Running the CLI in --summary mode renders through Aggregate.
+        must_match: "--summary"
+
+  - id: distinct_skips_invalid
+    behavior: >
+      report.Distinct must not count records whose Valid is false toward the
+      distinct-name total.
+    behavioral_surface: report.Distinct return value
+    # Not in the user's sentence; derived from the impact surface the fix has
+    # to cover. Kept separate for exactly that reason.
+    source: code-derived
+    supporting_paths:
+      - internal/report/aggregate.go
+    oracle: |
+      package report
+
+      import (
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func TestObligationDistinctSkipsInvalid(t *testing.T) {
+      	got := Distinct([]api.Batch{{Records: []api.Record{
+      		{Name: "a", Value: 1, Valid: true},
+      		{Name: "a", Value: 99, Valid: false},
+      		{Name: "ghost", Value: 5, Valid: false},
+      	}}})
+      	if got != 1 {
+      		t.Fatalf("Distinct counted invalid records: want 1, got %d", got)
+      	}
+      }
+    oracle_package: internal/report
+    oracle_run: TestObligationDistinctSkipsInvalid
+    # Distinct is reached by `--names-only`, never by the default CLI path.
+    evidence_surfaces:
+      - kind: package_test
+        package: internal/report
+      - kind: command_output
+        must_match: "names-only"
