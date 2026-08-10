@@ -1,0 +1,111 @@
+# C4-R7 — Long multi-step task. Five independent obligations across named
+# surfaces; the hidden acceptance checks all five at once. What this measures
+# is objective persistence: work finished early in the run must still be
+# alive at the end. Navigation is not the difficulty — every surface is named.
+id: c4-r7-long-multistep
+name: "[recovery] five output/report improvements land together"
+repo: fixtures/repos/navsvc
+max_rounds: 80
+relevant_paths:
+  - internal/report/summary.go
+  - internal/config/config.go
+  - cmd/navsvc/main.go
+required_impact_paths:
+  - internal/report/summary.go
+  - internal/config/load.go
+  - cmd/navsvc/main.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+task: |
+  A batch of small, independent improvements, all of which must land:
+
+  1. In `internal/report/summary.go`: records with an empty name must not
+     be counted at all.
+  2. Same file: add a `Reset` method clearing everything the summary has
+     accumulated — after `Reset` it renders like a fresh summary.
+  3. Same file: `Render` ends with one extra line
+     `TOTAL count=<sum> total=<sum>` after the per-metric lines, present
+     (with zeroes) even when nothing was observed.
+  4. New config key `output.name_prefix` (string, parsed in
+     `internal/config`): every record's name gains the prefix on output in
+     `cmd/navsvc/main.go`. Absent or empty means no change.
+  5. New config key `output.uppercase_names` (bool): record names are
+     uppercased on output. When both options are set, the prefix is added
+     first, then the whole name is uppercased. `--summary` reports names
+     as they came in — neither option affects it.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cat > internal/report/zz_hidden_r7_test.go <<'GO'
+      package report
+
+      import (
+      	"strings"
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func TestR7SummaryObligations(t *testing.T) {
+      	s := NewSummary()
+      	s.Observe(api.Batch{Records: []api.Record{
+      		{Name: "a", Value: 1, Valid: true},
+      		{Name: "", Value: 9, Valid: true},
+      	}})
+      	out := s.Render()
+      	if strings.Contains(out, " count=1 total=9") && strings.HasPrefix(out, " ") {
+      		t.Fatalf("nameless record leaked: %q", out)
+      	}
+      	if !strings.Contains(out, "a count=1 total=1") {
+      		t.Fatalf("named record lost: %q", out)
+      	}
+      	if !strings.HasSuffix(out, "TOTAL count=1 total=1\n") {
+      		t.Fatalf("TOTAL line missing or wrong: %q", out)
+      	}
+      	s.Reset()
+      	if out := s.Render(); out != "TOTAL count=0 total=0\n" {
+      		t.Fatalf("Reset must yield a fresh (all-zero) summary: %q", out)
+      	}
+      }
+      GO
+      trap 'rm -f internal/report/zz_hidden_r7_test.go' EXIT
+      go build ./... > /dev/null
+      go test ./internal/report/ > /dev/null
+      d="$(mktemp -d "${TMPDIR:-/tmp}/r7.XXXXXX")"
+      trap 'rm -f internal/report/zz_hidden_r7_test.go; rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf '{"name":"req","value":1}\n' > "$d/in.jsonl"
+      printf 'input.format = jsonl\noutput.sink = stdout\noutput.name_prefix = svc_\n' > "$d/p.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/p.conf" 2>/dev/null)" = "svc_req=1" ]
+      printf 'input.format = jsonl\noutput.sink = stdout\noutput.name_prefix = svc_\noutput.uppercase_names = true\n' > "$d/b.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/b.conf" 2>/dev/null)" = "SVC_REQ=1" ]
+      < "$d/in.jsonl" "$d/navsvc" "$d/b.conf" --summary | grep -qx 'req count=1 total=1'
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      All five obligations alive in one final tree, including the stated
+      composition order and the summary exemption.
+    oracle_interpretation: >-
+      Empty names skipped; Reset yields a fresh summary; TOTAL line last;
+      prefix and uppercase compose prefix-first; --summary untouched.
+    rationale: >-
+      Each obligation is a numbered, explicitly-worded instruction with its
+      surface named. The difficulty is keeping all five alive across a long
+      run, not reading the ask.

@@ -1,0 +1,126 @@
+# C4-R8 — Recovery-heavy long task. The tree starts red (compile failure in
+# report), and the ask is a real feature on top: repair is checkpoint one,
+# then the stats line has to be built and verified. Failures come from the
+# project state, not from forced tool errors. Measured: recovery followed by
+# sustained construction, converging on one fully-green final tree.
+id: c4-r8-recovery-heavy-long
+name: "[recovery] fix the build, then ship --stats"
+repo: fixtures/repos/navsvc
+max_rounds: 80
+recovery: true
+relevant_paths:
+  - internal/report/summary.go
+  - cmd/navsvc/main.go
+required_impact_paths:
+  - internal/report/summary.go
+  - cmd/navsvc/main.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/report/summary.go: |
+    package report
+
+    import (
+    	"fmt"
+    	"sort"
+    	"strings"
+
+    	"navsvc/pkg/api"
+    )
+
+    // Summary accumulates per-name statistics across every batch that ran.
+    type Summary struct {
+    	counts map[string]int
+    	totals map[string]float64
+    }
+
+    // NewSummary returns an empty summary ready to observe batches.
+    func NewSummary() *Summary {
+    	return &Summary{
+    		counts: map[string]int{},
+    		totals: map[string]float64{},
+    	}
+    }
+
+    // Observe folds one batch into the running totals.
+    func (s *Summary) Observe(batch api.Batch) {
+    	for _, record := range batch.Records {
+    		s.count[record.Name]++
+    		s.totals[record.Name] += record.Value
+    	}
+    }
+
+    // Render produces the human-readable report, one line per name, sorted.
+    func (s *Summary) Render() string {
+    	names := make([]string, 0, len(s.counts))
+    	for name := range s.counts {
+    		names = append(names, name)
+    	}
+    	sort.Strings(names)
+
+    	var b strings.Builder
+    	for _, name := range names {
+    		fmt.Fprintf(&b, "%s count=%d total=%g\n", name, s.counts[name], s.totals[name])
+    	}
+    	return b.String()
+    }
+
+task: |
+  Two jobs, in whatever order works — but both must hold at the end.
+
+  First, `go build ./...` is currently red: a half-landed refactor broke
+  `internal/report/summary.go`. The summary must behave as its tests
+  expect.
+
+  Second, add a `--stats` flag to `navsvc` (`cmd/navsvc/main.go`; counting
+  may live in `internal/report` if cleaner). With `--summary --stats`,
+  after the normal summary output, print exactly one final line to stdout:
+
+      records=<N> invalid=<M> distinct=<K>
+
+  where N counts every record that reached the report stage, M counts
+  those the decoder marked not valid, and K counts distinct names among
+  the valid records only. Without `--stats`, output is unchanged.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/r8.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf '{"name":"a","value":1}\n{"name":"a","value":2}\n{"name":"b","value":5}\n{"name":"g","value":"zz"}\n' > "$d/in.jsonl"
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/c.conf"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary --stats)"
+      printf '%s\n' "$out" | tail -1 | grep -qx 'records=4 invalid=1 distinct=2'
+      printf '%s\n' "$out" | grep -qx 'a count=2 total=3'
+      < "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary | grep -q 'records=' && exit 1
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  recovery_baseline:
+    build: fail
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      The repaired build AND the complete three-counter stats line in one
+      final tree, with the no-flag exemption.
+    oracle_interpretation: >-
+      Summary behaviour restored; records/invalid/distinct all correct in
+      the last line of --summary --stats; no line without the flag.
+    rationale: >-
+      The repair is the same known-good shape as R1 and each counter is a
+      stated sentence (same wording the C3-E8 case proved unambiguous).
+      The difficulty is sustaining both jobs to one green tree.

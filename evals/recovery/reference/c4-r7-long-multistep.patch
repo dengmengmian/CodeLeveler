@@ -1,0 +1,107 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..f5ee4d1 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"fmt"
+ 	"os"
++	"strings"
+ 
+ 	"navsvc/internal/config"
+ 	"navsvc/internal/ingest"
+@@ -68,6 +69,15 @@ func run(args []string) error {
+ 			collected = append(collected, batch)
+ 			return nil
+ 		}
++		if cfg.Output.NamePrefix != "" || cfg.Output.UppercaseNames {
++			for i := range batch.Records {
++				name := cfg.Output.NamePrefix + batch.Records[i].Name
++				if cfg.Output.UppercaseNames {
++					name = strings.ToUpper(name)
++				}
++				batch.Records[i].Name = name
++			}
++		}
+ 		return out.Write(batch)
+ 	})
+ 	if err != nil {
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 0010397..bfe695d 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -2,9 +2,9 @@ package config
+ 
+ // Config is the parsed, validated runtime configuration.
+ type Config struct {
+-	Input     InputConfig
+-	Pipeline  PipelineConfig
+-	Output    OutputConfig
++	Input    InputConfig
++	Pipeline PipelineConfig
++	Output   OutputConfig
+ }
+ 
+ type InputConfig struct {
+@@ -23,4 +23,8 @@ type PipelineConfig struct {
+ type OutputConfig struct {
+ 	Sink   string
+ 	Pretty bool
++	// NamePrefix, when non-empty, is prepended to record names on output.
++	NamePrefix string
++	// UppercaseNames uppercases record names on output.
++	UppercaseNames bool
+ }
+diff --git a/internal/config/load.go b/internal/config/load.go
+index bcc5136..b9ff6ff 100644
+--- a/internal/config/load.go
++++ b/internal/config/load.go
+@@ -62,6 +62,10 @@ func assign(cfg *Config, key, value string) error {
+ 			return fmt.Errorf("pipeline.max_depth: %w", err)
+ 		}
+ 		cfg.Pipeline.MaxDepth = n
++	case "output.name_prefix":
++		cfg.Output.NamePrefix = value
++	case "output.uppercase_names":
++		cfg.Output.UppercaseNames = value == "true"
+ 	case "output.sink":
+ 		cfg.Output.Sink = value
+ 	case "output.pretty":
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index 79f23c9..a3860b5 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -25,11 +25,20 @@ func NewSummary() *Summary {
+ // Observe folds one batch into the running totals.
+ func (s *Summary) Observe(batch api.Batch) {
+ 	for _, record := range batch.Records {
++		if record.Name == "" {
++			continue
++		}
+ 		s.counts[record.Name]++
+ 		s.totals[record.Name] += record.Value
+ 	}
+ }
+ 
++// Reset clears everything the summary has accumulated.
++func (s *Summary) Reset() {
++	s.counts = map[string]int{}
++	s.totals = map[string]float64{}
++}
++
+ // Render produces the human-readable report, one line per name, sorted.
+ func (s *Summary) Render() string {
+ 	names := make([]string, 0, len(s.counts))
+@@ -39,8 +48,12 @@ func (s *Summary) Render() string {
+ 	sort.Strings(names)
+ 
+ 	var b strings.Builder
++	count, total := 0, 0.0
+ 	for _, name := range names {
+ 		fmt.Fprintf(&b, "%s count=%d total=%g\n", name, s.counts[name], s.totals[name])
++		count += s.counts[name]
++		total += s.totals[name]
+ 	}
++	fmt.Fprintf(&b, "TOTAL count=%d total=%g\n", count, total)
+ 	return b.String()
+ }
