@@ -1,0 +1,1402 @@
+diff --git a/cmd/telemetryd/inventory.go b/cmd/telemetryd/inventory.go
+new file mode 100644
+index 0000000..f6de8d2
+--- /dev/null
++++ b/cmd/telemetryd/inventory.go
+@@ -0,0 +1,141 @@
++package main
++
++import (
++	"fmt"
++	"sort"
++
++	"telemetryd/internal/adapterspec"
++	feed01 "telemetryd/internal/adapters/feed01"
++	feed02 "telemetryd/internal/adapters/feed02"
++	feed03 "telemetryd/internal/adapters/feed03"
++	feed04 "telemetryd/internal/adapters/feed04"
++	feed05 "telemetryd/internal/adapters/feed05"
++	feed06 "telemetryd/internal/adapters/feed06"
++	feed07 "telemetryd/internal/adapters/feed07"
++	feed08 "telemetryd/internal/adapters/feed08"
++	feed09 "telemetryd/internal/adapters/feed09"
++	feed10 "telemetryd/internal/adapters/feed10"
++	feed11 "telemetryd/internal/adapters/feed11"
++	feed12 "telemetryd/internal/adapters/feed12"
++	feed13 "telemetryd/internal/adapters/feed13"
++	feed14 "telemetryd/internal/adapters/feed14"
++	feed15 "telemetryd/internal/adapters/feed15"
++	feed16 "telemetryd/internal/adapters/feed16"
++	feed17 "telemetryd/internal/adapters/feed17"
++	feed18 "telemetryd/internal/adapters/feed18"
++	feed19 "telemetryd/internal/adapters/feed19"
++	feed20 "telemetryd/internal/adapters/feed20"
++	feed21 "telemetryd/internal/adapters/feed21"
++	feed22 "telemetryd/internal/adapters/feed22"
++	feed23 "telemetryd/internal/adapters/feed23"
++	feed24 "telemetryd/internal/adapters/feed24"
++	feed25 "telemetryd/internal/adapters/feed25"
++	feed26 "telemetryd/internal/adapters/feed26"
++	feed27 "telemetryd/internal/adapters/feed27"
++	feed28 "telemetryd/internal/adapters/feed28"
++	feed29 "telemetryd/internal/adapters/feed29"
++	feed30 "telemetryd/internal/adapters/feed30"
++	feed31 "telemetryd/internal/adapters/feed31"
++	feed32 "telemetryd/internal/adapters/feed32"
++	feed33 "telemetryd/internal/adapters/feed33"
++	feed34 "telemetryd/internal/adapters/feed34"
++	feed35 "telemetryd/internal/adapters/feed35"
++	feed36 "telemetryd/internal/adapters/feed36"
++	feed37 "telemetryd/internal/adapters/feed37"
++	feed38 "telemetryd/internal/adapters/feed38"
++	feed39 "telemetryd/internal/adapters/feed39"
++	feed40 "telemetryd/internal/adapters/feed40"
++	feed41 "telemetryd/internal/adapters/feed41"
++	feed42 "telemetryd/internal/adapters/feed42"
++	feed43 "telemetryd/internal/adapters/feed43"
++	feed44 "telemetryd/internal/adapters/feed44"
++	feed45 "telemetryd/internal/adapters/feed45"
++	feed46 "telemetryd/internal/adapters/feed46"
++	feed47 "telemetryd/internal/adapters/feed47"
++	feed48 "telemetryd/internal/adapters/feed48"
++	feed49 "telemetryd/internal/adapters/feed49"
++	feed50 "telemetryd/internal/adapters/feed50"
++	feed51 "telemetryd/internal/adapters/feed51"
++	feed52 "telemetryd/internal/adapters/feed52"
++	feed53 "telemetryd/internal/adapters/feed53"
++	feed54 "telemetryd/internal/adapters/feed54"
++	feed55 "telemetryd/internal/adapters/feed55"
++	feed56 "telemetryd/internal/adapters/feed56"
++)
++
++type inventoryRow struct {
++	Name    string
++	Summary adapterspec.Summary
++}
++
++// inventoryRows collects every registered adapter's self-description.
++func inventoryRows() []inventoryRow {
++	rows := []inventoryRow{
++		{"feed01", feed01.Snapshot()},
++		{"feed02", feed02.Snapshot()},
++		{"feed03", feed03.Snapshot()},
++		{"feed04", feed04.Snapshot()},
++		{"feed05", feed05.Snapshot()},
++		{"feed06", feed06.Snapshot()},
++		{"feed07", feed07.Snapshot()},
++		{"feed08", feed08.Snapshot()},
++		{"feed09", feed09.Snapshot()},
++		{"feed10", feed10.Snapshot()},
++		{"feed11", feed11.Snapshot()},
++		{"feed12", feed12.Snapshot()},
++		{"feed13", feed13.Snapshot()},
++		{"feed14", feed14.Snapshot()},
++		{"feed15", feed15.Snapshot()},
++		{"feed16", feed16.Snapshot()},
++		{"feed17", feed17.Snapshot()},
++		{"feed18", feed18.Snapshot()},
++		{"feed19", feed19.Snapshot()},
++		{"feed20", feed20.Snapshot()},
++		{"feed21", feed21.Snapshot()},
++		{"feed22", feed22.Snapshot()},
++		{"feed23", feed23.Snapshot()},
++		{"feed24", feed24.Snapshot()},
++		{"feed25", feed25.Snapshot()},
++		{"feed26", feed26.Snapshot()},
++		{"feed27", feed27.Snapshot()},
++		{"feed28", feed28.Snapshot()},
++		{"feed29", feed29.Snapshot()},
++		{"feed30", feed30.Snapshot()},
++		{"feed31", feed31.Snapshot()},
++		{"feed32", feed32.Snapshot()},
++		{"feed33", feed33.Snapshot()},
++		{"feed34", feed34.Snapshot()},
++		{"feed35", feed35.Snapshot()},
++		{"feed36", feed36.Snapshot()},
++		{"feed37", feed37.Snapshot()},
++		{"feed38", feed38.Snapshot()},
++		{"feed39", feed39.Snapshot()},
++		{"feed40", feed40.Snapshot()},
++		{"feed41", feed41.Snapshot()},
++		{"feed42", feed42.Snapshot()},
++		{"feed43", feed43.Snapshot()},
++		{"feed44", feed44.Snapshot()},
++		{"feed45", feed45.Snapshot()},
++		{"feed46", feed46.Snapshot()},
++		{"feed47", feed47.Snapshot()},
++		{"feed48", feed48.Snapshot()},
++		{"feed49", feed49.Snapshot()},
++		{"feed50", feed50.Snapshot()},
++		{"feed51", feed51.Snapshot()},
++		{"feed52", feed52.Snapshot()},
++		{"feed53", feed53.Snapshot()},
++		{"feed54", feed54.Snapshot()},
++		{"feed55", feed55.Snapshot()},
++		{"feed56", feed56.Snapshot()},
++	}
++	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
++	return rows
++}
++
++func printInventory() {
++	for _, row := range inventoryRows() {
++		fmt.Printf("%s fallback=%s ordering=%s aliases=%d scale=%d\n",
++			row.Name, row.Summary.Fallback, row.Summary.Ordering,
++			len(row.Summary.Aliases), row.Summary.Scale)
++	}
++}
+diff --git a/cmd/telemetryd/main.go b/cmd/telemetryd/main.go
+index 16fdb34..90d8d5b 100644
+--- a/cmd/telemetryd/main.go
++++ b/cmd/telemetryd/main.go
+@@ -10,7 +10,11 @@ import (
+ )
+ 
+ func main() {
+-	if len(os.Args) != 2 {
++	if len(os.Args) > 1 && os.Args[1] == "inventory" {
++		printInventory()
++		return
++	}
++		if len(os.Args) != 2 {
+ 		fmt.Fprintln(os.Stderr, "usage: telemetryd <events-file>")
+ 		os.Exit(2)
+ 	}
+diff --git a/internal/adapters/feed01/snapshot.go b/internal/adapters/feed01/snapshot.go
+new file mode 100644
+index 0000000..792acf4
+--- /dev/null
++++ b/internal/adapters/feed01/snapshot.go
+@@ -0,0 +1,16 @@
++package feed01
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "input",
++		Aliases: map[string]string{
++		"reqs": "requests",
++		"rt": "round_trip",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed02/snapshot.go b/internal/adapters/feed02/snapshot.go
+new file mode 100644
+index 0000000..359d435
+--- /dev/null
++++ b/internal/adapters/feed02/snapshot.go
+@@ -0,0 +1,15 @@
++package feed02
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "input",
++		Aliases: map[string]string{
++		"q": "queue_depth",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed03/snapshot.go b/internal/adapters/feed03/snapshot.go
+new file mode 100644
+index 0000000..0a4cb08
+--- /dev/null
++++ b/internal/adapters/feed03/snapshot.go
+@@ -0,0 +1,15 @@
++package feed03
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"mem": "memory",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed04/snapshot.go b/internal/adapters/feed04/snapshot.go
+new file mode 100644
+index 0000000..4a614d7
+--- /dev/null
++++ b/internal/adapters/feed04/snapshot.go
+@@ -0,0 +1,15 @@
++package feed04
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"cpu": "cpu_time",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed05/snapshot.go b/internal/adapters/feed05/snapshot.go
+new file mode 100644
+index 0000000..b3b666a
+--- /dev/null
++++ b/internal/adapters/feed05/snapshot.go
+@@ -0,0 +1,16 @@
++package feed05
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"iops": "io_operations",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed06/snapshot.go b/internal/adapters/feed06/snapshot.go
+new file mode 100644
+index 0000000..a48eab3
+--- /dev/null
++++ b/internal/adapters/feed06/snapshot.go
+@@ -0,0 +1,16 @@
++package feed06
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"cpu": "cpu_time",
++		"reqs": "requests",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed07/snapshot.go b/internal/adapters/feed07/snapshot.go
+new file mode 100644
+index 0000000..5137e88
+--- /dev/null
++++ b/internal/adapters/feed07/snapshot.go
+@@ -0,0 +1,16 @@
++package feed07
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "input",
++		Aliases: map[string]string{
++		"err": "errors",
++		"q": "queue_depth",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed08/snapshot.go b/internal/adapters/feed08/snapshot.go
+new file mode 100644
+index 0000000..b567f70
+--- /dev/null
++++ b/internal/adapters/feed08/snapshot.go
+@@ -0,0 +1,15 @@
++package feed08
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "input",
++		Aliases: map[string]string{
++		"q": "queue_depth",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed09/snapshot.go b/internal/adapters/feed09/snapshot.go
+new file mode 100644
+index 0000000..fd1a45d
+--- /dev/null
++++ b/internal/adapters/feed09/snapshot.go
+@@ -0,0 +1,17 @@
++package feed09
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"q": "queue_depth",
++		"reqs": "requests",
++		"rt": "round_trip",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed10/snapshot.go b/internal/adapters/feed10/snapshot.go
+new file mode 100644
+index 0000000..1b7c28e
+--- /dev/null
++++ b/internal/adapters/feed10/snapshot.go
+@@ -0,0 +1,17 @@
++package feed10
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"conns": "connections",
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed11/snapshot.go b/internal/adapters/feed11/snapshot.go
+new file mode 100644
+index 0000000..76a6501
+--- /dev/null
++++ b/internal/adapters/feed11/snapshot.go
+@@ -0,0 +1,17 @@
++package feed11
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"lat": "latency",
++		"q": "queue_depth",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed12/snapshot.go b/internal/adapters/feed12/snapshot.go
+new file mode 100644
+index 0000000..7284e5e
+--- /dev/null
++++ b/internal/adapters/feed12/snapshot.go
+@@ -0,0 +1,17 @@
++package feed12
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"cpu": "cpu_time",
++		"lat": "latency",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed13/snapshot.go b/internal/adapters/feed13/snapshot.go
+new file mode 100644
+index 0000000..b8c640e
+--- /dev/null
++++ b/internal/adapters/feed13/snapshot.go
+@@ -0,0 +1,16 @@
++package feed13
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"iops": "io_operations",
++		"mem": "memory",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed14/snapshot.go b/internal/adapters/feed14/snapshot.go
+new file mode 100644
+index 0000000..90d894d
+--- /dev/null
++++ b/internal/adapters/feed14/snapshot.go
+@@ -0,0 +1,15 @@
++package feed14
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"conns": "connections",
++		},
++		Scale: 10,
++	}
++}
+diff --git a/internal/adapters/feed15/snapshot.go b/internal/adapters/feed15/snapshot.go
+new file mode 100644
+index 0000000..23f29a2
+--- /dev/null
++++ b/internal/adapters/feed15/snapshot.go
+@@ -0,0 +1,16 @@
++package feed15
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "input",
++		Aliases: map[string]string{
++		"iops": "io_operations",
++		"q": "queue_depth",
++		},
++		Scale: 10,
++	}
++}
+diff --git a/internal/adapters/feed16/snapshot.go b/internal/adapters/feed16/snapshot.go
+new file mode 100644
+index 0000000..8ecf085
+--- /dev/null
++++ b/internal/adapters/feed16/snapshot.go
+@@ -0,0 +1,16 @@
++package feed16
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"err": "errors",
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed17/snapshot.go b/internal/adapters/feed17/snapshot.go
+new file mode 100644
+index 0000000..c633975
+--- /dev/null
++++ b/internal/adapters/feed17/snapshot.go
+@@ -0,0 +1,16 @@
++package feed17
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"lat": "latency",
++		"q": "queue_depth",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed18/snapshot.go b/internal/adapters/feed18/snapshot.go
+new file mode 100644
+index 0000000..4e18e27
+--- /dev/null
++++ b/internal/adapters/feed18/snapshot.go
+@@ -0,0 +1,16 @@
++package feed18
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"err": "errors",
++		"lat": "latency",
++		},
++		Scale: 10,
++	}
++}
+diff --git a/internal/adapters/feed19/snapshot.go b/internal/adapters/feed19/snapshot.go
+new file mode 100644
+index 0000000..5a0ea56
+--- /dev/null
++++ b/internal/adapters/feed19/snapshot.go
+@@ -0,0 +1,15 @@
++package feed19
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"rt": "round_trip",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed20/snapshot.go b/internal/adapters/feed20/snapshot.go
+new file mode 100644
+index 0000000..9250366
+--- /dev/null
++++ b/internal/adapters/feed20/snapshot.go
+@@ -0,0 +1,16 @@
++package feed20
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"err": "errors",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed21/snapshot.go b/internal/adapters/feed21/snapshot.go
+new file mode 100644
+index 0000000..443a709
+--- /dev/null
++++ b/internal/adapters/feed21/snapshot.go
+@@ -0,0 +1,15 @@
++package feed21
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"lat": "latency",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed22/snapshot.go b/internal/adapters/feed22/snapshot.go
+new file mode 100644
+index 0000000..9a112b1
+--- /dev/null
++++ b/internal/adapters/feed22/snapshot.go
+@@ -0,0 +1,15 @@
++package feed22
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"iops": "io_operations",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed23/snapshot.go b/internal/adapters/feed23/snapshot.go
+new file mode 100644
+index 0000000..70a01ba
+--- /dev/null
++++ b/internal/adapters/feed23/snapshot.go
+@@ -0,0 +1,16 @@
++package feed23
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed24/snapshot.go b/internal/adapters/feed24/snapshot.go
+new file mode 100644
+index 0000000..c4185da
+--- /dev/null
++++ b/internal/adapters/feed24/snapshot.go
+@@ -0,0 +1,17 @@
++package feed24
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"err": "errors",
++		"iops": "io_operations",
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed25/snapshot.go b/internal/adapters/feed25/snapshot.go
+new file mode 100644
+index 0000000..80d6ea0
+--- /dev/null
++++ b/internal/adapters/feed25/snapshot.go
+@@ -0,0 +1,16 @@
++package feed25
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"iops": "io_operations",
++		"reqs": "requests",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed26/snapshot.go b/internal/adapters/feed26/snapshot.go
+new file mode 100644
+index 0000000..73a7801
+--- /dev/null
++++ b/internal/adapters/feed26/snapshot.go
+@@ -0,0 +1,16 @@
++package feed26
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"err": "errors",
++		"reqs": "requests",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed27/snapshot.go b/internal/adapters/feed27/snapshot.go
+new file mode 100644
+index 0000000..67c1733
+--- /dev/null
++++ b/internal/adapters/feed27/snapshot.go
+@@ -0,0 +1,16 @@
++package feed27
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"iops": "io_operations",
++		"reqs": "requests",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed28/snapshot.go b/internal/adapters/feed28/snapshot.go
+new file mode 100644
+index 0000000..3f4c921
+--- /dev/null
++++ b/internal/adapters/feed28/snapshot.go
+@@ -0,0 +1,16 @@
++package feed28
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "zero",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"cpu": "cpu_time",
++		"q": "queue_depth",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed29/snapshot.go b/internal/adapters/feed29/snapshot.go
+new file mode 100644
+index 0000000..4e41692
+--- /dev/null
++++ b/internal/adapters/feed29/snapshot.go
+@@ -0,0 +1,16 @@
++package feed29
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"iops": "io_operations",
++		"rt": "round_trip",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed30/snapshot.go b/internal/adapters/feed30/snapshot.go
+new file mode 100644
+index 0000000..d95a31e
+--- /dev/null
++++ b/internal/adapters/feed30/snapshot.go
+@@ -0,0 +1,17 @@
++package feed30
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"lat": "latency",
++		"mem": "memory",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed31/snapshot.go b/internal/adapters/feed31/snapshot.go
+new file mode 100644
+index 0000000..ede82c4
+--- /dev/null
++++ b/internal/adapters/feed31/snapshot.go
+@@ -0,0 +1,17 @@
++package feed31
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"err": "errors",
++		"lat": "latency",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed32/snapshot.go b/internal/adapters/feed32/snapshot.go
+new file mode 100644
+index 0000000..40d560c
+--- /dev/null
++++ b/internal/adapters/feed32/snapshot.go
+@@ -0,0 +1,16 @@
++package feed32
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"err": "errors",
++		"rt": "round_trip",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed33/snapshot.go b/internal/adapters/feed33/snapshot.go
+new file mode 100644
+index 0000000..e704510
+--- /dev/null
++++ b/internal/adapters/feed33/snapshot.go
+@@ -0,0 +1,15 @@
++package feed33
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		},
++		Scale: 10,
++	}
++}
+diff --git a/internal/adapters/feed34/snapshot.go b/internal/adapters/feed34/snapshot.go
+new file mode 100644
+index 0000000..e2e8cdb
+--- /dev/null
++++ b/internal/adapters/feed34/snapshot.go
+@@ -0,0 +1,17 @@
++package feed34
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"cpu": "cpu_time",
++		"reqs": "requests",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed35/snapshot.go b/internal/adapters/feed35/snapshot.go
+new file mode 100644
+index 0000000..5ed24b6
+--- /dev/null
++++ b/internal/adapters/feed35/snapshot.go
+@@ -0,0 +1,17 @@
++package feed35
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "zero",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"err": "errors",
++		"mem": "memory",
++		"q": "queue_depth",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed36/snapshot.go b/internal/adapters/feed36/snapshot.go
+new file mode 100644
+index 0000000..47207d0
+--- /dev/null
++++ b/internal/adapters/feed36/snapshot.go
+@@ -0,0 +1,16 @@
++package feed36
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"mem": "memory",
++		"reqs": "requests",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed37/snapshot.go b/internal/adapters/feed37/snapshot.go
+new file mode 100644
+index 0000000..2b6905a
+--- /dev/null
++++ b/internal/adapters/feed37/snapshot.go
+@@ -0,0 +1,15 @@
++package feed37
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed38/snapshot.go b/internal/adapters/feed38/snapshot.go
+new file mode 100644
+index 0000000..5c05a3e
+--- /dev/null
++++ b/internal/adapters/feed38/snapshot.go
+@@ -0,0 +1,17 @@
++package feed38
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"cpu": "cpu_time",
++		"reqs": "requests",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed39/snapshot.go b/internal/adapters/feed39/snapshot.go
+new file mode 100644
+index 0000000..49bc867
+--- /dev/null
++++ b/internal/adapters/feed39/snapshot.go
+@@ -0,0 +1,17 @@
++package feed39
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"cpu": "cpu_time",
++		"iops": "io_operations",
++		"lat": "latency",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed40/snapshot.go b/internal/adapters/feed40/snapshot.go
+new file mode 100644
+index 0000000..a76ee7d
+--- /dev/null
++++ b/internal/adapters/feed40/snapshot.go
+@@ -0,0 +1,15 @@
++package feed40
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"q": "queue_depth",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed41/snapshot.go b/internal/adapters/feed41/snapshot.go
+new file mode 100644
+index 0000000..0f574df
+--- /dev/null
++++ b/internal/adapters/feed41/snapshot.go
+@@ -0,0 +1,17 @@
++package feed41
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"err": "errors",
++		"lat": "latency",
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed42/snapshot.go b/internal/adapters/feed42/snapshot.go
+new file mode 100644
+index 0000000..dbefa20
+--- /dev/null
++++ b/internal/adapters/feed42/snapshot.go
+@@ -0,0 +1,17 @@
++package feed42
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"cpu": "cpu_time",
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed43/snapshot.go b/internal/adapters/feed43/snapshot.go
+new file mode 100644
+index 0000000..8096ee8
+--- /dev/null
++++ b/internal/adapters/feed43/snapshot.go
+@@ -0,0 +1,17 @@
++package feed43
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"err": "errors",
++		"q": "queue_depth",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed44/snapshot.go b/internal/adapters/feed44/snapshot.go
+new file mode 100644
+index 0000000..90d4b2f
+--- /dev/null
++++ b/internal/adapters/feed44/snapshot.go
+@@ -0,0 +1,16 @@
++package feed44
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "input",
++		Aliases: map[string]string{
++		"lat": "latency",
++		"mem": "memory",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed45/snapshot.go b/internal/adapters/feed45/snapshot.go
+new file mode 100644
+index 0000000..7928b0d
+--- /dev/null
++++ b/internal/adapters/feed45/snapshot.go
+@@ -0,0 +1,16 @@
++package feed45
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"iops": "io_operations",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed46/snapshot.go b/internal/adapters/feed46/snapshot.go
+new file mode 100644
+index 0000000..36682c3
+--- /dev/null
++++ b/internal/adapters/feed46/snapshot.go
+@@ -0,0 +1,15 @@
++package feed46
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "zero",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"err": "errors",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed47/snapshot.go b/internal/adapters/feed47/snapshot.go
+new file mode 100644
+index 0000000..43a0eb7
+--- /dev/null
++++ b/internal/adapters/feed47/snapshot.go
+@@ -0,0 +1,17 @@
++package feed47
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"err": "errors",
++		"lat": "latency",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed48/snapshot.go b/internal/adapters/feed48/snapshot.go
+new file mode 100644
+index 0000000..3cfa568
+--- /dev/null
++++ b/internal/adapters/feed48/snapshot.go
+@@ -0,0 +1,17 @@
++package feed48
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "last_seen",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"cpu": "cpu_time",
++		"err": "errors",
++		"iops": "io_operations",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed49/snapshot.go b/internal/adapters/feed49/snapshot.go
+new file mode 100644
+index 0000000..ba25f74
+--- /dev/null
++++ b/internal/adapters/feed49/snapshot.go
+@@ -0,0 +1,17 @@
++package feed49
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"lat": "latency",
++		"rt": "round_trip",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed50/snapshot.go b/internal/adapters/feed50/snapshot.go
+new file mode 100644
+index 0000000..b336ca2
+--- /dev/null
++++ b/internal/adapters/feed50/snapshot.go
+@@ -0,0 +1,16 @@
++package feed50
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "zero",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"conns": "connections",
++		"cpu": "cpu_time",
++		},
++		Scale: 1000,
++	}
++}
+diff --git a/internal/adapters/feed51/snapshot.go b/internal/adapters/feed51/snapshot.go
+new file mode 100644
+index 0000000..4237a70
+--- /dev/null
++++ b/internal/adapters/feed51/snapshot.go
+@@ -0,0 +1,17 @@
++package feed51
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_ts",
++		Aliases: map[string]string{
++		"bw": "bandwidth",
++		"conns": "connections",
++		"reqs": "requests",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed52/snapshot.go b/internal/adapters/feed52/snapshot.go
+new file mode 100644
+index 0000000..8c5f5a4
+--- /dev/null
++++ b/internal/adapters/feed52/snapshot.go
+@@ -0,0 +1,16 @@
++package feed52
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"err": "errors",
++		"reqs": "requests",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed53/snapshot.go b/internal/adapters/feed53/snapshot.go
+new file mode 100644
+index 0000000..9a83d24
+--- /dev/null
++++ b/internal/adapters/feed53/snapshot.go
+@@ -0,0 +1,17 @@
++package feed53
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "zero",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"q": "queue_depth",
++		"reqs": "requests",
++		"rt": "round_trip",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed54/snapshot.go b/internal/adapters/feed54/snapshot.go
+new file mode 100644
+index 0000000..5f2c7e4
+--- /dev/null
++++ b/internal/adapters/feed54/snapshot.go
+@@ -0,0 +1,15 @@
++package feed54
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "skip",
++		Ordering: "by_count",
++		Aliases: map[string]string{
++		"q": "queue_depth",
++		},
++		Scale: 10,
++	}
++}
+diff --git a/internal/adapters/feed55/snapshot.go b/internal/adapters/feed55/snapshot.go
+new file mode 100644
+index 0000000..5e93081
+--- /dev/null
++++ b/internal/adapters/feed55/snapshot.go
+@@ -0,0 +1,16 @@
++package feed55
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "zero",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"err": "errors",
++		"lat": "latency",
++		},
++		Scale: 1,
++	}
++}
+diff --git a/internal/adapters/feed56/snapshot.go b/internal/adapters/feed56/snapshot.go
+new file mode 100644
+index 0000000..aebbb58
+--- /dev/null
++++ b/internal/adapters/feed56/snapshot.go
+@@ -0,0 +1,16 @@
++package feed56
++
++import "telemetryd/internal/adapterspec"
++
++// Snapshot reports this adapter's dialect, exactly as Parse implements it.
++func Snapshot() adapterspec.Summary {
++	return adapterspec.Summary{
++		Fallback: "neg1",
++		Ordering: "by_metric",
++		Aliases: map[string]string{
++		"mem": "memory",
++		"rt": "round_trip",
++		},
++		Scale: 1,
++	}
++}

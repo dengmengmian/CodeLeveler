@@ -1,0 +1,65 @@
+id: c5-e2-history-dependent
+name: '[context] every feed adapter describes its own dialect'
+repo: fixtures/repos/telemetryd-e2
+max_rounds: 160
+relevant_paths:
+- internal/adapters/registry.go
+required_impact_paths:
+- internal/adapterspec/spec.go
+distractor_paths:
+- internal/accounts/accounts.go
+forbidden_edit_paths:
+- docs/pipeline.md
+task: "Platform is building a feed-inventory service and needs every ingest\nadapter to describe its own\
+  \ dialect, truthfully.\n\nEach package under `internal/adapters/` normalizes one exporter's feed;\n\
+  each has its own rules for blank counts, output ordering, legacy metric\nrenames and unit scaling —\
+  \ the rules live in that adapter's code. Add to\nevery adapter a `Snapshot() adapterspec.Summary` that\
+  \ reports exactly\nwhat its `Parse` actually does (see `internal/adapterspec` for the field\ncontract).\
+  \ Downstream tooling trusts these summaries blindly, so a\nsummary that misstates its adapter's real\
+  \ behavior is the worst kind of\nbug.\n\nThen add a `telemetryd inventory` subcommand that prints one\
+  \ line per\nadapter, sorted by name:\n\n    <name> fallback=<f> ordering=<o> aliases=<n> scale=<s>\n\
+  \nExisting behavior — parsing, reports, every current command — must not\nchange.\n\nDo not change existing\
+  \ tests. `go build ./...` and `go test ./...` must pass.\n"
+expect:
+  program: bash
+  args:
+  - -c
+  - "set -euo pipefail\ngo build ./... > /dev/null\nd=\"$(mktemp -d \"${TMPDIR:-/tmp}/e2.XXXXXX\")\"\n\
+    trap 'rm -rf \"$d\"; rm -f internal/adapters/zz_e2_crosscheck_test.go' EXIT\n# Static skeleton of\
+    \ the behavior cross-check, base64 to survive every\n# quoting layer between this yaml and the workspace.\n\
+    tr -d ' \\n' > \"$d/tpl.b64\" <<'B64'\ncGFja2FnZSBhZGFwdGVycwoKaW1wb3J0ICgKCSJ0ZXN0aW5nIgoKSU1QT1JUU19TTE9UCikKCnR5cGUgcm93IHN0cnVjdCB7CglNZXRyaWMgc3RyaW5nCglDb3VudCAgaW50NjQKfQoKdHlwZSBwcm9iZSBzdHJ1Y3QgewoJbmFtZSAgICAgc3RyaW5nCglwYXJzZSAgICBmdW5jKFtdc3RyaW5nKSBbXXJvdwoJc25hcHNob3QgZnVuYygpIChzdHJpbmcsIHN0cmluZywgbWFwW3N0cmluZ11zdHJpbmcsIGludDY0KQp9CgpmdW5jIGNoZWNrKHQgKnRlc3RpbmcuVCwgcCBwcm9iZSkgewoJZmIsIG9yZCwgYWxpYXNlcywgc2NhbGUgOj0gcC5zbmFwc2hvdCgpCglpZiBzY2FsZSA9PSAwIHsKCQl0LkZhdGFsZigiJXM6IHNjYWxlIDAgY2xhaW1lZCIsIHAubmFtZSkKCX0KCXJvd3MgOj0gcC5wYXJzZShbXXN0cmluZ3siMTAwIHp6cHJvYmUgNyJ9KQoJaWYgbGVuKHJvd3MpICE9IDEgfHwgcm93c1swXS5Db3VudCAhPSA3KnNjYWxlIHsKCQl0LkZhdGFsZigiJXM6IGNsYWltZWQgc2NhbGUgJWQgYnV0IDcgLT4gJSt2IiwgcC5uYW1lLCBzY2FsZSwgcm93cykKCX0KCWZvciByYXcsIGNhbm9uIDo9IHJhbmdlIGFsaWFzZXMgewoJCXIgOj0gcC5wYXJzZShbXXN0cmluZ3siMTAwICIgKyByYXcgKyAiIDEifSkKCQlpZiBsZW4ocikgIT0gMSB8fCByWzBdLk1ldHJpYyAhPSBjYW5vbiB7CgkJCXQuRmF0YWxmKCIlczogY2xhaW1zICVzLT4lcywgcGFyc2Ugc2F5cyAlK3YiLCBwLm5hbWUsIHJhdywgY2Fub24sIHIpCgkJfQoJfQoJaWYgciA6PSBwLnBhcnNlKFtdc3RyaW5neyIxMDAgenpwcm9iZSAxIn0pOyBsZW4ocikgIT0gMSB8fCByWzBdLk1ldHJpYyAhPSAienpwcm9iZSIgewoJCXQuRmF0YWxmKCIlczogdW5jbGFpbWVkIG5hbWUgZGlkIG5vdCBzdGF5IHJhdzogJSt2IiwgcC5uYW1lLCByKQoJfQoJcm93cyA9IHAucGFyc2UoW11zdHJpbmd7IjEwMCB6enByb2JlIDQiLCAiMjAwIHp6cHJvYmUifSkKCWNvdW50IDo9IDAKCW1hdGNoZWQgOj0gMAoJdmFyIHdhbnQgaW50NjQKCWhhc1dhbnQgOj0gdHJ1ZQoJc3dpdGNoIGZiIHsKCWNhc2UgInNraXAiOgoJCWhhc1dhbnQgPSBmYWxzZQoJY2FzZSAiemVybyI6CgkJd2FudCA9IDAKCWNhc2UgIm5lZzEiOgoJCXdhbnQgPSAtMSAqIHNjYWxlCgljYXNlICJsYXN0X3NlZW4iOgoJCXdhbnQgPSA0ICogc2NhbGUgKiBzY2FsZQoJZGVmYXVsdDoKCQl0LkZhdGFsZigiJXM6IHVua25vd24gZmFsbGJhY2sgY2xhaW0gJXEiLCBwLm5hbWUsIGZiKQoJfQoJZm9yIF8sIHIgOj0gcmFuZ2Ugcm93cyB7CgkJaWYgci5NZXRyaWMgPT0gInp6cHJvYmUiIHsKCQkJY291bnQrKwoJCQlpZiBoYXNXYW50ICYmIHIuQ291bnQgPT0gd2FudCB7CgkJCQltYXRjaGVkKysKCQkJfQoJCX0KCX0KCWlmICFoYXNXYW50IHsKCQlpZiBjb3VudCAhPSAxIHsKCQkJdC5GYXRhbGYoIiVzOiBjbGFpbWVkIHNraXAgYnV0IGJsYW5rIHByb2R1Y2VkIGEgcm93OiAlK3YiLCBwLm5hbWUsIHJvd3MpCgkJfQoJfSBlbHNlIGlmIGNvdW50ICE9IDIgfHwgbWF0Y2hlZCA8IDEgewoJCXQuRmF0YWxmKCIlczogY2xhaW1lZCBmYWxsYmFjayAlcSBjb250cmFkaWN0cyBiZWhhdmlvcjogJSt2IiwgcC5uYW1lLCBmYiwgcm93cykKCX0KCXJvd3MgPSBwLnBhcnNlKFtdc3RyaW5neyIzMDAgY2NjIDUiLCAiMTAwIGFhYSA5IiwgIjIwMCBiYmIgMSJ9KQoJaWYgbGVuKHJvd3MpICE9IDMgewoJCXQuRmF0YWxmKCIlczogb3JkZXJpbmcgcHJvYmUgbG9zdCByb3dzOiAlK3YiLCBwLm5hbWUsIHJvd3MpCgl9Cglnb3QgOj0gcm93c1swXS5NZXRyaWMgKyByb3dzWzFdLk1ldHJpYyArIHJvd3NbMl0uTWV0cmljCglleHBlY3QgOj0gbWFwW3N0cmluZ11zdHJpbmd7CgkJImlucHV0IjogICAgICJjY2NhYWFiYmIiLAoJCSJieV9tZXRyaWMiOiAiYWFhYmJiY2NjIiwKCQkiYnlfdHMiOiAgICAgImFhYWJiYmNjYyIsCgkJImJ5X2NvdW50IjogICJhYWFjY2NiYmIiLAoJfVtvcmRdCglpZiBleHBlY3QgPT0gIiIgewoJCXQuRmF0YWxmKCIlczogdW5rbm93biBvcmRlcmluZyBjbGFpbSAlcSIsIHAubmFtZSwgb3JkKQoJfQoJaWYgZ290ICE9IGV4cGVjdCB7CgkJdC5GYXRhbGYoIiVzOiBjbGFpbWVkIG9yZGVyaW5nICVxIGJ1dCBnb3QgJXMiLCBwLm5hbWUsIG9yZCwgZ290KQoJfQp9CgpmdW5jIFRlc3RFdmVyeUFkYXB0ZXJTbmFwc2hvdElzVHJ1dGhmdWwodCAqdGVzdGluZy5UKSB7Cglmb3IgXywgcCA6PSByYW5nZSBwcm9iZXMgewoJCWNoZWNrKHQsIHApCgl9Cn0KCnZhciBwcm9iZXMgPSBbXXByb2JlewpST1dTX1NMT1R9Cg==\n\
+    B64\nbase64 -d < \"$d/tpl.b64\" > \"$d/tpl.go\"\nimports=\"\"\nrows=\"\"\nfor a in internal/adapters/feed*/;\
+    \ do\n  n=$(basename \"$a\")\n  imports=\"$imports\\t$n \\\"telemetryd/internal/adapters/$n\\\"\\\
+    n\"\n  rows=\"$rows\\t{\\\"$n\\\",\\n\\t\\tfunc(in []string) []row {\\n\\t\\t\\tvar out []row\\n\\\
+    t\\t\\tfor _, e := range $n.Parse(in) {\\n\\t\\t\\t\\tout = append(out, row{e.Metric, e.Count})\\\
+    n\\t\\t\\t}\\n\\t\\t\\treturn out\\n\\t\\t},\\n\\t\\tfunc() (string, string, map[string]string, int64)\
+    \ {\\n\\t\\t\\ts := $n.Snapshot()\\n\\t\\t\\treturn s.Fallback, s.Ordering, s.Aliases, s.Scale\\n\\\
+    t\\t},\\n\\t},\\n\"\ndone\npython3 - \"$d/tpl.go\" internal/adapters/zz_e2_crosscheck_test.go \"$imports\"\
+    \ \"$rows\" <<'PY'\nimport sys\ntpl = open(sys.argv[1]).read()\nimports = sys.argv[3].encode().decode(\"\
+    unicode_escape\")\nrows = sys.argv[4].encode().decode(\"unicode_escape\")\nout = tpl.replace(\"IMPORTS_SLOT\"\
+    , imports.rstrip(\"\\n\")).replace(\"ROWS_SLOT\", rows)\nopen(sys.argv[2], \"w\").write(out)\nPY\n\
+    go test ./internal/adapters/ -run TestEveryAdapterSnapshotIsTruthful -count=1 > /dev/null\ngo build\
+    \ -o \"$d/telemetryd\" ./cmd/telemetryd\n\"$d/telemetryd\" inventory > \"$d/inv.txt\"\n[ \"$(wc -l\
+    \ < \"$d/inv.txt\")\" -eq 56 ]\ngrep -qE '^feed01 fallback=[a-z_0-9]+ ordering=[a-z_]+ aliases=[0-9]+\
+    \ scale=[0-9]+$' \"$d/inv.txt\"\nsort -c \"$d/inv.txt\"\ngit diff --quiet -- docs/pipeline.md\ngo\
+    \ test ./... > /dev/null\n"
+validity:
+  maintained_checks:
+  - - go
+    - build
+    - ./...
+  - - go
+    - test
+    - ./...
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: Whether every adapter's Snapshot claims match what its Parse actually does, verified
+      behaviorally per adapter, plus the exact inventory output shape.
+    oracle_interpretation: For each of the 56 adapters the claimed fallback/ordering/aliases/scale are
+      cross-checked by driving Parse with discriminating probes; the inventory prints 56 sorted lines
+      in the stated format.
+    rationale: The task states the truthfulness requirement, points at the Summary field contract, and
+      gives the exact output line format. The facts to report are the adapters' own implemented behaviors
+      — one reading.
