@@ -1,10 +1,11 @@
 # C2-BV Benchmark Validity Baseline
 
-日期：2026-08-09。分支 `feat/coding-context-efficiency-c2`。
-**BV0 —— 只造尺子、跑基线。未修任何 case，未跑任何模型，生产代码零改动。**
+日期：2026-08-09（BV0）/ 2026-08-10（BV1）。分支 `feat/coding-context-efficiency-c2`。
 
-**结论前置：修复前 N1–N8 的真实健康度是 `VALID 1/8`。** 唯一有效的是 N6。
-在此之前所有基于这套 benchmark 的能力结论（含 C2 的 6/8）都缺乏成立基础。
+**结论前置：BV1 已完成 —— N1–N8 现为 `VALID 8/8`，checker exit 0，benchmark ready。**
+修复前的真实健康度是 `VALID 1/8`（仅 N6），本文前半部分保留该 pre-repair 基线，
+§BV1 Repairs 记录每个 case 的修复。**全程未跑任何模型，生产代码零改动** ——
+8/8 只证明尺子可用，不证明 Agent 会通过它。
 
 ## HEAD
 
@@ -271,10 +272,78 @@ Eval 侧的改动有三处，都不属于 Agent 产品行为：case 的 `validit
 `cargo test -p leveler-eval --lib` ✅ 58 passed / 0 failed。本阶段也未改 N3 fixture、N4 task/expect/reference，
 未新增任何 reference patch。**未运行任何模型。**
 
+## BV1 Repairs
+
+日期：2026-08-10。`BV1_BASELINE_HEAD = 42edec3b34d55fceb76adf13b086a0ec4cdf7bb1`。
+顺序 N3 → N4 → N1 → N2 → N5 → N7 → N8；每修一个 case 立即跑该 case 的六项闸门 +
+真实 `EvaluationCase` loader regression，`VALID` 才进下一个。N6 未改动，仅作 positive regression。
+
+### N3 —— satisfiability repair（`6753938`）
+
+| | |
+| --- | --- |
+| before | `INVALID`：正确 guard 打破 `TestSummaryCountsPerName`，任务禁止改测试 |
+| defect | 该测试的记录未设 `Valid`，Go 零值让"正常记录"意外变成 invalid —— 测试本意是数数，不是验证 validity 语义 |
+| repair | **修 fixture 生成器**：三条记录显式 `Valid: true`，重新生成 `navsvc` 与 `navsvc-n6` 两仓。任务约束一字未动，隐藏验收强度未降 |
+| result | 六项全 PASS；N6 仍 VALID；N3 两条 obligation oracle 仍双向 PROVEN |
+
+### N4 —— semantic disambiguation（`7d5fef5`）
+
+| | |
+| --- | --- |
+| before | `UNDER_SPECIFIED`：任务同时说 "actually accepted"（→3）与 "really written / free to reject"（→0），隐藏验收静默取 3 |
+| repair | 任务文本改为只支持 accepted-count 一种读法：成功的 `Write` 即接受其记录、null sink 照数它故意丢弃的记录、失败的 `Write` 不贡献计数。"really written" 措辞删除。**oracle / reference / 隐藏验收未动** —— 它们本就编码 accepted-count |
+| result | G6 attestation → `UNAMBIGUOUS`；六项全 PASS；N4 两条 oracle 仍 PROVEN |
+
+### N1 N2 N5 N7 N8 —— references（`dfd1063`）
+
+五个 case 首次获得"可解"证明。每个 reference 都是对着 materialize 后的 workspace
+（clone+overlay）写的最小产品修复，不特判任何隐藏 fixture：
+
+| case | reference | 覆盖的 obligation |
+| --- | --- | --- |
+| N1 | normalize 阶段恢复 `strings.ToLower`（1 行） | 大小写折叠；whitespace 处理由既有路径保持 |
+| N2 | `Render` 末尾追加 `TOTAL count=%d total=%g`，空输入也输出 | TOTAL 行、位置、空集语义 |
+| N5 | `PipelineConfig.MinValue` + `pipeline.min_value` 解析 + 负值校验 + filter 阶段内阈值 | 配置贯通、缺省不变、负值报错、仅随 filter 生效 |
+| N7 | `OutputConfig.MaxRecords` + 解析/校验 + **写循环处**封顶（跨 sink 生效、跨 batch 裁剪、达到即停写） | 精确 cap、0=无限、`--summary` 不受影响 |
+| N8 | `rowName()`：带 `env` label 的记录按 `name{env=v}` 记账 | 分组、排序随打印名、格式不变 |
+
+每个都在进入下一个 case 之前单独跑到 `VALID`。
+
+## Final Validity Matrix
+
+日期：2026-08-10。`check_fixture_validity.py` 全量运行，**退出码 0**：
+
+```
+case                                G1    G2    G3    G4    G5    G6   status
+n1-unknown-location               PASS  PASS  PASS  PASS  PASS  PASS   VALID
+n2-competing-implementations      PASS  PASS  PASS  PASS  PASS  PASS   VALID
+n3-caller-propagation             PASS  PASS  PASS  PASS  PASS  PASS   VALID
+n4-interface-contract             PASS  PASS  PASS  PASS  PASS  PASS   VALID
+n5-config-to-runtime              PASS  PASS  PASS  PASS  PASS  PASS   VALID
+n6-large-file-region              PASS  PASS  PASS  PASS  PASS  PASS   VALID
+n7-cross-package                  PASS  PASS  PASS  PASS  PASS  PASS   VALID
+n8-distractor-resistance          PASS  PASS  PASS  PASS  PASS  PASS   VALID
+
+VALID 8/8
+```
+
+同时全绿：7 条 checker gate regression、4 条 obligation oracle（双向）、
+`cargo test -p leveler-eval --lib` 58 passed / 0 failed（含 loader regression）。
+
+Answer-key containment：reference 从 3 个扩到 8 个不需要额外密封 ——
+`seal_eval_answer_keys()` 按 subpath 密封整个仓库根，新文件自动在拒读范围内。
+
+## BV1 之后仍然成立的边界
+
+- **8/8 VALID 只证明尺子可用**，不证明 Agent 会通过任何一个 case。
+- C2 PRODUCT VERDICT 仍是 `NOT CURRENTLY ADJUDICABLE` —— 修 benchmark 不是重新测产品。
+- 生产代码零改动，模型运行 0 次。
+
 ## NEXT
 
 ```
-C2-BV1 — Repair invalid / under-specified / unverified cases
+C2-BV2 — Re-establish trustworthy C2 product baseline
 ```
 
-不开始 BV1。
+用修好的尺子重新跑 Agent。不在本阶段开始。
