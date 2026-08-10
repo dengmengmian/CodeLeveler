@@ -58,14 +58,18 @@ task: |
 
       wrote N records
 
-  where N is the number of records the output sink actually accepted across
-  the whole run.
+  where N is the number of records the output sink successfully accepted
+  across the whole run.
 
-  The count has to come from the sink itself rather than being recomputed by
-  the caller — a sink is free to reject or coalesce records, and the footer
-  must report what was really written.
+  The count belongs to the sink itself — it is part of what a sink is, so
+  make it part of the sink contract rather than something the caller
+  recomputes.
 
-  This is a change to what a sink is, so make it part of the sink contract.
+  For this contract, a successful `Write` accepts the records passed to it,
+  even when the sink intentionally discards their physical output; the null
+  sink therefore still counts the records it accepts. A `Write` that returns
+  an error contributes no accepted records.
+
   The footer appears only when the command is writing to a sink, not in
   `--summary` mode.
 
@@ -108,16 +112,17 @@ validity:
   constraints:
     existing_tests_unmodified: true
   semantics:
-    status: UNDER_SPECIFIED
+    status: UNAMBIGUOUS
     critical_observable: >-
       What a null sink reports as its accepted count.
     oracle_interpretation: >-
       A null sink fed 3 records must print `wrote 3 records`.
     rationale: >-
-      The task says the count is what the sink "actually accepted", which reads
-      as 3, and in the same breath that a sink "is free to reject or coalesce"
-      and the footer reports "what was really written", which reads as 0 for a
-      sink that writes nowhere. Both are defensible and the hidden acceptance
-      silently picks one. The intended contract has since been decided
-      (accepted-count; a null sink accepts what it discards) but is NOT APPLIED
-      here — repairing the wording belongs to BV1.
+      The original wording said both "actually accepted" (reads as 3) and
+      "what was really written" / "free to reject" (reads as 0 for a sink
+      that writes nowhere), and the hidden acceptance silently picked the
+      first. BV1 removed the second reading from the task: the contract is
+      accepted-count, a successful Write accepts the records passed to it,
+      the null sink counts what it deliberately discards, and a failed Write
+      contributes nothing. The task now states each of these directly, so
+      the oracle's interpretation is the only one the text supports.
