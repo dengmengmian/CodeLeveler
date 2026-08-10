@@ -1085,6 +1085,67 @@ async fn direct_budget_stop_preserves_the_executor_detail() {
 }
 
 #[tokio::test]
+async fn a_successful_repair_converges_on_fresh_verification() {
+    // The goal turn leaves the tree failing the gate; the repair turn creates
+    // the marker the gate checks for. Verified must come from the fresh
+    // post-repair verification — the gate genuinely fails before the repair
+    // and can only pass against the repaired tree.
+    let mut responses = patch_then_resolve();
+    responses.push(tool_call(
+        "r1",
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Add File: repaired.marker\n+ok\n*** End Patch"
+        }),
+    ));
+    responses.push(tool_call(
+        "g2",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "repaired"}),
+    ));
+    let h = harness(responses).await;
+    let plan = VerificationPlan {
+        commands: vec![VerificationCommand {
+            name: "marker".into(),
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec![
+                    "/c".into(),
+                    "if exist repaired.marker (exit 0) else (exit 1)".into(),
+                ]
+            } else {
+                vec!["-c".into(), "test -f repaired.marker".into()]
+            },
+            kind: CheckKind::Test,
+            gating: true,
+            timeout_seconds: 30,
+            scope_policy: Default::default(),
+        }],
+    };
+    let spec = spec(&h, plan);
+    let session = h.engine.create_task(&spec).await.unwrap();
+
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "a repaired tree with a green fresh verification must verify"
+    );
+
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    let kinds: Vec<&str> = turns.iter().map(|t| t.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["user", "repair"],
+        "exactly one repair turn, then convergence"
+    );
+}
+
+#[tokio::test]
 async fn failed_verification_repairs_once_then_fails() {
     // Goal turn (patch + resolve), one repair turn (resolve again), gate
     // always fails → Failed after the bounded repair.
