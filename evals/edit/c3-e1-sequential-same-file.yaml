@@ -1,0 +1,95 @@
+# C3-E1 — Sequential same-file edits. Two independent semantic changes in one
+# named file; the hidden acceptance requires both. The failure this measures is
+# a later edit clobbering or reverting an earlier correct one, not navigation:
+# the task names the exact file.
+id: c3-e1-sequential-same-file
+name: "[edit] summary skips nameless records and gains Reset"
+repo: fixtures/repos/navsvc
+max_rounds: 40
+relevant_paths:
+  - internal/report/summary.go
+required_impact_paths:
+  - internal/report/summary.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+task: |
+  Two problems in `internal/report/summary.go`:
+
+  First, a decoder can emit a record whose name is empty (a line with values
+  but no name column). The summary currently counts those, which shows up as
+  a nameless row. Records with an empty name must not be counted at all.
+
+  Second, callers embedding the summary want to reuse one instance across
+  runs. Add a `Reset` method that clears everything the summary has
+  accumulated, so after `Reset` it renders exactly like a fresh summary.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cat > internal/report/zz_hidden_e1_test.go <<'GO'
+      package report
+
+      import (
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func TestNamelessRecordsAreNotCounted(t *testing.T) {
+      	s := NewSummary()
+      	s.Observe(api.Batch{Records: []api.Record{
+      		{Name: "a", Value: 1, Valid: true},
+      		{Name: "", Value: 9, Valid: true},
+      	}})
+      	out := s.Render()
+      	if out != "a count=1 total=1\n" {
+      		t.Fatalf("nameless record leaked into the summary: %q", out)
+      	}
+      }
+
+      func TestResetClearsAccumulatedState(t *testing.T) {
+      	s := NewSummary()
+      	s.Observe(api.Batch{Records: []api.Record{{Name: "a", Value: 1, Valid: true}}})
+      	s.Reset()
+      	if out := s.Render(); out != "" {
+      		t.Fatalf("Reset left state behind: %q", out)
+      	}
+      	s.Observe(api.Batch{Records: []api.Record{{Name: "b", Value: 2, Valid: true}}})
+      	if out := s.Render(); out != "b count=1 total=2\n" {
+      		t.Fatalf("summary unusable after Reset: %q", out)
+      	}
+      }
+      GO
+      trap 'rm -f internal/report/zz_hidden_e1_test.go' EXIT
+      go build ./... > /dev/null
+      go test ./internal/report/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only: consumed by
+# scripts/check_fixture_validity.py, never placed in agent context.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Whether both changes survive in the final tree: nameless records skipped
+      AND Reset restoring a summary to fresh-render state.
+    oracle_interpretation: >-
+      Empty-name records never reach counts; Reset() then Render() yields the
+      empty string; the summary keeps working after Reset.
+    rationale: >-
+      Both behaviors are stated directly ("must not be counted at all",
+      "renders exactly like a fresh summary"). Neither admits a second
+      reading; the case's difficulty is keeping both edits alive in one file,
+      not interpreting the ask.

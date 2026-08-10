@@ -1,0 +1,72 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..7cd6311 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"fmt"
+ 	"os"
++	"strings"
+ 
+ 	"navsvc/internal/config"
+ 	"navsvc/internal/ingest"
+@@ -68,6 +69,18 @@ func run(args []string) error {
+ 			collected = append(collected, batch)
+ 			return nil
+ 		}
++		// Output-only name shaping: prefix first, then casing, so the two
++		// options compose in the documented order. Summary mode reports the
++		// incoming names and is deliberately left alone.
++		if cfg.Output.NamePrefix != "" || cfg.Output.UppercaseNames {
++			for i := range batch.Records {
++				name := cfg.Output.NamePrefix + batch.Records[i].Name
++				if cfg.Output.UppercaseNames {
++					name = strings.ToUpper(name)
++				}
++				batch.Records[i].Name = name
++			}
++		}
+ 		return out.Write(batch)
+ 	})
+ 	if err != nil {
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 0010397..bfe695d 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -2,9 +2,9 @@ package config
+ 
+ // Config is the parsed, validated runtime configuration.
+ type Config struct {
+-	Input     InputConfig
+-	Pipeline  PipelineConfig
+-	Output    OutputConfig
++	Input    InputConfig
++	Pipeline PipelineConfig
++	Output   OutputConfig
+ }
+ 
+ type InputConfig struct {
+@@ -23,4 +23,8 @@ type PipelineConfig struct {
+ type OutputConfig struct {
+ 	Sink   string
+ 	Pretty bool
++	// NamePrefix, when non-empty, is prepended to record names on output.
++	NamePrefix string
++	// UppercaseNames uppercases record names on output.
++	UppercaseNames bool
+ }
+diff --git a/internal/config/load.go b/internal/config/load.go
+index bcc5136..b9ff6ff 100644
+--- a/internal/config/load.go
++++ b/internal/config/load.go
+@@ -62,6 +62,10 @@ func assign(cfg *Config, key, value string) error {
+ 			return fmt.Errorf("pipeline.max_depth: %w", err)
+ 		}
+ 		cfg.Pipeline.MaxDepth = n
++	case "output.name_prefix":
++		cfg.Output.NamePrefix = value
++	case "output.uppercase_names":
++		cfg.Output.UppercaseNames = value == "true"
+ 	case "output.sink":
+ 		cfg.Output.Sink = value
+ 	case "output.pretty":

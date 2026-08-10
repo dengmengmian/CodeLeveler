@@ -1,0 +1,26 @@
+diff --git a/internal/report/summary.go b/internal/report/summary.go
+index 79f23c9..6dd2c50 100644
+--- a/internal/report/summary.go
++++ b/internal/report/summary.go
+@@ -25,11 +25,21 @@ func NewSummary() *Summary {
+ // Observe folds one batch into the running totals.
+ func (s *Summary) Observe(batch api.Batch) {
+ 	for _, record := range batch.Records {
++		if record.Name == "" {
++			continue
++		}
+ 		s.counts[record.Name]++
+ 		s.totals[record.Name] += record.Value
+ 	}
+ }
+ 
++// Reset clears everything the summary has accumulated, so one instance can
++// be reused across runs.
++func (s *Summary) Reset() {
++	s.counts = map[string]int{}
++	s.totals = map[string]float64{}
++}
++
+ // Render produces the human-readable report, one line per name, sorted.
+ func (s *Summary) Render() string {
+ 	names := make([]string, 0, len(s.counts))

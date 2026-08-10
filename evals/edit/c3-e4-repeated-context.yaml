@@ -1,0 +1,144 @@
+# C3-E4 — Structural patch in repeated context. MaxValue and MinValue are
+# near-identical loops; only MaxValue carries the zero-initialization bug. A
+# patch anchored on the shared loop body instead of the right function edits
+# the healthy twin. Rewriting both "to be safe" is also a failure: MinValue's
+# behaviour is pinned.
+id: c3-e4-repeated-context
+name: "[edit] MaxValue survives all-negative input, MinValue untouched"
+repo: fixtures/repos/navsvc
+max_rounds: 40
+relevant_paths:
+  - internal/report/extremes.go
+required_impact_paths:
+  - internal/report/extremes.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+files:
+  internal/report/extremes.go: |
+    package report
+
+    import "navsvc/pkg/api"
+
+    // MaxValue reports the largest valid value across the batches, or 0 when
+    // there are no valid records.
+    func MaxValue(batches []api.Batch) float64 {
+    	found := false
+    	best := 0.0
+    	for _, batch := range batches {
+    		for _, record := range batch.Records {
+    			if !record.Valid {
+    				continue
+    			}
+    			if !found || record.Value > best {
+    				if record.Value > best {
+    					best = record.Value
+    				}
+    				found = true
+    			}
+    		}
+    	}
+    	return best
+    }
+
+    // MinValue reports the smallest valid value across the batches, or 0 when
+    // there are no valid records.
+    func MinValue(batches []api.Batch) float64 {
+    	found := false
+    	best := 0.0
+    	for _, batch := range batches {
+    		for _, record := range batch.Records {
+    			if !record.Valid {
+    				continue
+    			}
+    			if !found || record.Value < best {
+    				best = record.Value
+    				found = true
+    			}
+    		}
+    	}
+    	return best
+    }
+task: |
+  `internal/report/extremes.go` has a reported bug: a run whose valid values
+  are all negative reports `MaxValue` as 0 — a value that never occurred.
+  `MaxValue([-3, -1])` must be -1. The empty-input behaviour (0 when there
+  are no valid records) stays.
+
+  `MinValue` right next to it looks nearly the same but is correct — leave
+  its behaviour exactly as it is.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cat > internal/report/zz_hidden_e4_test.go <<'GO'
+      package report
+
+      import (
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func rb(values ...float64) []api.Batch {
+      	records := make([]api.Record, 0, len(values))
+      	for _, value := range values {
+      		records = append(records, api.Record{Name: "m", Value: value, Valid: true})
+      	}
+      	return []api.Batch{{Records: records}}
+      }
+
+      func TestMaxValueSurvivesAllNegativeInput(t *testing.T) {
+      	if got := MaxValue(rb(-3, -1)); got != -1 {
+      		t.Fatalf("MaxValue([-3,-1]): want -1, got %g", got)
+      	}
+      	if got := MaxValue(rb(2, 5, 3)); got != 5 {
+      		t.Fatalf("MaxValue([2,5,3]): want 5, got %g", got)
+      	}
+      	if got := MaxValue(nil); got != 0 {
+      		t.Fatalf("MaxValue(empty): want 0, got %g", got)
+      	}
+      }
+
+      func TestMinValueBehaviourIsPinned(t *testing.T) {
+      	if got := MinValue(rb(2, 5)); got != 2 {
+      		t.Fatalf("MinValue([2,5]): want 2, got %g", got)
+      	}
+      	if got := MinValue(rb(-3, -1)); got != -3 {
+      		t.Fatalf("MinValue([-3,-1]): want -3, got %g", got)
+      	}
+      	if got := MinValue(nil); got != 0 {
+      		t.Fatalf("MinValue(empty): want 0, got %g", got)
+      	}
+      }
+      GO
+      trap 'rm -f internal/report/zz_hidden_e4_test.go' EXIT
+      go build ./... > /dev/null
+      go test ./internal/report/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      MaxValue correct for all-negative input while MinValue's (already
+      correct) behaviour is preserved.
+    oracle_interpretation: >-
+      MaxValue([-3,-1]) == -1, positives and empty unchanged; MinValue
+      unchanged on positives, negatives and empty.
+    rationale: >-
+      The task quotes the failing input and expected output, pins the empty
+      case, and pins the twin. The difficulty is anchoring the edit in the
+      right one of two nearly identical loops.

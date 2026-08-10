@@ -62,7 +62,13 @@ import tempfile
 
 import yaml
 
+# Reference patches live beside the cases they prove: <cases-dir>/reference/.
+# Kept as a module global so the checker's own tests can point it elsewhere.
 REFERENCE_DIR = "evals/navigation/reference"
+
+
+def reference_dir_for(cases_dir: str) -> str:
+    return os.path.join(cases_dir, "reference")
 
 VALID = "VALID"
 INVALID = "INVALID"
@@ -289,6 +295,8 @@ def main() -> None:
                                    ("G1", "G2", "G3", "G4", "G5", "G6")) + "   status")
 
     results = []
+    global REFERENCE_DIR
+    REFERENCE_DIR = reference_dir_for(args.cases)
     for path in sorted(glob.glob(f"{args.cases}/*.yaml")):
         case_id = yaml.safe_load(open(path))["id"]
         if args.only and args.only != case_id:

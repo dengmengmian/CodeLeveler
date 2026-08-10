@@ -1,0 +1,98 @@
+# C3-E3 — Ambiguous exact edit. The two helpers are line-for-line identical on
+# purpose: a careless replace_all, or a patch hunk anchored on the shared body
+# instead of the enclosing function, changes both. The acceptance requires one
+# changed and the other byte-for-byte in behavior.
+id: c3-e3-ambiguous-exact
+name: "[edit] trim the label helper only, its twin stays put"
+repo: fixtures/repos/navsvc
+max_rounds: 40
+relevant_paths:
+  - internal/report/trim.go
+required_impact_paths:
+  - internal/report/trim.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+files:
+  internal/report/trim.go: |
+    package report
+
+    import "strings"
+
+    // trimSummaryName cleans a metric name before it is used as a summary row
+    // key. Exporters pad names; the row key must not carry that padding.
+    func trimSummaryName(name string) string {
+    	name = strings.TrimSpace(name)
+    	name = strings.Trim(name, "\"")
+    	return name
+    }
+
+    // trimLabelName cleans a label key before it is matched against configured
+    // label filters. Exporters pad these too.
+    func trimLabelName(name string) string {
+    	name = strings.TrimSpace(name)
+    	name = strings.Trim(name, "\"")
+    	return name
+    }
+task: |
+  Prometheus-style exporters emit label keys with a trailing colon —
+  `env:`, `host:` — and our label matching misses them.
+
+  In `internal/report/trim.go`, `trimLabelName` must also drop a single
+  trailing `:` (after the existing cleanup). `trimSummaryName` looks almost
+  identical, but its behaviour is part of the row-key format and must not
+  change: a summary name that ends in `:` keeps it.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cat > internal/report/zz_hidden_e3_test.go <<'GO'
+      package report
+
+      import "testing"
+
+      func TestLabelHelperDropsTrailingColon(t *testing.T) {
+      	if got := trimLabelName(" env: "); got != "env" {
+      		t.Fatalf("label helper: want %q, got %q", "env", got)
+      	}
+      	if got := trimLabelName("host"); got != "host" {
+      		t.Fatalf("label helper must not disturb plain names: %q", got)
+      	}
+      }
+
+      func TestSummaryHelperKeepsTrailingColon(t *testing.T) {
+      	if got := trimSummaryName(" ratio: "); got != "ratio:" {
+      		t.Fatalf("summary helper must keep the colon: got %q", got)
+      	}
+      }
+      GO
+      trap 'rm -f internal/report/zz_hidden_e3_test.go' EXIT
+      go build ./... > /dev/null
+      go test ./internal/report/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Which of the two identical helpers changed: the label one must drop a
+      trailing colon, the summary one must keep it.
+    oracle_interpretation: >-
+      trimLabelName(" env: ") == "env"; trimSummaryName(" ratio: ") ==
+      "ratio:".
+    rationale: >-
+      The task names both functions, states the new behaviour for one and
+      explicitly pins the other ("must not change ... keeps it"). The only
+      way to fail is editing the wrong occurrence or both.

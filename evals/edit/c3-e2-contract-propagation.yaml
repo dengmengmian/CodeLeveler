@@ -1,0 +1,117 @@
+# C3-E2 — Multi-file contract propagation with NO compiler coupling. The new
+# rule ("writes after Close fail") is behavioral: missing one implementation
+# still compiles and still passes the generic suite, so only complete
+# propagation across all four implementors satisfies the acceptance.
+id: c3-e2-contract-propagation
+name: "[edit] every sink refuses writes after Close"
+repo: fixtures/repos/navsvc
+max_rounds: 50
+relevant_paths:
+  - internal/sink/sink.go
+required_impact_paths:
+  - internal/sink/stdout.go
+  - internal/sink/file.go
+  - internal/sink/null.go
+  - internal/testutil/fakesink.go
+distractor_paths:
+  - legacy/oldsummary.go
+forbidden_edit_paths:
+  - legacy/oldsummary.go
+task: |
+  A pipeline bug wrote batches into a sink that had already been closed; the
+  records vanished without a trace. That must become impossible.
+
+  Once a sink's `Close` has been called, any further `Write` must return an
+  error — never panic, never silently succeed. This is part of the sink
+  contract, so it applies to every sink in `internal/sink` (stdout, file,
+  null) and to the test double `internal/testutil.FakeSink`, which must obey
+  the same contract the real ones do.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cat > internal/sink/zz_hidden_e2_test.go <<'GO'
+      package sink
+
+      import (
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func TestEverySinkRefusesWriteAfterClose(t *testing.T) {
+      	batch := api.Batch{Records: []api.Record{{Name: "a", Value: 1, Valid: true}}}
+      	for _, name := range []string{"stdout", "file", "null"} {
+      		s, ok := For(name)
+      		if !ok {
+      			t.Fatalf("sink %q missing", name)
+      		}
+      		if err := s.Write(batch); err != nil {
+      			t.Fatalf("%s: write before close failed: %v", name, err)
+      		}
+      		if err := s.Close(); err != nil {
+      			t.Fatalf("%s: close failed: %v", name, err)
+      		}
+      		if err := s.Write(batch); err == nil {
+      			t.Fatalf("%s: write after close must fail", name)
+      		}
+      	}
+      }
+      GO
+      cat > internal/testutil/zz_hidden_e2_test.go <<'GO'
+      package testutil
+
+      import (
+      	"testing"
+
+      	"navsvc/pkg/api"
+      )
+
+      func TestFakeSinkObeysTheClosedContract(t *testing.T) {
+      	f := &FakeSink{}
+      	batch := api.Batch{Records: []api.Record{{Name: "a", Value: 1, Valid: true}}}
+      	if err := f.Write(batch); err != nil {
+      		t.Fatalf("write before close failed: %v", err)
+      	}
+      	if err := f.Close(); err != nil {
+      		t.Fatalf("close failed: %v", err)
+      	}
+      	if err := f.Write(batch); err == nil {
+      		t.Fatal("the double must obey the contract: write after close fails")
+      	}
+      	if len(f.Batches) != 1 {
+      		t.Fatalf("the refused write must not be recorded: %d", len(f.Batches))
+      	}
+      }
+      GO
+      trap 'rm -f internal/sink/zz_hidden_e2_test.go internal/testutil/zz_hidden_e2_test.go' EXIT
+      go build ./... > /dev/null
+      go test ./internal/sink/ ./internal/testutil/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Whether all four implementations — not just some — refuse a Write after
+      Close with an error.
+    oracle_interpretation: >-
+      For stdout, file, null (via the registry) and FakeSink: Write succeeds
+      before Close, errors after Close, and the double does not record the
+      refused batch.
+    rationale: >-
+      The task states the rule ("any further Write must return an error"),
+      enumerates the implementations by name, and explicitly binds the test
+      double to the same contract. What is measured is completeness of
+      propagation, not interpretation.

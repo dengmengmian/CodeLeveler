@@ -1,0 +1,11 @@
+diff --git a/internal/report/trim.go b/internal/report/trim.go
+index cbefa79..6bd9f65 100644
+--- a/internal/report/trim.go
++++ b/internal/report/trim.go
+@@ -15,5 +15,6 @@ func trimSummaryName(name string) string {
+ func trimLabelName(name string) string {
+ 	name = strings.TrimSpace(name)
+ 	name = strings.Trim(name, "\"")
++	name = strings.TrimSuffix(name, ":")
+ 	return name
+ }

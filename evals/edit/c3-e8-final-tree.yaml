@@ -1,0 +1,79 @@
+# C3-E8 — Final-tree consistency. Three numbers, one line. Implementing one or
+# two of them renders a plausible-looking stats line and every generic check
+# stays green; only the full triple — plus the no-flag exemption — passes. The
+# case measures whether the final tree carries the whole ask, not a half-fix
+# that looks done.
+id: c3-e8-final-tree
+name: "[edit] --stats reports records, invalid and distinct — all three"
+repo: fixtures/repos/navsvc
+max_rounds: 50
+relevant_paths:
+  - cmd/navsvc/main.go
+required_impact_paths:
+  - cmd/navsvc/main.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+task: |
+  Operators triaging a noisy exporter want one line of run totals. Add a
+  `--stats` flag to `navsvc` (in `cmd/navsvc/main.go`; the counting itself
+  may live in `internal/report` if that is cleaner).
+
+  With `--summary --stats`, after the normal summary output, print exactly
+  one final line to stdout:
+
+      records=<N> invalid=<M> distinct=<K>
+
+  where N counts every record that reached the report stage, M counts those
+  the decoder marked not valid, and K counts distinct names among the valid
+  records only.
+
+  Without `--stats`, output is unchanged — no stats line anywhere.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/e8.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf '{"name":"a","value":1}\n{"name":"a","value":2}\n{"name":"b","value":5}\n{"name":"g","value":"zz"}\n' > "$d/in.jsonl"
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/c.conf"
+      out="$(< "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary --stats)"
+      printf '%s\n' "$out" | tail -1 | grep -qx 'records=4 invalid=1 distinct=2'
+      # the summary above the stats line is untouched
+      printf '%s\n' "$out" | grep -qx 'a count=2 total=3'
+      # empty input still reports a (all-zero) stats line
+      printf '' | "$d/navsvc" "$d/c.conf" --summary --stats | tail -1 | grep -qx 'records=0 invalid=0 distinct=0'
+      # without --stats nothing changes
+      < "$d/in.jsonl" "$d/navsvc" "$d/c.conf" --summary | grep -q 'records=' && exit 1
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      All three counters correct in one line — total, invalid, distinct-valid
+      — plus the exact format, the empty-input case, and no line without the
+      flag.
+    oracle_interpretation: >-
+      records counts everything that reached the report stage, invalid counts
+      Valid==false, distinct counts distinct names among valid records; the
+      line is the last line of --summary --stats output and absent otherwise.
+    rationale: >-
+      Each counter's definition is a stated sentence ("every record that
+      reached the report stage", "those the decoder marked not valid",
+      "distinct names among the valid records only"), and the no-flag
+      exemption is explicit. Partial implementations fail on the numbers,
+      not on interpretation.

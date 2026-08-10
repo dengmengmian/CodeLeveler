@@ -1,0 +1,40 @@
+diff --git a/cmd/navsvc/main.go b/cmd/navsvc/main.go
+index c803dce..9a418cf 100644
+--- a/cmd/navsvc/main.go
++++ b/cmd/navsvc/main.go
+@@ -22,10 +22,13 @@ func main() {
+ func run(args []string) error {
+ 	configPath := ""
+ 	summarize := false
++	stats := false
+ 	for _, arg := range args {
+ 		switch {
+ 		case arg == "--summary":
+ 			summarize = true
++		case arg == "--stats":
++			stats = true
+ 		case configPath == "":
+ 			configPath = arg
+ 		}
+@@ -75,6 +78,21 @@ func run(args []string) error {
+ 	}
+ 	if summarize {
+ 		fmt.Print(report.Aggregate(collected))
++		if stats {
++			records, invalid := 0, 0
++			distinct := map[string]struct{}{}
++			for _, batch := range collected {
++				for _, record := range batch.Records {
++					records++
++					if !record.Valid {
++						invalid++
++						continue
++					}
++					distinct[record.Name] = struct{}{}
++				}
++			}
++			fmt.Printf("records=%d invalid=%d distinct=%d\n", records, invalid, len(distinct))
++		}
+ 	}
+ 	return nil
+ }

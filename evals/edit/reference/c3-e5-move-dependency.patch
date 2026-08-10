@@ -1,0 +1,52 @@
+diff --git a/cmd/navsvc/names.go b/cmd/navsvc/names.go
+index 7a97e49..4208d7d 100644
+--- a/cmd/navsvc/names.go
++++ b/cmd/navsvc/names.go
+@@ -11,5 +11,5 @@ import (
+ // printNameCount writes the distinct-name count for a finished run. Kept
+ // separate from run() so the reporting shape is testable.
+ func printNameCount(w io.Writer, batches []api.Batch) {
+-	fmt.Fprintf(w, "names: %d\n", report.Distinct(batches))
++	fmt.Fprintf(w, "names: %d\n", report.DistinctNames(batches))
+ }
+diff --git a/internal/report/aggregate.go b/internal/report/aggregate.go
+index 75b4375..680fba2 100644
+--- a/internal/report/aggregate.go
++++ b/internal/report/aggregate.go
+@@ -11,15 +11,3 @@ func Aggregate(batches []api.Batch) string {
+ 	}
+ 	return summary.Render()
+ }
+-
+-// Distinct reports how many distinct names a set of batches contains. Used by
+-// the CLI's --names-only mode.
+-func Distinct(batches []api.Batch) int {
+-	seen := map[string]struct{}{}
+-	for _, batch := range batches {
+-		for _, record := range batch.Records {
+-			seen[record.Name] = struct{}{}
+-		}
+-	}
+-	return len(seen)
+-}
+diff --git a/internal/report/distinct.go b/internal/report/distinct.go
+new file mode 100644
+index 0000000..393afb1
+--- /dev/null
++++ b/internal/report/distinct.go
+@@ -0,0 +1,15 @@
++package report
++
++import "navsvc/pkg/api"
++
++// DistinctNames reports how many distinct names a set of batches contains.
++// Used by the CLI's --names-only mode.
++func DistinctNames(batches []api.Batch) int {
++	seen := map[string]struct{}{}
++	for _, batch := range batches {
++		for _, record := range batch.Records {
++			seen[record.Name] = struct{}{}
++		}
++	}
++	return len(seen)
++}

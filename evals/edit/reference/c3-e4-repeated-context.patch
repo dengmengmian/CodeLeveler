@@ -1,0 +1,15 @@
+diff --git a/internal/report/extremes.go b/internal/report/extremes.go
+index f9bd1fa..aa38076 100644
+--- a/internal/report/extremes.go
++++ b/internal/report/extremes.go
+@@ -13,9 +13,7 @@ func MaxValue(batches []api.Batch) float64 {
+ 				continue
+ 			}
+ 			if !found || record.Value > best {
+-				if record.Value > best {
+-					best = record.Value
+-				}
++				best = record.Value
+ 				found = true
+ 			}
+ 		}

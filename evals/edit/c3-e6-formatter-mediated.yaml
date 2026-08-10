@@ -1,0 +1,105 @@
+# C3-E6 — Formatter-mediated edit. The file ships gofmt-dirty on purpose: the
+# first successful edit triggers auto-format, which rewrites the WHOLE file —
+# including the region the second obligation lives in. The second edit must be
+# built against the formatted tree, not the stale pre-format text.
+id: c3-e6-formatter-mediated
+name: "[edit] raise the line cap and fix the label clamp in one dirty file"
+repo: fixtures/repos/navsvc
+max_rounds: 40
+relevant_paths:
+  - internal/config/limits.go
+required_impact_paths:
+  - internal/config/limits.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+files:
+  internal/config/limits.go: |
+    package config
+
+    // Ingest guardrails. These bound what a single input line may cost before
+    // the decoder gives up on it.
+    const (
+    	MaxLineBytes   =   4096
+    	MaxLabelCount    = 8
+    )
+
+    // ClampLabelCount bounds a requested per-record label capacity to the
+    // configured maximum. Zero or negative requests fall back to the maximum.
+    func ClampLabelCount(requested int) int {
+    	if requested <= 0 {
+    			return MaxLabelCount
+    	}
+    	if requested > MaxLabelCount+1 {
+    		return MaxLabelCount
+    	}
+    	return requested
+    }
+task: |
+  Two fixes in `internal/config/limits.go`:
+
+  Operators ingest exporter dumps whose lines exceed the current 4096-byte
+  cap and get silently truncated records. Raise `MaxLineBytes` to one
+  megabyte (1048576).
+
+  Separately, `ClampLabelCount` is off by one: a request of 9 slips through
+  even though the maximum is 8. Any request above `MaxLabelCount` must clamp
+  to `MaxLabelCount` exactly.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      cat > internal/config/zz_hidden_e6_test.go <<'GO'
+      package config
+
+      import "testing"
+
+      func TestLineCapIsOneMegabyte(t *testing.T) {
+      	if MaxLineBytes != 1048576 {
+      		t.Fatalf("MaxLineBytes: want 1048576, got %d", MaxLineBytes)
+      	}
+      }
+
+      func TestLabelClampHasNoOffByOne(t *testing.T) {
+      	if got := ClampLabelCount(9); got != MaxLabelCount {
+      		t.Fatalf("ClampLabelCount(9): want %d, got %d", MaxLabelCount, got)
+      	}
+      	if got := ClampLabelCount(3); got != 3 {
+      		t.Fatalf("ClampLabelCount(3): want 3, got %d", got)
+      	}
+      	if got := ClampLabelCount(0); got != MaxLabelCount {
+      		t.Fatalf("ClampLabelCount(0): want %d, got %d", MaxLabelCount, got)
+      	}
+      }
+      GO
+      trap 'rm -f internal/config/zz_hidden_e6_test.go' EXIT
+      go build ./... > /dev/null
+      go test ./internal/config/ > /dev/null
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Both fixes present in the final tree after the auto-formatter has
+      rewritten the file between them.
+    oracle_interpretation: >-
+      MaxLineBytes == 1048576 and ClampLabelCount caps strictly at
+      MaxLabelCount, with the in-range and fallback behaviour preserved.
+    rationale: >-
+      Both changes are stated with exact values ("one megabyte (1048576)",
+      "must clamp to MaxLabelCount exactly"). The difficulty is mechanical —
+      the formatter rewrites the whole dirty file after the first edit — not
+      interpretive.

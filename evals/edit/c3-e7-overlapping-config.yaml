@@ -1,0 +1,78 @@
+# C3-E7 — Cross-file overlapping mutation. Two features thread the same
+# contract (config struct → parser → the one output path in main) and land on
+# the same lines. The second edit must not undo the first, and their stated
+# composition order must hold when both are on.
+id: c3-e7-overlapping-config
+name: "[edit] output name_prefix and uppercase_names compose in order"
+repo: fixtures/repos/navsvc
+max_rounds: 50
+relevant_paths:
+  - internal/config/config.go
+  - cmd/navsvc/main.go
+required_impact_paths:
+  - internal/config/config.go
+  - internal/config/load.go
+  - cmd/navsvc/main.go
+distractor_paths:
+  - legacy/oldpipeline.go
+forbidden_edit_paths:
+  - legacy/oldpipeline.go
+task: |
+  Operators piping `navsvc` output into a shared metrics bus asked for two
+  output options. Both are config keys under `output.`, parsed in
+  `internal/config` and applied in `cmd/navsvc/main.go` where records are
+  written to the sink:
+
+  - `output.name_prefix` (string): every record's name gains this prefix on
+    output. Absent or empty means no change.
+  - `output.uppercase_names` (bool): record names are uppercased on output.
+    Absent means no change.
+
+  When both are set, the prefix is added first and then the whole name is
+  uppercased. `--summary` mode reports names as they came in — neither
+  option affects it.
+
+  Do not change existing tests. `go build ./...` and `go test ./...` must pass.
+expect:
+  program: bash
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      d="$(mktemp -d "${TMPDIR:-/tmp}/e7.XXXXXX")"
+      trap 'rm -rf "$d"' EXIT
+      go build -o "$d/navsvc" ./cmd/navsvc
+      printf '{"name":"req","value":1}\n' > "$d/in.jsonl"
+      printf 'input.format = jsonl\noutput.sink = stdout\noutput.name_prefix = svc_\n' > "$d/p.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/p.conf" 2>/dev/null)" = "svc_req=1" ]
+      printf 'input.format = jsonl\noutput.sink = stdout\noutput.uppercase_names = true\n' > "$d/u.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/u.conf" 2>/dev/null)" = "REQ=1" ]
+      printf 'input.format = jsonl\noutput.sink = stdout\noutput.name_prefix = svc_\noutput.uppercase_names = true\n' > "$d/b.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/b.conf" 2>/dev/null)" = "SVC_REQ=1" ]
+      printf 'input.format = jsonl\noutput.sink = stdout\n' > "$d/n.conf"
+      [ "$(< "$d/in.jsonl" "$d/navsvc" "$d/n.conf" 2>/dev/null)" = "req=1" ]
+      # summary reports names as they came in
+      < "$d/in.jsonl" "$d/navsvc" "$d/b.conf" --summary | grep -qx 'req count=1 total=1'
+      git diff --quiet -- legacy/
+      go test ./... > /dev/null
+
+# Benchmark-author validity metadata. Metrics-only.
+validity:
+  maintained_checks:
+    - ["go", "build", "./..."]
+    - ["go", "test", "./..."]
+  constraints:
+    existing_tests_unmodified: true
+  semantics:
+    status: UNAMBIGUOUS
+    critical_observable: >-
+      Each option alone, their stated composition order when combined, the
+      no-op defaults, and summary mode staying untouched.
+    oracle_interpretation: >-
+      name_prefix yields svc_req=1; uppercase yields REQ=1; both yield
+      SVC_REQ=1 (prefix first, then uppercase); absent options change
+      nothing; --summary shows the incoming name.
+    rationale: >-
+      The task defines both keys, their defaults, the composition order
+      ("prefix is added first and then the whole name is uppercased") and
+      the summary exemption. Every assertion mirrors a stated sentence.

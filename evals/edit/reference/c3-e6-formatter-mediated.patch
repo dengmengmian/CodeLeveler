@@ -1,0 +1,26 @@
+diff --git a/internal/config/limits.go b/internal/config/limits.go
+index 33a9597..8fa37a5 100644
+--- a/internal/config/limits.go
++++ b/internal/config/limits.go
+@@ -3,17 +3,17 @@ package config
+ // Ingest guardrails. These bound what a single input line may cost before
+ // the decoder gives up on it.
+ const (
+-	MaxLineBytes   =   4096
+-	MaxLabelCount    = 8
++	MaxLineBytes  = 1048576
++	MaxLabelCount = 8
+ )
+ 
+ // ClampLabelCount bounds a requested per-record label capacity to the
+ // configured maximum. Zero or negative requests fall back to the maximum.
+ func ClampLabelCount(requested int) int {
+ 	if requested <= 0 {
+-			return MaxLabelCount
++		return MaxLabelCount
+ 	}
+-	if requested > MaxLabelCount+1 {
++	if requested > MaxLabelCount {
+ 		return MaxLabelCount
+ 	}
+ 	return requested
