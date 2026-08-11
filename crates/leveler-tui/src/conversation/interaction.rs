@@ -70,7 +70,7 @@ pub fn ensure_plain(state: &mut AppState) {
 pub fn scroll_by(state: &mut AppState, delta: i32) {
     let height = geometry::viewport_height(state);
     let width = geometry::content_width(state);
-    let total = crate::workbench::conversation_line_count(state, width);
+    let total = crate::conversation::build::conversation_line_count(state, width);
     let max_scroll = geometry::max_scroll(total, height);
     if delta < 0 {
         state.conv.auto_scroll = false;
@@ -97,7 +97,7 @@ pub fn scroll_pinned_by(state: &mut AppState, delta: i32) {
     }
     let height = geometry::viewport_height(state);
     let width = geometry::content_width(state);
-    let total = crate::workbench::conversation_line_count(state, width);
+    let total = crate::conversation::build::conversation_line_count(state, width);
     let max_scroll = geometry::max_scroll(total, height);
     state.conv.auto_scroll = false;
     if delta < 0 {
@@ -117,7 +117,7 @@ pub fn jump_to_live_edge(state: &mut AppState) {
     state.conv.unread = 0;
     let height = geometry::viewport_height(state);
     let width = geometry::content_width(state);
-    let total = crate::workbench::conversation_line_count(state, width);
+    let total = crate::conversation::build::conversation_line_count(state, width);
     state.conv.scroll = geometry::max_scroll(total, height);
 }
 

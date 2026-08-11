@@ -69,7 +69,7 @@ pub fn screen_to_content(
     let total = if state.conv.plain_width == width && !state.conv.plain.is_empty() {
         state.conv.plain.len()
     } else {
-        crate::workbench::conversation_line_count(state, width)
+        crate::conversation::build::conversation_line_count(state, width)
     };
     // While selecting we always use the pinned scroll, never auto-follow
     // bottom (the drag anchor must not move under the pointer).

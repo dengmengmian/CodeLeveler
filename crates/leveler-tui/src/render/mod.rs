@@ -1187,7 +1187,7 @@ mod tests {
             crate::action::Action::Runtime(leveler_client_protocol::RuntimeEvent::TurnCompleted),
         );
 
-        let rendered: Vec<String> = crate::workbench::build_conversation_lines(&s, 80)
+        let rendered: Vec<String> = crate::conversation::build::build_conversation_lines(&s, 80)
             .iter()
             .map(line_str)
             .collect();
@@ -1224,7 +1224,7 @@ mod tests {
                 error: "boom".into(),
             }),
         );
-        let joined: String = crate::workbench::build_conversation_lines(&s, 80)
+        let joined: String = crate::conversation::build::build_conversation_lines(&s, 80)
             .iter()
             .map(line_str)
             .collect::<Vec<_>>()
@@ -1263,7 +1263,7 @@ mod tests {
         // A finished batch states that it happened and names its failures; the
         // error text itself is one Ctrl+O away, so a run full of broken calls
         // stays readable.
-        let auto: String = crate::workbench::build_conversation_lines(&s, 100)
+        let auto: String = crate::conversation::build::build_conversation_lines(&s, 100)
             .iter()
             .map(line_str)
             .collect::<Vec<_>>()
@@ -1284,7 +1284,7 @@ mod tests {
         if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items_mut().last_mut() {
             group.expanded = true;
         }
-        let open: String = crate::workbench::build_conversation_lines(&s, 100)
+        let open: String = crate::conversation::build::build_conversation_lines(&s, 100)
             .iter()
             .map(line_str)
             .collect::<Vec<_>>()
@@ -1298,7 +1298,7 @@ mod tests {
         if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items_mut().last_mut() {
             group.expanded = true;
         }
-        let expanded: String = crate::workbench::build_conversation_lines(&s, 100)
+        let expanded: String = crate::conversation::build::build_conversation_lines(&s, 100)
             .iter()
             .map(line_str)
             .collect::<Vec<_>>()

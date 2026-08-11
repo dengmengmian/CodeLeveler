@@ -7,6 +7,7 @@
 //! because the worst interaction bug this UI ever shipped ("click A, group B
 //! expands") was exactly two modules computing the same scroll two ways.
 
+pub mod build;
 pub mod geometry;
 pub mod interaction;
 pub mod view;
@@ -25,7 +26,7 @@ pub fn pin_at_current_viewport(state: &mut AppState) {
     if state.conv.auto_scroll {
         let width = geometry::content_width(state);
         let height = geometry::viewport_height(state);
-        let total = crate::workbench::conversation_line_count(state, width);
+        let total = crate::conversation::build::conversation_line_count(state, width);
         state.conv.scroll = total.saturating_sub(height);
     }
     state.conv.auto_scroll = false;
@@ -41,7 +42,7 @@ pub fn pin_at_current_viewport(state: &mut AppState) {
 pub fn sync_scroll(state: &mut AppState) -> bool {
     let width = geometry::content_width(state);
     let height = geometry::viewport_height(state);
-    let total = crate::workbench::conversation_line_count(state, width);
+    let total = crate::conversation::build::conversation_line_count(state, width);
     let max_scroll = total.saturating_sub(height.max(1));
     let mut changed = false;
 
