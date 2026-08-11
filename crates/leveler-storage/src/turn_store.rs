@@ -167,7 +167,7 @@ impl TurnStore for MemoryTurnStore {
             session_id: session_id.as_str().to_string(),
             ordinal,
             kind: kind.to_string(),
-            payload: payload.map(|p| leveler_core::redact_secrets(p)),
+            payload: payload.map(leveler_core::redact_secrets),
             status: "running".to_string(),
             created_at: now.to_rfc3339(),
             finished_at: None,
