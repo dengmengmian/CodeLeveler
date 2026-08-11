@@ -11,6 +11,7 @@ pub mod build;
 pub mod geometry;
 pub mod interaction;
 pub mod view;
+pub mod viewport;
 
 pub use view::{ConvCacheEntry, ConvKey, ConversationView};
 
