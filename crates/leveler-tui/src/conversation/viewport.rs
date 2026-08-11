@@ -69,12 +69,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // it has a title card, and a title card pressed against the input box under
     // a screenful of void reads as a bug rather than a welcome, so centre it.
     if lines.len() < height {
-        let pad = crate::conversation::geometry::top_padding(lines.len(), height);
-        let above = if crate::splash::conversation_is_empty(state) {
-            pad / 2
-        } else {
-            pad
-        };
+        let above = crate::conversation::geometry::painted_top_padding(state, lines.len(), height);
         let mut padded = vec![Line::from(""); above];
         padded.append(&mut lines);
         padded.resize(height, Line::from(""));

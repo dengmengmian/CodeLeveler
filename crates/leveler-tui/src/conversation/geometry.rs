@@ -42,6 +42,21 @@ pub fn top_padding(total: usize, height: usize) -> usize {
     height.saturating_sub(total)
 }
 
+/// Blank rows the renderer actually paints above the content this frame.
+/// Policy lives HERE, not in the viewport: an empty session's splash is
+/// vertically centered (half the padding above), a normal short transcript
+/// is bottom-aligned (all of it above), and a full viewport has none. The
+/// painter and `screen_to_content` both consume this — if they ever used
+/// different padding, painted rows and mapped rows would disagree.
+pub fn painted_top_padding(state: &AppState, total: usize, height: usize) -> usize {
+    let pad = top_padding(total, height);
+    if crate::splash::conversation_is_empty(state) {
+        pad / 2
+    } else {
+        pad
+    }
+}
+
 /// The scroll offset actually painted this frame: the live edge while
 /// auto-following, the pinned (clamped) offset otherwise.
 pub fn effective_scroll(scroll: usize, auto_follow: bool, total: usize, height: usize) -> usize {
@@ -80,11 +95,88 @@ pub fn screen_to_content(
         height,
     );
     let viewport_row = (clamped_row - ry) as usize;
-    let pad = top_padding(total, height);
+    let pad = painted_top_padding(state, total, height);
     let abs_row = (scroll + viewport_row.saturating_sub(pad)).min(total.saturating_sub(1));
     let abs_col = (clamped_col - rx) as usize;
     Some(crate::selection::TextPos {
         row: abs_row,
         col: abs_col,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leveler_client_protocol::SessionId;
+
+    fn test_state() -> AppState {
+        let mut s = AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+            },
+        );
+        s.size = (80, 40);
+        s.conv.rect = Some((0, 2, 80, 20));
+        s.conv.auto_scroll = false;
+        s.conv.scroll = 0;
+        s
+    }
+
+    /// The paint↔interaction parity contract: for every painted content row,
+    /// the screen cell it was painted at must map back to that same row.
+    fn assert_roundtrip(s: &AppState, label: &str) {
+        let (_, ry, rw, rh) = s.conv.rect.unwrap();
+        let total = crate::conversation::build::conversation_line_count(s, rw as usize);
+        let height = rh as usize;
+        let pad = painted_top_padding(s, total, height);
+        let scroll = effective_scroll(s.conv.scroll, s.conv.auto_scroll, total, height);
+        for vis in 0..height.min(total.saturating_sub(scroll)) {
+            let content_row = scroll + vis;
+            let screen_row = ry + (pad + vis) as u16;
+            let mapped = screen_to_content(s, 1, screen_row)
+                .unwrap_or_else(|| panic!("{label}: row {screen_row} unmapped"));
+            assert_eq!(
+                mapped.row, content_row,
+                "{label}: painted content row {content_row} at screen row {screen_row} \
+                 must map back to itself"
+            );
+        }
+    }
+
+    #[test]
+    fn short_transcript_paint_and_mapping_agree() {
+        let mut s = test_state();
+        for i in 0..5 {
+            s.transcript.push_user(format!("row {i}"));
+        }
+        assert_roundtrip(&s, "short bottom-aligned");
+    }
+
+    #[test]
+    fn empty_splash_paint_and_mapping_agree() {
+        // The splash is CENTERED (pad/2 above), unlike the bottom-aligned
+        // normal short transcript — the mapping must follow the same policy.
+        let s = test_state();
+        assert!(crate::splash::conversation_is_empty(&s));
+        assert_roundtrip(&s, "centered splash");
+    }
+
+    #[test]
+    fn long_transcript_mapping_unchanged() {
+        let mut s = test_state();
+        for i in 0..60 {
+            s.transcript.push_user(format!("long row {i}"));
+        }
+        s.conv.scroll = 17;
+        assert_roundtrip(&s, "long scrolled");
+    }
 }

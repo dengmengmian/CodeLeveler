@@ -28,7 +28,7 @@ pub fn pin_at_current_viewport(state: &mut AppState) {
         let width = geometry::content_width(state);
         let height = geometry::viewport_height(state);
         let total = crate::conversation::build::conversation_line_count(state, width);
-        state.conv.scroll = total.saturating_sub(height);
+        state.conv.scroll = geometry::max_scroll(total, height);
     }
     state.conv.auto_scroll = false;
 }
@@ -44,7 +44,7 @@ pub fn sync_scroll(state: &mut AppState) -> bool {
     let width = geometry::content_width(state);
     let height = geometry::viewport_height(state);
     let total = crate::conversation::build::conversation_line_count(state, width);
-    let max_scroll = total.saturating_sub(height.max(1));
+    let max_scroll = geometry::max_scroll(total, height);
     let mut changed = false;
 
     // Track growth while the user is reading history → drive ▼ N.
