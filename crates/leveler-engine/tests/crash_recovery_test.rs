@@ -199,7 +199,7 @@ async fn seed_transcript(db: &Database, session: &SessionId) {
     let system =
         serde_json::to_string(&Message::text(Role::System, "you are a coding agent")).unwrap();
     let user = serde_json::to_string(&Message::text(Role::User, "add a function")).unwrap();
-    MessageRepository::new(&db)
+    MessageRepository::new(db)
         .append(session, &[system, user], leveler_core::now())
         .await
         .unwrap();
@@ -214,7 +214,7 @@ async fn seed_dangling_call(
     name: &str,
     arguments: String,
 ) {
-    let turn = TurnRepository::new(&db)
+    let turn = TurnRepository::new(db)
         .start(session, "user", None, leveler_core::now())
         .await
         .unwrap();
@@ -246,7 +246,7 @@ async fn seed_pending_approval_call(
     name: &str,
     arguments: String,
 ) {
-    let turn = TurnRepository::new(&db)
+    let turn = TurnRepository::new(db)
         .start(session, "user", None, leveler_core::now())
         .await
         .unwrap();
@@ -285,7 +285,7 @@ async fn seed_pending_approval_call(
 
 /// Replay the persisted event log as decoded engine events, in order.
 async fn recorded_events(db: &Database, session: &SessionId) -> Vec<EngineEvent> {
-    EventRepository::new(&db)
+    EventRepository::new(db)
         .load(session)
         .await
         .unwrap()

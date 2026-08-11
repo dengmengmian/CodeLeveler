@@ -300,10 +300,8 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
         {
             break client;
         }
-        if child_done {
-            if let Some(client) = connect_default_runtime(&socket_path).await? {
-                break client;
-            }
+        if child_done && let Some(client) = connect_default_runtime(&socket_path).await? {
+            break client;
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = child.start_kill();

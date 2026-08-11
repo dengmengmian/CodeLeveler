@@ -2880,7 +2880,7 @@ mod tests {
         for escape in [
             format!("cat {case}"),
             format!("head -1 {case}"),
-            format!("cd .. && cat host/case.yaml"),
+            "cd .. && cat host/case.yaml".to_string(),
             format!("sh -c 'cat {case}'"),
             format!("/usr/bin/python3 -c \"print(open('{case}').read())\""),
             "cat peek/case.yaml".to_string(),

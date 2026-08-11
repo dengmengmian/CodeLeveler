@@ -1538,7 +1538,7 @@ mod tests {
             let path = path.clone();
             join.spawn(async move {
                 let runtime: Arc<dyn LocalRuntimeService> = Arc::new(TestRuntime::new());
-                LocalSocketServer::bind(&path, runtime).await.map(|s| s)
+                LocalSocketServer::bind(&path, runtime).await
             });
         }
         let mut winners = Vec::new();

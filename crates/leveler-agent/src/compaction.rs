@@ -302,7 +302,7 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
     let mut ascii_tool: u64 = 0;
     let mut wide_bytes: u64 = 0;
     let mut flat: u64 = 0;
-    let mut split = |s: &str| -> (u64, u64) {
+    let split = |s: &str| -> (u64, u64) {
         let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
         (ascii, s.len() as u64 - ascii)
     };

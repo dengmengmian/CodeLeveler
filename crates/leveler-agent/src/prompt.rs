@@ -527,13 +527,10 @@ mod tests {
     /// C2.3B §30 A/B/C — navigation discipline is HARNESS baseline behavior:
     /// it ships in `prompts/base.md`, so every production request carries it,
     /// and every provider gets the same principles. A model profile that
-
     /// C2.3B §2/§6 — broader reads must stay legitimate. The guidance may not
     /// forbid whole-file reads or argue from token cost: the goal is evidence
-
     /// C2.3B §4 — a known location must not cost a ceremonial search. The
     /// guidance has to state the KNOWN case, or "search first" degrades into
-
     /// C2.3B §30 D/F — C2.3A's contract is untouched: the plan block may ask
     /// for a plan before *mutations*, but nothing in the prompt may frame
     /// navigation as optional or as a lesser action, and no guidance may force
@@ -558,9 +555,7 @@ mod tests {
     }
 
     /// C2.3B §15 — the dual of "re-read when a recollection may be stale":
-
     /// Analysis/review answers must not promote "tests passed" into unearned
-
     /// performance or "no regression" claims (evidence discipline).
     #[test]
     fn base_prompt_requires_evidence_layers_for_analysis_claims() {
