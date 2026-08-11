@@ -64,7 +64,7 @@ Terminal Event / Runtime Event
 | 改 hit-testing / 点击优先级 | `conversation/interaction.rs`（hit_test） |
 | 改 bottom alignment / 映射公式 | `conversation/geometry.rs`（一处） |
 | 新增 Conversation item 类型 | `transcript`（block）+ `render::item_render` 分发 + 所属 presentation adapter；不动 geometry/hit/workbench |
-| **加入 `!command`（User Shell）** | input 路由（submit）+ user-shell 执行态（新 transcript block 或复用）+ **新 presentation adapter → 复用 `presentation::disclosure`** + 测试。不动 ToolGroup 分类、tool taxonomy、geometry、workbench、鼠标 reducer |
+| `!command`（User Shell，已落地） | 实际落点与预测一致：submit 路由 + `TranscriptItem::UserShell` + user-shell adapter → 复用 `presentation::disclosure` + `Screen::Shell`。未动 ToolGroup 分类、taxonomy、geometry、workbench 布局（鼠标 reducer 仅按 item 身份分派 Details 打开） |
 | 改 Plan chrome | `workbench`（plan 面板函数）+ `plan_cell` |
 | 新增全屏 Screen | `screen.rs` + `render/`，不动 conversation |
 | 改顶层布局行数 | `workbench::render_workbench` 槽位；geometry 自动跟随 rect |

@@ -83,7 +83,7 @@ workflow infrastructure:
 | **Workflow / Policy** | Replaceable planning/check/retry composition above the engine. |
 | **NPC** | Long-running runtime / workflow / policy domain (FUTURE productization). **Not** a UI client. |
 | **MCP** | CURRENT tool integration: discovered tools adapted to `Tool`, exposed as `mcp__<server>__<tool>`. |
-| **User Shell Execution** | FUTURE `!command`: user-initiated direct command, **no** LLM/agent loop, **must** reuse host execution safety. |
+| **User Shell Execution** | CURRENT `!command`: user-initiated direct command, **no** LLM/agent loop (hard-gated by tests), reuses host execution safety via `CommandRunner::run_streaming`. |
 | **Capability / Extension** | FUTURE extension surface (may provide model tools, user capabilities, workflows, hooks). Not shipped. |
 
 Do **not** invent a second name such as `ExecutionOrigin` that merges
@@ -733,24 +733,32 @@ registry at `~/.leveler/web-projects.json`) is documented under Clients → Web.
 
 ---
 
-## User Shell Execution (**FUTURE** target only)
+## User Shell Execution (**CURRENT**)
 
-`!command` is **not implemented**. Target semantics:
+`!command` is implemented (TUI entry point):
 
 ```text
 !git status
-  → User-initiated direct command
-  → NO LLM, NO Agent Loop, NO tool selection
-  → reuse host execution boundary
-      (permission / workspace / sandbox / cancellation / audit)
-  → CommandRunner / process execution
+  → TUI submit routing (raw first char `!`; never trimmed prose)
+  → ClientCommand::RunUserShell (protocol 1.5, additive)
+  → leveler-app use case (ActiveTurns foreground mutex; hang guard)
+  → CommandRunner::run_streaming — the SAME host boundary as agent shell
+      (permission-profile write confinement / network sandbox / env scrub /
+       process-tree termination / workspace-root cwd)
+  → canonical EngineEvent facts (Started/Output*/Finished; Output transient,
+      others persisted LocalOnly) → session EventLog (turn_id = None)
+  → exhaustive EventBridge projection → RuntimeEvent UserShell*
+  → TUI UserShell block (reuses presentation::disclosure) + Shell Details
 ```
 
-Bypasses the **AI decision path**. Must **not** bypass host execution safety.
-Must **not** be described as raw `tokio::process::Command` from the TUI.
-
-Preferred names: **User Shell Execution**, **Shell Escape** — not “Capability
-Shell” or “Tool alias.”
+Hard-gated by tests: ZERO model requests per execution; neither the command
+nor its output ever enters model context. Cancellation is per-execution by
+`UserShellId` (`CancelUserShell`), never `CancelCurrentTurn`. Reconnect
+restores active + bounded history via `UiSessionSnapshot.user_shells`.
+MVP is non-interactive shell execution (`sh -c` / `cmd /C`, stdin closed) —
+not a PTY/terminal emulator; TTY programs (vim/top/interactive ssh) are out
+of scope. Remote policy denies both commands. Runtime restart follows the
+existing process-cleanup policy (no cross-process adoption).
 
 ---
 

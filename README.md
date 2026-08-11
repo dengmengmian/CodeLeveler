@@ -48,6 +48,9 @@ together:
 - **One runtime, multiple clients.** TUI and Web share the same client protocol
   (`ClientCommand` / `RuntimeEvent` / snapshots); work can outlive a single
   terminal process on platforms that support the local daemon.
+- **Run your own commands.** `!command` (e.g. `!git status`, `!cargo test`)
+  executes an explicit shell command in the repository without invoking the
+  model — live output, per-command stop, same sandbox as agent commands.
 - **Control stays with you.** Typed tools, approval rules, workspace boundaries,
   checkpoints, and platform-aware command isolation constrain what the agent
   may do.

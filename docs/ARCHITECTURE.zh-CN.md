@@ -72,7 +72,7 @@ CodeLeveler 不追求最少 crate 或最少行数，而是一套**本地优先�
 | **Workflow / Policy** | Engine 之上可替换的规划 / 检查 / 重试组合。 |
 | **NPC** | 长期运行 runtime / workflow / policy 域（FUTURE 产品化）。**不是** UI 客户端。 |
 | **MCP** | **CURRENT** 工具集成：发现后适配为 `Tool`，暴露为 `mcp__<server>__<tool>`。 |
-| **User Shell Execution** | FUTURE `!command`：用户发起的直接命令，**无** LLM/Agent Loop，**必须**复用宿主执行安全。 |
+| **User Shell Execution** | CURRENT `!command`：用户发起的直接命令，**无** LLM/Agent Loop（测试硬门），经 `CommandRunner::run_streaming` 复用宿主执行安全。 |
 | **Capability / Extension** | FUTURE 扩展面（可提供 model tool、user capability、workflow、hook）。未交付。 |
 
 禁止在无 ADR 的情况下把 `ClientOrigin` 与动作发起者（User / Agent / Policy）
@@ -456,8 +456,8 @@ screen/content 坐标、工具语义分类或 runtime 执行逻辑。
 Tool disclosure 呈现已存在（`presentation::disclosure` 为 domain-free 视觉；
 `activity_stream` 为 Agent Tool 适配器）。
 
-**TARGET：** 同一 disclosure 视觉语言可通过适配器呈现 Agent Tool、User Shell 与
-未来 Capability 行。User Shell / Capability **尚未**接入。
+**CURRENT：** 同一 disclosure 视觉语言已通过适配器呈现 Agent Tool 与 User
+Shell（第二个消费者证明了边界）；未来 Capability 行沿同一适配器模式接入。
 
 ---
 
@@ -684,24 +684,29 @@ Agent 循环内不得直接访问文件系统或进程以绕过审批、检查�
 
 ---
 
-## User Shell Execution（**FUTURE** 仅目标语义）
+## User Shell Execution（**CURRENT**）
 
-`!command` **尚未实现**。目标语义：
+`!command` 已实现（TUI 入口）：
 
 ```text
 !git status
-  → 用户发起的直接命令
-  → 无 LLM、无 Agent Loop、无工具选择
-  → 复用宿主执行边界
-      （权限 / 工作区 / 沙箱 / 取消 / 审计）
-  → CommandRunner / 进程执行
+  → TUI submit 路由（原始首字符 `!`，不 trim；散文永不误执行）
+  → ClientCommand::RunUserShell（协议 1.5，additive）
+  → leveler-app use case（ActiveTurns 前台互斥；hang guard）
+  → CommandRunner::run_streaming —— 与 agent shell 同一宿主边界
+      （权限档写限制 / 网络沙箱 / env 清洗 / 进程树终止 / 仓库根 cwd）
+  → 规范 EngineEvent 事实（Started/Output*/Finished；Output transient，
+      其余持久化 LocalOnly）→ 会话 EventLog（turn_id = None）
+  → 穷举 EventBridge 投影 → RuntimeEvent UserShell*
+  → TUI UserShell block（复用 presentation::disclosure）+ Shell Details
 ```
 
-绕过的是 **AI 决策路径**，**不得**绕过宿主执行安全。不得写成 TUI 直接
-`tokio::process::Command`。
-
-推荐称呼：**User Shell Execution**、**Shell Escape**——不要叫「Capability Shell」
-或「Tool 别名」。
+测试硬门：每次执行零模型请求；命令与输出永不进入模型上下文。取消按
+`UserShellId` 逐执行（`CancelUserShell`），绝非 `CancelCurrentTurn`。重连经
+`UiSessionSnapshot.user_shells` 恢复活跃 + 有界历史。MVP 为非交互 shell
+（`sh -c` / `cmd /C`，stdin 关闭）——不是 PTY/终端模拟器，vim/top/交互式 ssh
+不在范围。Remote policy 拒绝两条命令。runtime 重启按既有进程清理策略处理
+（无跨进程收养）。
 
 ---
 

@@ -44,6 +44,9 @@ Windows、macOS 和 Linux 均纳入 CI。CodeLeveler 目前处于 public beta
   留下可以审查的 diff。
 - **一个 runtime，多种客户端。** TUI 与 Web 共享同一客户端协议（`ClientCommand`
   / `RuntimeEvent` / 快照）；在支持本地 daemon 的平台上，工作可长过单个终端进程。
+- **直接运行你自己的命令。** `!command`（如 `!git status`、`!cargo test`）在仓库
+  内直接执行明确的 shell 命令，完全不经过模型——实时输出、逐命令停止、与 agent
+  命令同一套沙箱。
 - **控制权在用户手里。** 类型化工具、审批规则、工作区边界、检查点和平台级命令
   隔离共同约束代理能做什么。
 - **随时恢复已保存的工作。** SQLite 会话保存对话、待审批操作、工具结果、diff 和
