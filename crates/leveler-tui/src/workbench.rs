@@ -482,8 +482,21 @@ impl AppState {
     /// `Rc` clone, O(1)). The empty/splash case is not cached — the splash reads
     /// repo/branch, which the transcript `version` does not track.
     pub(crate) fn conversation_lines(&self, width: usize) -> std::rc::Rc<Vec<Line<'static>>> {
+        self.conversation_lines_and_hits(width).0
+    }
+
+    /// Cache-aware lines plus the disclosure hit rows built alongside them.
+    /// One cache entry carries both so a hit can never describe stale lines.
+    pub(crate) fn conversation_lines_and_hits(
+        &self,
+        width: usize,
+    ) -> (
+        std::rc::Rc<Vec<Line<'static>>>,
+        std::rc::Rc<Vec<(usize, usize)>>,
+    ) {
         if crate::splash::conversation_is_empty(self) {
-            return std::rc::Rc::new(build_conversation_lines(self, width));
+            let (lines, hits) = build_conversation_lines_with_hits(self, width);
+            return (std::rc::Rc::new(lines), std::rc::Rc::new(hits));
         }
         let key = ConvKey {
             version: self.transcript.version(),
@@ -495,25 +508,45 @@ impl AppState {
             reasoning_expanded: self.reasoning_expanded,
             reasoning: self.reasoning.clone(),
         };
-        if let Some((k, lines)) = self.conversation_cache.borrow().as_ref()
+        if let Some((k, lines, hits)) = self.conversation_cache.borrow().as_ref()
             && *k == key
         {
-            return lines.clone();
+            return (lines.clone(), hits.clone());
         }
-        let lines = std::rc::Rc::new(build_conversation_lines(self, width));
-        *self.conversation_cache.borrow_mut() = Some((key, lines.clone()));
-        lines
+        let (lines, hits) = build_conversation_lines_with_hits(self, width);
+        let (lines, hits) = (std::rc::Rc::new(lines), std::rc::Rc::new(hits));
+        *self.conversation_cache.borrow_mut() = Some((key, lines.clone(), hits.clone()));
+        (lines, hits)
+    }
+
+    /// The transcript item behind the disclosure row at `abs_line`, if any.
+    pub(crate) fn disclosure_item_at(&self, width: usize, abs_line: usize) -> Option<usize> {
+        let (_, hits) = self.conversation_lines_and_hits(width);
+        hits.iter()
+            .find(|(line, _)| *line == abs_line)
+            .map(|(_, item)| *item)
     }
 }
 
+#[cfg(test)]
 pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    build_conversation_lines_with_hits(state, width).0
+}
+
+/// Build the conversation plus its disclosure hit rows: for every finished,
+/// non-edit tool group the FIRST emitted line is the clickable `▸/▾` header.
+pub fn build_conversation_lines_with_hits(
+    state: &AppState,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let theme = &state.theme;
     let t = state.t();
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<(usize, usize)> = Vec::new();
 
     // Empty session: brand splash (logo + tagline) instead of a blank void.
     if crate::splash::conversation_is_empty(state) {
-        return crate::splash::splash_lines(state, width, theme, t);
+        return (crate::splash::splash_lines(state, width, theme, t), hits);
     }
 
     let items = state.transcript.items();
@@ -561,6 +594,11 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
                 // Product activity stream — not a raw tool trace:
                 // Silent (ls/list_files/probes) stay out; Normal exploration
                 // aggregates; Important edits/runs stay one bold line each.
+                // A finished, non-edit group's first line is its disclosure
+                // row — record it as a click target for this exact item.
+                if crate::activity_stream::group_has_disclosure(group) {
+                    hits.push((out.len(), idx));
+                }
                 out.extend(crate::activity_stream::render_group(
                     group,
                     theme,
@@ -647,7 +685,7 @@ pub fn build_conversation_lines(state: &AppState, width: usize) -> Vec<Line<'sta
         }
     }
 
-    out
+    (out, hits)
 }
 
 // ── Plan panel ──────────────────────────────────────────────────────────────

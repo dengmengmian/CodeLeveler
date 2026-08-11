@@ -470,6 +470,27 @@ impl TranscriptState {
         }
     }
 
+    /// Toggle expand/collapse on the collapsible block at `index` (a
+    /// ToolGroup or SubAgent item). The mouse path: a click on a disclosure
+    /// row targets exactly that historical group, not the latest one.
+    pub fn toggle_tool_group_at(&mut self, index: usize) -> Option<bool> {
+        let toggled = match self.items.get_mut(index)? {
+            TranscriptItem::ToolGroup(group) => {
+                group.expanded = !group.expanded;
+                Some(group.expanded)
+            }
+            TranscriptItem::SubAgent(block) => {
+                block.expanded = !block.expanded;
+                Some(block.expanded)
+            }
+            _ => None,
+        };
+        if toggled.is_some() {
+            self.bump();
+        }
+        toggled
+    }
+
     /// Toggle expand/collapse on whichever collapsible block came last.
     ///
     /// Tool groups and sub-agents both fold their detail away once finished, so

@@ -84,6 +84,15 @@ pub struct RemoteState {
     pub outcome: Option<String>,
 }
 
+/// One memoized conversation build: cache key, wrapped lines, and the
+/// disclosure hit rows (absolute line index → transcript item index). The hit
+/// rows are display-only — rebuilt with the lines, never persisted.
+pub type ConvCacheEntry = (
+    crate::workbench::ConvKey,
+    std::rc::Rc<Vec<ratatui::text::Line<'static>>>,
+    std::rc::Rc<Vec<(usize, usize)>>,
+);
+
 /// The whole UI state.
 #[derive(Debug)]
 pub struct AppState {
@@ -209,12 +218,7 @@ pub struct AppState {
     /// Memoized wrapped conversation lines, reused across repaints while no
     /// render input changed (see `AppState::conversation_lines`). Interior
     /// mutability so read-only render/measure paths can populate it.
-    pub conversation_cache: std::cell::RefCell<
-        Option<(
-            crate::workbench::ConvKey,
-            std::rc::Rc<Vec<ratatui::text::Line<'static>>>,
-        )>,
-    >,
+    pub conversation_cache: std::cell::RefCell<Option<ConvCacheEntry>>,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
 

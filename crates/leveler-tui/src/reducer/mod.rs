@@ -250,6 +250,22 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // Pin viewport so agent streaming cannot yank us to the bottom.
                 state.conversation_auto_scroll = false;
                 ensure_conversation_plain(state);
+                // A click on a tool-disclosure row toggles exactly that group
+                // — it never begins a selection and outranks URL opening on
+                // its own row (P0 disclosure contract). Historical groups are
+                // individually addressable via the hit map built with the
+                // cached lines, so a stale rect can never toggle the wrong
+                // group after resize or new content.
+                if let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row)
+                    && let Some(item) =
+                        state.disclosure_item_at(conversation_content_width(state), pos.row)
+                {
+                    state.transcript.toggle_tool_group_at(item);
+                    state.conversation_plain.clear();
+                    clear_selection_drag(state);
+                    state.selection.clear();
+                    return Vec::new();
+                }
                 // Cmd/Ctrl+click on a URL opens it immediately (no selection).
                 // Both modifiers are accepted so it works whichever the terminal
                 // forwards (Cmd is often eaten by macOS terminals). Plain click
@@ -1054,5 +1070,222 @@ fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
                 state.active_screen = crate::screen::Screen::Conversation;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+    use crate::state::Boot;
+    use crate::transcript::TranscriptItem;
+    use crossterm::event::{MouseButton, MouseEvent};
+    use leveler_client_protocol::{SessionId, ToolCallId};
+
+    fn test_state() -> AppState {
+        let mut s = AppState::new(
+            crate::theme::Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+            },
+        );
+        s.size = (80, 40);
+        s.conversation_rect = Some((0, 2, 80, 30));
+        s.conversation_auto_scroll = false;
+        s.conversation_scroll = 0;
+        s
+    }
+
+    fn finished_tool(s: &mut AppState, id: &str, name: &str, args: &str) {
+        s.transcript
+            .push_tool_started(ToolCallId::new(id), name.into(), args.into(), false, 0);
+        s.transcript
+            .complete_tool(&ToolCallId::new(id), true, "done".into(), 1200);
+    }
+
+    /// Three finished work-tool groups separated by user rows — the layout the
+    /// per-group disclosure contract is about.
+    fn three_groups(s: &mut AppState) {
+        s.transcript.push_user("q1".into());
+        finished_tool(
+            s,
+            "a1",
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+        );
+        s.transcript.push_user("q2".into());
+        finished_tool(s, "b1", "read_file", r#"{"path":"a.rs"}"#);
+        s.transcript.push_user("q3".into());
+        finished_tool(s, "c1", "grep", r#"{"pattern":"x"}"#);
+        s.transcript.push_user("tail".into());
+    }
+
+    /// Screen row of absolute content line `abs_line` under the current rect
+    /// (short transcripts render bottom-aligned, so pad rows come first).
+    fn screen_row_of(s: &AppState, abs_line: usize) -> u16 {
+        let (_, ry, rw, rh) = s.conversation_rect.unwrap();
+        let total = s.conversation_lines_and_hits(rw as usize).0.len();
+        let pad = (rh as usize).saturating_sub(total);
+        ry + (pad + abs_line) as u16
+    }
+
+    fn click(s: &mut AppState, col: u16, row: u16) {
+        reduce(
+            s,
+            Action::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: col,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }),
+        );
+    }
+
+    fn expanded_flags(s: &AppState) -> Vec<(usize, bool)> {
+        s.transcript
+            .items()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match item {
+                TranscriptItem::ToolGroup(g) => Some((i, g.expanded)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn click_toggles_exactly_the_target_group_and_back() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        let hits = s.conversation_lines_and_hits(80).1;
+        assert_eq!(hits.len(), 3, "three disclosure rows: {hits:?}");
+
+        // Expand the MIDDLE (historical) group — not the latest.
+        let (line_b, item_b) = hits[1];
+        let row = screen_row_of(&s, line_b);
+        click(&mut s, 1, row);
+        for (i, expanded) in expanded_flags(&s) {
+            assert_eq!(expanded, i == item_b, "only the clicked group opens");
+        }
+        assert!(
+            s.selection.anchor.is_none() && !s.selection.dragging,
+            "a disclosure click never begins a selection"
+        );
+
+        // Click the same header again (rows may have shifted) — collapses it.
+        let hits = s.conversation_lines_and_hits(80).1;
+        let (line_b2, _) = *hits.iter().find(|(_, i)| *i == item_b).unwrap();
+        let row = screen_row_of(&s, line_b2);
+        click(&mut s, 1, row);
+        assert!(
+            expanded_flags(&s).iter().all(|(_, e)| !e),
+            "second click collapses the group again"
+        );
+    }
+
+    #[test]
+    fn oldest_group_is_independently_expandable() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        let hits = s.conversation_lines_and_hits(80).1;
+        let (line_a, item_a) = hits[0];
+        let row = screen_row_of(&s, line_a);
+        click(&mut s, 1, row);
+        for (i, expanded) in expanded_flags(&s) {
+            assert_eq!(expanded, i == item_a, "history is individually addressable");
+        }
+    }
+
+    #[test]
+    fn click_on_plain_text_starts_selection_and_toggles_nothing() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        // Absolute line 0 is the first user row ("q1"), never a disclosure.
+        let hits = s.conversation_lines_and_hits(80).1;
+        assert!(hits.iter().all(|(line, _)| *line != 0));
+        let row = screen_row_of(&s, 0);
+        click(&mut s, 1, row);
+        assert!(
+            expanded_flags(&s).iter().all(|(_, e)| !e),
+            "no group toggled by a text-row click"
+        );
+        assert!(
+            s.selection.anchor.is_some(),
+            "text click begins a selection"
+        );
+    }
+
+    #[test]
+    fn running_group_has_no_disclosure_until_it_finishes() {
+        let mut s = test_state();
+        s.transcript.push_user("q".into());
+        s.transcript.push_tool_started(
+            ToolCallId::new("r1"),
+            "run_command".into(),
+            r#"{"program":"cargo"}"#.into(),
+            false,
+            0,
+        );
+        let running_idx = s.transcript.items().len() - 1;
+        let hits = s.conversation_lines_and_hits(80).1;
+        assert!(
+            hits.iter().all(|(_, i)| *i != running_idx),
+            "a running group is not clickable: {hits:?}"
+        );
+        s.transcript
+            .complete_tool(&ToolCallId::new("r1"), true, "ok".into(), 10);
+        let hits = s.conversation_lines_and_hits(80).1;
+        assert!(
+            hits.iter().any(|(_, i)| *i == running_idx),
+            "completion turns the group into a disclosure: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn resize_rebuilds_hit_rows_and_click_still_lands() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        let hits = s.conversation_lines_and_hits(80).1;
+        let row = screen_row_of(&s, hits[1].0);
+        click(&mut s, 1, row);
+        let item_b = hits[1].1;
+
+        // Narrow the viewport — wraps change, the hit map must follow.
+        s.conversation_rect = Some((0, 2, 60, 30));
+        s.conversation_plain.clear();
+        s.conversation_plain_width = 0;
+        let hits = s.conversation_lines_and_hits(60).1;
+        let (line_b, _) = *hits.iter().find(|(_, i)| *i == item_b).unwrap();
+        let row = screen_row_of(&s, line_b);
+        click(&mut s, 1, row);
+        assert!(
+            expanded_flags(&s).iter().all(|(_, e)| !e),
+            "post-resize click targets the same group (collapses it)"
+        );
+    }
+
+    #[test]
+    fn user_expanded_group_survives_new_transcript_events() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        let hits = s.conversation_lines_and_hits(80).1;
+        let (line_b, item_b) = hits[1];
+        let row = screen_row_of(&s, line_b);
+        click(&mut s, 1, row);
+
+        s.transcript.push_user("next question".into());
+        finished_tool(&mut s, "d1", "grep", r#"{"pattern":"y"}"#);
+        let flags = expanded_flags(&s);
+        assert!(
+            flags.iter().any(|(i, e)| *i == item_b && *e),
+            "streaming new events must not auto-collapse a user-opened group: {flags:?}"
+        );
     }
 }

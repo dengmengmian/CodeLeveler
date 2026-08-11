@@ -50,10 +50,25 @@ pub(crate) fn render_group(
         .iter()
         .filter(|c| is_conversation_visible(c))
         .collect();
-    if !group.expanded && visible.len() >= 2 && group_is_finished(group) && !group_has_edits(group)
-    {
-        out.push(collapsed_group_line(&visible, theme, width, t));
+    let disclosable = group_has_disclosure(group);
+    if disclosable && !group.expanded {
+        out.push(disclosure_line(&visible, false, theme, width, t));
+        // A failed group stays discoverable without expanding: the first
+        // meaningful error line rides along under the collapsed row.
+        if let Some(err) = first_error_line(&visible) {
+            out.push(Line::from(vec![
+                Span::styled("  └ ".to_string(), Style::default().fg(theme.dim)),
+                Span::styled(
+                    truncate_display(&err, width.saturating_sub(4)),
+                    Style::default().fg(theme.warning),
+                ),
+            ]));
+        }
         return out;
+    }
+    if disclosable && group.expanded {
+        // The same row, open — clicking it again folds the group back.
+        out.push(disclosure_line(&visible, true, theme, width, t));
     }
     // A concurrent batch gets one quiet dim header so the user sees these
     // calls ran together rather than one after another.
@@ -122,6 +137,34 @@ pub(crate) fn render_group(
     out
 }
 
+/// Work-tool classification for disclosure labels: 1=shell, 2=read,
+/// 3=search, 0=other (bookkeeping/plan/goal — never folded into a
+/// disclosure, their status lines carry meaning of their own).
+fn disclosure_kind(name: &str) -> u8 {
+    match name {
+        "run_command" | "shell_command" => 1,
+        "read_file" | "read_symbol" => 2,
+        "grep" | "find_files" | "find_symbol" | "find_references" | "list_files" => 3,
+        _ => 0,
+    }
+}
+
+/// Whether this group renders a clickable `▸/▾` disclosure header as its
+/// first line: finished, non-edit, and every visible call is a WORK tool
+/// (shell/read/search). Bookkeeping like a denied plan update keeps its own
+/// warning presentation instead of being folded into "ran N tools".
+pub(crate) fn group_has_disclosure(group: &ToolGroupBlock) -> bool {
+    if !group_is_finished(group) || group_has_edits(group) {
+        return false;
+    }
+    let visible: Vec<&ToolCallBlock> = group
+        .calls
+        .iter()
+        .filter(|c| is_conversation_visible(c))
+        .collect();
+    !visible.is_empty() && visible.iter().all(|c| disclosure_kind(&c.name) != 0)
+}
+
 fn group_is_finished(group: &ToolGroupBlock) -> bool {
     !group.calls.is_empty() && group.calls.iter().all(|c| c.status != ToolStatus::Running)
 }
@@ -133,14 +176,13 @@ fn group_has_edits(group: &ToolGroupBlock) -> bool {
         .iter()
         .any(|c| matches!(c.name.as_str(), "apply_patch" | "replace" | "write_file"))
 }
-
-/// The one row a finished group leaves behind.
-///
-/// Failures are named on it rather than expanded: hiding them would be worse
-/// than the noise, and expanding them is how a run with many broken calls
-/// becomes a screen you cannot read past.
-fn collapsed_group_line(
+/// The disclosure row a finished group renders in both states: `▸ label`
+/// folded, `▾ label` open. The whole row is a click target (hit-tested by the
+/// workbench); failures keep normal weight and are named so a broken run is
+/// never something you have to go looking for.
+fn disclosure_line(
     visible: &[&ToolCallBlock],
+    expanded: bool,
     theme: &Theme,
     width: usize,
     t: &UiText,
@@ -149,38 +191,79 @@ fn collapsed_group_line(
         .iter()
         .filter(|c| c.status == ToolStatus::Failed)
         .count();
-    let parallel = visible.iter().filter(|c| c.parallel).count() >= 2;
-    let (glyph, color) = if failed > 0 {
-        ("⚠", theme.warning)
-    } else {
-        ("✓", theme.success)
-    };
-    let n = visible.len().to_string();
-    let body = if parallel {
-        t.parallel_header.replace("{}", &n)
-    } else {
-        t.batch_done.replace("{}", &n)
-    };
+    let glyph = if expanded { "▾" } else { "▸" };
+    let body = disclosure_label(visible, failed, t);
     let mut spans = vec![
-        Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
-            truncate_display(&body, width.saturating_sub(24)),
-            // Dim once it is only history; a batch that broke keeps normal
-            // weight so a failure is not something you have to go looking for.
+            format!("{glyph} "),
+            Style::default().fg(if failed > 0 { theme.warning } else { theme.dim }),
+        ),
+        Span::styled(
+            truncate_display(&body, width.saturating_sub(16)),
             Style::default().fg(if failed > 0 { theme.text } else { theme.dim }),
         ),
     ];
     if failed > 0 {
+        spans.insert(
+            1,
+            Span::styled("✗ ".to_string(), Style::default().fg(theme.warning)),
+        );
+        if visible.len() > 1 {
+            spans.push(Span::styled(
+                format!(" · {}", t.batch_failed.replace("{}", &failed.to_string())),
+                Style::default().fg(theme.warning),
+            ));
+        }
+    }
+    let total_ms: u64 = visible.iter().filter_map(|c| c.duration_ms).sum();
+    if total_ms >= 1000 {
         spans.push(Span::styled(
-            format!(" · {}", t.batch_failed.replace("{}", &failed.to_string())),
-            Style::default().fg(theme.warning),
+            format!(" · {:.1}s", total_ms as f64 / 1000.0),
+            Style::default().fg(theme.dim),
         ));
     }
-    spans.push(Span::styled(
-        "  Ctrl+O".to_string(),
-        Style::default().fg(theme.dim),
-    ));
     Line::from(spans)
+}
+
+/// The semantic summary for a finished group: what KIND of work it was, in
+/// user language, with correct singular/plural — never a generic "N tools"
+/// when the batch had one shape.
+fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> String {
+    let n = visible.len();
+    let first = disclosure_kind(&visible[0].name);
+    let uniform = first != 0 && visible.iter().all(|c| disclosure_kind(&c.name) == first);
+    // "Shell command failed" only when the thing that failed IS a shell
+    // command; any other failed kind keeps its own label and lets the ✗
+    // glyph carry the failure.
+    if failed > 0 && n == 1 && first == 1 {
+        return t.disclosure_failed.to_string();
+    }
+    let parallel = visible.iter().filter(|c| c.parallel).count() >= 2;
+    if parallel && !uniform {
+        return t.disclosure_parallel.replace("{}", &n.to_string());
+    }
+    match (uniform, first, n) {
+        (true, 1, 1) => t.disclosure_shell_one.to_string(),
+        (true, 1, _) => t.disclosure_shell_many.replace("{}", &n.to_string()),
+        (true, 2, 1) => t.disclosure_read_one.to_string(),
+        (true, 2, _) => t.disclosure_read_many.replace("{}", &n.to_string()),
+        (true, 3, _) => t.disclosure_search.to_string(),
+        _ => t.disclosure_tools_many.replace("{}", &n.to_string()),
+    }
+}
+
+/// The first meaningful error line of a failed call, for the collapsed row.
+fn first_error_line(visible: &[&ToolCallBlock]) -> Option<String> {
+    visible
+        .iter()
+        .find(|c| c.status == ToolStatus::Failed)
+        .and_then(|c| c.preview.as_deref())
+        .and_then(|p| {
+            p.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// Whether a completed/running call may appear as its own Conversation unit.
@@ -885,10 +968,20 @@ mod tests {
         calls[4].status = ToolStatus::Failed;
         let g = group(calls);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 1, "still one row:\n{}", lines.join("\n"));
+        assert_eq!(
+            lines.len(),
+            2,
+            "disclosure row plus first error:\n{}",
+            lines.join("\n")
+        );
         assert!(
-            lines[0].contains('2') && lines[0].contains("失败"),
+            lines[0].contains('2') && lines[0].contains("失败") && lines[0].contains('✗'),
             "the row must name the failures: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].starts_with('▸'),
+            "collapsed disclosure: {:?}",
             lines[0]
         );
     }
@@ -952,17 +1045,29 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
+            lines[0].starts_with('▸') && lines[0].contains('3'),
+            "a finished parallel batch folds to its disclosure: {lines:?}"
+        );
+        let mut open = group(vec![
+            parallel_call("read_file", r#"{"path":"a.rs"}"#),
+            parallel_call("grep", r#"{"pattern":"x"}"#),
+            parallel_call("read_file", r#"{"path":"b.rs"}"#),
+        ]);
+        open.expanded = true;
+        let lines = render_group_text(&open, 100, Locale::Zh);
+        assert!(
             lines.iter().any(|l| l.contains("并行执行 3 个工具")),
-            "a ≥2-call parallel batch must show a concurrency header: {lines:?}"
+            "expanded parallel batch keeps its concurrency header: {lines:?}"
         );
     }
 
     #[test]
     fn parallel_header_is_localized() {
-        let g = group(vec![
+        let mut g = group(vec![
             parallel_call("read_file", r#"{"path":"a.rs"}"#),
             parallel_call("grep", r#"{"pattern":"x"}"#),
         ]);
+        g.expanded = true;
         let lines = render_group_text(&g, 100, Locale::En);
         assert!(
             lines.iter().any(|l| l.contains("2 tools in parallel")),
@@ -1071,6 +1176,7 @@ mod tests {
 
     #[test]
     fn single_read_renders_one_row() {
+        // New contract: a finished single work tool folds to its disclosure.
         let g = group(vec![call(
             "read_file",
             r#"{"path":"src/auth.go"}"#,
@@ -1079,10 +1185,8 @@ mod tests {
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].starts_with('✓')
-                && lines[0].contains("读取文件")
-                && lines[0].contains("auth.go"),
-            "the row carries glyph + action + target: {lines:?}"
+            lines[0].starts_with('▸') && lines[0].contains("读取了 1 个文件"),
+            "collapsed disclosure with the singular read label: {lines:?}"
         );
     }
 
@@ -1090,13 +1194,22 @@ mod tests {
     fn ok_read_result_reports_its_size_on_one_row() {
         let mut c = call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok);
         c.preview = Some("     1\t# GitCode AI 中间件服务\n     2\t\n     3\tbody".into());
-        let g = group(vec![c]);
+        let mut g = group(vec![c]);
+        g.expanded = true;
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("3 行"), "size must survive: {lines:?}");
         assert!(
-            !lines[0].contains("1\t"),
-            "line-number gutter must never leak: {lines:?}"
+            lines[0].starts_with('▾'),
+            "expanded disclosure header: {lines:?}"
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("3 行"), "size must survive: {joined}");
+        let summary = lines
+            .iter()
+            .find(|l| l.contains("3 行"))
+            .expect("summary row exists");
+        assert!(
+            !summary.contains('\t'),
+            "line-number gutter must not leak into the summary row: {summary}"
         );
     }
 
@@ -1124,13 +1237,14 @@ mod tests {
         c.preview = Some("warning: unused import\nexit: 0".into());
         let g = group(vec![c]);
         let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(lines.len(), 1, "collapsed to one disclosure row: {lines:?}");
         assert!(
-            lines[0].contains("1 行"),
-            "shell result keeps the quiet count: {lines:?}"
+            lines[0].starts_with('▸') && lines[0].contains("执行了 1 个命令"),
+            "shell disclosure label: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.contains("unused import")),
-            "no first-line dump: {lines:?}"
+            !lines[0].contains("unused import"),
+            "no output dump on the collapsed row: {lines:?}"
         );
     }
 
@@ -1157,7 +1271,10 @@ mod tests {
             ToolStatus::Failed,
         )]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert!(!lines.is_empty() && lines[0].starts_with('✗'), "{lines:?}");
+        assert!(
+            !lines.is_empty() && lines[0].starts_with('▸') && lines[0].contains('✗'),
+            "a silent failure still surfaces, marked failed: {lines:?}"
+        );
     }
 
     #[test]
@@ -1172,15 +1289,14 @@ mod tests {
         let g = group(vec![c]);
         assert!(!g.expanded);
         let lines = render_group_text(&g, 120, Locale::Zh);
-        assert_eq!(lines.len(), 2, "head / result rows: {lines:?}");
-        assert!(lines[0].starts_with('✗'), "{lines:?}");
+        assert_eq!(lines.len(), 2, "disclosure / error rows: {lines:?}");
+        assert!(
+            lines[0].starts_with('▸') && lines[0].contains('✗') && lines[0].contains("失败"),
+            "collapsed failure names itself: {lines:?}"
+        );
         assert!(
             lines[1].starts_with("  └ ") && lines[1].contains("error: no such command"),
             "result row carries the first error line: {lines:?}"
-        );
-        assert!(
-            lines[1].contains("+2 行") && lines[1].contains("Ctrl+O"),
-            "the hidden rest gets a fold hint: {lines:?}"
         );
         assert!(
             !lines.iter().any(|l| l.contains("long help dump line 2")),
@@ -1235,14 +1351,16 @@ mod tests {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/example".into());
         let args =
             format!(r#"{{"cmd":"cd {home}/Develop/app/codeleveler && cargo test --workspace"}}"#);
-        let g = group(vec![call("shell_command", &args, ToolStatus::Ok)]);
+        let mut g = group(vec![call("shell_command", &args, ToolStatus::Ok)]);
+        g.expanded = true;
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        let head = lines
+            .iter()
+            .find(|l| l.contains("执行命令"))
+            .expect("command row exists");
         assert!(
-            lines[0].contains("执行命令")
-                && lines[0].contains("$ ")
-                && lines[0].contains("cargo test --workspace"),
-            "head carries the command body with a shell prompt: {lines:?}"
+            head.contains("$ ") && head.contains("cargo test --workspace"),
+            "command row carries the body with a shell prompt: {lines:?}"
         );
         assert!(
             !lines

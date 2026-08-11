@@ -386,6 +386,18 @@ pub struct UiText {
     /// Appended when some of them failed: "{} 个失败".
     pub batch_failed: &'static str,
 
+    // Tool disclosure semantic labels (C5-TUI): the one-line summary a
+    // finished group leaves behind. `{}` is the count where present.
+    pub disclosure_shell_one: &'static str,
+    pub disclosure_shell_many: &'static str,
+    pub disclosure_read_one: &'static str,
+    pub disclosure_read_many: &'static str,
+    pub disclosure_search: &'static str,
+    pub disclosure_parallel: &'static str,
+    pub disclosure_tools_many: &'static str,
+    /// Collapsed failure header, e.g. "Shell command failed".
+    pub disclosure_failed: &'static str,
+
     // Sub-agent tree
     pub agents_running_header: &'static str, // "{} 个 agents 正在运行"
     pub agents_done_header: &'static str,    // "{} 个 agents 完成"
@@ -733,6 +745,14 @@ static ZH: UiText = UiText {
     tools_col_duration: "耗时",
     tools_output: "输出",
     parallel_header: "并行执行 {} 个工具",
+    disclosure_shell_one: "执行了 1 个命令",
+    disclosure_shell_many: "执行了 {} 个命令",
+    disclosure_read_one: "读取了 1 个文件",
+    disclosure_read_many: "读取了 {} 个文件",
+    disclosure_search: "搜索了代码库",
+    disclosure_parallel: "并行执行了 {} 个工具",
+    disclosure_tools_many: "执行了 {} 个工具",
+    disclosure_failed: "命令执行失败",
     batch_done: "{} 个工具",
     batch_failed: "{} 个失败",
     agents_running_header: "{} 个 agents 正在运行",
@@ -1015,6 +1035,14 @@ static EN: UiText = UiText {
     tools_col_duration: "Duration",
     tools_output: "Output",
     parallel_header: "{} tools in parallel",
+    disclosure_shell_one: "Ran 1 shell command",
+    disclosure_shell_many: "Ran {} shell commands",
+    disclosure_read_one: "Read 1 file",
+    disclosure_read_many: "Read {} files",
+    disclosure_search: "Searched codebase",
+    disclosure_parallel: "Ran {} tools in parallel",
+    disclosure_tools_many: "Ran {} tools",
+    disclosure_failed: "Shell command failed",
     batch_done: "{} tools",
     batch_failed: "{} failed",
     agents_running_header: "{} agents running",
