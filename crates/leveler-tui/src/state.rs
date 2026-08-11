@@ -84,15 +84,6 @@ pub struct RemoteState {
     pub outcome: Option<String>,
 }
 
-/// One memoized conversation build: cache key, wrapped lines, and the
-/// disclosure hit rows (absolute line index → transcript item index). The hit
-/// rows are display-only — rebuilt with the lines, never persisted.
-pub type ConvCacheEntry = (
-    crate::workbench::ConvKey,
-    std::rc::Rc<Vec<ratatui::text::Line<'static>>>,
-    std::rc::Rc<Vec<(usize, usize)>>,
-);
-
 /// The whole UI state.
 #[derive(Debug)]
 pub struct AppState {
@@ -187,38 +178,12 @@ pub struct AppState {
 
     /// Scroll offset (in lines) of the active full-screen view's content.
     pub screen_scroll: usize,
-    /// Conversation viewport scroll (line offset from top). Only Conversation scrolls.
-    pub conversation_scroll: usize,
-    /// When true, stick to the bottom as new activity arrives.
-    pub conversation_auto_scroll: bool,
+    /// Conversation viewport + interaction state (see `conversation::view`).
+    pub conv: crate::conversation::ConversationView,
     /// Which region owns arrow keys (Tab toggles).
     pub workbench_focus: WorkbenchFocus,
-    /// Content ticks observed while pinned away from bottom (for ▼ N).
-    pub conversation_unread: usize,
-    /// Last seen conversation line count (to detect growth while scrolled up).
-    pub conversation_last_len: usize,
-    /// Last painted Conversation rect (x, y, w, h) for mouse hit-testing.
-    pub conversation_rect: Option<(u16, u16, u16, u16)>,
     /// Last painted Input/composer rect for click-to-focus.
     pub input_rect: Option<(u16, u16, u16, u16)>,
-    /// Last painted scroll-to-bottom button rect, if visible.
-    pub scroll_bottom_rect: Option<(u16, u16, u16, u16)>,
-    /// Conversation text selection (mouse drag copy).
-    pub selection: crate::selection::TextSelection,
-    /// Edge auto-scroll while dragging a selection: `-1` up, `0` none, `1` down.
-    pub selection_edge_dir: i8,
-    /// Consecutive edge-scroll ticks (accelerates step size).
-    pub selection_edge_streak: u32,
-    /// Last mouse cell while dragging (screen col/row), for remapping after scroll.
-    pub selection_last_mouse: Option<(u16, u16)>,
-    /// Cached plain-text of conversation lines for the last render width.
-    pub conversation_plain: Vec<String>,
-    /// Content width used when `conversation_plain` was built.
-    pub conversation_plain_width: usize,
-    /// Memoized wrapped conversation lines, reused across repaints while no
-    /// render input changed (see `AppState::conversation_lines`). Interior
-    /// mutability so read-only render/measure paths can populate it.
-    pub conversation_cache: std::cell::RefCell<Option<ConvCacheEntry>>,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
 
@@ -341,21 +306,9 @@ impl AppState {
             available_models: Vec::new(),
             mode: PermissionProfile::Assisted,
             screen_scroll: 0,
-            conversation_scroll: 0,
-            conversation_auto_scroll: true,
+            conv: crate::conversation::ConversationView::default(),
             workbench_focus: WorkbenchFocus::Input,
-            conversation_unread: 0,
-            conversation_last_len: 0,
-            conversation_rect: None,
             input_rect: None,
-            scroll_bottom_rect: None,
-            selection: crate::selection::TextSelection::default(),
-            selection_edge_dir: 0,
-            selection_edge_streak: 0,
-            selection_last_mouse: None,
-            conversation_plain: Vec::new(),
-            conversation_plain_width: 0,
-            conversation_cache: std::cell::RefCell::new(None),
             plan_collapsed: false,
             tools_expanded: false,
             reasoning_expanded: false,

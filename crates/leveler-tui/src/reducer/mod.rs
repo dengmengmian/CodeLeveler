@@ -212,37 +212,37 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     clear_quit_confirm_notification(state);
 
     let over_input = point_in_rect(mouse.column, mouse.row, state.input_rect);
-    let over_conv = point_in_rect(mouse.column, mouse.row, state.conversation_rect);
-    let over_jump = point_in_rect(mouse.column, mouse.row, state.scroll_bottom_rect);
+    let over_conv = point_in_rect(mouse.column, mouse.row, state.conv.rect);
+    let over_jump = point_in_rect(mouse.column, mouse.row, state.conv.scroll_bottom_rect);
 
     match mouse.kind {
         // Wheel scrolls Conversation (never over Input — keeps history focus).
         MouseEventKind::ScrollUp if over_conv || over_jump => {
             state.workbench_focus = WorkbenchFocus::Conversation;
             clear_selection_drag(state);
-            state.selection.clear();
+            state.conv.selection.clear();
             scroll_conversation(state, -3);
         }
         MouseEventKind::ScrollDown if over_conv || over_jump => {
             state.workbench_focus = WorkbenchFocus::Conversation;
             clear_selection_drag(state);
-            state.selection.clear();
+            state.conv.selection.clear();
             scroll_conversation(state, 3);
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {}
         MouseEventKind::Down(MouseButton::Left) => {
             // Jump-to-bottom only when not mid-selection; badge is hidden during
             // an active selection so hit-testing is usually empty anyway.
-            if over_jump && !state.selection.is_active() {
+            if over_jump && !state.conv.selection.is_active() {
                 request_jump_to_bottom(state);
                 clear_selection_drag(state);
-                state.selection.clear();
+                state.conv.selection.clear();
                 return Vec::new();
             }
             if over_input {
                 state.workbench_focus = WorkbenchFocus::Input;
                 clear_selection_drag(state);
-                state.selection.clear();
+                state.conv.selection.clear();
                 return Vec::new();
             }
             if over_conv {
@@ -250,7 +250,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // Pin the viewport exactly where it is painted so agent
                 // streaming cannot yank us to the bottom AND the click below
                 // maps against the same scroll the user is looking at.
-                pin_conversation_at_current_viewport(state);
+                crate::conversation::pin_at_current_viewport(state);
                 ensure_conversation_plain(state);
                 // A click on a tool-disclosure row toggles exactly that group
                 // — it never begins a selection and outranks URL opening on
@@ -258,14 +258,17 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // individually addressable via the hit map built with the
                 // cached lines, so a stale rect can never toggle the wrong
                 // group after resize or new content.
-                if let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row)
-                    && let Some(item) =
-                        state.disclosure_item_at(conversation_content_width(state), pos.row)
+                if let Some(pos) =
+                    crate::conversation::geometry::screen_to_content(state, mouse.column, mouse.row)
+                    && let Some(item) = state.disclosure_item_at(
+                        crate::conversation::geometry::content_width(state),
+                        pos.row,
+                    )
                 {
                     state.transcript.toggle_tool_group_at(item);
-                    state.conversation_plain.clear();
+                    state.conv.plain.clear();
                     clear_selection_drag(state);
-                    state.selection.clear();
+                    state.conv.selection.clear();
                     return Vec::new();
                 }
                 // Cmd/Ctrl+click on a URL opens it immediately (no selection).
@@ -275,51 +278,62 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 if mouse
                     .modifiers
                     .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
-                    && let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row)
+                    && let Some(pos) = crate::conversation::geometry::screen_to_content(
+                        state,
+                        mouse.column,
+                        mouse.row,
+                    )
                     && let Some(url) = url_at_pos(state, pos)
                 {
                     return open_url(state, &url);
                 }
-                state.selection_last_mouse = Some((mouse.column, mouse.row));
+                state.conv.selection_last_mouse = Some((mouse.column, mouse.row));
                 update_selection_edge(state, mouse.column, mouse.row);
-                if let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row) {
-                    state.selection.begin(pos);
+                if let Some(pos) =
+                    crate::conversation::geometry::screen_to_content(state, mouse.column, mouse.row)
+                {
+                    state.conv.selection.begin(pos);
                 }
             } else {
                 state.workbench_focus = WorkbenchFocus::Input;
                 clear_selection_drag(state);
-                state.selection.clear();
+                state.conv.selection.clear();
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if !state.selection.dragging {
+            if !state.conv.selection.dragging {
                 return Vec::new();
             }
-            state.selection_last_mouse = Some((mouse.column, mouse.row));
+            state.conv.selection_last_mouse = Some((mouse.column, mouse.row));
             update_selection_edge(state, mouse.column, mouse.row);
             ensure_conversation_plain(state);
-            if let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row) {
-                state.selection.extend(pos);
+            if let Some(pos) =
+                crate::conversation::geometry::screen_to_content(state, mouse.column, mouse.row)
+            {
+                state.conv.selection.extend(pos);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            if state.selection.dragging {
+            if state.conv.selection.dragging {
                 // One last edge settle is not needed; stop continuous scroll.
                 clear_selection_drag(state);
-                state.selection.finish();
-                if state.selection.is_empty() {
+                state.conv.selection.finish();
+                if state.conv.selection.is_empty() {
                     // Click without drag: open the URL under the cursor, if any.
                     ensure_conversation_plain(state);
-                    if let Some(pos) = mouse_to_text_pos_clamped(state, mouse.column, mouse.row)
-                        && let Some(url) = url_at_pos(state, pos)
+                    if let Some(pos) = crate::conversation::geometry::screen_to_content(
+                        state,
+                        mouse.column,
+                        mouse.row,
+                    ) && let Some(url) = url_at_pos(state, pos)
                     {
                         return open_url(state, &url);
                     }
                 } else {
                     ensure_conversation_plain(state);
                     let text = crate::selection::extract_selected_text(
-                        &state.conversation_plain,
-                        &state.selection,
+                        &state.conv.plain,
+                        &state.conv.selection,
                     );
                     match crate::selection::copy_to_clipboard(&text) {
                         Ok(()) if !text.is_empty() => {
@@ -347,26 +361,26 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 
 /// Continuous edge scroll while the primary button is held in a hot zone.
 fn handle_selection_tick(state: &mut AppState) -> Vec<Effect> {
-    if !state.selection.dragging || state.selection_edge_dir == 0 {
+    if !state.conv.selection.dragging || state.conv.selection_edge_dir == 0 {
         return Vec::new();
     }
-    let step = edge_scroll_step(state.selection_edge_streak);
-    state.selection_edge_streak = state.selection_edge_streak.saturating_add(1);
-    let delta = i32::from(state.selection_edge_dir) * step as i32;
+    let step = edge_scroll_step(state.conv.selection_edge_streak);
+    state.conv.selection_edge_streak = state.conv.selection_edge_streak.saturating_add(1);
+    let delta = i32::from(state.conv.selection_edge_dir) * step as i32;
     scroll_conversation_pinned(state, delta);
     ensure_conversation_plain(state);
-    if let Some((col, row)) = state.selection_last_mouse
-        && let Some(pos) = mouse_to_text_pos_clamped(state, col, row)
+    if let Some((col, row)) = state.conv.selection_last_mouse
+        && let Some(pos) = crate::conversation::geometry::screen_to_content(state, col, row)
     {
-        state.selection.extend(pos);
+        state.conv.selection.extend(pos);
     }
     Vec::new()
 }
 
 fn clear_selection_drag(state: &mut AppState) {
-    state.selection_edge_dir = 0;
-    state.selection_edge_streak = 0;
-    state.selection_last_mouse = None;
+    state.conv.selection_edge_dir = 0;
+    state.conv.selection_edge_streak = 0;
+    state.conv.selection_last_mouse = None;
 }
 
 /// Accelerate scroll while the pointer stays in an edge hot zone.
@@ -381,20 +395,20 @@ fn edge_scroll_step(streak: u32) -> usize {
 
 /// Top / bottom Conversation rows (or outside those edges) drive auto-scroll.
 fn update_selection_edge(state: &mut AppState, col: u16, row: u16) {
-    let Some((rx, ry, rw, rh)) = state.conversation_rect else {
-        state.selection_edge_dir = 0;
-        state.selection_edge_streak = 0;
+    let Some((rx, ry, rw, rh)) = state.conv.rect else {
+        state.conv.selection_edge_dir = 0;
+        state.conv.selection_edge_streak = 0;
         return;
     };
     if rh == 0 {
-        state.selection_edge_dir = 0;
+        state.conv.selection_edge_dir = 0;
         return;
     }
     // Horizontally outside the conversation: stop edge scroll (still may clamp select).
     let in_x = col >= rx && col < rx.saturating_add(rw);
     if !in_x {
-        state.selection_edge_dir = 0;
-        state.selection_edge_streak = 0;
+        state.conv.selection_edge_dir = 0;
+        state.conv.selection_edge_streak = 0;
         return;
     }
     let edge = SELECTION_EDGE_ROWS.min(rh);
@@ -408,28 +422,17 @@ fn update_selection_edge(state: &mut AppState, col: u16, row: u16) {
         0
     };
     if dir == 0 {
-        state.selection_edge_dir = 0;
-        state.selection_edge_streak = 0;
-    } else if state.selection_edge_dir != dir {
-        state.selection_edge_dir = dir;
-        state.selection_edge_streak = 0;
+        state.conv.selection_edge_dir = 0;
+        state.conv.selection_edge_streak = 0;
+    } else if state.conv.selection_edge_dir != dir {
+        state.conv.selection_edge_dir = dir;
+        state.conv.selection_edge_streak = 0;
     }
-}
-
-/// Content width for Conversation layout / selection. Must match the painted
-/// viewport (`conversation_rect`), not the full terminal width — a mismatch
-/// re-wraps lines under the cursor and the selection highlight "jumps".
-pub(crate) fn conversation_content_width(state: &AppState) -> usize {
-    state
-        .conversation_rect
-        .map(|(_, _, w, _)| w as usize)
-        .filter(|w| *w > 0)
-        .unwrap_or_else(|| state.size.0.max(1) as usize)
 }
 
 /// The http(s) URL under display column `pos.col` of plain line `pos.row`, if any.
 fn url_at_pos(state: &AppState, pos: crate::selection::TextPos) -> Option<String> {
-    crate::url_link::url_at(state.conversation_plain.get(pos.row)?, pos.col)
+    crate::url_link::url_at(state.conv.plain.get(pos.row)?, pos.col)
 }
 
 /// Queue opening `url` in the OS default browser (handled by the event loop).
@@ -442,55 +445,13 @@ fn open_url(state: &mut AppState, url: &str) -> Vec<Effect> {
 }
 
 fn ensure_conversation_plain(state: &mut AppState) {
-    let width = conversation_content_width(state);
-    if state.conversation_plain_width == width && !state.conversation_plain.is_empty() {
+    let width = crate::conversation::geometry::content_width(state);
+    if state.conv.plain_width == width && !state.conv.plain.is_empty() {
         return;
     }
     let lines = state.conversation_lines(width);
-    state.conversation_plain = lines.iter().map(crate::selection::line_to_plain).collect();
-    state.conversation_plain_width = width;
-}
-
-/// Map screen cell → absolute content coordinates, clamping to the Conversation
-/// viewport. Used while dragging so the selection endpoint tracks the pointer
-/// even when it sits in an edge hot zone or briefly leaves the rect.
-fn mouse_to_text_pos_clamped(
-    state: &AppState,
-    col: u16,
-    row: u16,
-) -> Option<crate::selection::TextPos> {
-    let (rx, ry, rw, rh) = state.conversation_rect?;
-    if rw == 0 || rh == 0 {
-        return None;
-    }
-    let clamped_col = col.clamp(rx, rx.saturating_add(rw.saturating_sub(1)));
-    let clamped_row = row.clamp(ry, ry.saturating_add(rh.saturating_sub(1)));
-    let width = conversation_content_width(state);
-    let height = rh as usize;
-    let total = if state.conversation_plain_width == width && !state.conversation_plain.is_empty() {
-        state.conversation_plain.len()
-    } else {
-        crate::workbench::conversation_line_count(state, width)
-    };
-    let max_scroll = total.saturating_sub(height.max(1));
-    // While selecting we always use the pinned scroll, never auto-follow bottom.
-    let scroll = if state.conversation_auto_scroll && !state.selection.dragging {
-        max_scroll
-    } else {
-        state.conversation_scroll.min(max_scroll)
-    };
-    let viewport_row = (clamped_row - ry) as usize;
-    // A transcript shorter than the viewport is bottom-aligned (see
-    // `render_conversation`), so the first `pad` screen rows are blank filler,
-    // not content. Without this the mouse selects a line above the one under
-    // the cursor by exactly that many rows.
-    let pad = height.saturating_sub(total);
-    let abs_row = (scroll + viewport_row.saturating_sub(pad)).min(total.saturating_sub(1));
-    let abs_col = (clamped_col - rx) as usize;
-    Some(crate::selection::TextPos {
-        row: abs_row,
-        col: abs_col,
-    })
+    state.conv.plain = lines.iter().map(crate::selection::line_to_plain).collect();
+    state.conv.plain_width = width;
 }
 
 fn point_in_rect(x: u16, y: u16, rect: Option<(u16, u16, u16, u16)>) -> bool {
@@ -611,8 +572,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         // Conversation focus while reading history: Enter = jump to live edge.
         KeyCode::Enter
-            if state.workbench_focus == WorkbenchFocus::Conversation
-                && !state.conversation_auto_scroll =>
+            if state.workbench_focus == WorkbenchFocus::Conversation && !state.conv.auto_scroll =>
         {
             request_jump_to_bottom(state);
         }
@@ -777,22 +737,23 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 
 /// Scroll the conversation viewport by `delta` lines (negative = up).
 fn scroll_conversation(state: &mut AppState, delta: i32) {
-    let height = conversation_viewport_height(state);
-    let width = conversation_content_width(state);
+    let height = crate::conversation::geometry::viewport_height(state);
+    let width = crate::conversation::geometry::content_width(state);
     let total = crate::workbench::conversation_line_count(state, width);
     let max_scroll = total.saturating_sub(height);
     if delta < 0 {
-        state.conversation_auto_scroll = false;
-        state.conversation_scroll = state
-            .conversation_scroll
+        state.conv.auto_scroll = false;
+        state.conv.scroll = state
+            .conv
+            .scroll
             .saturating_sub((-delta) as usize)
             .min(max_scroll);
     } else {
-        let next = (state.conversation_scroll + delta as usize).min(max_scroll);
-        state.conversation_scroll = next;
+        let next = (state.conv.scroll + delta as usize).min(max_scroll);
+        state.conv.scroll = next;
         if next >= max_scroll {
-            state.conversation_auto_scroll = true;
-            state.conversation_unread = 0;
+            state.conv.auto_scroll = true;
+            state.conv.unread = 0;
         }
     }
 }
@@ -803,42 +764,19 @@ fn scroll_conversation_pinned(state: &mut AppState, delta: i32) {
     if delta == 0 {
         return;
     }
-    let height = conversation_viewport_height(state);
-    let width = conversation_content_width(state);
+    let height = crate::conversation::geometry::viewport_height(state);
+    let width = crate::conversation::geometry::content_width(state);
     let total = crate::workbench::conversation_line_count(state, width);
     let max_scroll = total.saturating_sub(height.max(1));
-    state.conversation_auto_scroll = false;
+    state.conv.auto_scroll = false;
     if delta < 0 {
-        state.conversation_scroll = state
-            .conversation_scroll
+        state.conv.scroll = state
+            .conv
+            .scroll
             .saturating_sub((-delta) as usize)
             .min(max_scroll);
     } else {
-        state.conversation_scroll = (state.conversation_scroll + delta as usize).min(max_scroll);
-    }
-}
-
-/// Freeze the viewport at the position the renderer actually painted BEFORE
-/// leaving auto-follow. While auto-following, `conversation_scroll` in state
-/// is stale (the live edge is computed at paint time), so flipping the flag
-/// first and mapping the mouse against the stale value would hit rows the
-/// user is not looking at. Order matters: capture the live scroll from the
-/// authoritative rect, then disable auto-follow, then hit-test.
-fn pin_conversation_at_current_viewport(state: &mut AppState) {
-    if state.conversation_auto_scroll {
-        let width = conversation_content_width(state);
-        let height = conversation_viewport_height(state);
-        let total = crate::workbench::conversation_line_count(state, width);
-        state.conversation_scroll = total.saturating_sub(height);
-    }
-    state.conversation_auto_scroll = false;
-}
-
-pub(crate) fn conversation_viewport_height(state: &AppState) -> usize {
-    if let Some((_, _, _, rh)) = state.conversation_rect {
-        rh.max(1) as usize
-    } else {
-        state.size.1.saturating_sub(12).max(3) as usize
+        state.conv.scroll = (state.conv.scroll + delta as usize).min(max_scroll);
     }
 }
 
@@ -907,13 +845,13 @@ fn toggle_current_expand(state: &mut AppState) {
 
 /// Jump conversation viewport to bottom (auto-follow resumes).
 fn request_jump_to_bottom(state: &mut AppState) {
-    state.conversation_auto_scroll = true;
-    state.conversation_unread = 0;
+    state.conv.auto_scroll = true;
+    state.conv.unread = 0;
     state.jump_to_bottom = true;
-    let height = conversation_viewport_height(state);
-    let width = conversation_content_width(state);
+    let height = crate::conversation::geometry::viewport_height(state);
+    let width = crate::conversation::geometry::content_width(state);
     let total = crate::workbench::conversation_line_count(state, width);
-    state.conversation_scroll = total.saturating_sub(height);
+    state.conv.scroll = total.saturating_sub(height);
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
         message: state.t().back_to_bottom.to_string(),
@@ -1114,9 +1052,9 @@ mod disclosure_tests {
             },
         );
         s.size = (80, 40);
-        s.conversation_rect = Some((0, 2, 80, 30));
-        s.conversation_auto_scroll = false;
-        s.conversation_scroll = 0;
+        s.conv.rect = Some((0, 2, 80, 30));
+        s.conv.auto_scroll = false;
+        s.conv.scroll = 0;
         s
     }
 
@@ -1147,7 +1085,7 @@ mod disclosure_tests {
     /// Screen row of absolute content line `abs_line` under the current rect
     /// (short transcripts render bottom-aligned, so pad rows come first).
     fn screen_row_of(s: &AppState, abs_line: usize) -> u16 {
-        let (_, ry, rw, rh) = s.conversation_rect.unwrap();
+        let (_, ry, rw, rh) = s.conv.rect.unwrap();
         let total = s.conversation_lines_and_hits(rw as usize).0.len();
         let pad = (rh as usize).saturating_sub(total);
         ry + (pad + abs_line) as u16
@@ -1216,12 +1154,12 @@ mod disclosure_tests {
         // Pinned mid-history: the middle disclosure is inside the viewport.
         let (lines, hits) = s.conversation_lines_and_hits(80);
         let (line_b, item_b) = hits[1];
-        let (_, ry, _, rh) = s.conversation_rect.unwrap();
+        let (_, ry, _, rh) = s.conv.rect.unwrap();
         let scroll = line_b.saturating_sub(rh as usize / 2);
         let max_scroll = lines.len().saturating_sub(rh as usize);
         let scroll = scroll.min(max_scroll);
-        s.conversation_auto_scroll = false;
-        s.conversation_scroll = scroll;
+        s.conv.auto_scroll = false;
+        s.conv.scroll = scroll;
         let row = ry + (line_b - scroll) as u16;
         click(&mut s, 1, row);
         let flags = expanded_flags(&s);
@@ -1263,7 +1201,7 @@ mod disclosure_tests {
     #[test]
     fn hundred_group_history_random_clicks_land() {
         let mut s = test_state();
-        s.conversation_rect = Some((0, 2, 100, 24));
+        s.conv.rect = Some((0, 2, 100, 24));
         for i in 0..100 {
             s.transcript.push_user(format!("turn {i}"));
             finished_tool(
@@ -1275,14 +1213,14 @@ mod disclosure_tests {
         }
         let (lines, hits) = s.conversation_lines_and_hits(100);
         assert_eq!(hits.len(), 100);
-        let (_, ry, _, rh) = s.conversation_rect.unwrap();
+        let (_, ry, _, rh) = s.conv.rect.unwrap();
         let max_scroll = lines.len().saturating_sub(rh as usize);
         // Deterministic spread of historical picks: near start, middle, end.
         for pick in [3usize, 49, 71, 96] {
             let (line, item) = s.conversation_lines_and_hits(100).1[pick];
             let scroll = line.saturating_sub(rh as usize / 2).min(max_scroll);
-            s.conversation_auto_scroll = false;
-            s.conversation_scroll = scroll;
+            s.conv.auto_scroll = false;
+            s.conv.scroll = scroll;
             let row = ry + (line - scroll) as u16;
             click(&mut s, 1, row);
             let flags = expanded_flags(&s);
@@ -1296,7 +1234,7 @@ mod disclosure_tests {
             let scroll2 = line2.saturating_sub(rh as usize / 2);
             let total = s.conversation_lines_and_hits(100).0.len();
             let scroll2 = scroll2.min(total.saturating_sub(rh as usize));
-            s.conversation_scroll = scroll2;
+            s.conv.scroll = scroll2;
             let row2 = ry + (line2 - scroll2) as u16;
             click(&mut s, 1, row2);
         }
@@ -1312,19 +1250,19 @@ mod disclosure_tests {
         // Dynamic chrome: the painted viewport (height 22) is NOT what a
         // rows-minus-constant guess would give for size (80, 40) — busy
         // status, an active plan, and a tall composer all shrink it.
-        s.conversation_rect = Some((0, 5, 80, 22));
+        s.conv.rect = Some((0, 5, 80, 22));
         for i in 0..40 {
             s.transcript.push_user(format!("filler row {i}"));
         }
         three_groups(&mut s);
         // Live edge: the renderer has been auto-following; the pinned scroll
         // value in state is stale (never synced since the user last scrolled).
-        s.conversation_auto_scroll = true;
-        s.conversation_scroll = 0;
+        s.conv.auto_scroll = true;
+        s.conv.scroll = 0;
 
         let (lines, hits) = s.conversation_lines_and_hits(80);
         let total = lines.len();
-        let (_, ry, _, rh) = s.conversation_rect.unwrap();
+        let (_, ry, _, rh) = s.conv.rect.unwrap();
         let live_scroll = total.saturating_sub(rh as usize);
         let (line_c, item_c) = *hits.last().unwrap();
         assert!(
@@ -1341,12 +1279,12 @@ mod disclosure_tests {
                 "the click must land on the group painted under the cursor"
             );
         }
-        assert!(s.selection.anchor.is_none(), "no selection began");
+        assert!(s.conv.selection.anchor.is_none(), "no selection began");
         // The viewport was frozen exactly where the live edge was painted —
         // leaving auto-follow must not make the screen jump.
-        assert!(!s.conversation_auto_scroll);
+        assert!(!s.conv.auto_scroll);
         assert_eq!(
-            s.conversation_scroll, live_scroll,
+            s.conv.scroll, live_scroll,
             "pin must capture the painted scroll, not a stale or guessed one"
         );
     }
@@ -1386,7 +1324,7 @@ mod disclosure_tests {
             assert_eq!(expanded, i == item_b, "only the clicked group opens");
         }
         assert!(
-            s.selection.anchor.is_none() && !s.selection.dragging,
+            s.conv.selection.anchor.is_none() && !s.conv.selection.dragging,
             "a disclosure click never begins a selection"
         );
 
@@ -1428,7 +1366,7 @@ mod disclosure_tests {
             "no group toggled by a text-row click"
         );
         assert!(
-            s.selection.anchor.is_some(),
+            s.conv.selection.anchor.is_some(),
             "text click begins a selection"
         );
     }
@@ -1469,9 +1407,9 @@ mod disclosure_tests {
         let item_b = hits[1].1;
 
         // Narrow the viewport — wraps change, the hit map must follow.
-        s.conversation_rect = Some((0, 2, 60, 30));
-        s.conversation_plain.clear();
-        s.conversation_plain_width = 0;
+        s.conv.rect = Some((0, 2, 60, 30));
+        s.conv.plain.clear();
+        s.conv.plain_width = 0;
         let hits = s.conversation_lines_and_hits(60).1;
         let (line_b, _) = *hits.iter().find(|(_, i)| *i == item_b).unwrap();
         let row = screen_row_of(&s, line_b);

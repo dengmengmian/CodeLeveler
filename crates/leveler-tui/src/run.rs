@@ -279,9 +279,9 @@ pub async fn run(
                     paint_now = true;
                 }
                 _ = tick.tick() => { ticked = true; }
-                _ = selection_tick.tick(), if state.selection.dragging => {
+                _ = selection_tick.tick(), if state.conv.selection.dragging => {
                     effects = reduce(&mut state, Action::SelectionTick);
-                    if state.selection_edge_dir != 0 {
+                    if state.conv.selection_edge_dir != 0 {
                         paint_now = true;
                     }
                 }
@@ -329,14 +329,10 @@ pub async fn run(
         }
 
         // Keep conversation viewport scroll in range as content/layout changes.
-        if state.active_screen == Screen::Conversation {
-            // Authoritative painted viewport (falls back to an estimate only
-            // before the first render publishes `conversation_rect`).
-            let width = crate::reducer::conversation_content_width(&state);
-            let height = crate::reducer::conversation_viewport_height(&state);
-            if crate::workbench::sync_conversation_scroll(&mut state, width, height) {
-                paint_now = true;
-            }
+        if state.active_screen == Screen::Conversation
+            && crate::conversation::sync_scroll(&mut state)
+        {
+            paint_now = true;
         }
 
         // Repaint on input, on runtime updates, and — while busy — on the tick

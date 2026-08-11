@@ -319,8 +319,8 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let width = area.width as usize;
     let height = area.height as usize;
     if height == 0 || width == 0 {
-        state.conversation_rect = None;
-        state.scroll_bottom_rect = None;
+        state.conv.rect = None;
+        state.conv.scroll_bottom_rect = None;
         return;
     }
 
@@ -329,21 +329,22 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // frame's lines while a selection is live; otherwise clear it (the mouse-down
     // path calls `ensure_conversation_plain`, which rebuilds against current
     // content on demand) so idle frames skip an O(lines) clone per repaint.
-    if state.selection.is_active() {
-        state.conversation_plain = all.iter().map(crate::selection::line_to_plain).collect();
-        state.conversation_plain_width = width;
-    } else if !state.conversation_plain.is_empty() {
-        state.conversation_plain.clear();
-        state.conversation_plain_width = 0;
+    if state.conv.selection.is_active() {
+        state.conv.plain = all.iter().map(crate::selection::line_to_plain).collect();
+        state.conv.plain_width = width;
+    } else if !state.conv.plain.is_empty() {
+        state.conv.plain.clear();
+        state.conv.plain_width = 0;
     }
 
     let total = all.len();
-    let max_scroll = total.saturating_sub(height);
-    let scroll = if state.conversation_auto_scroll {
-        max_scroll
-    } else {
-        state.conversation_scroll.min(max_scroll)
-    };
+    let max_scroll = crate::conversation::geometry::max_scroll(total, height);
+    let scroll = crate::conversation::geometry::effective_scroll(
+        state.conv.scroll,
+        state.conv.auto_scroll,
+        total,
+        height,
+    );
 
     // Only the visible window is cloned + highlighted; the rest stays in the Rc.
     let mut lines: Vec<Line> = all
@@ -355,7 +356,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
             crate::selection::apply_selection_highlight(
                 line.clone(),
                 abs_row,
-                &state.selection,
+                &state.conv.selection,
                 theme,
             )
         })
@@ -371,7 +372,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // it has a title card, and a title card pressed against the input box under
     // a screenful of void reads as a bug rather than a welcome, so centre it.
     if lines.len() < height {
-        let pad = height - lines.len();
+        let pad = crate::conversation::geometry::top_padding(lines.len(), height);
         let above = if crate::splash::conversation_is_empty(state) {
             pad / 2
         } else {
@@ -386,15 +387,15 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
     frame.render_widget(Paragraph::new(lines), area);
 
     // Mouse hit-testing for next events.
-    state.conversation_rect = Some((area.x, area.y, area.width, area.height));
+    state.conv.rect = Some((area.x, area.y, area.width, area.height));
 
     // Scroll-to-bottom affordance: only when pinned away from live edge.
     // Hide while selecting/copying so the badge cannot cover or steal mouse
     // hits on the text the user is trying to select (was centered on the last
     // row and blocked mid-line copy).
-    if max_scroll > 0 && scroll < max_scroll && !state.selection.is_active() {
+    if max_scroll > 0 && scroll < max_scroll && !state.conv.selection.is_active() {
         let below = max_scroll - scroll;
-        let n = state.conversation_unread.max(below);
+        let n = state.conv.unread.max(below);
         let hint = if n > 1 {
             format!(" ▼{n} ")
         } else {
@@ -410,7 +411,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
             width: hint_w,
             height: 1,
         };
-        state.scroll_bottom_rect = Some((btn.x, btn.y, btn.width, btn.height));
+        state.conv.scroll_bottom_rect = Some((btn.x, btn.y, btn.width, btn.height));
         frame.render_widget(
             Paragraph::new(Span::styled(
                 hint,
@@ -422,26 +423,11 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &mut AppState) {
             btn,
         );
     } else {
-        state.scroll_bottom_rect = None;
+        state.conv.scroll_bottom_rect = None;
     }
 }
 
-/// Flatten transcript (+ live reasoning) into display lines for the viewport.
-/// Everything `build_conversation_lines` reads that can change its output. When
-/// this is unchanged the previously wrapped lines are reused verbatim. Note the
-/// transcript is captured by its monotonic `version`, so any in-place item edit
-/// invalidates the cache.
-#[derive(Debug, PartialEq, Clone)]
-pub struct ConvKey {
-    version: u64,
-    width: usize,
-    theme_id: crate::theme::ThemeId,
-    monochrome: bool,
-    locale: crate::i18n::Locale,
-    tools_expanded: bool,
-    reasoning_expanded: bool,
-    reasoning: String,
-}
+use crate::conversation::ConvKey;
 
 impl AppState {
     /// Cache-aware conversation lines: re-wraps the whole transcript only when a
@@ -475,14 +461,14 @@ impl AppState {
             reasoning_expanded: self.reasoning_expanded,
             reasoning: self.reasoning.clone(),
         };
-        if let Some((k, lines, hits)) = self.conversation_cache.borrow().as_ref()
+        if let Some((k, lines, hits)) = self.conv.cache.borrow().as_ref()
             && *k == key
         {
             return (lines.clone(), hits.clone());
         }
         let (lines, hits) = build_conversation_lines_with_hits(self, width);
         let (lines, hits) = (std::rc::Rc::new(lines), std::rc::Rc::new(hits));
-        *self.conversation_cache.borrow_mut() = Some((key, lines.clone(), hits.clone()));
+        *self.conv.cache.borrow_mut() = Some((key, lines.clone(), hits.clone()));
         (lines, hits)
     }
 
@@ -860,40 +846,6 @@ fn wrap_simple(s: &str, width: usize) -> Vec<String> {
 /// How many lines the conversation content needs at `width` (for scroll math).
 pub fn conversation_line_count(state: &AppState, width: usize) -> usize {
     state.conversation_lines(width).len()
-}
-
-/// Clamp scroll after resize / content change. Returns true if state changed.
-///
-/// Called from the event loop after layout-affecting updates so a user who
-/// scrolled up is not shoved past the content end, and auto-follow sticks to
-/// the latest activity line.
-pub fn sync_conversation_scroll(state: &mut AppState, width: usize, height: usize) -> bool {
-    let total = conversation_line_count(state, width);
-    let max_scroll = total.saturating_sub(height.max(1));
-    let mut changed = false;
-
-    // Track growth while the user is reading history → drive ▼ N.
-    if !state.conversation_auto_scroll && total > state.conversation_last_len {
-        state.conversation_unread = state.conversation_unread.saturating_add(1);
-        changed = true;
-    }
-    if state.conversation_auto_scroll {
-        state.conversation_unread = 0;
-    }
-    state.conversation_last_len = total;
-
-    if state.conversation_auto_scroll {
-        if state.conversation_scroll != max_scroll {
-            state.conversation_scroll = max_scroll;
-            return true;
-        }
-        return changed;
-    }
-    if state.conversation_scroll > max_scroll {
-        state.conversation_scroll = max_scroll;
-        return true;
-    }
-    changed
 }
 
 #[cfg(test)]

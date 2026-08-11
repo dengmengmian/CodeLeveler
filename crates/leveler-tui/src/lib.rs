@@ -16,6 +16,7 @@ pub mod action;
 mod activity_stream;
 mod code_block;
 pub mod composer;
+pub mod conversation;
 mod diff_view;
 pub mod external_editor;
 pub mod i18n;

@@ -3406,17 +3406,17 @@ fn tab_toggles_workbench_focus_and_arrows_diverge() {
     // Tab → Conversation: ↑ scrolls (does not rewrite composer history).
     reduce(&mut s, key(KeyCode::Tab));
     assert_eq!(s.workbench_focus, WorkbenchFocus::Conversation);
-    s.conversation_auto_scroll = true;
-    s.conversation_scroll = 0;
+    s.conv.auto_scroll = true;
+    s.conv.scroll = 0;
     // Force non-empty content so scroll math can leave bottom.
-    s.conversation_auto_scroll = false;
-    s.conversation_scroll = 0;
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 0;
     reduce(&mut s, key(KeyCode::Up));
     assert!(
         s.composer.is_empty(),
         "conversation ↑ must not fill history"
     );
-    assert!(!s.conversation_auto_scroll);
+    assert!(!s.conv.auto_scroll);
 
     // Tab back → Input: ↑ recalls history.
     reduce(&mut s, key(KeyCode::Tab));
@@ -3436,12 +3436,12 @@ fn page_up_pins_away_from_bottom_and_enter_jumps_back() {
     }
     reduce(&mut s, key(KeyCode::PageUp));
     assert_eq!(s.workbench_focus, WorkbenchFocus::Conversation);
-    assert!(!s.conversation_auto_scroll);
+    assert!(!s.conv.auto_scroll);
 
     // Enter while Conversation focus + not at bottom → jump live.
     reduce(&mut s, key(KeyCode::Enter));
-    assert!(s.conversation_auto_scroll);
-    assert_eq!(s.conversation_unread, 0);
+    assert!(s.conv.auto_scroll);
+    assert_eq!(s.conv.unread, 0);
 }
 
 #[test]
@@ -3454,8 +3454,8 @@ fn mouse_scroll_moves_conversation_and_disables_auto_follow() {
         s.transcript.push_user(format!("line {i}"));
     }
     // Publish a conversation rect so drag/click paths work; scroll wheel does not need it.
-    s.conversation_rect = Some((0, 3, 100, 20));
-    s.conversation_auto_scroll = true;
+    s.conv.rect = Some((0, 3, 100, 20));
+    s.conv.auto_scroll = true;
     let mouse = MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 10,
@@ -3463,10 +3463,7 @@ fn mouse_scroll_moves_conversation_and_disables_auto_follow() {
         modifiers: KeyModifiers::empty(),
     };
     reduce(&mut s, Action::Mouse(mouse));
-    assert!(
-        !s.conversation_auto_scroll,
-        "wheel must pin away from live edge"
-    );
+    assert!(!s.conv.auto_scroll, "wheel must pin away from live edge");
     assert_eq!(s.workbench_focus, WorkbenchFocus::Conversation);
 }
 
@@ -3478,9 +3475,9 @@ fn mouse_drag_select_disables_auto_follow_and_sets_anchor() {
     for i in 0..50 {
         s.transcript.push_user(format!("row content {i:02}"));
     }
-    s.conversation_rect = Some((0, 2, 80, 20));
-    s.conversation_auto_scroll = true;
-    s.conversation_scroll = 0;
+    s.conv.rect = Some((0, 2, 80, 20));
+    s.conv.auto_scroll = true;
+    s.conv.scroll = 0;
     // Warm plain cache for width.
     reduce(
         &mut s,
@@ -3492,12 +3489,12 @@ fn mouse_drag_select_disables_auto_follow_and_sets_anchor() {
         }),
     );
     assert!(
-        !s.conversation_auto_scroll,
+        !s.conv.auto_scroll,
         "selection must pin viewport away from live edge"
     );
-    assert!(s.selection.dragging);
-    assert!(s.selection.anchor.is_some());
-    assert_eq!(s.selection_last_mouse, Some((5, 5)));
+    assert!(s.conv.selection.dragging);
+    assert!(s.conv.selection.anchor.is_some());
+    assert_eq!(s.conv.selection_last_mouse, Some((5, 5)));
 }
 
 #[test]
@@ -3509,9 +3506,9 @@ fn mouse_drag_bottom_edge_arms_auto_scroll_and_tick_extends() {
         s.transcript.push_user(format!("line-{i:03}-padding-text"));
     }
     // Conversation at rows 2..22 (height 20). Bottom edge = last 2 rows → 20,21.
-    s.conversation_rect = Some((0, 2, 80, 20));
-    s.conversation_auto_scroll = false;
-    s.conversation_scroll = 0;
+    s.conv.rect = Some((0, 2, 80, 20));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 0;
 
     reduce(
         &mut s,
@@ -3522,7 +3519,7 @@ fn mouse_drag_bottom_edge_arms_auto_scroll_and_tick_extends() {
             modifiers: KeyModifiers::empty(),
         }),
     );
-    let start = s.selection.anchor.expect("anchor");
+    let start = s.conv.selection.anchor.expect("anchor");
 
     // Drag into bottom edge hot zone.
     reduce(
@@ -3535,26 +3532,23 @@ fn mouse_drag_bottom_edge_arms_auto_scroll_and_tick_extends() {
         }),
     );
     assert_eq!(
-        s.selection_edge_dir, 1,
+        s.conv.selection_edge_dir, 1,
         "bottom edge must arm downward scroll"
     );
-    assert!(s.selection.dragging);
-    let before_scroll = s.conversation_scroll;
+    assert!(s.conv.selection.dragging);
+    let before_scroll = s.conv.scroll;
 
     // Continuous tick should scroll and keep auto_follow off.
     for _ in 0..5 {
         reduce(&mut s, Action::SelectionTick);
     }
     assert!(
-        s.conversation_scroll > before_scroll,
+        s.conv.scroll > before_scroll,
         "edge ticks must advance scroll: before={before_scroll} after={}",
-        s.conversation_scroll
+        s.conv.scroll
     );
-    assert!(
-        !s.conversation_auto_scroll,
-        "must stay pinned while selecting"
-    );
-    let focus = s.selection.focus.expect("focus");
+    assert!(!s.conv.auto_scroll, "must stay pinned while selecting");
+    let focus = s.conv.selection.focus.expect("focus");
     assert!(
         focus.row >= start.row,
         "selection must extend with scroll: start={start:?} focus={focus:?}"
@@ -3569,9 +3563,9 @@ fn mouse_drag_top_edge_arms_upward_scroll() {
     for i in 0..80 {
         s.transcript.push_user(format!("up-line-{i:03}"));
     }
-    s.conversation_rect = Some((0, 2, 80, 20));
-    s.conversation_auto_scroll = false;
-    s.conversation_scroll = 30;
+    s.conv.rect = Some((0, 2, 80, 20));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 30;
 
     reduce(
         &mut s,
@@ -3591,13 +3585,13 @@ fn mouse_drag_top_edge_arms_upward_scroll() {
             modifiers: KeyModifiers::empty(),
         }),
     );
-    assert_eq!(s.selection_edge_dir, -1);
-    let before = s.conversation_scroll;
+    assert_eq!(s.conv.selection_edge_dir, -1);
+    let before = s.conv.scroll;
     reduce(&mut s, Action::SelectionTick);
     assert!(
-        s.conversation_scroll < before,
+        s.conv.scroll < before,
         "top-edge tick scrolls up: before={before} after={}",
-        s.conversation_scroll
+        s.conv.scroll
     );
 }
 
@@ -3605,7 +3599,7 @@ fn mouse_drag_top_edge_arms_upward_scroll() {
 fn shift_mouse_does_not_start_app_selection() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let mut s = opened();
-    s.conversation_rect = Some((0, 2, 80, 20));
+    s.conv.rect = Some((0, 2, 80, 20));
     reduce(
         &mut s,
         Action::Mouse(MouseEvent {
@@ -3616,7 +3610,7 @@ fn shift_mouse_does_not_start_app_selection() {
         }),
     );
     assert!(
-        !s.selection.dragging,
+        !s.conv.selection.dragging,
         "Shift+mouse is reserved for terminal-native selection"
     );
 }
@@ -3624,20 +3618,20 @@ fn shift_mouse_does_not_start_app_selection() {
 #[test]
 fn selection_tick_noop_when_not_dragging() {
     let mut s = opened();
-    s.selection_edge_dir = 1;
-    s.conversation_scroll = 0;
+    s.conv.selection_edge_dir = 1;
+    s.conv.scroll = 0;
     reduce(&mut s, Action::SelectionTick);
-    assert_eq!(s.conversation_scroll, 0);
+    assert_eq!(s.conv.scroll, 0);
 }
 
 #[test]
 fn mouse_click_scroll_bottom_restores_auto_follow() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let mut s = opened();
-    s.conversation_auto_scroll = false;
-    s.conversation_scroll = 0;
-    s.conversation_unread = 3;
-    s.scroll_bottom_rect = Some((40, 20, 6, 1));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 0;
+    s.conv.unread = 3;
+    s.conv.scroll_bottom_rect = Some((40, 20, 6, 1));
     let mouse = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 42,
@@ -3645,8 +3639,8 @@ fn mouse_click_scroll_bottom_restores_auto_follow() {
         modifiers: KeyModifiers::empty(),
     };
     reduce(&mut s, Action::Mouse(mouse));
-    assert!(s.conversation_auto_scroll);
-    assert_eq!(s.conversation_unread, 0);
+    assert!(s.conv.auto_scroll);
+    assert_eq!(s.conv.unread, 0);
 }
 
 #[test]
@@ -3656,7 +3650,7 @@ fn mouse_scroll_over_input_keeps_input_focus() {
     let mut s = opened();
     s.workbench_focus = WorkbenchFocus::Input;
     s.input_rect = Some((0, 20, 100, 4));
-    s.conversation_rect = Some((0, 3, 100, 15));
+    s.conv.rect = Some((0, 3, 100, 15));
     let mouse = MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 10,
@@ -3680,7 +3674,7 @@ fn mouse_click_input_restores_input_focus_for_history() {
     reduce(&mut s, key(KeyCode::Enter));
     s.workbench_focus = WorkbenchFocus::Conversation;
     s.input_rect = Some((0, 20, 100, 4));
-    s.conversation_rect = Some((0, 3, 100, 15));
+    s.conv.rect = Some((0, 3, 100, 15));
     let click = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 5,
@@ -3699,10 +3693,10 @@ fn mouse_drag_selects_conversation_text() {
     let mut s = opened();
     s.size = (80, 30);
     s.transcript.push_user("hello world selection".into());
-    s.conversation_rect = Some((0, 3, 80, 20));
-    s.conversation_auto_scroll = true;
-    s.conversation_plain = vec!["hello world selection".into()];
-    s.conversation_plain_width = 80;
+    s.conv.rect = Some((0, 3, 80, 20));
+    s.conv.auto_scroll = true;
+    s.conv.plain = vec!["hello world selection".into()];
+    s.conv.plain_width = 80;
 
     let down = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -3711,7 +3705,7 @@ fn mouse_drag_selects_conversation_text() {
         modifiers: KeyModifiers::empty(),
     };
     reduce(&mut s, Action::Mouse(down));
-    assert!(s.selection.dragging);
+    assert!(s.conv.selection.dragging);
 
     let drag = MouseEvent {
         kind: MouseEventKind::Drag(MouseButton::Left),
@@ -3720,7 +3714,7 @@ fn mouse_drag_selects_conversation_text() {
         modifiers: KeyModifiers::empty(),
     };
     reduce(&mut s, Action::Mouse(drag));
-    let range = s.selection.range().expect("range");
+    let range = s.conv.selection.range().expect("range");
     assert!(
         range.0.col < range.1.col || range.0.row != range.1.row,
         "drag should span columns"
@@ -3733,8 +3727,8 @@ fn mouse_drag_selects_conversation_text() {
         modifiers: KeyModifiers::empty(),
     };
     reduce(&mut s, Action::Mouse(up));
-    assert!(!s.selection.dragging);
-    assert!(!s.selection.is_empty());
+    assert!(!s.conv.selection.dragging);
+    assert!(!s.conv.selection.is_empty());
 }
 
 #[test]
@@ -3743,11 +3737,11 @@ fn mouse_click_without_drag_on_url_opens_browser() {
     let mut s = opened();
     s.size = (80, 30);
     // Plain line with a bare URL; conversation_plain is what hit-testing reads.
-    s.conversation_rect = Some((0, 3, 80, 20));
-    s.conversation_auto_scroll = false;
-    s.conversation_scroll = 0;
-    s.conversation_plain = vec!["  Local: http://localhost:3000".into()];
-    s.conversation_plain_width = 80;
+    s.conv.rect = Some((0, 3, 80, 20));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 0;
+    s.conv.plain = vec!["  Local: http://localhost:3000".into()];
+    s.conv.plain_width = 80;
 
     let url_col = "  Local: http://localhost:3000"
         .find("http://")
@@ -3759,7 +3753,7 @@ fn mouse_click_without_drag_on_url_opens_browser() {
         modifiers: KeyModifiers::empty(),
     };
     reduce(&mut s, Action::Mouse(down));
-    assert!(s.selection.dragging);
+    assert!(s.conv.selection.dragging);
 
     let up = MouseEvent {
         kind: MouseEventKind::Up(MouseButton::Left),
@@ -3774,7 +3768,7 @@ fn mouse_click_without_drag_on_url_opens_browser() {
             .any(|e| matches!(e, Effect::OpenWebUrl(u) if u == "http://localhost:3000")),
         "expected OpenWebUrl effect, got {effects:?}"
     );
-    assert!(!s.selection.is_active());
+    assert!(!s.conv.selection.is_active());
 }
 
 #[test]
@@ -3782,11 +3776,11 @@ fn mouse_click_without_drag_off_url_does_not_open() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let mut s = opened();
     s.size = (80, 30);
-    s.conversation_rect = Some((0, 3, 80, 20));
-    s.conversation_auto_scroll = false;
-    s.conversation_scroll = 0;
-    s.conversation_plain = vec!["  Local: http://localhost:3000".into()];
-    s.conversation_plain_width = 80;
+    s.conv.rect = Some((0, 3, 80, 20));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 0;
+    s.conv.plain = vec!["  Local: http://localhost:3000".into()];
+    s.conv.plain_width = 80;
 
     let down = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -3814,14 +3808,14 @@ fn mouse_click_on_url_glued_to_chinese_prose_opens_clean_host() {
     use unicode_width::UnicodeWidthChar;
     let mut s = opened();
     s.size = (100, 30);
-    s.conversation_rect = Some((0, 3, 100, 20));
-    s.conversation_auto_scroll = false;
-    s.conversation_scroll = 0;
+    s.conv.rect = Some((0, 3, 100, 20));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 0;
     // Matches real assistant copy that previously produced toast:
     // "已在浏览器打开 http://localhost:8081，前端页面可以直接打开。"
     let line = "访问地址：http://localhost:8081，前端页面可以直接打开。";
-    s.conversation_plain = vec![line.into()];
-    s.conversation_plain_width = 100;
+    s.conv.plain = vec![line.into()];
+    s.conv.plain_width = 100;
 
     let byte = line.find("http://").expect("url");
     let url_col: u16 = line[..byte]
