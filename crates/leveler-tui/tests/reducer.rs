@@ -4461,3 +4461,205 @@ fn submitting_while_idle_still_submits_normally() {
         "{effects:?}"
     );
 }
+
+// ── User shell (`!command`) routing / lifecycle / details ───────────────────
+
+fn shell_started(s: &mut AppState, id: &str, command: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::UserShellStarted {
+            execution_id: leveler_core::UserShellId::new(id),
+            command: command.into(),
+            cwd: "/repo".into(),
+        }),
+    );
+}
+
+#[test]
+fn bang_routes_to_user_shell_and_never_the_model() {
+    let mut s = opened();
+    typed(&mut s, "!echo hi");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunUserShell { command, .. })] if command == "echo hi"
+        ),
+        "{effects:?}"
+    );
+    // Details opens immediately; input history keeps it; the conversation
+    // and model history never see it.
+    assert_eq!(s.active_screen, Screen::Shell);
+    assert!(s.composer.history().iter().any(|h| h == "!echo hi"));
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::User(text) if text.contains("echo"))),
+        "a shell command must not enter the conversation"
+    );
+}
+
+#[test]
+fn leading_whitespace_bang_is_a_normal_message() {
+    let mut s = opened();
+    typed(&mut s, " !not a shell");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SubmitMessage { content, .. })]
+                if content.trim() == "!not a shell"
+        ),
+        "trimmed submit keeps the text as a message: {effects:?}"
+    );
+}
+
+#[test]
+fn bare_bang_hints_and_keeps_the_composer() {
+    let mut s = opened();
+    typed(&mut s, "!");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(s.composer.text(), "!", "content preserved for editing");
+    assert!(s.notification.is_some(), "the hint names what is missing");
+}
+
+#[test]
+fn busy_agent_turn_rejects_bang_locally() {
+    let mut s = opened();
+    s.status = leveler_client_protocol::RuntimeStatus::Busy;
+    typed(&mut s, "!touch x");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "no command while busy: {effects:?}");
+    assert!(s.notification.is_some());
+}
+
+#[test]
+fn user_shell_lifecycle_updates_the_block() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-1", "cargo test");
+    let idx = s
+        .transcript
+        .user_shell_index(&leveler_core::UserShellId::new("ush-1"))
+        .expect("block created");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-1"),
+            stream: "stdout".into(),
+            chunk: "\u{1b}[31mred\u{1b}[0m line\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-1"),
+            exit_code: Some(0),
+            duration_ms: 4200,
+            status: "success".into(),
+        }),
+    );
+    let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
+        panic!("user shell block expected");
+    };
+    assert_eq!(
+        shell.status,
+        leveler_tui::transcript::UserShellStatus::Success
+    );
+    assert_eq!(shell.duration_ms, Some(4200));
+    assert!(
+        shell.output.contains("red line") && !shell.output.contains('\u{1b}'),
+        "ANSI stripped before buffering: {:?}",
+        shell.output
+    );
+}
+
+#[test]
+fn shell_details_x_cancels_only_a_running_shell() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-run", "sleep 30");
+    s.active_screen = Screen::Shell;
+    let effects = reduce(&mut s, key(KeyCode::Char('x')));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::CancelUserShell { execution_id, .. })]
+                if execution_id.as_str() == "ush-run"
+        ),
+        "{effects:?}"
+    );
+    // Finished shell: x is inert.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-run"),
+            exit_code: None,
+            duration_ms: 100,
+            status: "cancelled".into(),
+        }),
+    );
+    s.active_screen = Screen::Shell;
+    let effects = reduce(&mut s, key(KeyCode::Char('x')));
+    assert!(effects.is_empty(), "{effects:?}");
+    // Esc backs out without any cancel.
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty());
+    assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+#[test]
+fn snapshot_restores_shell_blocks_and_running_focus() {
+    let mut s = opened();
+    let mut snap = snapshot();
+    snap.user_shells = vec![
+        leveler_client_protocol::UiUserShell {
+            id: leveler_core::UserShellId::new("ush-done"),
+            command: "echo done".into(),
+            cwd: "/repo".into(),
+            status: "success".into(),
+            elapsed_secs: 2,
+            exit_code: Some(0),
+            output_tail: "done\n".into(),
+            output_truncated: false,
+        },
+        leveler_client_protocol::UiUserShell {
+            id: leveler_core::UserShellId::new("ush-live"),
+            command: "sleep 60".into(),
+            cwd: "/repo".into(),
+            status: "running".into(),
+            elapsed_secs: 21,
+            exit_code: None,
+            output_tail: String::new(),
+            output_truncated: false,
+        },
+    ];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    let shells: Vec<_> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            TranscriptItem::UserShell(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shells.len(), 2);
+    assert_eq!(
+        shells[0].status,
+        leveler_tui::transcript::UserShellStatus::Success
+    );
+    assert_eq!(
+        shells[1].status,
+        leveler_tui::transcript::UserShellStatus::Running
+    );
+    let focused = s.focused_user_shell().expect("running shell focused");
+    assert_eq!(focused.command, "sleep 60");
+    assert!(
+        (s.elapsed_secs as i64 - focused.started_elapsed_secs) >= 21,
+        "elapsed survives reconnect"
+    );
+}

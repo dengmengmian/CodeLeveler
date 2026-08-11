@@ -12,6 +12,120 @@ use crate::screen::Screen;
 use crate::state::AppState;
 use crate::status_line::{header_line, status_line_content};
 use crate::tool_cell::render_tools_screen;
+
+/// Shell Details: one user shell execution — status, live runtime, source,
+/// cwd, the user's exact command (never the `sh -c` wrapper), and the
+/// bounded output tail. Esc backs out; `x` stops a running one.
+fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
+    use crate::transcript::UserShellStatus;
+    let theme = &state.theme;
+    let t = state.t();
+    let dim = Style::default().fg(theme.dim);
+    let text_style = Style::default().fg(theme.text);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        t.shell_details_title.to_string(),
+        Style::default()
+            .fg(theme.heading)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    let Some(shell) = state.focused_user_shell() else {
+        lines.push(Line::from(Span::styled(t.shell_no_output.to_string(), dim)));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    };
+    let (status_text, status_style) = match shell.status {
+        UserShellStatus::Running => (t.shell_status_running, Style::default().fg(theme.accent)),
+        UserShellStatus::Success => (t.shell_status_success, Style::default().fg(theme.success)),
+        UserShellStatus::Failed => (t.shell_status_failed, Style::default().fg(theme.warning)),
+        UserShellStatus::Cancelled => (t.shell_status_cancelled, dim),
+    };
+    let runtime_secs = match shell.duration_ms {
+        Some(ms) => ms / 1000,
+        None => (state.elapsed_secs as i64 - shell.started_elapsed_secs).max(0) as u64,
+    };
+    let runtime = if runtime_secs >= 60 {
+        format!("{}m {:02}s", runtime_secs / 60, runtime_secs % 60)
+    } else {
+        format!("{runtime_secs}s")
+    };
+    let field = |label: &str, value: Span<'static>| {
+        Line::from(vec![Span::styled(format!("{label:<10}"), dim), value])
+    };
+    lines.push(field(
+        t.shell_status_label,
+        Span::styled(status_text.to_string(), status_style),
+    ));
+    lines.push(field(
+        t.shell_runtime_label,
+        Span::styled(runtime, text_style),
+    ));
+    lines.push(field(
+        t.shell_source_label,
+        Span::styled(t.shell_source_user.to_string(), text_style),
+    ));
+    lines.push(field(
+        t.shell_cwd_label,
+        Span::styled(shell.cwd.clone(), text_style),
+    ));
+    lines.push(field(
+        t.shell_command_label,
+        Span::styled(shell.command.clone(), text_style),
+    ));
+    if let Some(code) = shell.exit_code {
+        lines.push(field(
+            t.shell_exit_label,
+            Span::styled(
+                code.to_string(),
+                if code == 0 {
+                    Style::default().fg(theme.success)
+                } else {
+                    Style::default().fg(theme.warning)
+                },
+            ),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("{}:", t.shell_output_label),
+        dim,
+    )));
+    if shell.output_truncated {
+        lines.push(Line::from(Span::styled(t.shell_truncated.to_string(), dim)));
+    }
+    if shell.output.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", t.shell_no_output),
+            dim,
+        )));
+    } else {
+        let width = area.width.saturating_sub(2) as usize;
+        for raw in shell.output.lines() {
+            let line = sanitize_terminal_line(raw);
+            lines.push(Line::from(Span::styled(
+                truncate_display(&format!("  {line}"), width.max(4)),
+                Style::default().fg(theme.muted),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    let hint = if shell.status == UserShellStatus::Running {
+        t.shell_hint_running
+    } else {
+        t.shell_hint_done
+    };
+    lines.push(Line::from(Span::styled(hint.to_string(), dim)));
+
+    // Keep the tail visible by default; PgUp/PgDn (screen_scroll) pages back.
+    let height = area.height as usize;
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = state.screen_scroll.min(max_scroll);
+    let offset = max_scroll.saturating_sub(scroll);
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), area);
+}
+
 #[cfg(test)]
 pub(crate) use crate::tool_cell::tool_action_label;
 pub(crate) use crate::tool_cell::tool_summary;
@@ -29,11 +143,12 @@ pub use transcript_lines::{
 };
 pub(crate) use transcript_lines::{
     btw_card_lines, sub_agent_detail, sub_agent_display_name, sub_agent_status, sub_agent_usage,
+    user_shell_lines,
 };
 
 pub(crate) use panes::{render_list_focused, render_scrolled};
 pub(crate) use screens::screen_title;
-pub(crate) use text::{truncate_display, wrap};
+pub(crate) use text::{sanitize_terminal_line, truncate_display, wrap};
 
 pub(crate) use footer::{
     COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, render_attachments,
@@ -91,6 +206,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Context => render_context_screen(frame, chunks[1], state),
         Screen::Agents => render_agents_screen(frame, chunks[1], state),
         Screen::Remote => render_remote_screen(frame, chunks[1], state),
+        Screen::Shell => render_shell_screen(frame, chunks[1], state),
         Screen::Help => render_help_screen(frame, chunks[1], state),
     }
     frame.render_widget(

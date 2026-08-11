@@ -172,6 +172,19 @@ pub fn build_conversation_lines_with_hits(
                     state.elapsed_secs,
                 ));
             }
+            TranscriptItem::UserShell(shell) => {
+                // Every user shell row is a click target: click opens its
+                // Shell Details (running or finished) — the reducer
+                // dispatches by item type, geometry stays untouched.
+                hits.push((out.len(), idx));
+                out.extend(crate::render::user_shell_lines(
+                    shell,
+                    theme,
+                    width,
+                    t,
+                    state.elapsed_secs,
+                ));
+            }
             _ => {
                 out.extend(item_render(item, theme, width, state.tools_expanded, t));
             }

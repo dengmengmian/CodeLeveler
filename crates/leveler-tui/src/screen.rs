@@ -19,6 +19,9 @@ pub enum Screen {
     Agents,
     /// The `/remote` invite: a QR to scan, and the fingerprint to compare.
     Remote,
+    /// One user shell execution (`!command`): status, runtime, command,
+    /// live output; Esc backs out, `x` stops a running one.
+    Shell,
     Help,
 }
 

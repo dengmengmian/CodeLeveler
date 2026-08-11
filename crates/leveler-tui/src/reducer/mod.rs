@@ -259,7 +259,19 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // (see Up); anything else begins a selection.
                 match interaction::hit_test(state, mouse.column, mouse.row) {
                     Hit::Disclosure { item } => {
-                        state.transcript.toggle_tool_group_at(item);
+                        // A user shell row opens its Details screen (running
+                        // or finished); tool groups / sub-agents toggle
+                        // inline. Same hit map, dispatch by item identity.
+                        if matches!(
+                            state.transcript.items().get(item),
+                            Some(crate::transcript::TranscriptItem::UserShell(_))
+                        ) {
+                            state.shell_screen_item = Some(item);
+                            state.active_screen = Screen::Shell;
+                            state.screen_scroll = 0;
+                        } else {
+                            state.transcript.toggle_tool_group_at(item);
+                        }
                         state.conv.plain.clear();
                         interaction::clear_selection_drag(state);
                         state.conv.selection.clear();

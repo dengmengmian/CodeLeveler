@@ -184,6 +184,8 @@ pub struct AppState {
     pub workbench_focus: WorkbenchFocus,
     /// Last painted Input/composer rect for click-to-focus.
     pub input_rect: Option<(u16, u16, u16, u16)>,
+    /// Transcript index of the user shell the Shell Details screen shows.
+    pub shell_screen_item: Option<usize>,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
 
@@ -309,6 +311,7 @@ impl AppState {
             conv: crate::conversation::ConversationView::default(),
             workbench_focus: WorkbenchFocus::Input,
             input_rect: None,
+            shell_screen_item: None,
             plan_collapsed: false,
             tools_expanded: false,
             reasoning_expanded: false,
@@ -380,5 +383,16 @@ impl AppState {
         self.cancel_armed = false;
         self.force_cancel_armed = false;
         self.quit_armed = false;
+    }
+}
+
+impl AppState {
+    /// The user shell block the Shell Details screen is focused on.
+    pub fn focused_user_shell(&self) -> Option<&crate::transcript::UserShellBlock> {
+        let index = self.shell_screen_item?;
+        match self.transcript.items().get(index)? {
+            crate::transcript::TranscriptItem::UserShell(shell) => Some(shell),
+            _ => None,
+        }
     }
 }

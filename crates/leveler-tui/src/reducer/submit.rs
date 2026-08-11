@@ -21,6 +21,13 @@ pub(super) fn touch_slash_filter(state: &mut AppState) {
 }
 
 pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
+    // User shell escape: the RAW composer's first character is `!` — no
+    // leading-whitespace trim, so " !cargo test" stays a normal message and
+    // ordinary prose can never execute. Never reaches the model.
+    if let Some(cmd) = state.composer.text().strip_prefix('!') {
+        let cmd = cmd.to_string();
+        return submit_user_shell(state, cmd);
+    }
     let text = state.composer.text().trim().to_string();
     if text.is_empty() {
         return Vec::new();
@@ -844,6 +851,37 @@ fn doctor_slash(state: &mut AppState) -> Vec<Effect> {
         ),
     });
     Vec::new()
+}
+
+/// Route `!command`: enters input history (like slash commands), never the
+/// conversation or the model; opens Shell Details immediately.
+fn submit_user_shell(state: &mut AppState, cmd: String) -> Vec<Effect> {
+    if cmd.trim().is_empty() {
+        // Bare `!`: keep the composer content so the user can continue
+        // typing; just say what is missing.
+        state.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: state.t().user_shell_empty_hint.to_string(),
+        });
+        return Vec::new();
+    }
+    if state.is_busy() {
+        // Fast local hint; the runtime enforces the same mutex.
+        state.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Warning,
+            message: state.t().user_shell_busy_hint.to_string(),
+        });
+        return Vec::new();
+    }
+    state.composer.take();
+    // The Details screen opens now; UserShellStarted fills it in.
+    state.active_screen = crate::screen::Screen::Shell;
+    vec![Effect::Send(
+        leveler_client_protocol::ClientCommand::RunUserShell {
+            session_id: state.session_id.clone(),
+            command: cmd.trim().to_string(),
+        },
+    )]
 }
 
 #[cfg(test)]

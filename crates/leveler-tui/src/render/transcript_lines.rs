@@ -98,6 +98,9 @@ pub fn item_render(
         TranscriptItem::SubAgent(block) => {
             sub_agent_lines(block, theme, wrap_width, &mut out, t, 0)
         }
+        TranscriptItem::UserShell(shell) => {
+            out.extend(user_shell_lines(shell, theme, wrap_width, t, 0));
+        }
         TranscriptItem::Completion(report) => completion_lines(report, theme, &mut out, t),
         TranscriptItem::Error(text) => {
             push_prefixed(
@@ -905,6 +908,86 @@ fn push_prefixed(
             Span::styled(line, style),
         ]));
     }
+}
+
+/// User shell presentation adapter: one execution block → the shared
+/// disclosure language. Clearly marked as USER-initiated ("Run (user)"), so
+/// it can never read as an agent tool call; running shows a live `◌` row.
+pub(crate) fn user_shell_lines(
+    shell: &crate::transcript::UserShellBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &crate::i18n::UiText,
+    now_elapsed_secs: u64,
+) -> Vec<Line<'static>> {
+    use crate::transcript::UserShellStatus;
+    let mut out = Vec::new();
+    let label = format!("{} {}", t.user_shell_run_label, shell.command);
+    if shell.status == UserShellStatus::Running {
+        let elapsed = (now_elapsed_secs as i64 - shell.started_elapsed_secs).max(0);
+        let suffix = if elapsed > 0 {
+            format!(" · {elapsed}s")
+        } else {
+            String::new()
+        };
+        out.push(Line::from(vec![
+            Span::styled("◌ ".to_string(), Style::default().fg(theme.accent)),
+            Span::styled(
+                crate::render::truncate_display(&label, wrap_width.saturating_sub(8)),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(suffix, Style::default().fg(theme.dim)),
+        ]));
+        return out;
+    }
+    let failed = shell.status == UserShellStatus::Failed;
+    let label = if shell.status == UserShellStatus::Cancelled {
+        format!("{label} · {}", t.user_shell_cancelled)
+    } else {
+        label
+    };
+    let presentation = crate::presentation::disclosure::DisclosurePresentation {
+        label,
+        failed: usize::from(failed),
+        failed_suffix: shell
+            .exit_code
+            .filter(|code| failed && *code != 0)
+            .map(|code| format!("exit {code}")),
+        expanded: shell.expanded,
+        duration_ms: shell.duration_ms,
+        first_error: (!shell.expanded && failed)
+            .then(|| {
+                shell
+                    .output
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .map(str::to_string)
+            })
+            .flatten(),
+    };
+    if !shell.expanded {
+        return crate::presentation::disclosure::collapsed_lines(&presentation, theme, wrap_width);
+    }
+    out.push(crate::presentation::disclosure::header_line(
+        &presentation,
+        theme,
+        wrap_width,
+    ));
+    if shell.output_truncated {
+        out.push(Line::from(Span::styled(
+            format!("  {}", t.shell_truncated),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    for raw in shell.output.lines() {
+        let line = crate::render::sanitize_terminal_line(raw);
+        out.push(Line::from(Span::styled(
+            crate::render::truncate_display(&format!("  {line}"), wrap_width),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    out
 }
 
 #[cfg(test)]

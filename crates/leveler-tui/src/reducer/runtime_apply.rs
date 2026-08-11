@@ -407,11 +407,45 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 ),
             });
         }
-        RuntimeEvent::UserShellStarted { .. }
-        | RuntimeEvent::UserShellOutput { .. }
-        | RuntimeEvent::UserShellExited { .. } => {
-            // Wired to the UserShell transcript block in the user-shell TUI
-            // slice; explicit arms so this match stays exhaustive.
+        RuntimeEvent::UserShellStarted {
+            execution_id,
+            command,
+            cwd,
+        } => {
+            state.transcript.push_user_shell_started(
+                execution_id.clone(),
+                command,
+                cwd,
+                state.elapsed_secs as i64,
+            );
+            // Focus the Details screen on this execution (the `!` submit
+            // already switched to it).
+            state.shell_screen_item = state.transcript.user_shell_index(&execution_id);
+        }
+        RuntimeEvent::UserShellOutput {
+            execution_id,
+            chunk,
+            ..
+        } => {
+            // Sanitize BEFORE it enters any buffer: shell output is
+            // untrusted terminal text (ANSI/OSC/control sequences).
+            let clean = leveler_core::sanitize_terminal_output(&chunk);
+            state
+                .transcript
+                .append_user_shell_output(&execution_id, &clean);
+        }
+        RuntimeEvent::UserShellExited {
+            execution_id,
+            exit_code,
+            duration_ms,
+            status,
+        } => {
+            state.transcript.complete_user_shell(
+                &execution_id,
+                exit_code,
+                duration_ms,
+                crate::transcript::UserShellStatus::from_wire(&status),
+            );
         }
         RuntimeEvent::ContextCompacted { from, to } => {
             // Client-owned wording for the structured runtime fact.
@@ -802,6 +836,36 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
                 state.transcript.finish_assistant(&message.id);
             }
             UiRole::System | UiRole::Tool => {}
+        }
+    }
+    // User shell executions (history + a still-running one) survive
+    // reconnect via the snapshot; blocks are rebuilt in order.
+    state.shell_screen_item = None;
+    for shell in &session.user_shells {
+        let running = shell.status == "running";
+        // Back-date the start (possibly below zero) so the live runtime
+        // keeps counting from the runtime's elapsed, not from zero at
+        // reconnect.
+        let started = state.elapsed_secs as i64 - shell.elapsed_secs as i64;
+        state.transcript.push_user_shell_started(
+            shell.id.clone(),
+            shell.command.clone(),
+            shell.cwd.clone(),
+            started,
+        );
+        if !shell.output_tail.is_empty() {
+            let clean = leveler_core::sanitize_terminal_output(&shell.output_tail);
+            state.transcript.append_user_shell_output(&shell.id, &clean);
+        }
+        if !running {
+            state.transcript.complete_user_shell(
+                &shell.id,
+                shell.exit_code,
+                shell.elapsed_secs * 1000,
+                crate::transcript::UserShellStatus::from_wire(&shell.status),
+            );
+        } else {
+            state.shell_screen_item = state.transcript.user_shell_index(&shell.id);
         }
     }
     if let Some(report) = session.completion_report {

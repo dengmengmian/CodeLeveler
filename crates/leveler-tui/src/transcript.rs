@@ -132,12 +132,56 @@ pub struct BtwBlock {
 }
 
 /// One block in the transcript.
+/// Terminal state of one user shell execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserShellStatus {
+    Running,
+    Success,
+    Failed,
+    Cancelled,
+}
+
+impl UserShellStatus {
+    pub fn from_wire(status: &str) -> Self {
+        match status {
+            "success" => Self::Success,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// A user shell execution (`!command`) — NOT a tool call and NOT a user
+/// message: it never enters the model conversation. Bounded, sanitized
+/// output tail only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserShellBlock {
+    pub id: leveler_core::UserShellId,
+    pub command: String,
+    pub cwd: String,
+    pub status: UserShellStatus,
+    pub output: String,
+    pub output_truncated: bool,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    /// Session-elapsed baseline when it started (drives the live runtime).
+    /// SIGNED: a reconnect back-dates this below zero so a shell that ran 21
+    /// minutes before the client attached still shows 21 minutes, not 0.
+    pub started_elapsed_secs: i64,
+    /// Show full output inline (mouse / Ctrl+O). Pure display state.
+    pub expanded: bool,
+}
+
+/// Bounded client-side output tail for a user shell block.
+pub const USER_SHELL_OUTPUT_CAP: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
     User(String),
     Assistant(AssistantBlock),
     ToolGroup(ToolGroupBlock),
     SubAgent(SubAgentBlock),
+    UserShell(UserShellBlock),
     Completion(UiCompletionReport),
     Error(String),
     /// Multi-line host note (e.g. `/memory` listing). Transcript-visible, not
@@ -470,6 +514,76 @@ impl TranscriptState {
         }
     }
 
+    /// Begin a user shell execution block (idempotent per id).
+    pub fn push_user_shell_started(
+        &mut self,
+        id: leveler_core::UserShellId,
+        command: String,
+        cwd: String,
+        started_elapsed_secs: i64,
+    ) {
+        self.bump();
+        self.close_tool_group();
+        if self.user_shell_index(&id).is_some() {
+            return;
+        }
+        self.items.push(TranscriptItem::UserShell(UserShellBlock {
+            id,
+            command,
+            cwd,
+            status: UserShellStatus::Running,
+            output: String::new(),
+            output_truncated: false,
+            exit_code: None,
+            duration_ms: None,
+            started_elapsed_secs,
+            expanded: false,
+        }));
+    }
+
+    /// Append sanitized output to a running user shell (bounded tail).
+    pub fn append_user_shell_output(&mut self, id: &leveler_core::UserShellId, chunk: &str) {
+        let Some(index) = self.user_shell_index(id) else {
+            return;
+        };
+        self.bump();
+        if let TranscriptItem::UserShell(shell) = &mut self.items[index] {
+            shell.output.push_str(chunk);
+            if shell.output.len() > USER_SHELL_OUTPUT_CAP {
+                let cut = shell.output.len() - USER_SHELL_OUTPUT_CAP;
+                let cut = leveler_core::floor_char_boundary(&shell.output, cut);
+                shell.output.drain(..cut);
+                shell.output_truncated = true;
+            }
+        }
+    }
+
+    /// Finish a user shell execution with its terminal facts.
+    pub fn complete_user_shell(
+        &mut self,
+        id: &leveler_core::UserShellId,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        status: UserShellStatus,
+    ) {
+        let Some(index) = self.user_shell_index(id) else {
+            return;
+        };
+        self.bump();
+        if let TranscriptItem::UserShell(shell) = &mut self.items[index] {
+            shell.exit_code = exit_code;
+            shell.duration_ms = Some(duration_ms);
+            shell.status = status;
+        }
+    }
+
+    /// Index of the user shell block with `id`, if present.
+    pub fn user_shell_index(&self, id: &leveler_core::UserShellId) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|item| matches!(item, TranscriptItem::UserShell(shell) if &shell.id == id))
+    }
+
     /// Toggle expand/collapse on the collapsible block at `index` (a
     /// ToolGroup or SubAgent item). The mouse path: a click on a disclosure
     /// row targets exactly that historical group, not the latest one.
@@ -482,6 +596,10 @@ impl TranscriptState {
             TranscriptItem::SubAgent(block) => {
                 block.expanded = !block.expanded;
                 Some(block.expanded)
+            }
+            TranscriptItem::UserShell(shell) => {
+                shell.expanded = !shell.expanded;
+                Some(shell.expanded)
             }
             _ => None,
         };
