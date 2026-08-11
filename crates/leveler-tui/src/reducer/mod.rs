@@ -7,6 +7,7 @@ use crossterm::event::{
 use leveler_client_protocol::{ClientCommand, NotificationLevel, PermissionProfile, RuntimeEvent};
 
 use crate::action::{Action, Effect, EffectCompletion};
+use crate::conversation::interaction::{self, Hit};
 use crate::screen::Screen;
 use crate::state::{AppState, Notification, WorkbenchFocus};
 
@@ -193,9 +194,6 @@ fn snapshot_awaits_interaction(
         })
 }
 
-/// Rows at top/bottom of Conversation that trigger continuous scroll while dragging.
-const SELECTION_EDGE_ROWS: u16 = 2;
-
 /// Mouse: wheel scrolls Conversation; drag selects text with edge auto-scroll; release copies.
 ///
 /// `Shift`+mouse is ignored so the terminal can offer native selection as a fallback
@@ -219,15 +217,15 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         // Wheel scrolls Conversation (never over Input — keeps history focus).
         MouseEventKind::ScrollUp if over_conv || over_jump => {
             state.workbench_focus = WorkbenchFocus::Conversation;
-            clear_selection_drag(state);
+            interaction::clear_selection_drag(state);
             state.conv.selection.clear();
-            scroll_conversation(state, -3);
+            interaction::scroll_by(state, -3);
         }
         MouseEventKind::ScrollDown if over_conv || over_jump => {
             state.workbench_focus = WorkbenchFocus::Conversation;
-            clear_selection_drag(state);
+            interaction::clear_selection_drag(state);
             state.conv.selection.clear();
-            scroll_conversation(state, 3);
+            interaction::scroll_by(state, 3);
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {}
         MouseEventKind::Down(MouseButton::Left) => {
@@ -235,68 +233,55 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             // an active selection so hit-testing is usually empty anyway.
             if over_jump && !state.conv.selection.is_active() {
                 request_jump_to_bottom(state);
-                clear_selection_drag(state);
+                interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
                 return Vec::new();
             }
             if over_input {
                 state.workbench_focus = WorkbenchFocus::Input;
-                clear_selection_drag(state);
+                interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
                 return Vec::new();
             }
             if over_conv {
                 state.workbench_focus = WorkbenchFocus::Conversation;
                 // Pin the viewport exactly where it is painted so agent
-                // streaming cannot yank us to the bottom AND the click below
-                // maps against the same scroll the user is looking at.
+                // streaming cannot yank us to the bottom AND the hit test
+                // below maps against the same scroll the user is looking at.
                 crate::conversation::pin_at_current_viewport(state);
-                ensure_conversation_plain(state);
-                // A click on a tool-disclosure row toggles exactly that group
-                // — it never begins a selection and outranks URL opening on
-                // its own row (P0 disclosure contract). Historical groups are
-                // individually addressable via the hit map built with the
-                // cached lines, so a stale rect can never toggle the wrong
-                // group after resize or new content.
-                if let Some(pos) =
-                    crate::conversation::geometry::screen_to_content(state, mouse.column, mouse.row)
-                    && let Some(item) = state.disclosure_item_at(
-                        crate::conversation::geometry::content_width(state),
-                        pos.row,
-                    )
-                {
-                    state.transcript.toggle_tool_group_at(item);
-                    state.conv.plain.clear();
-                    clear_selection_drag(state);
-                    state.conv.selection.clear();
-                    return Vec::new();
-                }
-                // Cmd/Ctrl+click on a URL opens it immediately (no selection).
-                // Both modifiers are accepted so it works whichever the terminal
-                // forwards (Cmd is often eaten by macOS terminals). Plain click
-                // opens on release when the selection stayed empty — see Up.
-                if mouse
-                    .modifiers
-                    .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
-                    && let Some(pos) = crate::conversation::geometry::screen_to_content(
-                        state,
-                        mouse.column,
-                        mouse.row,
-                    )
-                    && let Some(url) = url_at_pos(state, pos)
-                {
-                    return open_url(state, &url);
-                }
-                state.conv.selection_last_mouse = Some((mouse.column, mouse.row));
-                update_selection_edge(state, mouse.column, mouse.row);
-                if let Some(pos) =
-                    crate::conversation::geometry::screen_to_content(state, mouse.column, mouse.row)
-                {
-                    state.conv.selection.begin(pos);
+                interaction::ensure_plain(state);
+                // Policy over semantics: the interaction layer says WHAT is
+                // under the cursor; this reducer decides what to do with it.
+                // A disclosure row toggles exactly its group and never begins
+                // a selection; Cmd/Ctrl+click opens a URL immediately (both
+                // modifiers — macOS terminals often eat Cmd); a plain click
+                // on a URL opens on release when the selection stayed empty
+                // (see Up); anything else begins a selection.
+                match interaction::hit_test(state, mouse.column, mouse.row) {
+                    Hit::Disclosure { item } => {
+                        state.transcript.toggle_tool_group_at(item);
+                        state.conv.plain.clear();
+                        interaction::clear_selection_drag(state);
+                        state.conv.selection.clear();
+                        return Vec::new();
+                    }
+                    Hit::Url { url, .. }
+                        if mouse
+                            .modifiers
+                            .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL) =>
+                    {
+                        return open_url(state, &url);
+                    }
+                    Hit::Url { pos, .. } | Hit::Text(pos) => {
+                        state.conv.selection_last_mouse = Some((mouse.column, mouse.row));
+                        interaction::update_selection_edge(state, mouse.column, mouse.row);
+                        state.conv.selection.begin(pos);
+                    }
+                    Hit::Outside => {}
                 }
             } else {
                 state.workbench_focus = WorkbenchFocus::Input;
-                clear_selection_drag(state);
+                interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
             }
         }
@@ -305,8 +290,8 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 return Vec::new();
             }
             state.conv.selection_last_mouse = Some((mouse.column, mouse.row));
-            update_selection_edge(state, mouse.column, mouse.row);
-            ensure_conversation_plain(state);
+            interaction::update_selection_edge(state, mouse.column, mouse.row);
+            interaction::ensure_plain(state);
             if let Some(pos) =
                 crate::conversation::geometry::screen_to_content(state, mouse.column, mouse.row)
             {
@@ -316,21 +301,18 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         MouseEventKind::Up(MouseButton::Left) => {
             if state.conv.selection.dragging {
                 // One last edge settle is not needed; stop continuous scroll.
-                clear_selection_drag(state);
+                interaction::clear_selection_drag(state);
                 state.conv.selection.finish();
                 if state.conv.selection.is_empty() {
                     // Click without drag: open the URL under the cursor, if any.
-                    ensure_conversation_plain(state);
-                    if let Some(pos) = crate::conversation::geometry::screen_to_content(
-                        state,
-                        mouse.column,
-                        mouse.row,
-                    ) && let Some(url) = url_at_pos(state, pos)
+                    interaction::ensure_plain(state);
+                    if let Hit::Url { url, .. } =
+                        interaction::hit_test(state, mouse.column, mouse.row)
                     {
                         return open_url(state, &url);
                     }
                 } else {
-                    ensure_conversation_plain(state);
+                    interaction::ensure_plain(state);
                     let text = crate::selection::extract_selected_text(
                         &state.conv.plain,
                         &state.conv.selection,
@@ -364,75 +346,17 @@ fn handle_selection_tick(state: &mut AppState) -> Vec<Effect> {
     if !state.conv.selection.dragging || state.conv.selection_edge_dir == 0 {
         return Vec::new();
     }
-    let step = edge_scroll_step(state.conv.selection_edge_streak);
+    let step = interaction::edge_scroll_step(state.conv.selection_edge_streak);
     state.conv.selection_edge_streak = state.conv.selection_edge_streak.saturating_add(1);
     let delta = i32::from(state.conv.selection_edge_dir) * step as i32;
-    scroll_conversation_pinned(state, delta);
-    ensure_conversation_plain(state);
+    interaction::scroll_pinned_by(state, delta);
+    interaction::ensure_plain(state);
     if let Some((col, row)) = state.conv.selection_last_mouse
         && let Some(pos) = crate::conversation::geometry::screen_to_content(state, col, row)
     {
         state.conv.selection.extend(pos);
     }
     Vec::new()
-}
-
-fn clear_selection_drag(state: &mut AppState) {
-    state.conv.selection_edge_dir = 0;
-    state.conv.selection_edge_streak = 0;
-    state.conv.selection_last_mouse = None;
-}
-
-/// Accelerate scroll while the pointer stays in an edge hot zone.
-fn edge_scroll_step(streak: u32) -> usize {
-    match streak {
-        0..=2 => 1,
-        3..=6 => 2,
-        7..=12 => 3,
-        _ => 5,
-    }
-}
-
-/// Top / bottom Conversation rows (or outside those edges) drive auto-scroll.
-fn update_selection_edge(state: &mut AppState, col: u16, row: u16) {
-    let Some((rx, ry, rw, rh)) = state.conv.rect else {
-        state.conv.selection_edge_dir = 0;
-        state.conv.selection_edge_streak = 0;
-        return;
-    };
-    if rh == 0 {
-        state.conv.selection_edge_dir = 0;
-        return;
-    }
-    // Horizontally outside the conversation: stop edge scroll (still may clamp select).
-    let in_x = col >= rx && col < rx.saturating_add(rw);
-    if !in_x {
-        state.conv.selection_edge_dir = 0;
-        state.conv.selection_edge_streak = 0;
-        return;
-    }
-    let edge = SELECTION_EDGE_ROWS.min(rh);
-    let top_end = ry.saturating_add(edge.saturating_sub(1));
-    let bottom_start = ry.saturating_add(rh.saturating_sub(edge));
-    let dir = if row <= top_end || row < ry {
-        -1
-    } else if row >= bottom_start || row >= ry.saturating_add(rh) {
-        1
-    } else {
-        0
-    };
-    if dir == 0 {
-        state.conv.selection_edge_dir = 0;
-        state.conv.selection_edge_streak = 0;
-    } else if state.conv.selection_edge_dir != dir {
-        state.conv.selection_edge_dir = dir;
-        state.conv.selection_edge_streak = 0;
-    }
-}
-
-/// The http(s) URL under display column `pos.col` of plain line `pos.row`, if any.
-fn url_at_pos(state: &AppState, pos: crate::selection::TextPos) -> Option<String> {
-    crate::url_link::url_at(state.conv.plain.get(pos.row)?, pos.col)
 }
 
 /// Queue opening `url` in the OS default browser (handled by the event loop).
@@ -442,16 +366,6 @@ fn open_url(state: &mut AppState, url: &str) -> Vec<Effect> {
         message: format!("已在浏览器打开 {url}"),
     });
     vec![Effect::OpenWebUrl(url.to_string())]
-}
-
-fn ensure_conversation_plain(state: &mut AppState) {
-    let width = crate::conversation::geometry::content_width(state);
-    if state.conv.plain_width == width && !state.conv.plain.is_empty() {
-        return;
-    }
-    let lines = state.conversation_lines(width);
-    state.conv.plain = lines.iter().map(crate::selection::line_to_plain).collect();
-    state.conv.plain_width = width;
 }
 
 fn point_in_rect(x: u16, y: u16, rect: Option<(u16, u16, u16, u16)>) -> bool {
@@ -682,20 +596,20 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // PageUp/PageDown always scroll Conversation (and pin auto-scroll off).
         KeyCode::PageUp => {
             state.workbench_focus = WorkbenchFocus::Conversation;
-            scroll_conversation(state, -(state.size.1 as i32 / 2).max(1));
+            interaction::scroll_by(state, -(state.size.1 as i32 / 2).max(1));
         }
         KeyCode::PageDown => {
             state.workbench_focus = WorkbenchFocus::Conversation;
-            scroll_conversation(state, (state.size.1 as i32 / 2).max(1));
+            interaction::scroll_by(state, (state.size.1 as i32 / 2).max(1));
         }
         // Conversation focus: ↑/↓ scroll the viewport only.
         KeyCode::Up if state.workbench_focus == WorkbenchFocus::Conversation && popup_len == 0 => {
-            scroll_conversation(state, -1);
+            interaction::scroll_by(state, -1);
         }
         KeyCode::Down
             if state.workbench_focus == WorkbenchFocus::Conversation && popup_len == 0 =>
         {
-            scroll_conversation(state, 1);
+            interaction::scroll_by(state, 1);
         }
         // Input focus: ↑/↓ = history only (never steal for conversation scroll).
         KeyCode::Up if popup_len == 0 => state.composer.up(),
@@ -736,50 +650,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 }
 
 /// Scroll the conversation viewport by `delta` lines (negative = up).
-fn scroll_conversation(state: &mut AppState, delta: i32) {
-    let height = crate::conversation::geometry::viewport_height(state);
-    let width = crate::conversation::geometry::content_width(state);
-    let total = crate::workbench::conversation_line_count(state, width);
-    let max_scroll = total.saturating_sub(height);
-    if delta < 0 {
-        state.conv.auto_scroll = false;
-        state.conv.scroll = state
-            .conv
-            .scroll
-            .saturating_sub((-delta) as usize)
-            .min(max_scroll);
-    } else {
-        let next = (state.conv.scroll + delta as usize).min(max_scroll);
-        state.conv.scroll = next;
-        if next >= max_scroll {
-            state.conv.auto_scroll = true;
-            state.conv.unread = 0;
-        }
-    }
-}
-
-/// Scroll during text selection: never re-enable auto-follow (streaming must not
-/// yank the viewport while the user is still choosing text).
-fn scroll_conversation_pinned(state: &mut AppState, delta: i32) {
-    if delta == 0 {
-        return;
-    }
-    let height = crate::conversation::geometry::viewport_height(state);
-    let width = crate::conversation::geometry::content_width(state);
-    let total = crate::workbench::conversation_line_count(state, width);
-    let max_scroll = total.saturating_sub(height.max(1));
-    state.conv.auto_scroll = false;
-    if delta < 0 {
-        state.conv.scroll = state
-            .conv
-            .scroll
-            .saturating_sub((-delta) as usize)
-            .min(max_scroll);
-    } else {
-        state.conv.scroll = (state.conv.scroll + delta as usize).min(max_scroll);
-    }
-}
-
 /// Move focus across user turns. `delta` is -1 (older) or +1 (newer).
 /// Does not modify `state.composer` — draft is always preserved (UI-N3/N4).
 fn navigate_user_turn(state: &mut AppState, delta: i32) {
@@ -845,13 +715,8 @@ fn toggle_current_expand(state: &mut AppState) {
 
 /// Jump conversation viewport to bottom (auto-follow resumes).
 fn request_jump_to_bottom(state: &mut AppState) {
-    state.conv.auto_scroll = true;
-    state.conv.unread = 0;
+    interaction::jump_to_live_edge(state);
     state.jump_to_bottom = true;
-    let height = crate::conversation::geometry::viewport_height(state);
-    let width = crate::conversation::geometry::content_width(state);
-    let total = crate::workbench::conversation_line_count(state, width);
-    state.conv.scroll = total.saturating_sub(height);
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
         message: state.t().back_to_bottom.to_string(),

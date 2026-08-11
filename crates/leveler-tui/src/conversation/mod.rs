@@ -8,6 +8,7 @@
 //! expands") was exactly two modules computing the same scroll two ways.
 
 pub mod geometry;
+pub mod interaction;
 pub mod view;
 
 pub use view::{ConvCacheEntry, ConvKey, ConversationView};
