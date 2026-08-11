@@ -227,6 +227,30 @@ pub enum EngineEvent {
         reason: String,
         crossed_reliable: bool,
     },
+    /// A user-originated shell execution (`!command`) started in this
+    /// session. Direct host execution: no turn, no model, no tool call.
+    /// Persisted so the session's audit trail names every explicit user
+    /// side effect.
+    UserShellStarted {
+        execution_id: leveler_core::UserShellId,
+        command: String,
+        cwd: String,
+    },
+    /// TRANSIENT: live output chunk from a running user shell. `stream` is
+    /// `stdout` or `stderr`. Never persisted — clients keep a bounded buffer.
+    UserShellOutput {
+        execution_id: leveler_core::UserShellId,
+        stream: String,
+        chunk: String,
+    },
+    /// A user shell execution ended (`status`: success | failed | cancelled).
+    /// Persisted alongside its start for audit/recovery.
+    UserShellFinished {
+        execution_id: leveler_core::UserShellId,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        status: String,
+    },
     /// The harness started an advisory (tool-free) model call during closeout —
     /// a completeness audit or a compaction summary. Transient UI hint only, so a
     /// status line can name the wait instead of a bare "waiting for model". `kind`
@@ -431,6 +455,7 @@ impl EngineEvent {
         matches!(
             self,
             EngineEvent::StreamAttemptStarted
+                | EngineEvent::UserShellOutput { .. }
                 | EngineEvent::AssistantDelta { .. }
                 | EngineEvent::ReasoningDelta { .. }
                 | EngineEvent::TokenUsage { .. }
@@ -525,7 +550,12 @@ impl EngineEvent {
             | EngineEvent::ReviewFailed { .. }
             // Transient local UI hints (may carry command text), never projected.
             | EngineEvent::AdvisoryStarted { .. }
-            | EngineEvent::CommandProgress { .. } => LocalOnly,
+            | EngineEvent::CommandProgress { .. }
+            // User shell facts carry the raw command line and its output —
+            // local-sensitive by construction.
+            | EngineEvent::UserShellStarted { .. }
+            | EngineEvent::UserShellOutput { .. }
+            | EngineEvent::UserShellFinished { .. } => LocalOnly,
         }
     }
 
@@ -657,6 +687,9 @@ impl EngineEvent {
             | EngineEvent::ReviewFailed { .. }
             | EngineEvent::AdvisoryStarted { .. }
             | EngineEvent::ContextExpanded { .. }
+            | EngineEvent::UserShellStarted { .. }
+            | EngineEvent::UserShellOutput { .. }
+            | EngineEvent::UserShellFinished { .. }
             | EngineEvent::CommandProgress { .. } => return None,
         })
     }

@@ -407,6 +407,12 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 ),
             });
         }
+        RuntimeEvent::UserShellStarted { .. }
+        | RuntimeEvent::UserShellOutput { .. }
+        | RuntimeEvent::UserShellExited { .. } => {
+            // Wired to the UserShell transcript block in the user-shell TUI
+            // slice; explicit arms so this match stays exhaustive.
+        }
         RuntimeEvent::ContextCompacted { from, to } => {
             // Client-owned wording for the structured runtime fact.
             state.notification = Some(Notification {

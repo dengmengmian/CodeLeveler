@@ -155,6 +155,21 @@ pub enum ClientCommand {
     },
     /// Side question (`/btw`): single-turn answer using current session
     /// context, without tools and without appending to the transcript store.
+    /// Run an explicit user shell command (`!command`) in the session's
+    /// repository. USER-ORIGINATED DIRECT EXECUTION: never reaches the model,
+    /// the agent loop, or the tool registry. `command` is the raw shell
+    /// string after the `!` prefix.
+    RunUserShell {
+        session_id: SessionId,
+        command: String,
+    },
+    /// Cancel exactly one user shell execution. Deliberately separate from
+    /// `CancelCurrentTurn`: a user shell is not an agent turn, and the id
+    /// match ensures a stale cancel can never kill a newer execution.
+    CancelUserShell {
+        session_id: SessionId,
+        execution_id: leveler_core::UserShellId,
+    },
     Btw {
         session_id: SessionId,
         question: String,
@@ -194,6 +209,8 @@ impl ClientCommand {
             | ClientCommand::ArchiveSession { session_id }
             | ClientCommand::ForkSession { session_id }
             | ClientCommand::RestoreCheckpoint { session_id, .. }
+            | ClientCommand::RunUserShell { session_id, .. }
+            | ClientCommand::CancelUserShell { session_id, .. }
             | ClientCommand::Btw { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
                 requester_session_id,
@@ -229,6 +246,24 @@ mod tests {
         );
         let back: ClientCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn user_shell_commands_roundtrip_through_serde() {
+        roundtrip(
+            ClientCommand::RunUserShell {
+                session_id: SessionId::new("s1"),
+                command: "cargo test --workspace".to_string(),
+            },
+            "run_user_shell",
+        );
+        roundtrip(
+            ClientCommand::CancelUserShell {
+                session_id: SessionId::new("s1"),
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+            },
+            "cancel_user_shell",
+        );
     }
 
     #[test]

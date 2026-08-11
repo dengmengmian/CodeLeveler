@@ -341,6 +341,41 @@ impl EventBridge {
             EngineEvent::EvidenceLedgerUpdated { .. } => {
                 // Persisted by engine; no dedicated UI cell in v1.
             }
+            EngineEvent::UserShellStarted {
+                execution_id,
+                command,
+                cwd,
+            } => {
+                let _ = self.events.send(RuntimeEvent::UserShellStarted {
+                    execution_id,
+                    command,
+                    cwd,
+                });
+            }
+            EngineEvent::UserShellOutput {
+                execution_id,
+                stream,
+                chunk,
+            } => {
+                let _ = self.events.send(RuntimeEvent::UserShellOutput {
+                    execution_id,
+                    stream,
+                    chunk,
+                });
+            }
+            EngineEvent::UserShellFinished {
+                execution_id,
+                exit_code,
+                duration_ms,
+                status,
+            } => {
+                let _ = self.events.send(RuntimeEvent::UserShellExited {
+                    execution_id,
+                    exit_code,
+                    duration_ms,
+                    status,
+                });
+            }
             EngineEvent::AdvisoryStarted { kind } => {
                 // Closeout round trips that happen after the visible answer.
                 // Label them so the status line does not read "等待模型" with no
@@ -1103,6 +1138,25 @@ mod projection_equivalence {
                 format!("note[{level:?}]:{message}")
             }
             RuntimeEvent::ContextCompacted { from, to } => format!("compacted:{from}->{to}"),
+            RuntimeEvent::UserShellStarted {
+                execution_id,
+                command,
+                cwd,
+            } => format!("ush_start:{}:{command}:{cwd}", execution_id.as_str()),
+            RuntimeEvent::UserShellOutput {
+                execution_id,
+                stream,
+                chunk,
+            } => format!("ush_out:{}:{stream}:{chunk}", execution_id.as_str()),
+            RuntimeEvent::UserShellExited {
+                execution_id,
+                exit_code,
+                duration_ms,
+                status,
+            } => format!(
+                "ush_exit:{}:{exit_code:?}:{duration_ms}:{status}",
+                execution_id.as_str()
+            ),
             RuntimeEvent::ContextExpanded {
                 from_tokens,
                 to_tokens,
@@ -1435,6 +1489,37 @@ mod projection_equivalence {
             },
         ]);
         assert!(shapes.is_empty(), "{shapes:?}");
+    }
+
+    #[test]
+    fn user_shell_lifecycle_projects_one_to_one() {
+        let id = leveler_core::UserShellId::new("ush-1");
+        let shapes = project(vec![
+            EngineEvent::UserShellStarted {
+                execution_id: id.clone(),
+                command: "cargo test".into(),
+                cwd: "/repo".into(),
+            },
+            EngineEvent::UserShellOutput {
+                execution_id: id.clone(),
+                stream: "stdout".into(),
+                chunk: "running".into(),
+            },
+            EngineEvent::UserShellFinished {
+                execution_id: id,
+                exit_code: Some(0),
+                duration_ms: 4200,
+                status: "success".into(),
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "ush_start:ush-1:cargo test:/repo",
+                "ush_out:ush-1:stdout:running",
+                "ush_exit:ush-1:Some(0):4200:success"
+            ]
+        );
     }
 
     #[test]

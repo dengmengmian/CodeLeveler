@@ -118,6 +118,13 @@ string_id!(
     TaskNodeId
 );
 string_id!(
+ /// Identifies one user-originated shell execution (`!command`) — a
+ /// session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]:
+ /// a user shell is not an agent tool call and never enters the model
+ /// conversation.
+    UserShellId
+);
+string_id!(
  /// Identifies one CodeLeveler runtime — the durable execution host, not a
  /// process. For a local runtime the id is persisted in the repository's
  /// state directory, so a daemon restart keeps the same identity; it changes

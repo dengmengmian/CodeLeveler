@@ -247,6 +247,9 @@ export type RuntimeEvent =
   | { type: 'sub_agent_updated'; id: string; nickname: string; role: string; done: boolean; ok: boolean; detail: string }
   | { type: 'sub_agent_progress'; id: string; active: boolean; input_tokens: number; output_tokens: number; cached_input_tokens: number }
   | { type: 'notification'; level: NotificationLevel; message: string }
+  | { type: 'user_shell_started'; execution_id: string; command: string; cwd: string }
+  | { type: 'user_shell_output'; execution_id: string; stream: string; chunk: string }
+  | { type: 'user_shell_exited'; execution_id: string; exit_code: number | null; duration_ms: number; status: string }
   | { type: 'context_compacted'; from: number; to: number }
   | { type: 'context_expanded'; from_tokens: number; to_tokens: number; reason: string }
   | { type: 'command_progress'; label: string; elapsed_ms: number }

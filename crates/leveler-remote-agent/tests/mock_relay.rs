@@ -52,6 +52,7 @@ fn snapshot_for(session_id: &str) -> UiSessionSnapshot {
         verification: None,
         diff: None,
         checkpoints: Vec::new(),
+        user_shells: Vec::new(),
         completion_report: None,
     }
 }

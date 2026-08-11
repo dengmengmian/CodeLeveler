@@ -131,6 +131,7 @@ impl InteractiveRuntimeClient for FakeRuntime {
             verification: None,
             diff: None,
             checkpoints: Vec::new(),
+            user_shells: Vec::new(),
             completion_report: None,
         })
     }

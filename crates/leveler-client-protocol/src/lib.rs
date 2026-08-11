@@ -78,6 +78,7 @@ pub mod mock;
 // import surface and never generate provider-specific formats themselves.
 pub use leveler_core::{
     ApprovalId, CheckpointId, ClarificationId, CommandId, RuntimeId, SessionId, ToolCallId,
+    UserShellId,
 };
 pub use leveler_model::ModelRef;
 

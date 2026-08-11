@@ -81,6 +81,7 @@ impl InteractiveRuntimeClient for RecordingRuntime {
             verification: None,
             diff: None,
             checkpoints: Vec::new(),
+            user_shells: Vec::new(),
             completion_report: None,
         })
     }

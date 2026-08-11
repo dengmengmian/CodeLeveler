@@ -220,6 +220,17 @@ impl RemotePolicy {
                 reason: "session management is not available remotely",
             },
 
+            // Arbitrary host shell execution from a phone is exactly the
+            // capability this policy exists to withhold. The user-shell
+            // product surface is the local TUI; remote gets nothing, not
+            // even cancel (it could kill work it cannot see).
+            ClientCommand::RunUserShell { .. } | ClientCommand::CancelUserShell { .. } => {
+                RemoteVerdict::Deny {
+                    code: DENIED_COMMAND,
+                    reason: "user shell execution is not available remotely",
+                }
+            }
+
             // Shuts down the runtime for every client, local ones included.
             // The local socket transport refuses it too.
             ClientCommand::Quit => RemoteVerdict::Deny {

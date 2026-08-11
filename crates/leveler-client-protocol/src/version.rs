@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks. Bump `minor` for additive changes,
 /// `major` for a breaking wire change.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 5 };
 
 /// A semantic-ish protocol version. Same `major` = compatible; `minor` is
 /// forward/backward compatible within a major.
@@ -111,7 +111,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":4},"body":{"type":"quit"}}"#
+            r#"{"protocol":{"major":1,"minor":5},"body":{"type":"quit"}}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

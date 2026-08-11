@@ -155,6 +155,28 @@ pub struct UiActiveToolCall {
     pub arguments: String,
 }
 
+/// One user shell execution (`!command`) as the reconnect snapshot carries
+/// it: the active one plus a bounded recent history. `output_tail` is the
+/// bounded end of the combined output (never the full log).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiUserShell {
+    pub id: leveler_core::UserShellId,
+    pub command: String,
+    pub cwd: String,
+    /// `running | success | failed | cancelled`.
+    pub status: String,
+    /// Seconds elapsed at snapshot time (running) or total runtime (done).
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub output_tail: String,
+    /// True when `output_tail` dropped earlier output.
+    #[serde(default)]
+    pub output_truncated: bool,
+}
+
 /// A one-line session summary for the Sessions screen (spec §52).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -214,6 +236,10 @@ pub struct UiSessionSnapshot {
     pub diff: Option<UiDiff>,
     #[serde(default)]
     pub checkpoints: Vec<UiCheckpoint>,
+    /// User shell executions: the active one (if any) plus a bounded recent
+    /// history, newest last. Additive/defaulted like the rest of this block.
+    #[serde(default)]
+    pub user_shells: Vec<UiUserShell>,
     #[serde(default)]
     pub completion_report: Option<UiCompletionReport>,
 }

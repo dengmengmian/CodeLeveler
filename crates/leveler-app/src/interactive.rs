@@ -1671,6 +1671,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::RunUserShell { session_id, .. }
+            | ClientCommand::CancelUserShell { session_id, .. } => {
+                // The user-shell execution slice implements these; until it
+                // lands the runtime states the truth instead of pretending.
+                self.notify_error(&session_id, "user shell execution 尚未启用".to_string());
+                Ok(())
+            }
             ClientCommand::Quit => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1938,6 +1945,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             verification: live.verification,
             diff: live.diff,
             checkpoints,
+            // Filled by the user-shell execution slice (active + history).
+            user_shells: Vec::new(),
             completion_report: live.completion_report,
         })
     }
@@ -2174,6 +2183,7 @@ async fn compact_conversation(
                 verification: live.verification,
                 diff: live.diff,
                 checkpoints: Vec::new(),
+                user_shells: Vec::new(),
                 completion_report: live.completion_report,
             },
         });

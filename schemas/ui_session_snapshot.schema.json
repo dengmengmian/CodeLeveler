@@ -124,6 +124,14 @@
       "description": "Persisted status string (e.g. \"running\", \"completed\").",
       "type": "string"
     },
+    "user_shells": {
+      "description": "User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiUserShell"
+      }
+    },
     "verification": {
       "default": null,
       "anyOf": [
@@ -535,6 +543,55 @@
         "tool"
       ]
     },
+    "UiUserShell": {
+      "description": "One user shell execution (`!command`) as the reconnect snapshot carries it: the active one plus a bounded recent history. `output_tail` is the bounded end of the combined output (never the full log).",
+      "type": "object",
+      "required": [
+        "command",
+        "cwd",
+        "elapsed_secs",
+        "id",
+        "status"
+      ],
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "elapsed_secs": {
+          "description": "Seconds elapsed at snapshot time (running) or total runtime (done).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "exit_code": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "id": {
+          "$ref": "#/definitions/UserShellId"
+        },
+        "output_tail": {
+          "default": "",
+          "type": "string"
+        },
+        "output_truncated": {
+          "description": "True when `output_tail` dropped earlier output.",
+          "default": false,
+          "type": "boolean"
+        },
+        "status": {
+          "description": "`running | success | failed | cancelled`.",
+          "type": "string"
+        }
+      }
+    },
     "UiVerification": {
       "description": "The verification result. `passed` is `None` while still running.",
       "type": "object",
@@ -555,6 +612,10 @@
           ]
         }
       }
+    },
+    "UserShellId": {
+      "description": "Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation.",
+      "type": "string"
     }
   }
 }

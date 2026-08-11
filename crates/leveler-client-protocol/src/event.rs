@@ -129,6 +129,31 @@ pub enum RuntimeEvent {
         to_tokens: u32,
         reason: String,
     },
+    /// A user shell execution (`!command`) started. User-originated direct
+    /// host execution — not an agent tool call; clients render it as its own
+    /// block and never feed it to the model conversation.
+    UserShellStarted {
+        execution_id: leveler_core::UserShellId,
+        command: String,
+        cwd: String,
+    },
+    /// Live output from a running user shell. `stream` is `stdout` or
+    /// `stderr`. Transient: clients keep a bounded buffer; the runtime does
+    /// not persist chunks.
+    UserShellOutput {
+        execution_id: leveler_core::UserShellId,
+        stream: String,
+        chunk: String,
+    },
+    /// A user shell execution ended. `status` is `success | failed |
+    /// cancelled`; `exit_code` is `None` when the process was killed or
+    /// never spawned.
+    UserShellExited {
+        execution_id: leveler_core::UserShellId,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        status: String,
+    },
     /// Real token usage reported by the model for the latest request. The
     /// context gauge tracks how full the window is; `input_tokens` already
     /// includes the whole prompt (system + history + tools), so the window in
@@ -304,6 +329,7 @@ mod tests {
             verification: None,
             diff: None,
             checkpoints: Vec::new(),
+            user_shells: Vec::new(),
             completion_report: None,
         }
     }
@@ -601,6 +627,35 @@ mod tests {
                 estimated_tokens: 1234,
             },
             "context_updated",
+        );
+    }
+
+    #[test]
+    fn user_shell_lifecycle_roundtrips() {
+        roundtrip(
+            RuntimeEvent::UserShellStarted {
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+                command: "cargo test".into(),
+                cwd: "/repo".into(),
+            },
+            "user_shell_started",
+        );
+        roundtrip(
+            RuntimeEvent::UserShellOutput {
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+                stream: "stdout".into(),
+                chunk: "running 312 tests\n".into(),
+            },
+            "user_shell_output",
+        );
+        roundtrip(
+            RuntimeEvent::UserShellExited {
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+                exit_code: Some(0),
+                duration_ms: 4200,
+                status: "success".into(),
+            },
+            "user_shell_exited",
         );
     }
 
