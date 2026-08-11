@@ -46,23 +46,19 @@ pub(crate) fn render_group(
         .collect();
     let disclosable = group_has_disclosure(group);
     if disclosable && !group.expanded {
-        out.push(disclosure_line(&visible, false, theme, width, t));
-        // A failed group stays discoverable without expanding: the first
-        // meaningful error line rides along under the collapsed row.
-        if let Some(err) = first_error_line(&visible) {
-            out.push(Line::from(vec![
-                Span::styled("  └ ".to_string(), Style::default().fg(theme.dim)),
-                Span::styled(
-                    truncate_display(&err, width.saturating_sub(4)),
-                    Style::default().fg(theme.warning),
-                ),
-            ]));
-        }
-        return out;
+        return crate::presentation::disclosure::collapsed_lines(
+            &disclosure_presentation(&visible, group.expanded, t),
+            theme,
+            width,
+        );
     }
     if disclosable && group.expanded {
         // The same row, open — clicking it again folds the group back.
-        out.push(disclosure_line(&visible, true, theme, width, t));
+        out.push(crate::presentation::disclosure::header_line(
+            &disclosure_presentation(&visible, group.expanded, t),
+            theme,
+            width,
+        ));
     }
     // A concurrent batch gets one quiet dim header so the user sees these
     // calls ran together rather than one after another.
@@ -212,58 +208,35 @@ fn group_has_edits(group: &ToolGroupBlock) -> bool {
             )
     })
 }
-/// The disclosure row a finished group renders in both states: `▸ label`
-/// folded, `▾ label` open. The whole row is a click target (hit-tested by the
-/// workbench); failures keep normal weight and are named so a broken run is
-/// never something you have to go looking for.
-fn disclosure_line(
+/// Adapter: an Agent ToolGroup's visible calls → the shared disclosure
+/// presentation. All tool-specific judgement happens here (semantic label,
+/// which failure names itself, when a duration is authoritative); the
+/// renderer in `presentation::disclosure` sees only the finished model.
+fn disclosure_presentation(
     visible: &[&ToolCallBlock],
     expanded: bool,
-    theme: &Theme,
-    width: usize,
     t: &UiText,
-) -> Line<'static> {
+) -> crate::presentation::disclosure::DisclosurePresentation {
     let failed = visible
         .iter()
         .filter(|c| c.status == ToolStatus::Failed)
         .count();
-    let glyph = if expanded { "▾" } else { "▸" };
-    let body = disclosure_label(visible, failed, t);
-    let mut spans = vec![
-        Span::styled(
-            format!("{glyph} "),
-            Style::default().fg(if failed > 0 { theme.warning } else { theme.dim }),
-        ),
-        Span::styled(
-            truncate_display(&body, width.saturating_sub(16)),
-            Style::default().fg(if failed > 0 { theme.text } else { theme.dim }),
-        ),
-    ];
-    if failed > 0 {
-        spans.insert(
-            1,
-            Span::styled("✗ ".to_string(), Style::default().fg(theme.warning)),
-        );
-        if visible.len() > 1 {
-            spans.push(Span::styled(
-                format!(" · {}", t.batch_failed.replace("{}", &failed.to_string())),
-                Style::default().fg(theme.warning),
-            ));
-        }
-    }
     // Only a single call has an authoritative duration (the runtime supplied
     // it). Summing children fakes wall time for parallel batches — four 5s
     // reads did not take 20s — so a multi-tool disclosure shows none.
-    if let [only] = visible
-        && let Some(ms) = only.duration_ms
-        && ms >= 1000
-    {
-        spans.push(Span::styled(
-            format!(" · {:.1}s", ms as f64 / 1000.0),
-            Style::default().fg(theme.dim),
-        ));
+    let duration_ms = match visible {
+        [only] => only.duration_ms,
+        _ => None,
+    };
+    crate::presentation::disclosure::DisclosurePresentation {
+        label: disclosure_label(visible, failed, t),
+        failed,
+        failed_suffix: (failed > 0 && visible.len() > 1)
+            .then(|| t.batch_failed.replace("{}", &failed.to_string())),
+        expanded,
+        duration_ms,
+        first_error: (!expanded).then(|| first_error_line(visible)).flatten(),
     }
-    Line::from(spans)
 }
 
 /// The semantic summary for a finished group: what KIND of work it was, in
