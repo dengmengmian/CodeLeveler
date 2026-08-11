@@ -7,10 +7,12 @@
 #![forbid(unsafe_code)]
 
 mod active_turns;
+mod checkpoints;
 pub mod doctor;
 mod event_bridge;
 pub mod global_config;
 mod interactive;
+mod live_view;
 pub mod mcp_config;
 mod parallel;
 mod prompt_bridge;

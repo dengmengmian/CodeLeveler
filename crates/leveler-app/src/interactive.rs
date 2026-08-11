@@ -38,8 +38,8 @@ use leveler_storage::{MessageRepository, SessionRepository};
 use leveler_client_protocol::{
     ApprovalDecision as UiApprovalDecision, AttachmentId, AttachmentKind, AttachmentRef,
     ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient, MessageId,
-    NotificationLevel, RuntimeEvent, UiActiveToolCall, UiCheckpoint, UiCompletionReport, UiDiff,
-    UiMessage, UiPlan, UiRole, UiSessionSnapshot, UiSessionSummary, UiVerification,
+    NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot,
+    UiSessionSummary,
 };
 
 fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalDecision {
@@ -164,13 +164,10 @@ pub struct InProcessRuntimeClient {
     pending_clarify: PendingClarifications,
     /// Conversation checkpoints, isolated by owning session (spec §68).
     /// Arc so the async compact worker can drop them after a successful rewrite.
-    checkpoints: Arc<Mutex<HashMap<SessionId, Vec<UiCheckpoint>>>>,
-    /// Workspace snapshots captured with each checkpoint (git repos only), so
-    /// restore rolls back files, not just the transcript (plan B9).
-    checkpoint_snapshots: Arc<Mutex<HashMap<CheckpointId, leveler_execution::SnapshotId>>>,
+    checkpoints: Arc<crate::checkpoints::CheckpointStore>,
     /// Live client-facing state that is not part of the message transcript.
     /// A reconnecting UI receives this through `snapshot()`.
-    live_views: Arc<Mutex<HashMap<SessionId, LiveSessionView>>>,
+    live_views: Arc<crate::live_view::LiveViews>,
     /// Per-session ownership and cancellation of active main turns.
     active: Arc<ActiveTurns>,
     /// Set when the runtime owner begins an explicit shutdown (Quit);
@@ -205,61 +202,6 @@ struct SessionRuntimeConfig {
     sandbox: bool,
     work_profile: String,
     collaboration: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct LiveSessionView {
-    active_tools: Vec<UiActiveToolCall>,
-    plan: Option<UiPlan>,
-    verification: Option<UiVerification>,
-    diff: Option<UiDiff>,
-    completion_report: Option<UiCompletionReport>,
-}
-
-fn update_live_view(
-    views: &Mutex<HashMap<SessionId, LiveSessionView>>,
-    session_id: &SessionId,
-    event: &RuntimeEvent,
-) {
-    let mut views = views.lock().unwrap();
-    let view = views.entry(session_id.clone()).or_default();
-    match event {
-        RuntimeEvent::ToolCallStarted {
-            id,
-            name,
-            arguments,
-            ..
-        } => {
-            view.active_tools.retain(|tool| tool.id != *id);
-            view.active_tools.push(UiActiveToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-            });
-        }
-        RuntimeEvent::ToolCallCompleted { id, .. } => {
-            view.active_tools.retain(|tool| tool.id != *id);
-        }
-        RuntimeEvent::PlanUpdated { plan } => view.plan = Some(plan.clone()),
-        RuntimeEvent::VerificationUpdated { verification } => {
-            view.verification = Some(verification.clone());
-        }
-        RuntimeEvent::DiffUpdated { diff } => view.diff = Some(diff.clone()),
-        RuntimeEvent::SessionCompleted { report } => {
-            view.completion_report = Some(report.clone());
-        }
-        RuntimeEvent::UserMessageAdded { .. } => {
-            view.completion_report = None;
-        }
-        RuntimeEvent::TurnCompleted
-        | RuntimeEvent::TurnAnswered
-        | RuntimeEvent::TurnTruncated { .. }
-        | RuntimeEvent::TurnIncomplete { .. }
-        | RuntimeEvent::TurnCompletedUnverified { .. }
-        | RuntimeEvent::TurnFailed { .. }
-        | RuntimeEvent::TurnCancelled => view.active_tools.clear(),
-        _ => {}
-    }
 }
 
 impl InProcessRuntimeClient {
@@ -303,9 +245,8 @@ impl InProcessRuntimeClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
             steering: Arc::new(Mutex::new(HashMap::new())),
-            checkpoints: Arc::new(Mutex::new(HashMap::new())),
-            checkpoint_snapshots: Arc::new(Mutex::new(HashMap::new())),
-            live_views: Arc::new(Mutex::new(HashMap::new())),
+            checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
+            live_views: Arc::new(crate::live_view::LiveViews::default()),
             active: Arc::new(ActiveTurns::default()),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -326,7 +267,7 @@ impl InProcessRuntimeClient {
             loop {
                 match forward.recv().await {
                     Ok(event) => {
-                        update_live_view(&live_views, &owned_session_id, &event);
+                        live_views.apply(&owned_session_id, &event);
                         let _ = all_events.send(event);
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -488,27 +429,50 @@ impl InProcessRuntimeClient {
         // Capture the workspace too (git repos only), so restoring the
         // checkpoint rolls back the files the turn changed — including
         // command-driven mutations (plan B9 on top of A8).
-        match leveler_execution::WorkspaceSnapshot::capture(&self.app.layout.repo_root).await {
-            Ok(Some(snapshot)) => {
-                self.checkpoint_snapshots
-                    .lock()
-                    .unwrap()
-                    .insert(checkpoint.id.clone(), snapshot);
-            }
-            Ok(None) => {} // not a git repo: transcript-only checkpoints
-            Err(error) => {
-                tracing::warn!("checkpoint workspace snapshot failed: {error}");
-            }
-        }
+        let snapshot =
+            match leveler_execution::WorkspaceSnapshot::capture(&self.app.layout.repo_root).await {
+                Ok(snapshot) => snapshot, // None: not a git repo (transcript-only)
+                Err(error) => {
+                    tracing::warn!("checkpoint workspace snapshot failed: {error}");
+                    None
+                }
+            };
         self.checkpoints
-            .lock()
-            .unwrap()
-            .entry(session_id.clone())
-            .or_default()
-            .push(checkpoint.clone());
+            .record(session_id, checkpoint.clone(), snapshot);
         let _ = self
             .events_for(session_id)
             .send(RuntimeEvent::CheckpointCreated { checkpoint });
+    }
+
+    /// The shared turn-launch preamble: admit the session (one active main
+    /// turn), optionally name a placeholder session after its first message,
+    /// capture the pre-turn checkpoint, and append the user's message to the
+    /// client stream. Every path that starts a main turn goes through here so
+    /// the sequence cannot drift between commands.
+    async fn stage_turn(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        retitle: bool,
+    ) -> Result<tokio_util::sync::CancellationToken, ClientError> {
+        let cancel = self
+            .active
+            .admit(session_id)
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        if retitle {
+            self.retitle_placeholder_session(session_id, text).await;
+        }
+        self.checkpoint_before_turn(session_id, text).await;
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::UserMessageAdded {
+                message: UiMessage {
+                    id: MessageId::new(leveler_core::new_uuid_string()),
+                    role: UiRole::User,
+                    text: text.to_string(),
+                },
+            });
+        Ok(cancel)
     }
 
     /// Steering for one session. Cloned into the executor, which drains it at
@@ -668,36 +632,14 @@ impl InProcessRuntimeClient {
     /// Used after /clear and /compact when the transcript is no longer aligned
     /// with prior checkpoint ordinals.
     fn drop_session_checkpoints(&self, session_id: &SessionId) {
-        drop_session_checkpoints_maps(&self.checkpoints, &self.checkpoint_snapshots, session_id);
+        self.checkpoints.drop_session(session_id);
     }
 
     /// After restore to `ordinal`, drop later checkpoints (and their snapshots)
     /// so the UI cannot re-restore a point that no longer exists in the transcript.
     fn prune_checkpoints_after_restore(&self, session_id: &SessionId, restored_ordinal: u32) {
-        let discarded = {
-            let mut map = self.checkpoints.lock().unwrap();
-            let Some(list) = map.get_mut(session_id) else {
-                return;
-            };
-            let mut keep = Vec::new();
-            let mut drop = Vec::new();
-            for checkpoint in list.drain(..) {
-                if checkpoint.ordinal <= restored_ordinal {
-                    keep.push(checkpoint);
-                } else {
-                    drop.push(checkpoint);
-                }
-            }
-            *list = keep;
-            drop
-        };
-        if discarded.is_empty() {
-            return;
-        }
-        let mut snaps = self.checkpoint_snapshots.lock().unwrap();
-        for checkpoint in discarded {
-            snaps.remove(&checkpoint.id);
-        }
+        self.checkpoints
+            .prune_after_restore(session_id, restored_ordinal);
     }
 
     /// Name a placeholder interactive session after its first real message:
@@ -961,15 +903,7 @@ impl InProcessRuntimeClient {
         checkpoint_id: CheckpointId,
     ) -> Result<(), ClientError> {
         let _token = self.admit_context_op(&session_id, "恢复检查点")?;
-        let ordinal = self
-            .checkpoints
-            .lock()
-            .unwrap()
-            .get(&session_id)
-            .into_iter()
-            .flatten()
-            .find(|c| c.id == checkpoint_id)
-            .map(|c| c.ordinal);
+        let ordinal = self.checkpoints.ordinal_of(&session_id, &checkpoint_id);
         if let Some(ordinal) = ordinal {
             // A failed truncate means the conversation did NOT roll
             // back; the user must know rather than see a fake restore.
@@ -986,12 +920,7 @@ impl InProcessRuntimeClient {
                     // Roll the workspace back to the checkpoint's
                     // snapshot (git repos). A failure is surfaced —
                     // the transcript rolled back but files did not.
-                    let snapshot = self
-                        .checkpoint_snapshots
-                        .lock()
-                        .unwrap()
-                        .get(&checkpoint_id)
-                        .cloned();
+                    let snapshot = self.checkpoints.snapshot_of(&checkpoint_id);
                     match snapshot {
                         Some(snapshot) => {
                             if let Err(error) = leveler_execution::WorkspaceSnapshot::restore(
@@ -1063,16 +992,24 @@ impl InProcessRuntimeClient {
         let mode = config.mode;
         let active = self.active.clone();
         let checkpoints = self.checkpoints.clone();
-        let checkpoint_snapshots = self.checkpoint_snapshots.clone();
+        let live_views = self.live_views.clone();
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
-                let rewrote =
-                    compact_conversation(&app, &events, &model, mode, &session_id, cancel).await;
+                let rewrote = compact_conversation(
+                    &app,
+                    &events,
+                    &live_views,
+                    &model,
+                    mode,
+                    &session_id,
+                    cancel,
+                )
+                .await;
                 // Only wipe checkpoints when the transcript was actually
                 // replaced — a short/no-op compact must keep them.
                 if rewrote {
-                    drop_session_checkpoints_maps(&checkpoints, &checkpoint_snapshots, &session_id);
+                    checkpoints.drop_session(&session_id);
                 }
                 active.finish(&session_id);
             });
@@ -1094,7 +1031,7 @@ impl InProcessRuntimeClient {
                         format!("会话已清空,但任务状态重置失败: {error}"),
                     );
                 }
-                self.live_views.lock().unwrap().remove(&session_id);
+                self.live_views.clear(&session_id);
                 self.drop_session_checkpoints(&session_id);
                 if let Ok(session) = self.snapshot(&session_id).await {
                     let _ = self
@@ -1119,22 +1056,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 attachments,
             } => {
                 let config = self.runtime_config(&session_id).await?;
-                let cancel = self
-                    .active
-                    .admit(&session_id)
-                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
-                self.retitle_placeholder_session(&session_id, &content)
-                    .await;
-                self.checkpoint_before_turn(&session_id, &content).await;
-                let _ = self
-                    .events_for(&session_id)
-                    .send(RuntimeEvent::UserMessageAdded {
-                        message: UiMessage {
-                            id: MessageId::new(leveler_core::new_uuid_string()),
-                            role: UiRole::User,
-                            text: content.clone(),
-                        },
-                    });
+                let cancel = self.stage_turn(&session_id, &content, true).await?;
                 // CollaborationMode is the single source of turn profile:
                 // goal → goal_mode / update_goal path; chat|plan → content turn.
                 // Plan read_only is applied inside engine from session.collaboration.
@@ -1157,22 +1079,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 content,
             } => {
                 let config = self.runtime_config(&session_id).await?;
-                let cancel = self
-                    .active
-                    .admit(&session_id)
-                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
-                self.retitle_placeholder_session(&session_id, &content)
-                    .await;
-                self.checkpoint_before_turn(&session_id, &content).await;
-                let _ = self
-                    .events_for(&session_id)
-                    .send(RuntimeEvent::UserMessageAdded {
-                        message: UiMessage {
-                            id: MessageId::new(leveler_core::new_uuid_string()),
-                            role: UiRole::User,
-                            text: content.clone(),
-                        },
-                    });
+                let cancel = self.stage_turn(&session_id, &content, true).await?;
                 self.spawn_goal_turn(session_id, content, cancel, config);
                 Ok(())
             }
@@ -1349,20 +1256,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 } else {
                     content
                 };
-                let cancel = self
-                    .active
-                    .admit(&session_id)
-                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
-                self.checkpoint_before_turn(&session_id, &goal).await;
-                let _ = self
-                    .events_for(&session_id)
-                    .send(RuntimeEvent::UserMessageAdded {
-                        message: UiMessage {
-                            id: MessageId::new(leveler_core::new_uuid_string()),
-                            role: UiRole::User,
-                            text: goal.clone(),
-                        },
-                    });
+                let cancel = self.stage_turn(&session_id, &goal, false).await?;
                 self.spawn_goal_turn(session_id, goal, cancel, config);
                 Ok(())
             }
@@ -2023,20 +1917,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             }
         });
 
-        let live = self
-            .live_views
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default();
-        let checkpoints = self
-            .checkpoints
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default();
+        let live = self.live_views.view(session_id);
+        let checkpoints = self.checkpoints.list(session_id);
 
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
@@ -2146,28 +2028,6 @@ fn parse_history_messages_strict(payloads: &[String]) -> Result<Vec<Message>, St
     Ok(out)
 }
 
-/// Drop UI checkpoints + workspace snapshots for a session (shared with the
-/// async compact worker that only holds map handles).
-fn drop_session_checkpoints_maps(
-    checkpoints: &Mutex<HashMap<SessionId, Vec<UiCheckpoint>>>,
-    checkpoint_snapshots: &Mutex<HashMap<CheckpointId, leveler_execution::SnapshotId>>,
-    session_id: &SessionId,
-) {
-    // `&Mutex` so both Arc and owned Mutex can call via as_ref.
-    let removed = checkpoints
-        .lock()
-        .unwrap()
-        .remove(session_id)
-        .unwrap_or_default();
-    if removed.is_empty() {
-        return;
-    }
-    let mut snaps = checkpoint_snapshots.lock().unwrap();
-    for checkpoint in removed {
-        snaps.remove(&checkpoint.id);
-    }
-}
-
 /// Summarize a session's history via the model and replace it with the summary,
 /// then push a refreshed snapshot (spec §28, §53).
 ///
@@ -2177,6 +2037,7 @@ fn drop_session_checkpoints_maps(
 async fn compact_conversation(
     app: &Application,
     events: &broadcast::Sender<RuntimeEvent>,
+    live_views: &crate::live_view::LiveViews,
     model: &ModelRef,
     mode: PermissionProfile,
     session_id: &SessionId,
@@ -2287,6 +2148,7 @@ async fn compact_conversation(
             .await
             .ok()
             .flatten();
+        let live = live_views.view(session_id);
         let _ = events.send(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
                 id: session_id.clone(),
@@ -2297,16 +2159,22 @@ async fn compact_conversation(
                 branch: detect_branch_label(&app.layout.repo_root),
                 status: record.status.as_str().to_string(),
                 messages,
+                // Compact is admitted like a turn, so no turn is running and
+                // no interaction can be pending; checkpoints are about to be
+                // dropped by the caller. The LIVE view (plan/verification/
+                // diff/report) must ride along though — hardcoding it empty
+                // made this snapshot lie relative to `snapshot()`, and a
+                // reconnect would resurrect state this push had cleared.
                 pending_interactions: vec![],
                 available_models,
                 vision,
                 last_sequence,
-                active_tools: Vec::new(),
-                plan: None,
-                verification: None,
-                diff: None,
+                active_tools: live.active_tools,
+                plan: live.plan,
+                verification: live.verification,
+                diff: live.diff,
                 checkpoints: Vec::new(),
-                completion_report: None,
+                completion_report: live.completion_report,
             },
         });
     }
@@ -2629,110 +2497,5 @@ mod context_ops_tests {
         );
         // All-or-nothing: no partial Vec is returned on error.
         assert!(parse_history_messages_strict(&[good.clone(), good]).is_ok());
-    }
-
-    #[test]
-    fn drop_session_checkpoints_removes_snapshot_entries() {
-        use leveler_core::CheckpointId;
-        use leveler_execution::SnapshotId;
-
-        let session = SessionId::new("s-drop");
-        let id_a = CheckpointId::new("a");
-        let id_b = CheckpointId::new("b");
-        let other = SessionId::new("other");
-        let id_other = CheckpointId::new("o");
-
-        let checkpoints = Mutex::new(HashMap::from([
-            (
-                session.clone(),
-                vec![
-                    UiCheckpoint {
-                        id: id_a.clone(),
-                        label: "a".into(),
-                        ordinal: 1,
-                    },
-                    UiCheckpoint {
-                        id: id_b.clone(),
-                        label: "b".into(),
-                        ordinal: 2,
-                    },
-                ],
-            ),
-            (
-                other.clone(),
-                vec![UiCheckpoint {
-                    id: id_other.clone(),
-                    label: "o".into(),
-                    ordinal: 0,
-                }],
-            ),
-        ]));
-        let snaps = Mutex::new(HashMap::from([
-            (id_a.clone(), SnapshotId("snap-a".into())),
-            (id_b.clone(), SnapshotId("snap-b".into())),
-            (id_other.clone(), SnapshotId("snap-o".into())),
-        ]));
-
-        drop_session_checkpoints_maps(&checkpoints, &snaps, &session);
-        assert!(!checkpoints.lock().unwrap().contains_key(&session));
-        assert!(checkpoints.lock().unwrap().contains_key(&other));
-        let snaps = snaps.lock().unwrap();
-        assert!(!snaps.contains_key(&id_a));
-        assert!(!snaps.contains_key(&id_b));
-        assert!(snaps.contains_key(&id_other));
-    }
-}
-
-#[cfg(test)]
-mod live_view_tests {
-    use super::*;
-    use leveler_core::ToolCallId;
-
-    #[test]
-    fn live_view_tracks_only_tools_that_are_still_running() {
-        let session_id = SessionId::new("s1");
-        let views = Mutex::new(HashMap::new());
-        let id = ToolCallId::new("tool-1");
-
-        update_live_view(
-            &views,
-            &session_id,
-            &RuntimeEvent::ToolCallStarted {
-                id: id.clone(),
-                name: "run_command".to_string(),
-                arguments: r#"{"cmd":"cargo test"}"#.to_string(),
-                parallel: false,
-            },
-        );
-        assert_eq!(
-            views
-                .lock()
-                .unwrap()
-                .get(&session_id)
-                .unwrap()
-                .active_tools
-                .len(),
-            1
-        );
-
-        update_live_view(
-            &views,
-            &session_id,
-            &RuntimeEvent::ToolCallCompleted {
-                id,
-                ok: true,
-                preview: "ok".to_string(),
-                duration_ms: 1,
-            },
-        );
-        assert!(
-            views
-                .lock()
-                .unwrap()
-                .get(&session_id)
-                .unwrap()
-                .active_tools
-                .is_empty()
-        );
     }
 }
