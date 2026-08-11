@@ -365,15 +365,11 @@ fn renders_failed_tool_inline_and_tools_screen() {
             duration_ms: 13000,
         }),
     );
-    // Failed Important tools: compact activity line + first error line only.
+    // A failed shell collapses to its disclosure: ✗ label + first error line.
     let conv = render_at(100, 24, &mut state);
     assert!(
-        conv.contains('✗') || conv.contains("!"),
-        "failed activity glyph missing: {conv}"
-    );
-    assert!(
-        conv.contains("cargo test"),
-        "collapsed failed tool should show its target: {conv}"
+        conv.contains('▸') && conv.contains('✗') && conv.contains("失败"),
+        "collapsed failure must name itself on the disclosure row: {conv}"
     );
     assert!(
         conv.contains("exit") && conv.contains("101"),
@@ -433,11 +429,11 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
         }),
     );
 
-    // Folded by default: Important activity line only; raw output stays hidden.
+    // Folded by default: one ▸ disclosure row; raw output stays hidden.
     let folded = render_at(100, 24, &mut state);
     assert!(
-        folded.contains('✓') && folded.contains("cargo"),
-        "activity line missing: {folded}"
+        folded.contains('▸') && folded.contains("执行了 1 个命令"),
+        "disclosure row missing: {folded}"
     );
     assert!(!folded.contains("line-one"), "collapsed output leaked");
     assert!(
@@ -454,6 +450,10 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
         )),
     );
     let expanded = render_at(100, 24, &mut state);
+    assert!(
+        expanded.contains('▾') && expanded.contains("cargo"),
+        "expanded group shows its ▾ header and the command: {expanded}"
+    );
     assert!(
         expanded.contains("line-three"),
         "expanded output should show all lines: {expanded}"
@@ -512,10 +512,9 @@ fn command_result_renders_as_important_activity_not_file_list() {
     );
     assert!(!collapsed.contains("工具输出"), "{collapsed}");
     assert!(!collapsed.contains("摘要:"), "{collapsed}");
-    assert!(collapsed.contains('✓'), "{collapsed}");
     assert!(
-        collapsed.contains("执行") && collapsed.contains("cargo"),
-        "important run must show verb + target: {collapsed}"
+        collapsed.contains('▸') && collapsed.contains("执行了 1 个命令"),
+        "finished run folds to its disclosure row: {collapsed}"
     );
     assert!(
         !collapsed.contains("raw-shell-output"),
