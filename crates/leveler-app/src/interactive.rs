@@ -536,7 +536,36 @@ impl InProcessRuntimeClient {
                         return;
                     }
                 };
-                let log = leveler_engine::EventLog::new(&db, session_id.clone());
+                // Ownership-fenced canonical writes (the same acquisition the
+                // parallel parent does): a stale runtime must never stamp user
+                // shell facts into a session another runtime now owns — and if
+                // this runtime may not own the session, it must not run a shell
+                // in that workspace at all.
+                let fenced = async {
+                    let task_id = leveler_storage::TaskStore::ensure_for_session(
+                        &db,
+                        &session_id,
+                        leveler_core::now(),
+                    )
+                    .await?;
+                    let runtime_id = app.runtime_id()?;
+                    crate::parallel::acquire_parallel_parent_ownership(&db, &task_id, &runtime_id)
+                        .await
+                }
+                .await;
+                let token = match fenced {
+                    Ok(token) => token,
+                    Err(error) => {
+                        store.finish(&session_id, &id, None, "failed");
+                        active.finish(&session_id);
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: NotificationLevel::Error,
+                            message: format!("无法获得会话执行所有权: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let log = leveler_engine::EventLog::new_owned(&db, session_id.clone(), token);
                 let mut forward = |event: leveler_engine::EngineEvent| bridge.forward(event);
                 let _ = log
                     .append(
