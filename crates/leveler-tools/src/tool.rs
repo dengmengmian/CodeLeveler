@@ -258,11 +258,14 @@ pub enum ToolError {
 /// synchronized) since one instance is shared across the process.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// The stable tool name exposed to the model.
-    fn name(&self) -> &'static str;
+    /// The stable tool name exposed to the model. Borrowed from the tool
+    /// instance so runtime-discovered tools (MCP, future extensions) can own
+    /// their metadata; built-ins keep returning `&'static str` literals.
+    fn name(&self) -> &str;
 
-    /// A concise description for the model.
-    fn description(&self) -> &'static str;
+    /// A concise description for the model. Same ownership contract as
+    /// [`Self::name`].
+    fn description(&self) -> &str;
 
     /// The JSON Schema for this tool's arguments.
     fn input_schema(&self) -> serde_json::Value;

@@ -14,7 +14,7 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 /// Holds the available tools and validates arguments before dispatching.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: BTreeMap<&'static str, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -24,7 +24,7 @@ impl ToolRegistry {
 
     /// Register a tool. A later registration with the same name replaces it.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name(), tool);
+        self.tools.insert(tool.name().to_string(), tool);
     }
 
     /// Look up a tool by name.
@@ -731,5 +731,91 @@ mod tests {
         // An unroutable name is refused before it can do anything.
         assert!(!reg.mutates_files("no_such_tool"));
         assert!(!reg.runs_command("no_such_tool"));
+    }
+}
+
+#[cfg(test)]
+mod dynamic_metadata_tests {
+    use super::*;
+    /// A tool whose name/description exist only at runtime — the MCP /
+    /// extension shape. Its metadata must be ownable without leaking.
+    struct DynamicTool {
+        name: String,
+        description: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DynamicTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            &self.description
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn risk(&self) -> RiskLevel {
+            RiskLevel::Safe
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: ToolContext,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("dynamic-ok"))
+        }
+    }
+
+    fn dynamic(name: &str) -> Arc<dyn Tool> {
+        Arc::new(DynamicTool {
+            name: name.to_string(),
+            description: format!("runtime-discovered tool {name}"),
+        })
+    }
+
+    #[test]
+    fn runtime_created_tool_registers_looks_up_and_defines() {
+        let mut registry = ToolRegistry::new();
+        registry.register(dynamic("mcp__demo__inspect"));
+        assert!(registry.get("mcp__demo__inspect").is_some());
+        let defs = registry.definitions();
+        let def = defs
+            .iter()
+            .find(|d| d.name == "mcp__demo__inspect")
+            .expect("definition generated");
+        assert!(def.description.contains("runtime-discovered"));
+    }
+
+    #[test]
+    fn dropped_and_recreated_dynamic_tools_do_not_accumulate() {
+        // Reconnect shape: registries built repeatedly with fresh metadata
+        // must not require the strings to live forever.
+        for round in 0..3 {
+            let mut registry = ToolRegistry::new();
+            registry.register(dynamic(&format!("mcp__srv__tool{round}")));
+            assert!(registry.get(&format!("mcp__srv__tool{round}")).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_executes_through_the_registry() {
+        let mut registry = ToolRegistry::new();
+        registry.register(dynamic("mcp__demo__run"));
+        let dir = std::env::temp_dir().join(format!("leveler-dyn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let context = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = registry
+            .execute(
+                "mcp__demo__run",
+                serde_json::json!({}),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("dynamic tool executes");
+        assert!(out.content.contains("dynamic-ok"));
     }
 }

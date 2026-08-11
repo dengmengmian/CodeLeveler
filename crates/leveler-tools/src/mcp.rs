@@ -243,28 +243,30 @@ fn format_tool_result(result: &serde_json::Value) -> String {
     out.trim_end().to_string()
 }
 
-/// Leak a runtime string to `&'static str` (tools live for the whole process).
-fn leak(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
-}
-
-/// A model-facing tool that proxies to an MCP server.
+/// A model-facing tool that proxies to an MCP server. Owns its
+/// runtime-discovered metadata — reconnect/reload can rebuild these without
+/// leaking the previous generation's strings.
 pub struct McpTool {
     client: Arc<McpClient>,
     remote_name: String,
-    exposed_name: &'static str,
-    description: &'static str,
+    exposed_name: String,
+    description: String,
     input_schema: serde_json::Value,
+}
+
+/// The model-facing name for a remote tool: `mcp__<server>__<tool>`.
+fn exposed_tool_name(server: &str, tool: &str) -> String {
+    format!("mcp__{server}__{tool}")
 }
 
 impl McpTool {
     fn new(client: Arc<McpClient>, server: &str, info: McpToolInfo) -> Self {
-        let exposed_name = leak(format!("mcp__{server}__{}", info.name));
-        let description = leak(if info.description.is_empty() {
+        let exposed_name = exposed_tool_name(server, &info.name);
+        let description = if info.description.is_empty() {
             format!("MCP tool `{}` from server `{server}`.", info.name)
         } else {
             info.description
-        });
+        };
         Self {
             client,
             remote_name: info.name,
@@ -277,12 +279,12 @@ impl McpTool {
 
 #[async_trait]
 impl Tool for McpTool {
-    fn name(&self) -> &'static str {
-        self.exposed_name
+    fn name(&self) -> &str {
+        &self.exposed_name
     }
 
-    fn description(&self) -> &'static str {
-        self.description
+    fn description(&self) -> &str {
+        &self.description
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -372,6 +374,6 @@ mod tests {
     #[test]
     fn exposed_name_is_prefixed() {
         // A tool from server "fs" named "read" is exposed as mcp__fs__read.
-        assert_eq!(leak("mcp__fs__read".to_string()), "mcp__fs__read");
+        assert_eq!(exposed_tool_name("fs", "read"), "mcp__fs__read");
     }
 }
