@@ -247,6 +247,10 @@ export type RuntimeEvent =
   | { type: 'sub_agent_updated'; id: string; nickname: string; role: string; done: boolean; ok: boolean; detail: string }
   | { type: 'sub_agent_progress'; id: string; active: boolean; input_tokens: number; output_tokens: number; cached_input_tokens: number }
   | { type: 'notification'; level: NotificationLevel; message: string }
+  | { type: 'context_compacted'; from: number; to: number }
+  | { type: 'context_expanded'; from_tokens: number; to_tokens: number; reason: string }
+  | { type: 'command_progress'; label: string; elapsed_ms: number }
+  | { type: 'sub_agent_activity'; id: string; phase: string; tool: string; preview: string; is_error: boolean }
   | { type: 'background_task_started'; task_id: string; program: string; args: string[] }
   | { type: 'background_task_exited'; task_id: string; exit_code: number | null; duration_ms: number; ok: boolean }
   | { type: 'memory_list'; memory_dir: string; active: UiMemoryEntry[]; archived: UiMemoryEntry[] }

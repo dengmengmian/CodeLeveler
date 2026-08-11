@@ -294,9 +294,10 @@ impl EventBridge {
                 });
             }
             EngineEvent::Compacted { from, to } => {
-                let _ = self.events.send(RuntimeEvent::Notification {
-                    level: NotificationLevel::Info,
-                    message: format!("上下文已压缩 {from} → {to} 条"),
+                // Structured fact — clients own the wording and locale.
+                let _ = self.events.send(RuntimeEvent::ContextCompacted {
+                    from: from as u32,
+                    to: to as u32,
                 });
             }
             // Reachable again under the canonical projection: the legacy
@@ -304,9 +305,10 @@ impl EventBridge {
             EngineEvent::ContextExpanded {
                 from, to, reason, ..
             } => {
-                let _ = self.events.send(RuntimeEvent::Notification {
-                    level: NotificationLevel::Info,
-                    message: format!("上下文预算已扩张 {from} → {to} tokens（{reason}）"),
+                let _ = self.events.send(RuntimeEvent::ContextExpanded {
+                    from_tokens: from,
+                    to_tokens: to,
+                    reason,
                 });
             }
             EngineEvent::ContextSnapshot { .. } => {
@@ -1100,6 +1102,12 @@ mod projection_equivalence {
             RuntimeEvent::Notification { level, message } => {
                 format!("note[{level:?}]:{message}")
             }
+            RuntimeEvent::ContextCompacted { from, to } => format!("compacted:{from}->{to}"),
+            RuntimeEvent::ContextExpanded {
+                from_tokens,
+                to_tokens,
+                reason,
+            } => format!("expanded:{from_tokens}->{to_tokens}:{reason}"),
             RuntimeEvent::AgentActivity { label } => format!("activity:{label}"),
             RuntimeEvent::CommandProgress { label, elapsed_ms } => {
                 format!("cmd:{label}@{elapsed_ms}")
@@ -1303,7 +1311,9 @@ mod projection_equivalence {
             EngineEvent::Compacted { from: 100, to: 40 },
         ]);
         assert_eq!(shapes[0], "usage:10/5/8");
-        assert!(shapes[1].starts_with("note[Info]") && shapes[1].contains("100 → 40"));
+        // Phase-5 structured-event migration: the compaction fact is typed;
+        // clients localize ("上下文已压缩 100 → 40 条" moves to the TUI).
+        assert_eq!(shapes[1], "compacted:100->40");
     }
 
     #[test]
@@ -1441,9 +1451,6 @@ mod projection_equivalence {
             crossed_reliable: false,
         }]);
         assert_eq!(shapes.len(), 1, "{shapes:?}");
-        assert!(
-            shapes[0].starts_with("note[Info]") && shapes[0].contains("256000 → 512000"),
-            "{shapes:?}"
-        );
+        assert_eq!(shapes[0], "expanded:256000->512000:reread_pressure");
     }
 }

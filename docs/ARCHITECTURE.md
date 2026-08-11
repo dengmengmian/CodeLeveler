@@ -547,45 +547,50 @@ Only structural gaps confirmed in code. Not a wishlist.
 | **Remaining** | Dual expand semantics (`tools_expanded` vs per-group `expanded`); first-frame geometry fallback; User Shell presentation adapter not present. |
 | **Status** | Geometry single-owner: **DONE**. Residual maintainability items: **KNOWN SEAM**. |
 
-### 2. EngineEvent projection shim
+### 2. EngineEvent projection shim — addressed
 
 | | |
 | --- | --- |
-| **CURRENT** | `EngineEvent` → `engine_event_to_agent` → `AgentEvent` → `EventBridge` → `RuntimeEvent` |
-| **TARGET** | `EngineEvent` → single application projection → `RuntimeEvent` |
-| **Status** | **PENDING CORE ARCHITECTURE HARDENING** |
+| **CURRENT** | `EngineEvent` → `EventBridge` (leveler-app) → `RuntimeEvent`, with an EXHAUSTIVE match: a new `EngineEvent` variant fails to compile until it gets a projection decision. Sixteen table-driven equivalence tests pin client-visible shapes. |
+| **Legacy** | `engine_event_to_agent` remains as a marked one-way adapter for the headless CLI renderer (`run_in_session`/`resume_session`) and eval collectors (`run_in_session_bounded`, `eval_signals`) only. Never a UI path. |
+| **Status** | **DONE** (core hardening). |
 
-### 3. Dynamic tool metadata
-
-| | |
-| --- | --- |
-| **CURRENT** | `Tool::name/description` return `&'static str`; MCP uses `Box::leak` for runtime-discovered strings. Fine for process lifetime. |
-| **TARGET** | Owned / dynamic metadata without permanent leak, for reload/disable and long-lived hosts. |
-| **Status** | **KNOWN EVOLUTION SEAM** (no frozen replacement API in this doc) |
-
-### 4. ToolContext growth
+### 3. Dynamic tool metadata — addressed
 
 | | |
 | --- | --- |
-| **CURRENT** | `ToolContext` carries workspace, runner, environment, permission, checkpoint, read guard, file state, command budgets/gates, sandbox/env policy, LSP, artifact, memory, background tasks, read-only flags, tool output budget, … |
-| **TARGET** | Clearer grouping (execution resources / policy / services) without claiming a finished split. |
-| **Status** | **KNOWN HOTSPOT** |
+| **CURRENT** | `Tool::name/description` return `&str` borrowed from the instance; the registry owns its keys (`BTreeMap<String, _>`); `McpTool` owns its discovered strings. Zero `Box::leak` in production code. Built-in tools unchanged. |
+| **Status** | **DONE** (core hardening). Reconnect/reload can rebuild registries without accumulating. |
 
-### 5. InProcessRuntimeClient responsibilities
-
-| | |
-| --- | --- |
-| **CURRENT** | One type owns session runtime config, streams, approvals, clarifications, media, checkpoints, live view, active turns, steering, command dispatch. |
-| **TARGET** | Clearer internal service ownership inside the application layer — without inventing a new platform marketing layer. |
-| **Status** | **KNOWN APPLICATION-LAYER CONCENTRATION** |
-
-### 6. Structured client events vs preformatted copy
+### 4. ToolContext growth — addressed
 
 | | |
 | --- | --- |
-| **CURRENT** | `EventBridge` still emits some preformatted Chinese UI strings (e.g. context compacted, budget expanded, closeout, no-progress streak). |
-| **TARGET** | Stable structured cross-client events; clients localize copy. |
-| **Status** | **KNOWN PROTOCOL / PRESENTATION DEBT** |
+| **CURRENT** | Three facets by lifecycle: `execution` (process-wide execution + write-safety infra), `policy` (gates/budgets; the scope-varying part — the two security-loosening switches are private behind `grant_network()` / `grant_unrestricted_fs()`), `services` (LSP/artifacts/memory/background). Anti-growth rule documented on the type: a new field must name its lifecycle and join a facet. |
+| **Placement guide** | Extension-provided service / secret provider → `services`; remote executor → `execution`. |
+| **Status** | **DONE** (core hardening). Enforcement semantics unchanged. |
+
+### 5. InProcessRuntimeClient responsibilities — partially addressed
+
+| | |
+| --- | --- |
+| **CURRENT** | `CheckpointStore` owns both checkpoint maps and their joint invariant; `LiveViews` owns reconnect state with a pure fold; `stage_turn` is the single turn-launch preamble. The facade routes commands and delegates (2739 → 2501 lines, 12 state fields). |
+| **Remaining** | Delivery middleware, session directory CRUD, runtime-config store, media/memory arms stay inline (stateless or single-path; extraction not yet justified by the rule "own state + own invariant + multiple paths"). Per-session map eviction on delete remains a KNOWN SEAM. |
+| **Status** | **CORE CLUSTERS DONE**; remainder tracked. A new client use case = a small handler + facade route, not another inline block. |
+
+### 6. Structured client events vs preformatted copy — policy set, migration started
+
+**The rule** (binding for new work): a stable product fact crosses the wire as
+a typed `RuntimeEvent`; clients own wording, layout, and locale. Free-form
+diagnostics (unexpected errors, transport failures, model/tool output) stay
+`Notification`/`String`. A domain fact is never a preformatted Chinese UI
+string.
+
+| | |
+| --- | --- |
+| **Migrated** | `ContextCompacted { from, to }` and `ContextExpanded { from_tokens, to_tokens, reason }` (protocol 1.4, additive; schemas + envelope golden regenerated; TUI localizes ZH/EN; Web mirror updated). Also fixed: the TUI reason-localizer matched `budget exhausted` (space) while the executor emits `budget_exhausted` — users saw the raw machine token. |
+| **Remaining** | AgentActivity advisory labels, turn-incomplete reason defaults, and assorted `interactive.rs` notices remain preformatted — tracked, migrate opportunistically under the rule above. |
+| **Status** | **POLICY IN FORCE; HIGH-CONFIDENCE FACTS DONE** |
 
 ---
 

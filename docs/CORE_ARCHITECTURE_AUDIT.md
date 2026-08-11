@@ -1,5 +1,9 @@
 # Core Architecture Audit
 
+> **历史文档。** 基线 `e6edbb8` 的**改前**审计。五项债务已在随后的 core
+> hardening commit 中处理（A/B/C DONE，D 核心簇 DONE，E 政策生效+高置信事实
+> DONE）；**CURRENT** 状态以 `ARCHITECTURE.md` 的 debt 章节为准。
+
 ## Baseline
 
 `e6edbb8`（BASELINE_SHA，workspace clean）。Core Architecture Hardening 改前审计。

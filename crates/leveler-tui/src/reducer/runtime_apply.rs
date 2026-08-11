@@ -407,6 +407,31 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 ),
             });
         }
+        RuntimeEvent::ContextCompacted { from, to } => {
+            // Client-owned wording for the structured runtime fact.
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: state
+                    .t()
+                    .context_compacted
+                    .replace("{from}", &from.to_string())
+                    .replace("{to}", &to.to_string()),
+            });
+        }
+        RuntimeEvent::ContextExpanded {
+            from_tokens,
+            to_tokens,
+            ..
+        } => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: state
+                    .t()
+                    .context_expanded
+                    .replace("{from}", &from_tokens.to_string())
+                    .replace("{to}", &to_tokens.to_string()),
+            });
+        }
         RuntimeEvent::Notification { level, message } => {
             // Errors stick until Esc / next turn; also land in the transcript so
             // a glance away cannot lose them to the status TTL.

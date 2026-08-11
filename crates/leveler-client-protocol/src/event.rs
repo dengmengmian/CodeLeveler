@@ -117,6 +117,18 @@ pub enum RuntimeEvent {
         candidate_files: Vec<String>,
         estimated_tokens: u32,
     },
+    /// The runtime folded conversation history: `from` transcript messages
+    /// became `to`. A stable product fact — clients own the wording and the
+    /// locale; the runtime does not send prose for this.
+    ContextCompacted { from: u32, to: u32 },
+    /// The context fold threshold climbed one tier on authoritative evidence
+    /// (adaptive context; production default off). Token budgets, not message
+    /// counts. `reason` is a stable machine key (e.g. `reread_pressure`).
+    ContextExpanded {
+        from_tokens: u32,
+        to_tokens: u32,
+        reason: String,
+    },
     /// Real token usage reported by the model for the latest request. The
     /// context gauge tracks how full the window is; `input_tokens` already
     /// includes the whole prompt (system + history + tools), so the window in
@@ -589,6 +601,26 @@ mod tests {
                 estimated_tokens: 1234,
             },
             "context_updated",
+        );
+    }
+
+    #[test]
+    fn context_compacted_roundtrip() {
+        roundtrip(
+            RuntimeEvent::ContextCompacted { from: 100, to: 40 },
+            "context_compacted",
+        );
+    }
+
+    #[test]
+    fn context_expanded_roundtrip() {
+        roundtrip(
+            RuntimeEvent::ContextExpanded {
+                from_tokens: 256_000,
+                to_tokens: 512_000,
+                reason: "reread_pressure".into(),
+            },
+            "context_expanded",
         );
     }
 

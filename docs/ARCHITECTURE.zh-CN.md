@@ -505,45 +505,48 @@ ABI、JSON-RPC 插件协议或 marketplace。这些需有真实实现后才成�
 | **残余** | 双重展开语义（`tools_expanded` vs per-group `expanded`）；首帧 geometry fallback；User Shell 呈现适配器尚未存在。 |
 | **状态** | Geometry 单一 owner：**已完成**。残余可维护性项：**KNOWN SEAM**。 |
 
-### 2. EngineEvent 投影 shim
+### 2. EngineEvent 投影 shim —— 已解决
 
 | | |
 | --- | --- |
-| **CURRENT** | `EngineEvent` → `engine_event_to_agent` → `AgentEvent` → `EventBridge` → `RuntimeEvent` |
-| **TARGET** | `EngineEvent` → 单一应用层投影 → `RuntimeEvent` |
-| **状态** | **PENDING CORE ARCHITECTURE HARDENING** |
+| **CURRENT** | `EngineEvent` → `EventBridge`（leveler-app）→ `RuntimeEvent`，**穷举 match**：新增 EngineEvent 变体必须显式做投影决策才能编译。16 条表驱动等价测试钉住客户端可见形态。 |
+| **Legacy** | `engine_event_to_agent` 仅作单向适配器保留，服务 headless CLI 渲染器与 eval 收集器；永不作为 UI 路径。 |
+| **状态** | **DONE**（core hardening）。 |
 
-### 3. 动态 Tool 元数据
-
-| | |
-| --- | --- |
-| **CURRENT** | `Tool::name/description` 返回 `&'static str`；MCP 用 `Box::leak` 把运行时发现的字符串变成 static。对当前进程生命周期可用。 |
-| **TARGET** | 真正 owned / dynamic 元数据，不依赖永久 leak，以支撑 reload/disable 与长寿命 host。 |
-| **状态** | **KNOWN EVOLUTION SEAM**（本文不冻结替代 Rust API） |
-
-### 4. ToolContext 膨胀
+### 3. 动态 Tool 元数据 —— 已解决
 
 | | |
 | --- | --- |
-| **CURRENT** | `ToolContext` 携带 workspace、runner、environment、permission、checkpoint、read guard、file state、command budget/gate、sandbox/env 策略、LSP、artifact、memory、background task、只读标志、tool output budget…… |
-| **TARGET** | 更清晰的职责分组（执行资源 / 策略 / 服务），不宣称已拆完。 |
-| **状态** | **KNOWN HOTSPOT** |
+| **CURRENT** | `Tool::name/description` 返回借自实例的 `&str`；Registry 拥有自己的 key（`BTreeMap<String, _>`）；`McpTool` 持有 owned 元数据。生产代码零 `Box::leak`；内建工具零改动。 |
+| **状态** | **DONE**（core hardening）。reconnect/reload 可重建 registry 而不累积泄漏。 |
 
-### 5. InProcessRuntimeClient 职责集中
-
-| | |
-| --- | --- |
-| **CURRENT** | 单一类型同时拥有会话 runtime 配置、事件流、审批、澄清、媒体、检查点、live view、活跃 turn、steering、命令分发。 |
-| **TARGET** | 应用层内部更清晰的 service ownership——不为宣传再叠一层平台名词。 |
-| **状态** | **KNOWN APPLICATION-LAYER CONCENTRATION** |
-
-### 6. 结构化客户端事件 vs 预格式化文案
+### 4. ToolContext 膨胀 —— 已解决
 
 | | |
 | --- | --- |
-| **CURRENT** | `EventBridge` 仍发出部分预格式化中文 UI 文案（如上下文已压缩、预算已扩张、收口中、无进展 streak）。 |
-| **TARGET** | 跨客户端稳定结构化事件；客户端负责本地化文案。 |
-| **状态** | **KNOWN PROTOCOL / PRESENTATION DEBT** |
+| **CURRENT** | 按生命周期分三个 facet：`execution`（进程级执行+写安全基础设施）、`policy`（门禁/预算；两个放权开关为私有字段，仅 `grant_network()` / `grant_unrestricted_fs()` 可放权）、`services`（LSP/artifact/memory/background）。类型上写明 anti-growth 规则：新字段必须声明生命周期并入 facet。 |
+| **归属指引** | Extension 服务 / secret provider → `services`；remote executor → `execution`。 |
+| **状态** | **DONE**（core hardening）。执法语义零变更。 |
+
+### 5. InProcessRuntimeClient 职责集中 —— 部分解决
+
+| | |
+| --- | --- |
+| **CURRENT** | `CheckpointStore`（双 map 联合不变量）、`LiveViews`（重连状态 + 纯 fold）、`stage_turn`（唯一 turn 启动前奏）已提取；facade 只做路由与委托（2739 → 2501 行，12 个状态字段）。 |
+| **残余** | 交付中间件、会话目录 CRUD、runtime-config store、media/memory 臂保持内联（无独立状态/单一路径，按提取规则暂不拆）；删除会话时 per-session map 不清理仍为 KNOWN SEAM。 |
+| **状态** | **核心簇 DONE**；其余登记在案。新增 client use case = 小 handler + facade 路由。 |
+
+### 6. 结构化客户端事件 vs 预格式化文案 —— 规则已立，迁移已启动
+
+**规则**（对新代码有约束力）：稳定产品事实以 typed `RuntimeEvent` 过线，客户端
+负责措辞/排版/语言；自由诊断（意外错误、传输故障、模型/工具输出）保留
+`Notification`/`String`。领域事实永远不是一条预格式化中文字符串。
+
+| | |
+| --- | --- |
+| **已迁移** | `ContextCompacted { from, to }` 与 `ContextExpanded { from_tokens, to_tokens, reason }`（协议 1.4 additive；schema+golden 已再生成；TUI 双语本地化；Web 镜像更新）。顺带修复：TUI 曾以 `budget exhausted`（空格）嗅探而执行器发 `budget_exhausted`（下划线）——用户看到裸机器串。 |
+| **残余** | AgentActivity 咨询标签、turn-incomplete 默认 reason、interactive.rs 各处通知仍为预格式化——登记在案，按上方规则机会性迁移。 |
+| **状态** | **政策生效；高置信事实 DONE** |
 
 ---
 

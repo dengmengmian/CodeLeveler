@@ -391,11 +391,18 @@ fn localized_turn_detail<'a>(detail: &'a str, t: &'a crate::i18n::UiText) -> &'a
         }
         // Executor machine tokens + long defaults → short product copy.
         s if s.contains("observe thrash") && s.contains("plan complete") => t.turn_plan_thrash,
-        s if s.contains("observe thrash") || s.starts_with("no-progress streak") => {
+        s if s.contains("observe thrash")
+            || s.starts_with("no-progress streak")
+            || s.contains("continue suppressed: no-progress cap") =>
+        {
             t.turn_observe_thrash
         }
         s if s.contains("预算已耗尽")
             || s.starts_with("轮次或资源预算")
+            // The executor emits the machine token `budget_exhausted
+            // dimension=… spent=… cap=…` (underscore) — the human-spaced
+            // spelling never matched and users saw the raw token.
+            || s.contains("budget_exhausted")
             || s.contains("budget exhausted")
             || s.contains("model token budget")
             || s.contains("model cost budget") =>
