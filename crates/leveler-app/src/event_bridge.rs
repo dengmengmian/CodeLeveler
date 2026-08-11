@@ -928,3 +928,397 @@ mod bridge_tests {
         );
     }
 }
+
+/// Projection equivalence characterization (core hardening §23). The TABLE
+/// (EngineEvent inputs → client-visible shapes) is the contract: it captures
+/// the behavior of the pre-hardening path and must stay green, unchanged,
+/// when the projection implementation is swapped. Message/call ids are
+/// normalized because the bridge mints fresh UUIDs.
+#[cfg(test)]
+mod projection_equivalence {
+    use super::*;
+    use leveler_engine::EngineEvent;
+
+    /// Run a canonical event sequence through the application projection and
+    /// return normalized shapes of every client-visible event.
+    fn project(events: Vec<EngineEvent>) -> Vec<String> {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        for event in events {
+            if let Some(agent_event) = crate::session::engine_event_to_agent(event) {
+                bridge.forward(agent_event);
+            }
+        }
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(shape(&ev));
+        }
+        out
+    }
+
+    /// Stable, id-free shape of a RuntimeEvent for table comparison.
+    fn shape(ev: &RuntimeEvent) -> String {
+        match ev {
+            RuntimeEvent::AssistantAttemptReset { message_id } => {
+                format!("reset(open={})", message_id.is_some())
+            }
+            RuntimeEvent::AssistantMessageStarted { .. } => "msg_start".into(),
+            RuntimeEvent::AssistantTextDelta { delta, .. } => format!("delta:{delta}"),
+            RuntimeEvent::AssistantMessageCompleted { .. } => "msg_done".into(),
+            RuntimeEvent::ReasoningDelta { delta } => format!("reasoning:{delta}"),
+            RuntimeEvent::ToolCallStarted {
+                id, name, parallel, ..
+            } => {
+                format!("tool_start:{id}:{name}:par={parallel}")
+            }
+            RuntimeEvent::ToolCallCompleted { id, ok, .. } => format!("tool_done:{id}:ok={ok}"),
+            RuntimeEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            } => format!("usage:{input_tokens}/{output_tokens}/{cached_input_tokens}"),
+            RuntimeEvent::Notification { level, message } => {
+                format!("note[{level:?}]:{message}")
+            }
+            RuntimeEvent::AgentActivity { label } => format!("activity:{label}"),
+            RuntimeEvent::CommandProgress { label, elapsed_ms } => {
+                format!("cmd:{label}@{elapsed_ms}")
+            }
+            RuntimeEvent::PlanUpdated { plan } => {
+                let steps: Vec<String> = plan
+                    .steps
+                    .iter()
+                    .map(|s| format!("{}={:?}", s.index, s.status))
+                    .collect();
+                format!("plan:[{}]", steps.join(","))
+            }
+            RuntimeEvent::VerificationUpdated { verification } => format!(
+                "verify:passed={:?}:checks={}",
+                verification.passed,
+                verification.checks.len()
+            ),
+            RuntimeEvent::SubAgentUpdated { id, done, ok, .. } => {
+                format!("sub:{id}:done={done}:ok={ok}")
+            }
+            RuntimeEvent::SubAgentProgress { id, active, .. } => {
+                format!("sub_progress:{id}:active={active}")
+            }
+            RuntimeEvent::SubAgentActivity {
+                id,
+                phase,
+                tool,
+                is_error,
+                ..
+            } => {
+                format!("sub_activity:{id}:{phase}:{tool}:err={is_error}")
+            }
+            RuntimeEvent::TurnProgress {
+                phase,
+                closing,
+                no_progress_streak,
+                closeout_deny_rounds,
+            } => format!(
+                "progress:{phase}:closing={closing}:streak={no_progress_streak}:deny={closeout_deny_rounds}"
+            ),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn tool_started(id: &str, name: &str, agent: Option<&str>) -> EngineEvent {
+        EngineEvent::ToolCallStarted {
+            call_id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            parallel: false,
+            risk: None,
+            agent_id: agent.map(str::to_string),
+        }
+    }
+
+    fn tool_finished(id: &str, name: &str, is_error: bool, agent: Option<&str>) -> EngineEvent {
+        EngineEvent::ToolCallFinished {
+            call_id: id.into(),
+            name: name.into(),
+            is_error,
+            preview: "out".into(),
+            agent_id: agent.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn streamed_answer_projects_start_deltas_done() {
+        let shapes = project(vec![
+            EngineEvent::StreamAttemptStarted,
+            EngineEvent::AssistantDelta { text: "he".into() },
+            EngineEvent::AssistantDelta { text: "llo".into() },
+            EngineEvent::AssistantMessage {
+                text: "hello".into(),
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "reset(open=false)",
+                "msg_start",
+                "delta:he",
+                "delta:llo",
+                "msg_done"
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_resets_the_open_message() {
+        let shapes = project(vec![
+            EngineEvent::AssistantDelta { text: "a".into() },
+            EngineEvent::StreamAttemptStarted,
+            EngineEvent::AssistantDelta { text: "b".into() },
+            EngineEvent::AssistantMessage { text: "b".into() },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "msg_start",
+                "delta:a",
+                "reset(open=true)",
+                "msg_start",
+                "delta:b",
+                "msg_done"
+            ]
+        );
+    }
+
+    #[test]
+    fn non_streamed_text_synthesizes_a_whole_message() {
+        assert_eq!(
+            project(vec![EngineEvent::AssistantMessage { text: "hi".into() }]),
+            ["msg_start", "delta:hi", "msg_done"]
+        );
+        assert!(project(vec![EngineEvent::AssistantMessage { text: "".into() }]).is_empty());
+    }
+
+    #[test]
+    fn near_duplicate_summary_folds_to_a_notification() {
+        let text = "这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。".to_string();
+        let shapes = project(vec![
+            EngineEvent::AssistantMessage { text: text.clone() },
+            EngineEvent::AssistantMessage { text },
+        ]);
+        assert_eq!(
+            shapes[..3],
+            [
+                "msg_start".to_string(),
+                format!("delta:这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。"),
+                "msg_done".to_string()
+            ]
+        );
+        assert!(shapes[3].starts_with("note[Info]"), "{shapes:?}");
+        assert_eq!(shapes.len(), 4);
+    }
+
+    #[test]
+    fn parent_tool_calls_project_with_duration_pairing() {
+        let shapes = project(vec![
+            tool_started("t1", "grep", None),
+            tool_finished("t1", "grep", false, None),
+        ]);
+        assert_eq!(
+            shapes,
+            ["tool_start:t1:grep:par=false", "tool_done:t1:ok=true"]
+        );
+    }
+
+    #[test]
+    fn unpaired_tool_result_synthesizes_its_start() {
+        let shapes = project(vec![tool_finished("t9", "apply_patch", true, None)]);
+        assert_eq!(
+            shapes,
+            [
+                "tool_start:t9:apply_patch:par=false",
+                "tool_done:t9:ok=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_closes_an_open_assistant_message() {
+        let shapes = project(vec![
+            EngineEvent::AssistantDelta {
+                text: "think".into(),
+            },
+            tool_started("t1", "read_file", None),
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "msg_start",
+                "delta:think",
+                "msg_done",
+                "tool_start:t1:read_file:par=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn delegated_agent_tool_facts_do_not_render_twice() {
+        // A child's canonical tool events are durable recovery facts; the UI
+        // stream already carries them as attributed SubAgentActivity.
+        assert!(
+            project(vec![
+                tool_started("c1", "grep", Some("agent-1")),
+                tool_finished("c1", "grep", false, Some("agent-1")),
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn usage_and_compaction_project() {
+        let shapes = project(vec![
+            EngineEvent::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 8,
+            },
+            EngineEvent::Compacted { from: 100, to: 40 },
+        ]);
+        assert_eq!(shapes[0], "usage:10/5/8");
+        assert!(shapes[1].starts_with("note[Info]") && shapes[1].contains("100 → 40"));
+    }
+
+    #[test]
+    fn verification_sequence_accumulates_checks() {
+        let shapes = project(vec![
+            EngineEvent::VerificationStarted,
+            EngineEvent::VerificationCheck {
+                name: "cargo test".into(),
+                status: "passed".into(),
+                evidence: None,
+            },
+            EngineEvent::VerificationFinished { passed: true },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "verify:passed=None:checks=0",
+                "verify:passed=None:checks=1",
+                "verify:passed=Some(true):checks=1"
+            ]
+        );
+    }
+
+    #[test]
+    fn sub_agent_lifecycle_projects() {
+        let shapes = project(vec![
+            EngineEvent::SubAgentStarted {
+                id: "a1".into(),
+                nickname: "Newton".into(),
+                role: "explorer".into(),
+                task: "look".into(),
+            },
+            EngineEvent::SubAgentProgress {
+                id: "a1".into(),
+                active: true,
+                input_tokens: 1,
+                output_tokens: 2,
+                cached_input_tokens: 0,
+            },
+            EngineEvent::SubAgentActivity {
+                id: "a1".into(),
+                phase: "tool_started".into(),
+                tool: "grep".into(),
+                preview: String::new(),
+                is_error: false,
+            },
+            EngineEvent::SubAgentFinished {
+                id: "a1".into(),
+                nickname: "Newton".into(),
+                ok: true,
+                summary: "done".into(),
+            },
+        ]);
+        assert_eq!(
+            shapes,
+            [
+                "sub:a1:done=false:ok=false",
+                "sub_progress:a1:active=true",
+                "sub_activity:a1:tool_started:grep:err=false",
+                "sub:a1:done=true:ok=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn advisory_and_command_progress_project() {
+        let shapes = project(vec![
+            EngineEvent::AdvisoryStarted {
+                kind: "context_compaction".into(),
+            },
+            EngineEvent::CommandProgress {
+                label: "cargo test".into(),
+                elapsed_ms: 1500,
+            },
+        ]);
+        assert!(shapes[0].starts_with("activity:"), "{shapes:?}");
+        assert_eq!(shapes[1], "cmd:cargo test@1500");
+    }
+
+    #[test]
+    fn goal_interception_surfaces_as_activity() {
+        let shapes = project(vec![EngineEvent::GoalIntercepted {
+            kind: "complete".into(),
+            detail: "checks failing".into(),
+        }]);
+        assert_eq!(shapes, ["activity:gate refused complete: checks failing"]);
+    }
+
+    #[test]
+    fn finished_closes_a_dangling_message() {
+        let shapes = project(vec![
+            EngineEvent::AssistantDelta {
+                text: "tail".into(),
+            },
+            EngineEvent::RunFinished {
+                text: "tail".into(),
+            },
+        ]);
+        assert_eq!(shapes, ["msg_start", "delta:tail", "msg_done"]);
+    }
+
+    #[test]
+    fn engine_only_facts_do_not_reach_the_client_stream() {
+        // Lifecycle, approvals, and strategy events are surfaced by
+        // engine-aware consumers (snapshot, approval channel, eval) — the
+        // client event stream must not see them.
+        let shapes = project(vec![
+            EngineEvent::TurnStarted {
+                turn_id: leveler_core::TurnId::new("turn-1"),
+                kind: leveler_engine::TurnKind::Chat,
+            },
+            EngineEvent::ContextSnapshot {
+                messages: Vec::new(),
+                through_ordinal: None,
+            },
+            EngineEvent::PhaseChanged {
+                from: leveler_lifecycle::AgentState::Plan,
+                to: leveler_lifecycle::AgentState::Execute,
+            },
+        ]);
+        assert!(shapes.is_empty(), "{shapes:?}");
+    }
+
+    #[test]
+    fn context_expansion_is_dropped_by_the_current_path() {
+        // KNOWN dead code on the pre-hardening path: the shim discards
+        // ContextExpanded before the bridge's notification arm can run. The
+        // canonical projection is expected to CHANGE this expectation (the
+        // arm exists and the fact is user-relevant).
+        let shapes = project(vec![EngineEvent::ContextExpanded {
+            from: 256_000,
+            to: 512_000,
+            reason: "reread_pressure".into(),
+            crossed_reliable: false,
+        }]);
+        assert!(shapes.is_empty(), "{shapes:?}");
+    }
+}
