@@ -993,6 +993,42 @@ mod disclosure_tests {
     }
 
     #[test]
+    fn user_shell_row_click_opens_its_details_not_a_toggle() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        s.transcript.push_user_shell_started(
+            leveler_core::UserShellId::new("ush-9"),
+            "cargo test".into(),
+            "/repo".into(),
+            0,
+        );
+        s.transcript.complete_user_shell(
+            &leveler_core::UserShellId::new("ush-9"),
+            Some(0),
+            4200,
+            crate::transcript::UserShellStatus::Success,
+        );
+        let shell_idx = s
+            .transcript
+            .user_shell_index(&leveler_core::UserShellId::new("ush-9"))
+            .unwrap();
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line, item) = *hits.iter().find(|(_, i)| *i == shell_idx).unwrap();
+        let row = screen_row_of(&s, line);
+        click(&mut s, 3, row);
+        assert_eq!(
+            s.active_screen,
+            crate::screen::Screen::Shell,
+            "a user shell row opens Shell Details"
+        );
+        assert_eq!(s.shell_screen_item, Some(item), "focused on THAT execution");
+        assert!(
+            expanded_flags(&s).iter().all(|(_, e)| !e),
+            "no tool group was toggled by the shell click"
+        );
+    }
+
+    #[test]
     fn two_groups_stay_expanded_simultaneously() {
         let mut s = test_state();
         three_groups(&mut s);

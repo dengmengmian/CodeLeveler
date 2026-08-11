@@ -394,3 +394,92 @@ async fn snapshot_restores_active_shell_with_elapsed() {
         .unwrap();
     let _ = wait_for_exit(&mut h).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn shell_syntax_pipes_env_and_failure_exit() {
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+
+    // Pipe: `echo hello | wc -c` → 6 (5 chars + newline).
+    let mut h = harness(&server).await;
+    h.client
+        .send(run_shell(&h, "echo hello | wc -c"))
+        .await
+        .unwrap();
+    let events = wait_for_exit(&mut h).await;
+    let out: String = events
+        .iter()
+        .filter_map(|e| match e {
+            RuntimeEvent::UserShellOutput { chunk, .. } => Some(chunk.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(out.trim(), "6", "pipe semantics preserved: {out:?}");
+
+    // Environment assignment inside the shell string.
+    let mut h = harness(&server).await;
+    h.client
+        .send(run_shell(&h, "FOO=bar sh -c 'echo \"$FOO\"'"))
+        .await
+        .unwrap();
+    let events = wait_for_exit(&mut h).await;
+    let out: String = events
+        .iter()
+        .filter_map(|e| match e {
+            RuntimeEvent::UserShellOutput { chunk, .. } => Some(chunk.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(out.trim(), "bar", "{out:?}");
+
+    // stderr is tagged; non-zero exit is failed with its code.
+    let mut h = harness(&server).await;
+    h.client
+        .send(run_shell(&h, "echo oops 1>&2; false"))
+        .await
+        .unwrap();
+    let events = wait_for_exit(&mut h).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        RuntimeEvent::UserShellOutput { stream, chunk, .. }
+            if stream == "stderr" && chunk.contains("oops")
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::UserShellExited { exit_code: Some(1), status, .. })
+            if status == "failed"
+    ));
+    assert_eq!(server.request_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn large_output_stays_bounded_with_a_truncation_flag() {
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+    let mut h = harness(&server).await;
+    // ~200 KiB >> the 64 KiB tail cap.
+    h.client
+        .send(run_shell(
+            &h,
+            "i=0; while [ $i -lt 2000 ]; do printf '%0100d\\n' $i; i=$((i+1)); done",
+        ))
+        .await
+        .unwrap();
+    let events = wait_for_exit(&mut h).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::UserShellExited { status, .. }) if status == "success"
+    ));
+    let snap = h.client.snapshot(&h.session_id).await.unwrap();
+    let shell = snap.user_shells.last().expect("in history");
+    assert!(
+        shell.output_tail.len() <= 64 * 1024,
+        "tail bounded: {} bytes",
+        shell.output_tail.len()
+    );
+    assert!(shell.output_truncated, "truncation is flagged, not silent");
+    assert!(
+        shell.output_tail.contains("1999"),
+        "the tail keeps the END of the output"
+    );
+}
