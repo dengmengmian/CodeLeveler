@@ -79,17 +79,25 @@ fn goal_from_content(content: &[ContentPart]) -> String {
         .join("")
 }
 
-/// Forward the engine's kernel events onto the legacy `AgentEvent` observer.
+/// LEGACY one-way adapter: canonical `EngineEvent` → the old `AgentEvent`
+/// observer vocabulary. The interactive UI path no longer goes through this —
+/// it consumes `EngineEvent` directly (see `EventBridge`). Remaining callers
+/// are the headless CLI renderer (`run_in_session` / `resume_session`) and
+/// the eval collectors (`run_in_session_bounded`, `eval_signals`). Never add
+/// a UI path through here: the mapping is deliberately lossy (engine-only
+/// facts return `None`).
 fn forward_engine_event(event: EngineEvent, observer: &mut dyn FnMut(AgentEvent)) {
     if let Some(agent_event) = engine_event_to_agent(event) {
         observer(agent_event);
     }
 }
 
-/// Map an engine kernel event to its legacy `AgentEvent` counterpart.
+/// LEGACY: map an engine kernel event to its old `AgentEvent` counterpart.
 /// Engine-only events (task/turn lifecycle, approvals, plan strategy) return
 /// `None` — they are already persisted in the event log and are surfaced by
-/// engine-aware consumers directly.
+/// engine-aware consumers directly. Kept only for the headless CLI renderer
+/// and the eval collectors; the client projection is `EventBridge` over
+/// `EngineEvent`.
 pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
     Some(match event {
         EngineEvent::StreamAttemptStarted => AgentEvent::StreamAttemptStarted,
@@ -446,7 +454,9 @@ impl Application {
             sandbox,
             // Headless: nobody is at a keyboard to steer.
             None,
-            observer,
+            // Legacy AgentEvent observer (headless CLI renderer): adapt from
+            // the canonical stream one-way.
+            &mut |event| forward_engine_event(event, observer),
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
             unattended_limits(self.top_level_limits()),
@@ -469,7 +479,7 @@ impl Application {
         sandbox: bool,
         // Mid-turn user input; `None` disables steering for this run.
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         self.run_in_session_with_policy(
@@ -517,7 +527,8 @@ impl Application {
             Arc::new(AutoClarify),
             sandbox,
             steering,
-            observer,
+            // Legacy AgentEvent observer (eval collectors): adapt one-way.
+            &mut |event| forward_engine_event(event, observer),
             cancellation,
             leveler_agent::ContinuationPolicy::bounded(max_rounds),
             leveler_agent::StepLimits::default(),
@@ -536,7 +547,7 @@ impl Application {
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
         continuation: leveler_agent::ContinuationPolicy,
         limits: leveler_agent::StepLimits,
@@ -580,14 +591,7 @@ impl Application {
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.runtime.continuation = continuation;
         spec.runtime.limits = limits;
-        let result = engine
-            .run(
-                session_id,
-                &spec,
-                &mut |event| forward_engine_event(event, observer),
-                cancellation,
-            )
-            .await;
+        let result = engine.run(session_id, &spec, observer, cancellation).await;
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -606,7 +610,7 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut dyn FnMut(EngineEvent),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
@@ -642,13 +646,7 @@ impl Application {
         self.enqueue_memory_candidates(&goal);
         let spec = self.direct_spec(goal, mode, sandbox);
         let result = engine
-            .chat(
-                session_id,
-                &spec,
-                content,
-                &mut |event| forward_engine_event(event, observer),
-                cancellation,
-            )
+            .chat(session_id, &spec, content, observer, cancellation)
             .await;
         match result {
             Ok(report) => report_to_result(report),

@@ -27,7 +27,6 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::AgentEvent;
 use leveler_core::{CheckpointId, SessionId};
 use leveler_execution::{Approver, AutoApprove, PermissionProfile};
 use leveler_media::MediaStore;
@@ -820,7 +819,7 @@ impl InProcessRuntimeClient {
             handle.block_on(async move {
                 emit_project_rules(&events, &repo);
                 let mut bridge = EventBridge::new(events.clone());
-                let mut observer = |event: AgentEvent| bridge.forward(event);
+                let mut observer = |event: leveler_engine::EngineEvent| bridge.forward(event);
                 let result = app
                     .run_in_session_with_clarifier(
                         &session_id,
@@ -934,7 +933,7 @@ impl InProcessRuntimeClient {
             handle.block_on(async move {
                 emit_project_rules(&events, &repo);
                 let mut bridge = EventBridge::new(events.clone());
-                let mut observer = |event: AgentEvent| bridge.forward(event);
+                let mut observer = |event: leveler_engine::EngineEvent| bridge.forward(event);
                 let result = app
                     .run_in_session_with_content(
                         &session_id,

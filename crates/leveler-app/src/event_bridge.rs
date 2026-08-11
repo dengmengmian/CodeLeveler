@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use tokio::sync::broadcast;
 
-use leveler_agent::{AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, StopReason};
+use leveler_agent::{AdvisoryKind, AgentError, AgentOutcome, StopReason};
 use leveler_core::ToolCallId;
+use leveler_engine::EngineEvent;
 
 use leveler_client_protocol::{
     CheckState, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent, UiCheck, UiPlan,
@@ -140,15 +141,15 @@ impl EventBridge {
         }
     }
 
-    pub(crate) fn forward(&mut self, event: AgentEvent) {
+    pub(crate) fn forward(&mut self, event: EngineEvent) {
         match event {
-            AgentEvent::StreamAttemptStarted => {
+            EngineEvent::StreamAttemptStarted => {
                 let message_id = self.open_assistant.take();
                 let _ = self
                     .events
                     .send(RuntimeEvent::AssistantAttemptReset { message_id });
             }
-            AgentEvent::AssistantDelta(delta) => {
+            EngineEvent::AssistantDelta { text: delta } => {
                 if self.open_assistant.is_none() {
                     let id = MessageId::new(leveler_core::new_uuid_string());
                     let _ = self.events.send(RuntimeEvent::AssistantMessageStarted {
@@ -163,10 +164,10 @@ impl EventBridge {
                     });
                 }
             }
-            AgentEvent::ReasoningDelta(delta) => {
+            EngineEvent::ReasoningDelta { text: delta } => {
                 let _ = self.events.send(RuntimeEvent::ReasoningDelta { delta });
             }
-            AgentEvent::AssistantText(text) => {
+            EngineEvent::AssistantMessage { text } => {
                 // Near-duplicate fold: a nudged model that re-states an earlier
                 // summary is collapsed into one notice instead of rendering the
                 // repeat. Display only — the transcript sink keeps the message.
@@ -214,11 +215,23 @@ impl EventBridge {
                         .send(RuntimeEvent::AssistantMessageCompleted { message_id: id });
                 }
             }
-            AgentEvent::ToolCall {
-                id,
+            // A delegated agent's canonical tool events are durable recovery
+            // facts, not a second UI stream: the parent already surfaces child
+            // work as attributed SubAgentActivity. Projecting them here would
+            // render every child call twice.
+            EngineEvent::ToolCallStarted {
+                agent_id: Some(_), ..
+            }
+            | EngineEvent::ToolCallFinished {
+                agent_id: Some(_), ..
+            } => {}
+            EngineEvent::ToolCallStarted {
+                call_id: id,
                 name,
                 arguments,
                 parallel,
+                risk: _,
+                agent_id: None,
             } => {
                 // A tool call ends the current assistant thought. Close any open
                 // streamed message so the next round's text opens a fresh block
@@ -236,11 +249,12 @@ impl EventBridge {
                     parallel,
                 });
             }
-            AgentEvent::ToolResult {
-                id,
+            EngineEvent::ToolCallFinished {
+                call_id: id,
                 name,
                 is_error,
                 preview,
+                agent_id: None,
             } => {
                 // Pair with the ToolCall by id, whatever order results arrive in.
                 // A denial/guard result has no prior ToolCall — synthesize a
@@ -264,11 +278,11 @@ impl EventBridge {
                     duration_ms: start.elapsed().as_millis() as u64,
                 });
             }
-            AgentEvent::WorkspaceSnapshot { .. } => {
+            EngineEvent::WorkspaceSnapshotCreated { .. } => {
                 // Durability metadata is persisted by the engine; it has no
                 // standalone transcript cell in the TUI.
             }
-            AgentEvent::Usage {
+            EngineEvent::TokenUsage {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
@@ -279,13 +293,15 @@ impl EventBridge {
                     cached_input_tokens,
                 });
             }
-            AgentEvent::Compacted { from, to } => {
+            EngineEvent::Compacted { from, to } => {
                 let _ = self.events.send(RuntimeEvent::Notification {
                     level: NotificationLevel::Info,
                     message: format!("上下文已压缩 {from} → {to} 条"),
                 });
             }
-            AgentEvent::ContextExpanded {
+            // Reachable again under the canonical projection: the legacy
+            // shim dropped this durable fact before the arm could run.
+            EngineEvent::ContextExpanded {
                 from, to, reason, ..
             } => {
                 let _ = self.events.send(RuntimeEvent::Notification {
@@ -293,10 +309,10 @@ impl EventBridge {
                     message: format!("上下文预算已扩张 {from} → {to} tokens（{reason}）"),
                 });
             }
-            AgentEvent::ContextSnapshot { .. } => {
+            EngineEvent::ContextSnapshot { .. } => {
                 // Engine durability metadata; no standalone UI cell.
             }
-            AgentEvent::PlanUpdated { steps } => {
+            EngineEvent::PlanUpdated { steps } => {
                 let plan = UiPlan {
                     steps: steps
                         .into_iter()
@@ -314,24 +330,26 @@ impl EventBridge {
                 };
                 let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
             }
-            AgentEvent::GoalIntercepted { kind, detail } => {
+            EngineEvent::GoalIntercepted { kind, detail } => {
                 // Surface as activity label; full tool error remains the model path.
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
                     label: format!("gate refused {kind}: {detail}"),
                 });
             }
-            AgentEvent::EvidenceLedgerUpdated { .. } => {
+            EngineEvent::EvidenceLedgerUpdated { .. } => {
                 // Persisted by engine; no dedicated UI cell in v1.
             }
-            AgentEvent::AdvisoryStarted { kind } => {
+            EngineEvent::AdvisoryStarted { kind } => {
                 // Closeout round trips that happen after the visible answer.
                 // Label them so the status line does not read "等待模型" with no
-                // hint of why the wait continues.
+                // hint of why the wait continues. Unknown keys (older/newer
+                // logs) degrade to the audit label.
                 use leveler_agent::closeout::CloseoutReason;
+                let kind = AdvisoryKind::from_key(&kind).unwrap_or(AdvisoryKind::ContextCompaction);
                 let label = match kind {
-                    leveler_agent::AdvisoryKind::ContextCompaction => "压缩上下文中…",
-                    leveler_agent::AdvisoryKind::GoalContinuation => "目标未确认完成,续跑一轮",
-                    leveler_agent::AdvisoryKind::CloseoutNudge(reason) => match reason {
+                    AdvisoryKind::ContextCompaction => "压缩上下文中…",
+                    AdvisoryKind::GoalContinuation => "目标未确认完成,续跑一轮",
+                    AdvisoryKind::CloseoutNudge(reason) => match reason {
                         CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
                         CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
                     },
@@ -340,7 +358,7 @@ impl EventBridge {
                     label: label.to_string(),
                 });
             }
-            AgentEvent::CommandProgress { label, elapsed_ms } => {
+            EngineEvent::CommandProgress { label, elapsed_ms } => {
                 // Structured event; the TUI reducer turns it into the status-line
                 // label ("运行 cargo test · 02:31"). Single source, so Web/logs get
                 // the same structured data instead of a pre-formatted string.
@@ -348,7 +366,7 @@ impl EventBridge {
                     .events
                     .send(RuntimeEvent::CommandProgress { label, elapsed_ms });
             }
-            AgentEvent::ProgressUpdated { ledger } => {
+            EngineEvent::ProgressUpdated { ledger } => {
                 let phase = match ledger.phase {
                     leveler_lifecycle::TurnPhase::Active => "active",
                     leveler_lifecycle::TurnPhase::AwaitingModel => "awaiting_model",
@@ -373,24 +391,24 @@ impl EventBridge {
                     });
                 }
             }
-            AgentEvent::VerificationStarted => {
+            EngineEvent::VerificationStarted => {
                 self.verification_checks.clear();
                 self.emit_verification(None);
             }
-            AgentEvent::VerificationCheck {
+            EngineEvent::VerificationCheck {
                 name,
                 status,
                 evidence,
             } => {
                 self.verification_checks.push(UiCheck {
                     name,
-                    status: map_agent_check_status(status),
+                    status: map_check_status(&status),
                     evidence,
                 });
                 self.emit_verification(None);
             }
-            AgentEvent::VerificationFinished { passed } => self.emit_verification(Some(passed)),
-            AgentEvent::SubAgentStarted {
+            EngineEvent::VerificationFinished { passed } => self.emit_verification(Some(passed)),
+            EngineEvent::SubAgentStarted {
                 id,
                 nickname,
                 role,
@@ -405,7 +423,7 @@ impl EventBridge {
                     detail: task,
                 });
             }
-            AgentEvent::SubAgentProgress {
+            EngineEvent::SubAgentProgress {
                 id,
                 active,
                 input_tokens,
@@ -420,7 +438,7 @@ impl EventBridge {
                     cached_input_tokens,
                 });
             }
-            AgentEvent::SubAgentFinished {
+            EngineEvent::SubAgentFinished {
                 id,
                 nickname,
                 ok,
@@ -435,7 +453,7 @@ impl EventBridge {
                     detail: summary,
                 });
             }
-            AgentEvent::SubAgentActivity {
+            EngineEvent::SubAgentActivity {
                 id,
                 phase,
                 tool,
@@ -450,7 +468,7 @@ impl EventBridge {
                     is_error,
                 });
             }
-            AgentEvent::Finished(_) => {
+            EngineEvent::RunFinished { .. } => {
                 // Close a still-open streamed message at turn end. Without this, a
                 // round that streamed only whitespace (no closing AssistantText,
                 // which the executor sends only for non-empty text) would leave
@@ -462,6 +480,33 @@ impl EventBridge {
                         .send(RuntimeEvent::AssistantMessageCompleted { message_id: id });
                 }
             }
+            // Engine-only facts: persisted in the event log and surfaced by
+            // engine-aware consumers (snapshot, approval channel, eval, the
+            // parallel strategy). Deliberately NOT on the client event stream.
+            // This list is exhaustive on purpose — a new EngineEvent variant
+            // must make an explicit projection decision here to compile.
+            EngineEvent::TaskStarted { .. }
+            | EngineEvent::TurnStarted { .. }
+            | EngineEvent::TurnFinished { .. }
+            | EngineEvent::TaskFinished { .. }
+            | EngineEvent::ApprovalRequested { .. }
+            | EngineEvent::ApprovalResolved { .. }
+            | EngineEvent::ClarificationRequested { .. }
+            | EngineEvent::ClarificationAnswered { .. }
+            | EngineEvent::AcceptanceEvidence { .. }
+            | EngineEvent::PhaseChanged { .. }
+            | EngineEvent::RequirementReady { .. }
+            | EngineEvent::ContextReady { .. }
+            | EngineEvent::PlanReady { .. }
+            | EngineEvent::NodeStarted { .. }
+            | EngineEvent::NodeFinished { .. }
+            | EngineEvent::RepairStarted { .. }
+            | EngineEvent::CandidateStarted { .. }
+            | EngineEvent::CandidateFinished { .. }
+            | EngineEvent::ReviewStarted { .. }
+            | EngineEvent::ReviewFinding { .. }
+            | EngineEvent::ReviewFailed { .. }
+            | EngineEvent::ReviewFinished { .. } => {}
         }
     }
 
@@ -475,17 +520,25 @@ impl EventBridge {
     }
 }
 
-fn map_agent_check_status(status: AgentVerificationStatus) -> CheckState {
+/// Wire status key (`passed | failed | skipped | tool_missing`) → UI state.
+fn map_check_status(status: &str) -> CheckState {
     match status {
-        AgentVerificationStatus::Passed => CheckState::Passed,
-        AgentVerificationStatus::Failed => CheckState::Failed,
-        AgentVerificationStatus::Skipped => CheckState::Skipped,
+        "passed" => CheckState::Passed,
+        "failed" => CheckState::Failed,
+        _ => CheckState::Skipped,
     }
 }
 
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
+
+    /// Legacy-vocabulary test helper: these tests predate the canonical
+    /// projection and speak AgentEvent; the total `From<AgentEvent> for
+    /// EngineEvent` conversion keeps them meaningful unchanged.
+    fn forward_agent(bridge: &mut EventBridge, event: leveler_agent::AgentEvent) {
+        bridge.forward(event.into());
+    }
 
     fn drain(rx: &mut broadcast::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
         let mut out = Vec::new();
@@ -512,7 +565,10 @@ mod bridge_tests {
         ] {
             let (tx, mut rx) = broadcast::channel(16);
             let mut bridge = EventBridge::new(tx);
-            bridge.forward(AgentEvent::AdvisoryStarted { kind });
+            forward_agent(
+                &mut bridge,
+                leveler_agent::AgentEvent::AdvisoryStarted { kind },
+            );
             let labels: Vec<String> = drain(&mut rx)
                 .into_iter()
                 .filter_map(|e| match e {
@@ -534,28 +590,31 @@ mod bridge_tests {
         let (tx, mut rx) = broadcast::channel(16);
         let mut bridge = EventBridge::new(tx);
 
-        bridge.forward(AgentEvent::PlanUpdated {
-            steps: vec![
-                leveler_agent::PlanStep {
-                    step: "locate the bug".into(),
-                    status: "completed".into(),
-                    id: None,
-                    origin: leveler_agent::PlanOrigin::ModelExplicit,
-                },
-                leveler_agent::PlanStep {
-                    step: "fix it".into(),
-                    status: "in_progress".into(),
-                    id: None,
-                    origin: leveler_agent::PlanOrigin::ModelExplicit,
-                },
-                leveler_agent::PlanStep {
-                    step: "run tests".into(),
-                    status: "pending".into(),
-                    id: None,
-                    origin: leveler_agent::PlanOrigin::ModelExplicit,
-                },
-            ],
-        });
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::PlanUpdated {
+                steps: vec![
+                    leveler_agent::PlanStep {
+                        step: "locate the bug".into(),
+                        status: "completed".into(),
+                        id: None,
+                        origin: leveler_agent::PlanOrigin::ModelExplicit,
+                    },
+                    leveler_agent::PlanStep {
+                        step: "fix it".into(),
+                        status: "in_progress".into(),
+                        id: None,
+                        origin: leveler_agent::PlanOrigin::ModelExplicit,
+                    },
+                    leveler_agent::PlanStep {
+                        step: "run tests".into(),
+                        status: "pending".into(),
+                        id: None,
+                        origin: leveler_agent::PlanOrigin::ModelExplicit,
+                    },
+                ],
+            },
+        );
 
         let events = drain(&mut rx);
         let plan = events
@@ -606,30 +665,42 @@ mod bridge_tests {
         // A FIFO pairing would swap the two previews; id pairing keeps them right.
         let (tx, mut rx) = broadcast::channel(64);
         let mut bridge = EventBridge::new(tx);
-        bridge.forward(AgentEvent::ToolCall {
-            id: "g".into(),
-            name: "grep".into(),
-            arguments: String::new(),
-            parallel: false,
-        });
-        bridge.forward(AgentEvent::ToolCall {
-            id: "p".into(),
-            name: "apply_patch".into(),
-            arguments: String::new(),
-            parallel: false,
-        });
-        bridge.forward(AgentEvent::ToolResult {
-            id: "p".into(),
-            name: "apply_patch".into(),
-            is_error: false,
-            preview: "AP".into(),
-        });
-        bridge.forward(AgentEvent::ToolResult {
-            id: "g".into(),
-            name: "grep".into(),
-            is_error: false,
-            preview: "GR".into(),
-        });
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "g".into(),
+                name: "grep".into(),
+                arguments: String::new(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "p".into(),
+                name: "apply_patch".into(),
+                arguments: String::new(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                id: "p".into(),
+                name: "apply_patch".into(),
+                is_error: false,
+                preview: "AP".into(),
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                id: "g".into(),
+                name: "grep".into(),
+                is_error: false,
+                preview: "GR".into(),
+            },
+        );
 
         let events = drain(&mut rx);
         // apply_patch's block must complete with apply_patch's preview, grep's with grep's.
@@ -651,8 +722,14 @@ mod bridge_tests {
         // AssistantText (e.g. whitespace-only output) must still be completed.
         let (tx, mut rx) = broadcast::channel(16);
         let mut bridge = EventBridge::new(tx);
-        bridge.forward(AgentEvent::AssistantDelta(" ".into()));
-        bridge.forward(AgentEvent::Finished(String::new()));
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta(" ".into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::Finished(String::new()),
+        );
         let events = drain(&mut rx);
         assert!(
             events
@@ -666,10 +743,16 @@ mod bridge_tests {
     fn retry_attempt_resets_the_open_transient_message() {
         let (tx, mut rx) = broadcast::channel(16);
         let mut bridge = EventBridge::new(tx);
-        bridge.forward(AgentEvent::StreamAttemptStarted);
-        bridge.forward(AgentEvent::AssistantDelta("wrong".into()));
-        bridge.forward(AgentEvent::StreamAttemptStarted);
-        bridge.forward(AgentEvent::AssistantDelta("right".into()));
+        forward_agent(&mut bridge, leveler_agent::AgentEvent::StreamAttemptStarted);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("wrong".into()),
+        );
+        forward_agent(&mut bridge, leveler_agent::AgentEvent::StreamAttemptStarted);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("right".into()),
+        );
         let events = drain(&mut rx);
 
         assert!(matches!(
@@ -698,12 +781,24 @@ mod bridge_tests {
                        UI 事件与 transcript 持久化,工作区测试全部通过。";
 
         // Streamed round one passes through untouched.
-        bridge.forward(AgentEvent::AssistantDelta(summary.into()));
-        bridge.forward(AgentEvent::AssistantText(summary.into()));
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta(summary.into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
         // Nudged round two repeats the same summary with a trivial suffix.
         let repeat = format!("{summary}(以上为最终结论)");
-        bridge.forward(AgentEvent::AssistantDelta(repeat.clone()));
-        bridge.forward(AgentEvent::AssistantText(repeat));
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta(repeat.clone()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(repeat),
+        );
 
         let events = drain(&mut rx);
         let completed = events
@@ -743,10 +838,13 @@ mod bridge_tests {
     fn different_second_answer_is_not_folded() {
         let (tx, mut rx) = broadcast::channel(64);
         let mut bridge = EventBridge::new(tx);
-        bridge.forward(AgentEvent::AssistantText(
-            "第一部分结论:closeout 决策点已统一,三个 nudge 机制合并为共享预算。".into(),
-        ));
-        bridge.forward(AgentEvent::AssistantText(
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(
+                "第一部分结论:closeout 决策点已统一,三个 nudge 机制合并为共享预算。".into(),
+            ),
+        );
+        forward_agent(&mut bridge, leveler_agent::AgentEvent::AssistantText(
             "补充遗漏的分支:event_bridge 的重复检测只作用于展示层,持久化与 resume 上下文都保持原样。"
                 .into(),
         ));
@@ -773,8 +871,14 @@ mod bridge_tests {
     fn short_repeats_are_not_folded() {
         let (tx, mut rx) = broadcast::channel(64);
         let mut bridge = EventBridge::new(tx);
-        bridge.forward(AgentEvent::AssistantText("好的,收到。".into()));
-        bridge.forward(AgentEvent::AssistantText("好的,收到。".into()));
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
+        );
         let events = drain(&mut rx);
         let completed = events
             .iter()
@@ -791,8 +895,14 @@ mod bridge_tests {
         let mut bridge = EventBridge::new(tx);
         let summary = "验证完成:所有工作区测试通过,改动范围与方案一致,没有引入新的配置开关,\
                        持久化层保持不变。";
-        bridge.forward(AgentEvent::AssistantText(summary.into()));
-        bridge.forward(AgentEvent::AssistantText(summary.into()));
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
         let events = drain(&mut rx);
         let started = events
             .iter()
@@ -819,14 +929,23 @@ mod bridge_tests {
         // concatenates them into one block ("…presets fileThe test expects…").
         let (tx, mut rx) = broadcast::channel(64);
         let mut bridge = EventBridge::new(tx);
-        bridge.forward(AgentEvent::AssistantDelta("round one text".into()));
-        bridge.forward(AgentEvent::ToolCall {
-            id: "c1".into(),
-            name: "read_file".into(),
-            arguments: String::new(),
-            parallel: false,
-        });
-        bridge.forward(AgentEvent::AssistantDelta("round two text".into()));
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("round one text".into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: String::new(),
+                parallel: false,
+            },
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantDelta("round two text".into()),
+        );
         let events = drain(&mut rx);
 
         let started: Vec<String> = events
@@ -861,12 +980,15 @@ mod bridge_tests {
         // must synthesize a Started so the block isn't dropped.
         let (tx, mut rx) = broadcast::channel(16);
         let mut bridge = EventBridge::new(tx);
-        bridge.forward(AgentEvent::ToolResult {
-            id: "x".into(),
-            name: "grep".into(),
-            is_error: true,
-            preview: "search budget reached".into(),
-        });
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolResult {
+                id: "x".into(),
+                name: "grep".into(),
+                is_error: true,
+                preview: "search budget reached".into(),
+            },
+        );
         let events = drain(&mut rx);
         let started = events
             .iter()
@@ -945,9 +1067,7 @@ mod projection_equivalence {
         let (tx, mut rx) = broadcast::channel(64);
         let mut bridge = EventBridge::new(tx);
         for event in events {
-            if let Some(agent_event) = crate::session::engine_event_to_agent(event) {
-                bridge.forward(agent_event);
-            }
+            bridge.forward(event);
         }
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -1108,7 +1228,7 @@ mod projection_equivalence {
             shapes[..3],
             [
                 "msg_start".to_string(),
-                format!("delta:这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。"),
+                "delta:这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。".to_string(),
                 "msg_done".to_string()
             ]
         );
@@ -1308,17 +1428,22 @@ mod projection_equivalence {
     }
 
     #[test]
-    fn context_expansion_is_dropped_by_the_current_path() {
-        // KNOWN dead code on the pre-hardening path: the shim discards
-        // ContextExpanded before the bridge's notification arm can run. The
-        // canonical projection is expected to CHANGE this expectation (the
-        // arm exists and the fact is user-relevant).
+    fn context_expansion_now_reaches_the_client() {
+        // DELIBERATE behavior change, the one exception in this table: the
+        // legacy shim dropped this durable fact before the bridge's
+        // notification arm could run (dead code confirmed in the audit). The
+        // canonical projection restores the intended notification. Production
+        // default keeps adaptive context disabled, so nothing fires today.
         let shapes = project(vec![EngineEvent::ContextExpanded {
             from: 256_000,
             to: 512_000,
             reason: "reread_pressure".into(),
             crossed_reliable: false,
         }]);
-        assert!(shapes.is_empty(), "{shapes:?}");
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert!(
+            shapes[0].starts_with("note[Info]") && shapes[0].contains("256000 → 512000"),
+            "{shapes:?}"
+        );
     }
 }

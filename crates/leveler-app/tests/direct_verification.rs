@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{AgentEvent, AgentVerificationStatus, AutoClarify};
+use leveler_agent::AutoClarify;
 use leveler_app::Application;
 use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_model::{ContentPart, ModelRef};
@@ -264,7 +264,7 @@ async fn direct_content_run_fails_when_post_edit_verification_fails() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            leveler_agent::AgentEvent::VerificationCheck { evidence: Some(evidence), .. }
+            leveler_engine::EngineEvent::VerificationCheck { evidence: Some(evidence), .. }
                 if evidence.contains("CONTENT_VERIFY_SENTINEL")
         )),
         "full evidence belongs in the structured verification event: {events:?}"
@@ -443,23 +443,24 @@ async fn direct_content_run_emits_verification_events() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::VerificationStarted))
+            .any(|event| matches!(event, leveler_engine::EngineEvent::VerificationStarted))
     );
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            AgentEvent::VerificationCheck {
+            leveler_engine::EngineEvent::VerificationCheck {
                 name,
-                status: AgentVerificationStatus::Passed,
+                status,
                 ..
-            } if name == "test"
+            } if name == "test" && status == "passed"
         )
     }));
-    assert!(
-        events
-            .iter()
-            .any(|event| { matches!(event, AgentEvent::VerificationFinished { passed: true }) })
-    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            leveler_engine::EngineEvent::VerificationFinished { passed: true }
+        )
+    }));
 }
 
 #[tokio::test]
