@@ -78,7 +78,7 @@ impl Tool for ShellCommandTool {
         if let Some(reason) = refuse_shell_script(cmd) {
             return Ok(ToolOutput::error(reason));
         }
-        let (program, args) = shell_invocation(cmd);
+        let (program, args) = leveler_execution::shell_invocation(cmd);
         execute_program(
             &program,
             args,
@@ -91,17 +91,6 @@ impl Tool for ShellCommandTool {
     }
 }
 
-fn shell_invocation(cmd: &str) -> (String, Vec<String>) {
-    #[cfg(windows)]
-    {
-        ("cmd".into(), vec!["/C".into(), cmd.to_string()])
-    }
-    #[cfg(not(windows))]
-    {
-        ("sh".into(), vec!["-c".into(), cmd.to_string()])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::shell_guard::HANG_ANTI_PATTERN;
@@ -110,7 +99,7 @@ mod tests {
 
     #[test]
     fn shell_invocation_uses_platform_shell() {
-        let (program, args) = shell_invocation("echo hi");
+        let (program, args) = leveler_execution::shell_invocation("echo hi");
         #[cfg(windows)]
         {
             assert_eq!(program, "cmd");

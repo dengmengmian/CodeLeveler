@@ -9,7 +9,7 @@
 /// Models often invent `python app.py & sleep 2 # curl …` which either hangs
 /// the turn (foreground wait on a process group) or silently comments out the
 /// health check. Surface a recoverable error so the agent retries correctly.
-pub(crate) fn refuse_shell_script(cmd: &str) -> Option<String> {
+pub fn refuse_shell_script(cmd: &str) -> Option<String> {
     let cmd = cmd.trim();
     if cmd.is_empty() {
         return None;

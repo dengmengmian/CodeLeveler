@@ -162,6 +162,9 @@ pub struct InProcessRuntimeClient {
     session_events: Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>,
     pending: PendingApprovals,
     pending_clarify: PendingClarifications,
+    /// User shell executions (`!command`): active + bounded history.
+    /// Arc so detached shell workers update it directly.
+    user_shells: Arc<crate::user_shell::UserShellStore>,
     /// Conversation checkpoints, isolated by owning session (spec §68).
     /// Arc so the async compact worker can drop them after a successful rewrite.
     checkpoints: Arc<crate::checkpoints::CheckpointStore>,
@@ -245,6 +248,7 @@ impl InProcessRuntimeClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
             steering: Arc::new(Mutex::new(HashMap::new())),
+            user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
             checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
             live_views: Arc::new(crate::live_view::LiveViews::default()),
             active: Arc::new(ActiveTurns::default()),
@@ -442,6 +446,163 @@ impl InProcessRuntimeClient {
         let _ = self
             .events_for(session_id)
             .send(RuntimeEvent::CheckpointCreated { checkpoint });
+    }
+
+    /// Run one explicit user shell command (`!command`). USER-ORIGINATED
+    /// DIRECT EXECUTION: no model, no agent loop, no tool registry. The
+    /// ActiveTurns slot enforces the Idle/AgentTurn/UserShell foreground
+    /// mutex; host safety (confinement, sandbox, env scrub, tree kill) rides
+    /// the same substrate as agent shell execution.
+    async fn handle_run_user_shell(
+        &self,
+        session_id: SessionId,
+        command: String,
+    ) -> Result<(), ClientError> {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            self.notify_error(&session_id, "在 ! 后输入要执行的命令".to_string());
+            return Ok(());
+        }
+        // The hang guard protects the user too (backgrounding via `&`,
+        // credential-file reads, comment-swallowed commands) — same rules as
+        // the agent's shell tool, stated to the user instead of the model.
+        if let Some(reason) = leveler_tools::tools::refuse_shell_script(trimmed) {
+            self.notify_error(&session_id, format!("命令被拒绝: {reason}"));
+            return Ok(());
+        }
+        let config = self.runtime_config(&session_id).await?;
+        let cancel = match self.active.admit(&session_id) {
+            Ok(token) => token,
+            Err(crate::active_turns::TurnAdmissionError::Busy(_)) => {
+                self.notify_error(
+                    &session_id,
+                    "Agent 正在运行,请等待当前任务结束或先取消".to_string(),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                self.notify_error(&session_id, error.to_string());
+                return Ok(());
+            }
+        };
+        let (runner, request, cwd) =
+            match self
+                .app
+                .user_shell_execution(config.mode, config.sandbox, trimmed)
+            {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.active.finish(&session_id);
+                    self.notify_error(&session_id, format!("无法构造执行环境: {error}"));
+                    return Ok(());
+                }
+            };
+        let id = leveler_core::UserShellId::new(format!("ush-{}", leveler_core::new_uuid_string()));
+        let cwd_display = cwd.display().to_string();
+        self.user_shells.begin(
+            &session_id,
+            id.clone(),
+            trimmed.to_string(),
+            cwd_display.clone(),
+            cancel.clone(),
+        );
+
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let store = self.user_shells.clone();
+        let active = self.active.clone();
+        let command_text = trimmed.to_string();
+        // spawn_blocking + block_on (the turn-spawn pattern): the worker's
+        // future borrows a `&mut dyn FnMut` observer across awaits, so it is
+        // !Send by construction; the blocking-thread bridge sidesteps that
+        // without loosening the EventLog observer contract.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                // Canonical facts go through the session EventLog with no turn
+                // attribution (persist-before-forward; transient output chunks
+                // skip the store automatically) and are projected by the SAME
+                // exhaustive EventBridge every other client fact uses.
+                let mut bridge = crate::event_bridge::EventBridge::new(events.clone());
+                let db = match app.open_database().await {
+                    Ok(db) => db,
+                    Err(error) => {
+                        store.finish(&session_id, &id, None, "failed");
+                        active.finish(&session_id);
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: NotificationLevel::Error,
+                            message: format!("无法打开会话数据库: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let log = leveler_engine::EventLog::new(&db, session_id.clone());
+                let mut forward = |event: leveler_engine::EngineEvent| bridge.forward(event);
+                let _ = log
+                    .append(
+                        None,
+                        crate::user_shell::started_event(&id, &command_text, &cwd_display),
+                        &mut forward,
+                    )
+                    .await;
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let run = tokio::spawn({
+                    let cancel = cancel.clone();
+                    async move { runner.run_streaming(request, cancel, tx).await }
+                });
+                while let Some(chunk) = rx.recv().await {
+                    store.append_output(&session_id, &id, &chunk.text);
+                    let _ = log
+                        .append(
+                            None,
+                            leveler_engine::EngineEvent::UserShellOutput {
+                                execution_id: id.clone(),
+                                stream: crate::user_shell::stream_tag(chunk.stream).to_string(),
+                                chunk: chunk.text,
+                            },
+                            &mut forward,
+                        )
+                        .await;
+                }
+                let result = match run.await {
+                    Ok(result) => result,
+                    Err(join_error) => Err(leveler_execution::ProcessError::Io {
+                        program: "user-shell".into(),
+                        source: std::io::Error::other(join_error.to_string()),
+                    }),
+                };
+                let status = crate::user_shell::terminal_status(&result);
+                let exit_code = match &result {
+                    Ok(output) => output.exit_code,
+                    Err(_) => None,
+                };
+                if let Err(error) = &result
+                    && !matches!(error, leveler_execution::ProcessError::Cancelled)
+                {
+                    // Spawn/sandbox failures never produced output — put the host
+                    // error where the user will look for it.
+                    store.append_output(&session_id, &id, &format!("{error}\n"));
+                }
+                let duration_ms = store
+                    .finish(&session_id, &id, exit_code, status)
+                    .unwrap_or(0);
+                let _ = log
+                    .append(
+                        None,
+                        leveler_engine::EngineEvent::UserShellFinished {
+                            execution_id: id.clone(),
+                            exit_code,
+                            duration_ms,
+                            status: status.to_string(),
+                        },
+                        &mut forward,
+                    )
+                    .await;
+                active.finish(&session_id);
+            });
+        });
+        Ok(())
     }
 
     /// The shared turn-launch preamble: admit the session (one active main
@@ -1671,11 +1832,20 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
-            ClientCommand::RunUserShell { session_id, .. }
-            | ClientCommand::CancelUserShell { session_id, .. } => {
-                // The user-shell execution slice implements these; until it
-                // lands the runtime states the truth instead of pretending.
-                self.notify_error(&session_id, "user shell execution 尚未启用".to_string());
+            ClientCommand::RunUserShell {
+                session_id,
+                command,
+            } => self.handle_run_user_shell(session_id, command).await,
+            ClientCommand::CancelUserShell {
+                session_id,
+                execution_id,
+            } => {
+                match self.user_shells.cancel_token(&session_id, &execution_id) {
+                    Some(token) => token.cancel(),
+                    None => {
+                        self.notify_error(&session_id, "该命令已结束或不存在,无需停止".to_string())
+                    }
+                }
                 Ok(())
             }
             ClientCommand::Quit => {
@@ -1945,8 +2115,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             verification: live.verification,
             diff: live.diff,
             checkpoints,
-            // Filled by the user-shell execution slice (active + history).
-            user_shells: Vec::new(),
+            user_shells: self.user_shells.snapshot(session_id),
             completion_report: live.completion_report,
         })
     }

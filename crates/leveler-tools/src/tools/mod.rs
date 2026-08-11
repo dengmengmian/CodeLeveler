@@ -21,6 +21,7 @@ mod replace;
 mod run_command;
 mod shell_command;
 mod shell_guard;
+pub use shell_guard::refuse_shell_script;
 mod skills;
 mod symbols;
 mod task_control;

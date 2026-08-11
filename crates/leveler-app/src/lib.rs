@@ -18,6 +18,7 @@ mod parallel;
 mod prompt_bridge;
 mod runtime_identity;
 mod session;
+mod user_shell;
 mod vcs;
 mod workspace_view;
 
@@ -623,6 +624,48 @@ fn top_level_limits_from_config(
 
 /// The env var names holding credentials for the configured providers (plus
 /// the built-in search key). Scrubbed from every `run_command` child.
+impl Application {
+    /// The runner + request for one user shell execution (`!command`),
+    /// mapped from the SAME policy inputs as agent shell execution: the
+    /// session's permission profile decides write confinement, `sandbox`
+    /// decides network denial, provider secrets are scrubbed, and cwd is the
+    /// repository root. No default timeout — the user cancels explicitly;
+    /// a 7-day backstop guards a forgotten process.
+    pub(crate) fn user_shell_execution(
+        &self,
+        mode: leveler_execution::PermissionProfile,
+        sandbox: bool,
+        command: &str,
+    ) -> Result<
+        (
+            leveler_execution::CommandRunner,
+            leveler_execution::ProcessRequest,
+            std::path::PathBuf,
+        ),
+        AppError,
+    > {
+        let cwd = self.layout.repo_root.clone();
+        let (program, args) = leveler_execution::shell_invocation(command);
+        let mut request = leveler_execution::ProcessRequest::new(program, args, cwd.clone());
+        request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
+        request.deny_network = sandbox;
+        request.deny_env = provider_secret_env_names(&self.config.providers);
+        if mode.confines_workspace() {
+            let extra = self.readonly_roots.clone();
+            request.write_root = Some(cwd.clone());
+            request.extra_read_roots = extra.clone();
+            request.filesystem_intent = Some(leveler_execution::FilesystemIntent::WorkspaceWrite {
+                write_root: cwd.clone(),
+                extra_read_roots: extra,
+            });
+        } else {
+            request.filesystem_intent = Some(leveler_execution::FilesystemIntent::Unrestricted);
+        }
+        let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
+        Ok((runner, request, cwd))
+    }
+}
+
 pub(crate) fn provider_secret_env_names(providers: &[ProviderConfig]) -> Vec<String> {
     let mut names: Vec<String> = providers
         .iter()

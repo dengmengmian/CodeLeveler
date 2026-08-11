@@ -180,16 +180,11 @@ pub(crate) fn extract_command(call: &ToolCall) -> (Option<String>, Vec<String>) 
     }
 }
 
-/// Platform shell wrapper used for classification (mirrors `shell_command` tool).
+/// Platform shell wrapper used for classification — the SAME single copy the
+/// tool executes with, so the classified shape can never drift from the
+/// executed shape.
 fn shell_invocation_for_classification(cmd: &str) -> (String, Vec<String>) {
-    #[cfg(windows)]
-    {
-        ("cmd".into(), vec!["/C".into(), cmd.to_string()])
-    }
-    #[cfg(not(windows))]
-    {
-        ("sh".into(), vec!["-c".into(), cmd.to_string()])
-    }
+    leveler_execution::shell_invocation(cmd)
 }
 
 pub(crate) fn drop_duplicate_program_arg(program: &str, args: &mut Vec<String>) {

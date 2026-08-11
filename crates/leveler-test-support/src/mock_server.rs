@@ -103,6 +103,7 @@ impl MockResponse {
 pub struct MockServer {
     addr: SocketAddr,
     request_count: Arc<AtomicUsize>,
+    request_bodies: Arc<Mutex<Vec<String>>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -120,8 +121,10 @@ impl MockServer {
         let addr = listener.local_addr().expect("local_addr");
         let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
         let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(Mutex::new(Vec::new()));
 
         let count = request_count.clone();
+        let bodies = request_bodies.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -129,6 +132,7 @@ impl MockServer {
                 };
                 let queue = queue.clone();
                 let count = count.clone();
+                let bodies = bodies.clone();
                 tokio::spawn(async move {
                     let response = {
                         let mut q = queue.lock().await;
@@ -140,7 +144,7 @@ impl MockServer {
                     };
                     count.fetch_add(1, Ordering::SeqCst);
                     if let Some(resp) = response {
-                        let _ = serve(stream, resp).await;
+                        let _ = serve(stream, resp, &bodies).await;
                     }
                 });
             }
@@ -149,6 +153,7 @@ impl MockServer {
         Self {
             addr,
             request_count,
+            request_bodies,
             handle,
         }
     }
@@ -164,14 +169,27 @@ impl MockServer {
     }
 
     /// How many requests have been received so far.
+    /// Raw request bodies received so far, in arrival order. Lets a test
+    /// assert what the "model" was actually sent (e.g. context-isolation
+    /// hard gates).
+    pub async fn request_bodies(&self) -> Vec<String> {
+        self.request_bodies.lock().await.clone()
+    }
+
     pub fn request_count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
     }
 }
 
 /// Read (and discard) the request, then write the scripted response.
-async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result<()> {
-    drain_request(&mut stream).await;
+async fn serve(
+    mut stream: TcpStream,
+    response: MockResponse,
+    bodies: &Mutex<Vec<String>>,
+) -> std::io::Result<()> {
+    if let Some(body) = drain_request(&mut stream).await {
+        bodies.lock().await.push(body);
+    }
 
     match response {
         MockResponse::Sse { body } => {
@@ -241,7 +259,7 @@ async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result
 /// body". Small requests fit in the first TCP segments and happened to pass,
 /// making the bug size-dependent and flaky. Reading the declared body length
 /// first lets the client finish writing before we close.
-async fn drain_request(stream: &mut TcpStream) {
+async fn drain_request(stream: &mut TcpStream) -> Option<String> {
     let mut buf = [0u8; 4096];
     let mut seen = Vec::new();
     let mut header_end = None;
@@ -249,7 +267,7 @@ async fn drain_request(stream: &mut TcpStream) {
     while header_end.is_none() {
         let read = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
         match read {
-            Ok(Ok(0)) => return,
+            Ok(Ok(0)) => return None,
             Ok(Ok(n)) => {
                 seen.extend_from_slice(&buf[..n]);
                 header_end = seen
@@ -257,7 +275,7 @@ async fn drain_request(stream: &mut TcpStream) {
                     .position(|w| w == b"\r\n\r\n")
                     .map(|p| p + 4);
             }
-            _ => return,
+            _ => return None,
         }
     }
     // 2. Read the rest of the body declared by Content-Length, if any.
@@ -268,10 +286,14 @@ async fn drain_request(stream: &mut TcpStream) {
         let read = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
         match read {
             Ok(Ok(0)) => break,
-            Ok(Ok(n)) => body_read += n,
+            Ok(Ok(n)) => {
+                seen.extend_from_slice(&buf[..n]);
+                body_read += n;
+            }
             _ => break,
         }
     }
+    Some(String::from_utf8_lossy(&seen[header_end..]).into_owned())
 }
 
 /// Parse a `Content-Length` header value (case-insensitive) from raw header

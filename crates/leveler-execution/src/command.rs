@@ -692,6 +692,37 @@ pub enum ProcessError {
     ProcessTreeSetup(String),
 }
 
+/// Which pipe a live output chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// One live output chunk from a streaming run. Chunks are emitted in the
+/// order the runtime read them per pipe; cross-pipe interleaving is
+/// best-effort (never claimed byte-perfect).
+#[derive(Debug, Clone)]
+pub struct OutputChunk {
+    pub stream: OutputStream,
+    pub text: String,
+}
+
+/// The platform shell wrapper for a raw command string: `sh -c` on Unix,
+/// `cmd /C` on Windows. THE single copy — the agent `shell_command` tool,
+/// approval classification, and user shell execution all consume this so the
+/// executed shape and the classified shape can never drift.
+pub fn shell_invocation(cmd: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        ("cmd".into(), vec!["/C".into(), cmd.to_string()])
+    }
+    #[cfg(not(windows))]
+    {
+        ("sh".into(), vec!["-c".into(), cmd.to_string()])
+    }
+}
+
 /// Runs external commands.
 #[derive(Debug, Clone)]
 pub struct CommandRunner {
@@ -722,6 +753,29 @@ impl CommandRunner {
         &self,
         request: ProcessRequest,
         cancellation: CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_observed(request, cancellation, None).await
+    }
+
+    /// Like [`Self::run`], but each output chunk is ALSO sent on `chunks` as
+    /// it is read (user shell live view). Same request policy, same sandbox,
+    /// same process-tree termination — one execution substrate, two read
+    /// modes. The retained `ProcessOutput` stays capped exactly like `run`;
+    /// the stream is not (consumers keep their own bounded buffers).
+    pub async fn run_streaming(
+        &self,
+        request: ProcessRequest,
+        cancellation: CancellationToken,
+        chunks: tokio::sync::mpsc::UnboundedSender<OutputChunk>,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_observed(request, cancellation, Some(chunks)).await
+    }
+
+    async fn run_observed(
+        &self,
+        request: ProcessRequest,
+        cancellation: CancellationToken,
+        chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
     ) -> Result<ProcessOutput, ProcessError> {
         // WS0/WS2: host-trusted intent (or legacy write_root mapping). On
         // Windows, restricted intents fail closed when FS backends are missing.
@@ -783,6 +837,7 @@ impl CommandRunner {
                 &args,
                 cancellation,
                 self.environment.clone(),
+                chunks,
             )
             .await;
         }
@@ -796,6 +851,7 @@ impl CommandRunner {
                 &args,
                 cancellation,
                 &self.environment,
+                chunks,
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 sandbox_paths.as_ref(),
             )
@@ -865,6 +921,7 @@ async fn run_unix_process_group(
     args: &[String],
     cancellation: CancellationToken,
     environment: &leveler_core::EnvSnapshot,
+    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
     #[cfg(any(target_os = "macos", target_os = "linux"))] sandbox_paths: Option<&SandboxPaths>,
 ) -> Result<ProcessOutput, ProcessError> {
     let mut cmd = Command::new(program);
@@ -892,11 +949,13 @@ async fn run_unix_process_group(
     let drain = CancellationToken::new();
     let stdout_task = {
         let drain = drain.clone();
-        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain).await })
+        let tx = chunks.clone().map(|tx| (OutputStream::Stdout, tx));
+        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, tx).await })
     };
     let stderr_task = {
         let drain = drain.clone();
-        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain).await })
+        let tx = chunks.map(|tx| (OutputStream::Stderr, tx));
+        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx).await })
     };
 
     let child_pid = child.id();
@@ -996,11 +1055,11 @@ async fn run_with_windows_job(
     let drain = CancellationToken::new();
     let stdout_task = {
         let drain = drain.clone();
-        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain).await })
+        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, None).await })
     };
     let stderr_task = {
         let drain = drain.clone();
-        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain).await })
+        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, None).await })
     };
 
     // Bound post-kill wait so a stuck job cannot trap the agent turn (same
@@ -1191,6 +1250,10 @@ async fn read_capped(
     pipe: &mut Option<impl AsyncReadExt + Unpin>,
     cap: usize,
     drain: CancellationToken,
+    chunks: Option<(
+        OutputStream,
+        tokio::sync::mpsc::UnboundedSender<OutputChunk>,
+    )>,
 ) -> (String, u64) {
     let Some(p) = pipe else {
         return (String::new(), 0);
@@ -1213,6 +1276,15 @@ async fn read_capped(
         match read {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if let Some((stream, tx)) = &chunks {
+                    // Live observer: forward the raw chunk before the
+                    // retained-buffer capping below. A closed receiver just
+                    // means nobody is watching anymore.
+                    let _ = tx.send(OutputChunk {
+                        stream: *stream,
+                        text: String::from_utf8_lossy(&buf[..n]).into_owned(),
+                    });
+                }
                 for &byte in &buf[..n] {
                     if head.len() < head_cap {
                         head.push(byte);
@@ -1397,7 +1469,7 @@ mod tests {
         });
         let drain = CancellationToken::new();
         drain.cancel();
-        let _ = read_capped(&mut pipe, 1024, drain).await;
+        let _ = read_capped(&mut pipe, 1024, drain, None).await;
 
         assert_eq!(
             reads.load(Ordering::Relaxed),
@@ -3531,5 +3603,86 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("process-tree") || msg.contains("Job"), "{msg}");
         assert!(matches!(err, ProcessError::ProcessTreeSetup(_)));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod streaming_tests {
+    use super::*;
+
+    /// The streaming contract: chunks arrive WHILE the child runs, not after
+    /// it exits, and stderr is tagged separately from stdout.
+    #[tokio::test]
+    async fn run_streaming_delivers_output_before_exit() {
+        let runner = CommandRunner::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "echo line1; echo err1 1>&2; sleep 2; echo line2".into(),
+            ],
+            std::env::temp_dir(),
+        );
+        let handle = tokio::spawn({
+            async move {
+                runner
+                    .run_streaming(request, CancellationToken::new(), tx)
+                    .await
+            }
+        });
+        // line1 must arrive well before the child's 2s sleep finishes.
+        let first = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .expect("a chunk arrived while the child was still running")
+            .expect("channel open");
+        assert_eq!(first.stream, OutputStream::Stdout);
+        assert!(first.text.contains("line1"), "{first:?}");
+        // stderr is tagged as stderr.
+        let mut saw_err = false;
+        let mut saw_line2 = false;
+        while let Some(chunk) = rx.recv().await {
+            if chunk.stream == OutputStream::Stderr && chunk.text.contains("err1") {
+                saw_err = true;
+            }
+            if chunk.text.contains("line2") {
+                saw_line2 = true;
+            }
+        }
+        assert!(saw_err, "stderr chunk tagged and delivered");
+        assert!(saw_line2, "output after the sleep still arrives");
+        let output = handle.await.unwrap().expect("run completed");
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.contains("line1") && output.stdout.contains("line2"));
+    }
+
+    /// Cancellation during streaming kills the tree and returns Cancelled.
+    #[tokio::test]
+    async fn run_streaming_cancel_terminates() {
+        let runner = CommandRunner::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "echo started; sleep 30".into()],
+            std::env::temp_dir(),
+        );
+        let handle = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { runner.run_streaming(request, cancel, tx).await })
+        };
+        let first = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .expect("started chunk")
+            .expect("open");
+        assert!(first.text.contains("started"));
+        let begun = std::time::Instant::now();
+        cancel.cancel();
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(ProcessError::Cancelled)), "{result:?}");
+        assert!(
+            begun.elapsed() < Duration::from_secs(4),
+            "cancel returned within the kill bound"
+        );
     }
 }
