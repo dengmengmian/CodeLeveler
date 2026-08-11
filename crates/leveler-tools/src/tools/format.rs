@@ -36,23 +36,31 @@ pub(crate) async fn format_after_edit(
     resolved: &Path,
     cancellation: &CancellationToken,
 ) {
-    if !context.auto_format {
+    if !context.policy.auto_format {
         return;
     }
     let Some((program, args)) = format_command(resolved) else {
         return;
     };
-    let mut req = ProcessRequest::new(program, args, context.workspace.root().to_path_buf());
+    let mut req = ProcessRequest::new(
+        program,
+        args,
+        context.execution.workspace.root().to_path_buf(),
+    );
     req.deny_network = true;
     req.timeout = Duration::from_secs(30);
-    if context.mode == PermissionProfile::Assisted {
-        req.write_root = Some(context.workspace.root().to_path_buf());
+    if context.policy.mode == PermissionProfile::Assisted {
+        req.write_root = Some(context.execution.workspace.root().to_path_buf());
     }
     // Best-effort: never let a formatter error or absence fail the edit. Honor
     // the turn's cancellation so a canceled turn doesn't wait out the formatter.
-    let _ = context.runner.run(req, cancellation.child_token()).await;
+    let _ = context
+        .execution
+        .runner
+        .run(req, cancellation.child_token())
+        .await;
     if let Ok(bytes) = tokio::fs::read(resolved).await {
-        context.file_state.record(rel_path, &bytes);
+        context.execution.file_state.record(rel_path, &bytes);
     }
 }
 

@@ -75,7 +75,7 @@ impl Executor {
         // Nothing to request under 完全访问 — the elevation it asks for is
         // already granted, so advertising it only invites a pointless round
         // trip and an interruption the user explicitly opted out of.
-        if self.tool_context.mode != leveler_execution::PermissionProfile::FullAccess {
+        if self.tool_context.policy.mode != leveler_execution::PermissionProfile::FullAccess {
             tools.push(request_permissions_tool_definition());
         }
         // A sub-agent shouldn't spawn its own sub-agents; product kill-switch
@@ -457,7 +457,7 @@ impl Executor {
             // first message would invalidate the provider's prefix cache for the
             // entire transcript on every round.
             let fresh = load_scoped_rules(
-                self.tool_context.workspace.root(),
+                self.tool_context.execution.workspace.root(),
                 &scoped_paths,
                 &injected_rule_sources,
             );
@@ -1198,7 +1198,7 @@ impl Executor {
                     let mut target_paths = scoped_paths.clone();
                     collect_scoped_paths_from_call(&call, &mut target_paths);
                     let fresh = load_scoped_rules(
-                        self.tool_context.workspace.root(),
+                        self.tool_context.execution.workspace.root(),
                         &target_paths,
                         &injected_rule_sources,
                     );
@@ -1746,7 +1746,10 @@ impl Executor {
                     let named = agent_name.map(|name| {
                         (
                             name,
-                            crate::named_agent::load(self.tool_context.workspace.root(), name),
+                            crate::named_agent::load(
+                                self.tool_context.execution.workspace.root(),
+                                name,
+                            ),
                         )
                     });
                     let explicit_role = call.arguments.get("role").and_then(|v| v.as_str());
@@ -1791,12 +1794,13 @@ impl Executor {
                     let reject = if let Some((requested, None)) = &named {
                         // Never fall back to a personaless spawn: the run would
                         // look successful while doing something else entirely.
-                        let known =
-                            crate::named_agent::discover(self.tool_context.workspace.root())
-                                .into_iter()
-                                .map(|a| a.name)
-                                .collect::<Vec<_>>()
-                                .join(", ");
+                        let known = crate::named_agent::discover(
+                            self.tool_context.execution.workspace.root(),
+                        )
+                        .into_iter()
+                        .map(|a| a.name)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                         Some(format!(
                             "Unknown agent `{requested}`. Available: {known}. Omit `agent` to \
                              spawn with an inline task instead."
@@ -1949,7 +1953,7 @@ impl Executor {
                                     // the central cap here.
                                     content: leveler_tools::registry::cap_output_with(
                                         &content,
-                                        self.tool_context.tool_output_budget,
+                                        self.tool_context.policy.tool_output_budget,
                                     ),
                                     is_error: !result.ok,
                                 },
@@ -2249,7 +2253,7 @@ impl Executor {
             // evidence is WHY the budget may grow. An eligible expansion keeps
             // the request prefix (cache-preserving); folding rewrites it — so
             // expand-before-compact whenever the evidence supports it.
-            let guard_trips = self.tool_context.read_guard.total_trips();
+            let guard_trips = self.tool_context.execution.read_guard.total_trips();
             let context_action = if has_next_round {
                 crate::context_budget::decide_context_action(
                     self.policy.adaptive_context,

@@ -208,7 +208,7 @@ impl Executor {
         // elevate after approval (the user already OK'd this call).
         let mut ctx = ctx;
         if call_needs_host_escape(&call) {
-            ctx.turn_unrestricted_fs = true;
+            ctx.policy.grant_unrestricted_fs();
         }
         Ok(AdmittedCall { call, ctx })
     }
@@ -281,9 +281,12 @@ impl Executor {
             leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
         }
 
-        let requirement =
-            self.approval_policy
-                .evaluate(self.tool_context.mode, &call.name, risk, command_view);
+        let requirement = self.approval_policy.evaluate(
+            self.tool_context.policy.mode,
+            &call.name,
+            risk,
+            command_view,
+        );
 
         match requirement {
             Requirement::Auto => Ok(()),
@@ -400,7 +403,7 @@ impl Executor {
         if call.name != "remember" {
             return format!("{UNATTENDED}; re-run with --permission full-access to allow it");
         }
-        let Some(root) = self.tool_context.memory_root.as_ref() else {
+        let Some(root) = self.tool_context.services.memory_root.as_ref() else {
             return format!("{UNATTENDED}; memory is not configured, so it could not be parked");
         };
         let title = call.arguments.get("title").and_then(|v| v.as_str());

@@ -68,7 +68,7 @@ impl Tool for ReplaceTool {
         if input.old.is_empty() {
             return Ok(ToolOutput::error("`old` must not be empty"));
         }
-        let resolved = match context.workspace.resolve(&input.path) {
+        let resolved = match context.execution.workspace.resolve(&input.path) {
             Ok(p) => p,
             Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
@@ -87,6 +87,7 @@ impl Tool for ReplaceTool {
         // The `old` text was chosen against contents the model read. If the file
         // moved on since, refuse and make the model re-read (mirrors apply_patch).
         if context
+            .execution
             .file_state
             .is_stale(&input.path, existing.as_bytes())
         {
@@ -167,6 +168,7 @@ impl Tool for ReplaceTool {
 
         // Re-fingerprint so our own edit isn't seen as an outside change next time.
         context
+            .execution
             .file_state
             .record(&input.path, new_content.as_bytes());
         // Auto-format the edited file (best-effort; re-fingerprints internally).
@@ -299,7 +301,8 @@ pub(crate) async fn commit_replace(
     expected: &str,
     replacement: &str,
 ) -> Result<Commit, ToolError> {
-    let lock_path = leveler_project::layout::target_lock_path(&context.environment, resolved);
+    let lock_path =
+        leveler_project::layout::target_lock_path(&context.execution.environment, resolved);
     let lock = tokio::task::spawn_blocking({
         let lock_path = lock_path.clone();
         move || TargetLock::acquire(lock_path)
@@ -308,7 +311,7 @@ pub(crate) async fn commit_replace(
     .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
     .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-    if let Err(e) = context.workspace.revalidate_write_path(resolved) {
+    if let Err(e) = context.execution.workspace.revalidate_write_path(resolved) {
         drop(lock);
         return Ok(Commit::Rejected(e.to_string()));
     }
@@ -317,8 +320,8 @@ pub(crate) async fn commit_replace(
     let committed_permissions: Option<std::fs::Permissions>;
     #[cfg(unix)]
     {
-        let root = context.workspace.root().to_path_buf();
-        let root_fd = context.workspace.root_fd();
+        let root = context.execution.workspace.root().to_path_buf();
+        let root_fd = context.execution.workspace.root_fd();
         let relative = resolved
             .strip_prefix(&root)
             .map_err(|_| {
@@ -339,8 +342,8 @@ pub(crate) async fn commit_replace(
     }
     #[cfg(windows)]
     {
-        let root = context.workspace.root().to_path_buf();
-        let root_dir = context.workspace.root_dir();
+        let root = context.execution.workspace.root().to_path_buf();
+        let root_dir = context.execution.workspace.root_dir();
         let relative = resolved
             .strip_prefix(&root)
             .map_err(|_| ToolError::Io("target left workspace".into()))?
@@ -411,9 +414,11 @@ pub(crate) async fn commit_replace(
     drop(lock);
     match committed_permissions {
         Some(permissions) => {
-            context
-                .checkpoint
-                .record_captured(resolved, expected.as_bytes().to_vec(), permissions);
+            context.execution.checkpoint.record_captured(
+                resolved,
+                expected.as_bytes().to_vec(),
+                permissions,
+            );
             Ok(Commit::Written)
         }
         None => Ok(Commit::Stale),
@@ -443,7 +448,8 @@ pub(crate) async fn commit_create_with_permissions(
             .await
             .map_err(|e| ToolError::Io(format!("mkdir {}: {e}", parent.display())))?;
     }
-    let lock_path = leveler_project::layout::target_lock_path(&context.environment, resolved);
+    let lock_path =
+        leveler_project::layout::target_lock_path(&context.execution.environment, resolved);
     let lock = tokio::task::spawn_blocking({
         let lock_path = lock_path.clone();
         move || TargetLock::acquire(lock_path)
@@ -452,14 +458,14 @@ pub(crate) async fn commit_create_with_permissions(
     .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
     .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-    if let Err(e) = context.workspace.revalidate_write_path(resolved) {
+    if let Err(e) = context.execution.workspace.revalidate_write_path(resolved) {
         drop(lock);
         return Ok(Commit::Rejected(e.to_string()));
     }
     #[cfg(unix)]
     let result: Result<bool, ToolError> = {
-        let root = context.workspace.root().to_path_buf();
-        let root_fd = context.workspace.root_fd();
+        let root = context.execution.workspace.root().to_path_buf();
+        let root_fd = context.execution.workspace.root_fd();
         let relative = resolved
             .strip_prefix(&root)
             .map_err(|_| {
@@ -521,7 +527,7 @@ pub(crate) async fn commit_create_with_permissions(
     };
     let outcome = match result {
         Ok(true) => {
-            context.checkpoint.record_absent(resolved);
+            context.execution.checkpoint.record_absent(resolved);
             Ok(Commit::Written)
         }
         Ok(false) => Ok(Commit::Stale),
@@ -537,7 +543,8 @@ pub(crate) async fn commit_remove(
     resolved: &std::path::Path,
     expected: &str,
 ) -> Result<Commit, ToolError> {
-    let lock_path = leveler_project::layout::target_lock_path(&context.environment, resolved);
+    let lock_path =
+        leveler_project::layout::target_lock_path(&context.execution.environment, resolved);
     let lock = tokio::task::spawn_blocking({
         let lock_path = lock_path.clone();
         move || TargetLock::acquire(lock_path)
@@ -546,14 +553,14 @@ pub(crate) async fn commit_remove(
     .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
     .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-    if let Err(e) = context.workspace.revalidate_write_path(resolved) {
+    if let Err(e) = context.execution.workspace.revalidate_write_path(resolved) {
         drop(lock);
         return Ok(Commit::Rejected(e.to_string()));
     }
     #[cfg(unix)]
     {
-        let root = context.workspace.root().to_path_buf();
-        let root_fd = context.workspace.root_fd();
+        let root = context.execution.workspace.root().to_path_buf();
+        let root_fd = context.execution.workspace.root_fd();
         let relative = resolved
             .strip_prefix(&root)
             .map_err(|_| {
@@ -574,9 +581,11 @@ pub(crate) async fn commit_remove(
             drop(lock);
             return Ok(Commit::Stale);
         };
-        context
-            .checkpoint
-            .record_captured(resolved, expected.as_bytes().to_vec(), permissions);
+        context.execution.checkpoint.record_captured(
+            resolved,
+            expected.as_bytes().to_vec(),
+            permissions,
+        );
         drop(lock);
         Ok(Commit::Written)
     }

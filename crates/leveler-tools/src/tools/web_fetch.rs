@@ -60,7 +60,7 @@ impl Tool for WebFetchTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        if context.deny_network {
+        if context.policy.network_denied() {
             return Ok(ToolOutput::error(
                 "web_fetch 不可用:当前模式/沙箱已禁用网络。",
             ));
@@ -395,7 +395,7 @@ mod tests {
         let tool = WebFetchTool;
         let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
         let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        ctx.deny_network = true;
+        ctx = ctx.with_sandbox(true);
         let out = tool
             .execute(
                 serde_json::json!({"url": "https://example.com"}),

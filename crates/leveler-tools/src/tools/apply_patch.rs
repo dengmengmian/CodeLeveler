@@ -262,7 +262,7 @@ impl Tool for ApplyPatchTool {
         for change in changes {
             match change {
                 FileChange::Add { path, content } => {
-                    let resolved = match context.workspace.resolve(&path) {
+                    let resolved = match context.execution.workspace.resolve(&path) {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
                     };
@@ -283,7 +283,7 @@ impl Tool for ApplyPatchTool {
                     modified.push(path);
                 }
                 FileChange::Delete { path } => {
-                    let resolved = match context.workspace.resolve(&path) {
+                    let resolved = match context.execution.workspace.resolve(&path) {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
                     };
@@ -313,7 +313,7 @@ impl Tool for ApplyPatchTool {
                     move_to,
                     chunks,
                 } => {
-                    let resolved = match context.workspace.resolve(&path) {
+                    let resolved = match context.execution.workspace.resolve(&path) {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
                     };
@@ -334,7 +334,11 @@ impl Tool for ApplyPatchTool {
                     // The patch was written against contents the model read. If
                     // the file moved on since, applying it would discard whatever
                     // the other writer did — refuse and make the model re-read.
-                    if context.file_state.is_stale(&path, existing.as_bytes()) {
+                    if context
+                        .execution
+                        .file_state
+                        .is_stale(&path, existing.as_bytes())
+                    {
                         return Ok(ToolOutput::error(format!(
                             "{path} changed since you read it — another process, command, or \
                              the user edited it. Your patch was written against stale contents \
@@ -354,7 +358,7 @@ impl Tool for ApplyPatchTool {
 
                     match move_to {
                         Some(dest) => {
-                            let dest_resolved = match context.workspace.resolve(&dest) {
+                            let dest_resolved = match context.execution.workspace.resolve(&dest) {
                                 Ok(p) => p,
                                 Err(e) => return Ok(ToolOutput::error(e.to_string())),
                             };
@@ -401,14 +405,14 @@ impl Tool for ApplyPatchTool {
 
         // Enforce the model-policy per-step file cap (spec §17): weaker models
         // are kept to small, reviewable edits.
-        if context.max_files_per_step > 0 {
+        if context.policy.max_files_per_step > 0 {
             let distinct: std::collections::BTreeSet<&String> = modified.iter().collect();
-            if distinct.len() > context.max_files_per_step {
+            if distinct.len() > context.policy.max_files_per_step {
                 return Ok(ToolOutput::error(format!(
                     "this patch changes {} files but the per-step limit is {}; \
                      make a smaller patch touching fewer files",
                     distinct.len(),
-                    context.max_files_per_step
+                    context.policy.max_files_per_step
                 )));
             }
         }
@@ -416,8 +420,9 @@ impl Tool for ApplyPatchTool {
         // Task-level residual file budget (epoch): a single multi-file patch
         // must not introduce more *new* paths than remain, even when under the
         // per-step model-policy cap.
-        if let Some(remaining) = context.command_modified_files_remaining {
+        if let Some(remaining) = context.policy.command_modified_files_remaining {
             let previously: std::collections::BTreeSet<&str> = context
+                .policy
                 .command_previously_modified
                 .iter()
                 .map(String::as_str)
@@ -468,17 +473,17 @@ impl Tool for ApplyPatchTool {
         // like an outside change to its next patch. A path we can no longer read
         // was deleted here; forget it so a recreated file starts clean.
         for rel in &modified {
-            match context.workspace.resolve(rel) {
+            match context.execution.workspace.resolve(rel) {
                 Ok(resolved) => match tokio::fs::read(&resolved).await {
                     Ok(bytes) => {
-                        context.file_state.record(rel, &bytes);
+                        context.execution.file_state.record(rel, &bytes);
                         // Auto-format the edited file (best-effort; re-fingerprints).
                         super::format::format_after_edit(&context, rel, &resolved, &cancellation)
                             .await;
                     }
-                    Err(_) => context.file_state.forget(rel),
+                    Err(_) => context.execution.file_state.forget(rel),
                 },
-                Err(_) => context.file_state.forget(rel),
+                Err(_) => context.execution.file_state.forget(rel),
             }
         }
 
@@ -847,7 +852,8 @@ mod tests {
 
         // Hold the second target's cooperative lock so the patch commits its
         // first delete and then pauses before comparing/removing the second.
-        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &second);
+        let lock_path =
+            leveler_project::layout::target_lock_path(&context.execution.environment, &second);
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -950,7 +956,8 @@ mod tests {
         let second = dir.join("src/second.rs");
         std::fs::write(&second, "second-original\n").unwrap();
 
-        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &second);
+        let lock_path =
+            leveler_project::layout::target_lock_path(&context.execution.environment, &second);
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -1032,7 +1039,8 @@ mod tests {
         std::fs::write(&second, "second-original\n").unwrap();
         let before = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
 
-        let lock_path = leveler_project::layout::target_lock_path(&context.environment, &second);
+        let lock_path =
+            leveler_project::layout::target_lock_path(&context.execution.environment, &second);
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)

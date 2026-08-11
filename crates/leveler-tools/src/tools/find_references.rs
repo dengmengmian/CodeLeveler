@@ -54,7 +54,7 @@ impl Tool for FindReferencesTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let root = context.workspace.root().to_path_buf();
+        let root = context.execution.workspace.root().to_path_buf();
 
         // Precise: locate the definition, then ask the server for references.
         if let Some((language, matches)) = lsp_locate(&context, &root, &input.symbol).await
@@ -129,7 +129,7 @@ async fn lsp_references(
     // Clone the session Arc out, then drop the lock before the LSP requests so
     // concurrent LSP tools don't serialize on the global sessions mutex.
     let client = {
-        let sessions = context.lsp_sessions.lock().await;
+        let sessions = context.services.lsp_sessions.lock().await;
         sessions.get(language.as_str())?.clone()
     };
     // References need the document open.

@@ -1342,16 +1342,16 @@ impl Executor {
     /// keeps this first message — and the provider's prefix cache of it —
     /// byte-identical.
     fn system_prompt(&self, request: &str) -> String {
-        let project_rules = load_rules(self.tool_context.workspace.root());
+        let project_rules = load_rules(self.tool_context.execution.workspace.root());
         let mut prompt = PromptBuilder::new()
             .base_instructions(self.base_instructions.clone())
             .commit_co_author(self.commit_co_author)
             .turn_context(TurnContext {
                 model: self.model.clone(),
-                mode: self.tool_context.mode,
+                mode: self.tool_context.policy.mode,
                 network_allowed: self.approval_policy.network_allowed,
-                deny_network: self.tool_context.deny_network,
-                cwd: self.tool_context.workspace.root().to_path_buf(),
+                deny_network: self.tool_context.policy.network_denied(),
+                cwd: self.tool_context.execution.workspace.root().to_path_buf(),
                 project_rules,
                 user_language: crate::prompt::user_language(request),
             })
@@ -1517,7 +1517,7 @@ impl Executor {
     /// Resolve `$name` mentions in the user request into a system injection block.
     fn skill_turn_injection(&self, request: &str) -> Option<String> {
         let resolution =
-            leveler_skills::resolve_mentions(self.tool_context.workspace.root(), request);
+            leveler_skills::resolve_mentions(self.tool_context.execution.workspace.root(), request);
         leveler_skills::render_turn_injection(&resolution)
     }
 
@@ -1528,7 +1528,7 @@ impl Executor {
     /// result as a `Role::System` message immediately before the user message so
     /// the cached prefix is preserved and the block is stripped next turn.
     fn relevant_memory_injection(&self, request: &str) -> Option<String> {
-        let root = self.tool_context.memory_root.as_ref()?;
+        let root = self.tool_context.services.memory_root.as_ref()?;
         let store = MemoryStore::open(root).ok()?;
         let hits = store.search(request, RECALL_K).ok()?;
         render_recall_block(hits.into_iter().filter(|(_, score)| *score >= RECALL_FLOOR))

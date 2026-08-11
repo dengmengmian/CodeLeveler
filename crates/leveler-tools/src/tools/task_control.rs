@@ -67,7 +67,7 @@ impl Tool for GetTaskTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
-        let Some(reg) = &context.background_tasks else {
+        let Some(reg) = &context.services.background_tasks else {
             return Ok(ToolOutput::error("no background task registry"));
         };
         match reg.get(input.task_id.trim()).await {
@@ -111,7 +111,7 @@ impl Tool for WaitTaskTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: WaitInput = super::parse_input(self.name(), input)?;
-        let Some(reg) = &context.background_tasks else {
+        let Some(reg) = &context.services.background_tasks else {
             return Ok(ToolOutput::error("no background task registry"));
         };
         let task_id = input.task_id.trim().to_string();
@@ -188,7 +188,7 @@ async fn account_background_mutations(
 
     // Restore ONLY under allowlist constraint (design §2.4 / K17).
     let mut mutation_error = None;
-    if let Some(allowlist) = context.command_write_allowlist.as_deref() {
+    if let Some(allowlist) = context.policy.command_write_allowlist.as_deref() {
         let outside: Vec<&str> = command_modified
             .iter()
             .map(String::as_str)
@@ -248,7 +248,7 @@ impl Tool for KillTaskTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
-        let Some(reg) = &context.background_tasks else {
+        let Some(reg) = &context.services.background_tasks else {
             return Ok(ToolOutput::error("no background task registry"));
         };
         match reg.kill(input.task_id.trim()).await {

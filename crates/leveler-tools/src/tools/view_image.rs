@@ -63,7 +63,7 @@ impl Tool for ViewImageTool {
                 "不支持的图片格式(支持 png/jpg/jpeg/gif/webp)。",
             ));
         };
-        let path = context.workspace.resolve_read(&input.path)?;
+        let path = context.execution.workspace.resolve_read(&input.path)?;
         // Check the size before reading, so a huge file is rejected instead of
         // pulled fully into memory first.
         match tokio::fs::metadata(&path).await {

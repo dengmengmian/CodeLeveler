@@ -65,7 +65,7 @@ impl Tool for BlastRadiusTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let max_depth = input.max_depth.unwrap_or(DEFAULT_DEPTH).clamp(1, MAX_DEPTH);
-        let root = context.workspace.root().to_path_buf();
+        let root = context.execution.workspace.root().to_path_buf();
 
         let resolver = LspResolver {
             context: &context,
@@ -197,7 +197,7 @@ impl ImpactResolver for LspResolver<'_> {
         // Clone the session Arc out and drop the lock before the LSP requests so
         // this BFS doesn't hold the global sessions mutex across many round-trips.
         let client = {
-            let sessions = self.context.lsp_sessions.lock().await;
+            let sessions = self.context.services.lsp_sessions.lock().await;
             let Some(client) = sessions.get(language.as_str()) else {
                 return Vec::new();
             };

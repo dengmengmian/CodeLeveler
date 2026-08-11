@@ -146,17 +146,17 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::NotFound(name.to_string()))?
             .clone();
 
-        if context.read_only && tool.risk() != RiskLevel::Safe {
+        if context.policy.read_only && tool.risk() != RiskLevel::Safe {
             return Err(ToolError::NotPermitted {
                 tool: name.to_string(),
-                mode: context.mode,
+                mode: context.policy.mode,
                 risk: tool.risk(),
             });
         }
-        if !context.mode.permits(tool.risk()) {
+        if !context.policy.mode.permits(tool.risk()) {
             return Err(ToolError::NotPermitted {
                 tool: name.to_string(),
-                mode: context.mode,
+                mode: context.policy.mode,
                 risk: tool.risk(),
             });
         }
@@ -164,7 +164,7 @@ impl ToolRegistry {
         let input = tool.normalize_input(input);
         validate_schema(name, &tool.input_schema(), &input)?;
 
-        let budget = context.tool_output_budget;
+        let budget = context.policy.tool_output_budget;
         let mut output = tool.execute(input, context, cancellation).await?;
         // Central guard: no single tool result may flood the context window,
         // whatever the tool's own limits are (some search tools have none). Keep
@@ -535,7 +535,7 @@ mod tests {
         let reg = default_registry();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        ctx.tool_output_budget = 4 * 1024;
+        ctx.policy.tool_output_budget = 4 * 1024;
         let out = reg
             .execute(
                 "read_file",

@@ -14,7 +14,7 @@ use leveler_memory::{MemoryStore, new_entry};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 fn open_store(context: &ToolContext) -> Result<MemoryStore, ToolError> {
-    let root = context.memory_root.as_ref().ok_or_else(|| {
+    let root = context.services.memory_root.as_ref().ok_or_else(|| {
         ToolError::Io(
             "memory store is not configured for this session (app must set Layout::memory_dir)"
                 .to_string(),

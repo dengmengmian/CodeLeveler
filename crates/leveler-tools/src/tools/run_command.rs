@@ -130,19 +130,19 @@ async fn execute_background(
     cwd_rel: Option<&str>,
     context: ToolContext,
 ) -> Result<ToolOutput, ToolError> {
-    let Some(reg) = context.background_tasks.clone() else {
+    let Some(reg) = context.services.background_tasks.clone() else {
         return Ok(ToolOutput::error(
             "background tasks are not available in this session (no registry).",
         ));
     };
     let rel = cwd_rel.unwrap_or(".").to_string();
-    let cwd = context.workspace.resolve(&rel)?;
+    let cwd = context.execution.workspace.resolve(&rel)?;
 
     // Pre-spawn snapshot for wait-end mutation accounting (PR-3b). Restore is
     // only applied later when command_write_allowlist is set; default Goal
     // background (dev servers) keeps the baseline for accounting only.
-    let root = context.workspace.root().to_path_buf();
-    let mutation_baseline = if context.read_only {
+    let root = context.execution.workspace.root().to_path_buf();
+    let mutation_baseline = if context.policy.read_only {
         None
     } else {
         match WorkspaceSnapshot::capture(&root).await {
@@ -164,9 +164,9 @@ async fn execute_background(
     };
     // Allowlist-constrained workers need a recoverable snapshot to restore on
     // wait. Without git we cannot enforce the constraint.
-    if context.command_write_allowlist.is_some()
+    if context.policy.command_write_allowlist.is_some()
         && mutation_baseline.is_none()
-        && !context.read_only
+        && !context.policy.read_only
     {
         return Ok(ToolOutput::error(
             "Refused: command mutation constraints require a recoverable git workspace snapshot.\n",
@@ -185,20 +185,21 @@ async fn execute_background(
 
 /// Build a [`ProcessRequest`] for background spawn with the same sandbox fields
 /// as foreground `execute_program` (PR-3a). Non-FullAccess / non-turn-unrestricted
-/// → write confinement; network follows `context.deny_network`.
+/// → write confinement; network follows `context.policy.network_denied()`.
 fn background_process_request(
     program: &str,
     args: Vec<String>,
     cwd: std::path::PathBuf,
     context: &ToolContext,
 ) -> ProcessRequest {
-    let confine_writes = context.mode.confines_workspace() && !context.turn_unrestricted_fs;
+    let confine_writes =
+        context.policy.mode.confines_workspace() && !context.policy.unrestricted_fs();
     let mut req = ProcessRequest::new(program, args, cwd);
-    req.deny_network = context.deny_network;
-    req.deny_env = context.deny_env.as_ref().clone();
+    req.deny_network = context.policy.network_denied();
+    req.deny_env = context.policy.deny_env.as_ref().clone();
     if confine_writes {
-        let write_root = context.workspace.root().to_path_buf();
-        let extra = context.workspace.readonly_roots().to_vec();
+        let write_root = context.execution.workspace.root().to_path_buf();
+        let extra = context.execution.workspace.readonly_roots().to_vec();
         req.write_root = Some(write_root.clone());
         req.extra_read_roots = extra.clone();
         req.filesystem_intent = Some(leveler_execution::FilesystemIntent::WorkspaceWrite {
@@ -221,39 +222,40 @@ pub(crate) async fn execute_program(
     cancellation: CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
     let rel = cwd_rel.unwrap_or(".").to_string();
-    let cwd = context.workspace.resolve(&rel)?;
+    let cwd = context.execution.workspace.resolve(&rel)?;
 
     // On macOS/Linux the OS sandbox allows broad *reads* and
     // confines *writes*; do not second-guess absolute path args there
     // (git/config paths, system tools). On Windows AppContainer uses host
     // intent; absolute-arg preflight remains a cheap fail-closed gate.
-    let confine_writes = context.mode.confines_workspace() && !context.turn_unrestricted_fs;
+    let confine_writes =
+        context.policy.mode.confines_workspace() && !context.policy.unrestricted_fs();
     #[cfg(windows)]
     if confine_writes {
-        let mut allowed = vec![context.workspace.root().to_path_buf()];
-        allowed.extend(context.workspace.readonly_roots().iter().cloned());
+        let mut allowed = vec![context.execution.workspace.root().to_path_buf()];
+        allowed.extend(context.execution.workspace.readonly_roots().iter().cloned());
         if let Some(bad) = leveler_execution::first_absolute_arg_outside_roots(&args, &allowed) {
             return Ok(ToolOutput::error(format!(
                 "Refused: argument `{bad}` is outside the workspace root `{}` \
                      and outside readonly roots. Use `read_file` for workspace \
                      files, or pass `--readonly-root <dir>` (or config \
                      `readonly_roots`) for cross-repo reads.",
-                context.workspace.root().display()
+                context.execution.workspace.root().display()
             )));
         }
     }
     let mut request = ProcessRequest::new(program.to_string(), args, cwd);
     let timeout = resolve_timeout(timeout_seconds);
     request.timeout = timeout;
-    request.deny_network = context.deny_network;
-    request.deny_env = context.deny_env.as_ref().clone();
+    request.deny_network = context.policy.network_denied();
+    request.deny_env = context.policy.deny_env.as_ref().clone();
     // OS confinement when not full-access / turn-unrestricted:
     // - macOS/Linux: broad reads; writes limited to workspace + temp + toolchain
     // - Windows: AppContainer write-restricted (host-trusted FilesystemIntent)
     // - turn_unrestricted_fs: approved elevation for this turn only
     if confine_writes {
-        let write_root = context.workspace.root().to_path_buf();
-        let extra = context.workspace.readonly_roots().to_vec();
+        let write_root = context.execution.workspace.root().to_path_buf();
+        let extra = context.execution.workspace.readonly_roots().to_vec();
         request.write_root = Some(write_root.clone());
         request.extra_read_roots = extra.clone();
         request.filesystem_intent = Some(leveler_execution::FilesystemIntent::WorkspaceWrite {
@@ -265,8 +267,8 @@ pub(crate) async fn execute_program(
     }
 
     // Pre-command workspace snapshot (git only). Read-only overlays skip it.
-    let root = context.workspace.root().to_path_buf();
-    let snapshot = if context.read_only {
+    let root = context.execution.workspace.root().to_path_buf();
+    let snapshot = if context.policy.read_only {
         None
     } else {
         match WorkspaceSnapshot::capture(&root).await {
@@ -284,9 +286,9 @@ pub(crate) async fn execute_program(
         }
     };
 
-    let constrained = context.command_write_allowlist.is_some()
-        || context.command_modified_files_remaining.is_some();
-    if constrained && snapshot.is_none() && !context.read_only {
+    let constrained = context.policy.command_write_allowlist.is_some()
+        || context.policy.command_modified_files_remaining.is_some();
+    if constrained && snapshot.is_none() && !context.policy.read_only {
         return Ok(ToolOutput::error(
             "Refused: command mutation constraints require a recoverable git workspace snapshot.\n",
         ));
@@ -298,14 +300,14 @@ pub(crate) async fn execute_program(
     // that observes the tree mid-edit produces an authoritative-looking wrong
     // answer. Background commands never reach here (they return earlier), so a
     // long-lived server cannot hold the gate.
-    let _gate = context.command_gate.clone().lock_owned().await;
-    let output = context.runner.run(request, cancellation).await?;
+    let _gate = context.execution.command_gate.clone().lock_owned().await;
+    let output = context.execution.runner.run(request, cancellation).await?;
 
     // Detect what the command changed so scope checks and budgets see
     // command-driven mutations, not just tool edits.
     let mut command_modified: Vec<String> = Vec::new();
     let mut snapshot_note: Option<String> = None;
-    match (&snapshot, context.read_only) {
+    match (&snapshot, context.policy.read_only) {
         (Some(id), _) => match WorkspaceSnapshot::changed_since(&root, id).await {
             Ok(changed) => command_modified = changed,
             Err(error) => {
@@ -328,6 +330,7 @@ pub(crate) async fn execute_program(
     let mut mutation_error = None;
     if let Some(id) = &snapshot {
         let outside: Vec<&str> = context
+            .policy
             .command_write_allowlist
             .as_deref()
             .map(|allowlist| {
@@ -340,9 +343,10 @@ pub(crate) async fn execute_program(
             .unwrap_or_default();
         let newly_modified = command_modified
             .iter()
-            .filter(|path| !context.command_previously_modified.contains(path))
+            .filter(|path| !context.policy.command_previously_modified.contains(path))
             .count();
         let budget_exceeded = context
+            .policy
             .command_modified_files_remaining
             .is_some_and(|remaining| newly_modified > remaining);
 
@@ -387,7 +391,7 @@ pub(crate) async fn execute_program(
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_string())
     ));
-    let store = context.artifact_store.as_deref();
+    let store = context.services.artifact_store.as_deref();
     if !output.stdout.trim().is_empty() {
         body.push_str("--- stdout ---\n");
         let stdout = leveler_core::sanitize_terminal_output(&output.stdout);
@@ -508,7 +512,7 @@ mod grant_tests {
         std::fs::create_dir_all(&ws).unwrap();
         let workspace = Workspace::new(&ws).unwrap();
         let mut ctx = ToolContext::new(workspace, PermissionProfile::Assisted);
-        ctx.turn_unrestricted_fs = true;
+        ctx.policy.grant_unrestricted_fs();
         // Write a file outside the workspace but under a sibling dir — only
         // possible when write_root is not applied.
         let outside = base.join("outside.txt");
@@ -614,7 +618,7 @@ mod grant_tests {
         std::fs::create_dir_all(ws.join(".git")).unwrap();
         let workspace = Workspace::new(&ws).unwrap();
         let mut ctx = ToolContext::new(workspace, PermissionProfile::Assisted);
-        ctx.turn_unrestricted_fs = true;
+        ctx.policy.grant_unrestricted_fs();
         let marker = ws.join(".git/canary-write");
         let _ = std::fs::remove_file(&marker);
         let out = execute_program(
@@ -992,7 +996,7 @@ mod tests {
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let root = ws.root().to_path_buf();
         let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        ctx.deny_network = true;
+        ctx = ctx.with_sandbox(true);
         let req = background_process_request("sleep", vec!["1".into()], root.clone(), &ctx);
         assert_eq!(req.write_root.as_deref(), Some(root.as_path()));
         assert!(req.deny_network);
@@ -1028,7 +1032,7 @@ mod tests {
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
         let root = ws.root().to_path_buf();
         let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
-        ctx.turn_unrestricted_fs = true;
+        ctx.policy.grant_unrestricted_fs();
         let req = background_process_request("sleep", vec!["1".into()], root, &ctx);
         assert!(req.write_root.is_none());
         assert!(matches!(

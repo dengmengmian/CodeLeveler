@@ -317,10 +317,10 @@ pub(crate) fn apply_turn_grants(
     grants: TurnPermissionGrants,
 ) -> leveler_tools::ToolContext {
     if grants.network {
-        ctx.deny_network = false;
+        ctx.policy.grant_network();
     }
     if grants.unrestricted_fs {
-        ctx.turn_unrestricted_fs = true;
+        ctx.policy.grant_unrestricted_fs();
     }
     ctx
 }
@@ -404,8 +404,8 @@ mod tests {
         let ctx =
             leveler_tools::ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
                 .with_sandbox(true);
-        assert!(ctx.deny_network);
-        assert!(!ctx.turn_unrestricted_fs);
+        assert!(ctx.policy.network_denied());
+        assert!(!ctx.policy.unrestricted_fs());
         let elevated = apply_turn_grants(
             ctx,
             TurnPermissionGrants {
@@ -413,8 +413,8 @@ mod tests {
                 unrestricted_fs: true,
             },
         );
-        assert!(!elevated.deny_network);
-        assert!(elevated.turn_unrestricted_fs);
+        assert!(!elevated.policy.network_denied());
+        assert!(elevated.policy.unrestricted_fs());
         std::fs::remove_dir_all(&dir).ok();
     }
 

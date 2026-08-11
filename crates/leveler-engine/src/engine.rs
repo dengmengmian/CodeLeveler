@@ -1488,7 +1488,7 @@ impl TaskEngine {
             .await?;
         let verifier = Verifier::with_environment(
             &spec.coding.repository,
-            self.factory.tool_context.environment.clone(),
+            self.factory.tool_context.execution.environment.clone(),
         );
         let mut plan = gate_plan(spec);
         // Blast-radius scoping: a change that touches no compiled input (docs,
@@ -1515,7 +1515,7 @@ impl TaskEngine {
                 base_commit,
                 &plan,
                 modified_files,
-                self.factory.tool_context.environment.clone(),
+                self.factory.tool_context.execution.environment.clone(),
                 cancellation,
             )
             .await;

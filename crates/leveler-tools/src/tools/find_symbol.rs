@@ -54,7 +54,7 @@ impl Tool for FindSymbolTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let root = context.workspace.root().to_path_buf();
+        let root = context.execution.workspace.root().to_path_buf();
 
         // Precise path: ask a language server (reused across calls).
         if let Some(body) = lsp_lookup(&context, &root, &input.symbol).await {
@@ -97,7 +97,8 @@ impl Tool for FindSymbolTool {
 async fn lsp_lookup(context: &ToolContext, root: &std::path::Path, symbol: &str) -> Option<String> {
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     for language in leveler_project::detect_languages(root) {
-        if !leveler_lsp::server_available_with_environment(language, &context.environment) {
+        if !leveler_lsp::server_available_with_environment(language, &context.execution.environment)
+        {
             continue;
         }
         let Some(spec) = leveler_lsp::server_for(language) else {
@@ -134,7 +135,7 @@ async fn lsp_lookup(context: &ToolContext, root: &std::path::Path, symbol: &str)
             }
         }
         if server_died {
-            let mut sessions = context.lsp_sessions.lock().await;
+            let mut sessions = context.services.lsp_sessions.lock().await;
             super::symbols::remove_if_same(&mut sessions, &key, &client);
         }
 

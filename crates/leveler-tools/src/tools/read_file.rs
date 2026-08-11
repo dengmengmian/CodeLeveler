@@ -69,7 +69,7 @@ impl Tool for ReadFileTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context.workspace.resolve_read(&input.path)?;
+        let path = context.execution.workspace.resolve_read(&input.path)?;
 
         let meta = match tokio::fs::metadata(&path).await {
             Ok(m) => m,
@@ -198,9 +198,11 @@ impl Tool for ReadFileTool {
 
         let fingerprint = fingerprint.finish();
         let repeated = context
+            .execution
             .read_guard
             .tripped_fingerprint(&range_key, fingerprint);
         context
+            .execution
             .file_state
             .record_fingerprint(&input.path, fingerprint);
 

@@ -132,7 +132,7 @@ impl ExecutorFactory {
         };
         // Per-model tool-result budget rides the turn's tool context.
         let mut tool_context = self.tool_context.clone();
-        tool_context.tool_output_budget = resolved.max_tool_output_bytes;
+        tool_context.policy.tool_output_budget = resolved.max_tool_output_bytes;
         let mut executor = Executor::new(
             self.runtime.clone(),
             self.registry.clone(),

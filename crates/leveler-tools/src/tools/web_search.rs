@@ -64,7 +64,7 @@ impl Tool for WebSearchTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
-        if context.deny_network {
+        if context.policy.network_denied() {
             return Ok(ToolOutput::error(
                 "web_search 不可用:当前模式/沙箱已禁用网络。",
             ));
@@ -75,7 +75,7 @@ impl Tool for WebSearchTool {
         }
         let count = input.count.unwrap_or(DEFAULT_COUNT).clamp(1, MAX_COUNT);
 
-        let key = match context.environment.var("LEVELER_SEARCH_API_KEY") {
+        let key = match context.execution.environment.var("LEVELER_SEARCH_API_KEY") {
             Some(k) if !k.trim().is_empty() => k,
             _ => {
                 return Ok(ToolOutput::error(
@@ -86,10 +86,11 @@ impl Tool for WebSearchTool {
             }
         };
         let provider = context
+            .execution
             .environment
             .var("LEVELER_SEARCH_PROVIDER")
             .unwrap_or_else(|| "bing".to_string());
-        let search_cx = context.environment.var("LEVELER_SEARCH_CX");
+        let search_cx = context.execution.environment.var("LEVELER_SEARCH_CX");
 
         // Race the request against cancellation so a killed turn returns promptly.
         let result = tokio::select! {

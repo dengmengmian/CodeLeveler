@@ -70,7 +70,7 @@ impl Tool for ListFilesTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.unwrap_or_else(|| ".".to_string());
         let max_depth = input.max_depth.unwrap_or(3);
-        let base = context.workspace.resolve_read(&rel)?;
+        let base = context.execution.workspace.resolve_read(&rel)?;
 
         if !base.is_dir() {
             return Ok(ToolOutput::error(crate::recoverable::path_not_directory(

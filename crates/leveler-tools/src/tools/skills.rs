@@ -42,7 +42,7 @@ impl Tool for LoadSkillTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: LoadInput = super::parse_input(self.name(), input)?;
-        match leveler_skills::load(context.workspace.root(), &input.name) {
+        match leveler_skills::load(context.execution.workspace.root(), &input.name) {
             Some(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
                 &detail,
             ))),
@@ -91,7 +91,7 @@ impl Tool for CreateSkillTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: CreateInput = super::parse_input(self.name(), input)?;
         match leveler_skills::create(
-            context.workspace.root(),
+            context.execution.workspace.root(),
             &input.name,
             &input.description,
             &input.body,

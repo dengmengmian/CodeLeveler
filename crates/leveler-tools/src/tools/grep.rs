@@ -85,7 +85,7 @@ impl Tool for GrepTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.clone().unwrap_or_else(|| ".".to_string());
-        let search_root = context.workspace.resolve_read(&rel)?;
+        let search_root = context.execution.workspace.resolve_read(&rel)?;
         let max = input.max_results.unwrap_or(DEFAULT_MAX);
 
         // Try ripgrep first.
@@ -102,11 +102,12 @@ impl Tool for GrepTool {
         args.push(input.pattern.clone());
         args.push(search_root.to_string_lossy().into_owned());
 
-        let request = ProcessRequest::new("rg", args, context.workspace.root().to_path_buf());
-        match context.runner.run(request, cancellation).await {
+        let request =
+            ProcessRequest::new("rg", args, context.execution.workspace.root().to_path_buf());
+        match context.execution.runner.run(request, cancellation).await {
             Ok(output) if !output.timed_out => {
                 // rg exits 1 when there are no matches; that is not an error.
-                let text = relativize(&output.stdout, context.workspace.root());
+                let text = relativize(&output.stdout, context.execution.workspace.root());
                 let body = truncate_lines(&text, max);
                 if body.trim().is_empty() {
                     Ok(ToolOutput::ok("(no matches)\n"))
@@ -160,7 +161,7 @@ fn builtin_grep(
         for (i, line) in content.lines().enumerate() {
             if line.contains(pattern) {
                 let rel = file
-                    .strip_prefix(context.workspace.root())
+                    .strip_prefix(context.execution.workspace.root())
                     .unwrap_or(&file)
                     .display();
                 matches.push(clip_line(&format!("{rel}:{}:{}", i + 1, line)));

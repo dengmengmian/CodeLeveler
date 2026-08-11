@@ -59,8 +59,8 @@ impl Tool for DiagnosticsTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let abs = context.workspace.resolve_read(&input.path)?;
-        let root = context.workspace.root().to_path_buf();
+        let abs = context.execution.workspace.resolve_read(&input.path)?;
+        let root = context.execution.workspace.root().to_path_buf();
 
         let Some(language) = Language::from_path(&abs) else {
             return Ok(ToolOutput::ok(format!(
@@ -68,7 +68,8 @@ impl Tool for DiagnosticsTool {
                 input.path
             )));
         };
-        if !leveler_lsp::server_available_with_environment(language, &context.environment) {
+        if !leveler_lsp::server_available_with_environment(language, &context.execution.environment)
+        {
             return Ok(ToolOutput::ok(format!(
                 "(no language server available for {}; diagnostics unavailable — a full \
                  build via run_command still works)\n",

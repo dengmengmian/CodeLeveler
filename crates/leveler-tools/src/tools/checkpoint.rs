@@ -37,7 +37,7 @@ impl Tool for CreateCheckpointTool {
         context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        context.checkpoint.reset();
+        context.execution.checkpoint.reset();
         Ok(ToolOutput::ok(
             "Checkpoint set. `restore_checkpoint` will revert changes made from here.\n",
         ))
@@ -69,13 +69,13 @@ impl Tool for RestoreCheckpointTool {
         context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let count = context.checkpoint.touched_count();
+        let count = context.execution.checkpoint.touched_count();
         if count == 0 {
             return Ok(ToolOutput::ok(
                 "Nothing to restore (no changes recorded).\n",
             ));
         }
-        match context.checkpoint.restore() {
+        match context.execution.checkpoint.restore() {
             Ok(()) => Ok(ToolOutput::ok(format!(
                 "Restored {count} file(s) to the checkpoint.\n"
             ))),
@@ -103,7 +103,7 @@ mod tests {
             .execute(serde_json::json!({}), ctx.clone(), CancellationToken::new())
             .await
             .unwrap();
-        ctx.checkpoint.record(&dir.join("a.txt")).unwrap();
+        ctx.execution.checkpoint.record(&dir.join("a.txt")).unwrap();
         std::fs::write(dir.join("a.txt"), "edited").unwrap();
 
         let out = RestoreCheckpointTool

@@ -19,10 +19,10 @@ async fn run_git(
     let mut request = ProcessRequest::new(
         "git",
         args.iter().map(|s| s.to_string()).collect(),
-        context.workspace.root().to_path_buf(),
+        context.execution.workspace.root().to_path_buf(),
     );
     request.timeout = Duration::from_secs(30);
-    let output = context.runner.run(request, cancellation).await?;
+    let output = context.execution.runner.run(request, cancellation).await?;
     if output.success() {
         let mut body = if output.stdout.trim().is_empty() {
             "(clean)\n".to_string()
@@ -121,7 +121,7 @@ impl Tool for GitDiffTool {
         // Validate the path stays in the workspace before passing it to git.
         let path_owned;
         if let Some(p) = &input.path {
-            context.workspace.resolve(p)?;
+            context.execution.workspace.resolve(p)?;
             args.push("--");
             path_owned = p.clone();
             args.push(&path_owned);

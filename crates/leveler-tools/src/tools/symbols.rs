@@ -29,18 +29,18 @@ pub(crate) async fn get_or_start_lsp(
     args: &[String],
     root: &Path,
 ) -> Result<std::sync::Arc<leveler_lsp::LspClient>, String> {
-    if let Some(client) = context.lsp_sessions.lock().await.get(key).cloned() {
+    if let Some(client) = context.services.lsp_sessions.lock().await.get(key).cloned() {
         return Ok(client);
     }
     let start_lock = {
-        let mut locks = context.lsp_start_locks.lock().await;
+        let mut locks = context.services.lsp_start_locks.lock().await;
         locks
             .entry(key.to_string())
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     };
     let _starting = start_lock.lock().await;
-    if let Some(client) = context.lsp_sessions.lock().await.get(key).cloned() {
+    if let Some(client) = context.services.lsp_sessions.lock().await.get(key).cloned() {
         return Ok(client);
     }
 
@@ -52,6 +52,7 @@ pub(crate) async fn get_or_start_lsp(
             .map_err(|error| error.to_string())?,
     );
     context
+        .services
         .lsp_sessions
         .lock()
         .await
@@ -68,7 +69,8 @@ pub(crate) async fn lsp_locate(
     symbol: &str,
 ) -> Option<(Language, Vec<SymbolLocation>)> {
     for language in leveler_project::detect_languages(root) {
-        if !leveler_lsp::server_available_with_environment(language, &context.environment) {
+        if !leveler_lsp::server_available_with_environment(language, &context.execution.environment)
+        {
             continue;
         }
         let Some(spec) = leveler_lsp::server_for(language) else {
@@ -106,7 +108,7 @@ pub(crate) async fn lsp_locate(
         if server_died {
             // Re-acquire only to evict, and only if it's still the same dead
             // client (a concurrent call may have already restarted it).
-            let mut sessions = context.lsp_sessions.lock().await;
+            let mut sessions = context.services.lsp_sessions.lock().await;
             remove_if_same(&mut sessions, &key, &client);
         }
         let matches: Vec<_> = located
