@@ -218,49 +218,16 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
-/// The header underline. Idle: a static hairline. Busy: an accent segment that
-/// slides back and forth (indeterminate progress) so the top of the screen shows
-/// the agent is working. Uses a heavy glyph for the moving part so the motion is
-/// still visible under `NO_COLOR`.
+/// The header underline: always a static hairline. The status spinner above
+/// the composer is the single busy indicator — an animated strip here would be
+/// a second indeterminate-progress signal competing for attention.
 fn header_rule_line(width: usize, state: &AppState) -> Line<'static> {
     let theme = &state.theme;
     let border = Style::default().fg(theme.border);
     if width == 0 {
         return Line::from("");
     }
-    if !state.is_busy() {
-        return Line::from(Span::styled("─".repeat(width), border));
-    }
-
-    let seg = (width / 6).clamp(6, 24).min(width);
-    let travel = width.saturating_sub(seg);
-    // Ping-pong the segment start across [0, travel] to avoid edge wrap. Two
-    // cells per frame keeps the slide lively without looking frantic.
-    let start = if travel == 0 {
-        0
-    } else {
-        let period = travel * 2;
-        let phase = (state.tick as usize).wrapping_mul(2) % period;
-        if phase <= travel {
-            phase
-        } else {
-            period - phase
-        }
-    };
-    let after = width - start - seg;
-
-    let accent = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let mut spans = Vec::new();
-    if start > 0 {
-        spans.push(Span::styled("─".repeat(start), border));
-    }
-    spans.push(Span::styled("━".repeat(seg), accent));
-    if after > 0 {
-        spans.push(Span::styled("─".repeat(after), border));
-    }
-    Line::from(spans)
+    Line::from(Span::styled("─".repeat(width), border))
 }
 
 /// Progressive single-line header that degrades as the terminal narrows.
@@ -966,19 +933,19 @@ mod tests {
     }
 
     #[test]
-    fn header_rule_animates_and_keeps_width_when_busy() {
+    fn header_rule_stays_static_while_busy() {
+        // The status spinner is the ONE busy indicator; a second animated
+        // strip at the top competes with it for attention (dual-signal).
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
-        // Width is preserved across frames; a moving heavy segment is present.
         for tick in [0u64, 3, 7, 50] {
             state.tick = tick;
             let plain = rule_plain(&header_rule_line(48, &state));
             assert_eq!(
-                unicode_width::UnicodeWidthStr::width(plain.as_str()),
-                48,
-                "busy rule must fill width at tick {tick}: {plain:?}"
+                plain,
+                "─".repeat(48),
+                "busy rule must stay a plain hairline at tick {tick}"
             );
-            assert!(plain.contains('━'), "moving segment missing at tick {tick}");
         }
     }
 
