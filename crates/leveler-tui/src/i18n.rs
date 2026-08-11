@@ -394,9 +394,11 @@ pub struct UiText {
     pub disclosure_read_many: &'static str,
     pub disclosure_search: &'static str,
     pub disclosure_parallel: &'static str,
+    pub disclosure_tools_one: &'static str,
     pub disclosure_tools_many: &'static str,
     /// Collapsed failure header, e.g. "Shell command failed".
     pub disclosure_failed: &'static str,
+    pub disclosure_failed_tool: &'static str,
 
     // Sub-agent tree
     pub agents_running_header: &'static str, // "{} 个 agents 正在运行"
@@ -751,8 +753,10 @@ static ZH: UiText = UiText {
     disclosure_read_many: "读取了 {} 个文件",
     disclosure_search: "搜索了代码库",
     disclosure_parallel: "并行执行了 {} 个工具",
+    disclosure_tools_one: "执行了 1 个工具",
     disclosure_tools_many: "执行了 {} 个工具",
     disclosure_failed: "命令执行失败",
+    disclosure_failed_tool: "工具执行失败",
     batch_done: "{} 个工具",
     batch_failed: "{} 个失败",
     agents_running_header: "{} 个 agents 正在运行",
@@ -1041,8 +1045,10 @@ static EN: UiText = UiText {
     disclosure_read_many: "Read {} files",
     disclosure_search: "Searched codebase",
     disclosure_parallel: "Ran {} tools in parallel",
+    disclosure_tools_one: "Ran 1 tool",
     disclosure_tools_many: "Ran {} tools",
     disclosure_failed: "Shell command failed",
+    disclosure_failed_tool: "Tool failed",
     batch_done: "{} tools",
     batch_failed: "{} failed",
     agents_running_header: "{} agents running",

@@ -330,8 +330,10 @@ pub async fn run(
 
         // Keep conversation viewport scroll in range as content/layout changes.
         if state.active_screen == Screen::Conversation {
-            let width = state.size.0.max(1) as usize;
-            let height = state.size.1.saturating_sub(10).max(3) as usize;
+            // Authoritative painted viewport (falls back to an estimate only
+            // before the first render publishes `conversation_rect`).
+            let width = crate::reducer::conversation_content_width(&state);
+            let height = crate::reducer::conversation_viewport_height(&state);
             if crate::workbench::sync_conversation_scroll(&mut state, width, height) {
                 paint_now = true;
             }

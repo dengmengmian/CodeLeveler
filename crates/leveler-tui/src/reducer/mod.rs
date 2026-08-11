@@ -247,8 +247,10 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             }
             if over_conv {
                 state.workbench_focus = WorkbenchFocus::Conversation;
-                // Pin viewport so agent streaming cannot yank us to the bottom.
-                state.conversation_auto_scroll = false;
+                // Pin the viewport exactly where it is painted so agent
+                // streaming cannot yank us to the bottom AND the click below
+                // maps against the same scroll the user is looking at.
+                pin_conversation_at_current_viewport(state);
                 ensure_conversation_plain(state);
                 // A click on a tool-disclosure row toggles exactly that group
                 // — it never begins a selection and outranks URL opening on
@@ -417,7 +419,7 @@ fn update_selection_edge(state: &mut AppState, col: u16, row: u16) {
 /// Content width for Conversation layout / selection. Must match the painted
 /// viewport (`conversation_rect`), not the full terminal width — a mismatch
 /// re-wraps lines under the cursor and the selection highlight "jumps".
-fn conversation_content_width(state: &AppState) -> usize {
+pub(crate) fn conversation_content_width(state: &AppState) -> usize {
     state
         .conversation_rect
         .map(|(_, _, w, _)| w as usize)
@@ -775,9 +777,8 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 
 /// Scroll the conversation viewport by `delta` lines (negative = up).
 fn scroll_conversation(state: &mut AppState, delta: i32) {
-    // Approximate viewport height: total rows minus chrome (header 3 + strips).
-    let height = state.size.1.saturating_sub(12).max(3) as usize;
-    let width = state.size.0.max(1) as usize;
+    let height = conversation_viewport_height(state);
+    let width = conversation_content_width(state);
     let total = crate::workbench::conversation_line_count(state, width);
     let max_scroll = total.saturating_sub(height);
     if delta < 0 {
@@ -803,7 +804,7 @@ fn scroll_conversation_pinned(state: &mut AppState, delta: i32) {
         return;
     }
     let height = conversation_viewport_height(state);
-    let width = state.size.0.max(1) as usize;
+    let width = conversation_content_width(state);
     let total = crate::workbench::conversation_line_count(state, width);
     let max_scroll = total.saturating_sub(height.max(1));
     state.conversation_auto_scroll = false;
@@ -817,7 +818,23 @@ fn scroll_conversation_pinned(state: &mut AppState, delta: i32) {
     }
 }
 
-fn conversation_viewport_height(state: &AppState) -> usize {
+/// Freeze the viewport at the position the renderer actually painted BEFORE
+/// leaving auto-follow. While auto-following, `conversation_scroll` in state
+/// is stale (the live edge is computed at paint time), so flipping the flag
+/// first and mapping the mouse against the stale value would hit rows the
+/// user is not looking at. Order matters: capture the live scroll from the
+/// authoritative rect, then disable auto-follow, then hit-test.
+fn pin_conversation_at_current_viewport(state: &mut AppState) {
+    if state.conversation_auto_scroll {
+        let width = conversation_content_width(state);
+        let height = conversation_viewport_height(state);
+        let total = crate::workbench::conversation_line_count(state, width);
+        state.conversation_scroll = total.saturating_sub(height);
+    }
+    state.conversation_auto_scroll = false;
+}
+
+pub(crate) fn conversation_viewport_height(state: &AppState) -> usize {
     if let Some((_, _, _, rh)) = state.conversation_rect {
         rh.max(1) as usize
     } else {
@@ -893,8 +910,8 @@ fn request_jump_to_bottom(state: &mut AppState) {
     state.conversation_auto_scroll = true;
     state.conversation_unread = 0;
     state.jump_to_bottom = true;
-    let height = state.size.1.saturating_sub(10).max(3) as usize;
-    let width = state.size.0.max(1) as usize;
+    let height = conversation_viewport_height(state);
+    let width = conversation_content_width(state);
     let total = crate::workbench::conversation_line_count(state, width);
     state.conversation_scroll = total.saturating_sub(height);
     state.notification = Some(Notification {
@@ -1158,6 +1175,200 @@ mod disclosure_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn two_groups_stay_expanded_simultaneously() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line_a, item_a) = hits[0];
+        let row = screen_row_of(&s, line_a);
+        click(&mut s, 1, row);
+        // A stays open while C is opened — history is not a radio group.
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line_c, item_c) = *hits.iter().find(|(_, i)| *i > item_a + 1).unwrap();
+        let row = screen_row_of(&s, line_c);
+        click(&mut s, 1, row);
+        let flags = expanded_flags(&s);
+        let open: Vec<usize> = flags.iter().filter(|(_, e)| *e).map(|(i, _)| *i).collect();
+        assert_eq!(open, vec![item_a, item_c], "both stay open: {flags:?}");
+        // Collapse A independently; C must remain open.
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line_a2, _) = *hits.iter().find(|(_, i)| *i == item_a).unwrap();
+        let row = screen_row_of(&s, line_a2);
+        click(&mut s, 1, row);
+        let flags = expanded_flags(&s);
+        let open: Vec<usize> = flags.iter().filter(|(_, e)| *e).map(|(i, _)| *i).collect();
+        assert_eq!(open, vec![item_c], "collapsing A leaves C open: {flags:?}");
+    }
+
+    #[test]
+    fn scrolled_to_middle_click_lands_on_the_painted_row() {
+        let mut s = test_state();
+        for i in 0..30 {
+            s.transcript.push_user(format!("early {i}"));
+        }
+        three_groups(&mut s);
+        for i in 0..30 {
+            s.transcript.push_user(format!("late {i}"));
+        }
+        // Pinned mid-history: the middle disclosure is inside the viewport.
+        let (lines, hits) = s.conversation_lines_and_hits(80);
+        let (line_b, item_b) = hits[1];
+        let (_, ry, _, rh) = s.conversation_rect.unwrap();
+        let scroll = line_b.saturating_sub(rh as usize / 2);
+        let max_scroll = lines.len().saturating_sub(rh as usize);
+        let scroll = scroll.min(max_scroll);
+        s.conversation_auto_scroll = false;
+        s.conversation_scroll = scroll;
+        let row = ry + (line_b - scroll) as u16;
+        click(&mut s, 1, row);
+        let flags = expanded_flags(&s);
+        assert!(
+            flags.iter().all(|(i, e)| *e == (*i == item_b)),
+            "mid-scroll click toggles the painted group: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn hit_identity_survives_invisible_items_between_groups() {
+        let mut s = test_state();
+        s.transcript.push_user("q".into());
+        // A silent successful probe group renders NOTHING — its transcript
+        // item still occupies an index the hit map must step over.
+        s.transcript.push_tool_started(
+            ToolCallId::new("s1"),
+            "run_command".into(),
+            r#"{"program":"ls"}"#.into(),
+            false,
+            0,
+        );
+        s.transcript
+            .complete_tool(&ToolCallId::new("s1"), true, "".into(), 3);
+        s.transcript.push_user("between".into());
+        finished_tool(&mut s, "w1", "grep", r#"{"pattern":"x"}"#);
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        assert_eq!(hits.len(), 1, "only the visible work group: {hits:?}");
+        let (line, item) = hits[0];
+        let row = screen_row_of(&s, line);
+        click(&mut s, 1, row);
+        let flags = expanded_flags(&s);
+        assert!(
+            flags.iter().any(|(i, e)| *i == item && *e),
+            "the click toggles the grep group, not the silent one: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn hundred_group_history_random_clicks_land() {
+        let mut s = test_state();
+        s.conversation_rect = Some((0, 2, 100, 24));
+        for i in 0..100 {
+            s.transcript.push_user(format!("turn {i}"));
+            finished_tool(
+                &mut s,
+                &format!("g{i}"),
+                if i % 3 == 0 { "grep" } else { "read_file" },
+                &format!(r#"{{"path":"f{i}.rs"}}"#),
+            );
+        }
+        let (lines, hits) = s.conversation_lines_and_hits(100);
+        assert_eq!(hits.len(), 100);
+        let (_, ry, _, rh) = s.conversation_rect.unwrap();
+        let max_scroll = lines.len().saturating_sub(rh as usize);
+        // Deterministic spread of historical picks: near start, middle, end.
+        for pick in [3usize, 49, 71, 96] {
+            let (line, item) = s.conversation_lines_and_hits(100).1[pick];
+            let scroll = line.saturating_sub(rh as usize / 2).min(max_scroll);
+            s.conversation_auto_scroll = false;
+            s.conversation_scroll = scroll;
+            let row = ry + (line - scroll) as u16;
+            click(&mut s, 1, row);
+            let flags = expanded_flags(&s);
+            assert!(
+                flags.iter().all(|(i, e)| *e == (*i == item)),
+                "pick {pick}: exactly one group open"
+            );
+            // Fold back so the next pick starts from a collapsed history.
+            let hits = s.conversation_lines_and_hits(100).1.as_ref().clone();
+            let (line2, _) = *hits.iter().find(|(_, i)| *i == item).unwrap();
+            let scroll2 = line2.saturating_sub(rh as usize / 2);
+            let total = s.conversation_lines_and_hits(100).0.len();
+            let scroll2 = scroll2.min(total.saturating_sub(rh as usize));
+            s.conversation_scroll = scroll2;
+            let row2 = ry + (line2 - scroll2) as u16;
+            click(&mut s, 1, row2);
+        }
+        assert!(
+            expanded_flags(&s).iter().all(|(_, e)| !e),
+            "history fully folded again"
+        );
+    }
+
+    #[test]
+    fn live_edge_click_lands_while_auto_following() {
+        let mut s = test_state();
+        // Dynamic chrome: the painted viewport (height 22) is NOT what a
+        // rows-minus-constant guess would give for size (80, 40) — busy
+        // status, an active plan, and a tall composer all shrink it.
+        s.conversation_rect = Some((0, 5, 80, 22));
+        for i in 0..40 {
+            s.transcript.push_user(format!("filler row {i}"));
+        }
+        three_groups(&mut s);
+        // Live edge: the renderer has been auto-following; the pinned scroll
+        // value in state is stale (never synced since the user last scrolled).
+        s.conversation_auto_scroll = true;
+        s.conversation_scroll = 0;
+
+        let (lines, hits) = s.conversation_lines_and_hits(80);
+        let total = lines.len();
+        let (_, ry, _, rh) = s.conversation_rect.unwrap();
+        let live_scroll = total.saturating_sub(rh as usize);
+        let (line_c, item_c) = *hits.last().unwrap();
+        assert!(
+            line_c >= live_scroll,
+            "fixture: the last disclosure must be on the live screen"
+        );
+        let row = ry + (line_c - live_scroll) as u16;
+        click(&mut s, 1, row);
+
+        for (i, expanded) in expanded_flags(&s) {
+            assert_eq!(
+                expanded,
+                i == item_c,
+                "the click must land on the group painted under the cursor"
+            );
+        }
+        assert!(s.selection.anchor.is_none(), "no selection began");
+        // The viewport was frozen exactly where the live edge was painted —
+        // leaving auto-follow must not make the screen jump.
+        assert!(!s.conversation_auto_scroll);
+        assert_eq!(
+            s.conversation_scroll, live_scroll,
+            "pin must capture the painted scroll, not a stale or guessed one"
+        );
+    }
+
+    #[test]
+    fn bottom_aligned_short_transcript_clicks_land_on_each_group() {
+        let mut s = test_state();
+        three_groups(&mut s);
+        // Short transcript renders bottom-aligned: pad rows precede content.
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        assert_eq!(hits.len(), 3);
+        for (line, item) in hits {
+            let row = screen_row_of(&s, line);
+            click(&mut s, 40, row); // any column on the row is a target
+            let flags = expanded_flags(&s);
+            assert!(
+                flags.iter().all(|(i, e)| *e == (*i == item)),
+                "row {line} must toggle item {item} only: {flags:?}"
+            );
+            let row = screen_row_of(&s, line);
+            click(&mut s, 40, row); // fold back before the next round
+        }
     }
 
     #[test]

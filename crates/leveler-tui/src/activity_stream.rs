@@ -31,17 +31,11 @@ pub(crate) fn render_group(
     now_elapsed_secs: u64,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    // Tool activity earns its rows while it is happening — which call is still
+    // A group earns its rows while it is happening — which call is still
     // running, what a command printed — and stops earning them the moment it
-    // finishes, because the answer below carries the result. So a finished
-    // group states that it happened and gets out of the way; Ctrl+O reopens it.
-    //
-    // Edits are the exception, handled inside the loop: a diff is not a step
-    // toward the result, it IS the result.
-    // A batch earns its rows while it is happening — which call is still
-    // running, what a command printed — and stops earning them the moment it
-    // finishes, because the answer below carries the result. A single call is
-    // already one row after its detail is folded in, so only batches collapse.
+    // finishes: every finished work group (single calls included) folds to
+    // its clickable ▸ disclosure row; a click (or Ctrl+O for the latest)
+    // reopens it.
     //
     // Edits are the exception: a diff is not a step toward the result, it IS
     // the result, and folding it would erase the only record of what changed.
@@ -137,22 +131,55 @@ pub(crate) fn render_group(
     out
 }
 
-/// Work-tool classification for disclosure labels: 1=shell, 2=read,
-/// 3=search, 0=other (bookkeeping/plan/goal — never folded into a
-/// disclosure, their status lines carry meaning of their own).
-fn disclosure_kind(name: &str) -> u8 {
-    match name {
-        "run_command" | "shell_command" => 1,
-        "read_file" | "read_symbol" => 2,
-        "grep" | "find_files" | "find_symbol" | "find_references" | "list_files" => 3,
-        _ => 0,
+/// Presentation class of one call for the disclosure contract, derived from
+/// the tool taxonomy — NOT a second tool-name registry. A tool the taxonomy
+/// has never heard of (MCP / future extension) is ordinary finished work and
+/// falls back to the generic "Ran N tools" label instead of losing its
+/// disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisclosureClass {
+    /// Shell commands — "Ran N shell commands".
+    Shell,
+    /// File/symbol reads — "Read N files".
+    Read,
+    /// Searches and LSP lookups — "Searched codebase".
+    Search,
+    /// Any other user-visible finished work, including unknown tools.
+    Work,
+    /// Keeps its own presentation, never folded into a disclosure:
+    /// plan/goal bookkeeping, user interaction, edits, and the
+    /// unsupported-delegation warning.
+    Excluded,
+}
+
+fn disclosure_class(name: &str) -> DisclosureClass {
+    use crate::tool_taxonomy::ToolKind;
+    let Some(entry) = crate::tool_taxonomy::lookup(name) else {
+        return DisclosureClass::Work;
+    };
+    match entry.kind {
+        // Task management shares the Execute kind but is not a shell command.
+        ToolKind::Execute if matches!(name, "run_command" | "shell_command") => {
+            DisclosureClass::Shell
+        }
+        ToolKind::Execute => DisclosureClass::Work,
+        ToolKind::Read => DisclosureClass::Read,
+        // A symbol read is a read; the rest of the LSP kind is code lookup.
+        ToolKind::Lsp if name == "read_symbol" => DisclosureClass::Read,
+        ToolKind::Search | ToolKind::ListDir | ToolKind::Lsp => DisclosureClass::Search,
+        ToolKind::Edit | ToolKind::Write => DisclosureClass::Excluded,
+        ToolKind::Plan | ToolKind::Goal | ToolKind::AskUser => DisclosureClass::Excluded,
+        // The unsupported-delegation warning has bespoke rendering that a
+        // generic fold would hide.
+        ToolKind::Other if name == "task" => DisclosureClass::Excluded,
+        _ => DisclosureClass::Work,
     }
 }
 
 /// Whether this group renders a clickable `▸/▾` disclosure header as its
-/// first line: finished, non-edit, and every visible call is a WORK tool
-/// (shell/read/search). Bookkeeping like a denied plan update keeps its own
-/// warning presentation instead of being folded into "ran N tools".
+/// first line: finished, non-edit, and every visible call is ordinary work.
+/// Bookkeeping/interaction calls (a denied plan update, a permission request)
+/// keep their own presentation instead of being folded into "ran N tools".
 pub(crate) fn group_has_disclosure(group: &ToolGroupBlock) -> bool {
     if !group_is_finished(group) || group_has_edits(group) {
         return false;
@@ -162,7 +189,10 @@ pub(crate) fn group_has_disclosure(group: &ToolGroupBlock) -> bool {
         .iter()
         .filter(|c| is_conversation_visible(c))
         .collect();
-    !visible.is_empty() && visible.iter().all(|c| disclosure_kind(&c.name) != 0)
+    !visible.is_empty()
+        && visible
+            .iter()
+            .all(|c| disclosure_class(&c.name) != DisclosureClass::Excluded)
 }
 
 fn group_is_finished(group: &ToolGroupBlock) -> bool {
@@ -170,11 +200,17 @@ fn group_is_finished(group: &ToolGroupBlock) -> bool {
 }
 
 /// Edits render as a diff, which stays visible whatever the group's state.
+/// (`write_file` is kept by name so an out-of-taxonomy writer can never be
+/// folded away as generic work.)
 fn group_has_edits(group: &ToolGroupBlock) -> bool {
-    group
-        .calls
-        .iter()
-        .any(|c| matches!(c.name.as_str(), "apply_patch" | "replace" | "write_file"))
+    use crate::tool_taxonomy::ToolKind;
+    group.calls.iter().any(|c| {
+        c.name == "write_file"
+            || matches!(
+                crate::tool_taxonomy::lookup(&c.name).map(|e| e.kind),
+                Some(ToolKind::Edit | ToolKind::Write)
+            )
+    })
 }
 /// The disclosure row a finished group renders in both states: `▸ label`
 /// folded, `▾ label` open. The whole row is a click target (hit-tested by the
@@ -215,10 +251,15 @@ fn disclosure_line(
             ));
         }
     }
-    let total_ms: u64 = visible.iter().filter_map(|c| c.duration_ms).sum();
-    if total_ms >= 1000 {
+    // Only a single call has an authoritative duration (the runtime supplied
+    // it). Summing children fakes wall time for parallel batches — four 5s
+    // reads did not take 20s — so a multi-tool disclosure shows none.
+    if let [only] = visible
+        && let Some(ms) = only.duration_ms
+        && ms >= 1000
+    {
         spans.push(Span::styled(
-            format!(" · {:.1}s", total_ms as f64 / 1000.0),
+            format!(" · {:.1}s", ms as f64 / 1000.0),
             Style::default().fg(theme.dim),
         ));
     }
@@ -229,25 +270,32 @@ fn disclosure_line(
 /// user language, with correct singular/plural — never a generic "N tools"
 /// when the batch had one shape.
 fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> String {
+    use DisclosureClass::*;
     let n = visible.len();
-    let first = disclosure_kind(&visible[0].name);
-    let uniform = first != 0 && visible.iter().all(|c| disclosure_kind(&c.name) == first);
-    // "Shell command failed" only when the thing that failed IS a shell
-    // command; any other failed kind keeps its own label and lets the ✗
-    // glyph carry the failure.
-    if failed > 0 && n == 1 && first == 1 {
-        return t.disclosure_failed.to_string();
+    let class = disclosure_class(&visible[0].name);
+    let uniform = visible.iter().all(|c| disclosure_class(&c.name) == class);
+    // A single failure names itself: a failed shell command is "Shell command
+    // failed", a failed generic tool is "Tool failed" (never a success-shaped
+    // "Ran 1 tool"). Read/search keep their semantic label — the ✗ glyph and
+    // error line carry the failure.
+    if failed > 0 && n == 1 {
+        match class {
+            Shell => return t.disclosure_failed.to_string(),
+            Work => return t.disclosure_failed_tool.to_string(),
+            _ => {}
+        }
     }
     let parallel = visible.iter().filter(|c| c.parallel).count() >= 2;
     if parallel && !uniform {
         return t.disclosure_parallel.replace("{}", &n.to_string());
     }
-    match (uniform, first, n) {
-        (true, 1, 1) => t.disclosure_shell_one.to_string(),
-        (true, 1, _) => t.disclosure_shell_many.replace("{}", &n.to_string()),
-        (true, 2, 1) => t.disclosure_read_one.to_string(),
-        (true, 2, _) => t.disclosure_read_many.replace("{}", &n.to_string()),
-        (true, 3, _) => t.disclosure_search.to_string(),
+    match (uniform, class, n) {
+        (true, Shell, 1) => t.disclosure_shell_one.to_string(),
+        (true, Shell, _) => t.disclosure_shell_many.replace("{}", &n.to_string()),
+        (true, Read, 1) => t.disclosure_read_one.to_string(),
+        (true, Read, _) => t.disclosure_read_many.replace("{}", &n.to_string()),
+        (true, Search, _) => t.disclosure_search.to_string(),
+        (true, Work, 1) => t.disclosure_tools_one.to_string(),
         _ => t.disclosure_tools_many.replace("{}", &n.to_string()),
     }
 }
@@ -890,6 +938,153 @@ mod tests {
             open: false,
             expanded: false,
         }
+    }
+
+    #[test]
+    fn unknown_tool_folds_to_a_generic_disclosure() {
+        // MCP-style / future tool the taxonomy has never heard of.
+        let g = group(vec![call(
+            "mcp__demo__inspect",
+            r#"{"target":"repo"}"#,
+            ToolStatus::Ok,
+        )]);
+        let lines = render_group_text(&g, 80, Locale::Zh);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with('▸') && lines[0].contains("执行了 1 个工具"),
+            "unknown tools fall back to the generic label: {lines:?}"
+        );
+        let mut open = group(vec![call(
+            "mcp__demo__inspect",
+            r#"{"target":"repo"}"#,
+            ToolStatus::Ok,
+        )]);
+        open.expanded = true;
+        let lines = render_group_text(&open, 80, Locale::Zh);
+        assert!(lines[0].starts_with('▾'), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("{\"target\"")),
+            "expanded detail must not dump raw JSON args: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn known_work_tools_outside_shell_read_search_fold_too() {
+        // WebSearch kind → generic work disclosure.
+        let g = group(vec![call("web_search", r#"{"query":"x"}"#, ToolStatus::Ok)]);
+        let lines = render_group_text(&g, 80, Locale::Zh);
+        assert!(
+            lines[0].starts_with('▸') && lines[0].contains("执行了 1 个工具"),
+            "web tools are ordinary finished work: {lines:?}"
+        );
+        // LSP kind reads as search work.
+        let g = group(vec![call(
+            "diagnostics",
+            r#"{"path":"a.rs"}"#,
+            ToolStatus::Ok,
+        )]);
+        let lines = render_group_text(&g, 80, Locale::Zh);
+        assert!(
+            lines[0].starts_with('▸') && lines[0].contains("搜索了代码库"),
+            "LSP lookups read as codebase search: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn interaction_and_delegation_groups_never_fold() {
+        // request_permissions is an interaction, task is the unsupported-
+        // delegation warning — both keep their own presentation.
+        for (name, args) in [
+            ("request_permissions", r#"{"scope":"full"}"#),
+            ("task", r#"{"description":"do x"}"#),
+        ] {
+            let g = group(vec![call(name, args, ToolStatus::Ok)]);
+            assert!(
+                !group_has_disclosure(&g),
+                "{name} must not fold into a generic disclosure"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_work_group_folds_to_a_generic_count() {
+        let g = group(vec![
+            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            call("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok),
+            call(
+                "run_command",
+                r#"{"program":"cargo","args":["test"]}"#,
+                ToolStatus::Ok,
+            ),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines[0].starts_with('▸') && lines[0].contains("执行了 3 个工具"),
+            "a mixed sequential batch gets the generic count: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn failed_unknown_tool_names_the_failure() {
+        let mut c = call(
+            "mcp__demo__inspect",
+            r#"{"target":"x"}"#,
+            ToolStatus::Failed,
+        );
+        c.preview = Some("connection refused".into());
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines[0].starts_with('▸')
+                && lines[0].contains('✗')
+                && lines[0].contains("工具执行失败"),
+            "an unknown failed tool must not read like success: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("connection refused"),
+            "first error line rides along: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn group_duration_is_shown_for_a_single_call_only() {
+        // Single call: the runtime-supplied duration is authoritative.
+        let mut c = call(
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Ok,
+        );
+        c.duration_ms = Some(1250);
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(lines[0].contains("1.2s"), "{lines:?}");
+
+        // Multi-call group: summing child durations fakes wall time (four
+        // parallel 5s reads did NOT take 20s) — show no group duration.
+        let calls: Vec<ToolCallBlock> = (0..4)
+            .map(|i| {
+                let mut c = parallel_call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#));
+                c.duration_ms = Some(5000);
+                c
+            })
+            .collect();
+        let g = group(calls);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            !lines[0].contains("20.0s") && !lines[0].contains(" s") && !lines[0].contains("5.0s"),
+            "no derived duration on a multi-tool disclosure: {lines:?}"
+        );
+
+        // Missing duration: nothing, not 0s.
+        let mut c = call(
+            "run_command",
+            r#"{"program":"cargo","args":["build"]}"#,
+            ToolStatus::Ok,
+        );
+        c.duration_ms = None;
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(!lines[0].contains("0.0s"), "{lines:?}");
     }
 
     fn parallel_call(name: &str, args: &str) -> ToolCallBlock {

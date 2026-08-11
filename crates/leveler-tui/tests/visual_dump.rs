@@ -244,3 +244,163 @@ fn visual_inspect() {
         }
     }
 }
+
+/// Disclosure state matrix — every disclosure form the conversation can paint,
+/// at realistic / narrow / wide sizes. Eyeball harness like `visual_inspect`:
+///   cargo test -p leveler-tui --test visual_dump -- --ignored --nocapture
+#[test]
+#[ignore = "manual visual harness; run with --ignored --nocapture"]
+fn visual_disclosure_matrix() {
+    fn tool(s: &mut AppState, id: &str, name: &str, args: &str, ok: bool, preview: &str) {
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: name.into(),
+                arguments: args.into(),
+                parallel: false,
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                id: ToolCallId::new(id),
+                ok,
+                preview: preview.into(),
+                duration_ms: 1250,
+            }),
+        );
+    }
+    fn say(s: &mut AppState, id: &str, text: &str) {
+        let mid = MessageId::new(id.to_string());
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                message_id: mid.clone(),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                message_id: mid.clone(),
+                delta: text.into(),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: mid }),
+        );
+    }
+
+    let mut s = opened();
+    s.transcript.push_user("梳理 resolver 并跑一遍测试".into());
+    // V4: three historical disclosure kinds.
+    tool(
+        &mut s,
+        "v1",
+        "grep",
+        r#"{"pattern":"resolveUsage"}"#,
+        true,
+        "resolver.go:120",
+    );
+    say(&mut s, "m1", "先看读取结果。");
+    tool(
+        &mut s,
+        "v2",
+        "read_file",
+        r#"{"path":"resolver.go"}"#,
+        true,
+        "package resolver\nfunc x() {}",
+    );
+    say(&mut s, "m2", "跑一下测试。");
+    tool(
+        &mut s,
+        "v3",
+        "run_command",
+        r#"{"program":"cargo","args":["test"]}"#,
+        true,
+        "exit: 0\nok. 12 passed",
+    );
+    // V6: failure collapsed (first error rides along).
+    say(&mut s, "m3", "再跑一个失败的例子。");
+    tool(
+        &mut s,
+        "v4",
+        "run_command",
+        r#"{"program":"cargo","args":["bogus"]}"#,
+        false,
+        "error: no such command: `bogus`\nhelp dump line 2",
+    );
+    // V8/V9: mixed batch + MCP-style unknown tool fallback.
+    say(&mut s, "m4", "混合批次与未知工具。");
+    tool(
+        &mut s,
+        "v5",
+        "web_search",
+        r#"{"query":"ratatui scroll"}"#,
+        true,
+        "3 results",
+    );
+    say(&mut s, "m5", "MCP 工具。");
+    tool(
+        &mut s,
+        "v6",
+        "mcp__demo__inspect",
+        r#"{"target":"repo"}"#,
+        true,
+        "inspected",
+    );
+    // V10: edit + diff stays visible.
+    say(&mut s, "m6", "然后做一处修改。");
+    tool(
+        &mut s,
+        "v7",
+        "apply_patch",
+        "{\"patch\":\"*** Begin Patch\\n*** Update File: resolver.go\\n@@\\n-old\\n+new\\n*** End Patch\"}",
+        true,
+        "1 file changed",
+    );
+    say(&mut s, "m7", "完成。");
+
+    for (w, h, label) in [
+        (100u16, 30u16, "V4-V10 collapsed 100x30"),
+        (60, 20, "V14 narrow 60x20"),
+        (160, 50, "V15 wide 160x50"),
+    ] {
+        s.size = (w, h);
+        println!("\n╔══════ {label} ══════╗");
+        print!("{}", screen_dump(&mut s, w, h));
+    }
+
+    // V5: two historical groups expanded simultaneously (search + failure).
+    let group_indices: Vec<usize> = s
+        .transcript
+        .items()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            matches!(it, leveler_tui::transcript::TranscriptItem::ToolGroup(_)).then_some(i)
+        })
+        .collect();
+    s.transcript.toggle_tool_group_at(group_indices[0]);
+    s.transcript.toggle_tool_group_at(group_indices[3]);
+    s.size = (100, 40);
+    println!("\n╔══════ V5+V7 two expanded (search + failed shell) 100x40 ══════╗");
+    print!("{}", screen_dump(&mut s, 100, 40));
+
+    // V11/V12: running tool with busy status + active plan.
+    let mut live = opened();
+    live.transcript.push_user("构建一次".into());
+    reduce(
+        &mut live,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("r1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"cargo","args":["build"]}"#.into(),
+            parallel: false,
+        }),
+    );
+    live.status = leveler_client_protocol::RuntimeStatus::Busy;
+    println!("\n╔══════ V11/V12 running tool + busy 100x24 ══════╗");
+    print!("{}", screen_dump(&mut live, 100, 24));
+}

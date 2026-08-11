@@ -335,7 +335,7 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     },
     ToolTaxonomyEntry {
         name: "request_permissions",
-        kind: ToolKind::Other,
+        kind: ToolKind::AskUser,
         presentation_en: "Request Permissions",
         presentation_zh: "请求权限",
         read_only_default: true,
