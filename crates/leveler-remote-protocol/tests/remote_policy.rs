@@ -278,6 +278,22 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             },
             true,
         ),
+        (
+            "run_user_shell",
+            ClientCommand::RunUserShell {
+                session_id: session(),
+                command: "cargo test".to_string(),
+            },
+            false,
+        ),
+        (
+            "cancel_user_shell",
+            ClientCommand::CancelUserShell {
+                session_id: session(),
+                execution_id: leveler_client_protocol::UserShellId::new("ush-1"),
+            },
+            false,
+        ),
         ("quit", ClientCommand::Quit, false),
     ]
 }
