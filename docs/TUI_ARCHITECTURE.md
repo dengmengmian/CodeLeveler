@@ -1,7 +1,11 @@
 # TUI Architecture
 
-自 Architecture Hardening（基线 `eceb271`）起的 ownership 契约。改 TUI 前先读
-本文的 "Where should a future change go?"。改前审计见 `TUI_ARCHITECTURE_AUDIT.md`。
+**CURRENT** TUI ownership 契约（geometry 单一 owner 已在 `eceb271` 之后落地，
+基线见 `main@04a015b`）。改 TUI 前先读本文的 "Where should a future change go?"。
+
+改前审计（历史，描述 hardening **之前** 的 ownership）见
+`TUI_ARCHITECTURE_AUDIT.md`。全栈架构与 CURRENT/TARGET/DEBT 分界见
+`ARCHITECTURE.md` / `ARCHITECTURE.zh-CN.md`。
 
 ## 数据流（不变的骨架）
 

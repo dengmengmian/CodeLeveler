@@ -2,8 +2,10 @@
 
 | 文档 | 读者 | 说明 |
 | --- | --- | --- |
-| [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md) | 贡献者 | 架构与边界 |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 贡献者 | 英文架构 |
+| [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md) | 贡献者 | 权威架构：CURRENT / TARGET / DEBT / FUTURE |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | 贡献者 | 英文架构（与中文版语义对齐） |
+| [TUI_ARCHITECTURE.md](TUI_ARCHITECTURE.md) | 贡献者 | CURRENT TUI 所有权契约（geometry / conversation / presentation） |
+| [TUI_ARCHITECTURE_AUDIT.md](TUI_ARCHITECTURE_AUDIT.md) | 贡献者 | `eceb271` 改前 TUI 所有权审计（历史） |
 | [leveler-config-example.yaml](leveler-config-example.yaml) | 用户 | 项目 `.leveler/config.yaml` |
 | [permissions.example.yaml](permissions.example.yaml) | 用户 | 权限规则 |
 | [hooks.example.yaml](hooks.example.yaml) | 用户 | 工具钩子 |

@@ -2,8 +2,10 @@
 
 | Document | Audience | Notes |
 | --- | --- | --- |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | Stable crate boundaries and runtime flows |
-| [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md) | Contributors (中文) | Chinese architecture guide |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | Authoritative architecture: CURRENT / TARGET / DEBT / FUTURE |
+| [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md) | Contributors (中文) | Chinese architecture guide (parity with EN) |
+| [TUI_ARCHITECTURE.md](TUI_ARCHITECTURE.md) | Contributors | CURRENT TUI ownership contract (geometry, conversation, presentation) |
+| [TUI_ARCHITECTURE_AUDIT.md](TUI_ARCHITECTURE_AUDIT.md) | Contributors | Pre-hardening TUI ownership audit at `eceb271` (historical) |
 | [leveler-config-example.yaml](leveler-config-example.yaml) | Users | Project `.leveler/config.yaml` schema |
 | [permissions.example.yaml](permissions.example.yaml) | Users | Permission rules file |
 | [hooks.example.yaml](hooks.example.yaml) | Users | Pre/post tool hooks |

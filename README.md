@@ -5,7 +5,7 @@
 <h1 align="center">CodeLeveler</h1>
 
 <p align="center">
-  <strong>From a coding request to a reviewable diff, in one terminal workflow.</strong>
+  <strong>From a coding request to a reviewable diff — local-first coding agent runtime.</strong>
 </p>
 
 <p align="center">
@@ -14,10 +14,17 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 License"></a>
 </p>
 
-CodeLeveler is a terminal coding agent that can inspect, edit, run, and verify
-real repositories. Work interactively in the TUI or automate a task from the
-CLI. Sessions, permissions, and project state stay on your machine; model
-requests go only to the provider you configure.
+CodeLeveler is a **local-first coding agent runtime** with terminal and browser
+clients, built around a persistent execution engine that can inspect, edit,
+run, and verify real repositories. Work interactively in the TUI, use the Web
+UI, or automate a task from the CLI. Sessions, permissions, and project state
+stay on your machine; model requests go only to the provider you configure.
+
+The primary product surface today is the terminal coding workflow; the same
+runtime also powers `leveler web` and a host-side remote bridge. Desktop/mobile
+APP productization, long-running NPC workflows, and a Capability/Extension
+framework are architectural directions — not all shipped yet. See
+[Architecture](docs/ARCHITECTURE.md) for CURRENT vs TARGET vs FUTURE.
 
 Windows, macOS, and Linux are tested in CI. CodeLeveler is currently in public
 beta (`0.1.x`).
@@ -30,7 +37,7 @@ together:
 
 | Tool | Focus |
 | --- | --- |
-| **CodeLeveler** | Inspect, edit, run, and verify code in the terminal |
+| **CodeLeveler** | Inspect, edit, run, and verify code via a persistent local runtime (TUI, Web, CLI) |
 | [AgentGate](https://github.com/dengmengmian/agentgate-ai) | Adapt model APIs behind one local gateway |
 | [ReviewGate](https://github.com/dengmengmian/ReviewGate) | Review code changes and surface high-confidence issues |
 
@@ -38,6 +45,9 @@ together:
 
 - **A complete coding loop.** Explore a repository, make focused edits, run
   project checks, repair failures, and leave a reviewable diff.
+- **One runtime, multiple clients.** TUI and Web share the same client protocol
+  (`ClientCommand` / `RuntimeEvent` / snapshots); work can outlive a single
+  terminal process on platforms that support the local daemon.
 - **Control stays with you.** Typed tools, approval rules, workspace boundaries,
   checkpoints, and platform-aware command isolation constrain what the agent
   may do.
@@ -170,7 +180,8 @@ discard.
 
 | Need | Command |
 | --- | --- |
-| Work interactively | `leveler` |
+| Work interactively (TUI) | `leveler` |
+| Browser UI (same runtime) | `leveler web` |
 | Run one task | `leveler run "add validation to the order endpoint"` |
 | Resume previous work | `leveler resume <session-id>` |
 | Long task until done | TUI `/goal …`, or `leveler run "…" --collaboration goal` |
@@ -180,8 +191,9 @@ discard.
 On macOS/Linux, a long-running interactive session can use `leveler serve` in
 one terminal and `leveler` in another. The TUI reconnects to the
 repository-local runtime instead of tying the work to one terminal process.
-Windows supports persisted sessions and `resume`, but this daemon transport is
-not available there yet.
+`leveler web` attaches to the same runtime contract (in-process or via
+`leveler serve --tcp`). Windows supports persisted sessions and `resume`, but
+the daemon socket transport is not available there yet.
 
 ## What happens during a task
 

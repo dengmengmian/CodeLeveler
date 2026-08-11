@@ -5,7 +5,7 @@
 <h1 align="center">CodeLeveler</h1>
 
 <p align="center">
-  <strong>从编程需求到可审查的 diff，在一个终端工作流里完成。</strong>
+  <strong>从编程需求到可审查的 diff — 本地优先的编程代理运行时。</strong>
 </p>
 
 <p align="center">
@@ -14,9 +14,15 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 License"></a>
 </p>
 
-CodeLeveler 是一个终端编程代理，可以理解、修改、运行并验证真实项目。你既可以
-在 TUI 里交互，也可以通过 CLI 自动执行单个任务。会话、权限和项目状态保存在本机；
-模型请求只发送给你配置的 provider。
+CodeLeveler 是**本地优先的编程代理运行时**，提供终端与浏览器客户端，围绕可持久
+化的执行引擎理解、修改、运行并验证真实仓库。你可以在 TUI 里交互、使用 Web UI，
+或通过 CLI 自动执行任务。会话、权限和项目状态保存在本机；模型请求只发送给你
+配置的 provider。
+
+当前主产品面是终端编程工作流；同一 runtime 也驱动 `leveler web` 与 host 侧远程
+bridge。完整桌面/移动 APP、长期运行的 NPC 工作流、Capability/Extension 框架是
+架构方向，**并非全部已交付**。CURRENT / TARGET / FUTURE 见
+[架构说明](docs/ARCHITECTURE.zh-CN.md)。
 
 Windows、macOS 和 Linux 均纳入 CI。CodeLeveler 目前处于 public beta
 （`0.1.x`）。
@@ -28,7 +34,7 @@ Windows、macOS 和 Linux 均纳入 CI。CodeLeveler 目前处于 public beta
 
 | 工具 | 专注于 |
 | --- | --- |
-| **CodeLeveler** | 在终端中理解、修改、运行并验证代码 |
+| **CodeLeveler** | 通过可持久化的本地 runtime 理解、修改、运行并验证代码（TUI / Web / CLI） |
 | [AgentGate](https://github.com/dengmengmian/agentgate-ai) | 通过一个本地网关适配不同模型 API |
 | [ReviewGate](https://github.com/dengmengmian/ReviewGate) | 审查代码改动并筛出高置信问题 |
 
@@ -36,6 +42,8 @@ Windows、macOS 和 Linux 均纳入 CI。CodeLeveler 目前处于 public beta
 
 - **完成整个编程闭环。** 理解仓库、进行聚焦修改、运行项目检查、修复失败，最后
   留下可以审查的 diff。
+- **一个 runtime，多种客户端。** TUI 与 Web 共享同一客户端协议（`ClientCommand`
+  / `RuntimeEvent` / 快照）；在支持本地 daemon 的平台上，工作可长过单个终端进程。
 - **控制权在用户手里。** 类型化工具、审批规则、工作区边界、检查点和平台级命令
   隔离共同约束代理能做什么。
 - **随时恢复已保存的工作。** SQLite 会话保存对话、待审批操作、工具结果、diff 和
@@ -160,6 +168,7 @@ worktree 开始，确保所有修改都能轻松审查或丢弃。
 | 需要 | 命令 |
 | --- | --- |
 | 在 TUI 中交互 | `leveler` |
+| 浏览器 UI（同一 runtime） | `leveler web` |
 | 执行单个任务 | `leveler run "给下单接口加校验"` |
 | 长任务 / 交付到完成为止 | TUI `/goal …`，或 `leveler run "…" --collaboration goal` |
 | 更严的交付门禁 | `--work-mode delivery` 或 TUI `/work-mode delivery` |
@@ -171,7 +180,8 @@ worktree 开始，确保所有修改都能轻松审查或丢弃。
 
 在 macOS/Linux 上，长时间交互可以在一个终端运行 `leveler serve`，在另一个终端
 运行 `leveler`。TUI 会重连仓库对应的本地 runtime，工作不再依赖某一个终端进程。
-Windows 支持持久化会话和 `resume`，但目前还不支持这种 daemon transport。
+`leveler web` 接入同一 runtime 契约（进程内，或经 `leveler serve --tcp`）。
+Windows 支持持久化会话和 `resume`，但目前还不支持 daemon socket transport。
 
 ## 一次任务会经历什么
 

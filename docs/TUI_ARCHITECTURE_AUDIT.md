@@ -1,7 +1,11 @@
 # TUI Architecture Audit
 
-基线 `eceb271`（TUI Correctness 已 PASS）。本文档是 Architecture Hardening 的
-改前审计：当前 ownership 实况、变更半径、重复知识。改造原则见结尾。
+> **历史文档。** 基线 `eceb271`（TUI Correctness 已 PASS）的 **改前** 审计。
+> Geometry / conversation / presentation 所有权 hardening 已在后续 commit
+> 落地；**CURRENT** 契约以 [`TUI_ARCHITECTURE.md`](TUI_ARCHITECTURE.md) 为准。
+> 下文「当前 ownership」指 hardening **之前** 的实况，勿当作今日代码地图。
+
+基线 `eceb271`。当时的 ownership 实况、变更半径、重复知识如下。改造原则见结尾。
 
 ## Current Ownership（实况，非注释宣称）
 
