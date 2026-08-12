@@ -9,6 +9,7 @@
 
 pub mod budget;
 pub mod environment;
+pub mod home;
 pub mod ids;
 pub mod ownership;
 pub mod text;
@@ -19,6 +20,7 @@ pub use environment::{
     EnvSnapshot, environment, git_diff_stdout, git_stdout, install_environment,
     is_credential_env_name, leveler_home_dir, leveler_home_dir_from, scrubbed_environment,
 };
+pub use home::LevelerHome;
 pub use ids::{
     ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, RequestId,
     RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, UserShellId, new_uuid_string,
