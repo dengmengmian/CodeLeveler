@@ -286,4 +286,74 @@ mod tests {
             "temp fallback should be /tmp/leveler-<pid>, got {root:?}"
         );
     }
+
+    /// Architecture tripwire: home paths must be built through [`LevelerHome`],
+    /// never re-derived ad hoc. Two idioms are how that decays, so both are
+    /// banned in `crates/*/src` (this authority file excepted):
+    ///
+    /// - `from(".leveler")` — a cwd-relative fallback that writes runtime state
+    ///   into whatever directory the process launched from (the exact workspace
+    ///   pollution this module exists to prevent).
+    /// - `|home| home.join(` — joining a fixed sub-path onto a bare home root
+    ///   instead of asking `LevelerHome` for a named accessor.
+    ///
+    /// A new home sub-path should get a `LevelerHome` accessor, not a raw join.
+    #[test]
+    fn no_crate_rebuilds_home_paths_by_hand() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/leveler-core has a parent");
+        let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/home.rs");
+
+        const BANNED: [(&str, &str); 2] = [
+            (
+                "from(\".leveler\")",
+                "cwd-relative `.leveler` fallback — resolve via LevelerHome::resolve",
+            ),
+            (
+                "|home| home.join(",
+                "raw join onto the home root — add/use a LevelerHome accessor",
+            ),
+        ];
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![crates.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Only scan crate source trees, and skip build artifacts.
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path == this_file {
+                    continue;
+                }
+                // Only production source under a `src/` dir; test trees may name
+                // these idioms as fixtures.
+                if !path.components().any(|c| c.as_os_str() == "src") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (needle, why) in BANNED {
+                    if text.contains(needle) {
+                        offenders.push(format!("{}: {needle} — {why}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "home paths must go through LevelerHome:\n{}",
+            offenders.join("\n")
+        );
+    }
 }
