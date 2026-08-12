@@ -203,6 +203,15 @@ Engine、Agent Loop、工具 + MCP、execution、client protocol、持久化。
 模式（`update_goal` 直到 complete 或 blocked）与可选的 `spawn_agent` 扇出。
 日志里遗留的 `orchestrate` kind 会被接受并按 direct 跑。
 
+**一个 goal 跨多个 bounded work window，而不是一个巨大的 turn。** 单 turn 的
+100-round 上限结束的是一个 *work window*，不是整个 goal：supervisor
+（`DefaultSupervisorPolicy::after_turn`）会开下一个 window（`DriveGoalAgain`，
+一个重述目标的全新 turn）而非直接失败。窗口受双重 bound——内存级跨窗
+no-progress 计数器（`MAX_NO_PROGRESS_WINDOWS`，被实质工作区改动重置）在绝对
+`MAX_SUPERVISED_TURNS` 上限之下——所以卡住的 goal 会收敛而非空转。用尽 round
+预算的窗口是 `BudgetLimited`（未完成、可恢复），**不是** `Failed`。goal 身份即
+session；window 预算在内存中（daemon 崩溃后的窗口恢复是未来工作，非当前）。
+
 ---
 
 ## 宿主执行边界
@@ -213,6 +222,13 @@ Engine、Agent Loop、工具 + MCP、execution、client protocol、持久化。
 - `PermissionProfile`、`RiskLevel`、审批策略
 - 进程执行（`CommandRunner`）、沙箱后端、取消
 - 检查点、后台进程、artifact
+
+**执行宿主在 daemon 里，不在 client。** 审批是每 session 的策略
+（`ApprovalPolicy`，随 trusted-local 的 `CreateSessionRequest` 下发）：
+`--auto-approve` 是在 daemon 上选一个无人值守的 session，而不是把 runtime 嵌进
+TUI 进程——因此长跑的 goal 能熬过 client 断连，reconnect 能恢复仍在运行的 turn。
+remote/web client 不能把自己的 session 提升为 auto-approve——边界会把它强制
+重置回 interactive。
 
 平台控制（显式能力探测，从不虚报）：
 
