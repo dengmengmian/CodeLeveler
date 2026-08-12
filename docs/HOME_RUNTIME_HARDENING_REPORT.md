@@ -78,13 +78,36 @@ SHA-256 of the canonical repo path.
 
 ---
 
+## Merge closeout (review round)
+
+Review of the pushed branch surfaced two MAJOR findings; both are now CLOSED.
+
+**H-1 — Canonical home authority was incomplete (was: the tool cache escaped
+canonical ownership).** `prepare_sandbox_paths()` still resolved its owner via
+the raw `leveler_home_dir()` with a multi-candidate fallback, so the tool cache
+was created at `<owner>/tool-cache/<hash>` (not `cache/tools`) and could land in
+`$HOME/.cache/codeleveler-private` or a temp dir — outside the one authoritative
+home. Fixed: it now resolves a single `LevelerHome`, validates the root is
+outside the workspace (rejecting even a home reachable *through* a
+workspace-planted symlink, on the raw path before any resolve), and derives the
+scratch and tool-cache roots from `sandboxes_dir()` / `tool_cache_dir()`
+(`run/sandboxes`, `cache/tools`) — no `codeleveler-private`, no bare
+`tool-cache`, no silent fallback. A poisoned `LEVELER_HOME` now fails closed
+instead of inventing another namespace. The tripwire was strengthened to also
+ban the bare resolver `leveler_home_dir(` and the `"tool-cache"` literal in
+business `src`.
+
+**H-2 — Background command dropped its lease before the scratch ended.**
+`into_scratch()` returned a naked `TempDir`, dropping the `SandboxLeaseGuard`
+while a backgrounded command still used the scratch. Fixed structurally: it now
+returns an owned `SandboxScratch` carrying both the `TempDir` and the lease, so
+`lease lifetime == actual scratch lifetime`. Tests S1–S7 cover synchronous hold,
+lease-survives-transfer, drop-reclaims, crash-orphan reclaim, live-lease
+survival, and fail-closed-without-a-lock. The previously-accepted residual is
+withdrawn — CLOSED.
+
 ## Residuals (accepted)
 
-- A command **backgrounded** via `into_scratch` releases its lock sidecar when
-  its `SandboxPaths` is consumed; if the daemon then crashes, that one scratch
-  dir orphans with no lock and the fail-closed reaper won't reclaim it. Rare,
-  disposable, and under `run/sandboxes/`. The common (synchronous) path keeps
-  its lock to the end, so its crash orphan *is* reclaimed.
 - Global user-config files (`hooks.yaml`, `permissions.yaml`, `trusted.yaml`,
   `agents/`, `skills/`) stay at the home **root** (user-owned config, not the
   six machine namespaces). They now route through `LevelerHome` accessors, so

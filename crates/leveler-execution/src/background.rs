@@ -128,8 +128,13 @@ struct TaskInner {
     log_pumps_remaining: u8,
     /// Taken once by wait-end accounting so restore/diff runs at most once.
     mutation_baseline: Option<MutationBaseline>,
-    /// Keeps the private temp tree alive until the child and log pumps finish.
-    /// [`finalize_if_drained`] drops it immediately at that point.
+    /// Keeps the private scratch (and, on macOS/Linux, its OS lease) alive
+    /// until the child and log pumps finish — so a backgrounded command holds
+    /// its lease for its whole life. [`finalize_if_drained`] drops it at that
+    /// point. On other platforms there is no lease, just the temp tree.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    sandbox_scratch: Option<crate::command::SandboxScratch>,
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     sandbox_scratch: Option<tempfile::TempDir>,
 }
 
@@ -758,7 +763,16 @@ mod tests {
             process_done: true,
             log_pumps_remaining: 0,
             mutation_baseline: None,
-            sandbox_scratch: Some(scratch),
+            sandbox_scratch: {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    Some(crate::command::SandboxScratch::unleased(scratch))
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    Some(scratch)
+                }
+            },
         };
 
         finalize_if_drained(&mut task);

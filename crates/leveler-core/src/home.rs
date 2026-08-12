@@ -329,14 +329,21 @@ mod tests {
     }
 
     /// Architecture tripwire: home paths must be built through [`LevelerHome`],
-    /// never re-derived ad hoc. Two idioms are how that decays, so both are
-    /// banned in `crates/*/src` (this authority file excepted):
+    /// never re-derived ad hoc. These idioms are how that decays, so all are
+    /// banned in `crates/*/src` (the two authority files — this one and
+    /// `environment.rs`, which define resolution — excepted):
     ///
     /// - `from(".leveler")` — a cwd-relative fallback that writes runtime state
     ///   into whatever directory the process launched from (the exact workspace
     ///   pollution this module exists to prevent).
     /// - `|home| home.join(` — joining a fixed sub-path onto a bare home root
     ///   instead of asking `LevelerHome` for a named accessor.
+    /// - `leveler_home_dir(` — the bare snapshot resolver. Business code must
+    ///   go through `LevelerHome::resolve`; the sanctioned bridge for
+    ///   `Option`-returning callers is `leveler_home_dir_from(..).map(|root|
+    ///   LevelerHome::from_root(root).<accessor>())`, which is not this needle.
+    /// - `"tool-cache"` — the pre-canonical cache dir; the tool cache is
+    ///   `LevelerHome::tool_cache_dir()` (`cache/tools`).
     ///
     /// A new home sub-path should get a `LevelerHome` accessor, not a raw join.
     #[test]
@@ -344,9 +351,15 @@ mod tests {
         let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crates/leveler-core has a parent");
-        let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/home.rs");
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // The path-resolution authority: these two files legitimately name the
+        // raw resolver and the layout literals.
+        let exempt = [
+            manifest.join("src/home.rs"),
+            manifest.join("src/environment.rs"),
+        ];
 
-        const BANNED: [(&str, &str); 2] = [
+        const BANNED: [(&str, &str); 4] = [
             (
                 "from(\".leveler\")",
                 "cwd-relative `.leveler` fallback — resolve via LevelerHome::resolve",
@@ -354,6 +367,15 @@ mod tests {
             (
                 "|home| home.join(",
                 "raw join onto the home root — add/use a LevelerHome accessor",
+            ),
+            (
+                "leveler_home_dir(",
+                "bare home resolver — go through LevelerHome::resolve (or the \
+                 leveler_home_dir_from(..)→LevelerHome::from_root bridge)",
+            ),
+            (
+                "\"tool-cache\"",
+                "pre-canonical cache dir — use LevelerHome::tool_cache_dir()",
             ),
         ];
 
@@ -373,7 +395,7 @@ mod tests {
                     stack.push(path);
                     continue;
                 }
-                if path.extension().is_none_or(|e| e != "rs") || path == this_file {
+                if path.extension().is_none_or(|e| e != "rs") || exempt.contains(&path) {
                     continue;
                 }
                 // Only production source under a `src/` dir; test trees may name
