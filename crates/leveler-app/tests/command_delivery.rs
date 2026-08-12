@@ -194,6 +194,46 @@ async fn reused_command_id_with_different_payload_is_rejected() {
     );
 }
 
+/// M-3 — a trusted-local AutoApprove session keeps its policy per-session, and a
+/// session known only from the DB (a restore) is fail-closed to Interactive: an
+/// AutoApprove policy is never persisted and re-granted on restore.
+#[tokio::test]
+async fn auto_approve_is_per_session_and_restore_is_fail_closed() {
+    use leveler_client_protocol::ApprovalPolicy;
+    let (_tmp, _app, client, restored_session) = build_client().await;
+
+    // `restored_session` was created via the Application (a DB record) and is not
+    // in this client's live config map → it resolves through the DB-restore path.
+    assert_eq!(
+        client.effective_approval_policy(&restored_session).await,
+        ApprovalPolicy::Interactive,
+        "a restored session must never auto-approve — the policy is not persisted"
+    );
+
+    // A trusted-local create with AutoApprove is honored and stored per-session.
+    let approving = client
+        .create_session(CreateSessionRequest {
+            approval_policy: ApprovalPolicy::AutoApprove,
+            goal: "unattended".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .effective_approval_policy(&approving.session.id)
+            .await,
+        ApprovalPolicy::AutoApprove
+    );
+
+    // The other session is unaffected — policy is per-session, not global.
+    assert_eq!(
+        client.effective_approval_policy(&restored_session).await,
+        ApprovalPolicy::Interactive
+    );
+}
+
 #[tokio::test]
 async fn daemon_session_runtime_options_are_isolated_per_session() {
     let (_tmp, app, client, _existing_session) = build_client().await;

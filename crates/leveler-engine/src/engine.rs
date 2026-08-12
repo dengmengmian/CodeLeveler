@@ -130,6 +130,20 @@ fn merge_continued_outcome(
 /// the product interpretation of the report (a passing gate upgrades a mere
 /// "answered" to completed; a failed verification reads as incomplete), moved
 /// here from the app layer so the engine is the single lifecycle writer.
+/// The goal-invocation no-progress window counter update. A window that made
+/// material progress (grew the modified-file set) resets it to 0; one that did
+/// not increments it. `after_turn` stops opening windows once it reaches
+/// `MAX_NO_PROGRESS_WINDOWS`, so a stuck goal converges in a couple of windows
+/// rather than burning the absolute `MAX_SUPERVISED_TURNS` ceiling. Extracted so
+/// the hard-bound termination is unit-testable without a live model.
+pub(crate) fn advance_no_progress_windows(current: u32, made_progress: bool) -> u32 {
+    if made_progress {
+        0
+    } else {
+        current.saturating_add(1)
+    }
+}
+
 pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentState) {
     use StopReason as S;
     let verification_failed = report
@@ -1245,12 +1259,10 @@ impl TaskEngine {
             // A window that grew the modified-file set made material progress and
             // resets the counter; one that touched nothing new counts toward the
             // no-progress-window cap the policy enforces on the next decision.
-            if outcome.modified_files.len() > progress_mark {
-                progress_mark = outcome.modified_files.len();
-                windows_without_progress = 0;
-            } else {
-                windows_without_progress = windows_without_progress.saturating_add(1);
-            }
+            let made_progress = outcome.modified_files.len() > progress_mark;
+            progress_mark = outcome.modified_files.len();
+            windows_without_progress =
+                advance_no_progress_windows(windows_without_progress, made_progress);
         }
         Ok(outcome)
     }
@@ -1676,6 +1688,90 @@ mod continue_cap_tests {
                 caps,
             ),
             "engine must not open another turn after no-progress cap"
+        );
+    }
+
+    // M-2 — the multi-window loop is hard-bounded. These drive the SAME policy
+    // (`after_turn`) and the SAME counter rule (`advance_no_progress_windows`)
+    // that `supervise()` uses, in the same order, so the termination guarantee is
+    // exercised deterministically without a live model.
+    fn goal_ended(
+        progress: &ProgressLedger,
+        windows_without_progress: u32,
+    ) -> crate::TurnEnded<'_> {
+        crate::TurnEnded {
+            stop_reason: leveler_agent::StopReason::TurnLimitReached,
+            stop_detail: None,
+            progress,
+            budget_exhaustion: None,
+            modified_files: &[],
+            extensions_granted: 0,
+            round_budget: leveler_agent::ContinuationPolicy::UntilTerminal,
+            windows_without_progress,
+        }
+    }
+
+    #[test]
+    fn a_stuck_goal_stops_within_the_no_progress_cap_not_the_hard_bound() {
+        use crate::SupervisorPolicy;
+        use crate::continuation::MAX_NO_PROGRESS_WINDOWS;
+        let policy = crate::DefaultSupervisorPolicy::default();
+        let progress = ProgressLedger {
+            phase: leveler_lifecycle::TurnPhase::Active,
+            closing: false,
+            ..Default::default()
+        };
+        let mut wwp = 0u32;
+        let mut windows_opened = 0u32;
+        let mut stopped = false;
+        // Every window hits the ceiling and grows no files (no material progress).
+        for _ in 0..MAX_SUPERVISED_TURNS {
+            match policy.after_turn(&goal_ended(&progress, wwp)) {
+                crate::Continuation::Stop => {
+                    stopped = true;
+                    break;
+                }
+                _ => {
+                    windows_opened += 1;
+                    wwp = advance_no_progress_windows(wwp, /*made_progress*/ false);
+                }
+            }
+        }
+        assert!(
+            stopped,
+            "a stuck goal must stop, never reach the {MAX_SUPERVISED_TURNS}-window hard bound"
+        );
+        assert!(
+            windows_opened <= MAX_NO_PROGRESS_WINDOWS,
+            "opened {windows_opened} windows; must converge within the no-progress cap {MAX_NO_PROGRESS_WINDOWS} (< the {MAX_SUPERVISED_TURNS}-window hard bound)"
+        );
+    }
+
+    #[test]
+    fn even_a_progressing_never_completing_goal_is_capped_by_the_hard_bound() {
+        use crate::SupervisorPolicy;
+        let policy = crate::DefaultSupervisorPolicy::default();
+        let progress = ProgressLedger {
+            phase: leveler_lifecycle::TurnPhase::Active,
+            closing: false,
+            ..Default::default()
+        };
+        let mut wwp = 0u32;
+        let mut windows_opened = 0u32;
+        // Every window makes progress (counter resets), so the no-progress cap
+        // never fires — only the absolute MAX_SUPERVISED_TURNS bounds the loop.
+        for _ in 0..MAX_SUPERVISED_TURNS {
+            match policy.after_turn(&goal_ended(&progress, wwp)) {
+                crate::Continuation::Stop => break,
+                _ => {
+                    windows_opened += 1;
+                    wwp = advance_no_progress_windows(wwp, /*made_progress*/ true);
+                }
+            }
+        }
+        assert_eq!(
+            windows_opened, MAX_SUPERVISED_TURNS,
+            "a progressing goal opens windows up to — and never beyond — the hard bound"
         );
     }
 

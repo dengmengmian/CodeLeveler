@@ -311,6 +311,18 @@ impl InProcessRuntimeClient {
             .insert(session_id, self.default_runtime.clone());
     }
 
+    /// The effective approval policy the daemon would use for `session_id` —
+    /// the live per-session config if present, else the DB-restored config
+    /// (which never carries a persisted policy, so it falls back to
+    /// `Interactive`). A read-only diagnostic: lets a caller (and a regression)
+    /// confirm a restored session is fail-closed and never silently auto-approves.
+    pub async fn effective_approval_policy(&self, session_id: &SessionId) -> ApprovalPolicy {
+        self.runtime_config(session_id)
+            .await
+            .map(|config| config.approval_policy)
+            .unwrap_or(ApprovalPolicy::Interactive)
+    }
+
     async fn runtime_config(
         &self,
         session_id: &SessionId,

@@ -195,3 +195,67 @@ Once B-1 is closed at the boundary with a test, and M-2/M-3 tests are added, thi
 mergeable — no architectural rework is required.
 
 Per the review mandate: findings are reported only. No code changed, no merge, no push.
+
+---
+
+## R. Merge Blocker Closeout (follow-up, code changed)
+
+Sections A–Q above are the read-only review that recommended CHANGES REQUIRED. The
+findings were then fixed (4 files: `leveler-local-transport`, `leveler-app`,
+`leveler-engine`; no product-behavior change beyond the trust boundary and the
+extracted counter). Re-review below.
+
+### B-1 + M-1 — CLOSED
+Root-caused as one issue: the AutoApprove reset lived in a single client handler
+(web), so other session-creation entry points (the remote-agent bridge, the raw
+TCP/Unix wire handler) let a remote client carry `approval_policy = AutoApprove`.
+Fixed at the daemon's single wire trust boundary, reusing the existing `ClientKind`
+transport signal (which the bridge already sets to `Remote`):
+- `WireRequest::CreateSession` now carries the connection's `client_kind` (set by the
+  connecting client, never from a relayed body — unspoofable by a remote peer).
+- `handle_connection` computes the effective trust as the MORE restrictive of the
+  transport (TCP → always Remote) and the declared kind (the bridge → Remote), and
+  **rejects** an explicit AutoApprove from any Remote/TCP origin (observable error),
+  never silently elevates. A trusted-local `LocalInteractive` client over the Unix
+  socket is still honoured.
+- The web boundary keeps its `Interactive` reset (defence in depth; closes the
+  multi-project router → sub-daemon wire-forward path, where `ClientKind` does not
+  survive the hop).
+- serde default stays `Interactive`; a restored session is `Interactive`.
+Tests (leveler-local-transport): `remote_client_cannot_create_an_auto_approve_session`
+(the bridge path, rejected + never reaches the runtime), `tcp_origin_cannot_elevate_to_auto_approve`
+(TCP rejected regardless of declared kind), `trusted_local_may_create_an_auto_approve_session`
+(honoured), `remote_client_may_create_an_interactive_session` (safe policy allowed).
+
+### M-2 — CLOSED
+The no-progress counter rule is extracted into `advance_no_progress_windows`, which
+`supervise()` now calls, so the hard-bound termination is unit-testable without a live
+model. Tests (leveler-engine): `a_stuck_goal_stops_within_the_no_progress_cap_not_the_hard_bound`
+(a never-progressing goal stops within `MAX_NO_PROGRESS_WINDOWS`, never reaching the
+32-window ceiling) and `even_a_progressing_never_completing_goal_is_capped_by_the_hard_bound`
+(a never-completing but progressing goal is bounded by `MAX_SUPERVISED_TURNS`). Both run
+the real `after_turn` + the real counter rule in the same order as `supervise()`.
+
+### M-3 — CLOSED
+`auto_approve_is_per_session_and_restore_is_fail_closed` (leveler-app): a trusted-local
+AutoApprove session keeps its policy per-session; a session known only from the DB (a
+restore) resolves to `Interactive` — the policy is never persisted and re-granted.
+
+### m-1 — DEFERRED (unchanged)
+The coarse "new distinct file path" no-progress proxy remains a MINOR tradeoff, left to
+the backlog per the closeout scope.
+
+### Regression (canonical gates, on the closeout tree)
+`cargo fmt --all -- --check` PASS · `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` **0 warnings** · `cargo test --workspace --all-features
+--locked --no-fail-fast` **0 failures**.
+
+### Re-verdict
+**APPROVED FOR MERGE** — no BLOCKER, no unresolved MAJOR: remote/TCP cannot elevate
+(rejected at the daemon boundary + tested), trusted-local AutoApprove still works,
+session isolation and fail-closed restore hold, the multi-window hard bound has a
+deterministic regression, and the full workspace gates are green. Architecture
+conformance and the R2 lifecycle findings from A–Q are unchanged.
+
+Per the standing instruction: **do NOT merge and do NOT push main this turn** — this
+verdict is for human sign-off before the branch lands.
