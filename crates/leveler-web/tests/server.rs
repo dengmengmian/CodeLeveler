@@ -24,6 +24,33 @@ use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, Session
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
+/// Point the global home at an isolated temp dir for this test binary, so
+/// uploads land in `state/web/uploads` under it instead of the real
+/// `~/.leveler` or a cwd-relative path. The process-wide snapshot is
+/// install-once (first caller wins); every test then shares this home, which
+/// is why the upload assertions below are change-relative rather than
+/// absolute-count. Returns the resolved uploads directory.
+fn test_uploads_dir() -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let root = HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("leveler-web-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = leveler_core::EnvSnapshot::new(
+            [(
+                OsString::from("LEVELER_HOME"),
+                OsString::from(dir.as_os_str()),
+            )],
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        );
+        let _ = leveler_core::install_environment(snapshot);
+        dir
+    });
+    leveler_core::LevelerHome::from_root(root.clone()).web_uploads_dir()
+}
+
 /// A `LocalRuntimeService` facade over the protocol crate's mock, so tests
 /// drive session creation, commands, snapshots, and events deterministically.
 struct TestService {
@@ -99,6 +126,9 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        // Install the isolated test home before `bind` resolves the uploads
+        // directory into the app state.
+        let _ = test_uploads_dir();
         let service = Arc::new(TestService::new());
         let server = leveler_web::bind(
             service.clone(),
@@ -867,7 +897,7 @@ async fn attachments_store_uploads_and_deliver_commands() {
     let server = TestServer::start().await;
     let repo = tempfile::tempdir().unwrap();
     use_repository(&server, repo.path()).await;
-    let uploads = repo.path().canonicalize().unwrap().join(".leveler/uploads");
+    let uploads_root = test_uploads_dir();
 
     let form = reqwest::multipart::Form::new()
         .part(
@@ -893,6 +923,12 @@ async fn attachments_store_uploads_and_deliver_commands() {
         .map(|path| path.as_str().unwrap())
         .collect();
     assert_eq!(stored.len(), 2);
+    // Uploads land under the global home, never inside the workspace.
+    let uploads = uploads_root.canonicalize().unwrap();
+    assert!(
+        !uploads.starts_with(repo.path().canonicalize().unwrap()),
+        "uploads must not be stored inside the workspace: {uploads:?}"
+    );
     assert!(stored[0].starts_with(uploads.to_string_lossy().as_ref()));
     assert!(stored[0].ends_with("-note.txt"));
     assert_eq!(
@@ -998,6 +1034,10 @@ async fn attachments_reject_files_above_twenty_mib() {
     let server = TestServer::start().await;
     let repo = tempfile::tempdir().unwrap();
     use_repository(&server, repo.path()).await;
+    // The home uploads dir is shared across tests in this binary, so check for
+    // this upload's own residue by its unique file-name suffix rather than an
+    // absolute count (which other tests' files would perturb).
+    let uploads = test_uploads_dir();
     let form = reqwest::multipart::Form::new().part(
         "file",
         reqwest::multipart::Part::bytes(vec![0x5a; 20 * 1024 * 1024 + 1])
@@ -1011,8 +1051,14 @@ async fn attachments_reject_files_above_twenty_mib() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
-    let uploads = repo.path().join(".leveler/uploads");
-    assert_eq!(std::fs::read_dir(uploads).unwrap().count(), 0);
+    let residue = std::fs::read_dir(&uploads)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().ends_with("-too-large.bin"))
+        })
+        .unwrap_or(false);
+    assert!(!residue, "a rejected upload must leave no residue");
 }
 
 #[tokio::test]
@@ -1037,72 +1083,11 @@ async fn attachments_reject_too_many_files() {
     assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn attachments_reject_symlinked_upload_parents() {
-    use std::os::unix::fs::symlink;
-
-    let server = TestServer::start().await;
-    for link_leveler in [true, false] {
-        let repo = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        if link_leveler {
-            symlink(outside.path(), repo.path().join(".leveler")).unwrap();
-        } else {
-            std::fs::create_dir(repo.path().join(".leveler")).unwrap();
-            symlink(outside.path(), repo.path().join(".leveler/uploads")).unwrap();
-        }
-        use_repository(&server, repo.path()).await;
-        let form = reqwest::multipart::Form::new().part(
-            "file",
-            reqwest::multipart::Part::bytes(b"must stay inside".to_vec()).file_name("escape.txt"),
-        );
-
-        let response = reqwest::Client::new()
-            .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
-            .multipart(form)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
-        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-    }
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn attachments_reject_windows_junction_upload_parent() {
-    let server = TestServer::start().await;
-    let repo = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::create_dir(repo.path().join(".leveler")).unwrap();
-    let junction = repo.path().join(".leveler/uploads");
-    let created = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(&junction)
-        .arg(outside.path())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !created {
-        eprintln!("junction creation is unavailable; skipping the Windows junction case");
-        return;
-    }
-    use_repository(&server, repo.path()).await;
-    let form = reqwest::multipart::Form::new().part(
-        "file",
-        reqwest::multipart::Part::bytes(b"must stay inside".to_vec()).file_name("escape.txt"),
-    );
-
-    let response = reqwest::Client::new()
-        .post(server.http(&format!("/api/sessions/s1/attachments?token={TOKEN}")))
-        .multipart(form)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
-    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-}
+// The uploads store now lives under the global home, not the workspace, so the
+// old "malicious `<repo>/.leveler/uploads` symlink" attack surface is gone. The
+// equivalent defense-in-depth check — rejecting a symlinked/reparse uploads
+// leaf under the home — is covered by `prepare_upload_directory`'s in-crate unit
+// tests in `repo.rs`, where the base can be isolated per test.
 
 /// A socket bound to one session must not be fed another session's events.
 ///

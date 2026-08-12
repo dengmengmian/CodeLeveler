@@ -95,6 +95,12 @@ impl LevelerHome {
         self.web_state_dir().join("projects.json")
     }
 
+    /// Imported web attachment store: `state/web/uploads/`. Kept out of the
+    /// workspace so importing a file never mutates the repository.
+    pub fn web_uploads_dir(&self) -> PathBuf {
+        self.web_state_dir().join("uploads")
+    }
+
     // ── run/ — ephemeral runtime coordination ───────────────────────────────
 
     /// Ephemeral runtime-coordination root: `run/`.

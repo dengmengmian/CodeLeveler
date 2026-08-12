@@ -877,7 +877,7 @@ mod tests {
         let repo = dir.path().join("tui-only-project");
         std::fs::create_dir_all(&repo).unwrap();
         let canonical_repo = repo.canonicalize().unwrap();
-        let state_dir = dir.path().join("projects").join("-some-slug");
+        let state_dir = dir.path().join("state").join("projects").join("-some-slug");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(
             state_dir.join(".repository-root"),
@@ -911,7 +911,11 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let canonical_repo = repo.canonicalize().unwrap();
         // Legacy state dir: sessions.db only, no marker.
-        let state_dir = dir.path().join("projects").join("-legacy-slug");
+        let state_dir = dir
+            .path()
+            .join("state")
+            .join("projects")
+            .join("-legacy-slug");
         std::fs::create_dir_all(&state_dir).unwrap();
         {
             let db = leveler_storage::Database::connect(&state_dir.join("sessions.db"))
@@ -949,7 +953,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_skips_vanished_repositories() {
         let dir = tempfile::tempdir().unwrap();
-        let state_dir = dir.path().join("projects").join("-gone-slug");
+        let state_dir = dir.path().join("state").join("projects").join("-gone-slug");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(
             state_dir.join(".repository-root"),
@@ -973,7 +977,7 @@ mod tests {
         let ephemeral = dir.path().join("tempzone");
         let repo = ephemeral.join("leveler-eval-rust-h1-12345");
         std::fs::create_dir_all(&repo).unwrap();
-        let state_dir = dir.path().join("projects").join("-eval-slug");
+        let state_dir = dir.path().join("state").join("projects").join("-eval-slug");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(
             state_dir.join(".repository-root"),
@@ -1003,7 +1007,11 @@ mod tests {
         let repo = dir.path().join("removed-project");
         std::fs::create_dir_all(&repo).unwrap();
         let canonical_repo = repo.canonicalize().unwrap();
-        let state_dir = dir.path().join("projects").join("-removed-slug");
+        let state_dir = dir
+            .path()
+            .join("state")
+            .join("projects")
+            .join("-removed-slug");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(
             state_dir.join(".repository-root"),
@@ -1049,7 +1057,11 @@ mod tests {
         let repo = dir.path().join("promoted-project");
         std::fs::create_dir_all(&repo).unwrap();
         let canonical_repo = repo.canonicalize().unwrap();
-        let state_dir = dir.path().join("projects").join("-promoted-slug");
+        let state_dir = dir
+            .path()
+            .join("state")
+            .join("projects")
+            .join("-promoted-slug");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(
             state_dir.join(".repository-root"),
