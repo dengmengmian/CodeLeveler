@@ -1185,6 +1185,11 @@ impl TaskEngine {
         let policy = self.supervisor_policy();
         let mut extensions = 0u32;
         let mut limits = spec.runtime.limits;
+        // Goal-invocation-scoped, in-memory (not persisted): how many windows in
+        // a row have failed to grow the modified-file set. Bounds multi-window
+        // continuation so a stuck goal converges without a durable window ledger.
+        let mut windows_without_progress = 0u32;
+        let mut progress_mark = outcome.modified_files.len();
 
         for _ in 0..MAX_SUPERVISED_TURNS {
             if cancellation.is_cancelled() {
@@ -1198,6 +1203,7 @@ impl TaskEngine {
                 modified_files: &outcome.modified_files,
                 extensions_granted: extensions,
                 round_budget: spec.runtime.continuation,
+                windows_without_progress,
             });
 
             let continued = match decision {
@@ -1236,6 +1242,15 @@ impl TaskEngine {
                 }
             };
             merge_continued_outcome(&mut outcome, continued);
+            // A window that grew the modified-file set made material progress and
+            // resets the counter; one that touched nothing new counts toward the
+            // no-progress-window cap the policy enforces on the next decision.
+            if outcome.modified_files.len() > progress_mark {
+                progress_mark = outcome.modified_files.len();
+                windows_without_progress = 0;
+            } else {
+                windows_without_progress = windows_without_progress.saturating_add(1);
+            }
         }
         Ok(outcome)
     }
@@ -1767,8 +1782,9 @@ mod continue_cap_tests {
         );
         assert_eq!(
             direct_non_success_outcome(leveler_agent::StopReason::TurnLimitReached),
-            Some(TaskOutcome::Failed),
-            "an absolute-ceiling loop break is a failed turn, not a resumable budget"
+            Some(TaskOutcome::BudgetLimited),
+            "after multi-window continuation, a ceiling stop is a resource boundary \
+             (incomplete + resumable), not a model failure"
         );
         assert_eq!(
             direct_non_success_outcome(leveler_agent::StopReason::Answered),
@@ -1824,13 +1840,13 @@ pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Opt
     match stop {
         // Plan done (incl. a forced closeout stop): let verification decide.
         S::Completed | S::Answered | S::CloseoutForced => None,
-        S::BudgetExhausted => Some(TaskOutcome::BudgetLimited),
-        // Incomplete thrash, stalled quiet, blocked, etc. — never success. A
-        // turn broken by the absolute round ceiling belongs here, NOT with
-        // BudgetLimited: it is a failed (likely looping) turn, so it must
-        // terminate the auto-orchestrated path instead of auto-resuming — which
-        // would re-enter the same loop the ceiling just broke.
-        S::Incomplete | S::Blocked | S::Stalled | S::CompletedUnverified | S::TurnLimitReached => {
+        // The round ceiling is a resource boundary, not a model failure. After a
+        // goal has exhausted its bounded work windows (the supervisor already
+        // decided to stop opening more), a ceiling stop is BudgetLimited —
+        // incomplete and resumable — the same class as an exhausted budget.
+        S::BudgetExhausted | S::TurnLimitReached => Some(TaskOutcome::BudgetLimited),
+        // Incomplete thrash, stalled quiet, blocked, etc. — never success.
+        S::Incomplete | S::Blocked | S::Stalled | S::CompletedUnverified => {
             Some(TaskOutcome::Failed)
         }
     }

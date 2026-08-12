@@ -44,6 +44,12 @@ pub struct TurnEnded<'a> {
     /// The caller pinned a fixed round budget (eval reproducibility), so no
     /// supervisor-initiated continuation may happen at all.
     pub round_budget: RoundBudget,
+    /// Consecutive work windows that made no material progress before this turn.
+    /// The supervisor counts them across `DriveGoalAgain` windows (each window is
+    /// a fresh turn whose per-turn progress ledger resets), so a goal that keeps
+    /// hitting the round ceiling without moving the workspace is stopped instead
+    /// of burning every supervised window.
+    pub windows_without_progress: u32,
 }
 
 /// Decides whether a finished turn gets a successor.
@@ -67,6 +73,15 @@ impl SupervisorPolicy for DefaultSupervisorPolicy {
         }
         if ended.stop_reason == StopReason::Stalled
             && ended.progress.allows_engine_continue(self.caps)
+        {
+            return Continuation::DriveGoalAgain;
+        }
+        // The per-turn round ceiling ends a WORK WINDOW, not the goal: open the
+        // next bounded window (a fresh objective-restated turn), unless the goal
+        // has been spinning without material workspace progress across windows.
+        // A pinned round budget already returned Stop above, so evals are unaffected.
+        if ended.stop_reason == StopReason::TurnLimitReached
+            && ended.windows_without_progress < MAX_NO_PROGRESS_WINDOWS
         {
             return Continuation::DriveGoalAgain;
         }
@@ -103,6 +118,12 @@ pub fn extended_limits(limits: StepLimits, exhaustion: &BudgetExhaustion) -> Ste
 /// asking for extensions cannot exceed it.
 pub const MAX_EXTENSIONS: u32 = MAX_BUDGET_EXTENSIONS;
 
+/// How many consecutive no-material-progress work windows a goal may open before
+/// the supervisor stops driving it. Bounds the multi-window continuation so a
+/// stuck goal converges in a couple of windows rather than the absolute
+/// `MAX_SUPERVISED_TURNS` ceiling. A window that moves the workspace resets it.
+pub const MAX_NO_PROGRESS_WINDOWS: u32 = 2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +144,7 @@ mod tests {
             modified_files: modified,
             extensions_granted: 0,
             round_budget: ContinuationPolicy::UntilTerminal,
+            windows_without_progress: 0,
         }
     }
 
@@ -222,12 +244,13 @@ mod tests {
     fn a_clean_finish_never_continues() {
         let progress = active();
         let policy = DefaultSupervisorPolicy::default();
+        // TurnLimitReached is deliberately NOT here: a goal that exhausted a work
+        // window's round budget opens the next window (see the ceiling tests).
         for reason in [
             StopReason::Completed,
             StopReason::Answered,
             StopReason::Blocked,
             StopReason::CloseoutForced,
-            StopReason::TurnLimitReached,
         ] {
             assert_eq!(
                 policy.after_turn(&ended(reason, &progress, &[], None)),
@@ -235,5 +258,41 @@ mod tests {
                 "{reason:?} must not be re-driven"
             );
         }
+    }
+
+    #[test]
+    fn a_goal_that_hit_the_round_ceiling_opens_the_next_window() {
+        // R2 (G2) — the per-turn round ceiling ends a WORK WINDOW, not the goal.
+        let progress = active();
+        let policy = DefaultSupervisorPolicy::default();
+        assert_eq!(
+            policy.after_turn(&ended(StopReason::TurnLimitReached, &progress, &[], None)),
+            Continuation::DriveGoalAgain,
+        );
+    }
+
+    #[test]
+    fn a_goal_spinning_across_windows_finally_stops() {
+        // R2 (G11) — a goal that keeps hitting the ceiling without material
+        // workspace progress across windows stops instead of burning all 32.
+        let progress = active();
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.windows_without_progress = MAX_NO_PROGRESS_WINDOWS;
+        assert_eq!(
+            policy.after_turn(&e),
+            Continuation::Stop,
+            "the cross-window no-progress cap must bound multi-window continuation"
+        );
+    }
+
+    #[test]
+    fn a_pinned_budget_ceiling_never_opens_a_window() {
+        // An eval's fixed round budget owns pacing: no multi-window continuation.
+        let progress = active();
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(5);
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
     }
 }
