@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use leveler_client_protocol::{
-    ClientCommand, ClientError, InteractiveRuntimeClient, ModelRef, PermissionProfile,
-    ProtocolError, RuntimeEvent, SessionId, UiSessionSnapshot,
+    ApprovalPolicy, ClientCommand, ClientError, InteractiveRuntimeClient, ModelRef,
+    PermissionProfile, ProtocolError, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
 #[cfg(unix)]
 use leveler_client_protocol::{CommandEnvelope, ProtocolEnvelope};
@@ -92,6 +92,13 @@ pub struct CreateSessionRequest {
     pub goal: String,
     pub model: Option<ModelRef>,
     pub mode: PermissionProfile,
+    /// Whether this session auto-approves risky actions (unattended) or prompts.
+    /// Carried on the trusted local transport so `--auto-approve` selects a
+    /// per-session policy instead of forcing an in-process runtime. `default`
+    /// keeps old clients (and any request that omits it) at `Interactive`; the
+    /// remote/web boundary force-resets it so a remote client cannot elevate.
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
 }
 
 /// Initial client state returned atomically with session creation.
@@ -1506,6 +1513,7 @@ mod tests {
             addr,
             "s3cret-token",
             WireRequest::CreateSession(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "tcp session".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -1729,6 +1737,7 @@ mod tests {
 
         let error = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -1823,6 +1832,7 @@ mod tests {
         let received = deadend_server(&path);
         let error = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -1976,6 +1986,7 @@ mod tests {
             .unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "tcp e2e".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -2122,6 +2133,7 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "interactive session".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,

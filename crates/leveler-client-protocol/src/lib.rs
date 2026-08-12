@@ -69,7 +69,7 @@ pub use snapshot::{
     UiMessage, UiRole, UiSessionSnapshot, UiSessionSummary, UiUserShell,
 };
 pub use version::{PROTOCOL_VERSION, ProtocolEnvelope, ProtocolError, ProtocolVersion};
-pub use wire_types::{ApprovalDecision, PermissionProfile};
+pub use wire_types::{ApprovalDecision, ApprovalPolicy, PermissionProfile};
 
 #[cfg(feature = "testing")]
 pub mod mock;

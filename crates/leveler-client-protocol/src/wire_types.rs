@@ -25,6 +25,23 @@ pub enum PermissionProfile {
     FullAccess,
 }
 
+/// Whether a session prompts for approval of risky actions or auto-approves
+/// them. Unlike [`PermissionProfile`] (which actions are *allowed*), this is
+/// about whether the approval overlay is shown. It is a per-session property so
+/// one daemon can host an attended interactive session and an unattended
+/// auto-approving goal at the same time without crossing their approval flows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// Round-trip every risky action to the client for approval.
+    #[default]
+    Interactive,
+    /// Skip the approval overlay (unattended). Only honoured from the trusted
+    /// local transport, never elevated by a remote client.
+    AutoApprove,
+}
+
 impl PermissionProfile {
     pub const fn as_str(self) -> &'static str {
         match self {

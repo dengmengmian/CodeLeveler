@@ -199,6 +199,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
@@ -207,6 +208,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
             model: None,
             mode: WirePermissionProfile::FullAccess,
@@ -246,6 +248,7 @@ async fn creating_a_daemon_session_does_not_reap_another_live_turn() {
 
     client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "another session".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -266,6 +269,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -274,6 +278,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -313,6 +318,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session() {
     let (_tmp, _app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
@@ -321,6 +327,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
@@ -360,6 +367,7 @@ async fn socket_clients_receive_only_their_session_events() {
 
     let first = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first over socket".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
@@ -368,6 +376,7 @@ async fn socket_clients_receive_only_their_session_events() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second over socket".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
@@ -498,6 +507,7 @@ async fn first_message_retitles_a_placeholder_session() {
     let (_tmp, app, client, _existing) = build_client().await;
     let bootstrap = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "interactive session".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -544,6 +554,7 @@ async fn first_message_retitles_a_placeholder_session() {
     // A session created with a real goal keeps it untouched.
     let named = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "已有正式目标".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -722,6 +733,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
     let (_tmp, app, client, _existing) = build_client().await;
     let onlooker = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "onlooker".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -730,6 +742,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
         .unwrap();
     let requester = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "requester".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,

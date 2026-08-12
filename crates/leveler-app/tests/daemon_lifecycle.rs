@@ -167,6 +167,7 @@ async fn client_disconnect_does_not_cancel_and_explicit_cancel_fires_once() {
 
     let bootstrap = client1
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "long task".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -264,6 +265,7 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
 
     let session_a = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "session A".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
@@ -274,6 +276,7 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
         .id;
     let session_b = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "session B".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
