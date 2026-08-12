@@ -152,13 +152,6 @@ pub(crate) async fn cmd_sessions(
     layout: Layout,
     command: SessionsCommand,
 ) -> anyhow::Result<std::process::ExitCode> {
-    let command = match command {
-        SessionsCommand::MigrateState { confirm } => {
-            migrate_state(&layout, confirm)?;
-            return Ok(std::process::ExitCode::SUCCESS);
-        }
-        other => other,
-    };
     let app = Application::assemble(layout)?;
     let db = app.open_database().await?;
     let repo = SessionRepository::new(&db);
@@ -204,61 +197,8 @@ pub(crate) async fn cmd_sessions(
                 return Ok(std::process::ExitCode::FAILURE);
             }
         }
-        SessionsCommand::MigrateState { .. } => unreachable!("handled before opening state"),
     }
     Ok(std::process::ExitCode::SUCCESS)
-}
-
-fn migrate_state(layout: &Layout, confirm: bool) -> anyhow::Result<()> {
-    let projects = layout.state_dir.parent().ok_or_else(|| {
-        anyhow::anyhow!("invalid state directory: {}", layout.state_dir.display())
-    })?;
-    let home = projects
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid projects directory: {}", projects.display()))?;
-    let (source, destination) = leveler_project::legacy_repo_state_paths(home, &layout.repo_root);
-    println!("Legacy state source: {}", source.display());
-    println!("Hashed state destination: {}", destination.display());
-    if !confirm {
-        anyhow::bail!("migration not performed; inspect the paths, then rerun with --confirm");
-    }
-    if leveler_project::migrate_legacy_repo_state(home, &layout.repo_root)? {
-        println!("Migrated state by rename; no directories were merged.");
-    } else {
-        anyhow::bail!("legacy state source does not exist: {}", source.display());
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod migration_tests {
-    use super::*;
-
-    #[test]
-    fn migration_requires_confirmation_and_never_merges() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let home = temp.path().join("home");
-        let (source, destination) = leveler_project::legacy_repo_state_paths(&home, &repo);
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(source.join("sessions.db"), b"legacy").unwrap();
-        let layout = Layout {
-            repo_root: repo,
-            config_dir: temp.path().join("config"),
-            state_dir: destination.clone(),
-        };
-
-        assert!(migrate_state(&layout, false).is_err());
-        assert!(source.exists());
-        assert!(!destination.exists());
-        migrate_state(&layout, true).unwrap();
-        assert!(!source.exists());
-        assert_eq!(
-            std::fs::read(destination.join("sessions.db")).unwrap(),
-            b"legacy"
-        );
-    }
 }
 
 #[cfg(test)]

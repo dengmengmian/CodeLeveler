@@ -605,11 +605,11 @@ fn seal_eval_answer_keys() {
     // the tool history, and enough to reconstruct the setup. Sealed by the
     // subdirectory, not by `~/.leveler` as a whole: the toolchain cache lives
     // in that tree too, and sealing it stops `go build` from working at all.
-    if let Some(home) = std::env::var_os("HOME") {
-        let leveler = std::path::Path::new(&home).join(".leveler");
-        roots.push(leveler.join("projects"));
-        roots.push(leveler.join("config.toml"));
-    }
+    // Via LevelerHome so LEVELER_HOME is honoured and the canonical layout is
+    // sealed (the toolchain cache under the same tree is deliberately NOT sealed).
+    let home = leveler_core::LevelerHome::resolve(leveler_core::environment());
+    roots.push(home.projects_dir());
+    roots.push(home.config_file());
     leveler_execution::seal_read_denials(roots);
 }
 

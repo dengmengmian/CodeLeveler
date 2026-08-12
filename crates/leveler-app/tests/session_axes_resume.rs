@@ -23,11 +23,11 @@ fn isolate_global_config() {
 }
 
 fn layout(tmp: &tempfile::TempDir) -> Layout {
-    Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    }
+    Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    )
 }
 
 #[tokio::test]

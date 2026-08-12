@@ -29,11 +29,7 @@ fn broken_db_client() -> (tempfile::TempDir, Arc<dyn InteractiveRuntimeClient>) 
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     std::fs::write(&state, "not a directory").unwrap();
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: state,
-    };
+    let layout = Layout::from_parts(tmp.path().to_path_buf(), tmp.path().join("configs"), state);
     let app = Arc::new(Application::assemble(layout).expect("assemble with empty config"));
     let model = ModelRef::parse("deepseek/test-model").unwrap();
     let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
@@ -154,11 +150,11 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
 "#,
     )
     .unwrap();
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Arc::new(Application::assemble(layout).unwrap());
     let model = ModelRef::new("mock", "m");
     let session_id = app.create_session(&model, "goal").await.unwrap();

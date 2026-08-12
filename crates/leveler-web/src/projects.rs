@@ -514,8 +514,9 @@ async fn historical_repositories(home: &Path, ephemeral_root: &Path) -> Vec<Path
     let ephemeral = ephemeral_root
         .canonicalize()
         .unwrap_or_else(|_| ephemeral_root.to_path_buf());
-    let mut repos = leveler_project::layout::known_repositories(home);
-    if let Ok(entries) = std::fs::read_dir(home.join("projects")) {
+    let home = leveler_core::LevelerHome::from_root(home);
+    let mut repos = leveler_project::layout::known_repositories(&home);
+    if let Ok(entries) = std::fs::read_dir(home.projects_dir()) {
         for entry in entries.filter_map(Result::ok) {
             let dir = entry.path();
             if dir

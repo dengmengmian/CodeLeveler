@@ -39,8 +39,10 @@ impl LevelerHome {
     /// temp dir so the runtime always has a coherent, workspace-external home
     /// rather than each caller inventing its own fallback.
     pub fn resolve(env: &EnvSnapshot) -> Self {
-        let root = crate::leveler_home_dir(env)
-            .unwrap_or_else(|| env.temp_dir().join(format!("leveler-{}", std::process::id())));
+        let root = crate::leveler_home_dir(env).unwrap_or_else(|| {
+            env.temp_dir()
+                .join(format!("leveler-{}", std::process::id()))
+        });
         Self { root }
     }
 
@@ -175,7 +177,10 @@ mod tests {
     #[test]
     fn every_path_is_under_root_and_in_a_canonical_namespace() {
         let h = home_at("/home/u/.leveler");
-        assert_eq!(h.config_file(), PathBuf::from("/home/u/.leveler/config.toml"));
+        assert_eq!(
+            h.config_file(),
+            PathBuf::from("/home/u/.leveler/config.toml")
+        );
         assert_eq!(
             h.project_state_dir("proj-abc"),
             PathBuf::from("/home/u/.leveler/state/projects/proj-abc")
@@ -188,13 +193,19 @@ mod tests {
             h.remote_state_dir(),
             PathBuf::from("/home/u/.leveler/state/remote")
         );
-        assert_eq!(h.sockets_dir(), PathBuf::from("/home/u/.leveler/run/sockets"));
+        assert_eq!(
+            h.sockets_dir(),
+            PathBuf::from("/home/u/.leveler/run/sockets")
+        );
         assert_eq!(h.locks_dir(), PathBuf::from("/home/u/.leveler/run/locks"));
         assert_eq!(
             h.sandboxes_dir(),
             PathBuf::from("/home/u/.leveler/run/sandboxes")
         );
-        assert_eq!(h.tool_cache_dir(), PathBuf::from("/home/u/.leveler/cache/tools"));
+        assert_eq!(
+            h.tool_cache_dir(),
+            PathBuf::from("/home/u/.leveler/cache/tools")
+        );
         assert_eq!(h.runtimes_dir(), PathBuf::from("/home/u/.leveler/runtimes"));
         assert_eq!(
             h.daemon_log("proj-abc"),
@@ -217,7 +228,10 @@ mod tests {
     fn resolve_honours_leveler_home_over_everything() {
         let env = EnvSnapshot::new(
             [
-                (OsString::from("LEVELER_HOME"), OsString::from("/custom/home")),
+                (
+                    OsString::from("LEVELER_HOME"),
+                    OsString::from("/custom/home"),
+                ),
                 (OsString::from("HOME"), OsString::from("/home/u")),
             ],
             /*current_dir*/ PathBuf::new(),
@@ -240,7 +254,11 @@ mod tests {
 
         // No HOME/USERPROFILE → a workspace-external temp home, never None and
         // never the cwd.
-        let bare = EnvSnapshot::new([], /*current_dir*/ PathBuf::new(), /*temp_dir*/ PathBuf::from("/tmp"));
+        let bare = EnvSnapshot::new(
+            [],
+            /*current_dir*/ PathBuf::new(),
+            /*temp_dir*/ PathBuf::from("/tmp"),
+        );
         let root = LevelerHome::resolve(&bare).root().to_path_buf();
         assert_eq!(root.parent(), Some(Path::new("/tmp")));
         assert!(

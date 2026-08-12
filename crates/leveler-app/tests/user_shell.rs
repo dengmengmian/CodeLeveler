@@ -83,11 +83,11 @@ async fn app_with_repo(server: &MockServer) -> (tempfile::TempDir, Application) 
         .status()
         .unwrap();
     write_config(tmp.path(), &server.base_url());
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).unwrap();
     (tmp, app)
 }

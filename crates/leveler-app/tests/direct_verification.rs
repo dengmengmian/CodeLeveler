@@ -158,11 +158,11 @@ async fn direct_run_fails_when_post_edit_verification_fails() {
     .unwrap();
     write_config(tmp.path(), &server.base_url());
 
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).unwrap();
     let session_id = app
         .create_session(&ModelRef::new("mock", "m"), "edit readme")
@@ -226,11 +226,11 @@ async fn direct_content_run_fails_when_post_edit_verification_fails() {
     .unwrap();
     write_config(tmp.path(), &server.base_url());
 
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).unwrap();
     let session_id = app
         .create_session(&ModelRef::new("mock", "m"), "edit readme")
@@ -299,11 +299,11 @@ async fn direct_run_succeeds_when_post_edit_verification_passes() {
     .unwrap();
     write_config(tmp.path(), &server.base_url());
 
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).unwrap();
     let session_id = app
         .create_session(&ModelRef::new("mock", "m"), "edit readme")
@@ -349,11 +349,11 @@ async fn direct_run_without_gating_verification_is_completed_unverified() {
     std::fs::write(tmp.path().join("README.md"), "old\n").unwrap();
     write_config(tmp.path(), &server.base_url());
 
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).unwrap();
     let session_id = app
         .create_session(&ModelRef::new("mock", "m"), "edit readme")
@@ -406,11 +406,11 @@ async fn direct_content_run_emits_verification_events() {
     .unwrap();
     write_config(tmp.path(), &server.base_url());
 
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).unwrap();
     let session_id = app
         .create_session(&ModelRef::new("mock", "m"), "edit readme")
@@ -500,11 +500,11 @@ async fn direct_run_repairs_once_after_failed_verification() {
     .unwrap();
     write_config(tmp.path(), &server.base_url());
 
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).unwrap();
     let session_id = app
         .create_session(&ModelRef::new("mock", "m"), "edit readme")

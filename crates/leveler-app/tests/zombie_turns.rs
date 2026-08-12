@@ -22,11 +22,11 @@ fn isolate_global_config() {
 async fn create_session_reaps_zombie_running_turns() {
     isolate_global_config();
     let tmp = tempfile::tempdir().unwrap();
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Application::assemble(layout).expect("assemble with empty config");
 
     let db = app.open_database().await.expect("open db");

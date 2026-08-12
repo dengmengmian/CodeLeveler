@@ -11,4 +11,4 @@ pub mod layout;
 
 pub use config::{CommandSpec, ProjectConfig, RunLimitsConfig, VerifySpec};
 pub use detect::{Language, detect_languages};
-pub use layout::{Layout, legacy_repo_state_paths, migrate_legacy_repo_state};
+pub use layout::Layout;

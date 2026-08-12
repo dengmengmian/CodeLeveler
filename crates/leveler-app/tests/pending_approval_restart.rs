@@ -95,11 +95,7 @@ async fn session_awaiting_approval(
     base_url: &str,
 ) -> (Arc<Application>, Arc<InProcessRuntimeClient>, SessionId) {
     write_config(root, base_url);
-    let layout = Layout {
-        repo_root: root.to_path_buf(),
-        config_dir: root.join("configs"),
-        state_dir: root.join("state"),
-    };
+    let layout = Layout::from_parts(root.to_path_buf(), root.join("configs"), root.join("state"));
     let app = Arc::new(Application::assemble(layout).unwrap());
     let model = ModelRef::new("mock", "m");
     let session_id = app.create_session(&model, "delete a file").await.unwrap();
@@ -171,11 +167,11 @@ async fn an_unanswered_approval_does_not_survive_a_restart() {
     drop(client);
     drop(app);
 
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Arc::new(Application::assemble(layout).unwrap());
     let client = Arc::new(InProcessRuntimeClient::new(
         app.clone(),
