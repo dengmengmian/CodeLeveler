@@ -147,7 +147,7 @@ unsafe fn libc_kill(pid: i32, signal: i32) {
 
 /// The single socket the environment's daemon listens on.
 fn find_socket(env: &TestEnv) -> PathBuf {
-    let sock_dir = env.home.join("sock");
+    let sock_dir = env.home.join("run/sockets");
     let mut sockets: Vec<PathBuf> = std::fs::read_dir(&sock_dir)
         .map(|entries| {
             entries
@@ -163,7 +163,7 @@ fn find_socket(env: &TestEnv) -> PathBuf {
 
 /// The single per-repo state dir under the isolated home.
 fn find_state_dir(env: &TestEnv) -> PathBuf {
-    let projects = env.home.join("projects");
+    let projects = env.home.join("state/projects");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&projects)
         .map(|entries| {
             entries

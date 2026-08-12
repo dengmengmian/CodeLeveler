@@ -696,7 +696,7 @@ Agent 循环内不得直接访问文件系统或进程以绕过审批、检查�
 ### UI 边界
 
 客户端渲染协议事件并发送命令，不拥有 agent 执行。多项目 Web 行为（daemon
-探测、spawn、`RouterService`、`~/.leveler/web-projects.json`）见「客户端 → Web」。
+探测、spawn、`RouterService`、`~/.leveler/state/web/projects.json`）见「客户端 → Web」。
 
 ---
 
@@ -752,6 +752,47 @@ Agent 循环内不得直接访问文件系统或进程以绕过审批、检查�
 
 示例见同目录 `*.example.yaml`、`leveler-config-example.yaml` 与
 [`configs/example.yaml`](../configs/example.yaml)。
+
+---
+
+## Home 与运行时布局（**CURRENT**）
+
+**零工作区污染。** CodeLeveler 绝不在工作区内创建或修改自己的运行时/状态设施；
+所有机器写入都落在唯一的全局 home 下，checkout 保持干净、无需 `.gitignore`。
+仓库内唯一的 `.leveler/` 是**用户手写、可入库**的配置（`config.yaml`、
+`instructions.md`、`rules/`、`skills/`、`hooks.yaml`，以及 `AGENTS.md`）——
+运行时只读不写。
+
+`LevelerHome`（[`leveler-core/src/home.rs`](../crates/leveler-core/src/home.rs)）
+是所有自有路径的唯一权威：它只解析一次根目录（`$LEVELER_HOME`，否则
+`$HOME/.leveler`，否则 `%USERPROFILE%\.leveler`，否则进程级临时目录——绝不用
+cwd 相对兜底），并通过具名访问器交出每个子路径。业务 crate 只向 `LevelerHome`
+索取，不自行拼接根目录。一个测试探针会在任何 crate 手工重建 home 路径时让构建失败。
+
+```text
+~/.leveler/
+├── config.toml                      全局用户配置（+ agents/、skills/、hooks.yaml、permissions.yaml、trusted.yaml）
+├── state/                           持久状态
+│   ├── projects/<id>/               每仓库：sessions.db、memory/、permissions.yaml（机器写）、图片存储
+│   ├── remote/                      远程配对密钥、配置、设备
+│   └── web/  projects.json · uploads/   多项目注册表 + 导入附件
+├── run/                             临时运行时协调
+│   ├── sockets/                     daemon Unix socket（短的每仓库哈希 → 守住 macOS SUN_LEN）
+│   ├── locks/                       工作区编辑咨询锁
+│   └── sandboxes/<id>/ (+ <id>.lock)   带 OS 租约的单命令 scratch
+├── cache/  tools/                   可丢弃、可重建的工具链缓存
+├── runtimes/                        受管执行依赖（预留）
+└── logs/   leveler.log · crash/ · daemon/<id>.log
+```
+
+布局是惰性的：索取路径绝不创建它。项目 id = 可读 slug + 其规范路径的短 SHA-256，
+因此状态以仓库为键、无需注册表。
+
+**Sandbox 租约 + reaper。** 每个受沙箱命令在 `run/sandboxes/` 下拿到一个 scratch
+目录，由其 `<id>.lock` 旁文件上的排他咨询锁（与 daemon 选举锁同一 `flock` 原语）
+守护，持有到命令结束。RAII 在完成时清除两者；崩溃时 flock 由 OS 释放。一个
+fail-closed 的 reaper 每进程运行一次（绝不定时）：能拿到的锁即证明持有者已死，
+于是回收该 scratch；仍被持有的锁、或没有锁的目录，一律不动。
 
 ---
 

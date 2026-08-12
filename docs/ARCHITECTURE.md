@@ -748,7 +748,8 @@ Redact credentials before any durable write.
 
 Clients render protocol events and send commands. They do not own agent
 execution. Multi-project Web behavior (daemon probe, spawn, `RouterService`,
-registry at `~/.leveler/web-projects.json`) is documented under Clients → Web.
+registry at `~/.leveler/state/web/projects.json`) is documented under
+Clients → Web.
 
 ---
 
@@ -807,6 +808,53 @@ Do not schedule Capability ahead of User Shell without new evidence.
 
 Examples: `*.example.yaml`, `leveler-config-example.yaml`,
 [`configs/example.yaml`](../configs/example.yaml).
+
+---
+
+## Home & runtime layout (**CURRENT**)
+
+**Zero Workspace Pollution.** CodeLeveler never creates or mutates its own
+runtime/state infrastructure inside the workspace. Everything machine-written
+lives under one global home; a checkout stays clean and needs no `.gitignore`
+entry. The only `.leveler/` inside a repo is *user-authored, committable*
+config (`config.yaml`, `instructions.md`, `rules/`, `skills/`, `hooks.yaml`,
+plus `AGENTS.md`) — the runtime reads it, never writes it.
+
+`LevelerHome` ([`leveler-core/src/home.rs`](../crates/leveler-core/src/home.rs))
+is the single authority for every owned path. It resolves the root once
+(`$LEVELER_HOME`, else `$HOME/.leveler`, else `%USERPROFILE%\.leveler`, else a
+process-local temp dir — never a cwd-relative fallback) and hands out every
+sub-path through a named accessor. Business crates ask `LevelerHome`; they do
+not join onto the root. A test tripwire fails the build if any crate rebuilds
+a home path by hand.
+
+```text
+~/.leveler/
+├── config.toml                      global user config (+ agents/, skills/, hooks.yaml, permissions.yaml, trusted.yaml)
+├── state/                           durable state
+│   ├── projects/<id>/               per-repo: sessions.db, memory/, permissions.yaml (machine), image store
+│   ├── remote/                      remote pairing key, config, devices
+│   └── web/  projects.json · uploads/   multi-project registry + imported attachments
+├── run/                             ephemeral runtime coordination
+│   ├── sockets/                     daemon Unix sockets (short per-repo hash → stays under macOS SUN_LEN)
+│   ├── locks/                       advisory workspace edit-locks
+│   └── sandboxes/<id>/ (+ <id>.lock)   per-command scratch under an OS lease
+├── cache/  tools/                   disposable, rebuildable toolchain caches
+├── runtimes/                        managed execution deps (reserved)
+└── logs/   leveler.log · crash/ · daemon/<id>.log
+```
+
+The layout is lazy: asking for a path never creates it. A project's id is a
+readable slug plus a short SHA-256 of its canonical path, so state is keyed by
+repository without a registry.
+
+**Sandbox lease + reaper.** Each sandboxed command gets a scratch dir under
+`run/sandboxes/` guarded by an exclusive advisory lock on its `<id>.lock`
+sidecar (the same `flock` primitive as the daemon election lock), held for the
+command's lifetime. RAII removes both on completion; the flock releases on
+crash. A fail-closed reaper runs once per process (never on a timer): a lock it
+can acquire proves the owner died, so it reclaims that scratch tree; a live
+lock, or a dir with no lock, is left untouched.
 
 ---
 
