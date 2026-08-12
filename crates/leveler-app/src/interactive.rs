@@ -36,11 +36,20 @@ use leveler_model::{
 use leveler_storage::{MessageRepository, SessionRepository};
 
 use leveler_client_protocol::{
-    ApprovalDecision as UiApprovalDecision, AttachmentId, AttachmentKind, AttachmentRef,
-    ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient, MessageId,
-    NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot,
+    ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
+    AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
+    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot,
     UiSessionSummary,
 };
+
+/// Whether a turn auto-approves risky actions. True when the session opted in
+/// (`AutoApprove`), or the daemon was started with a global `--auto-approve`
+/// (backward-compatible fallback). Keeping the global as an OR means a plain
+/// daemon can host a per-session unattended goal AND interactive sessions at the
+/// same time, while `serve --auto-approve` still auto-approves everything.
+fn should_auto_approve(session_policy: Option<ApprovalPolicy>, global_auto_approve: bool) -> bool {
+    matches!(session_policy, Some(ApprovalPolicy::AutoApprove)) || global_auto_approve
+}
 
 fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalDecision {
     match value {
@@ -205,6 +214,11 @@ struct SessionRuntimeConfig {
     sandbox: bool,
     work_profile: String,
     collaboration: String,
+    /// Per-session approval policy. `AutoApprove` skips the approval overlay for
+    /// this session only; the daemon-wide `auto_approve` still applies as a
+    /// fallback (see `approver`). Not persisted: a restored session falls back to
+    /// `Interactive` (daemon-crash continuation is out of scope for this gate).
+    approval_policy: ApprovalPolicy,
 }
 
 impl InProcessRuntimeClient {
@@ -239,6 +253,9 @@ impl InProcessRuntimeClient {
                 work_profile: "balanced".into(),
                 // Default: plain conversation (no update_goal gate).
                 collaboration: "chat".into(),
+                // Per-session default; the daemon-wide `auto_approve` still
+                // applies as the fallback in `approver`.
+                approval_policy: ApprovalPolicy::Interactive,
             },
             session_runtime: Mutex::new(HashMap::new()),
             auto_approve,
@@ -292,6 +309,18 @@ impl InProcessRuntimeClient {
             .lock()
             .unwrap()
             .insert(session_id, self.default_runtime.clone());
+    }
+
+    /// The effective approval policy the daemon would use for `session_id` —
+    /// the live per-session config if present, else the DB-restored config
+    /// (which never carries a persisted policy, so it falls back to
+    /// `Interactive`). A read-only diagnostic: lets a caller (and a regression)
+    /// confirm a restored session is fail-closed and never silently auto-approves.
+    pub async fn effective_approval_policy(&self, session_id: &SessionId) -> ApprovalPolicy {
+        self.runtime_config(session_id)
+            .await
+            .map(|config| config.approval_policy)
+            .unwrap_or(ApprovalPolicy::Interactive)
     }
 
     async fn runtime_config(
@@ -353,6 +382,9 @@ impl InProcessRuntimeClient {
             sandbox,
             work_profile: record.work_profile.clone(),
             collaboration: record.collaboration.clone(),
+            // Not persisted in the session record; a restored session prompts
+            // unless the daemon-wide `auto_approve` fallback applies.
+            approval_policy: ApprovalPolicy::Interactive,
         };
         self.session_runtime
             .lock()
@@ -890,7 +922,13 @@ impl InProcessRuntimeClient {
     }
 
     fn approver(&self, session_id: &SessionId, cancel: CancellationToken) -> Arc<dyn Approver> {
-        if self.auto_approve {
+        let session_policy = self
+            .session_runtime
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|config| config.approval_policy);
+        if should_auto_approve(session_policy, self.auto_approve) {
             Arc::new(AutoApprove)
         } else {
             Arc::new(ChannelApprover {
@@ -2177,6 +2215,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 sandbox: self.default_runtime.sandbox,
                 work_profile: self.default_runtime.work_profile.clone(),
                 collaboration: self.default_runtime.collaboration.clone(),
+                approval_policy: request.approval_policy,
             },
         )
         .await?;
@@ -2522,6 +2561,38 @@ mod title_tests {
         assert_eq!(title_from_first_message(&long).unwrap().chars().count(), 40);
         assert_eq!(title_from_first_message("   \n  "), None);
         assert_eq!(title_from_first_message("？？？"), None);
+    }
+}
+
+#[cfg(test)]
+mod approval_policy_tests {
+    use super::should_auto_approve;
+    use leveler_client_protocol::ApprovalPolicy;
+
+    #[test]
+    fn per_session_auto_approve_needs_no_global_flag() {
+        // §6.B — on a plain daemon (global off), an unattended goal session
+        // auto-approves while an interactive session on the SAME daemon prompts.
+        assert!(should_auto_approve(
+            Some(ApprovalPolicy::AutoApprove),
+            false
+        ));
+        assert!(!should_auto_approve(
+            Some(ApprovalPolicy::Interactive),
+            false
+        ));
+        // No stored config (e.g. a restored session) prompts unless the global
+        // fallback applies.
+        assert!(!should_auto_approve(None, false));
+    }
+
+    #[test]
+    fn global_auto_approve_stays_a_backward_compatible_fallback() {
+        // `serve --auto-approve` keeps auto-approving every session regardless of
+        // per-session policy.
+        assert!(should_auto_approve(Some(ApprovalPolicy::Interactive), true));
+        assert!(should_auto_approve(None, true));
+        assert!(should_auto_approve(Some(ApprovalPolicy::AutoApprove), true));
     }
 }
 

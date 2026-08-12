@@ -252,14 +252,20 @@ async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<WebCreateSessionRequest>,
 ) -> Result<Json<SessionBootstrap>, ApiError> {
+    // §6.G — the web/remote boundary must not let a client elevate its session
+    // to auto-approve. Auto-approve is only reachable from the trusted local
+    // transport (`leveler tui --auto-approve`); force every web session back to
+    // interactive regardless of what the JSON body carried.
+    let mut inner = request.inner;
+    inner.approval_policy = leveler_client_protocol::ApprovalPolicy::Interactive;
     let bootstrap = match (&state.multi, &request.project) {
         (Some(multi), Some(project)) => {
             multi
                 .router
-                .create_session_for(Path::new(project), request.inner)
+                .create_session_for(Path::new(project), inner)
                 .await?
         }
-        _ => state.service.create_session(request.inner).await?,
+        _ => state.service.create_session(inner).await?,
     };
     Ok(Json(bootstrap))
 }

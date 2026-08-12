@@ -721,6 +721,7 @@ mod tests {
             .add_daemon(PathBuf::from("/daemon"), daemon.clone())
             .await;
         let request = CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "g".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
@@ -743,6 +744,7 @@ mod tests {
         assert!(matches!(
             router
                 .create_session_for(Path::new("/missing"), CreateSessionRequest {
+                    approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                     goal: "g".to_string(),
                     model: None,
                     mode: leveler_client_protocol::PermissionProfile::Assisted,

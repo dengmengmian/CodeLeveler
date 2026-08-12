@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use leveler_client_protocol::{
-    ClientCommand, ClientError, InteractiveRuntimeClient, ModelRef, PermissionProfile,
-    ProtocolError, RuntimeEvent, SessionId, UiSessionSnapshot,
+    ApprovalPolicy, ClientCommand, ClientError, InteractiveRuntimeClient, ModelRef,
+    PermissionProfile, ProtocolError, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
 #[cfg(unix)]
 use leveler_client_protocol::{CommandEnvelope, ProtocolEnvelope};
@@ -92,6 +92,13 @@ pub struct CreateSessionRequest {
     pub goal: String,
     pub model: Option<ModelRef>,
     pub mode: PermissionProfile,
+    /// Whether this session auto-approves risky actions (unattended) or prompts.
+    /// Carried on the trusted local transport so `--auto-approve` selects a
+    /// per-session policy instead of forcing an in-process runtime. `default`
+    /// keeps old clients (and any request that omits it) at `Interactive`; the
+    /// remote/web boundary force-resets it so a remote client cannot elevate.
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
 }
 
 /// Initial client state returned atomically with session creation.
@@ -169,7 +176,18 @@ enum WireRequest {
     Snapshot {
         session_id: SessionId,
     },
-    CreateSession(CreateSessionRequest),
+    CreateSession {
+        request: CreateSessionRequest,
+        /// The kind of client that opened this connection, as it declared itself
+        /// when connecting (`connect_as`). Load-bearing for approval trust: only
+        /// a `LocalInteractive` client on a trusted-local transport may create an
+        /// `AutoApprove` session; a `Remote` kind (the remote-agent bridge) or a
+        /// TCP connection is normalized to `Interactive` at the daemon boundary
+        /// (see `handle_connection`). Set by the connecting client, never from a
+        /// relayed body, so a remote peer cannot spoof it.
+        #[serde(default)]
+        client_kind: ClientKind,
+    },
     /// How many local interactive UIs are attached. Asked by the remote agent,
     /// which cannot see this machine's terminals from its own process.
     LocalWaiters,
@@ -204,7 +222,7 @@ impl WireRequest {
             | WireRequest::RuntimeInfo
             | WireRequest::Deliver(_) => true,
             WireRequest::Send(_)
-            | WireRequest::CreateSession(_)
+            | WireRequest::CreateSession { .. }
             | WireRequest::Subscribe { .. } => false,
         }
     }
@@ -338,6 +356,10 @@ mod unix {
         runtime: Arc<dyn LocalRuntimeService>,
         shutdown: CancellationToken,
         local_waiters: LocalWaiters,
+        // Whether this listener is a trusted-local transport (the per-repo Unix
+        // socket). `false` for the loopback TCP server: a TCP peer is never
+        // trusted to grant AutoApprove, whatever `ClientKind` it declares.
+        transport_trusted: bool,
     ) -> Result<(), TransportError> {
         let request = read_frame::<WireRequest>(&mut stream).await?.into_body()?;
         match request {
@@ -387,7 +409,40 @@ mod unix {
                 )
                 .await
             }
-            WireRequest::CreateSession(request) => {
+            WireRequest::CreateSession {
+                mut request,
+                client_kind,
+            } => {
+                // The single daemon-side trust boundary for AutoApprove. The
+                // effective trust is the MORE restrictive of the transport
+                // (TCP → Remote) and the client's declared kind (the bridge
+                // declares Remote even over the local socket). AutoApprove is
+                // honoured only for a LocalInteractive client on a trusted-local
+                // transport; an explicit AutoApprove from any remote/TCP origin
+                // is rejected (observable), never silently downgraded — while an
+                // absent/Interactive policy is simply allowed.
+                let effective_kind = if transport_trusted {
+                    client_kind
+                } else {
+                    ClientKind::Remote
+                };
+                if effective_kind == ClientKind::Remote
+                    && request.approval_policy == ApprovalPolicy::AutoApprove
+                {
+                    return send_result(
+                        &mut stream,
+                        Err(ClientError::Runtime(
+                            "auto-approve may only be requested from the trusted local transport"
+                                .to_string(),
+                        )),
+                    )
+                    .await;
+                }
+                // Defence in depth: never let a non-trusted origin carry an
+                // AutoApprove policy further into the runtime.
+                if effective_kind == ClientKind::Remote {
+                    request.approval_policy = ApprovalPolicy::Interactive;
+                }
                 send_result(
                     &mut stream,
                     runtime
@@ -577,9 +632,15 @@ mod unix {
                         let connection_shutdown = child_shutdown.clone();
                         let waiters = self.local_waiters.clone();
                         tasks.spawn(async move {
-                            if let Err(error) =
-                                handle_connection(stream, runtime, connection_shutdown, waiters)
-                                    .await
+                            // The per-repo Unix socket is the trusted-local transport.
+                            if let Err(error) = handle_connection(
+                                stream,
+                                runtime,
+                                connection_shutdown,
+                                waiters,
+                                /*transport_trusted*/ true,
+                            )
+                            .await
                             {
                                 tracing::debug!(%error, "local socket connection ended");
                             }
@@ -755,7 +816,10 @@ mod unix {
             request: CreateSessionRequest,
         ) -> Result<SessionBootstrap, ClientError> {
             match self
-                .request(WireRequest::CreateSession(request))
+                .request(WireRequest::CreateSession {
+                    request,
+                    client_kind: self.client_kind,
+                })
                 .await
                 .map_err(transport_client_error)?
             {
@@ -1102,7 +1166,17 @@ mod unix {
             return Ok(());
         }
         send_response(&mut stream, WireResponse::Ack).await?;
-        handle_connection(stream, runtime, shutdown, local_waiters).await
+        // A loopback TCP peer is authenticated by the bearer token but is never
+        // trusted to grant AutoApprove — it is treated as Remote regardless of
+        // the ClientKind it declares.
+        handle_connection(
+            stream,
+            runtime,
+            shutdown,
+            local_waiters,
+            /*transport_trusted*/ false,
+        )
+        .await
     }
 
     /// A loopback TCP runtime server. Every connection presents a shared bearer
@@ -1379,6 +1453,9 @@ mod tests {
         deliveries: Mutex<Vec<leveler_client_protocol::CommandId>>,
         /// How many CreateSession mutations ran (replay regression).
         creates: std::sync::atomic::AtomicUsize,
+        /// The approval policy the runtime actually received on the last
+        /// CreateSession — lets a test assert the daemon boundary normalized it.
+        last_approval: Mutex<Option<ApprovalPolicy>>,
         snapshot: Arc<Mutex<UiSessionSnapshot>>,
     }
 
@@ -1390,6 +1467,7 @@ mod tests {
                 commands: Mutex::new(Vec::new()),
                 deliveries: Mutex::new(Vec::new()),
                 creates: std::sync::atomic::AtomicUsize::new(0),
+                last_approval: Mutex::new(None),
                 snapshot: Arc::new(Mutex::new(UiSessionSnapshot {
                     id: SessionId::new("s1"),
                     repository: "/repo".to_string(),
@@ -1462,8 +1540,9 @@ mod tests {
     impl LocalRuntimeService for TestRuntime {
         async fn create_session(
             &self,
-            _request: CreateSessionRequest,
+            request: CreateSessionRequest,
         ) -> Result<SessionBootstrap, ClientError> {
+            *self.last_approval.lock().unwrap() = Some(request.approval_policy);
             self.creates
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(SessionBootstrap {
@@ -1505,11 +1584,15 @@ mod tests {
         let response = tcp_request(
             addr,
             "s3cret-token",
-            WireRequest::CreateSession(CreateSessionRequest {
-                goal: "tcp session".to_string(),
-                model: None,
-                mode: PermissionProfile::Assisted,
-            }),
+            WireRequest::CreateSession {
+                request: CreateSessionRequest {
+                    approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+                    goal: "tcp session".to_string(),
+                    model: None,
+                    mode: PermissionProfile::Assisted,
+                },
+                client_kind: ClientKind::LocalInteractive,
+            },
         )
         .await
         .unwrap();
@@ -1729,6 +1812,7 @@ mod tests {
 
         let error = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -1823,6 +1907,7 @@ mod tests {
         let received = deadend_server(&path);
         let error = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -1941,6 +2026,141 @@ mod tests {
         shutdown.cancel();
     }
 
+    // ── Approval-policy trust boundary (Merge Blocker Closeout: B-1 / M-1) ──
+    // AutoApprove is a trusted-local privilege: only a LocalInteractive client on
+    // the trusted-local Unix socket may request it. A Remote client (the
+    // remote-agent bridge) or any TCP peer is rejected — never silently elevated.
+
+    use leveler_client_protocol::ApprovalPolicy;
+
+    fn create_req(policy: ApprovalPolicy) -> CreateSessionRequest {
+        CreateSessionRequest {
+            goal: "s".to_string(),
+            model: None,
+            mode: PermissionProfile::Assisted,
+            approval_policy: policy,
+        }
+    }
+
+    /// S4 — a trusted-local interactive client may create an AutoApprove session,
+    /// and the runtime actually receives AutoApprove.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_local_may_create_an_auto_approve_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+
+        let client = LocalSocketRuntimeClient::connect_as(&path, ClientKind::LocalInteractive)
+            .await
+            .unwrap();
+        client
+            .create_session(create_req(ApprovalPolicy::AutoApprove))
+            .await
+            .unwrap();
+        assert_eq!(
+            *runtime.last_approval.lock().unwrap(),
+            Some(ApprovalPolicy::AutoApprove),
+            "trusted-local auto-approve must reach the runtime as AutoApprove"
+        );
+        shutdown.cancel();
+    }
+
+    /// S1 / §11 — a Remote client (the bridge's connection kind) that explicitly
+    /// requests AutoApprove is REJECTED, and the request never reaches the runtime.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_client_cannot_create_an_auto_approve_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+
+        let bridge = LocalSocketRuntimeClient::connect_as(&path, ClientKind::Remote)
+            .await
+            .unwrap();
+        let result = bridge
+            .create_session(create_req(ApprovalPolicy::AutoApprove))
+            .await;
+        assert!(
+            result.is_err(),
+            "a remote client requesting auto-approve must be rejected: {result:?}"
+        );
+        assert_eq!(
+            runtime.creates.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the rejected create must never have reached the runtime"
+        );
+        assert!(runtime.last_approval.lock().unwrap().is_none());
+        shutdown.cancel();
+    }
+
+    /// S8 — a Remote client requesting the safe Interactive policy (or omitting
+    /// it, which defaults to Interactive) is allowed and stays Interactive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_client_may_create_an_interactive_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+
+        let bridge = LocalSocketRuntimeClient::connect_as(&path, ClientKind::Remote)
+            .await
+            .unwrap();
+        bridge
+            .create_session(create_req(ApprovalPolicy::Interactive))
+            .await
+            .unwrap();
+        assert_eq!(
+            *runtime.last_approval.lock().unwrap(),
+            Some(ApprovalPolicy::Interactive)
+        );
+        shutdown.cancel();
+    }
+
+    /// S3 — a TCP peer is never trusted to grant AutoApprove, whatever ClientKind
+    /// it declares: the transport itself is untrusted.
+    #[tokio::test]
+    async fn tcp_origin_cannot_elevate_to_auto_approve() {
+        let (addr, runtime, shutdown) = tcp_server("s3cret-token").await;
+        let response = tcp_request(
+            addr,
+            "s3cret-token",
+            WireRequest::CreateSession {
+                request: create_req(ApprovalPolicy::AutoApprove),
+                // Even a spoofed LocalInteractive is overridden by the untrusted
+                // transport ceiling.
+                client_kind: ClientKind::LocalInteractive,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(response, WireResponse::Error(_)),
+            "TCP auto-approve must be rejected: {response:?}"
+        );
+        assert_eq!(
+            runtime.creates.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the rejected TCP create must never have reached the runtime"
+        );
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn tcp_daemon_rejects_a_wrong_token_and_serves_nothing() {
         let (addr, runtime, shutdown) = tcp_server("s3cret-token").await;
@@ -1976,6 +2196,7 @@ mod tests {
             .unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "tcp e2e".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -2122,6 +2343,7 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "interactive session".to_string(),
                 model: None,
                 mode: PermissionProfile::Assisted,

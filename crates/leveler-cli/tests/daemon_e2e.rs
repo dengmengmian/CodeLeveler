@@ -304,6 +304,7 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication() {
     let client = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "crash me".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
@@ -441,6 +442,7 @@ async fn connected_client_recovers_after_daemon_sigkill() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "survive the crash".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,

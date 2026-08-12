@@ -172,7 +172,10 @@ enum SocketIntent {
 
 fn socket_intent(
     in_process: bool,
-    auto_approve: bool,
+    // R1: `--auto-approve` no longer forces an embedded runtime. It is carried as
+    // a per-session approval policy on the (trusted-local) CreateSessionRequest,
+    // so an unattended goal runs in the daemon and survives client disconnect.
+    _auto_approve: bool,
     explicit_socket: bool,
     config_overridden: bool,
 ) -> SocketIntent {
@@ -180,8 +183,8 @@ fn socket_intent(
         SocketIntent::Embedded
     } else if explicit_socket {
         SocketIntent::RequireExplicit
-    } else if auto_approve || config_overridden {
-        // A running daemon cannot inherit these invocation-scoped settings.
+    } else if config_overridden {
+        // A running daemon cannot inherit this invocation-scoped config.
         SocketIntent::Embedded
     } else {
         SocketIntent::ProbeDefault
@@ -440,6 +443,13 @@ pub(crate) async fn cmd_tui(
                         leveler_execution::PermissionProfile::FullAccess => {
                             leveler_client_protocol::PermissionProfile::FullAccess
                         }
+                    },
+                    // `--auto-approve` becomes this session's policy; the daemon
+                    // runs the turn and it survives this client disconnecting.
+                    approval_policy: if auto_approve {
+                        leveler_client_protocol::ApprovalPolicy::AutoApprove
+                    } else {
+                        leveler_client_protocol::ApprovalPolicy::Interactive
                     },
                 })
                 .await?;
@@ -1288,16 +1298,38 @@ mod tui_runtime_selection_tests {
 
     #[test]
     fn non_replayable_launch_options_force_the_embedded_runtime() {
-        assert_eq!(
-            socket_intent(false, true, false, false),
-            SocketIntent::Embedded,
-        );
+        // `config_overridden` still forces embedded this round (invocation-scoped
+        // config a running daemon cannot inherit), as does `--in-process`.
         assert_eq!(
             socket_intent(false, false, false, true),
             SocketIntent::Embedded,
         );
         assert_eq!(
             socket_intent(true, false, false, false),
+            SocketIntent::Embedded,
+        );
+    }
+
+    // R1: `--auto-approve` is no longer an invocation-scoped reason to embed the
+    // runtime in the TUI. It becomes a per-session approval policy carried on the
+    // CreateSessionRequest, so an unattended goal runs in the daemon and survives
+    // client disconnect. (§6.A)
+    #[test]
+    fn auto_approve_attaches_to_the_daemon_via_session_scoped_policy() {
+        assert_eq!(
+            socket_intent(
+                /*in_process*/ false, /*auto_approve*/ true,
+                /*explicit_socket*/ false, /*config_overridden*/ false,
+            ),
+            SocketIntent::ProbeDefault,
+        );
+    }
+
+    // §6.C — an explicit `--in-process` must still win over `--auto-approve`.
+    #[test]
+    fn in_process_wins_over_auto_approve() {
+        assert_eq!(
+            socket_intent(true, true, false, false),
             SocketIntent::Embedded,
         );
     }

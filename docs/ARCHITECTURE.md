@@ -219,6 +219,17 @@ stay on that path via goal mode (`update_goal` until complete or blocked) and
 optional `spawn_agent` fan-out. Legacy log kinds named `orchestrate` are
 accepted and run as direct.
 
+**A goal spans bounded work windows, not one giant turn.** The per-turn
+100-round ceiling ends a *work window*, not the goal: the supervisor
+(`DefaultSupervisorPolicy::after_turn`) opens the next window
+(`DriveGoalAgain`, a fresh objective-restated turn) instead of failing. Windows
+are bounded twice — an in-memory cross-window no-progress counter
+(`MAX_NO_PROGRESS_WINDOWS`, reset by material workspace change) under the
+absolute `MAX_SUPERVISED_TURNS` ceiling — so a stuck goal converges rather than
+spins. A window that exhausts the round budget is `BudgetLimited` (incomplete,
+resumable), **not** `Failed`. Goal identity is the session; the window budget is
+in-memory (daemon-crash window recovery is future work, not current).
+
 ---
 
 ## Host execution boundary
@@ -229,6 +240,14 @@ accepted and run as direct.
 - `PermissionProfile`, `RiskLevel`, approval policy
 - Process execution (`CommandRunner`), sandbox backends, cancellation
 - Checkpoints, background processes, artifacts
+
+**Execution hosts in the daemon, not the client.** Approval is a per-session
+policy (`ApprovalPolicy`, carried on the trusted-local `CreateSessionRequest`):
+`--auto-approve` selects an unattended session on the daemon rather than forcing
+an in-process runtime, so a long-running goal survives the client disconnecting
+and a reconnect resumes the still-running turn. A remote/web client cannot
+elevate its own session to auto-approve — the boundary force-resets it to
+interactive.
 
 Platform controls (capability-detected, never over-claimed):
 
