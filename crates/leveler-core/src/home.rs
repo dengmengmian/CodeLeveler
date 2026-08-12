@@ -63,6 +63,17 @@ impl LevelerHome {
         self.root.join("config.toml")
     }
 
+    /// User-authored global named-agent definitions: `agents/`. A sibling of
+    /// `config.toml` — user-owned config, not machine state.
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
+    /// User-authored global skills: `skills/`. User-owned config, not state.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
     // ── state/ — durable ────────────────────────────────────────────────────
 
     /// Durable-state root: `state/`.

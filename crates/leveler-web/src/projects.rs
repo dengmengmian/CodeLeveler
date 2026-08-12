@@ -1,7 +1,7 @@
 //! Project registry + daemon lifecycle for the multi-project WebUI.
 //!
 //! The aggregation server keeps a registry of repositories the user opened
-//! (`<leveler home>/web-projects.json`) and brings each one online behind the
+//! (`<home>/state/web/projects.json`) and brings each one online behind the
 //! [`RouterService`]: probe the repo's per-daemon Unix socket first and attach
 //! to a live daemon when one exists (e.g. the user's own `leveler tui`),
 //! otherwise spawn `leveler --repo <path> serve --ready-json <file>` and
@@ -55,7 +55,7 @@ struct Registry {
     #[serde(default)]
     aliases: HashMap<PathBuf, String>,
     /// Removed by the user: historical discovery must not re-list these even
-    /// though their state dirs under `<home>/projects` still exist. An
+    /// though their state dirs under `<home>/state/projects` still exist. An
     /// explicit open clears the entry.
     #[serde(default)]
     ignored: Vec<PathBuf>,
@@ -98,6 +98,9 @@ impl State {
 /// Registry + daemon lifecycle. One per aggregation server.
 pub struct ProjectManager {
     router: Arc<RouterService>,
+    /// The global home root, kept so historical discovery scans the real
+    /// `state/projects/` rather than guessing it from the registry path.
+    home_root: PathBuf,
     registry_path: PathBuf,
     /// Binary to spawn for projects with no live daemon (`current_exe`).
     /// `None` (tests, exotic setups) disables spawning; probing still works.
@@ -111,22 +114,24 @@ pub struct ProjectManager {
 impl ProjectManager {
     pub fn new(
         router: Arc<RouterService>,
-        registry_path: PathBuf,
+        home: leveler_core::LevelerHome,
         exe: Option<PathBuf>,
     ) -> Arc<Self> {
-        Self::with_socket_resolver(router, registry_path, exe, |repo| {
+        Self::with_socket_resolver(router, home, exe, |repo| {
             Layout::resolve(repo.to_path_buf(), None).socket_path()
         })
     }
 
     pub fn with_socket_resolver(
         router: Arc<RouterService>,
-        registry_path: PathBuf,
+        home: leveler_core::LevelerHome,
         exe: Option<PathBuf>,
         socket_for: impl Fn(&Path) -> PathBuf + Send + Sync + 'static,
     ) -> Arc<Self> {
+        let registry_path = home.web_projects_registry();
         Arc::new(Self {
             router,
+            home_root: home.root().to_path_buf(),
             registry_path,
             exe,
             socket_for: Box::new(socket_for),
@@ -335,10 +340,7 @@ impl ProjectManager {
     /// bury the real projects in noise. Explicitly opening such a path still
     /// works — only discovery skips it.
     pub async fn discover_historical_projects(&self, ephemeral_root: &Path) {
-        let Some(home) = self.registry_path.parent() else {
-            return;
-        };
-        for repo in historical_repositories(home, ephemeral_root).await {
+        for repo in historical_repositories(&self.home_root, ephemeral_root).await {
             self.register_discovered(repo).await;
         }
     }
@@ -684,7 +686,7 @@ mod tests {
         let router = RouterService::new(StubService::new(), dir.join("primary"));
         let manager = ProjectManager::with_socket_resolver(
             router.clone(),
-            dir.join("web-projects.json"),
+            leveler_core::LevelerHome::from_root(dir.to_path_buf()),
             None,
             move |_repo| socket.clone(),
         );
@@ -735,9 +737,10 @@ mod tests {
         );
 
         // Registry landed on disk with the canonical path.
-        let registry: Registry =
-            serde_json::from_slice(&std::fs::read(dir.path().join("web-projects.json")).unwrap())
-                .unwrap();
+        let registry: Registry = serde_json::from_slice(
+            &std::fs::read(dir.path().join("state/web/projects.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(registry.projects, vec![canonical_repo.clone()]);
 
         // list(): primary first, then the registered project.
@@ -750,9 +753,10 @@ mod tests {
             .remove(repo.to_str().unwrap())
             .expect("removes cleanly");
         assert!(!router.handles(&canonical_repo));
-        let registry: Registry =
-            serde_json::from_slice(&std::fs::read(dir.path().join("web-projects.json")).unwrap())
-                .unwrap();
+        let registry: Registry = serde_json::from_slice(
+            &std::fs::read(dir.path().join("state/web/projects.json")).unwrap(),
+        )
+        .unwrap();
         assert!(registry.projects.is_empty());
     }
 
@@ -795,9 +799,10 @@ mod tests {
         assert_eq!(manager.list()[1].name, "别名");
 
         // The alias is persisted alongside the paths.
-        let registry: Registry =
-            serde_json::from_slice(&std::fs::read(dir.path().join("web-projects.json")).unwrap())
-                .unwrap();
+        let registry: Registry = serde_json::from_slice(
+            &std::fs::read(dir.path().join("state/web/projects.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             registry.aliases.get(&canonical_repo).map(String::as_str),
             Some("别名")
@@ -822,8 +827,9 @@ mod tests {
         let repo = dir.path().join("project-f");
         std::fs::create_dir_all(&repo).unwrap();
         let canonical_repo = repo.canonicalize().unwrap();
+        std::fs::create_dir_all(dir.path().join("state/web")).unwrap();
         std::fs::write(
-            dir.path().join("web-projects.json"),
+            dir.path().join("state/web/projects.json"),
             serde_json::to_vec(&Registry {
                 projects: vec![canonical_repo.clone()],
                 aliases: HashMap::from([(canonical_repo, "历史别名".to_string())]),
@@ -849,8 +855,9 @@ mod tests {
         let repo = dir.path().join("project-d");
         std::fs::create_dir_all(&repo).unwrap();
         let canonical_repo = repo.canonicalize().unwrap();
+        std::fs::create_dir_all(dir.path().join("state/web")).unwrap();
         std::fs::write(
-            dir.path().join("web-projects.json"),
+            dir.path().join("state/web/projects.json"),
             serde_json::to_vec(&Registry {
                 projects: vec![canonical_repo.clone()],
                 aliases: HashMap::new(),
@@ -873,7 +880,7 @@ mod tests {
         let socket = dir.path().join("daemon.sock");
         let _shutdown = serve_stub_daemon(&socket).await;
         // A historical repo: state dir under <home>/projects with an owner
-        // marker, but absent from web-projects.json.
+        // marker, but absent from state/web/projects.json.
         let repo = dir.path().join("tui-only-project");
         std::fs::create_dir_all(&repo).unwrap();
         let canonical_repo = repo.canonicalize().unwrap();
@@ -943,7 +950,7 @@ mod tests {
         assert_eq!(list[1].status, ProjectStatus::Online);
         // Discovery is ephemeral: no registry write.
         assert!(
-            !dir.path().join("web-projects.json").exists(),
+            !dir.path().join("state/web/projects.json").exists(),
             "discovery must not persist the registry"
         );
     }
@@ -1074,14 +1081,15 @@ mod tests {
             .discover_historical_projects(&dir.path().join("tempzone"))
             .await;
         assert_eq!(manager.list()[1].status, ProjectStatus::Offline);
-        assert!(!dir.path().join("web-projects.json").exists());
+        assert!(!dir.path().join("state/web/projects.json").exists());
 
         // Explicit open: no daemon and no spawner, so it errors — but the
         // project is now persisted for the retry path.
         let _ = manager.add(canonical_repo.to_str().unwrap()).await;
-        let registry: Registry =
-            serde_json::from_slice(&std::fs::read(dir.path().join("web-projects.json")).unwrap())
-                .unwrap();
+        let registry: Registry = serde_json::from_slice(
+            &std::fs::read(dir.path().join("state/web/projects.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(registry.projects, vec![canonical_repo]);
     }
 }

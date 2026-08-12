@@ -136,8 +136,9 @@ fn merge_cli_readonly_roots(roots: &[PathBuf]) {
 /// Goes to stderr so it never contaminates machine-readable stdout, and runs
 /// before dispatch so it precedes any alternate-screen UI.
 fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
-    let home = leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-        .unwrap_or_else(|| std::path::PathBuf::from(".leveler"));
+    let home = leveler_core::LevelerHome::resolve(leveler_core::environment())
+        .root()
+        .to_path_buf();
     let ignored = leveler_execution::untrusted_project_files(&home, &layout.repo_root);
     if ignored.is_empty() {
         return;

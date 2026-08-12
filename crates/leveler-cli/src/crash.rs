@@ -1,4 +1,4 @@
-//! Crash records (`~/.leveler/crash/`).
+//! Crash records (`~/.leveler/logs/crash/`).
 //!
 //! A panic in a TUI is close to invisible: the alternate screen is torn down,
 //! the message scrolls past, and all anyone can report afterwards is "it
@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 const KEEP: usize = 20;
 
 pub(crate) fn crash_dir() -> Option<PathBuf> {
-    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k)).map(|home| home.join("crash"))
+    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+        .map(|root| leveler_core::LevelerHome::from_root(root).crash_dir())
 }
 
 /// Install the panic hook.

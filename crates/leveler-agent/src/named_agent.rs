@@ -98,7 +98,8 @@ pub fn project_agents_dir(root: &Path) -> PathBuf {
 }
 
 pub fn global_agents_dir() -> Option<PathBuf> {
-    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k)).map(|home| home.join("agents"))
+    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
+        .map(|root| leveler_core::LevelerHome::from_root(root).agents_dir())
 }
 
 /// Load one agent by name, project → global → built-in.

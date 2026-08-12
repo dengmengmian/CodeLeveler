@@ -116,12 +116,12 @@ fn format_rule(rule: &PermissionRule) -> String {
     format!("{effect}  {}", parts.join(" "))
 }
 
-/// The leveler home, with a local `.leveler` fallback (should not hit in normal
-/// interactive use). Home-resolution order is shared via
-/// [`leveler_core::leveler_home_dir_from`].
+/// The global leveler home root. Resolution (incl. the workspace-external temp
+/// fallback when no `HOME` is set) is owned by [`leveler_core::LevelerHome`].
 fn leveler_home() -> PathBuf {
-    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-        .unwrap_or_else(|| PathBuf::from(".leveler"))
+    leveler_core::LevelerHome::resolve(leveler_core::environment())
+        .root()
+        .to_path_buf()
 }
 
 // Unit tests for this module live in `tests/permissions.rs` (bin-only crate).

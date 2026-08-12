@@ -481,9 +481,7 @@ pub(crate) async fn cmd_tui(
             client.clone() as Arc<dyn leveler_local_transport::LocalRuntimeService>,
             layout.repo_root.clone(),
             leveler_remote_agent::RemoteHome::new(
-                leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-                    .unwrap_or_else(|| std::path::PathBuf::from(".leveler"))
-                    .join("remote"),
+                leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
             ),
         );
         let client: Arc<dyn InteractiveRuntimeClient> = client;
@@ -550,7 +548,7 @@ pub(crate) async fn cmd_tui(
             let router = leveler_web::RouterService::new(service, repo_root);
             let manager = leveler_web::ProjectManager::new(
                 router.clone(),
-                web_projects_registry_path(),
+                leveler_core::LevelerHome::resolve(leveler_core::environment()),
                 std::env::current_exe().ok(),
             );
             let background = manager.clone();
@@ -607,9 +605,7 @@ pub(crate) async fn cmd_tui(
         remote_service,
         remote_repo_root,
         leveler_remote_agent::RemoteHome::new(
-            leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-                .unwrap_or_else(|| std::path::PathBuf::from(".leveler"))
-                .join("remote"),
+            leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
         ),
     );
 
@@ -824,10 +820,9 @@ pub(crate) async fn cmd_web(
             // The daemon is the primary behind the RouterService; added projects
             // get their own probe-or-spawn daemons like the in-process path.
             let router = leveler_web::RouterService::new(service, layout.repo_root.clone());
-            let registry_path = web_projects_registry_path();
             let manager = leveler_web::ProjectManager::new(
                 router.clone(),
-                registry_path,
+                leveler_core::LevelerHome::resolve(leveler_core::environment()),
                 std::env::current_exe().ok(),
             );
             let background = manager.clone();
@@ -871,10 +866,9 @@ pub(crate) async fn cmd_web(
                 );
             }
             let router = leveler_web::RouterService::new(service, app.layout.repo_root.clone());
-            let registry_path = web_projects_registry_path();
             let manager = leveler_web::ProjectManager::new(
                 router.clone(),
-                registry_path,
+                leveler_core::LevelerHome::resolve(leveler_core::environment()),
                 std::env::current_exe().ok(),
             );
             // Bring persisted projects online in the background — the server
@@ -917,15 +911,6 @@ pub(crate) async fn cmd_web(
     }
     result?;
     Ok(std::process::ExitCode::SUCCESS)
-}
-
-/// The multi-project registry lives at the top of the CodeLeveler home
-/// (default `~/.leveler/web-projects.json`) — it is cross-repository state,
-/// unlike the per-repo dirs under `projects/`.
-fn web_projects_registry_path() -> PathBuf {
-    leveler_core::leveler_home_dir(leveler_core::environment())
-        .unwrap_or_else(std::env::temp_dir)
-        .join("web-projects.json")
 }
 
 /// A `LocalRuntimeService` facade over a TCP-connected daemon client: the

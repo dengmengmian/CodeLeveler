@@ -1,7 +1,7 @@
 //! What a host keeps on disk to be reachable: its key, its id, and where its
 //! relay is.
 //!
-//! Three files under `~/.leveler/remote/`, and the split between them is the
+//! Three files under `~/.leveler/state/remote/`, and the split between them is the
 //! point:
 //!
 //! - `runtime_key` — the private key, `0600`. Losing it means re-pairing every
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 =
     leveler_remote_protocol::policy::DEFAULT_APPROVAL_TIMEOUT_SECS;
 
-/// `~/.leveler/remote/config.toml`.
+/// `~/.leveler/state/remote/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteConfig {
     /// Base URL of the relay this host dials out to, without a trailing slash.

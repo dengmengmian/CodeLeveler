@@ -13,7 +13,8 @@ use crate::theme::ThemeId;
 /// Config path: `<leveler-home>/config.toml`, or `None` when no home is known.
 /// Shares the home-resolution order via [`leveler_core::leveler_home_dir`].
 pub fn config_path() -> Option<PathBuf> {
-    leveler_core::leveler_home_dir(leveler_core::environment()).map(|home| home.join("config.toml"))
+    leveler_core::leveler_home_dir(leveler_core::environment())
+        .map(|root| leveler_core::LevelerHome::from_root(root).config_file())
 }
 
 /// Read the theme id string from config, if present and valid.
