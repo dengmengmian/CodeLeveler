@@ -1734,9 +1734,17 @@ mod tests {
                 "missing private cache directory {relative}"
             );
         }
+        // Scratch now lives under `run/sandboxes/` beneath the home, not the
+        // home root directly.
         assert_eq!(
             paths.scratch_path().parent(),
-            Some(leveler_home.canonicalize().unwrap().as_path())
+            Some(
+                leveler_home
+                    .canonicalize()
+                    .unwrap()
+                    .join("run/sandboxes")
+                    .as_path()
+            )
         );
         assert!(
             paths
@@ -1764,7 +1772,8 @@ mod tests {
         );
 
         let paths = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
-        let owner = paths.scratch_path().parent().unwrap();
+        // scratch = <owner>/run/sandboxes/<name>; strip name + sandboxes + run.
+        let owner = paths.scratch_path().ancestors().nth(3).unwrap();
         assert_eq!(
             owner.parent(),
             Some(base.path().canonicalize().unwrap().as_path())

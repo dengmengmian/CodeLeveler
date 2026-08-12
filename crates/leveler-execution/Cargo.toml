@@ -20,6 +20,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
+fs2 = { workspace = true }
 cap-std = { workspace = true }
 # Shell-script danger classification parses bash with a real grammar instead of
 # string splitting. Pinned exactly: grammar and runtime ABI must stay in sync.

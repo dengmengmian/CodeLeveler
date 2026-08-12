@@ -35,6 +35,77 @@ pub(crate) struct SandboxPaths {
     go_mod_cache: PathBuf,
     npm_cache: PathBuf,
     cache_write_roots: Vec<PathBuf>,
+    /// OS lease on `<scratch>.lock`, held for this scratch's lifetime. Its Drop
+    /// removes the lock file; the flock releases when the file handle drops
+    /// (including on crash, where the reaper reclaims the orphan). Kept last so
+    /// it drops after `scratch`.
+    _lease: SandboxLeaseGuard,
+}
+
+/// RAII guard tying a per-command scratch dir to an exclusive advisory lock on
+/// its sidecar `<name>.lock`. A live command holds the lock for its whole
+/// lifetime; the reaper treats a lock it can acquire as proof the owner died.
+struct SandboxLeaseGuard {
+    lock_path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Drop for SandboxLeaseGuard {
+    fn drop(&mut self) {
+        // Graceful path: remove the sidecar lock file. The flock is released
+        // when `_lock` drops right after. (On a crash this Drop never runs, so
+        // the lock file lingers and the reaper reclaims it.)
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Acquire an exclusive lease for a freshly-created scratch dir: open (create)
+/// `<scratch>.lock` beside it and flock it. The lock is brand-new and
+/// uncontended, so this never blocks; a failure is surfaced rather than
+/// silently proceeding lockless.
+fn acquire_sandbox_lease(scratch_dir: &Path) -> std::io::Result<SandboxLeaseGuard> {
+    let lock_path = scratch_dir.with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    fs2::FileExt::try_lock_exclusive(&lock)?;
+    Ok(SandboxLeaseGuard {
+        lock_path,
+        _lock: lock,
+    })
+}
+
+/// Reclaim crash-orphaned scratch dirs under `sandboxes_root`: for each
+/// `<name>.lock` whose flock we can acquire, the owner is gone, so remove its
+/// `<name>` tree and the lock. Fail-closed — a lock we cannot open or acquire
+/// (owner alive), or any I/O hiccup, leaves the entry untouched. Opportunistic:
+/// the caller runs it once per process, never on a timer.
+fn reap_orphaned_sandboxes(sandboxes_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(sandboxes_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".lock") else {
+            continue;
+        };
+        let Ok(lock) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            continue;
+        };
+        if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            // Owner still holds the lease — leave everything alone.
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(sandboxes_root.join(stem));
+        let _ = fs2::FileExt::unlock(&lock);
+        drop(lock);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 impl SandboxPaths {
@@ -246,11 +317,18 @@ pub(crate) fn prepare_sandbox_paths(
                 "no stable tool-cache owner outside the writable workspace",
             )
         })?;
-    // Scratch creation uses the same stable, workspace-external owner rather
-    // than TMPDIR, which may itself live in or be poisoned by the workspace.
+    // Scratch dirs live under `run/sandboxes/` beneath the same stable,
+    // workspace-external owner (never TMPDIR, which may sit in or be poisoned by
+    // the workspace, and never the owner root itself). Reap crash-orphans once
+    // per process — opportunistically, before creating this command's dir.
+    let sandboxes_root =
+        ensure_real_private_chain(&owner, &owner_path, Path::new("run/sandboxes"))?;
+    static REAP_ONCE: std::sync::Once = std::sync::Once::new();
+    REAP_ONCE.call_once(|| reap_orphaned_sandboxes(&sandboxes_root));
     let scratch = tempfile::Builder::new()
         .prefix("codeleveler-sandbox-")
-        .tempdir_in(&owner_path)?;
+        .tempdir_in(&sandboxes_root)?;
+    let lease = acquire_sandbox_lease(scratch.path())?;
     let (cache_base_dir, cache_base) =
         ensure_real_private_child(&owner, &owner_path, "tool-cache".as_ref())?;
     let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
@@ -321,6 +399,7 @@ pub(crate) fn prepare_sandbox_paths(
         go_mod_cache,
         npm_cache,
         cache_write_roots,
+        _lease: lease,
     })
 }
 
@@ -860,5 +939,73 @@ mod tests {
         );
         assert!(!private.path().join("config.toml").exists());
         assert!(!private.path().join("credentials.toml").exists());
+    }
+
+    // ── sandbox lease + reaper (D2) ─────────────────────────────────────────
+
+    /// S1: a lease creates and holds `<scratch>.lock`; dropping it removes the
+    /// lock file (the graceful RAII path).
+    #[test]
+    fn lease_holds_then_removes_its_lock_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-abc");
+        std::fs::create_dir(&scratch).unwrap();
+        let lock = scratch.with_extension("lock");
+
+        let lease = acquire_sandbox_lease(&scratch).unwrap();
+        assert!(lock.exists(), "the lease creates its sidecar lock");
+        drop(lease);
+        assert!(!lock.exists(), "dropping the lease removes the lock file");
+    }
+
+    /// S2: the reaper reclaims an orphan whose lock is free (owner gone) —
+    /// removing both the scratch tree and the lock.
+    #[test]
+    fn reaper_reclaims_an_orphan_with_a_free_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-dead");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("residue"), b"x").unwrap();
+        // Simulate a crashed owner: lock file left behind, no live flock.
+        std::fs::write(scratch.with_extension("lock"), b"").unwrap();
+
+        reap_orphaned_sandboxes(root.path());
+
+        assert!(!scratch.exists(), "orphan scratch tree is removed");
+        assert!(
+            !scratch.with_extension("lock").exists(),
+            "orphan lock is removed"
+        );
+    }
+
+    /// S3: a live lease is never reaped — its held flock is the proof of life.
+    #[test]
+    fn reaper_leaves_a_live_lease_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-live");
+        std::fs::create_dir(&scratch).unwrap();
+        let _lease = acquire_sandbox_lease(&scratch).unwrap();
+
+        reap_orphaned_sandboxes(root.path());
+
+        assert!(scratch.exists(), "a live-leased scratch must survive");
+        assert!(scratch.with_extension("lock").exists());
+    }
+
+    /// S4: fail-closed — a scratch dir with no lock sidecar is left alone rather
+    /// than deleted on a guess.
+    #[test]
+    fn reaper_is_fail_closed_without_a_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-nolock");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("keep"), b"x").unwrap();
+
+        reap_orphaned_sandboxes(root.path());
+
+        assert!(
+            scratch.exists(),
+            "a lock-less dir is ambiguous and must be left untouched"
+        );
     }
 }
