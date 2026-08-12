@@ -284,6 +284,34 @@ mod tests {
     }
 
     #[test]
+    fn resolving_a_layout_writes_nothing_into_the_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = env_home(&home.path().display().to_string());
+
+        let before: Vec<_> = fs::read_dir(repo.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let _ = Layout::resolve_with_environment(repo.path().to_path_buf(), None, &env);
+        let after: Vec<_> = fs::read_dir(repo.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+
+        assert_eq!(
+            before, after,
+            "resolving a layout must not create anything inside the workspace"
+        );
+        assert!(
+            !repo.path().join(".leveler").exists(),
+            "no `.leveler` may appear in the repo"
+        );
+    }
+
+    #[test]
     fn target_lock_path_lives_under_run_locks_never_in_the_workspace() {
         let lock = target_lock_path(&env_home("/home/x/.leveler"), Path::new("/repo/src/lib.rs"));
         assert_eq!(

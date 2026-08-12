@@ -287,6 +287,47 @@ mod tests {
         );
     }
 
+    /// The layout is lazy: asking for any path must not create it (callers
+    /// create on write). A pristine root stays empty after touching every
+    /// accessor.
+    #[test]
+    fn accessors_never_create_directories() {
+        let root = std::env::temp_dir().join(format!("leveler-home-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let h = LevelerHome::from_root(&root);
+
+        // Touch one accessor from every namespace.
+        let _ = [
+            h.config_file(),
+            h.agents_dir(),
+            h.skills_dir(),
+            h.state_dir(),
+            h.projects_dir(),
+            h.project_state_dir("p"),
+            h.remote_state_dir(),
+            h.web_state_dir(),
+            h.web_projects_registry(),
+            h.web_uploads_dir(),
+            h.run_dir(),
+            h.sockets_dir(),
+            h.locks_dir(),
+            h.sandboxes_dir(),
+            h.cache_dir(),
+            h.tool_cache_dir(),
+            h.runtimes_dir(),
+            h.logs_dir(),
+            h.main_log(),
+            h.crash_dir(),
+            h.daemon_logs_dir(),
+            h.daemon_log("p"),
+        ];
+
+        assert!(
+            !root.exists(),
+            "resolving paths must not create the home tree"
+        );
+    }
+
     /// Architecture tripwire: home paths must be built through [`LevelerHome`],
     /// never re-derived ad hoc. Two idioms are how that decays, so both are
     /// banned in `crates/*/src` (this authority file excepted):
