@@ -59,6 +59,8 @@ SHA-256 of the canonical repo path.
 | `ea96b89` | **Sandbox lease + fail-closed reaper** under `run/sandboxes/` (D2). |
 | `272f7e7` | **Architecture tripwire**: a test fails the build if any crate rebuilds a home path by hand (`from(".leveler")` or `|home| home.join(`). |
 | `ddb6202` | Lazy-create and filesystem-level zero-pollution tests. |
+| `0a54186` | Bilingual layout docs; fix two pre-canonical test harnesses; first regression pass. |
+| `c52a667` | **Review closeout (H-1, H-2):** route the sandbox scratch + tool cache through `LevelerHome` (`run/sandboxes`, `cache/tools`; no `codeleveler-private`/`tool-cache`; poisoned `LEVELER_HOME` fails closed); bind the background lease to the scratch's lifetime; strengthen the tripwire (bare `leveler_home_dir(`, `"tool-cache"`). |
 
 ---
 
@@ -115,18 +117,32 @@ withdrawn — CLOSED.
 
 ---
 
-## Regression
+## Regression (post-closeout)
 
 - `cargo fmt --check` — clean.
-- `cargo test --workspace --no-fail-fast` — **123 test binaries, 2675 tests, 0
+- `cargo test --workspace --no-fail-fast` — **123 test binaries, 2678 tests, 0
   failures.**
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
-Two test harnesses carried pre-canonical layout assumptions and were updated
-(not product regressions — they had been stale since the state/socket dirs
-moved and were only exposed once the suite ran end to end):
-`daemon_e2e.rs` (`home/sock` → `home/run/sockets`, `home/projects` →
-`home/state/projects`) and `permissions.rs` (`home/projects` →
-`home/state/projects`).
+Test harnesses that carried pre-canonical layout assumptions were updated
+(not product regressions — they had been stale since the state/socket/cache
+dirs moved and were only exposed once the suite ran end to end):
+`daemon_e2e.rs` (`home/sock` → `run/sockets`, `home/projects` →
+`state/projects`), `permissions.rs` (`home/projects` → `state/projects`), and
+the sandbox-cache tests (`home/tool-cache` → `cache/tools`; the poisoned-
+`LEVELER_HOME` case now asserts fail-closed instead of a HOME fallback).
+
+## Final status
+
+| Item | Status |
+| --- | --- |
+| H-1 canonical sandbox+cache authority | CLOSED |
+| H-2 background lease bound to scratch lifetime | CLOSED |
+| Canonical tool cache path | `~/.leveler/cache/tools/<hash>` |
+| Zero Workspace Pollution | enforced (tripwire + real sandbox-init test) |
+| `LEVELER_HOME` override | honored; poisoned home fails closed |
+| Full regression | 2678 tests / 0 fail; clippy -D clean; fmt clean |
+| Blockers / Majors / Minors | 0 / 0 / 0 |
+| Merge recommendation | ready for a final human review, then PR |
 
 Not merged; feature branch only, pending human review.
