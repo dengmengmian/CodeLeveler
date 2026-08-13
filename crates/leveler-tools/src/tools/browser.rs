@@ -73,6 +73,12 @@ fn check_navigation(context: &ToolContext, url: &str) -> Result<(), String> {
     if context.policy.network_denied() {
         return Err("network access is denied for this run".into());
     }
+    navigation_host_allowed(url)
+}
+
+/// The URL/host half of the gate (pure, no policy) — split out so the SSRF
+/// logic is testable without a full `ToolContext`.
+fn navigation_host_allowed(url: &str) -> Result<(), String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("unsupported URL (need http/https): {url}"))?;
@@ -704,5 +710,30 @@ impl Tool for BrowserScreenshotTool {
             )),
             Err(e) => Ok(err_out(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::navigation_host_allowed;
+
+    #[test]
+    fn ssrf_gate_allows_localhost_and_public_forms_but_blocks_private() {
+        // Loopback dev servers are the narrow allowed exception.
+        assert!(navigation_host_allowed("http://localhost:3000/users").is_ok());
+        assert!(navigation_host_allowed("http://127.0.0.1/").is_ok());
+        assert!(navigation_host_allowed("https://[::1]/").is_ok());
+
+        // Private / link-local / metadata addresses are refused (IP literals,
+        // so this is hermetic — no DNS needed).
+        assert!(navigation_host_allowed("http://10.0.0.1/").is_err());
+        assert!(navigation_host_allowed("http://192.168.1.1/").is_err());
+        assert!(navigation_host_allowed("http://169.254.169.254/latest/meta-data").is_err());
+
+        // Non-http schemes and malformed URLs are refused (no file://, no data:).
+        assert!(navigation_host_allowed("file:///etc/passwd").is_err());
+        assert!(navigation_host_allowed("ftp://example.com/").is_err());
+        assert!(navigation_host_allowed("not-a-url").is_err());
+        assert!(navigation_host_allowed("http:///no-host").is_err());
     }
 }
