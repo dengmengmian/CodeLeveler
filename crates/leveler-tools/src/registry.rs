@@ -288,7 +288,25 @@ pub fn full_registry() -> ToolRegistry {
     registry.register(Arc::new(tools::RememberTool));
     registry.register(Arc::new(tools::ForgetTool));
     registry.register(Arc::new(tools::ConsolidateMemoryTool));
+    register_browser(&mut registry);
     registry
+}
+
+/// The structured browser tools (§19). Grouped so `full_registry` and the
+/// `"browser"` expand category register exactly the same set.
+fn register_browser(registry: &mut ToolRegistry) {
+    use crate::tools;
+    registry.register(Arc::new(tools::BrowserNavigateTool));
+    registry.register(Arc::new(tools::BrowserSnapshotTool));
+    registry.register(Arc::new(tools::BrowserClickTool));
+    registry.register(Arc::new(tools::BrowserTypeTool));
+    registry.register(Arc::new(tools::BrowserSelectTool));
+    registry.register(Arc::new(tools::BrowserPressTool));
+    registry.register(Arc::new(tools::BrowserWaitTool));
+    registry.register(Arc::new(tools::BrowserTabsTool));
+    registry.register(Arc::new(tools::BrowserDialogTool));
+    registry.register(Arc::new(tools::BrowserConsoleTool));
+    registry.register(Arc::new(tools::BrowserScreenshotTool));
 }
 
 /// Economy / Core tool surface (appendix B). Missing categories via expand_tools.
@@ -344,6 +362,9 @@ pub fn expand_tool_category(registry: &mut ToolRegistry, category: &str) {
         }
         "skills" => {
             registry.register(Arc::new(tools::CreateSkillTool));
+        }
+        "browser" => {
+            register_browser(registry);
         }
         _ => {}
     }
@@ -448,7 +469,11 @@ mod tests {
         assert!(names.contains(&"memory".to_string()));
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"forget".to_string()));
-        assert_eq!(names.len(), 31);
+        assert!(names.contains(&"browser_navigate".to_string()));
+        assert!(names.contains(&"browser_snapshot".to_string()));
+        assert!(names.contains(&"browser_click".to_string()));
+        // core (13) + full extras (18) + browser (11) = 42
+        assert_eq!(names.len(), 42);
     }
 
     #[test]

@@ -142,6 +142,11 @@ pub struct Application {
     /// every background process — hence servers dying between turns. Only the
     /// process exit drops the last handle.
     background_tasks: Arc<leveler_execution::BackgroundTaskRegistry>,
+    /// Daemon-owned, lazily-started browser runtime, shared (cloned `Arc`) into
+    /// every engine/turn so the browser and its isolated project profile survive
+    /// across turns and client disconnect. Nothing starts until a browser tool
+    /// is first used.
+    browser: Arc<leveler_browser::BrowserRuntime>,
     /// Durable runtime identity, loaded (and minted on first use) lazily from
     /// the state directory. Cached: the id cannot change within one process.
     runtime_id: OnceLock<leveler_core::RuntimeId>,
@@ -226,6 +231,12 @@ impl Application {
         let background_tasks = Arc::new(
             leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone()),
         );
+        // Lazy: the runtime holds only paths until a browser tool starts it.
+        let browser = Arc::new(leveler_browser::BrowserRuntime::new(
+            layout.home().clone(),
+            (*environment).clone(),
+            layout.browser_profile_dir(),
+        ));
         Ok(Self {
             layout,
             config,
@@ -238,6 +249,7 @@ impl Application {
             collaboration: CollaborationMode::Chat,
             environment,
             background_tasks,
+            browser,
             runtime_id: OnceLock::new(),
         })
     }
@@ -395,11 +407,13 @@ impl Application {
             clarifier,
             self.work_profile,
             false,
+            None,
         )
         .await
     }
 
     /// Like [`Self::engine_for`], but force a work profile (resume / axes reload).
+    #[allow(clippy::too_many_arguments)]
     pub async fn engine_for_with_profile(
         &self,
         model: &ModelRef,
@@ -409,6 +423,7 @@ impl Application {
         clarifier: Arc<dyn leveler_agent::Clarifier>,
         work_profile: WorkProfile,
         read_only: bool,
+        session_scope: Option<&str>,
     ) -> Result<leveler_engine::TaskEngine, AppError> {
         let workspace = Workspace::new(&self.layout.repo_root)?
             .with_readonly_roots(self.readonly_roots.iter().cloned());
@@ -436,7 +451,12 @@ impl Application {
             .with_artifact_store(artifact_store)
             .with_memory_root(self.layout.memory_dir())
             .with_read_only(read_only)
-            .with_background_tasks(bg);
+            .with_background_tasks(bg)
+            .with_browser(self.browser.clone());
+        let tool_context = match session_scope {
+            Some(scope) => tool_context.with_session_scope(scope),
+            None => tool_context,
+        };
         // Economy ships Core tool surface; balanced/delivery use Full.
         let mut registry = match work_profile {
             WorkProfile::Economy => core_registry(),

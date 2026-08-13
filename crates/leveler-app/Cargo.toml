@@ -18,6 +18,7 @@ leveler-execution = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-memory = { workspace = true }
 leveler-tools = { workspace = true }
+leveler-browser = { workspace = true }
 leveler-agent = { workspace = true }
 leveler-verifier = { workspace = true }
 leveler-vcs = { workspace = true }

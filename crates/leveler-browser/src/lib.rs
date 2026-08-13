@@ -24,7 +24,7 @@ mod types;
 pub use driver::DriverEvent;
 pub use error::{BrowserError, BrowserResult};
 pub use install::{PINNED_PLAYWRIGHT, RuntimeLayout, discover_system_chrome, which};
-pub use runtime::{BrowserRuntime, Interaction};
+pub use runtime::{BrowserRuntime, Interaction, WaitCondition};
 pub use types::{
     BrowserActionResult, BrowserEngine, BrowserPageId, BrowserRef, BrowserRuntimeInfo,
     BrowserRuntimeStatus, BrowserSessionId, BrowserSnapshot, ConsoleEntry, DialogInfo, TabInfo,

@@ -33,6 +33,10 @@ pub struct ToolContext {
     pub execution: ExecutionResources,
     pub policy: ToolPolicy,
     pub services: ToolServices,
+    /// Stable identity of the session this context serves, used to isolate
+    /// per-session capability state (e.g. browser pages/refs — §18). `None` for
+    /// non-session contexts (eval, one-shot CLI); those share a default scope.
+    pub session_scope: Option<Arc<str>>,
 }
 
 /// Process-wide execution and write-safety infrastructure. Every handle is an
@@ -145,6 +149,10 @@ pub struct ToolServices {
     pub memory_root: Option<std::path::PathBuf>,
     /// Background process task registry (run_command background=true).
     pub background_tasks: Option<std::sync::Arc<leveler_execution::BackgroundTaskRegistry>>,
+    /// Daemon-owned browser runtime, shared across turns so the browser (and its
+    /// isolated project profile) survives client disconnect. `None` disables the
+    /// browser tools (they error clearly). See `leveler_browser::BrowserRuntime`.
+    pub browser: Option<std::sync::Arc<leveler_browser::BrowserRuntime>>,
 }
 
 impl ToolContext {
@@ -193,8 +201,22 @@ impl ToolContext {
                 artifact_store: None,
                 memory_root: None,
                 background_tasks: None,
+                browser: None,
             },
+            session_scope: None,
         }
+    }
+
+    /// Bind this context to a session identity (browser page/ref isolation).
+    pub fn with_session_scope(mut self, scope: impl Into<Arc<str>>) -> Self {
+        self.session_scope = Some(scope.into());
+        self
+    }
+
+    /// The session scope for capability isolation, defaulting to a shared scope
+    /// when this context has no session identity.
+    pub fn session_scope(&self) -> &str {
+        self.session_scope.as_deref().unwrap_or("default")
     }
 
     /// Share a background task registry across tool calls.
@@ -203,6 +225,15 @@ impl ToolContext {
         registry: std::sync::Arc<leveler_execution::BackgroundTaskRegistry>,
     ) -> Self {
         self.services.background_tasks = Some(registry);
+        self
+    }
+
+    /// Share the daemon-owned browser runtime across tool calls.
+    pub fn with_browser(
+        mut self,
+        runtime: std::sync::Arc<leveler_browser::BrowserRuntime>,
+    ) -> Self {
+        self.services.browser = Some(runtime);
         self
     }
 

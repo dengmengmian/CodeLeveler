@@ -87,6 +87,7 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
             Arc::new(AutoClarify),
             WorkProfile::Economy,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -107,6 +108,7 @@ async fn engine_for_with_profile_uses_session_axes_not_app_default() {
             Arc::new(AutoClarify),
             WorkProfile::Delivery,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -147,6 +149,7 @@ async fn resume_session_rebuilds_engine_with_persisted_delivery_profile() {
             Arc::new(AutoClarify),
             wp,
             false,
+            None,
         )
         .await
         .unwrap();

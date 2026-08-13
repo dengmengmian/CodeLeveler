@@ -46,6 +46,9 @@ struct Active {
     driver: Arc<BrowserDriver>,
     info: BrowserRuntimeInfo,
     pages: HashMap<BrowserPageId, PageState>,
+    /// The page each session is currently focused on, so tools can default to
+    /// "the current page" without the agent tracking ids.
+    active: HashMap<BrowserSessionId, BrowserPageId>,
     crashed: Option<String>,
 }
 
@@ -139,9 +142,38 @@ impl BrowserRuntime {
             driver: Arc::new(driver),
             info: info.clone(),
             pages: HashMap::new(),
+            active: HashMap::new(),
             crashed: None,
         });
         Ok(info)
+    }
+
+    /// The session's current page, or an error prompting a navigate first.
+    pub async fn active_page(
+        &self,
+        session: &BrowserSessionId,
+    ) -> Result<BrowserPageId, BrowserError> {
+        let guard = self.inner.lock().await;
+        let active = guard.as_ref().and_then(|a| a.active.get(session)).cloned();
+        active.ok_or_else(|| {
+            BrowserError::ActionFailed("no active page — call browser.navigate first".into())
+        })
+    }
+
+    /// Open (reusing the session's current page, else creating one) and navigate
+    /// to `url`, making it the session's active page. The tool applies the
+    /// network/SSRF gate before calling this.
+    pub async fn open(
+        &self,
+        session: &BrowserSessionId,
+        url: &str,
+    ) -> Result<BrowserActionResult, BrowserError> {
+        self.ensure_ready().await?;
+        let page = match self.active_page(session).await {
+            Ok(p) => p,
+            Err(_) => self.new_page(session).await?,
+        };
+        self.navigate(session, &page, url).await
     }
 
     /// Subscribe to driver events (console errors, page errors, dialogs) for
@@ -182,6 +214,7 @@ impl BrowserRuntime {
                 tokens: HashSet::new(),
             },
         );
+        active.active.insert(session.clone(), page.clone());
         Ok(page)
     }
 
@@ -222,6 +255,8 @@ impl BrowserRuntime {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
         own_page(active, session, page)?;
+        // Snapshotting a page focuses it (tab switch).
+        active.active.insert(session.clone(), page.clone());
         let res = active
             .driver
             .request("snapshot", json!({"pageId": page.as_str()}), ACTION_TIMEOUT)
@@ -295,6 +330,48 @@ impl BrowserRuntime {
         // bumps the generation. Report the current generation.
         let st = active.pages.get(page).expect("owned");
         Ok(action_result(page, &res, st.generation))
+    }
+
+    /// Structured wait (§32) — replaces shell sleep. `ref`-based conditions
+    /// validate the ref's generation like [`Self::interact`].
+    pub async fn wait(
+        &self,
+        session: &BrowserSessionId,
+        page: &BrowserPageId,
+        condition: WaitCondition,
+        timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        let mut guard = self.inner.lock().await;
+        let active = active_mut(&mut guard)?;
+        own_page(active, session, page)?;
+        let st = active.pages.get(page).expect("owned");
+        let cond = match &condition {
+            WaitCondition::Load => json!({ "load": true }),
+            WaitCondition::UrlContains(s) => json!({ "urlContains": s }),
+            WaitCondition::TextVisible(s) => json!({ "textVisible": s }),
+            WaitCondition::TextGone(s) => json!({ "textGone": s }),
+            WaitCondition::RefVisible(r) | WaitCondition::RefHidden(r) => {
+                let (ref_gen, token) = parse_ref(r)
+                    .ok_or_else(|| BrowserError::RefStale(format!("unparseable ref {r}")))?;
+                if ref_gen != st.generation || !st.tokens.contains(&token) {
+                    return Err(BrowserError::RefStale(format!("ref {r} is not current")));
+                }
+                if matches!(condition, WaitCondition::RefVisible(_)) {
+                    json!({ "refVisible": token })
+                } else {
+                    json!({ "refHidden": token })
+                }
+            }
+        };
+        active
+            .driver
+            .request(
+                "waitFor",
+                json!({"pageId": page.as_str(), "condition": cond, "timeoutMs": timeout.as_millis()}),
+                timeout + Duration::from_secs(5),
+            )
+            .await?;
+        Ok(())
     }
 
     /// List the open pages/tabs (§34).
@@ -418,6 +495,22 @@ impl BrowserRuntime {
             .to_string();
         Ok((b64, mt))
     }
+}
+
+/// Structured wait conditions (§32).
+pub enum WaitCondition {
+    /// Page `load` event.
+    Load,
+    /// The URL contains a substring.
+    UrlContains(String),
+    /// Text appears (visible) anywhere on the page.
+    TextVisible(String),
+    /// Text disappears.
+    TextGone(String),
+    /// A ref becomes visible.
+    RefVisible(String),
+    /// A ref becomes hidden.
+    RefHidden(String),
 }
 
 /// The interaction verbs the runtime forwards to the driver.

@@ -582,6 +582,7 @@ impl Application {
                 clarifier,
                 work_profile,
                 read_only,
+                Some(session_id.as_str()),
             )
             .await?
             .with_steering(steering);
@@ -638,6 +639,7 @@ impl Application {
                 clarifier,
                 self.work_profile(),
                 read_only,
+                Some(session_id.as_str()),
             )
             .await?;
         let goal = goal_from_content(&content);
@@ -730,6 +732,7 @@ impl Application {
                 Arc::new(AutoClarify),
                 work_profile,
                 read_only,
+                Some(session_id.as_str()),
             )
             .await?;
         let mut spec = self.direct_spec(record.goal.clone(), mode, sandbox);

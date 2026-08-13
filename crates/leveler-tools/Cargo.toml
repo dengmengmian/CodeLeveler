@@ -15,6 +15,7 @@ leveler-execution = { workspace = true }
 leveler-context = { workspace = true }
 leveler-project = { workspace = true }
 leveler-lsp = { workspace = true }
+leveler-browser = { workspace = true }
 leveler-skills = { workspace = true }
 leveler-memory = { workspace = true }
 serde = { workspace = true }
