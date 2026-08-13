@@ -27,6 +27,7 @@ fn permissions_list_and_clear_cover_the_state_dir_file() {
     let canonical_repo = repo.path().canonicalize().unwrap();
     let state_rules = home
         .path()
+        .join("state")
         .join("projects")
         .join(leveler_project::layout::encode_repo_path(&canonical_repo))
         .join("permissions.yaml");

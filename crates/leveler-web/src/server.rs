@@ -63,6 +63,10 @@ pub(crate) struct AppState {
     pub(crate) token: Arc<str>,
     /// On-disk asset directory override (`LEVELER_WEB_DIST`), if set.
     dist_dir: Option<Arc<Path>>,
+    /// Where imported attachments are stored (`state/web/uploads` under the
+    /// global home) — resolved once at the composition root so a handler never
+    /// reaches for process-global state, and never writes into the workspace.
+    pub(crate) uploads_dir: Arc<Path>,
     /// `Some` in aggregation mode; `None` for a single-project server
     /// (`--connect` bridge, embedding, tests) — project routes answer 404.
     pub(crate) multi: Option<MultiProject>,
@@ -79,10 +83,16 @@ impl AppState {
             .map(PathBuf::from)
             .map(PathBuf::into_boxed_path)
             .map(Arc::from);
+        let uploads_dir: Arc<Path> = Arc::from(
+            leveler_core::LevelerHome::resolve(leveler_core::environment())
+                .web_uploads_dir()
+                .into_boxed_path(),
+        );
         Self {
             service,
             token: Arc::from(token),
             dist_dir,
+            uploads_dir,
             multi,
         }
     }

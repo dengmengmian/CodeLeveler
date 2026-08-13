@@ -107,11 +107,11 @@ struct Harness {
 async fn harness(base_url: &str) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     write_config(tmp.path(), base_url);
-    let layout = Layout {
-        repo_root: tmp.path().to_path_buf(),
-        config_dir: tmp.path().join("configs"),
-        state_dir: tmp.path().join("state"),
-    };
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
     let app = Arc::new(Application::assemble(layout).unwrap());
     let runtime = Arc::new(InProcessRuntimeClient::new(
         app.clone(),

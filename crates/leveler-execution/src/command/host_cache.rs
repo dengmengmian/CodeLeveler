@@ -35,6 +35,77 @@ pub(crate) struct SandboxPaths {
     go_mod_cache: PathBuf,
     npm_cache: PathBuf,
     cache_write_roots: Vec<PathBuf>,
+    /// OS lease on `<scratch>.lock`, held for this scratch's lifetime. Its Drop
+    /// removes the lock file; the flock releases when the file handle drops
+    /// (including on crash, where the reaper reclaims the orphan). Kept last so
+    /// it drops after `scratch`.
+    _lease: SandboxLeaseGuard,
+}
+
+/// RAII guard tying a per-command scratch dir to an exclusive advisory lock on
+/// its sidecar `<name>.lock`. A live command holds the lock for its whole
+/// lifetime; the reaper treats a lock it can acquire as proof the owner died.
+struct SandboxLeaseGuard {
+    lock_path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Drop for SandboxLeaseGuard {
+    fn drop(&mut self) {
+        // Graceful path: remove the sidecar lock file. The flock is released
+        // when `_lock` drops right after. (On a crash this Drop never runs, so
+        // the lock file lingers and the reaper reclaims it.)
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Acquire an exclusive lease for a freshly-created scratch dir: open (create)
+/// `<scratch>.lock` beside it and flock it. The lock is brand-new and
+/// uncontended, so this never blocks; a failure is surfaced rather than
+/// silently proceeding lockless.
+fn acquire_sandbox_lease(scratch_dir: &Path) -> std::io::Result<SandboxLeaseGuard> {
+    let lock_path = scratch_dir.with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    fs2::FileExt::try_lock_exclusive(&lock)?;
+    Ok(SandboxLeaseGuard {
+        lock_path,
+        _lock: lock,
+    })
+}
+
+/// Reclaim crash-orphaned scratch dirs under `sandboxes_root`: for each
+/// `<name>.lock` whose flock we can acquire, the owner is gone, so remove its
+/// `<name>` tree and the lock. Fail-closed — a lock we cannot open or acquire
+/// (owner alive), or any I/O hiccup, leaves the entry untouched. Opportunistic:
+/// the caller runs it once per process, never on a timer.
+fn reap_orphaned_sandboxes(sandboxes_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(sandboxes_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".lock") else {
+            continue;
+        };
+        let Ok(lock) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            continue;
+        };
+        if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            // Owner still holds the lease — leave everything alone.
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(sandboxes_root.join(stem));
+        let _ = fs2::FileExt::unlock(&lock);
+        drop(lock);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 impl SandboxPaths {
@@ -50,8 +121,38 @@ impl SandboxPaths {
         &self.cache_write_roots
     }
 
-    pub(crate) fn into_scratch(self) -> tempfile::TempDir {
-        self.scratch
+    /// Hand the scratch to a longer-lived owner (a backgrounded command) as an
+    /// owned unit that carries BOTH the `TempDir` and its lease, so the OS lock
+    /// stays held for exactly as long as the scratch exists. Returning a naked
+    /// `TempDir` used to drop the lease here, orphaning the still-live scratch.
+    pub(crate) fn into_scratch(self) -> SandboxScratch {
+        SandboxScratch {
+            dir: self.scratch,
+            _lease: Some(self._lease),
+        }
+    }
+}
+
+/// An owned, leased scratch directory whose OS lock is bound to the scratch's
+/// actual lifetime — held while a backgrounded command runs, released (and the
+/// dir removed) only when this is dropped. Field order matters: `dir` drops
+/// first (removes the scratch tree), then `_lease` (removes the sidecar lock).
+pub(crate) struct SandboxScratch {
+    dir: tempfile::TempDir,
+    _lease: Option<SandboxLeaseGuard>,
+}
+
+impl SandboxScratch {
+    /// The scratch path (for symmetry with `SandboxPaths::scratch_path`).
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Test-only: wrap a bare `TempDir` with no lease.
+    #[cfg(test)]
+    pub(crate) fn unleased(dir: tempfile::TempDir) -> Self {
+        Self { dir, _lease: None }
     }
 }
 
@@ -120,6 +221,17 @@ fn ensure_real_private_chain(
     base_path: &Path,
     relative: &Path,
 ) -> std::io::Result<PathBuf> {
+    ensure_real_private_chain_handle(base, base_path, relative).map(|(_, path)| path)
+}
+
+/// Like [`ensure_real_private_chain`] but also returns the open handle for the
+/// leaf, so a caller can keep creating children under it without reopening the
+/// ambient path (which would reintroduce the symlink race the handle closes).
+fn ensure_real_private_chain_handle(
+    base: &cap_std::fs::Dir,
+    base_path: &Path,
+    relative: &Path,
+) -> std::io::Result<(cap_std::fs::Dir, PathBuf)> {
     let mut current = base.try_clone()?;
     let mut current_path = base_path.to_path_buf();
     for component in relative.components() {
@@ -131,7 +243,7 @@ fn ensure_real_private_chain(
         };
         (current, current_path) = ensure_real_private_child(&current, &current_path, name)?;
     }
-    Ok(current_path)
+    Ok((current, current_path))
 }
 
 fn canonicalize_allow_missing(path: &Path) -> std::io::Result<PathBuf> {
@@ -164,14 +276,14 @@ fn open_cache_owner_outside_workspace(
     if resolved.starts_with(workspace) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "tool-cache owner directory is inside the writable workspace",
+            "leveler home directory is inside the writable workspace",
         ));
     }
     if std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "tool-cache owner directory must not be a symlink",
+            "leveler home directory must not be a symlink",
         ));
     }
     std::fs::create_dir_all(candidate)?;
@@ -179,44 +291,27 @@ fn open_cache_owner_outside_workspace(
     if candidate.starts_with(workspace) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "tool-cache owner resolved inside the writable workspace",
+            "leveler home resolved inside the writable workspace",
         ));
     }
     let dir = cap_std::fs::Dir::open_ambient_dir(&candidate, cap_std::ambient_authority())?;
     Ok((dir, candidate))
 }
 
-/// Open a private per-user cache owner under the captured host temp directory.
-/// This is the fallback when no home directory capability was supplied. The
-/// temp base itself must be a real, workspace-external directory; the child is
-/// repaired relative to an open base handle and forced to mode 0700.
-fn open_temp_cache_owner_outside_workspace(
-    temp_base: &Path,
-    workspace: &Path,
-) -> std::io::Result<(cap_std::fs::Dir, PathBuf)> {
-    if !temp_base.is_absolute()
-        || temp_base.starts_with(workspace)
-        || std::fs::symlink_metadata(temp_base)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "temporary cache base must be a real directory",
-        ));
-    }
-    let temp_base = temp_base.canonicalize()?;
-    if temp_base.starts_with(workspace) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "temporary cache base is inside the writable workspace",
-        ));
-    }
-    let base = cap_std::fs::Dir::open_ambient_dir(&temp_base, cap_std::ambient_authority())?;
-    let name = format!("codeleveler-private-{}", nix::unistd::geteuid().as_raw());
-    let (owner, owner_path) = ensure_real_private_child(&base, &temp_base, name.as_ref())?;
-    use cap_std::fs::PermissionsExt as _;
-    owner.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))?;
-    Ok((owner, owner_path))
+/// The portion of a canonical `LevelerHome` sub-path below the home root — the
+/// bytes to recreate under the (canonicalized) owner handle. Errors rather than
+/// guessing if the accessor ever returns something not under the root.
+fn relative_under_home(root: &Path, full: &Path) -> std::io::Result<PathBuf> {
+    full.strip_prefix(root).map(Path::to_path_buf).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "LevelerHome path {} is not under its root {}",
+                full.display(),
+                root.display()
+            ),
+        )
+    })
 }
 
 pub(crate) fn prepare_sandbox_paths(
@@ -224,35 +319,50 @@ pub(crate) fn prepare_sandbox_paths(
     workspace: &Path,
     read_host_caches: bool,
 ) -> std::io::Result<SandboxPaths> {
+    let workspace_raw = workspace;
     let workspace = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    let mut candidates = Vec::new();
-    if let Some(leveler_home) = leveler_core::leveler_home_dir(environment) {
-        candidates.push(leveler_home);
+
+    // The sandbox scratch and the tool cache both live under the single
+    // canonical `LevelerHome` — never a second `.cache/codeleveler-private`
+    // namespace, and never a bare `<home>/tool-cache`. The home must resolve
+    // outside the writable workspace; if it cannot (e.g. LEVELER_HOME points
+    // inside the repo), that is a hard error, not a reason to invent another
+    // location. `open_cache_owner_outside_workspace` performs that check and
+    // hands back a capability for the validated home root; every sub-path is
+    // then created through the same race-safe capability chain.
+    let home = leveler_core::LevelerHome::resolve(environment);
+    // A home reachable only *through* the agent-writable workspace — e.g. via a
+    // planted symlink whose target sits elsewhere — is untrusted even though it
+    // canonicalizes outside. Reject on the raw path, before any filesystem call
+    // resolves the symlink and hides the traversal.
+    if home.root().starts_with(workspace_raw) || home.root().starts_with(&workspace) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "leveler home resolves through the writable workspace",
+        ));
     }
-    if let Some(home) = environment.var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".cache/codeleveler-private"));
-    }
-    let (owner, owner_path) = candidates
-        .iter()
-        .find_map(|candidate| open_cache_owner_outside_workspace(candidate, &workspace).ok())
-        .or_else(|| {
-            open_temp_cache_owner_outside_workspace(environment.temp_dir(), &workspace).ok()
-        })
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "no stable tool-cache owner outside the writable workspace",
-            )
-        })?;
-    // Scratch creation uses the same stable, workspace-external owner rather
-    // than TMPDIR, which may itself live in or be poisoned by the workspace.
+    let (owner, owner_path) = open_cache_owner_outside_workspace(home.root(), &workspace)?;
+    // The canonical sub-paths come from `LevelerHome`, not from literals here,
+    // so the layout lives in exactly one place. They are relative to the home
+    // root; create them under the (canonicalized) owner handle.
+    let sandboxes_rel = relative_under_home(home.root(), &home.sandboxes_dir())?;
+    let tool_cache_rel = relative_under_home(home.root(), &home.tool_cache_dir())?;
+
+    // Scratch dirs live under `run/sandboxes/`. Reap crash-orphans once per
+    // process — opportunistically, before creating this command's dir.
+    let sandboxes_root = ensure_real_private_chain(&owner, &owner_path, &sandboxes_rel)?;
+    static REAP_ONCE: std::sync::Once = std::sync::Once::new();
+    REAP_ONCE.call_once(|| reap_orphaned_sandboxes(&sandboxes_root));
     let scratch = tempfile::Builder::new()
         .prefix("codeleveler-sandbox-")
-        .tempdir_in(&owner_path)?;
+        .tempdir_in(&sandboxes_root)?;
+    let lease = acquire_sandbox_lease(scratch.path())?;
+
+    // Tool cache: `<home>/cache/tools/<workspace-hash>/`.
     let (cache_base_dir, cache_base) =
-        ensure_real_private_child(&owner, &owner_path, "tool-cache".as_ref())?;
+        ensure_real_private_chain_handle(&owner, &owner_path, &tool_cache_rel)?;
     let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
     let workspace_key = digest
         .iter()
@@ -321,6 +431,7 @@ pub(crate) fn prepare_sandbox_paths(
         go_mod_cache,
         npm_cache,
         cache_write_roots,
+        _lease: lease,
     })
 }
 
@@ -860,5 +971,189 @@ mod tests {
         );
         assert!(!private.path().join("config.toml").exists());
         assert!(!private.path().join("credentials.toml").exists());
+    }
+
+    // ── sandbox lease + reaper (D2) ─────────────────────────────────────────
+
+    /// S1: a lease creates and holds `<scratch>.lock`; dropping it removes the
+    /// lock file (the graceful RAII path).
+    #[test]
+    fn lease_holds_then_removes_its_lock_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-abc");
+        std::fs::create_dir(&scratch).unwrap();
+        let lock = scratch.with_extension("lock");
+
+        let lease = acquire_sandbox_lease(&scratch).unwrap();
+        assert!(lock.exists(), "the lease creates its sidecar lock");
+        drop(lease);
+        assert!(!lock.exists(), "dropping the lease removes the lock file");
+    }
+
+    /// S2: the reaper reclaims an orphan whose lock is free (owner gone) —
+    /// removing both the scratch tree and the lock.
+    #[test]
+    fn reaper_reclaims_an_orphan_with_a_free_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-dead");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("residue"), b"x").unwrap();
+        // Simulate a crashed owner: lock file left behind, no live flock.
+        std::fs::write(scratch.with_extension("lock"), b"").unwrap();
+
+        reap_orphaned_sandboxes(root.path());
+
+        assert!(!scratch.exists(), "orphan scratch tree is removed");
+        assert!(
+            !scratch.with_extension("lock").exists(),
+            "orphan lock is removed"
+        );
+    }
+
+    /// S3: a live lease is never reaped — its held flock is the proof of life.
+    #[test]
+    fn reaper_leaves_a_live_lease_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-live");
+        std::fs::create_dir(&scratch).unwrap();
+        let _lease = acquire_sandbox_lease(&scratch).unwrap();
+
+        reap_orphaned_sandboxes(root.path());
+
+        assert!(scratch.exists(), "a live-leased scratch must survive");
+        assert!(scratch.with_extension("lock").exists());
+    }
+
+    /// S4: fail-closed — a scratch dir with no lock sidecar is left alone rather
+    /// than deleted on a guess.
+    #[test]
+    fn reaper_is_fail_closed_without_a_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("codeleveler-sandbox-nolock");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("keep"), b"x").unwrap();
+
+        reap_orphaned_sandboxes(root.path());
+
+        assert!(
+            scratch.exists(),
+            "a lock-less dir is ambiguous and must be left untouched"
+        );
+    }
+
+    /// Build a real `SandboxPaths` rooted at an isolated `LEVELER_HOME`, with a
+    /// workspace that is a *separate* tree (so the home is outside it).
+    fn prepared_paths() -> (tempfile::TempDir, tempfile::TempDir, SandboxPaths) {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("ws")).unwrap();
+        let ws = workspace.path().join("ws");
+        let env = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                home.path().as_os_str().to_os_string(),
+            )],
+            std::path::PathBuf::new(),
+            std::env::temp_dir(),
+        );
+        let paths = prepare_sandbox_paths(&env, &ws, false).expect("prepare paths");
+        (home, workspace, paths)
+    }
+
+    /// S1 (synchronous): a live `SandboxPaths` holds its lease — the reaper
+    /// cannot reclaim it — and dropping it removes both the scratch and lock.
+    #[test]
+    fn synchronous_paths_hold_the_lease_until_dropped() {
+        let (_home, _ws, paths) = prepared_paths();
+        let scratch = paths.scratch_path().to_path_buf();
+        let lock = scratch.with_extension("lock");
+        let sandboxes_root = scratch.parent().unwrap().to_path_buf();
+        assert!(scratch.is_dir() && lock.exists());
+
+        reap_orphaned_sandboxes(&sandboxes_root);
+        assert!(
+            scratch.exists(),
+            "a live command's scratch must survive reap"
+        );
+
+        drop(paths);
+        assert!(!scratch.exists() && !lock.exists());
+    }
+
+    /// S2 + S4 (background): `into_scratch` transfers the lease with the
+    /// scratch, so a backgrounded command keeps its lock (reaper leaves it);
+    /// dropping the transferred handle reclaims both.
+    #[test]
+    fn into_scratch_carries_the_lease_for_the_scratch_lifetime() {
+        let (_home, _ws, paths) = prepared_paths();
+        let scratch = paths.scratch_path().to_path_buf();
+        let lock = scratch.with_extension("lock");
+        let sandboxes_root = scratch.parent().unwrap().to_path_buf();
+
+        let held = paths.into_scratch();
+        assert_eq!(held.path(), scratch, "the same scratch is transferred");
+
+        // S2: still leased after the transfer — the reaper must not reclaim it.
+        reap_orphaned_sandboxes(&sandboxes_root);
+        assert!(scratch.exists(), "transferred scratch keeps its lease live");
+        assert!(lock.exists());
+
+        // S4: dropping the background owner cleans up scratch + lock.
+        drop(held);
+        assert!(!scratch.exists() && !lock.exists());
+    }
+
+    /// Zero Workspace Pollution, exercised for real: running the full
+    /// sandbox+cache initialization must not create or mutate anything inside
+    /// the workspace, and both the scratch and the tool cache must land in the
+    /// canonical home namespaces (`run/sandboxes`, `cache/tools`).
+    #[test]
+    fn sandbox_init_writes_nothing_into_the_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("main.rs"), "fn main() {}").unwrap();
+        let names = |dir: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            v.sort();
+            v
+        };
+        let before = names(&ws);
+
+        let env = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                home.path().as_os_str().to_os_string(),
+            )],
+            std::path::PathBuf::new(),
+            std::env::temp_dir(),
+        );
+        let paths = prepare_sandbox_paths(&env, &ws, false).expect("prepare paths");
+
+        assert_eq!(
+            before,
+            names(&ws),
+            "sandbox init must not touch the workspace"
+        );
+        assert!(
+            !ws.join(".leveler").exists(),
+            "no `.leveler` may appear in the workspace"
+        );
+        let home_root = home.path().canonicalize().unwrap();
+        assert!(
+            paths
+                .scratch_path()
+                .starts_with(home_root.join("run/sandboxes"))
+        );
+        assert!(
+            paths
+                .tool_cache_path()
+                .starts_with(home_root.join("cache/tools"))
+        );
     }
 }

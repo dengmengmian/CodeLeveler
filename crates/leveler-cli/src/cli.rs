@@ -659,12 +659,6 @@ pub enum SessionsCommand {
     },
     /// Delete a session by id.
     Delete { id: String },
-    /// Migrate this repository's pre-hash state directory without merging.
-    MigrateState {
-        /// Confirm the displayed source should be renamed to the destination.
-        #[arg(long)]
-        confirm: bool,
-    },
 }
 
 #[cfg(test)]
@@ -682,17 +676,6 @@ mod tests {
         let cli = parse(&["leveler"]);
         assert!(cli.command.is_none());
         assert_eq!(cli.verbose, 0);
-    }
-
-    #[test]
-    fn state_migration_requires_an_explicit_confirmation_flag() {
-        let cli = parse(&["leveler", "sessions", "migrate-state", "--confirm"]);
-        assert!(matches!(
-            cli.command,
-            Some(Command::Sessions(SessionsCommand::MigrateState {
-                confirm: true
-            }))
-        ));
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! file (`/file`), the file panel lists repository paths (`/files`), the
 //! search panel greps case-insensitively (`/search`), the git panel
 //! summarizes `git status` (`/git-status`), and the composer accepts
-//! multipart uploads stored under `.leveler/uploads` and announced to the
-//! runtime as `AddAttachment` commands (`/attachments`). Listing and search
+//! multipart uploads stored under the global home's `state/web/uploads`
+//! (never the workspace) and announced to the runtime as `AddAttachment`
+//! commands (`/attachments`). Listing and search
 //! respect `.gitignore` (via the `ignore` crate) and never descend into
 //! `.git`.
 
@@ -219,15 +220,18 @@ pub(crate) async fn git_status(
 }
 
 /// `POST /api/sessions/{id}/attachments` (multipart, `file` fields) — store
-/// each upload under `.leveler/uploads` and deliver one `AddAttachment`
-/// command per stored file.
+/// each upload under the global home's `state/web/uploads` (never the
+/// workspace) and deliver one `AddAttachment` command per stored file.
 pub(crate) async fn upload_attachments(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<StoredAttachmentsResponse>), EndpointError> {
-    let root = repository(&state, &id).await?.path;
-    let uploads = prepare_upload_directory(&root)?;
+    // Validate the session (and its repository) exist before accepting bytes,
+    // but store the upload under the global home — importing a file must never
+    // create or mutate anything inside the workspace.
+    repository(&state, &id).await?;
+    let uploads = prepare_upload_directory(&state.uploads_dir)?;
 
     let mut stored = Vec::new();
     let mut file_count = 0_usize;
@@ -267,7 +271,7 @@ pub(crate) async fn upload_attachments(
             store_field(&mut field, &uploads.dir, &file_name, &name, remaining).await?;
         total_bytes += written;
         let path = uploads.absolute.join(&file_name);
-        if let Err(error) = verify_stored_upload(&root, &uploads.absolute, &path) {
+        if let Err(error) = verify_stored_upload(&uploads.base, &uploads.absolute, &path) {
             let _ = uploads.dir.remove_file(&file_name);
             return Err(error);
         }
@@ -699,54 +703,73 @@ fn parse_numstat(text: &str) -> HashMap<String, (u64, u64)> {
         .collect()
 }
 
-/// An opened uploads directory plus the canonical path exposed to the
-/// runtime. File creation is performed through `dir`, not by resolving the
+/// An opened uploads directory plus the canonical paths used to validate
+/// stored files. File creation is performed through `dir`, not by resolving the
 /// ambient path again, so swapping a checked parent for a symlink cannot
-/// redirect writes outside the repository.
+/// redirect writes outside the uploads store.
 struct UploadDirectory {
     dir: cap_std::fs::Dir,
+    /// Canonical containment root (`state/web` under the global home).
+    base: PathBuf,
+    /// Canonical uploads directory (`<base>/uploads`).
     absolute: PathBuf,
 }
 
-/// Create/open `.leveler/uploads` relative to a capability for the canonical
-/// repository root. Both components must be real directories: symlinks are
-/// rejected even when they happen to point back inside the repository.
-fn prepare_upload_directory(root: &Path) -> Result<UploadDirectory, EndpointError> {
-    let repo = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
-        .map_err(|error| io_error(&error, "cannot open the repository"))?;
-    ensure_plain_directory(&repo, root, Path::new(".leveler"), ".leveler")?;
-    ensure_plain_directory(
-        &repo,
-        root,
-        Path::new(".leveler/uploads"),
-        ".leveler/uploads",
-    )?;
+/// Create/open `uploads_dir` (the global home's `state/web/uploads`, never the
+/// workspace) through a capability for its parent, so the `uploads` leaf is
+/// created and rechecked by name. The leaf must be a real directory: symlinks
+/// and reparse points are rejected even when they point somewhere plausible.
+fn prepare_upload_directory(uploads_dir: &Path) -> Result<UploadDirectory, EndpointError> {
+    let leaf = uploads_dir
+        .file_name()
+        .ok_or_else(|| {
+            EndpointError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the uploads directory has no final component",
+            )
+        })?
+        .to_os_string();
+    let parent_path = uploads_dir.parent().ok_or_else(|| {
+        EndpointError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the uploads directory has no parent",
+        )
+    })?;
 
-    // Open a stable directory handle before rechecking both path components.
+    // The home tree is ours to create; the workspace is never touched.
+    std::fs::create_dir_all(uploads_dir)
+        .map_err(|error| io_error(&error, "cannot create the uploads store"))?;
+    let base = parent_path
+        .canonicalize()
+        .map_err(|error| io_error(&error, "cannot resolve the uploads store"))?;
+
+    let parent = cap_std::fs::Dir::open_ambient_dir(&base, cap_std::ambient_authority())
+        .map_err(|error| io_error(&error, "cannot open the uploads store"))?;
+    ensure_plain_directory(&parent, &base, Path::new(&leaf), "uploads")?;
+
+    // Open a stable directory handle before rechecking the path component.
     // Later file creation stays relative to this handle even if an attacker
     // races an ambient rename or symlink replacement.
-    let dir = repo
-        .open_dir(".leveler/uploads")
+    let dir = parent
+        .open_dir(&leaf)
         .map_err(|error| io_error(&error, "cannot open the uploads directory"))?;
-    ensure_plain_directory(&repo, root, Path::new(".leveler"), ".leveler")?;
-    ensure_plain_directory(
-        &repo,
-        root,
-        Path::new(".leveler/uploads"),
-        ".leveler/uploads",
-    )?;
+    ensure_plain_directory(&parent, &base, Path::new(&leaf), "uploads")?;
 
-    let absolute = root
-        .join(".leveler/uploads")
+    let absolute = base
+        .join(&leaf)
         .canonicalize()
         .map_err(|error| io_error(&error, "cannot resolve the uploads directory"))?;
-    if !absolute.starts_with(root) {
+    if !absolute.starts_with(&base) {
         return Err(EndpointError::new(
             StatusCode::FORBIDDEN,
-            "the uploads directory escapes the repository",
+            "the uploads directory escapes the uploads store",
         ));
     }
-    Ok(UploadDirectory { dir, absolute })
+    Ok(UploadDirectory {
+        dir,
+        base,
+        absolute,
+    })
 }
 
 fn ensure_plain_directory(
@@ -800,7 +823,7 @@ fn is_windows_reparse_point(_path: &Path) -> Result<bool, EndpointError> {
 /// file just created below the same canonical upload directory. The stable
 /// directory handle protects the write; this final check prevents delivery
 /// of a path redirected by a concurrent parent-directory swap.
-fn verify_stored_upload(root: &Path, uploads: &Path, path: &Path) -> Result<(), EndpointError> {
+fn verify_stored_upload(base: &Path, uploads: &Path, path: &Path) -> Result<(), EndpointError> {
     let current_uploads = path
         .parent()
         .expect("stored upload always has a parent")
@@ -810,12 +833,12 @@ fn verify_stored_upload(root: &Path, uploads: &Path, path: &Path) -> Result<(), 
         .canonicalize()
         .map_err(|error| io_error(&error, "cannot resolve the stored upload"))?;
     if current_uploads != uploads
-        || !current_uploads.starts_with(root)
+        || !current_uploads.starts_with(base)
         || !current_file.starts_with(&current_uploads)
     {
         return Err(EndpointError::new(
             StatusCode::FORBIDDEN,
-            "the stored upload path escaped the repository",
+            "the stored upload path escaped the uploads store",
         ));
     }
     let metadata = std::fs::symlink_metadata(&current_file)
@@ -831,7 +854,7 @@ fn verify_stored_upload(root: &Path, uploads: &Path, path: &Path) -> Result<(), 
 
 /// Stream one multipart field to `path`, enforcing the per-file cap. The
 /// partial file is removed on any failure so a rejected upload never
-/// lingers in `.leveler/uploads`.
+/// lingers in the uploads store.
 async fn store_field(
     field: &mut Field<'_>,
     uploads: &cap_std::fs::Dir,
@@ -1333,5 +1356,44 @@ mod tests {
         assert_eq!(decode_utf8(split, true).unwrap(), "h");
         assert!(decode_utf8(split, false).is_err());
         assert!(decode_utf8(&[0xff, 0xfe], true).is_err());
+    }
+
+    #[test]
+    fn prepare_upload_directory_creates_a_plain_leaf_under_an_isolated_base() {
+        let home = tempfile::tempdir().unwrap();
+        let uploads = home.path().join("state/web/uploads");
+        let prepared = prepare_upload_directory(&uploads).expect("plain leaf is accepted");
+        assert!(prepared.absolute.is_dir());
+        assert!(prepared.absolute.starts_with(&prepared.base));
+        assert!(
+            !prepared.absolute.starts_with(home.path().join("workspace")),
+            "the uploads store is home-owned, never a workspace path"
+        );
+    }
+
+    // Defense in depth for the home path: even though the home tree is ours, a
+    // symlinked `uploads` leaf must be refused rather than followed outside the
+    // store — the same guarantee the old workspace-rooted test gave, now on an
+    // isolated per-test base.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_upload_directory_rejects_a_symlinked_leaf() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let web = home.path().join("state/web");
+        std::fs::create_dir_all(&web).unwrap();
+        symlink(outside.path(), web.join("uploads")).unwrap();
+
+        let status = match prepare_upload_directory(&web.join("uploads")) {
+            Ok(_) => panic!("a symlinked uploads leaf must be rejected"),
+            Err(error) => error.status,
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "nothing may be written through the symlink"
+        );
     }
 }

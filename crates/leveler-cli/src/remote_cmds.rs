@@ -37,12 +37,13 @@ pub(crate) async fn cmd_remote(cmd: RemoteCommand) -> anyhow::Result<std::proces
     }
 }
 
-/// Where the remote agent keeps its state. Sibling of the rest of the leveler
-/// home so a user who backs that up gets the pairing record too.
+fn leveler_home() -> leveler_core::LevelerHome {
+    leveler_core::LevelerHome::resolve(leveler_core::environment())
+}
+
+/// Where the remote agent keeps its state (`state/remote/` under the home).
 fn remote_dir() -> PathBuf {
-    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-        .unwrap_or_else(|| PathBuf::from(".leveler"))
-        .join("remote")
+    leveler_home().remote_state_dir()
 }
 
 fn home() -> RemoteHome {
@@ -56,9 +57,7 @@ fn devices_path() -> PathBuf {
 /// The multi-project registry the browser UI writes. Read-only from here: what
 /// is "open" is decided by opening it, not by a phone asking.
 fn registry_path() -> PathBuf {
-    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-        .unwrap_or_else(|| PathBuf::from(".leveler"))
-        .join("web-projects.json")
+    leveler_home().web_projects_registry()
 }
 
 /// Config and key together, or a message naming the command that creates them.

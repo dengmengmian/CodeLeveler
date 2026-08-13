@@ -447,8 +447,11 @@ impl Application {
             registry.register(tool);
         }
         let memory_index = load_memory_index(&self.layout.memory_dir());
-        let leveler_home = leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-            .unwrap_or_else(|| std::path::PathBuf::from(".leveler"));
+        // The global home root (never a cwd-relative `.leveler`, which would
+        // read/write user config inside whatever directory we launched from).
+        let leveler_home = leveler_core::LevelerHome::resolve(leveler_core::environment())
+            .root()
+            .to_path_buf();
         let merged_rules = leveler_execution::load_merged_rules(
             &leveler_home,
             &self.layout.permissions_path(),

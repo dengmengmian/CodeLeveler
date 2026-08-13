@@ -220,6 +220,7 @@ fn trust_store_display(home: &std::path::Path) -> String {
 }
 
 fn leveler_home() -> PathBuf {
-    leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-        .unwrap_or_else(|| PathBuf::from(".leveler"))
+    leveler_core::LevelerHome::resolve(leveler_core::environment())
+        .root()
+        .to_path_buf()
 }

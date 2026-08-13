@@ -266,7 +266,7 @@ impl GlobalConfig {
     /// shared via [`leveler_core::leveler_home_dir_from`].
     pub fn path() -> Option<PathBuf> {
         leveler_core::leveler_home_dir_from(|k| std::env::var_os(k))
-            .map(|home| home.join("config.toml"))
+            .map(|root| leveler_core::LevelerHome::from_root(root).config_file())
     }
 
     /// Load the global config, or an empty one if the file is absent. A present

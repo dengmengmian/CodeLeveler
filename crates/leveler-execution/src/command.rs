@@ -453,7 +453,9 @@ fn writable_roots(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod host_cache;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) use host_cache::{SandboxPaths, apply_sandbox_environment, prepare_sandbox_paths};
+pub(crate) use host_cache::{
+    SandboxPaths, SandboxScratch, apply_sandbox_environment, prepare_sandbox_paths,
+};
 
 /// True when `arg` looks like an absolute filesystem path the model might use
 /// to bypass `read_file`.
@@ -1734,14 +1736,24 @@ mod tests {
                 "missing private cache directory {relative}"
             );
         }
+        // Scratch now lives under `run/sandboxes/` beneath the home, not the
+        // home root directly.
         assert_eq!(
             paths.scratch_path().parent(),
-            Some(leveler_home.canonicalize().unwrap().as_path())
+            Some(
+                leveler_home
+                    .canonicalize()
+                    .unwrap()
+                    .join("run/sandboxes")
+                    .as_path()
+            )
         );
+        // Canonical cache location: `<home>/cache/tools/<hash>` — never a bare
+        // `<home>/tool-cache`.
         assert!(
             paths
                 .tool_cache_path()
-                .starts_with(leveler_home.canonicalize().unwrap())
+                .starts_with(leveler_home.canonicalize().unwrap().join("cache/tools"))
         );
 
         let second = prepare_sandbox_paths(&environment, &workspace, false).expect("second paths");
@@ -1764,7 +1776,10 @@ mod tests {
         );
 
         let paths = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
-        let owner = paths.scratch_path().parent().unwrap();
+        // With no HOME, LevelerHome falls back to a process-local temp home —
+        // `<temp>/leveler-<pid>` — never a second `codeleveler-private`
+        // namespace. scratch = <home>/run/sandboxes/<name>.
+        let owner = paths.scratch_path().ancestors().nth(3).unwrap();
         assert_eq!(
             owner.parent(),
             Some(base.path().canonicalize().unwrap().as_path())
@@ -1774,13 +1789,27 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("codeleveler-private-")
+                .starts_with("leveler-"),
+            "temp fallback home is <temp>/leveler-<pid>, got {owner:?}"
+        );
+        // The tool cache is the confined private surface and is forced 0700,
+        // and it is the canonical `cache/tools`, never a bare `tool-cache`.
+        assert!(paths.tool_cache_path().starts_with(owner));
+        assert!(
+            paths
+                .tool_cache_path()
+                .starts_with(owner.join("cache/tools")),
+            "tool cache must be <home>/cache/tools/..., got {:?}",
+            paths.tool_cache_path()
         );
         assert_eq!(
-            std::fs::metadata(owner).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(paths.tool_cache_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o700
         );
-        assert!(paths.tool_cache_path().starts_with(owner));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1889,12 +1918,37 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &poisoned_leveler_home).unwrap();
         std::os::unix::fs::symlink(&outside, &poisoned_tmp).unwrap();
         std::os::unix::fs::symlink(&outside, &poisoned_cargo_home).unwrap();
-        let mut variables: Vec<_> = std::env::vars_os().collect();
-        variables.push(("HOME".into(), safe_home.clone().into_os_string()));
-        variables.push((
+        // H-1: a LEVELER_HOME that is — or routes through — the agent-writable
+        // workspace is refused outright, never silently redirected to another
+        // namespace. Nothing may be created through the link.
+        let base_vars: Vec<_> = std::env::vars_os().collect();
+        let mut poisoned_vars = base_vars.clone();
+        poisoned_vars.push(("HOME".into(), safe_home.clone().into_os_string()));
+        poisoned_vars.push((
             "LEVELER_HOME".into(),
             poisoned_leveler_home.into_os_string(),
         ));
+        poisoned_vars.push((
+            "CARGO_HOME".into(),
+            poisoned_cargo_home.clone().into_os_string(),
+        ));
+        let poisoned_env = leveler_core::EnvSnapshot::new(
+            poisoned_vars,
+            std::env::current_dir().unwrap(),
+            poisoned_tmp.clone(),
+        );
+        assert!(
+            prepare_sandbox_paths(&poisoned_env, &workspace, false).is_err(),
+            "a workspace-linked LEVELER_HOME must fail closed"
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
+
+        // With a real, workspace-external LEVELER_HOME the cache and scratch
+        // land under it, and the capability initializer still resists a
+        // poisoned cache leaf and a confined `ln` attack (below).
+        let mut variables = base_vars;
+        variables.push(("HOME".into(), safe_home.clone().into_os_string()));
+        variables.push(("LEVELER_HOME".into(), safe_home.clone().into_os_string()));
         variables.push(("CARGO_HOME".into(), poisoned_cargo_home.into_os_string()));
         let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
             variables,
@@ -2567,7 +2621,7 @@ mod tests {
             assert!(output.success(), "confined npm build failed: {output:?}");
             assert!(npm_workspace.join("built.txt").is_file());
         }
-        assert!(base.path().join("home/tool-cache").is_dir());
+        assert!(base.path().join("home/cache/tools").is_dir());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2722,7 +2776,7 @@ mod tests {
             "host cache symlink target must remain read-only: {output:?}"
         );
 
-        let workspace_cache = std::fs::read_dir(leveler_home.join("tool-cache"))
+        let workspace_cache = std::fs::read_dir(leveler_home.join("cache/tools"))
             .unwrap()
             .next()
             .unwrap()
