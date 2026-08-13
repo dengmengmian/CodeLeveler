@@ -154,6 +154,13 @@ impl LevelerHome {
         self.root.join("runtimes")
     }
 
+    /// CodeLeveler-managed browser runtime (driver + browsers): `runtimes/browser/`.
+    /// The only place a managed Chromium/driver is installed — never the repo,
+    /// never a global/system location.
+    pub fn browser_runtime_dir(&self) -> PathBuf {
+        self.runtimes_dir().join("browser")
+    }
+
     // ── logs/ — diagnostics only ────────────────────────────────────────────
 
     /// Diagnostics root: `logs/`.

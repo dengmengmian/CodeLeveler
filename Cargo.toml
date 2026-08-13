@@ -26,6 +26,7 @@ members = [
     "crates/leveler-remote-agent",
     "crates/leveler-local-transport",
     "crates/leveler-media",
+    "crates/leveler-browser",
     "crates/leveler-tui",
     "crates/leveler-web",
     "crates/leveler-cli",
@@ -69,6 +70,7 @@ leveler-remote-agent = { version = "0.1.4", path = "crates/leveler-remote-agent"
 leveler-relay = { version = "0.1.4", path = "services/leveler-relay" }
 leveler-local-transport = { version = "0.1.4", path = "crates/leveler-local-transport" }
 leveler-media = { version = "0.1.4", path = "crates/leveler-media" }
+leveler-browser = { version = "0.1.4", path = "crates/leveler-browser" }
 leveler-tui = { version = "0.1.4", path = "crates/leveler-tui" }
 leveler-web = { version = "0.1.4", path = "crates/leveler-web" }
 leveler-test-support = { version = "0.1.4", path = "crates/leveler-test-support" }

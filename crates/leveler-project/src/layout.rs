@@ -124,6 +124,21 @@ impl Layout {
     pub fn permissions_path(&self) -> PathBuf {
         self.state_dir.join("permissions.yaml")
     }
+
+    /// Isolated, durable per-project browser profile
+    /// (`<state_dir>/browser/profile/`). Holds cookies/localStorage/login state
+    /// scoped to THIS repository — never the user's real Chrome profile, never
+    /// in the workspace. Distinct per project (keyed by the repo-path hash).
+    pub fn browser_profile_dir(&self) -> PathBuf {
+        self.state_dir.join("browser").join("profile")
+    }
+
+    /// Per-project browser artifact store (`<state_dir>/browser/screenshots/`)
+    /// for screenshots and browser diagnostics — a project-scoped asset root,
+    /// never the repo.
+    pub fn browser_screenshots_dir(&self) -> PathBuf {
+        self.state_dir.join("browser").join("screenshots")
+    }
 }
 
 /// Advisory write-lock path for a workspace file: `<home>/run/locks/<hash>.lock`.
