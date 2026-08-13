@@ -1,8 +1,11 @@
 # Browser Capability V1 — Production Gate Report
 
 **Status:** complete on `feat/browser-capability-v1` (not merged; awaiting human
-review). Structured browser automation is a real, daemon-owned capability the
-agent uses as its primary web-verification path.
+sign-off). All MERGE VERIFICATION gaps are closed — daemon ownership and
+disconnect/reconnect are proven by a live TUI↔daemon E2E (§T), and the full
+four-gate regression is a clean 0-failure run (§AG). Structured browser
+automation is a real, daemon-owned capability the agent uses as its primary
+web-verification path.
 
 ## A. Baseline
 
@@ -82,17 +85,27 @@ reaped only on daemon exit. Owned by the daemon, never the client.
 
 ## T. Disconnect / Reconnect
 
-The browser is owned on the daemon's `Application` identically to
-`background_tasks`, whose daemon-hosted disconnect/reconnect survival the Long
-Task Reliability gate proved; the browser inherits it by construction. A live
-check confirmed the daemon survives a client kill. **Honest limitation:** the
-scriptable headless `leveler run` is a *one-shot embedded* command (it owns its
-browser in-process by design and never connects to a running `leveler serve`),
-so it cannot exercise the daemon-hosted browser-continues-across-disconnect path
-end-to-end; that path is the TUI↔daemon flow the Long Task gate validated. This
-is recorded as EXPECTED (a harness limitation, not a capability gap) — the
-ownership is correct and the §62 STOP condition ("reconnect kills Browser") is
-not triggered.
+Proven **live** over the real TUI↔daemon path (not the embedded `leveler run`).
+Harness: `leveler serve` daemon + a PTY `leveler tui` client (no `--in-process`,
+so it reuses the daemon) submits a multi-step browser goal; evidence is read
+from the daemon's own SQLite (`sessions.db`), so "progress with no client" is a
+fact about the daemon, not a screen scrape:
+
+- **Ownership:** the Playwright driver's parent is the daemon (`driver_ppid ==
+  serve pid`; process-ancestry check: `ancestor==daemon` true, `ancestor==client`
+  false). The browser is a child of the daemon, never the client.
+- **Disconnect:** SIGKILL the TUI client mid-goal → client dead, but daemon,
+  driver (stable PID), and Chrome all stay alive.
+- **Progress with zero client attached:** across the detached window the session
+  advanced `event seq 50 → 98` and `browser tool calls 2 → 9` (seven more browser
+  calls *after* the client was killed) and reached `status=completed` — with no
+  TUI process attached.
+- **Reconnect:** a fresh `leveler tui --session <id>` reattached to the same
+  session, saw the completed transcript, `task_finished=1` (a real completion,
+  not an error stop → no false completion).
+
+The §62 STOP condition ("reconnect kills Browser") is not triggered: the driver
+PID stayed stable across the whole disconnect/reconnect.
 
 ## U. Cancel / Timeout / Crash
 
@@ -165,30 +178,33 @@ Zero across all three dogfoods (the only `run_command` uses were the legitimate
 ## AE. Findings / AF. NEXT
 
 - **BLOCKER: 0 · MAJOR: 0 · MINOR: 0.**
-- **NEXT** (out of V1): live daemon-hosted browser disconnect/reconnect e2e via
-  the TUI/PTY harness; a dedicated `Browser` ToolKind for TUI grouping; refless
+- **NEXT** (out of V1): a dedicated `Browser` ToolKind for TUI grouping; refless
   page-level key press; multi-tab agent ergonomics; managed Node download when
-  no system Node.
+  no system Node. (The live daemon-hosted disconnect/reconnect E2E, previously
+  listed here, is now DONE — see §T.)
 
 ## AG. Full Regression
 
-- `cargo fmt --check` — **clean**.
-- `cargo check --workspace --all-targets` — **clean**.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — **clean**.
-- `cargo test --workspace --all-features --locked --no-fail-fast` — every
-  browser-specific binary passes (leveler-browser unit + acceptance + reliability,
-  leveler-tools incl. the SSRF gate + registry count, leveler-tui taxonomy,
-  leveler-app), and the run passed every binary through the slow
-  network-dependent provider/relay tail with **zero failures**. Any residual
-  failures in that tail are the pre-existing env-flaky provider/network tests
-  (per the repo's known-env notes), not browser regressions, and are folded into
-  the end-stage CI/regression cleanup the reviewer scheduled.
+Run clean, from a hygienic tree (no leftover test shells, daemons, drivers, or
+Chrome), on `feat/browser-capability-v1`:
+
+- `cargo fmt --all --check` — **clean** (rc 0).
+- `cargo check --workspace --all-targets` — **clean** (rc 0).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — **clean** (rc 0).
+- `cargo test --workspace --all-features --locked --no-fail-fast` — **rc 0;
+  2699 passed, 0 failed, 5 ignored** across 127 test binaries/doctest suites.
+  The whole slow network-dependent provider/relay tail ran to completion with
+  **zero failures** this run — no classification needed. The 5 ignored are the
+  repo's intentional `#[ignore]` cases (live rust-analyzer timing, a live
+  MCP-server test needing node/npx + network, the manual visual-disclosure
+  harness), not skips introduced here.
 
 Browser-specific test inventory (all green): `leveler-browser` domain/driver/
-install units + the real-Chrome acceptance and reliability fixtures (lazy,
-zero-pollution, SPA/dynamic-DOM stale-ref, dialog/new-tab); `leveler-tools`
-SSRF-gate + 247 tool tests + registry count (42); `leveler-tui` taxonomy
-coverage. Plus the three real agent-driven dogfoods (A/B/C).
+install units + the real-Chrome `acceptance` and `reliability` fixtures (lazy,
+zero-pollution, SPA/dynamic-DOM stale-ref, dialog/new-tab) + `phase1_acceptance`;
+`leveler-tools` SSRF-gate + tool tests + registry count (42); `leveler-tui`
+taxonomy coverage. Plus the three real agent-driven dogfoods (A/B/C) and the
+live TUI↔daemon disconnect/reconnect E2E (§T).
 
 ## AH. Final Verdict
 
@@ -209,8 +225,9 @@ DYNAMIC DOM / SPA:          PASS (fixtures + Dogfood B)
 TABS / DIALOGS:             PASS (no hang)
 CONSOLE / PAGE ERRORS:      PASS (errors/warnings only)
 PERMISSION INTEGRATION:     PASS (RiskLevel/ApprovalPolicy; SSRF gate)
-DAEMON OWNERSHIP:           PASS (owned on Application; daemon survives client kill)
-DISCONNECT/RECONNECT:       PASS by construction (= background_tasks; live e2e = NEXT)
+DAEMON OWNERSHIP:           PASS — live E2E (driver parent == serve pid; ancestor==daemon, not client)
+DISCONNECT/RECONNECT:       PASS — live E2E (TUI↔daemon; client killed, goal ran seq 50→98 /
+                            browser calls 2→9 with no client, then completed; reconnect reattached)
 CRASH RECOVERY:             PASS (RuntimeCrashed → restart, refs invalidated)
 ZERO WORKSPACE POLLUTION:   PASS
 USER CHROME PROFILE MUTATION: NO
@@ -220,11 +237,14 @@ BROWSER SHELL WORKAROUNDS:  0
 STRUCTURED BROWSER CALLS:   38 across A/B/C
 MANUAL INTERVENTION:        0
 FALSE COMPLETION:           0
-FULL REGRESSION:            fmt/check/clippy(--all-features) clean; test green for
-                            all browser+core; env-flaky provider tail deferred
-BLOCKER: 0   MAJOR: 0   MINOR: 0   NEXT: 5
+FULL REGRESSION:            PASS — fmt/check/clippy(--all-features) clean;
+                            test --all-features --locked --no-fail-fast: 2699 passed,
+                            0 failed, 5 ignored (127 suites); hygienic tree, 0 orphans
+BLOCKER: 0   MAJOR: 0   MINOR: 0   NEXT: 4
 
-MERGE RECOMMENDATION: APPROVED FOR MERGE
-  (pending the scheduled human review + end-stage CI/regression cleanup;
-   do NOT merge main and do NOT start Benchmark until then)
+MERGE RECOMMENDATION: READY FOR MERGE — awaiting the human sign-off
+  (all MERGE VERIFICATION gaps closed: DAEMON OWNERSHIP + DISCONNECT/RECONNECT
+   are live E2E, FULL REGRESSION is a clean 0-failure run. Branch pushed and
+   remotely reviewable. Do NOT merge main and do NOT start Benchmark until the
+   human signs off.)
 ```
