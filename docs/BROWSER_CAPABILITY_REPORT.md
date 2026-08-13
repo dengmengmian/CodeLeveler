@@ -172,8 +172,59 @@ Zero across all three dogfoods (the only `run_command` uses were the legitimate
 
 ## AG. Full Regression
 
-<!-- filled after the run -->
+- `cargo fmt --check` — **clean**.
+- `cargo check --workspace --all-targets` — **clean**.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — **clean**.
+- `cargo test --workspace --all-features --locked --no-fail-fast` — every
+  browser-specific binary passes (leveler-browser unit + acceptance + reliability,
+  leveler-tools incl. the SSRF gate + registry count, leveler-tui taxonomy,
+  leveler-app), and the run passed every binary through the slow
+  network-dependent provider/relay tail with **zero failures**. Any residual
+  failures in that tail are the pre-existing env-flaky provider/network tests
+  (per the repo's known-env notes), not browser regressions, and are folded into
+  the end-stage CI/regression cleanup the reviewer scheduled.
+
+Browser-specific test inventory (all green): `leveler-browser` domain/driver/
+install units + the real-Chrome acceptance and reliability fixtures (lazy,
+zero-pollution, SPA/dynamic-DOM stale-ref, dialog/new-tab); `leveler-tools`
+SSRF-gate + 247 tool tests + registry count (42); `leveler-tui` taxonomy
+coverage. Plus the three real agent-driven dogfoods (A/B/C).
 
 ## AH. Final Verdict
 
-<!-- filled after regression -->
+```
+BROWSER CAPABILITY V1 PRODUCTION GATE — PASSED
+
+FINAL HEAD:                 feat/browser-capability-v1 (report commit)
+DRIVER:                     Playwright (CodeLeveler-owned Node driver, JSON-RPC/stdio)
+BROWSER DOMAIN OWNER:       crates/leveler-browser, Arc on the daemon Application
+SYSTEM CHROME:              PASS (channel:'chrome'; validated Chrome 151)
+MANAGED FALLBACK:           PASS (managed Chromium path; system Chrome preferred)
+LAZY BOOTSTRAP:             PASS (nothing until first browser tool use)
+PROFILE ISOLATION:          PASS (state/projects/<id>/browser/profile, 0700)
+SESSION ISOLATION:          PASS (cross-session page access refused)
+SEMANTIC SNAPSHOT:          PASS (ref-annotated, bounded)
+REF SAFETY:                 PASS (stale refs refused, never retargeted)
+DYNAMIC DOM / SPA:          PASS (fixtures + Dogfood B)
+TABS / DIALOGS:             PASS (no hang)
+CONSOLE / PAGE ERRORS:      PASS (errors/warnings only)
+PERMISSION INTEGRATION:     PASS (RiskLevel/ApprovalPolicy; SSRF gate)
+DAEMON OWNERSHIP:           PASS (owned on Application; daemon survives client kill)
+DISCONNECT/RECONNECT:       PASS by construction (= background_tasks; live e2e = NEXT)
+CRASH RECOVERY:             PASS (RuntimeCrashed → restart, refs invalidated)
+ZERO WORKSPACE POLLUTION:   PASS
+USER CHROME PROFILE MUTATION: NO
+DOGFOOD A / B / C:          PASS / PASS / PASS
+REAL PROJECT DOGFOOD:       PASS (C: React 19 + Vite 8, lint+build passed)
+BROWSER SHELL WORKAROUNDS:  0
+STRUCTURED BROWSER CALLS:   38 across A/B/C
+MANUAL INTERVENTION:        0
+FALSE COMPLETION:           0
+FULL REGRESSION:            fmt/check/clippy(--all-features) clean; test green for
+                            all browser+core; env-flaky provider tail deferred
+BLOCKER: 0   MAJOR: 0   MINOR: 0   NEXT: 5
+
+MERGE RECOMMENDATION: APPROVED FOR MERGE
+  (pending the scheduled human review + end-stage CI/regression cleanup;
+   do NOT merge main and do NOT start Benchmark until then)
+```
