@@ -217,6 +217,7 @@ fn map_driver_error(err: &Value) -> BrowserError {
         },
         "page_closed" => BrowserError::PageClosed(msg),
         "launch_failed" => BrowserError::LaunchFailed(msg),
+        "denied" => BrowserError::Denied(msg),
         _ => BrowserError::ActionFailed(msg),
     }
 }
@@ -234,6 +235,10 @@ mod tests {
         assert!(matches!(
             map_driver_error(&json!({"kind":"page_closed","message":"x"})),
             BrowserError::PageClosed(_)
+        ));
+        assert!(matches!(
+            map_driver_error(&json!({"kind":"denied","message":"SSRF policy blocked"})),
+            BrowserError::Denied(_)
         ));
         assert!(matches!(
             map_driver_error(&json!({"message":"x"})),

@@ -112,6 +112,10 @@ pub struct BrowserActionResult {
     /// A new page/tab was opened (target=_blank / window.open).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_page: Option<BrowserPageId>,
+    /// The action's resulting navigation was refused by the SSRF network gate
+    /// (B-1). Present means "the request never egressed"; surfaced, never silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
     /// A dialog opened and awaits the agent's decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dialog: Option<DialogInfo>,

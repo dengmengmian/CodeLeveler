@@ -228,7 +228,7 @@ impl BrowserRuntime {
     ) -> Result<BrowserActionResult, BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
-        own_page(active, session, page)?;
+        own_page(&active.pages, session, page)?;
         let res = active
             .driver
             .request(
@@ -254,7 +254,7 @@ impl BrowserRuntime {
     ) -> Result<BrowserSnapshot, BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
-        own_page(active, session, page)?;
+        own_page(&active.pages, session, page)?;
         // Snapshotting a page focuses it (tab switch).
         active.active.insert(session.clone(), page.clone());
         let res = active
@@ -308,7 +308,7 @@ impl BrowserRuntime {
     ) -> Result<BrowserActionResult, BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
-        own_page(active, session, page)?;
+        own_page(&active.pages, session, page)?;
         let (ref_gen, token) = parse_ref(ref_str)
             .ok_or_else(|| BrowserError::RefStale(format!("unparseable ref {ref_str}")))?;
         let st = active.pages.get(page).expect("owned");
@@ -326,6 +326,23 @@ impl BrowserRuntime {
             .driver
             .request(&method, params, ACTION_TIMEOUT + Duration::from_secs(5))
             .await?;
+        // A `target=_blank`/`window.open` opens a new driver page. The runtime is
+        // the ownership authority: bind that page to THIS session and track it,
+        // so the agent can actually snapshot/act on it (own_page would otherwise
+        // reject it as unknown) and no other session can reach it (§18).
+        if let Some(np) = res
+            .get("newPage")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            let npid = BrowserPageId::new(np);
+            active.pages.entry(npid).or_insert_with(|| PageState {
+                session: session.clone(),
+                generation: 0,
+                aria_hash: 0,
+                tokens: HashSet::new(),
+            });
+        }
         // The action may have mutated the page; the next snapshot detects it and
         // bumps the generation. Report the current generation.
         let st = active.pages.get(page).expect("owned");
@@ -343,7 +360,7 @@ impl BrowserRuntime {
     ) -> Result<(), BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
-        own_page(active, session, page)?;
+        own_page(&active.pages, session, page)?;
         let st = active.pages.get(page).expect("owned");
         let cond = match &condition {
             WaitCondition::Load => json!({ "load": true }),
@@ -374,34 +391,46 @@ impl BrowserRuntime {
         Ok(())
     }
 
-    /// List the open pages/tabs (§34).
-    pub async fn tabs(&self, _session: &BrowserSessionId) -> Result<Vec<TabInfo>, BrowserError> {
+    /// List the open pages/tabs owned by `session` (§34, §18). The driver's
+    /// context is shared across sessions, so this is where ownership is applied:
+    /// a session sees only its own pages, never another session's tab urls, and
+    /// pages the driver has dropped (closed) are pruned so the view stays honest.
+    pub async fn tabs(&self, session: &BrowserSessionId) -> Result<Vec<TabInfo>, BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
         let res = active
             .driver
             .request("listPages", json!({}), ACTION_TIMEOUT)
             .await?;
-        let mut tabs = Vec::new();
+        let mut live: HashMap<String, (String, String)> = HashMap::new();
         if let Some(arr) = res.get("pages").and_then(Value::as_array) {
             for p in arr {
-                tabs.push(TabInfo {
-                    page: BrowserPageId::new(p.get("pageId").and_then(Value::as_str).unwrap_or("")),
-                    url: p
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    title: p
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    active: p.get("active").and_then(Value::as_bool).unwrap_or(false),
-                });
+                let id = p
+                    .get("pageId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let url = p
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let title = p
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                live.insert(id, (url, title));
             }
         }
-        Ok(tabs)
+        // Reconcile: drop owned pages the driver no longer has (closed elsewhere),
+        // and clear any session-focus pointing at a now-dead page.
+        active.pages.retain(|id, _| live.contains_key(id.as_str()));
+        active
+            .active
+            .retain(|_, page| live.contains_key(page.as_str()));
+        let current = active.active.get(session).cloned();
+        Ok(owned_tabs(&active.pages, &live, session, current.as_ref()))
     }
 
     /// Set how the next dialog on a page is answered (§35), before the action
@@ -415,7 +444,7 @@ impl BrowserRuntime {
     ) -> Result<(), BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
-        own_page(active, session, page)?;
+        own_page(&active.pages, session, page)?;
         active
             .driver
             .request(
@@ -435,7 +464,7 @@ impl BrowserRuntime {
     ) -> Result<Vec<ConsoleEntry>, BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
-        own_page(active, session, page)?;
+        own_page(&active.pages, session, page)?;
         let res = active
             .driver
             .request(
@@ -474,7 +503,7 @@ impl BrowserRuntime {
     ) -> Result<(String, String), BrowserError> {
         let mut guard = self.inner.lock().await;
         let active = active_mut(&mut guard)?;
-        own_page(active, session, page)?;
+        own_page(&active.pages, session, page)?;
         let res = active
             .driver
             .request(
@@ -561,19 +590,48 @@ fn active_mut<'a>(
 }
 
 /// Enforce session ownership of a page (§10/§18) — a session may never act on
-/// another session's page.
+/// another session's page. Takes just the page map so the rule is unit-testable
+/// without a live driver.
 fn own_page(
-    active: &Active,
+    pages: &HashMap<BrowserPageId, PageState>,
     session: &BrowserSessionId,
     page: &BrowserPageId,
 ) -> Result<(), BrowserError> {
-    match active.pages.get(page) {
+    match pages.get(page) {
         None => Err(BrowserError::PageClosed(format!("unknown page {page}"))),
         Some(st) if &st.session != session => Err(BrowserError::ActionFailed(
             "page belongs to another session".into(),
         )),
         Some(_) => Ok(()),
     }
+}
+
+/// The tabs one session may see: only pages it owns, that the driver still has
+/// live. Pure so the ownership/isolation rule (§18) is unit-tested without a
+/// browser. `current` marks the session's focused page as active.
+fn owned_tabs(
+    pages: &HashMap<BrowserPageId, PageState>,
+    live: &HashMap<String, (String, String)>,
+    session: &BrowserSessionId,
+    current: Option<&BrowserPageId>,
+) -> Vec<TabInfo> {
+    let mut tabs = Vec::new();
+    for (id, st) in pages {
+        if &st.session != session {
+            continue;
+        }
+        if let Some((url, title)) = live.get(id.as_str()) {
+            tabs.push(TabInfo {
+                page: id.clone(),
+                url: url.clone(),
+                title: title.clone(),
+                active: current == Some(id),
+            });
+        }
+    }
+    // Stable order: the id is `page-N`; sort by id so output is deterministic.
+    tabs.sort_by(|a, b| a.page.as_str().cmp(b.page.as_str()));
+    tabs
 }
 
 fn action_result(page: &BrowserPageId, res: &Value, generation: u64) -> BrowserActionResult {
@@ -597,6 +655,10 @@ fn action_result(page: &BrowserPageId, res: &Value, generation: u64) -> BrowserA
             .get("newPage")
             .and_then(Value::as_str)
             .map(BrowserPageId::new),
+        blocked: res
+            .get("blocked")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         dialog: None,
         generation,
     }
@@ -668,6 +730,103 @@ fn fnv1a(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ps(session: &str) -> PageState {
+        PageState {
+            session: BrowserSessionId::new(session),
+            generation: 0,
+            aria_hash: 0,
+            tokens: HashSet::new(),
+        }
+    }
+
+    // ── B-2: page/session ownership (§18) ───────────────────────────────────
+    #[test]
+    fn tabs_show_only_the_asking_sessions_pages() {
+        let mut pages = HashMap::new();
+        pages.insert(BrowserPageId::new("page-1"), ps("A"));
+        pages.insert(BrowserPageId::new("page-2"), ps("B"));
+        let mut live = HashMap::new();
+        live.insert("page-1".into(), ("http://a".into(), "A".into()));
+        live.insert("page-2".into(), ("http://b".into(), "B".into()));
+
+        let a = owned_tabs(&pages, &live, &BrowserSessionId::new("A"), None);
+        assert_eq!(a.len(), 1, "A sees only its own page");
+        assert_eq!(a[0].page.as_str(), "page-1");
+        // B's url/title must not leak into A's view.
+        assert!(a.iter().all(|t| t.url != "http://b" && t.title != "B"));
+
+        let b = owned_tabs(&pages, &live, &BrowserSessionId::new("B"), None);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].page.as_str(), "page-2");
+    }
+
+    #[test]
+    fn tabs_prune_pages_the_driver_no_longer_has() {
+        let mut pages = HashMap::new();
+        pages.insert(BrowserPageId::new("page-1"), ps("A"));
+        pages.insert(BrowserPageId::new("page-2"), ps("A")); // closed in the driver
+        let mut live = HashMap::new();
+        live.insert("page-1".into(), ("http://a".into(), "A".into()));
+        // page-2 is absent from `live` (closed) → must not appear.
+        let a = owned_tabs(&pages, &live, &BrowserSessionId::new("A"), None);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].page.as_str(), "page-1");
+    }
+
+    #[test]
+    fn tabs_mark_the_sessions_current_page_active() {
+        let mut pages = HashMap::new();
+        pages.insert(BrowserPageId::new("page-1"), ps("A"));
+        pages.insert(BrowserPageId::new("page-3"), ps("A"));
+        let mut live = HashMap::new();
+        live.insert("page-1".into(), ("u1".into(), "t1".into()));
+        live.insert("page-3".into(), ("u3".into(), "t3".into()));
+        let cur = BrowserPageId::new("page-3");
+        let a = owned_tabs(&pages, &live, &BrowserSessionId::new("A"), Some(&cur));
+        let active: Vec<_> = a
+            .iter()
+            .filter(|t| t.active)
+            .map(|t| t.page.as_str())
+            .collect();
+        assert_eq!(active, vec!["page-3"], "only the focused page is active");
+    }
+
+    #[test]
+    fn own_page_refuses_another_sessions_page() {
+        // The runtime authority: even a valid page id is refused cross-session,
+        // and an unknown id is refused outright (an unadopted tab is unreachable).
+        let mut pages = HashMap::new();
+        pages.insert(BrowserPageId::new("page-1"), ps("A"));
+        let r = own_page(
+            &pages,
+            &BrowserSessionId::new("B"),
+            &BrowserPageId::new("page-1"),
+        );
+        assert!(
+            matches!(r, Err(BrowserError::ActionFailed(_))),
+            "B must not act on A's page, got {r:?}"
+        );
+        assert!(
+            own_page(
+                &pages,
+                &BrowserSessionId::new("A"),
+                &BrowserPageId::new("page-1")
+            )
+            .is_ok()
+        );
+        assert!(
+            matches!(
+                own_page(
+                    &pages,
+                    &BrowserSessionId::new("A"),
+                    &BrowserPageId::new("page-9")
+                ),
+                Err(BrowserError::PageClosed(_))
+            ),
+            "an unknown/unadopted page is refused"
+        );
+    }
 
     #[test]
     fn parse_ref_requires_generation_and_token() {

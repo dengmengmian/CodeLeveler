@@ -155,6 +155,12 @@ pub async fn ensure_installed(
     };
 
     if is_ready(&root) {
+        // The managed npm deps are version-gated, but the CodeLeveler-authored
+        // driver bridge ships INSIDE the binary — an existing install must not
+        // keep running a stale bridge after an upgrade (that is how a security
+        // fix like the B-1 network gate would silently fail to deploy). Keep the
+        // on-disk bridge in lockstep with the binary on every (re)start.
+        sync_driver_script(&root)?;
         return Ok(layout);
     }
 
@@ -182,6 +188,24 @@ pub async fn ensure_installed(
     let _ = fs2::FileExt::unlock(&lock);
     install_result?;
     Ok(layout)
+}
+
+/// Write the shipped driver bridge if the on-disk copy is missing or differs
+/// from the binary's. Atomic (temp + rename) so a concurrent driver spawn never
+/// reads a half-written script. Cheap: a no-op when already in sync.
+fn sync_driver_script(root: &Path) -> Result<(), BrowserError> {
+    let path = root.join("driver/browser_driver.mjs");
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(DRIVER_SCRIPT) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(root.join("driver"))
+        .map_err(|e| BrowserError::RuntimeInstallFailed(format!("mkdir driver: {e}")))?;
+    let tmp = root.join("driver/.browser_driver.mjs.tmp");
+    std::fs::write(&tmp, DRIVER_SCRIPT)
+        .map_err(|e| BrowserError::RuntimeInstallFailed(format!("write driver: {e}")))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| BrowserError::RuntimeInstallFailed(format!("swap driver: {e}")))?;
+    Ok(())
 }
 
 /// The env handed to the driver child: PATH (to find node's own deps) plus the

@@ -58,6 +58,9 @@ fn fmt_action(r: &leveler_browser::BrowserActionResult) -> String {
     if let Some(np) = &r.new_page {
         s.push_str(&format!("\nnew_page: {np}"));
     }
+    if let Some(reason) = &r.blocked {
+        s.push_str(&format!("\n⚠ blocked by network policy: {reason}"));
+    }
     s.push_str("\n(call browser.snapshot to see the current refs)");
     s
 }

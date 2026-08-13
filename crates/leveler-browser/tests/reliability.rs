@@ -155,6 +155,218 @@ async fn spa_route_and_dynamic_dom_keep_refs_correct() {
     );
 }
 
+// ── a tiny loopback HTTP server (the allowed dev exception) ──────────────────
+// Serves the pages the SSRF / ownership fixtures navigate: a redirect to the
+// cloud-metadata address, a link + a window.open to private ranges, and a
+// second page reachable via a `target=_blank` link. Loopback is allowed by the
+// gate, so the page itself loads; the private targets are what must be refused.
+struct LocalServer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for LocalServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn serve_local() -> (String, LocalServer) {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let home = format!(
+        "<!doctype html><html><body><h1>Home</h1>\
+         <a id=\"priv\" href=\"http://10.0.0.1/secret\">go private</a>\
+         <a id=\"blank\" target=\"_blank\" href=\"{base}/other\">open tab</a>\
+         <button id=\"wopen\" onclick=\"window.open('http://10.0.0.2/x','_blank')\">open private tab</button>\
+         </body></html>"
+    );
+    let other = "<!doctype html><html><body><h1>OtherTab</h1><p>OTHER-CONTENT</p></body></html>";
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        while !stop_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let resp = if path.starts_with("/redir") {
+                        "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if path.starts_with("/other") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            other.len(),
+                            other
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            home.len(),
+                            home
+                        )
+                    };
+                    let _ = sock.write_all(resp.as_bytes());
+                    let _ = sock.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (
+        base,
+        LocalServer {
+            stop,
+            handle: Some(handle),
+        },
+    )
+}
+
+// ── B-1: SSRF enforced at the actual browser request boundary ────────────────
+#[tokio::test]
+async fn ssrf_enforced_at_the_browser_request_boundary() {
+    let Some((rt, s, _url)) = ready_runtime().await else {
+        return;
+    };
+    let (base, _server) = serve_local();
+    let page = rt.new_page(&s).await.unwrap();
+
+    // 1) A direct navigation to a private IP is refused at the request boundary.
+    let direct = rt.navigate(&s, &page, "http://10.0.0.1/").await;
+    assert!(
+        matches!(direct, Err(BrowserError::Denied(_))),
+        "direct private navigation must be Denied, got {direct:?}"
+    );
+
+    // 2) A public→redirect→metadata hop is refused (the redirect target, not the
+    //    initial URL, is the blocked one). The loopback origin itself is allowed.
+    let redir = rt.navigate(&s, &page, &format!("{base}/redir")).await;
+    assert!(
+        matches!(redir, Err(BrowserError::Denied(_))),
+        "redirect into the metadata address must be Denied, got {redir:?}"
+    );
+
+    // 3) A link click whose navigation targets a private IP must NOT reach it —
+    //    the loopback page stays put (no data egressed to 10.0.0.1). Fresh page:
+    //    each SSRF vector is an independent navigation (a blocked nav leaves the
+    //    prior page on chrome-error, exactly as a real agent's next step would
+    //    start clean).
+    let page = rt.new_page(&s).await.unwrap();
+    rt.navigate(&s, &page, &base).await.unwrap();
+    let snap = rt.snapshot(&s, &page).await.unwrap();
+    let priv_ref = ref_for(&snap.text, "go private").expect("link ref");
+    let click = rt
+        .interact(&s, &page, &priv_ref, Interaction::Click)
+        .await
+        .expect("click itself succeeds");
+    // The block is surfaced on the action (not swallowed) …
+    assert!(
+        click.blocked.is_some(),
+        "a click whose navigation targets a private IP must report a block"
+    );
+    // … and the private target is never reached (no data egressed to 10.0.0.1).
+    let after = rt.snapshot(&s, &page).await.unwrap();
+    assert!(
+        !after.url.contains("10.0.0.1"),
+        "click must not navigate to the private IP, url was {}",
+        after.url
+    );
+}
+
+// ── B-2: session/page ownership incl. target=_blank adoption ─────────────────
+#[tokio::test]
+async fn sessions_and_new_tabs_are_owned_by_the_originating_session() {
+    let Some((rt, _s, _url)) = ready_runtime().await else {
+        return;
+    };
+    let (base, _server) = serve_local();
+    let a = BrowserSessionId::new("sess-A");
+    let b = BrowserSessionId::new("sess-B");
+
+    // Each session opens its own page on the shared context.
+    let pa = rt.new_page(&a).await.unwrap();
+    rt.navigate(&a, &pa, &base).await.unwrap();
+    let pb = rt.new_page(&b).await.unwrap();
+    rt.navigate(&b, &pb, &format!("{base}/other"))
+        .await
+        .unwrap();
+
+    // S1: A's tab list shows only A's page, never B's url/title.
+    let a_tabs = rt.tabs(&a).await.unwrap();
+    assert!(
+        a_tabs.iter().any(|t| t.page == pa) && a_tabs.iter().all(|t| t.page != pb),
+        "A must see its own page and not B's: {a_tabs:?}"
+    );
+    assert!(
+        a_tabs.iter().all(|t| !t.url.contains("/other")),
+        "B's url must not leak into A's tabs"
+    );
+
+    // S2: A cannot operate B's page.
+    let cross = rt.snapshot(&a, &pb).await;
+    assert!(
+        matches!(cross, Err(BrowserError::ActionFailed(_))),
+        "A must not snapshot B's page, got {cross:?}"
+    );
+
+    // S3/S4: a target=_blank click gives A a NEW owned page it can operate.
+    let snap = rt.snapshot(&a, &pa).await.unwrap();
+    let blank_ref = ref_for(&snap.text, "open tab").expect("blank-link ref");
+    let res = rt
+        .interact(&a, &pa, &blank_ref, Interaction::Click)
+        .await
+        .unwrap();
+    let new_page = res.new_page.expect("target=_blank opened a new page");
+    let a_tabs2 = rt.tabs(&a).await.unwrap();
+    assert!(
+        a_tabs2.iter().any(|t| t.page == new_page),
+        "the new tab is adopted into A's tabs: {a_tabs2:?}"
+    );
+    // The adopted tab is operable by A: wait for its content, then snapshot it.
+    rt.wait(
+        &a,
+        &new_page,
+        WaitCondition::TextVisible("OtherTab".into()),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("A can drive the adopted tab (structured wait)");
+    let new_snap = rt.snapshot(&a, &new_page).await.unwrap();
+    assert!(
+        new_snap.text.contains("OtherTab"),
+        "A can snapshot the adopted new tab"
+    );
+
+    // S5: B can neither see nor operate A's adopted new tab.
+    let b_tabs = rt.tabs(&b).await.unwrap();
+    assert!(
+        b_tabs.iter().all(|t| t.page != new_page && t.page != pa),
+        "B must not see A's pages/new tab: {b_tabs:?}"
+    );
+    assert!(
+        matches!(
+            rt.snapshot(&b, &new_page).await,
+            Err(BrowserError::ActionFailed(_))
+        ),
+        "B must not operate A's adopted tab"
+    );
+}
+
 #[tokio::test]
 async fn dialog_and_new_tab_do_not_hang() {
     let Some((rt, s, url)) = ready_runtime().await else {
