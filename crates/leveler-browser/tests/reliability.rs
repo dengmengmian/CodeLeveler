@@ -189,6 +189,22 @@ fn serve_local() -> (String, LocalServer) {
          </body></html>"
     );
     let other = "<!doctype html><html><body><h1>OtherTab</h1><p>OTHER-CONTENT</p></body></html>";
+    // A loopback dev page that fetches a same-origin asset (the granted case).
+    let fetcher = format!(
+        "<!doctype html><html><body><h1>Fetcher</h1><script>\
+         fetch('{base}/other').then(r=>r.text()).then(t=>{{document.title=t.includes('OtherTab')?'FETCH_OK':'FETCH_ODD';}})\
+         .catch(()=>{{document.title='FETCH_BLOCKED';}});</script></body></html>"
+    );
+    // A page that tries to open WebSockets to private / metadata targets. Uses
+    // readyState (reliable) rather than depending on onerror/onclose timing: if
+    // either socket is OPEN after the grace, the gate failed.
+    let wspage =
+        "<!doctype html><html><body><h1>WS</h1><script>\
+         let a=new WebSocket('ws://10.0.0.1:80/');let b=new WebSocket('ws://169.254.169.254:80/');\
+         a.onopen=()=>document.title='WS_OPEN';b.onopen=()=>document.title='WS_OPEN';\
+         setTimeout(()=>{if(document.title!=='WS_OPEN'){document.title=(a.readyState===WebSocket.OPEN||b.readyState===WebSocket.OPEN)?'WS_OPEN':'WS_BLOCKED';}},1500);\
+         </script></body></html>"
+            .to_string();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || {
@@ -205,11 +221,23 @@ fn serve_local() -> (String, LocalServer) {
                         .unwrap_or("/");
                     let resp = if path.starts_with("/redir") {
                         "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
-                    } else if path.starts_with("/other") {
+                    } else if path.starts_with("/other") || path.starts_with("/asset") {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             other.len(),
                             other
+                        )
+                    } else if path.starts_with("/fetcher") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            fetcher.len(),
+                            fetcher
+                        )
+                    } else if path.starts_with("/wspage") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            wspage.len(),
+                            wspage
                         )
                     } else {
                         format!(
@@ -285,6 +313,85 @@ async fn ssrf_enforced_at_the_browser_request_boundary() {
         !after.url.contains("10.0.0.1"),
         "click must not navigate to the private IP, url was {}",
         after.url
+    );
+}
+
+// Poll the page title (set by page JS) until it matches, or time out.
+async fn poll_title(
+    rt: &BrowserRuntime,
+    s: &BrowserSessionId,
+    page: &leveler_browser::BrowserPageId,
+    secs: u64,
+    want: &[&str],
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(sn) = rt.snapshot(s, page).await {
+            last = sn.title.clone();
+            if want.iter().any(|w| last == *w) {
+                return last;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    last
+}
+
+// ── B-1 #1: loopback is a PAGE-SCOPED dev grant, not a global bypass ──────────
+#[tokio::test]
+async fn loopback_is_a_page_scoped_grant_not_a_global_bypass() {
+    let Some((rt, s, _url)) = ready_runtime().await else {
+        return;
+    };
+    let (base, _server) = serve_local();
+
+    // A GRANTED loopback dev page (explicit loopback navigation) may fetch its
+    // own loopback origin — the narrow dev exception still works.
+    let granted = rt.new_page(&s).await.unwrap();
+    rt.navigate(&s, &granted, &format!("{base}/fetcher"))
+        .await
+        .unwrap();
+    let t2 = poll_title(&rt, &s, &granted, 8, &["FETCH_OK", "FETCH_BLOCKED"]).await;
+    assert_eq!(
+        t2, "FETCH_OK",
+        "an explicitly-navigated loopback dev page may fetch its own origin, got {t2}"
+    );
+
+    // An UNGRANTED page (opaque `data:` origin — the public-page stand-in: no
+    // explicit loopback navigation, no loopback opener) must NOT reach loopback.
+    // A distinct path (`/asset`) so it shares no cache key with the granted fetch.
+    // `no-cors` so the refusal is the network gate, not a CORS rejection.
+    let ungranted = rt.new_page(&s).await.unwrap();
+    let data_url = format!(
+        "data:text/html,<html><body><script>fetch('{base}/asset',{{mode:'no-cors'}})\
+         .then(()=>{{document.title='FETCH_REACHED'}}).catch(()=>{{document.title='FETCH_BLOCKED'}})</script></body></html>"
+    );
+    rt.navigate(&s, &ungranted, &data_url).await.unwrap();
+    let t = poll_title(&rt, &s, &ungranted, 8, &["FETCH_BLOCKED", "FETCH_REACHED"]).await;
+    assert_eq!(
+        t, "FETCH_BLOCKED",
+        "an ungranted (public-equivalent) page must not fetch loopback"
+    );
+}
+
+// ── B-1 #3: WebSocket egress is gated by the same host policy ─────────────────
+#[tokio::test]
+async fn websocket_egress_is_gated() {
+    let Some((rt, s, _url)) = ready_runtime().await else {
+        return;
+    };
+    let (base, _server) = serve_local();
+    let page = rt.new_page(&s).await.unwrap();
+    // Even from a granted loopback page, WebSockets to private / metadata targets
+    // are refused (never connected) — the ws boundary applies the same policy.
+    rt.navigate(&s, &page, &format!("{base}/wspage"))
+        .await
+        .unwrap();
+    let t = poll_title(&rt, &s, &page, 8, &["WS_BLOCKED", "WS_OPEN"]).await;
+    assert_eq!(
+        t, "WS_BLOCKED",
+        "WebSocket to a private/metadata host must be refused, not opened"
     );
 }
 
