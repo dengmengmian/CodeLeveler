@@ -1830,9 +1830,15 @@ dependencies = [
 name = "leveler-browser"
 version = "0.1.4"
 dependencies = [
+ "fs2",
+ "leveler-core",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

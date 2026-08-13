@@ -12,3 +12,11 @@ description = "Structured browser automation domain: runtime, managed driver, se
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+leveler-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+fs2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

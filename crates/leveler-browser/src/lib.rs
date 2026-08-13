@@ -15,14 +15,17 @@
 //! - `serde_json::Value` is confined to the driver transport; the domain is
 //!   typed.
 
-#![forbid(unsafe_code)]
-
+mod driver;
 mod error;
+mod install;
+mod runtime;
 mod types;
 
+pub use driver::DriverEvent;
 pub use error::{BrowserError, BrowserResult};
+pub use install::{PINNED_PLAYWRIGHT, RuntimeLayout, discover_system_chrome, which};
+pub use runtime::{BrowserRuntime, Interaction};
 pub use types::{
-    BrowserActionResult, BrowserEngine, BrowserNode, BrowserNodeState, BrowserPageId, BrowserRef,
-    BrowserRuntimeInfo, BrowserRuntimeStatus, BrowserSessionId, BrowserSnapshot, DialogInfo,
-    TabInfo,
+    BrowserActionResult, BrowserEngine, BrowserPageId, BrowserRef, BrowserRuntimeInfo,
+    BrowserRuntimeStatus, BrowserSessionId, BrowserSnapshot, ConsoleEntry, DialogInfo, TabInfo,
 };

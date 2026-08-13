@@ -64,68 +64,26 @@ impl BrowserRef {
     }
 }
 
-/// State flags carried by a snapshot node. All optional — absent means the
-/// attribute does not apply to that role.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserNodeState {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checked: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selected: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expanded: Option<bool>,
-    /// Heading/treeitem level, when applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<u32>,
-}
-
-impl BrowserNodeState {
-    pub fn is_empty(&self) -> bool {
-        self.checked.is_none()
-            && self.selected.is_none()
-            && self.disabled.is_none()
-            && self.expanded.is_none()
-            && self.level.is_none()
-    }
-}
-
-/// One node of a semantic snapshot: an accessibility-oriented view of an
-/// element, never raw DOM/HTML/CSS.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserNode {
-    /// ARIA role (`button`, `textbox`, `heading`, `row`, `dialog`, …).
-    pub role: String,
-    /// Accessible name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Current value for form controls (redacted for password fields — never
-    /// the real secret).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    /// The interaction token, present only on actionable elements.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(default, skip_serializing_if = "BrowserNodeState::is_empty")]
-    pub state: BrowserNodeState,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub children: Vec<BrowserNode>,
-}
-
-/// A bounded, semantic view of a page (§21/§23). `truncated` is never silent.
+/// A bounded, semantic view of a page (§21/§23).
+///
+/// `text` is the accessibility-oriented rendering — roles, accessible names,
+/// state, and `[ref=…]` interaction tokens, with nesting for tables/lists —
+/// never raw DOM/HTML/CSS. It is the native, ref-annotated snapshot the driver
+/// produces; the agent reads it directly. `truncated` is never silent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSnapshot {
     pub page: BrowserPageId,
     pub url: String,
     pub title: String,
     /// Monotonic per-page generation; bumped on structural change/navigation.
-    /// Refs carry the generation they were minted in.
+    /// The `[ref=…]` tokens embed this generation so a ref from a superseded
+    /// snapshot is detected as stale rather than retargeting a lookalike.
     pub generation: u64,
-    pub root: Vec<BrowserNode>,
-    /// True when the node/char budget clipped the tree.
+    /// The rendered semantic snapshot (interactive-first, budget-bounded).
+    pub text: String,
+    /// True when the node/char budget clipped the view.
     pub truncated: bool,
-    /// Nodes actually included after budgeting.
+    /// Interactive/semantic nodes actually included after budgeting.
     pub nodes_returned: usize,
     /// Best-effort total node estimate when truncated.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,6 +117,15 @@ pub struct BrowserActionResult {
     pub dialog: Option<DialogInfo>,
     /// The page generation after the action (a bump signals prior refs stale).
     pub generation: u64,
+}
+
+/// One console/page-error entry surfaced to the agent (§36). Only
+/// errors/warnings are collected — never the full `console.log` firehose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleEntry {
+    /// `error` | `warning` | `pageerror`.
+    pub level: String,
+    pub text: String,
 }
 
 /// One entry of the tab/page list (§34).
@@ -243,23 +210,12 @@ mod tests {
             url: "http://localhost:3000/users".into(),
             title: "Users".into(),
             generation: 18,
-            root: vec![BrowserNode {
-                role: "button".into(),
-                name: Some("Create user".into()),
-                value: None,
-                token: Some("e15".into()),
-                state: BrowserNodeState::default(),
-                children: vec![],
-            }],
+            text: "[ref=18e15] button \"Create user\"".into(),
             truncated: false,
             nodes_returned: 1,
             approximate_total: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
-        // Empty state/value/children/approximate_total are omitted for density.
-        assert!(!json.contains("\"state\""));
-        assert!(!json.contains("\"value\""));
-        assert!(!json.contains("\"children\""));
         assert!(!json.contains("approximate_total"));
         let back: BrowserSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back, snap);
