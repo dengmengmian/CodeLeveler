@@ -181,13 +181,17 @@ fn serve_local() -> (String, LocalServer) {
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://127.0.0.1:{port}");
-    let home = format!(
+    // The popup opens about:blank and the opener writes its content (no network
+    // request, non-loopback): a frame-less popup cannot be attributed to a granted
+    // opener, so loopback popups are refused by design (B-1.3) — ownership is what
+    // this fixture tests, not the popup's network origin.
+    let home =
         "<!doctype html><html><body><h1>Home</h1>\
          <a id=\"priv\" href=\"http://10.0.0.1/secret\">go private</a>\
-         <a id=\"blank\" target=\"_blank\" href=\"{base}/other\">open tab</a>\
+         <button id=\"blank\" onclick=\"var w=window.open('about:blank','_blank');w.document.write('<h1>OtherTab</h1>');w.document.close();\">open tab</button>\
          <button id=\"wopen\" onclick=\"window.open('http://10.0.0.2/x','_blank')\">open private tab</button>\
          </body></html>"
-    );
+            .to_string();
     let other = "<!doctype html><html><body><h1>OtherTab</h1><p>OTHER-CONTENT</p></body></html>";
     // A loopback dev page that fetches a same-origin asset (the granted case).
     let fetcher = format!(
@@ -372,6 +376,31 @@ async fn loopback_is_a_page_scoped_grant_not_a_global_bypass() {
     assert_eq!(
         t, "FETCH_BLOCKED",
         "an ungranted (public-equivalent) page must not fetch loopback"
+    );
+}
+
+// ── B-1: non-loopback egress goes through the single pinning proxy authority ──
+// A `.invalid` host (RFC 6761: never resolves) is not a loopback literal and not
+// a blocked IP literal, so the route layer lets it proceed — it can ONLY be
+// refused by the proxy (the sole resolver/connector). A typed `Denied` therefore
+// proves the request reached the proxy and the proxy failed closed on a target it
+// could not resolve/validate, rather than any connection escaping.
+#[tokio::test]
+async fn non_loopback_egress_is_refused_by_the_proxy_fail_closed() {
+    let Some((rt, s, _url)) = ready_runtime().await else {
+        return;
+    };
+    let page = rt.new_page(&s).await.unwrap();
+    let r = rt
+        .navigate(
+            &s,
+            &page,
+            "http://blocked.this-name-never-resolves.invalid/",
+        )
+        .await;
+    assert!(
+        matches!(r, Err(BrowserError::Denied(_))),
+        "an unresolvable non-loopback target must be Denied by the proxy, got {r:?}"
     );
 }
 

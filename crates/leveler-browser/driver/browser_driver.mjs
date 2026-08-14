@@ -6,12 +6,16 @@
 // does no ref-generation bookkeeping, no snapshot budgeting, no session/page
 // ownership — those live in Rust.
 //
-// The ONE policy this process enforces is the SSRF network boundary (B-1): the
-// browser is where a redirect, link click, form submit, window.open or
-// window.location actually becomes a network request, so that is the only place
-// the runtime's per-request IP gate can be applied. The blocked-range set below
-// mirrors Rust `web_fetch::is_blocked_ip` (loopback is the allowed dev
-// exception) and MUST stay in sync with it; the B-1 regressions pin that.
+// The ONE security policy this process enforces is the SSRF network boundary
+// (B-1), and it enforces it through a SINGLE fail-closed connect-time authority:
+// a CodeLeveler-owned forward proxy that Chromium is launched to use. Every
+// http/https/ws/wss egress therefore hands the proxy the target host and the
+// proxy is the sole resolver+connector (resolve → validate → pin → connect), so
+// a DNS name that rebinds safe→private between check and connect can never reach
+// the private endpoint. Redirects, cookies, origin and TLS stay 100% native.
+// Loopback LITERALS keep Chrome's built-in bypass — a fixed address that cannot
+// rebind — and the route layer applies the PAGE-SCOPED loopback grant to them.
+// The blocked-range set mirrors Rust `web_fetch::is_blocked_ip`; keep in sync.
 //
 // Protocol contract:
 //   - stdout carries EXACTLY one JSON message per line and nothing else.
@@ -29,7 +33,6 @@ import { chromium } from 'playwright';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import http from 'node:http';
-import https from 'node:https';
 
 // ── stdout protocol writer (line-buffered, JSON only) ───────────────────────
 function send(obj) {
@@ -49,38 +52,16 @@ function event(params) {
 let context = null; // Playwright BrowserContext (persistent)
 let engine = null; // reported engine label
 let browserVersion = null;
+let egressProxy = null; // the single connect-time network authority
 const pages = new Map(); // pageId -> Page
 let nextPageId = 1;
 const consoleLog = new Map(); // pageId -> [{level,text}]
 const dialogPolicy = new Map(); // pageId -> {action, promptText}
-// Pages the agent EXPLICITLY navigated to a loopback dev URL. Loopback is a
-// page-scoped dev grant, never a global exception: a public page must not reach
-// loopback via redirect/click/form/window.open/fetch/ws just because loopback
-// happens to be locally reachable.
-const loopbackGrant = new Set(); // pageId
-// A popup's INITIAL document request is frame-less (Playwright cannot attribute
-// it to a page yet), so a popup opened BY A GRANTED dev page briefly carries the
-// grant here — set on the opener's `popup` event. A popup opened by a public
-// page gets no such window, so it still cannot reach loopback.
-let pendingPopupGrantUntil = 0;
-
-// ── SSRF network boundary (B-1) ──────────────────────────────────────────────
-// The browser is where a redirect / link click / form submit / window.open /
-// fetch / WebSocket actually becomes a network request, so this is the only
-// place the runtime's per-request IP policy can hold. Invariants:
-//   * Loopback is a PAGE-SCOPED dev grant (set on an explicit loopback
-//     navigation), never a global exception — a public page cannot reach
-//     loopback via redirect/click/form/window.open/fetch/ws.
-//   * Verification FAILS CLOSED: any error resolving/validating/fetching a
-//     request aborts it — never a `continue` past an unverified target.
-//   * Navigations are followed hop-by-hop and PINNED at connect (resolve →
-//     validate → pin → connect, like `web_fetch`), so a name that rebinds
-//     safe→private between check and connect never reaches the private endpoint.
-//   * WebSocket egress is gated by the same host policy.
-//   * Service workers are blocked (they would otherwise bypass route interception).
-// The blocked-range set mirrors Rust `web_fetch::is_blocked_ip`; keep in sync.
+const loopbackGrant = new Set(); // pageId — pages whose live top-level origin is loopback
 let lastBlock = null; // {url, reason, at} — surfaced on the action that caused it
 
+// ── IP-range classifier (mirrors Rust web_fetch::is_blocked_ip) ───────────────
+// Loopback is NOT "blocked" here; it is a separate allowed-but-page-scoped case.
 function isLoopbackIp(ip) {
   if (net.isIPv4(ip)) return ip.split('.')[0] === '127';
   if (net.isIPv6(ip)) return ip.toLowerCase() === '::1';
@@ -89,12 +70,12 @@ function isLoopbackIp(ip) {
 
 function v4Blocked(o) {
   const [a, b] = o;
-  if (a === 127) return false; // loopback: classified separately as its own kind
+  if (a === 127) return false; // loopback: classified separately
   if (a === 0) return true; // 0.0.0.0/8 incl unspecified
   if (a === 10) return true; // 10/8 private
   if (a === 172 && (b & 0xf0) === 16) return true; // 172.16/12 private
   if (a === 192 && b === 168) return true; // 192.168/16 private
-  if (a === 169 && b === 254) return true; // 169.254/16 link-local (incl 169.254.169.254 metadata)
+  if (a === 169 && b === 254) return true; // 169.254/16 link-local (incl metadata)
   if (a === 100 && (b & 0xc0) === 64) return true; // 100.64/10 CGNAT
   if (a >= 224) return true; // multicast + reserved + broadcast
   return false;
@@ -119,55 +100,34 @@ function addrBlocked(ip) {
   return true; // unparseable → refuse
 }
 
-// Classify a request host into loopback / blocked / allowed, resolving hostnames
-// once and returning the validated addresses so the caller can PIN to them. Any
-// blocked resolved address makes the host blocked; loopback is its own kind so a
-// page grant can gate it. Resolution failure fails closed (blocked).
-async function classifyHost(host) {
-  if (net.isIP(host)) {
-    if (isLoopbackIp(host)) return { kind: 'loopback', addrs: [host] };
-    if (addrBlocked(host)) return { kind: 'blocked', reason: `blocked address ${host}` };
-    return { kind: 'allowed', addrs: [host] };
-  }
-  let addrs;
-  try {
-    addrs = await dns.lookup(host, { all: true });
-  } catch {
-    return { kind: 'blocked', reason: `cannot resolve ${host}` };
-  }
-  let anyLoop = false;
-  for (const a of addrs) {
-    if (isLoopbackIp(a.address)) anyLoop = true;
-    else if (addrBlocked(a.address)) {
-      return { kind: 'blocked', reason: `${host} resolves to blocked ${a.address}` };
-    }
-  }
-  const list = addrs.map((a) => a.address);
-  return anyLoop ? { kind: 'loopback', addrs: list } : { kind: 'allowed', addrs: list };
+function isLoopbackLiteralHost(h) {
+  return (
+    h === 'localhost' ||
+    h === '::1' ||
+    (net.isIPv4(h) && h.split('.')[0] === '127')
+  );
 }
 
 function urlHostIsLoopbackLiteral(url) {
-  let h;
   try {
-    h = new URL(url).hostname;
+    return isLoopbackLiteralHost(new URL(url).hostname);
   } catch {
     return false;
   }
-  return h === 'localhost' || h === '::1' || (net.isIPv4(h) && h.split('.')[0] === '127');
 }
 
+// ── page-scoped loopback grant (the only per-page network decision) ───────────
 function pageGrantedById(page) {
   for (const [k, v] of pages) if (v === page && loopbackGrant.has(k)) return true;
   return false;
 }
 
-// Whether loopback is permitted for a request from `page`. True when the page is
-// (currently) a loopback dev page — its live top-level origin is loopback, or
-// `loopbackGrant` (kept in lockstep with that origin) holds it — or when the
-// request comes from a popup whose OPENER is a live loopback dev page. Takes the
-// Page object (not an id) so it also decides correctly for a popup whose initial
-// document request fires before the context 'page' event has registered it.
-// Evaluated at request time, so it never depends on event ordering.
+// Whether loopback is permitted for a request from `page`: the page is currently
+// a loopback dev page (its live top-level origin is loopback; `loopbackGrant` is
+// kept in lockstep with that origin), or the request comes from a popup whose
+// opener is a live loopback dev page. Evaluated at request time — never depends
+// on event ordering. `null` (a popup's frame-less initial navigation that cannot
+// be attributed) is refused.
 async function loopbackAllowedForPage(page) {
   if (!page) return false;
   try {
@@ -195,167 +155,171 @@ async function loopbackAllowedForPage(page) {
   return false;
 }
 
-// The Page a request belongs to (null if detached).
 function pageOf(req) {
   try {
     const frame = req.frame();
     return frame ? frame.page() : null;
   } catch {
-    return null;
+    return null; // a popup's frame-less initial navigation
   }
 }
 
-// One hop of a navigation, connected to the PINNED validated IP (Host header +
-// TLS SNI keep the hostname) so Chromium cannot re-resolve to a rebound address.
-function fetchPinned(u, pinnedIp, method, body, reqHeaders) {
-  return new Promise((resolve, reject) => {
-    const isHttps = u.protocol === 'https:';
-    const mod = isHttps ? https : http;
-    const headers = {};
-    for (const [k, v] of Object.entries(reqHeaders || {})) {
-      const lk = k.toLowerCase();
-      if (lk === 'content-length' || lk === 'connection') continue;
-      headers[k] = v;
+// ── the egress proxy: the single connect-time authority ───────────────────────
+function recordBlock(target, reason) {
+  lastBlock = { url: target, reason, at: Date.now() };
+  event({ kind: 'blocked_request', url: target, reason });
+}
+
+// Resolve a target host and refuse anything that resolves into a blocked range or
+// rebinds to loopback; return the validated IP to connect to (the pin). Loopback
+// literals are allowed here (the route layer already applied the page grant to
+// them); a NON-loopback name that resolves to loopback is a rebind → refused.
+// Throws (fail closed) on any resolution/validation failure.
+async function resolveAndPin(host) {
+  if (net.isIP(host)) {
+    if (isLoopbackIp(host)) return host; // loopback literal (route page-scoped)
+    if (addrBlocked(host)) throw new Error(`blocked address ${host}`);
+    return host;
+  }
+  if (isLoopbackLiteralHost(host)) return '127.0.0.1'; // "localhost" (route page-scoped)
+  let addrs;
+  try {
+    addrs = await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error(`cannot resolve ${host}`);
+  }
+  for (const a of addrs) {
+    if (isLoopbackIp(a.address)) throw new Error(`${host} resolves to loopback ${a.address}`);
+    if (addrBlocked(a.address)) throw new Error(`${host} resolves to blocked ${a.address}`);
+  }
+  return addrs[0].address;
+}
+
+// Proxied http:// request: resolve+validate+pin the origin, then forward. https
+// never arrives here (it tunnels via CONNECT). A refusal destroys the socket so
+// the navigation/subresource FAILS (surfaced as Denied/blocked), never a silent
+// success and never a connection to the target.
+async function handleProxyHttp(creq, cres) {
+  cres.on('error', () => {});
+  creq.on('error', () => {});
+  let u;
+  try {
+    u = new URL(creq.url);
+  } catch {
+    try {
+      cres.destroy();
+    } catch {
+      /* ignore */
     }
-    headers['host'] = u.host;
-    const opts = {
-      method: method || 'GET',
-      hostname: u.hostname,
-      port: u.port || (isHttps ? 443 : 80),
-      path: (u.pathname || '/') + (u.search || ''),
+    return;
+  }
+  let ip;
+  try {
+    ip = await resolveAndPin(u.hostname);
+  } catch (e) {
+    recordBlock(creq.url, e && e.message ? e.message : String(e));
+    try {
+      cres.destroy();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  const headers = { ...creq.headers };
+  delete headers['proxy-connection'];
+  const preq = http.request(
+    {
+      host: ip,
+      port: u.port || 80,
+      method: creq.method,
+      path: u.pathname + u.search,
       headers,
-      servername: isHttps ? u.hostname : undefined,
-      lookup: (_h, _o, cb) => cb(null, pinnedIp, net.isIPv6(pinnedIp) ? 6 : 4),
-      timeout: 30000,
-    };
-    const rq = mod.request(opts, (res) => {
-      const chunks = [];
-      res.on('data', (d) => chunks.push(d));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
-      res.on('error', reject);
-    });
-    rq.on('error', reject);
-    rq.on('timeout', () => rq.destroy(new Error('request timeout')));
-    if (body && body.length) rq.write(body);
-    rq.end();
+    },
+    (pres) => {
+      try {
+        cres.writeHead(pres.statusCode, pres.headers);
+      } catch {
+        /* client gone */
+      }
+      pres.on('error', () => {});
+      pres.pipe(cres);
+    }
+  );
+  preq.on('error', () => {
+    try {
+      cres.destroy();
+    } catch {
+      /* ignore */
+    }
+  });
+  creq.pipe(preq);
+}
+
+// CONNECT (https://, wss://): resolve+validate+pin, then blind-tunnel so Chromium
+// does TLS + any WebSocket handshake end-to-end (native origin/cert semantics).
+async function handleProxyConnect(creq, csock, head) {
+  csock.on('error', () => {});
+  const sep = creq.url.lastIndexOf(':');
+  const host = sep >= 0 ? creq.url.slice(0, sep) : creq.url;
+  const port = parseInt(sep >= 0 ? creq.url.slice(sep + 1) : '443', 10) || 443;
+  let ip;
+  try {
+    ip = await resolveAndPin(host);
+  } catch (e) {
+    recordBlock(creq.url, e && e.message ? e.message : String(e));
+    try {
+      csock.destroy();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  const up = net.connect(port, ip, () => {
+    try {
+      csock.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    } catch {
+      /* ignore */
+    }
+    if (head && head.length) up.write(head);
+    up.pipe(csock);
+    csock.pipe(up);
+  });
+  up.on('error', () => {
+    try {
+      csock.destroy();
+    } catch {
+      /* ignore */
+    }
   });
 }
 
-async function fulfillPinned(route, resp) {
-  const headers = {};
-  for (const [k, v] of Object.entries(resp.headers)) {
-    const lk = k.toLowerCase();
-    if (lk === 'content-length' || lk === 'transfer-encoding' || lk === 'connection' || lk === 'keep-alive') {
-      continue;
-    }
-    headers[k] = Array.isArray(v) ? v[0] : v; // keep it single-valued for fulfill
-  }
-  try {
-    await route.fulfill({ status: resp.status, headers, body: resp.body });
-  } catch {
-    /* route already resolved — our fetch was validated + pinned, so this is benign */
-  }
-}
-
-// A navigation, followed hop-by-hop with each hop validated and connected via a
-// pinned IP. Fails closed on any resolve/validate/fetch error.
-async function pinnedNavigate(route, page) {
-  const req0 = route.request();
-  let current = req0.url();
-  let method = req0.method();
-  let body = null;
-  try {
-    body = req0.postDataBuffer ? req0.postDataBuffer() : null;
-  } catch {
-    body = null;
-  }
-  const baseHeaders = req0.headers();
-  try {
-    for (let hop = 0; hop < 12; hop++) {
-      let u;
-      try {
-        u = new URL(current);
-      } catch {
-        return recordBlockAndAbort(route, current, 'unparseable url');
-      }
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') return safeContinue(route);
-      const c = await classifyHost(u.hostname);
-      if (c.kind === 'blocked') return recordBlockAndAbort(route, current, c.reason);
-      if (c.kind === 'loopback') {
-        // `page` is null for a popup's frame-less initial navigation; a popup
-        // opened by a granted dev page carries a short pending grant instead.
-        const allowed = page
-          ? await loopbackAllowedForPage(page)
-          : Date.now() < pendingPopupGrantUntil;
-        if (!allowed) {
-          return recordBlockAndAbort(route, current, `loopback ${u.hostname} without an explicit dev grant`);
-        }
-      }
-      let resp;
-      try {
-        resp = await fetchPinned(u, c.addrs[0], method, body, baseHeaders);
-      } catch (e) {
-        // FAIL CLOSED: a validated target we could not fetch is refused, never continued.
-        return recordBlockAndAbort(route, current, `verification fetch failed: ${e && e.message ? e.message : e}`);
-      }
-      if (resp.status >= 300 && resp.status < 400 && resp.headers.location) {
-        let next;
-        try {
-          next = new URL(resp.headers.location, current);
-        } catch {
-          return fulfillPinned(route, resp);
-        }
-        current = next.href;
-        if (resp.status !== 307 && resp.status !== 308) {
-          method = 'GET';
-          body = null;
-        }
-        continue;
-      }
-      return fulfillPinned(route, resp);
-    }
-    return recordBlockAndAbort(route, current, 'too many redirects');
-  } catch (e) {
-    // FAIL CLOSED on any unexpected gate error.
-    return recordBlockAndAbort(route, current, `gate error: ${e && e.message ? e.message : e}`);
-  }
-}
-
-// A subresource (script/img/xhr/fetch/…): host-classified at request time. Blocked
-// ranges and ungranted loopback are refused. Loopback subresources are served via
-// the same pinned fetch as navigations (dev assets are local and small, and this
-// pins them against rebinding too); public subresources proceed normally (so
-// streaming/range/large responses are not buffered).
-async function gateSubresource(route, u, page) {
-  let c;
-  try {
-    c = await classifyHost(u.hostname);
-  } catch (e) {
-    return recordBlockAndAbort(route, u.href, `classify error: ${e && e.message ? e.message : e}`);
-  }
-  if (c.kind === 'blocked') return recordBlockAndAbort(route, u.href, c.reason);
-  if (c.kind === 'loopback') {
-    if (!(await loopbackAllowedForPage(page))) {
-      return recordBlockAndAbort(route, u.href, `loopback ${u.hostname} without an explicit dev grant`);
-    }
-    const req = route.request();
-    let body = null;
+// Plaintext ws:// through the proxy is NOT relayed (Node closes unhandled
+// 'upgrade' connections) → public ws:// fails closed. wss:// tunnels via CONNECT
+// and is pinned; loopback ws is handled by the route layer below.
+async function startEgressProxy() {
+  const server = http.createServer();
+  server.on('request', handleProxyHttp);
+  server.on('connect', handleProxyConnect);
+  server.on('clientError', (_e, sock) => {
     try {
-      body = req.postDataBuffer ? req.postDataBuffer() : null;
+      sock.destroy();
     } catch {
-      body = null;
+      /* ignore */
     }
-    let resp;
-    try {
-      resp = await fetchPinned(u, c.addrs[0], req.method(), body, req.headers());
-    } catch (e) {
-      return recordBlockAndAbort(route, u.href, `verification fetch failed: ${e && e.message ? e.message : e}`);
-    }
-    return fulfillPinned(route, resp);
-  }
-  return safeContinue(route);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  server.port = server.address().port;
+  return server;
 }
 
+// ── route layer: the ONLY per-page decision (the loopback grant) ──────────────
+// Loopback literals are the only non-proxied path (a fixed address that cannot
+// rebind); everything else proceeds to the single proxy authority, which
+// resolves/validates/pins. A literal private/link-local/metadata backstop guards
+// against Chrome bypassing those directly.
 async function installNetworkGate(ctx) {
   await ctx.route('**/*', async (route) => {
     const req = route.request();
@@ -365,75 +329,59 @@ async function installNetworkGate(ctx) {
     } catch {
       return safeContinue(route);
     }
-    // Non-network schemes (file:/data:/about:/blob:/chrome:) never egress to an IP.
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return safeContinue(route);
-    const page = pageOf(req);
-    if (req.resourceType() === 'document') return pinnedNavigate(route, page);
-    return gateSubresource(route, u, page);
+    const host = u.hostname;
+    if (isLoopbackLiteralHost(host)) {
+      const page = pageOf(req); // null for a frame-less popup nav → deny (unattributable)
+      const allowed = page ? await loopbackAllowedForPage(page) : false;
+      if (!allowed) {
+        return recordBlockAndAbort(route, u.href, `loopback ${host} without an explicit dev grant`);
+      }
+      return safeContinue(route);
+    }
+    if (net.isIP(host) && !isLoopbackIp(host) && addrBlocked(host)) {
+      return recordBlockAndAbort(route, u.href, `blocked address ${host}`);
+    }
+    return safeContinue(route); // → the proxy resolves/validates/pins
   });
 }
 
-// WebSocket egress is a separate Playwright boundary; gate it with the same host
-// policy (private/link-local/metadata denied; loopback only with a page grant).
-async function installWsGate(page) {
-  try {
-    await page.routeWebSocket('**/*', async (ws) => {
-      let host = '';
+// Context-wide WebSocket boundary, installed BEFORE any page can create a socket.
+// Loopback ws is refused (no page handle at the context level, and dev/HMR ws to
+// localhost is out of V1 scope); every other ws goes through the pinning proxy
+// (wss via CONNECT) or fails closed (public ws://).
+async function installWsGate(ctx) {
+  await ctx.routeWebSocket('**/*', (ws) => {
+    let host = '';
+    try {
+      host = new URL(ws.url()).hostname;
+    } catch {
       try {
-        host = new URL(ws.url()).hostname;
-      } catch {
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
-        }
-        return;
-      }
-      let c;
-      try {
-        c = await classifyHost(host);
-      } catch {
-        c = { kind: 'blocked', reason: `ws classify failed for ${host}` };
-      }
-      const blocked =
-        c.kind === 'blocked' || (c.kind === 'loopback' && !(await loopbackAllowedForPage(page)));
-      if (blocked) {
-        const reason = c.reason || `loopback ws ${host} without a dev grant`;
-        lastBlock = { url: ws.url(), reason, at: Date.now() };
-        event({ kind: 'blocked_request', url: ws.url(), reason });
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
-        }
-        return;
-      }
-      try {
-        ws.connectToServer();
+        ws.close();
       } catch {
         /* ignore */
       }
-    });
-  } catch {
-    /* routeWebSocket unavailable — best effort */
-  }
-}
-
-async function urlIsLoopback(url) {
-  let u;
-  try {
-    u = new URL(url);
-  } catch {
-    return false;
-  }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-  const c = await classifyHost(u.hostname);
-  return c.kind === 'loopback';
+      return;
+    }
+    if (isLoopbackLiteralHost(host)) {
+      recordBlock(ws.url(), 'loopback WebSocket is not permitted in V1');
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    try {
+      ws.connectToServer();
+    } catch {
+      /* ignore */
+    }
+  });
 }
 
 function recordBlockAndAbort(route, url, reason) {
-  lastBlock = { url, reason, at: Date.now() };
-  event({ kind: 'blocked_request', url, reason });
+  recordBlock(url, reason);
   return safeAbort(route);
 }
 
@@ -453,13 +401,8 @@ async function safeContinue(route) {
   }
 }
 
-// If an action failed because the network gate aborted its request, turn the
-// opaque failure into a typed `denied` — never a silent success, never a shell
-// fallback. A block that fired within the grace window IS the cause of a
-// same-navigation failure: a direct abort surfaces as net::ERR_*, while a
-// redirect hop that we abort surfaces as Playwright "interrupted by another
-// navigation to chrome-error://" (the aborted hop becomes an error page). Both
-// are the gate; attribute them to it when a block just landed.
+// If an action failed because the gate refused a request within the grace window,
+// turn the opaque net error into a typed `denied` — never a silent success.
 function blockedOr(err) {
   if (lastBlock && Date.now() - lastBlock.at < 3000) {
     const denied = new Error(`SSRF policy blocked ${lastBlock.url} (${lastBlock.reason})`);
@@ -471,7 +414,7 @@ function blockedOr(err) {
 }
 
 // A block that landed within the grace window, for surfacing on a non-navigating
-// action (e.g. a link click whose navigation was aborted). Consumes the record.
+// action (e.g. a link click whose navigation was refused). Consumes the record.
 function takeRecentBlock() {
   if (lastBlock && Date.now() - lastBlock.at < 3000) {
     const r = lastBlock.reason;
@@ -501,21 +444,14 @@ function registerPage(page) {
   pages.set(id, page);
   consoleLog.set(id, []);
   dialogPolicy.set(id, { action: 'dismiss' });
-  // Gate this page's WebSocket egress with the same host policy (B-1).
-  installWsGate(page);
-  // Keep the loopback grant in lockstep with the page's LIVE top-level origin:
-  // a page that navigates (by click/JS/redirect, not just the navigate() method)
-  // to a public origin must lose loopback access; one that lands on loopback
-  // gains it. This closes the stale-grant hole without depending on navigate().
+  // Keep the loopback grant in lockstep with the page's LIVE top-level origin: a
+  // page that navigates (by click/JS/redirect, not just the navigate() method) to
+  // a public origin must lose loopback access; one that lands on loopback gains
+  // it. This closes the stale-grant hole without depending on navigate().
   page.on('framenavigated', (frame) => {
     if (frame !== page.mainFrame()) return;
     if (urlHostIsLoopbackLiteral(frame.url())) loopbackGrant.add(id);
     else loopbackGrant.delete(id);
-  });
-  // When a GRANTED dev page opens a popup, briefly authorize that popup's
-  // frame-less initial loopback navigation (a public page's popup gets nothing).
-  page.on('popup', () => {
-    if (loopbackGrant.has(id)) pendingPopupGrantUntil = Date.now() + 4000;
   });
 
   page.on('console', (msg) => {
@@ -583,17 +519,25 @@ const methods = {
 
   async launch(p) {
     if (context) return { engine, browserVersion };
+    // Start the single egress authority FIRST. If it cannot bind, the launch
+    // fails closed — there is no browser without the network boundary (B-1).
+    egressProxy = await startEgressProxy();
     const opts = { headless: p.headless !== false };
     if (p.channel) opts.channel = p.channel; // e.g. "chrome"
     if (p.executablePath) opts.executablePath = p.executablePath;
-    // Block service workers: because request interception IS the security
-    // boundary here, a SW-mediated fetch must not be able to route around it (B-1).
+    // Service workers off: request interception is the security boundary, and a
+    // SW-mediated fetch must not be able to route around it.
     opts.serviceWorkers = 'block';
-    // Never inherit ambient proxy/user state beyond the given user-data-dir.
+    // Route ALL non-loopback egress through our proxy (the sole resolver/
+    // connector). Loopback literals keep Chrome's built-in bypass — a fixed
+    // address that cannot rebind, page-scoped by the route layer. Nothing
+    // inherits an ambient system proxy.
+    opts.proxy = { server: `http://127.0.0.1:${egressProxy.port}` };
     context = await chromium.launchPersistentContext(p.userDataDir, opts);
-    // B-1: enforce the SSRF network boundary on every request BEFORE any page
-    // can navigate — covers redirects, clicks, window.open, form submits, fetch.
+    // Install the security boundary BEFORE any page can run. A setup failure
+    // throws → the launch fails closed (no best-effort).
     await installNetworkGate(context);
+    await installWsGate(context);
     engine = p.channel ? 'system:' + p.channel : (p.executablePath ? 'system:chromium' : 'managed:chromium');
     try {
       browserVersion = context.browser() ? context.browser().version() : 'unknown';
@@ -628,15 +572,15 @@ const methods = {
     const page = requirePage(p.pageId);
     // An EXPLICIT navigation to a loopback dev URL grants this page loopback
     // access; any other explicit target revokes it. Set before goto so the
-    // document request (and its subresources) are gated with the right grant —
-    // and so a public page can never reach loopback via redirect/click/fetch.
-    if (await urlIsLoopback(p.url)) loopbackGrant.add(p.pageId);
+    // document request is gated with the right grant. `framenavigated` keeps it
+    // in sync afterwards for in-page navigations.
+    if (urlHostIsLoopbackLiteral(p.url)) loopbackGrant.add(p.pageId);
     else loopbackGrant.delete(p.pageId);
     let resp;
     try {
       resp = await page.goto(p.url, { timeout: p.timeoutMs || 30000, waitUntil: 'domcontentloaded' });
     } catch (e) {
-      throw blockedOr(e); // a gate-aborted navigation (incl. redirect) → denied
+      throw blockedOr(e); // a gate-refused navigation (incl. redirect) → denied
     }
     return { url: page.url(), title: await titleSafe(page), status: resp ? resp.status() : null };
   },
@@ -656,12 +600,6 @@ const methods = {
   async click(p) {
     const page = requirePage(p.pageId);
     const urlBefore = page.url();
-    // If THIS page is a loopback dev page and the click may open a popup, arm the
-    // pending-popup grant BEFORE the click — synchronously, in the same driver
-    // call — so the popup's frame-less initial loopback navigation is authorized
-    // without racing the opener's async `popup` event. A public page never
-    // reaches here with a grant, so its popup gets nothing.
-    if (loopbackGrant.has(p.pageId)) pendingPopupGrantUntil = Date.now() + 4000;
     // A target=_blank/window.open popup registers asynchronously; arm the popup
     // wait BEFORE clicking so the event is never missed. Resolves immediately
     // when a popup opens, else null after a short grace (no popup expected).
@@ -762,6 +700,11 @@ const methods = {
     } catch {
       /* ignore */
     }
+    try {
+      if (egressProxy) egressProxy.close();
+    } catch {
+      /* ignore */
+    }
     return { ok: true };
   },
 };
@@ -811,5 +754,8 @@ process.stdin.on('end', () => {
   methods.shutdown().finally(() => process.exit(0));
 });
 process.on('uncaughtException', (e) => {
+  // Proxy client sockets can reset/EPIPE as Chromium tears connections down; that
+  // is normal relay noise, not a driver defect.
+  if (e && (e.code === 'EPIPE' || e.code === 'ECONNRESET')) return;
   process.stderr.write('driver: uncaught: ' + (e && e.stack ? e.stack : e) + '\n');
 });

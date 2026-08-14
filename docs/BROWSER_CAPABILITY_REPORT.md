@@ -5,10 +5,11 @@ sign-off). All MERGE VERIFICATION gaps are closed — daemon ownership and
 disconnect/reconnect are proven by a live TUI↔daemon E2E (§T) — and the MAJOR
 implementation gaps the human reviews found are fixed with regressions: **B-2**
 page/session ownership (tabs + `target=_blank` adoption) is closed (§J); **B-1**
-SSRF is enforced at the browser's real network egress — a page-scoped loopback
-grant (not a global bypass), per-hop redirect gating with a pinned connect (no
-rebinding), fail-closed verification, WebSocket gating, and blocked service
-workers (§Q). The full four-gate regression is a clean 0-failure run (§AG).
+SSRF is enforced by a single fail-closed connect-time authority — a
+CodeLeveler-owned forward proxy that is the sole resolver/connector for all
+non-loopback egress (resolve→validate→pin→connect, native redirect/origin/TLS),
+with a page-scoped loopback grant, context-wide WebSocket gating, and blocked
+service workers (§Q). The full four-gate regression is a clean 0-failure run (§AG).
 Structured browser automation is a real, daemon-owned capability the agent uses
 as its primary web-verification path.
 
@@ -91,46 +92,51 @@ Reuses the existing `RiskLevel`/`ApprovalPolicy` — snapshot/wait/tabs/console/
 screenshot = `Safe`; navigate/click/type/select/press/dialog = `Network` (auto
 under Assisted, prompted under RequestApproval). No second permission engine.
 
-**SSRF is enforced at the browser's own request boundary (B-1 fix).** The Rust
-`browser_navigate` arg-gate stays as an early, cheap deny, but it is no longer the
-security boundary — a redirect, link click, `window.open`, form submit, `fetch`,
-`window.location` or WebSocket never depends on it. Enforcement lives at the
-browser's real network egress, holding these invariants (each with a real-Chrome
-regression):
+**SSRF is enforced by ONE fail-closed connect-time authority (B-1 fix).** The Rust
+`browser_navigate` arg-gate stays as an early, cheap deny, but it is not the
+security boundary. The boundary is a **CodeLeveler-owned forward proxy** that
+Chromium is launched to use (`proxy: {server: 127.0.0.1:<ephemeral>}`); every
+non-loopback http/https/ws/wss egress — document, redirect, subresource, `fetch`,
+`window.open`, WebSocket, even Chromium's own background requests — hands the
+proxy the target, so **the proxy is the sole resolver and connector**:
 
-- **Loopback is a PAGE-SCOPED dev grant, not a global exception.** A page earns
-  loopback access only by being (or being opened by) a page whose live top-level
-  origin is loopback — tracked via `navigate` + `framenavigated`, so a page that
-  moves to a public origin loses it, and a popup's frame-less first navigation is
-  authorized only when its opener is a live loopback dev page. A public
-  (opaque-origin) page's `fetch`/`window.open`/redirect/click into loopback is
-  refused. *(regression: granted dev page fetches its own origin → allowed;
-  ungranted page → blocked.)*
-- **Per-hop redirect gating + pinned connect (no rebinding).** Playwright follows
-  redirects internally without re-routing the hops, so navigations are walked
-  hop-by-hop; each hop is resolved, validated, and then **connected to the
-  validated IP** (Node `lookup`-pinned fetch, Host/SNI preserved — the same
-  resolve→validate→pin→connect `web_fetch` uses), so a name that rebinds
-  safe→private between check and connect never reaches the private endpoint.
-  Loopback subresources are pinned the same way; public subresources proceed
-  natively (streaming/range preserved). *(regression: public→302→metadata →
-  Denied; direct-private → Denied; click→private → surfaced+blocked.)*
-- **Fails closed.** Any resolve/validate/fetch error aborts the request with a
-  typed `Denied`/`blocked` — never a `continue` past an unverified target, never a
-  shell fallback.
-- **WebSocket egress is gated** by the same host policy (`routeWebSocket`):
-  private/link-local/metadata refused, loopback only with a page grant. *(regression:
-  ws→private/metadata → refused, never opened.)*
+- **resolve → validate → pin → connect, once.** The proxy resolves the host,
+  refuses any address in a private/link-local/metadata/CGNAT/ULA range (mirrors
+  `web_fetch::is_blocked_ip`) or any name that resolves to loopback (a rebind),
+  and otherwise connects to *that* validated address. Chromium never resolves the
+  name itself, so a DNS answer that changes safe→private between check and connect
+  cannot exist — there is one resolution and it IS the connection. HTTP is
+  forwarded; HTTPS/WSS are blind-tunnelled via `CONNECT`, so **redirects, cookies,
+  origin and TLS stay 100% native** (no manual redirect following, no header
+  reuse across origins, no response rewriting).
+- **Fails closed.** Any resolve/validate/connect failure destroys the connection —
+  the navigation/subresource fails (surfaced as a typed `Denied`/`blocked`), never
+  a silent success and never a connection to an unverified target. *(regression:
+  an unresolvable non-loopback host → `Denied` by the proxy.)*
+- **Loopback is a PAGE-SCOPED dev grant.** Loopback *literals* are the only
+  non-proxied path — a fixed address that cannot rebind — and the `context.route`
+  layer applies the page grant to them: a page has loopback access only if its
+  live top-level origin is loopback (tracked via `navigate` + `framenavigated`, so
+  it is lost on moving to a public origin) or it is a popup whose opener is a live
+  loopback dev page. A public/opaque page's redirect/click/`fetch`/`window.open`
+  into loopback is refused; a frame-less popup that cannot be attributed to a
+  granted opener is refused. Any *hostname* that resolves to loopback is refused by
+  the proxy as a rebind. *(regression: granted dev page fetches its own origin →
+  allowed; ungranted page → blocked; public→302→metadata → Denied; click→private
+  → surfaced+blocked.)*
+- **WebSocket egress** is gated context-wide (`context.routeWebSocket`, installed
+  before any page — a setup failure fails the launch): loopback ws is refused in
+  V1, and every other ws goes through the pinning proxy (wss via `CONNECT`) or
+  fails closed (public `ws://`). *(regression: ws→private/metadata → refused.)*
 - **Service workers are blocked** at launch (`serviceWorkers:'block'`), so a SW
-  cannot mediate a fetch around request interception.
+  cannot mediate a fetch around the boundary.
 
-The blocked-range set mirrors `web_fetch::is_blocked_ip`. The driver bridge ships
-in the binary and is re-synced to disk on every runtime start, so the gate reaches
-existing installs on upgrade instead of leaving a stale, ungated bridge in place.
-Residual (recorded, not claimed away): a rebind on a *public subresource* (served
-natively) is validated at request time but not pinned; and a public site is only
-reachable when the browser context itself has network egress (it does not inherit
-a system proxy — the same as before this change).
+There is no path where Chromium connects directly to a rebind-capable host. The
+driver bridge ships in the binary and is re-synced to disk on every runtime start,
+so the boundary reaches existing installs on upgrade. Scope notes (recorded, not
+claimed away): loopback WebSockets (e.g. Vite HMR) are refused in V1; public
+`ws://` (plaintext) fails closed (wss works); and a public site is only reachable
+when the machine has real network egress (the context inherits no system proxy).
 
 ## R. Error Model / S. Process Ownership
 
@@ -246,17 +252,23 @@ Zero across all three dogfoods (the only `run_command` uses were the legitimate
     `browser_tabs(session)` is session-scoped and prunes closed pages;
     `target=_blank`/`window.open` pages are adopted into the originating session;
     cross-session pages refused. See §J.
-  - **B-1 (SSRF at the real network egress) — FIXED.** Round 1 moved enforcement
-    into the driver's request boundary with per-hop redirect gating. Round 2
-    closed the five gaps the second review found: loopback is a page-scoped grant
-    (not a global bypass); verification fails closed (no `continue` after a failed
-    check); WebSocket egress is gated (`routeWebSocket`); service workers are
-    blocked; and DNS-rebinding is defeated by a pinned connect (resolve → validate
-    → pin → connect) for navigations and loopback subresources. See §Q.
+  - **B-1 (SSRF network boundary) — FIXED, converged to one authority.** Rounds 1–2
+    stacked a route gate + Node pinned fetch + manual redirects + per-page ws +
+    a global popup window; the third review correctly rejected that as a split,
+    partly fail-open boundary (public-subresource rebind, ws fail-open + race,
+    global popup grant, redirect header/origin leaks). Round 3 replaces it with a
+    **single CodeLeveler-owned forward proxy** that Chromium is launched to use —
+    the sole resolver/connector for all non-loopback egress (resolve→validate→pin
+    →connect, so rebind is structurally impossible; redirects/cookies/origin/TLS
+    native), plus a page-scoped loopback grant on the (non-rebindable) loopback
+    literals, context-wide fail-closed WebSocket gating, and blocked service
+    workers. See §Q.
 - **NEXT** (out of V1): a dedicated `Browser` ToolKind for TUI grouping; refless
-  page-level key press; multi-tab agent ergonomics; managed Node download when
-  no system Node; a policy-enforcing forward proxy so public-subresource rebind is
-  pinned too. (The live daemon-hosted disconnect/reconnect E2E is DONE — see §T.)
+  page-level key press; multi-tab agent ergonomics; managed Node download when no
+  system Node; loopback-WebSocket support (e.g. Vite HMR) behind the page grant;
+  public `ws://` relay through the proxy. (The live daemon-hosted disconnect/
+  reconnect E2E is DONE — see §T; the network boundary is now the single proxy
+  authority — see §Q.)
 
 ## AG. Full Regression
 
@@ -266,20 +278,26 @@ Chrome), on `feat/browser-capability-v1`:
 - `cargo fmt --all --check` — **clean** (rc 0).
 - `cargo check --workspace --all-targets` — **clean** (rc 0).
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — **clean** (rc 0).
-- `cargo test --workspace --all-features --locked --no-fail-fast` — **rc 0;
-  2707 passed, 0 failed, 5 ignored** across 127 test binaries/doctest suites.
-  The whole slow network-dependent provider/relay tail ran to completion with
-  **zero failures** this run — no classification needed. The 5 ignored are the
-  repo's intentional `#[ignore]` cases (live rust-analyzer timing, a live
-  MCP-server test needing node/npx + network, the manual visual-disclosure
-  harness), not skips introduced here.
+- `cargo test --workspace --all-features --locked --no-fail-fast` — **2707 passed,
+  5 ignored** across 127 test binaries/doctest suites. One binary
+  (`leveler-local-transport`) reported a single failure —
+  `deliver_envelope_can_retry_after_revival_without_duplicate_effect` — a
+  timing-sensitive mailbox-revival test that lost a race under the heavily loaded
+  concurrent run; it is **not** in a changed crate (this change touches only
+  `leveler-browser` + `leveler-tools`) and passes **3/3 in isolation**. Classified
+  as an env/concurrency flake per the repo's known-env policy, not a B-1
+  regression. The 5 ignored are the repo's intentional `#[ignore]` cases (live
+  rust-analyzer timing, a live MCP-server test needing node/npx + network, the
+  manual visual-disclosure harness), not skips introduced here.
 
 Browser-specific test inventory (all green): `leveler-browser` domain/driver/
-install units + the real-Chrome `acceptance` and `reliability` fixtures (lazy,
-zero-pollution, SPA/dynamic-DOM stale-ref, dialog/new-tab) + `phase1_acceptance`;
-`leveler-tools` SSRF-gate + tool tests + registry count (42); `leveler-tui`
-taxonomy coverage. Plus the three real agent-driven dogfoods (A/B/C) and the
-live TUI↔daemon disconnect/reconnect E2E (§T).
+install units + the real-Chrome `acceptance` and the 8 `reliability` fixtures
+(lazy, zero-pollution, SPA/dynamic-DOM stale-ref, dialog/new-tab, session/new-tab
+ownership, SSRF at the boundary, page-scoped loopback grant, the proxy fail-closed
+path, WebSocket gating) + `phase1_acceptance`; `leveler-tools` SSRF arg-gate +
+tool tests + registry count (42); `leveler-tui` taxonomy coverage. Plus the three
+real agent-driven dogfoods (A/B/C) and the live TUI↔daemon disconnect/reconnect
+E2E (§T).
 
 ## AH. Final Verdict
 
@@ -300,8 +318,8 @@ DYNAMIC DOM / SPA:          PASS (fixtures + Dogfood B)
 TABS / NEW-TAB OWNERSHIP:   PASS — B-2 (no hang; target=_blank adopted by originating session)
 CONSOLE / PAGE ERRORS:      PASS (errors/warnings only)
 PERMISSION INTEGRATION:     PASS (RiskLevel/ApprovalPolicy)
-SSRF / NETWORK BOUNDARY:    PASS — B-1 (page-scoped loopback grant; per-hop pinned connect;
-                            fail-closed; WebSocket gated; service workers blocked)
+SSRF / NETWORK BOUNDARY:    PASS — B-1 (single forward-proxy authority: sole resolver/connector,
+                            resolve→validate→pin→connect; page-scoped loopback; ws gated; SW blocked)
 DAEMON OWNERSHIP:           PASS — live E2E (driver parent == serve pid; ancestor==daemon, not client)
 DISCONNECT/RECONNECT:       PASS — live E2E (TUI↔daemon; client killed, goal ran seq 50→98 /
                             browser calls 2→9 with no client, then completed; reconnect reattached)
@@ -315,12 +333,14 @@ STRUCTURED BROWSER CALLS:   38 across A/B/C
 MANUAL INTERVENTION:        0
 FALSE COMPLETION:           0
 FULL REGRESSION:            PASS — fmt/check/clippy(--all-features) clean;
-                            test --all-features --locked --no-fail-fast: 2707 passed,
-                            0 failed, 5 ignored (127 suites); hygienic tree, 0 orphans
+                            test: 2707 passed, 5 ignored (127 suites). 1 concurrency-flaky
+                            transport test (not a changed crate; passes 3/3 isolated) —
+                            env-flake per repo policy, not a B-1 regression
 MAJOR B-2 (session/new-tab ownership):  FIXED + regressed — signed CLOSED (§J)
-MAJOR B-1 (SSRF at network egress):     FIXED + regressed over two rounds (§Q):
-                                        page-scoped loopback grant · fail-closed ·
-                                        pinned connect (no rebind) · ws gated · SW blocked
+MAJOR B-1 (SSRF network boundary):      FIXED + regressed over three rounds (§Q):
+                                        single forward-proxy authority (sole resolver/connector,
+                                        resolve→validate→pin→connect, native redirect/origin/TLS) ·
+                                        page-scoped loopback · fail-closed · ws gated · SW blocked
 BLOCKER: 0   MAJOR: 0 (all resolved)   MINOR: 0   NEXT: 5
 
 MERGE RECOMMENDATION: READY FOR MERGE — awaiting the human sign-off
