@@ -4,6 +4,13 @@ CodeLeveler can run several focused **sub-agents** in parallel for independent
 investigation or disjoint edits. The parent agent keeps the conversation and
 synthesizes child results. Sub-agents do not talk to each other (star topology).
 
+> Future evolution is intentionally evidence-gated. The current `spawn_agent`
+> surface is the shipped behavior; structured child results, capability profiles,
+> provider seams and continuable children are **not** implied by this document.
+> See [`HARNESS_EVOLUTION_PLAN.md`](HARNESS_EVOLUTION_PLAN.md) for the Batch #1 ->
+> Spawn Utility -> Spawn Reliability -> SubAgent Capability roadmap and the
+> explicit DeepSeek Harness adoption/rejection decisions.
+
 ## When it runs
 
 The model calls the injected `spawn_agent` tool. Emitting **several**
