@@ -796,6 +796,34 @@ fail-closed 的 reaper 每进程运行一次（绝不定时）：能拿到的锁
 
 ---
 
+## Browser Capability（**CURRENT**）
+
+结构化浏览器自动化——agent 验证 Web/前端工作的主路径，取代 `chrome --headless`/curl 临时脚本。
+
+```text
+Agent → browser_* 工具（leveler-tools）
+      → ToolServices.browser（Arc<BrowserRuntime>，daemon 持有）
+      → BrowserRuntime（crates/leveler-browser）：refs · generation · session 隔离
+        · snapshot 预算 · 懒式受管安装
+      → Node/Playwright driver 子进程（stdio 上的 JSON-RPC）
+      → 系统 Chrome（channel:'chrome'）或受管 Chromium
+```
+
+- 工具：`browser_navigate/snapshot/click/type/select/press/wait/tabs/dialog/
+  console/screenshot`。**语义快照**（Playwright 带 ref 的可访问性文本，有预算上限）是
+  控制协议；`[ref=…]` 只在其 `(session, page, generation)` 内有效，过期 ref 被判
+  `RefStale`、绝不改指向。无 `browser.evaluate`。
+- **daemon 持有**（在 `Application` 上，同 `background_tasks`），跨回合、跨客户端断连存活。
+  懒式：首次调用 browser 工具前不启动。
+- **文件系统**：受管 runtime 在 `runtimes/browser/`，每项目隔离 profile 在
+  `state/projects/<id>/browser/profile/`——绝不入工作区、绝不用用户真实 Chrome profile。
+- **权限**：复用 `RiskLevel`/`ApprovalPolicy`（读=Safe，动作=Network）；`browser_navigate`
+  走 SSRF 门（`web_fetch::is_blocked_ip`）。
+
+见 `docs/BROWSER_CAPABILITY_ANALYSIS.md` 与 `docs/BROWSER_CAPABILITY_REPORT.md`。
+
+---
+
 ## 仓库导览
 
 - `crates/` — Rust workspace

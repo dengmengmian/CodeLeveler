@@ -2,6 +2,7 @@
 
 mod apply_patch;
 mod blast_radius;
+mod browser;
 mod checkpoint;
 mod diagnostics;
 mod expand_tools;
@@ -32,6 +33,11 @@ mod web_search;
 
 pub use apply_patch::ApplyPatchTool;
 pub use blast_radius::BlastRadiusTool;
+pub use browser::{
+    BrowserClickTool, BrowserConsoleTool, BrowserDialogTool, BrowserNavigateTool, BrowserPressTool,
+    BrowserScreenshotTool, BrowserSelectTool, BrowserSnapshotTool, BrowserTabsTool,
+    BrowserTypeTool, BrowserWaitTool,
+};
 pub use checkpoint::{CreateCheckpointTool, RestoreCheckpointTool};
 pub use diagnostics::DiagnosticsTool;
 pub use expand_tools::ExpandToolsTool;

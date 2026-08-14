@@ -1797,6 +1797,7 @@ dependencies = [
  "fs2",
  "futures",
  "leveler-agent",
+ "leveler-browser",
  "leveler-client-protocol",
  "leveler-context",
  "leveler-core",
@@ -1823,6 +1824,21 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "tracing",
+]
+
+[[package]]
+name = "leveler-browser"
+version = "0.1.4"
+dependencies = [
+ "fs2",
+ "leveler-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -2221,6 +2237,7 @@ dependencies = [
  "cap-tempfile",
  "fs2",
  "jsonschema",
+ "leveler-browser",
  "leveler-context",
  "leveler-core",
  "leveler-execution",

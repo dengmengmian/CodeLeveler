@@ -858,6 +858,37 @@ lock, or a dir with no lock, is left untouched.
 
 ---
 
+## Browser Capability (**CURRENT**)
+
+Structured browser automation — the agent's primary way to verify web/frontend
+work, replacing adhoc `chrome --headless` / curl shell probes.
+
+```text
+Agent → browser_* tools (leveler-tools)
+      → ToolServices.browser (Arc<BrowserRuntime>, daemon-owned)
+      → BrowserRuntime (crates/leveler-browser): refs · generations · session
+        isolation · snapshot budgeting · lazy managed install
+      → Node/Playwright driver subprocess (JSON-RPC over stdio)
+      → system Chrome (channel:'chrome') or managed Chromium
+```
+
+- Tools: `browser_navigate/snapshot/click/type/select/press/wait/tabs/dialog/
+  console/screenshot`. The **semantic snapshot** (Playwright's ref-annotated
+  accessibility text, bounded) is the control protocol; a `[ref=…]` is valid only
+  in its `(session, page, generation)` and a superseded ref is refused as
+  `RefStale`, never retargeted. No `browser.evaluate`.
+- **Owned by the daemon** (`Application`, like `background_tasks`) so it survives
+  turns and client disconnect. Lazy: nothing starts until a browser tool runs.
+- **Filesystem:** managed runtime under `runtimes/browser/`, isolated per-project
+  profile under `state/projects/<id>/browser/profile/` — never the workspace,
+  never the user's real Chrome profile.
+- **Permissions:** reuses `RiskLevel`/`ApprovalPolicy` (reads = Safe, actions =
+  Network); `browser_navigate` runs the SSRF gate (`web_fetch::is_blocked_ip`).
+
+See `docs/BROWSER_CAPABILITY_ANALYSIS.md` and `docs/BROWSER_CAPABILITY_REPORT.md`.
+
+---
+
 ## Repository guide
 
 - `crates/` — Rust workspace
