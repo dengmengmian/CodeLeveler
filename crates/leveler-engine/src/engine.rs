@@ -469,6 +469,31 @@ impl TaskEngine {
         ) {
             return Ok(());
         }
+        // Settle this session's background tasks at the terminal fact — the
+        // ONE choke point every path shares (run/chat/resume/continuation,
+        // completed/failed/budget_limited). R006 R6-P4: the reap used to hang
+        // off one spawn function in the app layer, so a goal continued via
+        // ordinary messages (chat-routed) leaked its dev servers. Interrupted
+        // (user cancel) deliberately keeps them inspectable. Daemon-owned
+        // services (browser/MCP/LSP) have no session scope and are untouched.
+        let interrupted = matches!(
+            result,
+            Err(EngineError::Agent(leveler_agent::AgentError::Cancelled))
+        );
+        if !interrupted
+            && let (Some(scope), Some(registry)) = (
+                self.factory.tool_context.session_scope.as_deref(),
+                self.factory.tool_context.services.background_tasks.as_ref(),
+            )
+        {
+            let reaped = registry.kill_scope(scope).await;
+            if reaped > 0 {
+                tracing::info!(
+                    session = scope,
+                    "terminal settlement reaped {reaped} session-owned background task(s)"
+                );
+            }
+        }
         match result {
             Ok(report) => {
                 let (status, state) = terminal_status_for(report);

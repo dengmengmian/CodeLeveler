@@ -1017,18 +1017,10 @@ impl InProcessRuntimeClient {
                 let outcome = turn_runtime_event(result);
                 let _ = events.send(outcome);
                 active.finish(&session_id);
-                // The goal has concluded (terminal session state): dev servers
-                // and other background children this session started are
-                // session-owned temporary resources — reap them now instead of
-                // leaving them until daemon exit (R004 F7). Daemon-owned
-                // services (browser runtime) are untouched.
-                let reaped = app.background_tasks().kill_scope(session_id.as_str()).await;
-                if reaped > 0 {
-                    tracing::info!(
-                        session = session_id.as_str(),
-                        "goal end reaped {reaped} session-owned background task(s)"
-                    );
-                }
+                // Session-owned background reap moved to the engine's terminal
+                // settlement (finish_from_result) so chat-routed continuations
+                // are covered too — one reap site, not one per spawn function
+                // (R006 R6-P4).
             });
         });
     }
