@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{ClarificationRequest, Clarifier};
+use leveler_agent::{ClarificationRequest, Clarifier, ClarifyOutcome};
 use leveler_core::TurnId;
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver};
 
@@ -223,7 +223,7 @@ pub struct RecordingClarifier {
 
 #[async_trait]
 impl Clarifier for RecordingClarifier {
-    async fn clarify(&self, request: &ClarificationRequest) -> String {
+    async fn clarify(&self, request: &ClarificationRequest) -> ClarifyOutcome {
         let mut request = request.clone();
         request.turn_id = Some(self.turn_id.clone());
         self.events.emit(EngineEvent::ClarificationRequested {
@@ -231,12 +231,16 @@ impl Clarifier for RecordingClarifier {
             question: request.question.clone(),
             options: request.options.clone(),
         });
-        let answer = self.inner.clarify(&request).await;
+        let outcome = self.inner.clarify(&request).await;
         self.events.emit(EngineEvent::ClarificationAnswered {
             id: request.id.clone(),
-            answer: answer.clone(),
+            answer: match &outcome {
+                ClarifyOutcome::Answered(text) => text.clone(),
+                _ => String::new(),
+            },
+            outcome: outcome.label().to_string(),
         });
-        answer
+        outcome
     }
 }
 

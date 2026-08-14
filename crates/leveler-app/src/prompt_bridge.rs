@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{ClarificationRequest, Clarifier};
+use leveler_agent::{ClarificationRequest, Clarifier, ClarifyOutcome};
 use leveler_core::{ApprovalId, ClarificationId, SessionId, TurnId};
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, RiskLevel};
 
@@ -128,7 +128,7 @@ pub(crate) struct ChannelClarifier {
 
 #[async_trait]
 impl Clarifier for ChannelClarifier {
-    async fn clarify(&self, request: &ClarificationRequest) -> String {
+    async fn clarify(&self, request: &ClarificationRequest) -> ClarifyOutcome {
         let ui = UiClarificationRequest {
             id: request.id.clone(),
             question: request.question.clone(),
@@ -149,14 +149,23 @@ impl Clarifier for ChannelClarifier {
             .is_err()
         {
             self.pending.lock().unwrap().remove(&request.id);
-            return String::new();
+            // Nobody is subscribed: the question was never delivered. This is
+            // an unattended run, not a user reply (R004 F2).
+            return ClarifyOutcome::Unattended;
         }
         // If the UI goes away or the turn is cancelled without answering, the
-        // model proceeds on its own — never block the turn indefinitely.
-        let answer = tokio::select! {
-            answer = rx => answer.unwrap_or_default(),
-            _ = self.cancel.cancelled() => String::new(),
-            _ = tokio::time::sleep(control_response_timeout()) => String::new(),
+        // turn must not block indefinitely — but each exit keeps its own
+        // meaning instead of collapsing to a fake empty "answer".
+        let outcome = tokio::select! {
+            answer = rx => match answer {
+                // The wire keeps `answer: String` with "" meaning the user
+                // explicitly skipped (Esc / empty submit).
+                Ok(text) if text.trim().is_empty() => ClarifyOutcome::Skipped,
+                Ok(text) => ClarifyOutcome::Answered(text),
+                Err(_) => ClarifyOutcome::Unattended,
+            },
+            _ = self.cancel.cancelled() => ClarifyOutcome::Cancelled,
+            _ = tokio::time::sleep(control_response_timeout()) => ClarifyOutcome::TimedOut,
         };
         self.pending.lock().unwrap().remove(&request.id);
         // However it resolved (answered, cancelled, or timed out), tell every
@@ -165,7 +174,7 @@ impl Clarifier for ChannelClarifier {
         let _ = self.events.send(RuntimeEvent::ClarificationResolved {
             id: request.id.clone(),
         });
-        answer
+        outcome
     }
 }
 
@@ -354,7 +363,8 @@ mod tests {
         )
         .await
         .expect("disconnected clarification must resolve");
-        assert_eq!(answer, "");
+        // Never delivered ⇒ unattended, NOT an (empty) user answer (R004 F2).
+        assert_eq!(answer, ClarifyOutcome::Unattended);
         assert!(pending.lock().unwrap().is_empty());
     }
 
@@ -380,7 +390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unanswered_clarification_times_out_to_empty_answer() {
+    async fn unanswered_clarification_times_out_as_timed_out_not_an_answer() {
         let (events, _receiver) = broadcast::channel(1);
         let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
         let clarifier = ChannelClarifier {
@@ -405,7 +415,53 @@ mod tests {
         )
         .await
         .expect("clarification must have a bounded response window");
-        assert_eq!(answer, "");
+        // A deadline lapse is a timeout, NOT an (empty) user answer (R004 F2).
+        assert_eq!(answer, ClarifyOutcome::TimedOut);
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn answered_and_skipped_clarifications_stay_distinct() {
+        for (wire_answer, expected) in [
+            (
+                "用第二个方案".to_string(),
+                ClarifyOutcome::Answered("用第二个方案".into()),
+            ),
+            (String::new(), ClarifyOutcome::Skipped),
+        ] {
+            let (events, mut receiver) = broadcast::channel(4);
+            let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
+            let clarifier = ChannelClarifier {
+                events,
+                pending: pending.clone(),
+                cancel: CancellationToken::new(),
+                session_id: SessionId::new("session-a"),
+            };
+            let request = ClarificationRequest {
+                id: ClarificationId::new("clarification-answered"),
+                turn_id: Some(leveler_core::TurnId::new("turn-a")),
+                tool: "ask_user".to_string(),
+                call_id: "call-a".to_string(),
+                action_fingerprint: "fingerprint-a".to_string(),
+                question: "which?".to_string(),
+                options: vec![],
+            };
+            let pending_for_reply = pending.clone();
+            let id = request.id.clone();
+            let replier = tokio::spawn(async move {
+                // Wait for the request event, then answer over the wire shape.
+                let _ = receiver.recv().await;
+                resolve_clarification(&pending_for_reply, &id, wire_answer).unwrap();
+            });
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                clarifier.clarify(&request),
+            )
+            .await
+            .expect("answered clarification must resolve");
+            replier.await.unwrap();
+            assert_eq!(outcome, expected);
+            assert!(pending.lock().unwrap().is_empty());
+        }
     }
 }

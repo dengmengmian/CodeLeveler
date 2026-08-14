@@ -50,15 +50,32 @@ impl Executor {
             question,
             options,
         };
-        let answer = tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
-            answer = self.clarifier.clarify(&request) => answer,
+            outcome = self.clarifier.clarify(&request) => outcome,
         };
-        Ok(if answer.trim().is_empty() {
-            "The user did not provide an answer; proceed using your best judgment.".to_string()
-        } else {
-            answer
+        // Only `Answered` speaks for the user. Everything else must be
+        // reported as the absence of a user, so the model cannot mistake an
+        // unattended run or a timeout for "the user said nothing is needed".
+        Ok(match outcome {
+            crate::executor::ClarifyOutcome::Answered(text) if !text.trim().is_empty() => text,
+            crate::executor::ClarifyOutcome::Answered(_) | crate::executor::ClarifyOutcome::Skipped => {
+                "The user saw this question and chose to skip it; proceed using your best judgment."
+                    .to_string()
+            }
+            crate::executor::ClarifyOutcome::Unattended => {
+                "No user is available to answer in this unattended run — this is NOT a user reply. \
+                 Continue only if the task can be completed without this information; otherwise \
+                 finish what is safely possible and state explicitly what is missing instead of guessing."
+                    .to_string()
+            }
+            crate::executor::ClarifyOutcome::TimedOut => {
+                "The user did not respond in time — this is NOT a user reply. Continue only if the \
+                 task can proceed without the answer; otherwise state explicitly what is missing."
+                    .to_string()
+            }
+            crate::executor::ClarifyOutcome::Cancelled => return Err(AgentError::Cancelled),
         })
     }
 
