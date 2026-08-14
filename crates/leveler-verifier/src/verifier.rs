@@ -79,7 +79,7 @@ impl Verifier {
         modified_files: &[String],
         cancellation: &CancellationToken,
     ) -> CheckOutcome {
-        if find_in_path(&command.program, &self.environment).is_none() {
+        let Some(resolved) = find_in_path(&command.program, &self.environment) else {
             return CheckOutcome {
                 name: command.name.clone(),
                 kind: command.kind,
@@ -89,7 +89,7 @@ impl Verifier {
                 failure: None,
                 failed_tests: BTreeSet::new(),
             };
-        }
+        };
 
         let args = effective_args(command, modified_files, &self.workspace_root);
         // Repo / builtin verify: write confinement on, network inherits session
@@ -113,6 +113,24 @@ impl Verifier {
                         status: CheckStatus::Passed,
                         evidence: truncate(&combined),
                         failure: None,
+                        failed_tests: BTreeSet::new(),
+                    }
+                } else if crate::failure::is_environment_mismatch(&combined) {
+                    // Toolchain/MSRV refusal: the ENVIRONMENT could not run the
+                    // check, the code was never judged (R005 F-P1). Report it
+                    // as environment — with provenance naming the binary that
+                    // actually ran — instead of gating as a code failure.
+                    CheckOutcome {
+                        name: command.name.clone(),
+                        kind: command.kind,
+                        gating: command.gating,
+                        status: CheckStatus::EnvironmentUnavailable,
+                        evidence: format!(
+                            "environment mismatch (ran `{}`): {}",
+                            resolved.display(),
+                            truncate(&combined)
+                        ),
+                        failure: Some(classify(command.kind, &combined)),
                         failed_tests: BTreeSet::new(),
                     }
                 } else {
@@ -711,6 +729,71 @@ mod tests {
             report.verdict(),
             crate::report::Verdict::Unverified(_)
         ));
+    }
+
+    /// R005 F-P1 accident: the gate ran bare `cargo` under the host's default
+    /// rustc 1.96 while the task's tree required 1.97, and the MSRV refusal
+    /// was reported as a CODE failure gating completion. The mismatch must be
+    /// classified as environment, not code: the gate stays open (not Failed)
+    /// and the verdict is honestly Unverified with an environment reason.
+    #[tokio::test]
+    async fn toolchain_mismatch_is_environment_unavailable_not_a_code_failure() {
+        let v = Verifier::with_environment(
+            std::env::temp_dir(),
+            Arc::new(leveler_core::EnvSnapshot::new(
+                std::env::vars_os(),
+                std::env::current_dir().unwrap_or_default(),
+                std::env::temp_dir(),
+            )),
+        );
+        let msrv = "error: rustc 1.96.0 is not supported by the following packages: foo@0.1.0 requires rustc 1.97";
+        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), format!("echo {msrv}& exit 1")])
+        } else {
+            (
+                "sh",
+                vec!["-c".into(), format!("echo '{msrv}' >&2; exit 1")],
+            )
+        };
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "build".into(),
+                kind: CheckKind::Build,
+                program: program.into(),
+                args,
+                timeout_seconds: 30,
+                gating: true,
+                scope_policy: ScopePolicy::Auto,
+            }],
+        };
+        let report = v
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        assert_eq!(
+            report.checks[0].status,
+            CheckStatus::EnvironmentUnavailable,
+            "evidence: {}",
+            report.checks[0].evidence
+        );
+        // Environment mismatch must not gate as a code failure…
+        assert!(report.passed());
+        assert!(report.failed_gates().is_empty());
+        // …but the run is NOT silently "verified" either.
+        match report.verdict() {
+            crate::report::Verdict::Unverified(reason) => {
+                assert!(
+                    reason.contains("environment mismatch"),
+                    "reason should name the environment: {reason}"
+                );
+            }
+            other => panic!("expected Unverified, got {other:?}"),
+        }
+        // Provenance: the evidence names the resolved binary that actually ran.
+        assert!(
+            report.checks[0].evidence.contains("ran `"),
+            "evidence should carry binary provenance: {}",
+            report.checks[0].evidence
+        );
     }
 
     /// Bare program names on Windows resolve via PATHEXT (`gate` → `gate.exe`),

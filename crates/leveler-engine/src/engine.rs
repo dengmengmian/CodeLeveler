@@ -1603,6 +1603,7 @@ impl TaskEngine {
                         check.status,
                         leveler_verifier::CheckStatus::Failed
                             | leveler_verifier::CheckStatus::ToolMissing
+                            | leveler_verifier::CheckStatus::EnvironmentUnavailable
                     )
                     .then(|| check.evidence.clone()),
                 },

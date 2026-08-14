@@ -17,6 +17,11 @@ pub enum CheckStatus {
     Skipped,
     /// The check's program is not on PATH, so it could not run at all.
     ToolMissing,
+    /// The check ran but the environment refused it (toolchain/MSRV mismatch:
+    /// e.g. cargo declining because the host rustc is older than the tree's
+    /// pin). Like [`Self::ToolMissing`], this is not the code's failure — it
+    /// yields `Unverified`, never `Failed` (R005 F-P1).
+    EnvironmentUnavailable,
 }
 
 /// The three-way completion verdict. `Unverified` is not a failure — the task
@@ -114,8 +119,9 @@ impl VerificationReport {
     /// The three-way verdict: whether completion is actually evidence-backed.
     ///
     /// `Verified` requires `scope_ok`, at least one applicable (gating) check,
-    /// and **every** applicable check `Passed`. ToolMissing / Skipped / not-run
-    /// yield `Unverified` (v1 does not treat ToolMissing as non-applicable).
+    /// and **every** applicable check `Passed`. ToolMissing /
+    /// EnvironmentUnavailable / Skipped / not-run yield `Unverified` (v1 does
+    /// not treat them as non-applicable).
     pub fn verdict(&self) -> Verdict {
         if !self.scope_ok
             || self
@@ -145,6 +151,9 @@ impl VerificationReport {
                 }
                 match c.status {
                     CheckStatus::ToolMissing => format!("{} (tool missing)", c.name),
+                    CheckStatus::EnvironmentUnavailable => {
+                        format!("{} (environment mismatch)", c.name)
+                    }
                     _ => format!("{} (skipped)", c.name),
                 }
             })
@@ -304,6 +313,25 @@ mod tests {
         }
         // Unverified does not block completion.
         assert!(r.passed());
+    }
+
+    /// R005 F-P1: a toolchain/MSRV mismatch gate must read as environment —
+    /// open gate (not Failed), honest Unverified reason naming the mismatch.
+    #[test]
+    fn environment_unavailable_gate_is_unverified_with_mismatch_reason() {
+        let r = report(vec![check(
+            "build",
+            true,
+            CheckStatus::EnvironmentUnavailable,
+        )]);
+        assert!(r.passed());
+        match r.verdict() {
+            Verdict::Unverified(reason) => assert!(
+                reason.contains("build (environment mismatch)"),
+                "reason: {reason}"
+            ),
+            other => panic!("expected Unverified, got {other:?}"),
+        }
     }
 
     #[test]
