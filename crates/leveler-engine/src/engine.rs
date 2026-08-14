@@ -173,7 +173,9 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
         S::Incomplete | S::BudgetExhausted | S::TurnLimitReached | S::Stalled => {
             (SessionStatus::Incomplete, AgentState::Execute)
         }
-        S::Blocked => (SessionStatus::Blocked, AgentState::Execute),
+        // A harness-policy dead end needs attention, not silent retry: same
+        // resumable-with-attention class as a model-declared block (R006 R6-P1).
+        S::Blocked | S::PolicyBlocked => (SessionStatus::Blocked, AgentState::Execute),
     }
 }
 
@@ -1991,8 +1993,9 @@ pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Opt
         // decided to stop opening more), a ceiling stop is BudgetLimited —
         // incomplete and resumable — the same class as an exhausted budget.
         S::BudgetExhausted | S::TurnLimitReached => Some(TaskOutcome::BudgetLimited),
-        // Incomplete thrash, stalled quiet, blocked, etc. — never success.
-        S::Incomplete | S::Blocked | S::Stalled | S::CompletedUnverified => {
+        // Incomplete thrash, stalled quiet, blocked (model- or policy-side),
+        // etc. — never success.
+        S::Incomplete | S::Blocked | S::PolicyBlocked | S::Stalled | S::CompletedUnverified => {
             Some(TaskOutcome::Failed)
         }
     }

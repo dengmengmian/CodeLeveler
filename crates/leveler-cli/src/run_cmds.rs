@@ -1210,6 +1210,13 @@ fn finish(
                             outcome.rounds
                         ))
                     ),
+                    StopReason::PolicyBlocked => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Policy-blocked after {} round(s): a harness gate refused every action (e.g. plan required).",
+                            outcome.rounds
+                        ))
+                    ),
                     StopReason::Blocked => println!(
                         "{}",
                         Line::warn(&format!(

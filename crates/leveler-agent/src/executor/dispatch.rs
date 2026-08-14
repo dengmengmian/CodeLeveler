@@ -78,20 +78,20 @@ pub(crate) fn compact_json(value: &serde_json::Value) -> String {
 }
 
 /// Read-only tools permitted during plan explore rounds (before first plan).
-pub(crate) fn is_plan_explore_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "list_files"
-            | "grep"
-            | "find_files"
-            | "find_symbol"
-            | "read_symbol"
-            | "find_references"
-            | "web_search"
-            | "web_fetch"
-            | "load_skill"
-    )
+///
+/// Delegates to the canonical observe-class list (R006: a second narrower
+/// copy here silently dropped `git_status` and the plan gate refused a
+/// read-only tool) plus web research, plus observe-classified shell/git
+/// wrappers (`shell_command "git status"`, `run_command git log …`) so the
+/// model's natural fallback is not refused by a different code path.
+pub(crate) fn is_plan_explore_tool(name: &str, arguments: &serde_json::Value) -> bool {
+    if leveler_tools::is_observe_class_tool(name) {
+        return true;
+    }
+    if matches!(name, "web_search" | "web_fetch") {
+        return true;
+    }
+    crate::authorization::observe_class(name, arguments).is_some()
 }
 
 /// Keep one-step requests lightweight, but require a machine-readable plan for
