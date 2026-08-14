@@ -153,6 +153,16 @@ pub struct Application {
 }
 
 impl Application {
+    /// The shared background-task registry (R004 F7 shutdown reaping).
+    pub fn background_tasks(&self) -> &Arc<leveler_execution::BackgroundTaskRegistry> {
+        &self.background_tasks
+    }
+
+    /// The daemon-owned browser runtime (R004 F7 shutdown teardown).
+    pub fn browser(&self) -> &Arc<leveler_browser::BrowserRuntime> {
+        &self.browser
+    }
+
     /// Load all config bundles from the layout's config directory.
     pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
         let mut providers = Vec::new();

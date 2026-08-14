@@ -1831,10 +1831,13 @@ dependencies = [
 name = "leveler-browser"
 version = "0.1.4"
 dependencies = [
+ "base64",
  "fs2",
  "leveler-core",
+ "libc",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror",
  "tokio",

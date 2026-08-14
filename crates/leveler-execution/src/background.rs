@@ -113,6 +113,10 @@ impl Drop for KillOnDrop {
 
 struct TaskInner {
     id: String,
+    /// Which session started this task, when known. Daemon-scoped tasks have
+    /// no owner; session-owned tasks are reaped when their session's goal
+    /// reaches a terminal state or the daemon shuts down (R004 F7).
+    owner_scope: Option<String>,
     program: String,
     args: Vec<String>,
     cwd: PathBuf,
@@ -176,6 +180,18 @@ impl BackgroundTaskRegistry {
         &self,
         request: ProcessRequest,
         mutation_baseline: Option<MutationBaseline>,
+    ) -> Result<String, String> {
+        self.spawn_owned(request, mutation_baseline, None).await
+    }
+
+    /// Spawn with an owner scope (typically the session id). Owned tasks can
+    /// be reaped as a group via [`Self::kill_scope`]; unowned tasks stay
+    /// daemon-scoped (R004 F7).
+    pub async fn spawn_owned(
+        &self,
+        request: ProcessRequest,
+        mutation_baseline: Option<MutationBaseline>,
+        owner_scope: Option<&str>,
     ) -> Result<String, String> {
         let mut st = self.inner.lock().await;
         prune_terminal_tasks(&mut st);
@@ -293,6 +309,7 @@ impl BackgroundTaskRegistry {
             id.clone(),
             TaskInner {
                 id: id.clone(),
+                owner_scope: owner_scope.map(str::to_string),
                 program: request.program.clone(),
                 args: request.args.clone(),
                 cwd: request.cwd.clone(),
@@ -416,6 +433,46 @@ impl BackgroundTaskRegistry {
         self.get(id)
             .await
             .ok_or_else(|| format!("task `{id}` disappeared"))
+    }
+
+    /// Kill every non-terminal task regardless of owner. Used on runtime
+    /// shutdown paths where Drop-based reaping may never run (R004 F7).
+    pub async fn kill_all(&self) -> usize {
+        let ids: Vec<String> = {
+            let st = self.inner.lock().await;
+            st.tasks
+                .values()
+                .filter(|t| !t.status.is_terminal())
+                .map(|t| t.id.clone())
+                .collect()
+        };
+        let mut n = 0;
+        for id in ids {
+            if self.kill(&id).await.is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Kill every non-terminal task owned by `scope` (best-effort; errors on
+    /// individual tasks are ignored). Returns how many tasks were signalled.
+    pub async fn kill_scope(&self, scope: &str) -> usize {
+        let ids: Vec<String> = {
+            let st = self.inner.lock().await;
+            st.tasks
+                .values()
+                .filter(|t| t.owner_scope.as_deref() == Some(scope) && !t.status.is_terminal())
+                .map(|t| t.id.clone())
+                .collect()
+        };
+        let mut n = 0;
+        for id in ids {
+            if self.kill(&id).await.is_ok() {
+                n += 1;
+            }
+        }
+        n
     }
 
     pub async fn kill(&self, id: &str) -> Result<BackgroundTaskSnapshot, String> {
@@ -682,6 +739,7 @@ mod tests {
                 id.clone(),
                 TaskInner {
                     id,
+                    owner_scope: None,
                     program: "true".into(),
                     args: Vec::new(),
                     cwd: PathBuf::new(),
@@ -708,6 +766,7 @@ mod tests {
                 id.into(),
                 TaskInner {
                     id: id.into(),
+                    owner_scope: None,
                     program: "sleep".into(),
                     args: Vec::new(),
                     cwd: PathBuf::new(),
@@ -749,6 +808,7 @@ mod tests {
         let scratch_path = scratch.path().to_path_buf();
         let mut task = TaskInner {
             id: "done".into(),
+            owner_scope: None,
             program: "true".into(),
             args: Vec::new(),
             cwd: PathBuf::new(),
@@ -815,6 +875,63 @@ mod tests {
         let _ = reg
             .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
             .await;
+    }
+
+    /// R004 F7 / T7: session-owned tasks are reaped as a group; tasks owned
+    /// by another scope (or daemon-scoped) are untouched by kill_scope.
+    #[tokio::test]
+    async fn kill_scope_reaps_only_the_owning_session() {
+        let reg = BackgroundTaskRegistry::new();
+        let mk = || ProcessRequest::new("sleep", vec!["30".into()], std::env::temp_dir());
+        let owned = reg
+            .spawn_owned(mk(), None, Some("session-a"))
+            .await
+            .expect("spawn owned");
+        let other = reg
+            .spawn_owned(mk(), None, Some("session-b"))
+            .await
+            .expect("spawn other");
+        let daemon = reg.spawn(mk(), None).await.expect("spawn daemon-scoped");
+
+        let n = reg.kill_scope("session-a").await;
+        assert_eq!(n, 1, "exactly the session-a task is reaped");
+        let snap = reg
+            .wait(
+                &owned,
+                Some(Duration::from_secs(5)),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("wait owned");
+        assert_eq!(snap.status, BackgroundTaskStatus::Killed);
+        // The other two are still running (then cleaned up).
+        for id in [&other, &daemon] {
+            let snap = reg.get(id).await.expect("get");
+            assert!(
+                snap.status.is_active(),
+                "{id} must survive: {:?}",
+                snap.status
+            );
+            let _ = reg.kill(id).await;
+        }
+    }
+
+    /// R004 F7 / T7: kill_all reaps everything for daemon shutdown paths.
+    #[tokio::test]
+    async fn kill_all_reaps_every_scope() {
+        let reg = BackgroundTaskRegistry::new();
+        let mk = || ProcessRequest::new("sleep", vec!["30".into()], std::env::temp_dir());
+        let a = reg.spawn_owned(mk(), None, Some("s1")).await.expect("a");
+        let b = reg.spawn(mk(), None).await.expect("b");
+        let n = reg.kill_all().await;
+        assert_eq!(n, 2);
+        for id in [&a, &b] {
+            let snap = reg
+                .wait(id, Some(Duration::from_secs(5)), &CancellationToken::new())
+                .await
+                .expect("wait");
+            assert_eq!(snap.status, BackgroundTaskStatus::Killed);
+        }
     }
 
     #[tokio::test]
