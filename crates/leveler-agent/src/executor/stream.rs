@@ -27,6 +27,21 @@ pub(crate) fn retry_backoff_delay(error: &ModelError, attempt: u32) -> Duration 
     }
 }
 
+/// Slow-lane schedule for request-start failures whose provider-level fast
+/// retries are already exhausted: re-firing 200 ms after a 4-attempt transport
+/// wipeout is a guaranteed second wipeout. Seconds-scale, bounded (R6-P3).
+pub(crate) fn exhausted_backoff_delay(error: &ModelError, attempt: u32) -> Duration {
+    const MAX_ADVERTISED: Duration = Duration::from_secs(120);
+    if let Some(ms) = error.retry_after_ms {
+        return Duration::from_millis(ms).min(MAX_ADVERTISED);
+    }
+    match attempt {
+        0 | 1 => Duration::from_secs(2),
+        2 => Duration::from_secs(8),
+        _ => Duration::from_secs(20),
+    }
+}
+
 /// Cheap ±0–20% jitter (no `rand` dependency) so N concurrent turns hitting
 /// the same rate limit do not retry in lockstep.
 fn jittered(base: Duration) -> Duration {
@@ -53,7 +68,12 @@ impl Executor {
         cancellation: &CancellationToken,
     ) -> Result<StreamRoundResult, AgentError> {
         const MAX_ATTEMPTS: u32 = 5;
+        // Separate, smaller budget for retryable-KIND errors whose provider
+        // fast retries are exhausted (request-start timeouts etc.). Worst case
+        // total = provider attempts × this budget, still bounded (R6-P3).
+        const MAX_EXHAUSTED_ATTEMPTS: u32 = 3;
         let mut attempt = 0u32;
+        let mut exhausted_attempts = 0u32;
         let started = std::time::Instant::now();
         loop {
             attempt += 1;
@@ -68,9 +88,20 @@ impl Executor {
                     return Ok(value);
                 }
                 Err(AgentError::Model(e))
-                    if e.retryable && attempt < MAX_ATTEMPTS && !cancellation.is_cancelled() =>
+                    if e.retryable
+                        && !cancellation.is_cancelled()
+                        && if e.provider_retries_exhausted {
+                            exhausted_attempts < MAX_EXHAUSTED_ATTEMPTS
+                        } else {
+                            attempt < MAX_ATTEMPTS
+                        } =>
                 {
-                    let wait = jittered(retry_backoff_delay(&e, attempt));
+                    let wait = if e.provider_retries_exhausted {
+                        exhausted_attempts += 1;
+                        jittered(exhausted_backoff_delay(&e, exhausted_attempts))
+                    } else {
+                        jittered(retry_backoff_delay(&e, attempt))
+                    };
                     // A silent retry re-sends the whole (often huge) request and
                     // looks identical to a hang from the outside. Name it.
                     tracing::warn!(

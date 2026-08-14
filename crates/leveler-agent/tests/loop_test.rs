@@ -6266,3 +6266,132 @@ async fn observe_tools_including_git_status_run_without_a_plan() {
     assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── R006 R6-P3: request-start timeout after provider exhaustion retries ─────
+
+/// The R006 accident: a continuation window's FIRST model request failed with
+/// a provider-exhausted Timeout and the whole goal died. The executor must
+/// retry such errors on its slow lane and succeed.
+struct ExhaustedTimeoutRuntime {
+    fails_left: Mutex<u32>,
+    kind: leveler_model::ModelErrorKind,
+}
+
+#[async_trait]
+impl ModelRuntime for ExhaustedTimeoutRuntime {
+    async fn generate(
+        &self,
+        _r: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        unimplemented!()
+    }
+    async fn stream(
+        &self,
+        _request: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        use leveler_model::ModelEvent;
+        {
+            let mut left = self.fails_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                let mut err = ModelError::new(self.kind, "error sending request for url");
+                err.provider_retries_exhausted = true;
+                return Err(err);
+            }
+        }
+        let events: Vec<Result<ModelEvent, ModelError>> = vec![
+            Ok(ModelEvent::MessageStarted {
+                request_id: RequestId::new("ok-1"),
+            }),
+            Ok(ModelEvent::TextDelta {
+                delta: "recovered".into(),
+            }),
+            Ok(ModelEvent::MessageCompleted {
+                finish_reason: leveler_model::FinishReason::Stop,
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn exhausted_request_start_timeout_is_retried_on_the_slow_lane() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-exhausted-retry-{}",
+        std::process::id() as u64 * 139 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(ExhaustedTimeoutRuntime {
+        fails_left: Mutex::new(1),
+        kind: leveler_model::ModelErrorKind::Timeout,
+    });
+    let mut attempts = 0u32;
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .run(
+        "answer",
+        &mut |event| {
+            if matches!(event, AgentEvent::StreamAttemptStarted) {
+                attempts += 1;
+            }
+        },
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2, "one exhausted-timeout retry then success");
+    assert!(outcome.final_text.contains("recovered"), "{outcome:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Negative control: a permanent error (auth) is NEVER retried, exhausted or
+/// not — fail fast with a single attempt.
+#[tokio::test]
+async fn exhausted_auth_failure_is_not_retried() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-exhausted-auth-{}",
+        std::process::id() as u64 * 149 + 9
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(ExhaustedTimeoutRuntime {
+        fails_left: Mutex::new(5),
+        kind: leveler_model::ModelErrorKind::Auth,
+    });
+    let mut attempts = 0u32;
+    let result = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .run(
+        "answer",
+        &mut |event| {
+            if matches!(event, AgentEvent::StreamAttemptStarted) {
+                attempts += 1;
+            }
+        },
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_err(), "auth must fail fast");
+    assert_eq!(attempts, 1, "no retry for a permanent error");
+    std::fs::remove_dir_all(&dir).ok();
+}

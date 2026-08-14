@@ -241,9 +241,16 @@ async fn exhausted_provider_retries_are_terminal_for_outer_layers() {
         .expect("the exhausted provider must fail");
 
     assert_eq!(server.request_count(), 3);
+    // R006 R6-P3: `retryable` stays kind-derived (a 429 IS retryable) — the
+    // exhausted budget is signalled separately so outer layers switch to the
+    // slow lane instead of being silently forbidden to retry at all.
     assert!(
-        !err.retryable,
-        "the agent must not multiply an already exhausted provider retry loop"
+        err.retryable,
+        "kind-level retryability must survive provider exhaustion"
+    );
+    assert!(
+        err.provider_retries_exhausted,
+        "the exhausted fast budget must be flagged for the outer slow lane"
     );
 }
 
