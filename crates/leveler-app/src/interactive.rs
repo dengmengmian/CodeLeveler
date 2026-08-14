@@ -1007,6 +1007,18 @@ impl InProcessRuntimeClient {
                 let outcome = turn_runtime_event(result);
                 let _ = events.send(outcome);
                 active.finish(&session_id);
+                // The goal has concluded (terminal session state): dev servers
+                // and other background children this session started are
+                // session-owned temporary resources — reap them now instead of
+                // leaving them until daemon exit (R004 F7). Daemon-owned
+                // services (browser runtime) are untouched.
+                let reaped = app.background_tasks().kill_scope(session_id.as_str()).await;
+                if reaped > 0 {
+                    tracing::info!(
+                        session = session_id.as_str(),
+                        "goal end reaped {reaped} session-owned background task(s)"
+                    );
+                }
             });
         });
     }
@@ -1922,6 +1934,15 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // Process is exiting: reaper is the safety net for turns that
                 // never got finish() because the OS killed the process mid-flight.
                 self.reap_running_turns(None).await;
+                // Runtime-owned OS resources must not outlive the runtime:
+                // background tasks (dev servers) and the browser tree are
+                // reaped explicitly — Drop never runs on exit paths that call
+                // `std::process::exit` or die to SIGTERM (R004 F7).
+                let killed = self.app.background_tasks().kill_all().await;
+                if killed > 0 {
+                    tracing::info!("shutdown reaped {killed} background task(s)");
+                }
+                self.app.browser().shutdown().await;
                 Ok(())
             }
         }

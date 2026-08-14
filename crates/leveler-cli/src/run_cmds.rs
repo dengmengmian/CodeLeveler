@@ -538,6 +538,7 @@ pub(crate) async fn cmd_tui(
     let web_repo_root = app.layout.repo_root.clone();
     let remote_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
+    let quit_client = in_process_client.clone();
     let remote_repo_root = app.layout.repo_root.clone();
     let web_launcher: leveler_tui::WebLauncher = Arc::new(move || {
         let service = web_service.clone();
@@ -610,6 +611,11 @@ pub(crate) async fn cmd_tui(
     );
 
     leveler_tui::run(client, Some(web_launcher), Some(remote_launcher), boot).await?;
+    // Drop-based reapers never run past `std::process::exit`; shut the
+    // runtime down explicitly (background tasks + browser tree, R004 F7).
+    let _ = quit_client
+        .send(leveler_client_protocol::ClientCommand::Quit)
+        .await;
     // The TUI owns the only runtime, and an in-process `/web` server is spawned
     // detached on a token it never cancels (it serves "until the process
     // exits"). Falling through to a normal return would drop the runtime with
@@ -765,6 +771,20 @@ pub(crate) async fn cmd_serve(
     let shutdown = CancellationToken::new();
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
+        // Ctrl-C and SIGTERM both reach the graceful path: a plain `kill`
+        // must not orphan background tasks / the browser tree (R004 F7).
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            signal_shutdown.cancel();
+        }
+        #[cfg(not(unix))]
         if tokio::signal::ctrl_c().await.is_ok() {
             signal_shutdown.cancel();
         }
@@ -897,6 +917,20 @@ pub(crate) async fn cmd_web(
     let shutdown = CancellationToken::new();
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
+        // Ctrl-C and SIGTERM both reach the graceful path: a plain `kill`
+        // must not orphan background tasks / the browser tree (R004 F7).
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            signal_shutdown.cancel();
+        }
+        #[cfg(not(unix))]
         if tokio::signal::ctrl_c().await.is_ok() {
             signal_shutdown.cancel();
         }

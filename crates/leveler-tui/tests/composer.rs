@@ -197,3 +197,25 @@ fn multiline_up_down_move_cursor_not_history() {
     let (row, _) = c.cursor_row_col_display();
     assert_eq!(row, 0);
 }
+
+#[test]
+fn canonical_text_expands_without_consuming() {
+    let mut c = Composer::default();
+    c.insert_str("/goal ");
+    let paste = "a\nb\nc\nd\ne\nf";
+    c.insert_paste(paste);
+    let canonical = c.canonical_text();
+    assert_eq!(canonical, format!("/goal {paste}"));
+    // Non-destructive: presentation and pending pastes are untouched…
+    assert!(c.text().contains("[Pasted: 6 lines]"), "{}", c.text());
+    // …and take() still returns the same canonical content afterwards.
+    assert_eq!(c.take(), canonical);
+    assert!(c.is_empty());
+}
+
+#[test]
+fn canonical_text_without_pastes_is_the_buffer_verbatim() {
+    let mut c = Composer::default();
+    c.insert_str("[Pasted: 5 lines]");
+    assert_eq!(c.canonical_text(), "[Pasted: 5 lines]");
+}

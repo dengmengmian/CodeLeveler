@@ -38,6 +38,10 @@ pub struct BrowserDriver {
     next_id: AtomicU64,
     pending: Pending,
     events: broadcast::Sender<DriverEvent>,
+    /// Process group id of the node driver (Unix). Chrome is the driver's
+    /// grandchild; the group makes the whole tree signalable (R004 F7).
+    #[cfg(unix)]
+    pgid: i32,
     // Held so the child is SIGKILLed on drop (kill_on_drop).
     _child: tokio::process::Child,
 }
@@ -60,12 +64,21 @@ impl BrowserDriver {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .env_clear();
+        // Own the whole tree: Chrome is spawned by Playwright inside this
+        // process group, so daemon shutdown can killpg it (R004 F7).
+        #[cfg(unix)]
+        cmd.process_group(0);
         for (k, v) in envs {
             cmd.env(k, v);
         }
         let mut child = cmd
             .spawn()
             .map_err(|e| BrowserError::LaunchFailed(format!("spawn driver: {e}")))?;
+        #[cfg(unix)]
+        let pgid = child
+            .id()
+            .map(|pid| pid as i32)
+            .ok_or_else(|| BrowserError::LaunchFailed("driver has no pid".into()))?;
 
         let stdin = child
             .stdin
@@ -147,8 +160,24 @@ impl BrowserDriver {
             next_id: AtomicU64::new(1),
             pending,
             events: events_tx,
+            #[cfg(unix)]
+            pgid,
             _child: child,
         })
+    }
+
+    /// Graceful teardown: ask the driver to close its browser context and
+    /// egress proxy (its `shutdown` RPC), then signal the whole process group
+    /// so Chrome cannot outlive the daemon (R004 F7). Safe to call twice.
+    pub async fn shutdown(&self, timeout: Duration) {
+        let _ = self.request("shutdown", Value::Null, timeout).await;
+        #[cfg(unix)]
+        unsafe {
+            // SIGTERM the group, then SIGKILL stragglers after a short grace.
+            libc::killpg(self.pgid, libc::SIGTERM);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            libc::killpg(self.pgid, libc::SIGKILL);
+        }
     }
 
     /// Subscribe to driver events (console/page errors/dialogs).

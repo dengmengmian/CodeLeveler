@@ -94,6 +94,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                 vec![Effect::Send(ClientCommand::AddClipboardImage {
                     session_id: state.session_id.clone(),
                 })]
+            } else if let Some(crate::overlay::Overlay::Clarification(ov)) = state.overlay.as_mut()
+            {
+                // A paste while a question is on screen answers the question;
+                // it must not vanish into the composer behind the overlay.
+                ov.insert_text(&text);
+                Vec::new()
             } else {
                 state.composer.insert_paste(&text);
                 touch_slash_filter(state);
@@ -103,6 +109,14 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         Action::TextInput(text) => {
             state.disarm_ctrlc();
             clear_quit_confirm_notification(state);
+            if !text.is_empty()
+                && let Some(crate::overlay::Overlay::Clarification(ov)) = state.overlay.as_mut()
+            {
+                // Coalesced typing/paste bursts answer the open question, same
+                // as the single-key Char path (R004 F2).
+                ov.insert_text(&text);
+                return Vec::new();
+            }
             if !text.is_empty()
                 && state.overlay.is_none()
                 && state.active_screen == Screen::Conversation
@@ -792,7 +806,7 @@ fn request_cancel(state: &mut AppState) -> Vec<Effect> {
 /// Hand the current draft to `$EDITOR` (Ctrl+X Ctrl+E, or `/editor`).
 pub(super) fn open_external_editor(state: &mut AppState) -> Vec<Effect> {
     vec![Effect::OpenExternalEditor {
-        text: state.composer.text().to_string(),
+        text: state.composer.canonical_text(),
     }]
 }
 

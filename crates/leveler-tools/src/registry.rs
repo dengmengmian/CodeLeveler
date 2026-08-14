@@ -299,6 +299,7 @@ fn register_browser(registry: &mut ToolRegistry) {
     registry.register(Arc::new(tools::BrowserNavigateTool));
     registry.register(Arc::new(tools::BrowserSnapshotTool));
     registry.register(Arc::new(tools::BrowserClickTool));
+    registry.register(Arc::new(tools::BrowserDragTool));
     registry.register(Arc::new(tools::BrowserTypeTool));
     registry.register(Arc::new(tools::BrowserSelectTool));
     registry.register(Arc::new(tools::BrowserPressTool));
@@ -472,8 +473,9 @@ mod tests {
         assert!(names.contains(&"browser_navigate".to_string()));
         assert!(names.contains(&"browser_snapshot".to_string()));
         assert!(names.contains(&"browser_click".to_string()));
-        // core (13) + full extras (18) + browser (11) = 42
-        assert_eq!(names.len(), 42);
+        assert!(names.contains(&"browser_drag".to_string()));
+        // core (13) + full extras (18) + browser (12) = 43
+        assert_eq!(names.len(), 43);
     }
 
     #[test]

@@ -279,9 +279,18 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
             // leveler's own gate passed on real work: surface it as done + verified
             // even when the model merely "answered" instead of signalling
             // completion — a passing gate is stronger evidence than a self-claim.
-            TaskOutcome::Verified if did_work => StopReason::Completed,
+            // EXCEPT a guard-forced Incomplete stop: green gates say the tree is
+            // healthy, not that the task finished — the honest stop survives
+            // (R004 F4: "任务已完成 · verify ✓" over an unfinished plan).
+            TaskOutcome::Verified if did_work && report.stop_reason != StopReason::Incomplete => {
+                StopReason::Completed
+            }
             // Real work finished, but no gate could confirm it.
-            TaskOutcome::CompletedUnverified if did_work => StopReason::CompletedUnverified,
+            TaskOutcome::CompletedUnverified
+                if did_work && report.stop_reason != StopReason::Incomplete =>
+            {
+                StopReason::CompletedUnverified
+            }
             // Pure Q&A, or any other terminal reason: keep the executor's reason.
             _ => report.stop_reason,
         }
@@ -836,6 +845,23 @@ mod tests {
             rounds: 1,
             review: None,
         }
+    }
+
+    /// R004 F4: a guard-forced Incomplete stop must never be laundered into
+    /// "Completed" by a green gate — gates describe the tree, not the task.
+    #[test]
+    fn incomplete_stop_survives_a_verified_outcome() {
+        let task = report(TaskOutcome::Verified, StopReason::Incomplete, &["a.rs"]);
+        let out = report_to_result(task).unwrap();
+        assert_eq!(out.stop_reason, StopReason::Incomplete);
+
+        let task = report(
+            TaskOutcome::CompletedUnverified,
+            StopReason::Incomplete,
+            &["a.rs"],
+        );
+        let out = report_to_result(task).unwrap();
+        assert_eq!(out.stop_reason, StopReason::Incomplete);
     }
 
     #[test]

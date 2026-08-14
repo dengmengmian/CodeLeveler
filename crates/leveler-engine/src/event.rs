@@ -366,6 +366,11 @@ pub enum EngineEvent {
     ClarificationAnswered {
         id: ClarificationId,
         answer: String,
+        /// answered | skipped | unattended | timed_out | cancelled — how the
+        /// request actually resolved. Only `answered` carries a user reply;
+        /// the other variants must never be read as the user speaking.
+        #[serde(default)]
+        outcome: String,
     },
 
     // ── kernel: verification ─────────────────────────────────────────────

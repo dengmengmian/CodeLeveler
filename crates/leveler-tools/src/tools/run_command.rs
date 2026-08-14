@@ -130,6 +130,20 @@ async fn execute_background(
     cwd_rel: Option<&str>,
     context: ToolContext,
 ) -> Result<ToolOutput, ToolError> {
+    // Same R004 F3 read-preflight as the foreground path (before any
+    // environment checks: a refused path is a refusal, not a config gap).
+    #[cfg(not(windows))]
+    {
+        let confine_writes =
+            context.policy.mode.confines_workspace() && !context.policy.unrestricted_fs();
+        if confine_writes {
+            let mut allowed = vec![context.execution.workspace.root().to_path_buf()];
+            allowed.extend(context.execution.workspace.readonly_roots().iter().cloned());
+            if let Some(output) = refuse_home_escape(program, &args, &allowed, &context) {
+                return Ok(output);
+            }
+        }
+    }
     let Some(reg) = context.services.background_tasks.clone() else {
         return Ok(ToolOutput::error(
             "background tasks are not available in this session (no registry).",
@@ -174,7 +188,13 @@ async fn execute_background(
     }
 
     let req = background_process_request(program, args.clone(), cwd, &context);
-    match reg.spawn(req, mutation_baseline).await {
+    // Session-owned: reaped when this session's goal reaches terminal state
+    // or the daemon shuts down (R004 F7). Daemon-scoped spawning is reserved
+    // for runtime-internal services, not agent tool calls.
+    match reg
+        .spawn_owned(req, mutation_baseline, Some(context.session_scope()))
+        .await
+    {
         Ok(task_id) => Ok(ToolOutput::ok(format!(
             "background task started\ntask_id: {task_id}\nprogram: {program}\nargs: {args:?}\n\
              status: running\nUse get_task/wait_task/kill_task with this task_id."
@@ -212,6 +232,39 @@ fn background_process_request(
     req
 }
 
+/// R004 F3 read-preflight (Unix): refuse absolute args that resolve into the
+/// user's HOME tree outside workspace + readonly roots + the runtime tool
+/// cache. `sh -c` scripts are checked by their parsed literal words; a script
+/// that cannot be parsed falls through to the danger classifier / approval.
+#[cfg(not(windows))]
+fn refuse_home_escape(
+    program: &str,
+    args: &[String],
+    allowed: &[std::path::PathBuf],
+    context: &ToolContext,
+) -> Option<ToolOutput> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let mut allowed = allowed.to_vec();
+    // The runtime-managed tool cache feeds toolchains (go, node); it holds no
+    // foreign user content and must stay readable (C2.3C-S §11).
+    allowed.push(home.join(".leveler").join("cache"));
+    let program_base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let script_words: Vec<String>;
+    let words: Vec<&str> = if leveler_execution::is_shell_wrapper_program(program_base)
+        && let Some(script) = leveler_execution::shell_c_script(args)
+    {
+        script_words = leveler_execution::literal_command_words(script).unwrap_or_default();
+        script_words.iter().map(String::as_str).collect()
+    } else {
+        args.iter().map(String::as_str).collect()
+    };
+    let bad = leveler_execution::first_home_path_outside_roots(words, &allowed, &home)?;
+    Some(ToolOutput::error(format!(
+        "Refused: `{bad}` is outside the workspace root `{}` and outside          readonly roots — shell commands may not read other user directories.          Use workspace paths, or grant access with `--readonly-root <dir>` /          config `readonly_roots`.",
+        context.execution.workspace.root().display()
+    )))
+}
+
 /// Shared runner used by `run_command` and `shell_command`.
 pub(crate) async fn execute_program(
     program: &str,
@@ -224,16 +277,21 @@ pub(crate) async fn execute_program(
     let rel = cwd_rel.unwrap_or(".").to_string();
     let cwd = context.execution.workspace.resolve(&rel)?;
 
-    // On macOS/Linux the OS sandbox allows broad *reads* and
-    // confines *writes*; do not second-guess absolute path args there
-    // (git/config paths, system tools). On Windows AppContainer uses host
-    // intent; absolute-arg preflight remains a cheap fail-closed gate.
+    // Read-preflight (R004 F3). On macOS/Linux the OS sandbox confines
+    // *writes* and leaves reads broad so toolchains keep working — but that
+    // left `cat/ls/find` of foreign USER trees wide open. The preflight
+    // refuses absolute args that resolve into $HOME outside the workspace,
+    // readonly roots, and the runtime tool cache; system paths (/etc, /tmp,
+    // toolchains) stay readable. For `sh -c` scripts the literal words of the
+    // parsed script are checked, so `cat /Users/x/other` inside a shell string
+    // is seen. On Windows AppContainer the stricter any-absolute-arg gate
+    // remains the primary defense.
     let confine_writes =
         context.policy.mode.confines_workspace() && !context.policy.unrestricted_fs();
-    #[cfg(windows)]
     if confine_writes {
         let mut allowed = vec![context.execution.workspace.root().to_path_buf()];
         allowed.extend(context.execution.workspace.readonly_roots().iter().cloned());
+        #[cfg(windows)]
         if let Some(bad) = leveler_execution::first_absolute_arg_outside_roots(&args, &allowed) {
             return Ok(ToolOutput::error(format!(
                 "Refused: argument `{bad}` is outside the workspace root `{}` \
@@ -242,6 +300,10 @@ pub(crate) async fn execute_program(
                      `readonly_roots`) for cross-repo reads.",
                 context.execution.workspace.root().display()
             )));
+        }
+        #[cfg(not(windows))]
+        if let Some(output) = refuse_home_escape(program, &args, &allowed, &context) {
+            return Ok(output);
         }
     }
     let mut request = ProcessRequest::new(program.to_string(), args, cwd);
@@ -703,6 +765,193 @@ fn normalize_args(program: &str, mut args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R004 F3: workspace read boundary for shell/argv (T4) ────────────────
+
+    #[cfg(not(windows))]
+    struct HomeSecret {
+        dir: std::path::PathBuf,
+        file: std::path::PathBuf,
+    }
+
+    #[cfg(not(windows))]
+    impl HomeSecret {
+        fn create(tag: &str) -> Self {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let dir = home.join(format!(
+                ".leveler-r004-t4-{tag}-{}",
+                u64::from(std::process::id()) * 31 + super::super::test_ordinal()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("secret.txt");
+            std::fs::write(&file, "HIDDEN_CONTROL_CONTENT").unwrap();
+            Self { dir, file }
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for HomeSecret {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn t4_workspace(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-t4-{tag}-{}",
+            u64::from(std::process::id()) * 37 + super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_cat_of_foreign_home_tree_is_refused() {
+        use crate::tool::{Tool, ToolContext};
+        let secret = HomeSecret::create("cat");
+        let dir = t4_workspace("cat");
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = super::super::shell_command::ShellCommandTool
+            .execute(
+                serde_json::json!({"cmd": format!("cat {}", secret.file.display())}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{out:?}");
+        assert!(out.content.contains("Refused"), "{out:?}");
+        assert!(!out.content.contains("HIDDEN_CONTROL_CONTENT"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn run_command_argv_foreign_home_path_is_refused_fg_and_bg() {
+        use crate::tool::{Tool, ToolContext};
+        let secret = HomeSecret::create("argv");
+        let dir = t4_workspace("argv");
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"background": true}),
+        ] {
+            let ws = leveler_execution::Workspace::new(&dir).unwrap();
+            let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+            let mut input = serde_json::json!({
+                "program": "cat",
+                "args": [secret.file.to_string_lossy()],
+            });
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let out = RunCommandTool
+                .execute(input, ctx, CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(out.is_error, "{out:?}");
+            assert!(out.content.contains("Refused"), "{out:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn workspace_readonly_roots_and_system_paths_stay_readable() {
+        use crate::tool::{Tool, ToolContext};
+        let secret = HomeSecret::create("ro");
+        let dir = t4_workspace("ro");
+        std::fs::write(dir.join("inside.txt"), "WS_OK").unwrap();
+
+        // workspace absolute path → allowed
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = super::super::shell_command::ShellCommandTool
+            .execute(
+                serde_json::json!({"cmd": format!("cat {}", dir.join("inside.txt").display())}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{out:?}");
+        assert!(out.content.contains("WS_OK"), "{out:?}");
+
+        // declared readonly root under HOME → allowed
+        let ws = leveler_execution::Workspace::new(&dir)
+            .unwrap()
+            .with_readonly_roots(vec![secret.dir.clone()]);
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = super::super::shell_command::ShellCommandTool
+            .execute(
+                serde_json::json!({"cmd": format!("cat {}", secret.file.display())}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "readonly root must stay readable: {out:?}");
+
+        // system path → allowed (not a home tree)
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = super::super::shell_command::ShellCommandTool
+            .execute(
+                serde_json::json!({"cmd": "head -1 /etc/hosts"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "system reads must keep working: {out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn symlink_into_home_tree_is_refused() {
+        use crate::tool::{Tool, ToolContext};
+        let secret = HomeSecret::create("sym");
+        let dir = t4_workspace("sym");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&secret.dir, &link).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = super::super::shell_command::ShellCommandTool
+            .execute(
+                serde_json::json!({"cmd": format!("cat {}/secret.txt", link.display())}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "symlink escape must be refused: {out:?}");
+        assert!(!out.content.contains("HIDDEN_CONTROL_CONTENT"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn nested_sh_c_body_words_are_checked() {
+        use crate::tool::{Tool, ToolContext};
+        let secret = HomeSecret::create("nested");
+        let dir = t4_workspace("nested");
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = super::super::shell_command::ShellCommandTool
+            .execute(
+                serde_json::json!({"cmd": format!("sh -c 'cat {}'", secret.file.display())}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "nested -c body must be checked: {out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn resolve_timeout_defaults_zero_and_clamps_huge() {

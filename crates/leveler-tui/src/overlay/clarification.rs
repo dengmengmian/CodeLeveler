@@ -35,6 +35,18 @@ impl ClarificationOverlay {
         &self.input
     }
 
+    /// Pasted / burst text goes into the answer field. The prompt is a
+    /// single-line input, so newlines become spaces — but the content reaches
+    /// the question instead of being swallowed by the composer hidden behind
+    /// the overlay (R004 F2).
+    pub fn insert_text(&mut self, s: &str) {
+        let normalized = s
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', " ");
+        self.input.push_str(&normalized);
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> ClarificationOutcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return ClarificationOutcome::None;

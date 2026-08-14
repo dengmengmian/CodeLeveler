@@ -125,6 +125,9 @@ fn walk(
         if IGNORED.contains(&name.as_str()) {
             continue;
         }
+        let is_symlink = path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink());
         let is_dir = path.is_dir();
         if let Ok(rel) = path.strip_prefix(root) {
             let mut display = rel.to_string_lossy().replace('\\', "/");
@@ -133,7 +136,9 @@ fn walk(
             }
             out.push(display);
         }
-        if is_dir {
+        // Never descend through a symlinked directory: an in-workspace link to
+        // an outside tree must not have its names enumerated (R004 F3).
+        if is_dir && !is_symlink {
             walk(root, &path, depth + 1, max_depth, out);
         }
     }

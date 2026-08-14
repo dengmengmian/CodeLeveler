@@ -3556,9 +3556,12 @@ struct RecordingClarifier {
 
 #[async_trait]
 impl leveler_agent::Clarifier for RecordingClarifier {
-    async fn clarify(&self, request: &leveler_agent::ClarificationRequest) -> String {
+    async fn clarify(
+        &self,
+        request: &leveler_agent::ClarificationRequest,
+    ) -> leveler_agent::ClarifyOutcome {
         self.asked.lock().unwrap().push(request.tool.clone());
-        "拒绝".to_string()
+        leveler_agent::ClarifyOutcome::Answered("拒绝".to_string())
     }
 }
 
