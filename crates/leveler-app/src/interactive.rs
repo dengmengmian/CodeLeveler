@@ -383,8 +383,18 @@ impl InProcessRuntimeClient {
             work_profile: record.work_profile.clone(),
             collaboration: record.collaboration.clone(),
             // Not persisted in the session record; a restored session prompts
-            // unless the daemon-wide `auto_approve` fallback applies.
-            approval_policy: ApprovalPolicy::Interactive,
+            // unless the daemon-wide `auto_approve` fallback applies. A client
+            // that resumed with --auto-approve must re-assert it via
+            // attach_session_policy (R006 R6-P2) — warn so the downgrade is
+            // never silent again.
+            approval_policy: {
+                tracing::warn!(
+                    session = session_id.as_str(),
+                    "restored session hydrated with Interactive approval policy; \
+                     a resuming client must re-assert auto-approve explicitly"
+                );
+                ApprovalPolicy::Interactive
+            },
         };
         self.session_runtime
             .lock()
@@ -2211,6 +2221,27 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
 
 #[async_trait]
 impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
+    /// Re-assert the effective approval policy for an existing session
+    /// (attach/resume). Memory-only and keyed by session id: it upgrades or
+    /// downgrades exactly ONE session's live policy without touching the DB
+    /// (the policy is deliberately not persisted, so restores stay fail-closed
+    /// Interactive) and without leaking across sessions (R006 R6-P2).
+    async fn attach_session_policy(
+        &self,
+        session_id: &SessionId,
+        policy: ApprovalPolicy,
+    ) -> Result<(), ClientError> {
+        // Hydrate first so an unknown session errs and a known-but-cold one
+        // gets its full runtime config before the policy write.
+        let _ = self.runtime_config(session_id).await?;
+        let mut map = self.session_runtime.lock().unwrap();
+        let entry = map.get_mut(session_id).ok_or_else(|| {
+            ClientError::Runtime(format!("session {} is not open", session_id.as_str()))
+        })?;
+        entry.approval_policy = policy;
+        Ok(())
+    }
+
     async fn create_session(
         &self,
         request: leveler_local_transport::CreateSessionRequest,

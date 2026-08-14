@@ -826,3 +826,64 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
 
     settle_background_turns(&app, &client, &[]).await;
 }
+
+/// R006 R6-P2 accident regression — resuming a session must be able to
+/// re-assert its effective auto-approve policy on a fresh runtime (the daemon
+/// that originally held it in memory died between windows), while:
+/// restore stays fail-closed, other sessions never leak the policy, and a
+/// resume WITHOUT the flag upgrades nothing.
+#[tokio::test]
+async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime() {
+    use leveler_client_protocol::ApprovalPolicy;
+    use leveler_local_transport::LocalRuntimeService as _;
+    let (_tmp, _app, client, resumed_session) = build_client().await;
+
+    // Fresh runtime hydrates the restored session fail-closed.
+    assert_eq!(
+        client.effective_approval_policy(&resumed_session).await,
+        ApprovalPolicy::Interactive,
+        "restore alone must stay fail-closed"
+    );
+
+    // A second, untouched session for the leak check.
+    let other = client
+        .create_session(CreateSessionRequest {
+            approval_policy: ApprovalPolicy::Interactive,
+            goal: "bystander".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+
+    // The resuming client re-asserts the policy it was launched with
+    // (`leveler tui --session <id> --auto-approve`).
+    client
+        .attach_session_policy(&resumed_session, ApprovalPolicy::AutoApprove)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.effective_approval_policy(&resumed_session).await,
+        ApprovalPolicy::AutoApprove,
+        "the resumed session must run under its re-asserted policy"
+    );
+
+    // No cross-session leakage; no blanket upgrade of other sessions.
+    assert_eq!(
+        client.effective_approval_policy(&other.session.id).await,
+        ApprovalPolicy::Interactive,
+        "policy re-assert is strictly per-session"
+    );
+
+    // And a later downgrade back to Interactive also sticks (client without
+    // the flag re-attaching does not carry auto-approve forward implicitly —
+    // it simply asserts nothing; explicit downgrade is also honored).
+    client
+        .attach_session_policy(&resumed_session, ApprovalPolicy::Interactive)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.effective_approval_policy(&resumed_session).await,
+        ApprovalPolicy::Interactive
+    );
+}

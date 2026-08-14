@@ -291,6 +291,9 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
         // TUI's process group (terminal signals) and is never kill-on-drop.
         .process_group(0)
         .spawn()?;
+    // NOTE on lifetime: the daemon also installs a SIGHUP handler (see the
+    // serve shutdown select) so a closing terminal cannot hard-kill it and
+    // wipe in-memory session policy (R006 R6-P2 enabling condition).
 
     let deadline = tokio::time::Instant::now() + DAEMON_ENSURE_TIMEOUT;
     let client = loop {
@@ -426,6 +429,24 @@ pub(crate) async fn cmd_tui(
                      list sessions: leveler resume"
                 )
             })?;
+            // R006 R6-P2: --auto-approve was a silent no-op on `--session`
+            // resume — the policy lives only in the daemon's session map, and
+            // reconnecting never re-asserted it, so approvals fell back to a
+            // 5-minute human timeout → Deny → guard kill. Re-assert the
+            // session's effective policy through the same trust gate as
+            // creation. Without the flag nothing changes (no blanket upgrade).
+            if auto_approve {
+                use leveler_local_transport::LocalRuntimeService as _;
+                client
+                    .attach_session_policy(
+                        &session_id,
+                        leveler_client_protocol::ApprovalPolicy::AutoApprove,
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("cannot re-assert auto-approve on session {id}: {e}")
+                    })?;
+            }
             // Daemon path has no local registry; gauge may show 0 until first turn.
             (session_id, 0u32)
         } else {
@@ -778,9 +799,15 @@ pub(crate) async fn cmd_serve(
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("install SIGTERM handler");
+            // SIGHUP: a closing spawn terminal must trigger the same graceful
+            // path, never a default hard kill that orphans background tasks
+            // and wipes session policy (R006 R6-P2).
+            let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("install SIGHUP handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
+                _ = hup.recv() => {}
             }
             signal_shutdown.cancel();
         }
@@ -924,9 +951,15 @@ pub(crate) async fn cmd_web(
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("install SIGTERM handler");
+            // SIGHUP: a closing spawn terminal must trigger the same graceful
+            // path, never a default hard kill that orphans background tasks
+            // and wipes session policy (R006 R6-P2).
+            let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("install SIGHUP handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
+                _ = hup.recv() => {}
             }
             signal_shutdown.cancel();
         }
