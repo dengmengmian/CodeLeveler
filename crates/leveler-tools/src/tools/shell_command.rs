@@ -44,8 +44,10 @@ impl Tool for ShellCommandTool {
         "Run a shell command string in the workspace. Prefer \
          this when you have a full command line (e.g. `git pull --rebase`, \
          `cargo test -q`). For structured argv without a shell, use `run_command`. \
-         Same sandbox as `run_command`: broad reads, writes confined to the \
-         workspace (plus temp/toolchain caches) unless full-access. \
+         Same sandbox as `run_command`: system/toolchain reads allowed, other \
+         user directories outside the workspace and readonly roots refused, \
+         writes confined to the workspace (plus temp/toolchain caches) unless \
+         full-access. \
          Default timeout 120s. Do NOT start long-lived servers here with `&` or \
          nohup — they are refused and hang the turn if forced. Use `run_command` \
          with background=true for dev servers, then curl/get_task in a separate call. \

@@ -51,6 +51,26 @@ pub(crate) fn collect_scoped_paths_from_call(call: &ToolCall, out: &mut Vec<Stri
             push_unique_path(out, &path);
         }
     }
+    // Shell targets are visible to path rules and approval prompts (R004 F3):
+    // absolute-looking literal words of the command are scoped paths too.
+    if call.name == "run_command"
+        && let Some(args) = call.arguments.get("args").and_then(|v| v.as_array())
+    {
+        for arg in args.iter().filter_map(|a| a.as_str()) {
+            if leveler_execution::looks_like_absolute_path_arg(arg) {
+                push_unique_path(out, arg);
+            }
+        }
+    }
+    if call.name == "shell_command"
+        && let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str())
+    {
+        for word in leveler_execution::literal_command_words(cmd).unwrap_or_default() {
+            if leveler_execution::looks_like_absolute_path_arg(&word) {
+                push_unique_path(out, &word);
+            }
+        }
+    }
 }
 
 pub(crate) fn patch_paths(patch: &str) -> Vec<String> {

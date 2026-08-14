@@ -224,9 +224,15 @@ fn walk(root: &std::path::Path, dir: &std::path::Path, candidates: &mut Candidat
             continue;
         }
         let path = entry.path();
-        if path.is_dir() {
+        let is_symlink = path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink());
+        // Never descend through a symlinked directory (R004 F3).
+        if path.is_dir() && !is_symlink {
             walk(root, &path, candidates);
-        } else if let Ok(relative) = path.strip_prefix(root) {
+        } else if !path.is_dir()
+            && let Ok(relative) = path.strip_prefix(root)
+        {
             candidates
                 .paths
                 .push(relative.to_string_lossy().replace('\\', "/"));

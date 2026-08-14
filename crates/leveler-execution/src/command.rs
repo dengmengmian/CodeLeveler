@@ -496,14 +496,16 @@ pub fn looks_like_absolute_path_arg(arg: &str) -> bool {
 }
 
 /// First absolute path argument outside `allowed_roots` (canonicalized when
-/// possible). Used by `run_command` for a **portable** preflight before spawn.
+/// possible). Used by `run_command` for a preflight before spawn.
 ///
-/// This is the only cross-platform read gate today:
-/// - **macOS**: also OS seatbelt (deny `/Users`/`/home` except allowed roots)
-/// - **Linux**: bwrap still ro-binds `/` (full read); rely on this preflight
+/// Platform reality (R004 F3):
+/// - **macOS**: seatbelt confines writes + network; production reads are broad
+///   (`(allow file-read*)`) — kernel read denial is armed only by `leveler
+///   eval`. Unix read-preflight is [`first_home_path_outside_roots`].
+/// - **Linux**: bwrap ro-binds `/` (full read); same Unix preflight applies.
 /// - **Windows**: Job tree kill (WS1) + AppContainer RO/WW (WS3) when intent
-///   is set — **preflight is
-///   the primary defense** against `type`/`Get-Content`/`cat` of foreign trees
+///   is set — this any-absolute-arg preflight is the primary defense against
+///   `type`/`Get-Content`/`cat` of foreign trees.
 pub fn first_absolute_arg_outside_roots<'a>(
     args: &'a [String],
     allowed_roots: &[PathBuf],
@@ -522,6 +524,36 @@ pub fn first_absolute_arg_outside_roots<'a>(
             .unwrap_or_else(|_| lexical_abs_normalize(path));
         if !roots.iter().any(|r| path_is_under(&probe, r)) {
             return Some(arg.as_str());
+        }
+    }
+    None
+}
+
+/// First argument that resolves into the user's HOME tree but outside
+/// `allowed_roots` (canonicalized; symlinks into home count). This is the
+/// Unix read-preflight scope for R004 F3: system paths and temp stay readable
+/// (toolchains, /etc, /tmp), while foreign user trees — other repos, control
+/// files, dotfiles — are refused at the tool boundary before spawn.
+pub fn first_home_path_outside_roots<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+    allowed_roots: &[PathBuf],
+    home: &Path,
+) -> Option<String> {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let roots: Vec<PathBuf> = allowed_roots
+        .iter()
+        .filter_map(|r| r.canonicalize().ok().or_else(|| Some(r.clone())))
+        .collect();
+    for arg in args {
+        if !looks_like_absolute_path_arg(arg) {
+            continue;
+        }
+        let path = Path::new(arg);
+        let probe = path
+            .canonicalize()
+            .unwrap_or_else(|_| lexical_abs_normalize(path));
+        if path_is_under(&probe, &home) && !roots.iter().any(|r| path_is_under(&probe, r)) {
+            return Some(arg.to_string());
         }
     }
     None

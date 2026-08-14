@@ -220,6 +220,56 @@ fn heredoc_feeds_shell(stmt: &Node, src: &[u8]) -> bool {
     resolve_command_name(&name, src).is_some_and(|prog| is_shell_wrapper_program(&prog))
 }
 
+/// All plain-literal words appearing as command arguments anywhere in the
+/// script, nested `sh -c '…'` bodies included. This is the read-preflight's
+/// view of the paths a shell string touches (R004 F3): expansions and
+/// substitutions resolve to nothing here — those shapes already route to the
+/// danger classifier / approval instead.
+///
+/// Returns `None` when the script does not parse cleanly, so the caller can
+/// decide its own conservative fallback.
+pub fn literal_command_words(script: &str) -> Option<Vec<String>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(script, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let src = script.as_bytes();
+    let mut words = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "command" {
+            let args = literal_arguments(&node, src);
+            // Nested `sh -c 'body'`: the body's words are what actually runs.
+            let program = node
+                .child_by_field_name("name")
+                .and_then(|n| resolve_command_name(&n, src));
+            if let Some(program) = &program
+                && is_shell_wrapper_program(program)
+                && let Some(pos) = args
+                    .iter()
+                    .position(|a| a.as_deref().is_some_and(is_shell_c_flag))
+                && let Some(Some(body)) = args.get(pos + 1)
+                && let Some(mut inner) = literal_command_words(body)
+            {
+                words.append(&mut inner);
+                continue;
+            }
+            words.extend(args.into_iter().flatten());
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(words)
+}
+
 #[cfg(test)]
 mod tests {
     //! Pins the *internal* contract of [`classify_bash_script`]: which inputs
