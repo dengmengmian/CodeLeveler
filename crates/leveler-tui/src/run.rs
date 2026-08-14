@@ -351,7 +351,7 @@ pub async fn run(
 
     // Persist (or clear) the composer draft for next launch (spec §24).
     if let Some(path) = state.draft_path() {
-        let draft = state.composer.text();
+        let draft = state.composer.canonical_text();
         if draft.trim().is_empty() {
             let _ = std::fs::remove_file(path);
         } else if let Some(parent) = path.parent() {

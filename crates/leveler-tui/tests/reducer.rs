@@ -4663,3 +4663,220 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
         "elapsed survives reconnect"
     );
 }
+
+// ── R004 F1: paste placeholders are presentation-only; every submit path must
+// expand them back to canonical content (§R004 Harness Repair Gate) ──────────
+
+const BIG_PASTE: &str = "line one\nline two\n第三行中文\n\n    indented\nfinal line";
+
+#[test]
+fn slash_goal_expands_large_paste_to_canonical_content() {
+    let mut s = opened();
+    typed(&mut s, "/goal ");
+    reduce(&mut s, Action::Paste(BIG_PASTE.into()));
+    // The composer shows a chip, not the content (presentation).
+    assert!(
+        s.composer.text().contains("[Pasted:"),
+        "precondition: chip in buffer: {}",
+        s.composer.text()
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunGoal { content, .. })] if content == BIG_PASTE
+        ),
+        "/goal must submit the pasted content, not the placeholder: {effects:?}"
+    );
+}
+
+#[test]
+fn steering_expands_large_paste_to_canonical_content() {
+    let mut s = busy_state();
+    typed(&mut s, "context: ");
+    reduce(&mut s, Action::Paste(BIG_PASTE.into()));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let want = format!("context: {BIG_PASTE}");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SteerCurrentTurn { content, .. })] if content == &want
+        ),
+        "steering must carry the pasted content: {effects:?}"
+    );
+}
+
+#[test]
+fn bang_shell_expands_large_paste_to_canonical_content() {
+    let mut s = opened();
+    typed(&mut s, "!");
+    reduce(&mut s, Action::Paste(BIG_PASTE.into()));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunUserShell { command, .. })] if command == BIG_PASTE
+        ),
+        "! shell must run the pasted command text: {effects:?}"
+    );
+}
+
+#[test]
+fn btw_expands_large_paste_to_canonical_content() {
+    let mut s = busy_state();
+    typed(&mut s, "/btw ");
+    reduce(&mut s, Action::Paste(BIG_PASTE.into()));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let text = format!("{effects:?}");
+    assert!(
+        text.contains("line two") && !text.contains("[Pasted:"),
+        "/btw must carry pasted content, not the chip: {effects:?}"
+    );
+}
+
+/// T2: a user who literally TYPES placeholder-looking text gets it delivered
+/// verbatim — the chip is a composer artifact, not a reserved syntax.
+#[test]
+fn typed_placeholder_text_is_delivered_literally() {
+    let mut s = opened();
+    typed(&mut s, "[Pasted: 5 lines]");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content == "[Pasted: 5 lines]"
+        ),
+        "typed literal must stay literal: {effects:?}"
+    );
+}
+
+// ── R004 F2: input while a clarification is on screen answers the question ──
+
+#[test]
+fn paste_while_clarification_overlay_open_fills_the_answer() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ClarificationRequested {
+            request: leveler_client_protocol::UiClarificationRequest {
+                id: leveler_core::ClarificationId::new("c1"),
+                question: "task content?".into(),
+                options: vec![],
+            },
+        }),
+    );
+    assert!(matches!(s.overlay, Some(Overlay::Clarification(_))));
+    reduce(
+        &mut s,
+        Action::Paste("line a\nline b\nline c\nline d\nline e\nline f".into()),
+    );
+    // The paste must land in the overlay's answer, not the composer.
+    let Some(Overlay::Clarification(ov)) = &s.overlay else {
+        panic!("overlay closed unexpectedly");
+    };
+    assert!(
+        ov.input().contains("line a") && ov.input().contains("line f"),
+        "{}",
+        ov.input()
+    );
+    assert!(
+        s.composer.is_empty(),
+        "composer must not swallow the paste: {}",
+        s.composer.text()
+    );
+    // Enter submits the pasted answer, not an empty skip.
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let text = format!("{effects:?}");
+    assert!(
+        text.contains("AnswerClarification") && text.contains("line a"),
+        "{effects:?}"
+    );
+}
+
+/// R004 F4: a completed turn whose plan still has open steps must carry the
+/// plan progress in the turn-end summary — never a bare full-success line.
+#[test]
+fn turn_end_summary_carries_open_plan_progress() {
+    let mut s = busy_state();
+    let step = |i: usize, d: &str, st| UiPlanStep {
+        index: i,
+        description: d.to_string(),
+        status: st,
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![
+                    step(1, "根因", leveler_client_protocol::PlanStepStatus::Done),
+                    step(2, "实现", leveler_client_protocol::PlanStepStatus::Done),
+                    step(3, "测试", leveler_client_protocol::PlanStepStatus::Done),
+                    step(
+                        4,
+                        "浏览器验证",
+                        leveler_client_protocol::PlanStepStatus::Running,
+                    ),
+                ],
+            },
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::VerificationUpdated {
+            verification: leveler_client_protocol::UiVerification {
+                checks: vec![],
+                passed: Some(true),
+            },
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    let text = format!("{:?}", s.transcript.items());
+    assert!(
+        text.contains("计划 3/4"),
+        "turn-end must carry plan progress: {text}"
+    );
+}
+
+/// R004 F1 adjacent: a KNOWN slash command with a small multiline paste (below
+/// the chip threshold) must still dispatch as that command with the full
+/// multiline argument — not silently degrade to a chat message.
+#[test]
+fn slash_goal_with_small_multiline_paste_still_runs_a_goal() {
+    let mut s = opened();
+    typed(&mut s, "/goal ");
+    reduce(
+        &mut s,
+        Action::Paste("修 README\n第二行要求\n第三行要求".into()),
+    );
+    assert!(
+        !s.composer.text().contains("[Pasted:"),
+        "precondition: below chip threshold: {}",
+        s.composer.text()
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunGoal { content, .. })]
+                if content == "修 README\n第二行要求\n第三行要求"
+        ),
+        "multiline /goal must stay a goal: {effects:?}"
+    );
+}
+
+/// The unknown-command guard keeps its old scope: multiline text starting with
+/// an unknown /token is an ordinary message, never swallowed.
+#[test]
+fn multiline_unknown_slash_prefix_stays_a_message() {
+    let mut s = opened();
+    typed(&mut s, "/usr/local/bin notes");
+    reduce(&mut s, Action::Paste("\nline2\nline3".into()));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content.contains("line3")
+        ),
+        "{effects:?}"
+    );
+}

@@ -650,6 +650,12 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
     }
     // Unverified / incomplete / failed / cancelled: no success verify mark.
     let allow_success_verify = matches!(status, TurnEndStatus::Completed | TurnEndStatus::Answered);
+    // Open plan steps travel with the summary: a green gate line must not read
+    // as full task success while the plan panel says work remains (R004 F4).
+    let plan_open = state.plan.as_ref().and_then(|p| {
+        let (k, n) = crate::workbench::plan_done_total(p);
+        (n > 0 && k < n).then_some((k, n))
+    });
     if let Some(v) = &state.verification {
         if let Some(passed) = v.passed {
             if passed {
@@ -682,6 +688,9 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
                 .count();
             parts.push(format!("verify {ok}/{}", v.checks.len()));
         }
+    }
+    if let Some((k, n)) = plan_open {
+        parts.push(format!("计划 {k}/{n}"));
     }
     if parts.is_empty() {
         None

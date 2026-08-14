@@ -347,13 +347,24 @@ impl Composer {
 
     // ---- history ------------------------------------------------------------
 
+    /// The buffer with paste placeholders expanded back to their real content.
+    /// `text()` is presentation (chips stay chips); THIS is the canonical form
+    /// that submission paths must use — a placeholder is never user content.
+    /// Each pending paste replaces its chip once, oldest first.
+    pub fn canonical_text(&self) -> String {
+        let mut text = self.buffer.clone();
+        for paste in &self.pending_pastes {
+            text = text.replacen(&paste.placeholder, &paste.content, 1);
+        }
+        text
+    }
+
     /// Take the buffer for submission: clears it and records it in history
     /// (skipping empty and consecutive-duplicate entries, ).
     pub fn take(&mut self) -> String {
-        let mut text = std::mem::take(&mut self.buffer);
-        for paste in std::mem::take(&mut self.pending_pastes) {
-            text = text.replace(&paste.placeholder, &paste.content);
-        }
+        let text = self.canonical_text();
+        self.buffer.clear();
+        self.pending_pastes.clear();
         self.cursor = 0;
         self.history_index = None;
         self.stash = None;

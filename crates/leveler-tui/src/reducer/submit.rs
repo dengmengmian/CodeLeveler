@@ -24,42 +24,67 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     // User shell escape: the RAW composer's first character is `!` — no
     // leading-whitespace trim, so " !cargo test" stays a normal message and
     // ordinary prose can never execute. Never reaches the model.
-    if let Some(cmd) = state.composer.text().strip_prefix('!') {
-        let cmd = cmd.to_string();
+    if state.composer.text().starts_with('!') {
+        // Command content comes from the canonical form so a pasted script
+        // runs as pasted, not as its `[Pasted: N lines]` chip (R004 F1).
+        let canonical = state.composer.canonical_text();
+        let cmd = canonical
+            .strip_prefix('!')
+            .unwrap_or(&canonical)
+            .to_string();
         return submit_user_shell(state, cmd);
     }
     let text = state.composer.text().trim().to_string();
     if text.is_empty() {
         return Vec::new();
     }
-    // A single line starting with a KNOWN `/command` is a local slash command,
-    // parsed locally and never sent to the model. An unknown `/xxx` keeps the
-    // composer content (so a typo or a path-like message is never swallowed).
-    if let Some(rest) = text.strip_prefix('/')
-        && !text.contains('\n')
-    {
-        let name = rest.split_whitespace().next().unwrap_or("");
+    // A FIRST LINE starting with a KNOWN `/command` is a local slash command,
+    // parsed locally and never sent to the model — its argument may span
+    // multiple lines (a small pasted goal below the chip threshold must not
+    // silently degrade `/goal` into a chat message; R004 F1-adjacent). The
+    // unknown-`/xxx` guard keeps its single-line scope so a typo or path-like
+    // multiline message is never swallowed.
+    if let Some(rest) = text.strip_prefix('/') {
+        let name = rest
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
         refresh_skill_catalog(state);
         if crate::screen::is_known_slash_token(name) {
             // /clear confirm arming is handled inside; other commands disarm.
             if name != "clear" && name != "new" {
                 state.clear_confirm_armed = false;
             }
-            state.composer.take();
-            return handle_slash(state, rest.trim());
+            // `take()` returns the canonical content (paste chips expanded);
+            // slash ARGUMENTS must come from it, not from the raw buffer, or
+            // a pasted goal/question degrades to its placeholder (R004 F1).
+            // Detection above stays on the raw single-line presentation.
+            let expanded = state.composer.take();
+            let expanded = expanded.trim();
+            let rest_expanded = expanded.strip_prefix('/').unwrap_or(expanded);
+            return handle_slash(state, rest_expanded.trim());
         }
         // Project/user skills are first-class: `/code-review` ≡ `/skill code-review`.
         if crate::screen::is_skill_slash_token(state, name) {
             state.clear_confirm_armed = false;
-            state.composer.take();
-            let task = rest.strip_prefix(name).unwrap_or("").trim().to_string();
+            let expanded = state.composer.take();
+            let expanded = expanded.trim();
+            let rest_expanded = expanded.strip_prefix('/').unwrap_or(expanded);
+            let task = rest_expanded
+                .strip_prefix(name)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             return run_named_skill(state, name, &task);
         }
         state.clear_confirm_armed = false;
-        // Reserve unknown-command feedback for command-shaped typos such as
-        // `/hlep`. Absolute paths (`/Users/...`), file names, and other
-        // slash-prefixed prose are ordinary messages.
-        if looks_like_unknown_slash_command(name) {
+        // Reserve unknown-command feedback for SINGLE-LINE command-shaped
+        // typos such as `/hlep`. Absolute paths (`/Users/...`), file names,
+        // and multiline slash-prefixed prose are ordinary messages.
+        if !text.contains('\n') && looks_like_unknown_slash_command(name) {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
                 message: format!("未知命令: /{name}（内容已保留，/help 查看命令）"),
@@ -74,8 +99,7 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         // finished. The runtime injects it at the top of the next round, and
         // falls back to an ordinary submission if the turn ended in the
         // meantime — so nothing typed is ever lost.
-        let text = state.composer.text().trim().to_string();
-        state.composer.take();
+        let text = state.composer.take().trim().to_string();
         if text.is_empty() {
             return Vec::new();
         }
