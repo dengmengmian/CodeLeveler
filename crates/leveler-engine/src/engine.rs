@@ -155,8 +155,14 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
         S::Incomplete
     } else {
         match report.outcome {
-            TaskOutcome::Verified if did_work => S::Completed,
-            TaskOutcome::CompletedUnverified if did_work => S::CompletedUnverified,
+            // A guard-forced Incomplete stop keeps its honest terminal status:
+            // gate-green describes the tree, not task completion (R004 F4).
+            TaskOutcome::Verified if did_work && report.stop_reason != S::Incomplete => {
+                S::Completed
+            }
+            TaskOutcome::CompletedUnverified if did_work && report.stop_reason != S::Incomplete => {
+                S::CompletedUnverified
+            }
             _ => report.stop_reason,
         }
     };
@@ -1494,7 +1500,20 @@ impl TaskEngine {
             ),
             has_mutation: !outcome.modified_files.is_empty(),
         };
-        let task_outcome = map_completion_verdict(finalize_task_outcome(&report, expected));
+        let mut task_outcome = map_completion_verdict(finalize_task_outcome(&report, expected));
+        // Terminal audit applies the same open-todo rule readiness::check
+        // enforces on the model's own completion claim: green gates over a plan
+        // with open steps is healthy-tree evidence, not task completion. An
+        // honest model that DECLINES to claim completion must not receive a
+        // better verdict than one that claims it (R004 F4).
+        if task_outcome == TaskOutcome::Verified
+            && let Ok(Some(plan)) =
+                crate::turn::last_persisted_plan(runner.stores.events.as_ref(), &runner.session_id)
+                    .await
+            && plan.has_incomplete_model_todos()
+        {
+            task_outcome = TaskOutcome::CompletedUnverified;
+        }
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
             verification: Some(report),
@@ -1858,6 +1877,37 @@ mod continue_cap_tests {
             &BudgetExhaustion::new(BudgetDimension::ModelTokens, 100, 100),
         );
         assert_eq!(next.max_model_tokens, Some(150));
+    }
+
+    /// R004 F4: `terminal_status_for` must not launder a guard-forced
+    /// Incomplete stop into a Completed session because the gates were green.
+    #[test]
+    fn incomplete_stop_keeps_session_incomplete_even_when_verified() {
+        let report = TaskReport {
+            outcome: TaskOutcome::Verified,
+            final_text: String::new(),
+            modified_files: vec!["a.rs".into()],
+            verification: None,
+            stop_reason: leveler_agent::StopReason::Incomplete,
+            stop_detail: None,
+            rounds: 1,
+            review: None,
+        };
+        let (status, _) = terminal_status_for(&report);
+        assert_eq!(status, SessionStatus::Incomplete);
+
+        let clean = TaskReport {
+            stop_reason: leveler_agent::StopReason::Completed,
+            outcome: TaskOutcome::Verified,
+            final_text: String::new(),
+            modified_files: vec!["a.rs".into()],
+            verification: None,
+            stop_detail: None,
+            rounds: 1,
+            review: None,
+        };
+        let (status, _) = terminal_status_for(&clean);
+        assert_eq!(status, SessionStatus::Completed);
     }
 
     #[test]

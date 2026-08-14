@@ -502,7 +502,7 @@ async fn last_event_of_type(
 }
 
 /// Last full-list plan from the event log (SoT for resume PlanState).
-async fn last_persisted_plan(
+pub(crate) async fn last_persisted_plan(
     events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_agent::PlanState>, EngineError> {
