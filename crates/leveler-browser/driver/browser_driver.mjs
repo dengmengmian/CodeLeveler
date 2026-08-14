@@ -155,6 +155,28 @@ async function loopbackAllowedForPage(page) {
   return false;
 }
 
+// A loopback ws target is allowed only if some granted page's live top-level
+// origin is loopback AND its port equals the ws port (R004 F6).
+function wsLoopbackAllowed(wsUrl) {
+  let target;
+  try {
+    target = new URL(wsUrl);
+  } catch {
+    return false;
+  }
+  for (const id of loopbackGrant) {
+    const page = pages.get(id);
+    if (!page) continue;
+    try {
+      const u = new URL(page.mainFrame().url());
+      if (urlHostIsLoopbackLiteral(page.mainFrame().url()) && u.port === target.port) return true;
+    } catch {
+      /* frame gone */
+    }
+  }
+  return false;
+}
+
 function pageOf(req) {
   try {
     const frame = req.frame();
@@ -165,8 +187,10 @@ function pageOf(req) {
 }
 
 // ── the egress proxy: the single connect-time authority ───────────────────────
-function recordBlock(target, reason) {
-  lastBlock = { url: target, reason, at: Date.now() };
+function recordBlock(target, reason, kind = 'http') {
+  // `kind` keeps ws-gate blocks from being misattributed to unrelated HTTP
+  // actions (a vite page retries its HMR ws every few seconds — R004 F6).
+  lastBlock = { url: target, reason, at: Date.now(), kind };
   event({ kind: 'blocked_request', url: target, reason });
 }
 
@@ -364,7 +388,19 @@ async function installWsGate(ctx) {
       return;
     }
     if (isLoopbackLiteralHost(host)) {
-      recordBlock(ws.url(), 'loopback WebSocket is not permitted in V1');
+      // Grant-scoped (R004 F6): a loopback ws is permitted only when a
+      // currently-granted loopback dev page exists whose origin port matches
+      // the ws target (vite HMR: same port as the page). Strictly narrower
+      // than the HTTP loopback allowance — no new egress class.
+      if (wsLoopbackAllowed(ws.url())) {
+        try {
+          ws.connectToServer();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      recordBlock(ws.url(), 'loopback WebSocket without a granted dev page', 'ws');
       try {
         ws.close();
       } catch {
@@ -404,7 +440,7 @@ async function safeContinue(route) {
 // If an action failed because the gate refused a request within the grace window,
 // turn the opaque net error into a typed `denied` — never a silent success.
 function blockedOr(err) {
-  if (lastBlock && Date.now() - lastBlock.at < 3000) {
+  if (lastBlock && lastBlock.kind === 'http' && Date.now() - lastBlock.at < 3000) {
     const denied = new Error(`SSRF policy blocked ${lastBlock.url} (${lastBlock.reason})`);
     denied.kind = 'denied';
     lastBlock = null;
@@ -416,7 +452,7 @@ function blockedOr(err) {
 // A block that landed within the grace window, for surfacing on a non-navigating
 // action (e.g. a link click whose navigation was refused). Consumes the record.
 function takeRecentBlock() {
-  if (lastBlock && Date.now() - lastBlock.at < 3000) {
+  if (lastBlock && lastBlock.kind === 'http' && Date.now() - lastBlock.at < 3000) {
     const r = lastBlock.reason;
     lastBlock = null;
     return r;
@@ -625,6 +661,39 @@ const methods = {
       title: await titleSafe(page),
       navigated: page.url() !== urlBefore,
       newPage,
+      ...(blocked ? { blocked } : {}),
+    };
+  },
+
+  async drag(p) {
+    const page = requirePage(p.pageId);
+    const loc = page.locator('aria-ref=' + p.ref);
+    const timeout = p.timeoutMs || 15000;
+    const urlBefore = page.url();
+    try {
+      if (p.toRef) {
+        await loc.dragTo(page.locator('aria-ref=' + p.toRef), { timeout });
+      } else {
+        const box = await loc.boundingBox({ timeout });
+        if (!box) throw new Error('element has no visible bounding box to drag from');
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+        // Stepped moves make canvas mousemove/pointermove handlers fire; a
+        // single jump often draws nothing.
+        const steps = Math.max(1, Math.min(100, p.steps || 12));
+        await page.mouse.move(cx, cy);
+        await page.mouse.down();
+        await page.mouse.move(cx + (p.dx || 0), cy + (p.dy || 0), { steps });
+        await page.mouse.up();
+      }
+    } catch (e) {
+      throw blockedOr(e);
+    }
+    const blocked = takeRecentBlock();
+    return {
+      url: page.url(),
+      title: await titleSafe(page),
+      navigated: page.url() !== urlBefore,
       ...(blocked ? { blocked } : {}),
     };
   },

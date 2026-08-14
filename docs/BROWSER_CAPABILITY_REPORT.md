@@ -134,7 +134,10 @@ proxy the target, so **the proxy is the sole resolver and connector**:
 There is no path where Chromium connects directly to a rebind-capable host. The
 driver bridge ships in the binary and is re-synced to disk on every runtime start,
 so the boundary reaches existing installs on upgrade. Scope notes (recorded, not
-claimed away): loopback WebSockets (e.g. Vite HMR) are refused in V1; public
+claimed away): loopback WebSockets are **grant-scoped** since the R004 Harness
+Repair Gate — a granted loopback dev page may open a ws to its own origin/port
+(the Vite-HMR class); any other loopback ws stays refused, and ws-gate blocks
+are tagged so they are never misattributed to unrelated HTTP actions; public
 `ws://` (plaintext) fails closed (wss works); and a public site is only reachable
 when the machine has real network egress (the context inherits no system proxy).
 
@@ -265,8 +268,9 @@ Zero across all three dogfoods (the only `run_command` uses were the legitimate
     workers. See §Q.
 - **NEXT** (out of V1): a dedicated `Browser` ToolKind for TUI grouping; refless
   page-level key press; multi-tab agent ergonomics; managed Node download when no
-  system Node; loopback-WebSocket support (e.g. Vite HMR) behind the page grant;
-  public `ws://` relay through the proxy. (The live daemon-hosted disconnect/
+  system Node; public `ws://` relay through the proxy. (Loopback-WebSocket
+  support behind the page grant is DONE — R004 Harness Repair Gate, with a
+  same-port own-origin rule and a live ws-echo regression.) (The live daemon-hosted disconnect/
   reconnect E2E is DONE — see §T; the network boundary is now the single proxy
   authority — see §Q.)
 

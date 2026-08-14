@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Structured browser automation domain: runtime, managed driver, semantic snapshots, and safe element refs."
 
 [dependencies]
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,4 +20,6 @@ tracing = { workspace = true }
 fs2 = { workspace = true }
 
 [dev-dependencies]
+sha1 = "0.10"
+base64 = { workspace = true }
 tempfile = "3"

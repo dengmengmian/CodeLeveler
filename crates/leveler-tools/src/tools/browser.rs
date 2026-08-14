@@ -273,6 +273,20 @@ ref_input!(PressInput {
     /// Key to press, e.g. "Enter", "Escape", "ArrowDown".
     key: String,
 });
+ref_input!(DragInput {
+    /// Target [ref=…] to drop onto (drag-and-drop). Omit when using dx/dy.
+    #[serde(default)]
+    to_ref: Option<String>,
+    /// Horizontal drag distance in pixels from the element's center.
+    #[serde(default)]
+    dx: Option<f64>,
+    /// Vertical drag distance in pixels from the element's center.
+    #[serde(default)]
+    dy: Option<f64>,
+    /// Intermediate mouse-move steps (default 12; canvas handlers need >1).
+    #[serde(default)]
+    steps: Option<u32>,
+});
 
 async fn run_interaction(
     context: &ToolContext,
@@ -317,6 +331,47 @@ impl Tool for BrowserClickTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: ClickInput = super::parse_input(self.name(), input)?;
         Ok(run_interaction(&context, input.page, &input.r#ref, Interaction::Click).await)
+    }
+}
+
+pub struct BrowserDragTool;
+#[async_trait]
+impl Tool for BrowserDragTool {
+    fn name(&self) -> &'static str {
+        "browser_drag"
+    }
+    fn description(&self) -> &'static str {
+        "Drag from a [ref=…] element: either onto `to_ref` (drag-and-drop) or \
+         by a pixel offset `dx`/`dy` from its center (canvas drawing). Exactly \
+         one target form must be given."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        super::schema_of::<DragInput>()
+    }
+    fn risk(&self) -> RiskLevel {
+        RiskLevel::Network
+    }
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: ToolContext,
+        _cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        let input: DragInput = super::parse_input(self.name(), input)?;
+        let has_offset = input.dx.is_some() || input.dy.is_some();
+        if input.to_ref.is_some() == has_offset {
+            return Ok(ToolOutput::error(
+                "browser_drag needs exactly one target: `to_ref` (drop onto an \
+                 element) OR `dx`/`dy` (drag by an offset).",
+            ));
+        }
+        let action = Interaction::Drag {
+            to_ref: input.to_ref,
+            dx: input.dx.unwrap_or(0.0),
+            dy: input.dy.unwrap_or(0.0),
+            steps: input.steps.unwrap_or(12).clamp(1, 100),
+        };
+        Ok(run_interaction(&context, input.page, &input.r#ref, action).await)
     }
 }
 

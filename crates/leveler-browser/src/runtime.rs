@@ -90,6 +90,21 @@ impl BrowserRuntime {
     /// Ensure a driver + browser are live, installing the managed runtime on
     /// first use. Idempotent and singleflighted (the `inner` mutex in-process,
     /// an `fs2` install lock cross-process). Returns non-sensitive runtime info.
+    /// Graceful daemon-shutdown teardown: if a driver is live, ask it to close
+    /// its context/proxy and then reap its whole process group (Chrome
+    /// included). Lifetime stays daemon-scoped — this is only for the moments
+    /// the daemon itself goes away (Quit, SIGTERM, explicit exit) so the
+    /// browser tree can never outlive its owner (R004 F7).
+    pub async fn shutdown(&self) {
+        let active = { self.inner.lock().await.take() };
+        if let Some(active) = active {
+            active
+                .driver
+                .shutdown(std::time::Duration::from_secs(3))
+                .await;
+        }
+    }
+
     pub async fn ensure_ready(&self) -> Result<BrowserRuntimeInfo, BrowserError> {
         let mut guard = self.inner.lock().await;
         if let Some(a) = guard.as_ref()
@@ -322,6 +337,23 @@ impl BrowserRuntime {
         params["pageId"] = json!(page.as_str());
         params["ref"] = json!(token);
         params["timeoutMs"] = json!(ACTION_TIMEOUT.as_millis());
+        // A drag target ref is generation-validated like the source: a stale
+        // target must fail as RefStale, never silently retarget (R004 F5).
+        if let Interaction::Drag {
+            to_ref: Some(to_ref),
+            ..
+        } = &action
+        {
+            let (to_gen, to_token) = parse_ref(to_ref)
+                .ok_or_else(|| BrowserError::RefStale(format!("unparseable ref {to_ref}")))?;
+            if to_gen != st.generation || !st.tokens.contains(&to_token) {
+                return Err(BrowserError::RefStale(format!(
+                    "ref {to_ref} is not current (page generation {})",
+                    st.generation
+                )));
+            }
+            params["toRef"] = json!(to_token);
+        }
         let res = active
             .driver
             .request(&method, params, ACTION_TIMEOUT + Duration::from_secs(5))
@@ -559,6 +591,15 @@ pub enum Interaction {
     Press {
         key: String,
     },
+    /// Drag from the element to another ref, or by a pixel offset (canvas
+    /// drawing, drag-and-drop). Exactly one of `to_ref` / offset is used;
+    /// the tool layer validates the shape (R004 F5).
+    Drag {
+        to_ref: Option<String>,
+        dx: f64,
+        dy: f64,
+        steps: u32,
+    },
 }
 
 impl Interaction {
@@ -571,6 +612,12 @@ impl Interaction {
                 json!({"values": values, "by": if *by_value {"value"} else {"label"}}),
             ),
             Self::Press { key } => ("press".into(), json!({"key": key})),
+            // `to_ref` is NOT serialized here: the runtime validates it against
+            // the current generation and injects the bare token in `interact`,
+            // exactly like the primary ref (never an unvalidated pass-through).
+            Self::Drag { dx, dy, steps, .. } => {
+                ("drag".into(), json!({"dx": dx, "dy": dy, "steps": steps}))
+            }
         }
     }
 }

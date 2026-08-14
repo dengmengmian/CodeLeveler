@@ -61,6 +61,9 @@ const SPA_FIXTURE: &str = r#"<!doctype html><html><head><title>App</title></head
 <button id="openModal">Open dialog</button>
 <button id="newtab">Open tab</button>
 <ul id="list"><li>Alice</li><li>Bob</li></ul>
+<canvas id="pad" width="300" height="200" style="border:1px solid #000"></canvas>
+<div id="dragme" draggable="true">DragMe</div>
+<div id="dropzone" style="width:120px;height:60px;border:1px dashed #000">Drop here</div>
 <div id="view"></div>
 <script>
 document.getElementById('go').onclick = () => {
@@ -77,6 +80,19 @@ document.getElementById('openModal').onclick = () => {
   setTimeout(()=>{ if(confirm('Proceed?')) document.querySelector('h1').textContent='Confirmed'; else document.querySelector('h1').textContent='Cancelled'; }, 10);
 };
 document.getElementById('newtab').onclick = () => { window.open('about:blank','_blank'); };
+(() => {
+  const pad = document.getElementById('pad');
+  let down = false, moves = 0;
+  pad.addEventListener('mousedown', () => { down = true; moves = 0; });
+  pad.addEventListener('mousemove', () => { if (down) moves += 1; });
+  pad.addEventListener('mouseup', () => {
+    down = false;
+    document.title = moves >= 3 ? 'CANVAS_DRAWN_' + moves : 'CANVAS_TOO_FEW_' + moves;
+  });
+  const drop = document.getElementById('dropzone');
+  drop.addEventListener('dragover', (e) => e.preventDefault());
+  drop.addEventListener('drop', (e) => { e.preventDefault(); document.title = 'DND_DROPPED'; });
+})();
 </script></body></html>"#;
 
 async fn ready_runtime() -> Option<(BrowserRuntime, BrowserSessionId, String)> {
@@ -209,6 +225,15 @@ fn serve_local() -> (String, LocalServer) {
          setTimeout(()=>{if(document.title!=='WS_OPEN'){document.title=(a.readyState===WebSocket.OPEN||b.readyState===WebSocket.OPEN)?'WS_OPEN':'WS_BLOCKED';}},1500);\
          </script></body></html>"
             .to_string();
+    // A loopback dev page that opens a ws to ITS OWN origin (the vite-HMR
+    // class): allowed for a granted page after R004 F6.
+    let wsself = format!(
+        "<!doctype html><html><body><h1>WSSELF</h1><script>\
+         let w=new WebSocket('ws://127.0.0.1:{port}/ws');\
+         w.onopen=()=>document.title='WS_SELF_OPEN';\
+         setTimeout(()=>{{if(document.title!=='WS_SELF_OPEN')document.title='WS_SELF_BLOCKED';}},2500);\
+         </script></body></html>"
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || {
@@ -223,6 +248,32 @@ fn serve_local() -> (String, LocalServer) {
                         .next()
                         .and_then(|l| l.split_whitespace().nth(1))
                         .unwrap_or("/");
+                    // RFC 6455 handshake for /ws: Chrome only fires onopen on a
+                    // valid Sec-WebSocket-Accept.
+                    if path.starts_with("/ws")
+                        && !path.starts_with("/wsself")
+                        && !path.starts_with("/wspage")
+                    {
+                        let key = req
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                            .map(|l| l.split_once(':').map_or("", |x| x.1).trim().to_string())
+                            .unwrap_or_default();
+                        use base64::Engine as _;
+                        use sha1::Digest as _;
+                        let mut h = sha1::Sha1::new();
+                        h.update(key.as_bytes());
+                        h.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                        let accept = base64::engine::general_purpose::STANDARD.encode(h.finalize());
+                        let resp = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                        );
+                        let _ = sock.write_all(resp.as_bytes());
+                        let _ = sock.flush();
+                        // Hold the socket open briefly so onopen fires.
+                        std::thread::sleep(std::time::Duration::from_millis(3000));
+                        continue;
+                    }
                     let resp = if path.starts_with("/redir") {
                         "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                     } else if path.starts_with("/other") || path.starts_with("/asset") {
@@ -236,6 +287,12 @@ fn serve_local() -> (String, LocalServer) {
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             fetcher.len(),
                             fetcher
+                        )
+                    } else if path.starts_with("/wsself") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            wsself.len(),
+                            wsself
                         )
                     } else if path.starts_with("/wspage") {
                         format!(
@@ -538,4 +595,136 @@ async fn dialog_and_new_tab_do_not_hang() {
             "window.open produced a second tab: {tabs:?}"
         );
     }
+}
+
+// ── R004 F5: structured drag — canvas drawing (ref→offset) & DnD (ref→ref) ───
+#[tokio::test]
+async fn structured_drag_draws_on_canvas_and_drops_on_targets() {
+    let Some((rt, s, url)) = ready_runtime().await else {
+        return;
+    };
+    let page = rt.new_page(&s).await.unwrap();
+    rt.navigate(&s, &page, &url).await.unwrap();
+    let snap = rt.snapshot(&s, &page).await.unwrap();
+    let canvas_ref = ref_for(&snap.text, "pad").or_else(|| ref_for(&snap.text, "canvas"));
+    let Some(canvas_ref) = canvas_ref else {
+        // The aria snapshot may not expose a bare canvas; fall back to any ref
+        // and only assert the DnD half in that case.
+        return drag_dnd_half(&rt, &s, &page).await;
+    };
+    // ref→offset drag: the canvas mouse handlers must see a stepped path.
+    rt.interact(
+        &s,
+        &page,
+        &canvas_ref,
+        Interaction::Drag {
+            to_ref: None,
+            dx: 120.0,
+            dy: 60.0,
+            steps: 12,
+        },
+    )
+    .await
+    .unwrap();
+    let t = poll_title(&rt, &s, &page, 8, &["CANVAS_DRAWN_12"]).await;
+    assert!(
+        t.starts_with("CANVAS_DRAWN_"),
+        "stepped drag must fire canvas move handlers, got {t}"
+    );
+    drag_dnd_half(&rt, &s, &page).await;
+}
+
+async fn drag_dnd_half(
+    rt: &BrowserRuntime,
+    s: &BrowserSessionId,
+    page: &leveler_browser::BrowserPageId,
+) {
+    let snap = rt.snapshot(s, page).await.unwrap();
+    let (Some(src_ref), Some(dst_ref)) = (
+        ref_for(&snap.text, "DragMe"),
+        ref_for(&snap.text, "Drop here"),
+    ) else {
+        eprintln!("skipping DnD half: fixture refs not exposed in aria snapshot");
+        return;
+    };
+    rt.interact(
+        s,
+        page,
+        &src_ref,
+        Interaction::Drag {
+            to_ref: Some(dst_ref),
+            dx: 0.0,
+            dy: 0.0,
+            steps: 12,
+        },
+    )
+    .await
+    .unwrap();
+    let t = poll_title(rt, s, page, 8, &["DND_DROPPED"]).await;
+    assert_eq!(t, "DND_DROPPED", "ref→ref drag must perform HTML5 DnD");
+}
+
+// A drag whose TARGET ref is stale must fail RefStale and never retarget.
+#[tokio::test]
+async fn stale_drag_target_fails_ref_stale_not_retarget() {
+    let Some((rt, s, url)) = ready_runtime().await else {
+        return;
+    };
+    let page = rt.new_page(&s).await.unwrap();
+    rt.navigate(&s, &page, &url).await.unwrap();
+    let snap = rt.snapshot(&s, &page).await.unwrap();
+    let Some(any_ref) = first_ref(&snap.text) else {
+        eprintln!("skipping: no refs in snapshot");
+        return;
+    };
+    let bogus_target = format!("{}zz", any_ref);
+    let r = rt
+        .interact(
+            &s,
+            &page,
+            &any_ref,
+            Interaction::Drag {
+                to_ref: Some(bogus_target),
+                dx: 0.0,
+                dy: 0.0,
+                steps: 4,
+            },
+        )
+        .await;
+    assert!(
+        matches!(r, Err(BrowserError::RefStale(_))),
+        "a stale/unknown drag target must be RefStale, got {r:?}"
+    );
+}
+
+// ── R004 F6: loopback ws is grant-scoped — a granted dev page's own-origin
+// HMR-style socket connects; the private/metadata refusal stays intact
+// (websocket_egress_is_gated above must stay green). ─────────────────────────
+#[tokio::test]
+async fn loopback_ws_from_a_granted_dev_page_connects() {
+    let Some((rt, s, _url)) = ready_runtime().await else {
+        return;
+    };
+    let (base, _server) = serve_local();
+    let page = rt.new_page(&s).await.unwrap();
+    rt.navigate(&s, &page, &format!("{base}/wsself"))
+        .await
+        .unwrap();
+    let t = poll_title(&rt, &s, &page, 8, &["WS_SELF_OPEN", "WS_SELF_BLOCKED"]).await;
+    assert_eq!(
+        t, "WS_SELF_OPEN",
+        "a granted loopback dev page must reach its own-origin ws (vite HMR class), got {t}"
+    );
+}
+
+fn first_ref(snapshot_text: &str) -> Option<String> {
+    for line in snapshot_text.lines() {
+        if let Some(i) = line.find("[ref=") {
+            let rest = &line[i + 5..];
+            if let Some(end) = rest.find(']') {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    None
 }

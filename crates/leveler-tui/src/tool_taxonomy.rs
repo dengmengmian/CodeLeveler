@@ -243,6 +243,14 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         visibility: ActivityVisibility::Normal,
     },
     ToolTaxonomyEntry {
+        name: "browser_drag",
+        kind: ToolKind::Execute,
+        presentation_en: "Drag",
+        presentation_zh: "拖拽",
+        read_only_default: false,
+        visibility: ActivityVisibility::Normal,
+    },
+    ToolTaxonomyEntry {
         name: "browser_type",
         kind: ToolKind::Execute,
         presentation_en: "Type",
