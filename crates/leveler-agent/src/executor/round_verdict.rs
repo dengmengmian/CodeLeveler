@@ -77,8 +77,10 @@ pub fn classify(input: &RoundInput) -> RoundVerdict {
     if input.closing && input.substantive {
         RoundVerdict::CloseoutThrash
     } else if input.pure_observe {
-        // A fresh grep with new hits is exploration, not thrash; only a repeat
-        // of an observation already made counts against the streak.
+        // A fresh grep with new hits is exploration, not thrash; only an
+        // observation THIS ROUND re-made counts against the streak (R007 F1 —
+        // `repeated_observation` is a per-round fact, never a latch over the
+        // turn's whole history).
         if input.repeated_observation {
             RoundVerdict::ObserveThrash
         } else {
@@ -190,6 +192,25 @@ mod tests {
         };
         assert_eq!(classify(&repair), RoundVerdict::NeutralPolicyBlocked);
         assert!(classify(&repair).is_neutral());
+    }
+
+    /// R007 F1: `repeated_observation` is a fact about THIS round. The caller
+    /// must never pass "some key in the whole turn history repeated once" —
+    /// that latch made every later novel observation classify as thrash and
+    /// killed a healthy Large-repo discovery phase nine minutes in.
+    #[test]
+    fn a_round_that_only_observed_new_things_is_exploring_however_old_the_turn_is() {
+        let round = RoundInput {
+            pure_observe: true,
+            // The turn repeated something earlier, but THIS round did not.
+            repeated_observation: false,
+            ..input()
+        };
+        assert_eq!(classify(&round), RoundVerdict::ObserveExploring);
+        assert!(
+            classify(&round).is_neutral(),
+            "novel observation must neither grow nor reset the kill streak"
+        );
     }
 
     #[test]
