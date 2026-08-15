@@ -771,7 +771,9 @@ mod tests {
             EngineEvent::AssistantMessage {
                 text: "and the value is password: hunter2-durable-secret".into(),
             },
-            EngineEvent::AssistantMessage { text: "done".into() },
+            EngineEvent::AssistantMessage {
+                text: "done".into(),
+            },
         ];
         for event in events {
             log.append(None, event, &mut |_| {}).await.unwrap();
@@ -784,7 +786,8 @@ mod tests {
             "gapless"
         );
         assert!(
-            rows.iter().all(|r| !r.payload.contains("hunter2-durable-secret")),
+            rows.iter()
+                .all(|r| !r.payload.contains("hunter2-durable-secret")),
             "secret must not persist"
         );
 
@@ -814,7 +817,8 @@ mod tests {
         .unwrap();
         // The exact malformed bytes R007 persisted (truncated structure),
         // injected BELOW the validating write boundary as a legacy row.
-        let corrupt = r#"{"payload":{"text":"secret PASSWORD:"[REDACTED]"type":"assistant_message"}"#;
+        let corrupt =
+            r#"{"payload":{"text":"secret PASSWORD:"[REDACTED]"type":"assistant_message"}"#;
         store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
             id: leveler_core::EventId::generate().into_inner(),
             session_id: session.as_str().to_string(),
@@ -826,7 +830,10 @@ mod tests {
             schema_version: 1,
         });
 
-        let err = log.replay().await.expect_err("corrupt row must fail closed");
+        let err = log
+            .replay()
+            .await
+            .expect_err("corrupt row must fail closed");
         let msg = err.to_string();
         assert!(msg.contains("corrupt authoritative event"), "{msg}");
         assert!(msg.contains(session.as_str()), "session provenance: {msg}");

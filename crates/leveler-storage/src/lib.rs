@@ -52,10 +52,7 @@ pub use turn_store::{MemoryTurnStore, TurnStore};
 /// payloads) must go through this boundary: the serialized-text scrubber used
 /// to swallow JSON structural bytes and persist unreplayable rows. `context`
 /// names the plane for the error message and must never contain payload bytes.
-pub(crate) fn redact_json_payload(
-    context: &str,
-    payload: &str,
-) -> Result<String, StorageError> {
+pub(crate) fn redact_json_payload(context: &str, payload: &str) -> Result<String, StorageError> {
     leveler_core::redact_secrets_json(payload).map_err(|e| {
         StorageError::InvalidData(format!(
             "refusing to persist non-JSON {context} payload: {e}"

@@ -61,8 +61,7 @@ impl<'a> EventRepository<'a> {
         // Structure-aware redaction (R007 F2): scrub string values only, never
         // the serialized document — and refuse loudly BEFORE the INSERT, so a
         // rejected payload can never corrupt the log or consume a sequence.
-        let payload =
-            crate::redact_json_payload(&format!("event (type '{event_type}')"), payload)?;
+        let payload = crate::redact_json_payload(&format!("event (type '{event_type}')"), payload)?;
         // The sequence is assigned inside the INSERT so concurrent appends on
         // one connection pool cannot race a read-then-write; the UNIQUE index on
         // (session_id, sequence) is the backstop that turns any residual race
@@ -319,7 +318,13 @@ mod tests {
         let with_secret = r#"{"payload":{"text":"add secret PASSWORD:\"hunter2-secret-value\""},"type":"assistant_message"}"#;
         for payload in [accident, with_secret] {
             let record = repo
-                .append(&session, None, "assistant_message", payload, leveler_core::now())
+                .append(
+                    &session,
+                    None,
+                    "assistant_message",
+                    payload,
+                    leveler_core::now(),
+                )
                 .await
                 .unwrap();
             let value: serde_json::Value = serde_json::from_str(&record.payload)

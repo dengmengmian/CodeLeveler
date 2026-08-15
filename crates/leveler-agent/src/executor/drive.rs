@@ -29,13 +29,13 @@ use super::dispatch::{
 };
 use super::host::AdmitError;
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor,
-    ModelRequestRecord, StopReason, TranscriptSink,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor, ModelRequestRecord, StopReason,
+    TranscriptSink,
 };
 use crate::authorization::{
     collect_scoped_paths_from_call, counts_as_verification_evidence, extract_command,
-    is_observe_result_tool, is_pure_observe_call, is_search_tool, observe_class,
-    push_unique_path, write_targets_outside_allowlist,
+    is_observe_result_tool, is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
+    write_targets_outside_allowlist,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
@@ -2069,8 +2069,7 @@ impl Executor {
                     // latch. A round that re-obtained (or was refused re-
                     // obtaining) an identical observation AND produced nothing
                     // novel is thrash; any novel observation is exploration.
-                    repeated_observation: repeated_observe_this_round
-                        && !novel_observe_this_round,
+                    repeated_observation: repeated_observe_this_round && !novel_observe_this_round,
                     had_calls: !call_snapshot.is_empty(),
                     all_denied: denied_calls_this_round == call_snapshot.len(),
                     // ALL of this round's refusals came from harness policy

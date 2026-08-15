@@ -737,7 +737,8 @@ mod tests {
     /// Numbers, bools, nulls, and keys are never rewritten.
     #[test]
     fn json_redaction_touches_only_string_values() {
-        let payload = r#"{"password_attempts":3,"ok":true,"none":null,"secret":"real-secret-value"}"#;
+        let payload =
+            r#"{"password_attempts":3,"ok":true,"none":null,"secret":"real-secret-value"}"#;
         let redacted = redact_secrets_json(payload).unwrap();
         let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
         assert_eq!(value["password_attempts"], 3);

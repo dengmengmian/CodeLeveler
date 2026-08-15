@@ -313,14 +313,21 @@ mod tests {
         let id = SessionId::new(session.id.clone());
 
         let repo = MessageRepository::new(&db);
-        repo.append(&id, &[r#""a""#.into(), r#""b""#.into()], leveler_core::now())
-            .await
-            .unwrap();
+        repo.append(
+            &id,
+            &[r#""a""#.into(), r#""b""#.into()],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
         repo.append(&id, &[r#""c""#.into()], leveler_core::now())
             .await
             .unwrap();
 
-        assert_eq!(repo.load(&id).await.unwrap(), vec![r#""a""#, r#""b""#, r#""c""#]);
+        assert_eq!(
+            repo.load(&id).await.unwrap(),
+            vec![r#""a""#, r#""b""#, r#""c""#]
+        );
     }
 
     #[tokio::test]
@@ -333,7 +340,12 @@ mod tests {
         let repo = MessageRepository::new(&db);
         repo.append(
             &id,
-            &[r#""a""#.into(), r#""b""#.into(), r#""c""#.into(), r#""d""#.into()],
+            &[
+                r#""a""#.into(),
+                r#""b""#.into(),
+                r#""c""#.into(),
+                r#""d""#.into(),
+            ],
             leveler_core::now(),
         )
         .await
@@ -377,7 +389,10 @@ mod tests {
             .unwrap();
 
         // Whole-session ordering is preserved across turns…
-        assert_eq!(repo.load(&session).await.unwrap(), vec![r#""m1""#, r#""m2""#, r#""m3""#]);
+        assert_eq!(
+            repo.load(&session).await.unwrap(),
+            vec![r#""m1""#, r#""m2""#, r#""m3""#]
+        );
         // …and each turn owns exactly its own messages.
         assert_eq!(
             repo.load_for_turn(&session, &a_id).await.unwrap(),

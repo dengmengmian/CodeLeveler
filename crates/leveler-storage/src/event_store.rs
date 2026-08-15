@@ -126,8 +126,8 @@ impl EventStore for Database {
     ) -> Result<EventRecord, crate::OwnershipError> {
         let id = leveler_core::EventId::generate().into_inner();
         // Structure-aware redaction (R007 F2): fail loud before the INSERT.
-        let payload = redact_validated(event_type, payload)
-            .map_err(crate::OwnershipError::Storage)?;
+        let payload =
+            redact_validated(event_type, payload).map_err(crate::OwnershipError::Storage)?;
         // One guarded statement: sequence assignment AND the ownership check
         // happen inside the INSERT itself, so there is no window between
         // "token verified" and "row written".
@@ -284,8 +284,8 @@ impl EventStore for MemoryEventStore {
                 "memory event store has no ownership authority configured".to_string(),
             )));
         };
-        let payload = redact_validated(event_type, payload)
-            .map_err(crate::OwnershipError::Storage)?;
+        let payload =
+            redact_validated(event_type, payload).map_err(crate::OwnershipError::Storage)?;
         // Ownership lock held across the append — no interleaved CAS window.
         ownership.with_current(token, || {
             self.append_record(session_id, turn_id, event_type, &payload, now)

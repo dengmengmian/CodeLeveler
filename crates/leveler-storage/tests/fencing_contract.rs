@@ -90,7 +90,13 @@ async fn assert_fencing_contract(
         .unwrap();
     ports
         .messages
-        .append_in_turn_owned(current, session, &turn_id, &[r#""msg-1""#.to_string()], now())
+        .append_in_turn_owned(
+            current,
+            session,
+            &turn_id,
+            &[r#""msg-1""#.to_string()],
+            now(),
+        )
         .await
         .unwrap();
 

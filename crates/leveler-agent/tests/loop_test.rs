@@ -1942,10 +1942,22 @@ async fn an_early_benign_repeat_must_not_latch_later_novel_observation_as_thrash
         assistant_tool_call("r2", "read_file", serde_json::json!({"path": "src/a.rs"})),
         // …followed by rounds of purely NOVEL observation (the W1 tail that
         // was refused and killed pre-fix).
-        assistant_tool_call("g1", "grep", serde_json::json!({"pattern": "alpha", "path": "src"})),
-        assistant_tool_call("g2", "grep", serde_json::json!({"pattern": "beta", "path": "src"})),
+        assistant_tool_call(
+            "g1",
+            "grep",
+            serde_json::json!({"pattern": "alpha", "path": "src"}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "grep",
+            serde_json::json!({"pattern": "beta", "path": "src"}),
+        ),
         assistant_tool_call("l1", "list_files", serde_json::json!({"path": "src"})),
-        assistant_tool_call("g3", "grep", serde_json::json!({"pattern": "gamma", "path": "src"})),
+        assistant_tool_call(
+            "g3",
+            "grep",
+            serde_json::json!({"pattern": "gamma", "path": "src"}),
+        ),
         assistant_text("diagnosis complete"),
     ];
     let runtime = Arc::new(MockRuntime::new(responses));
@@ -2022,7 +2034,11 @@ async fn novel_observation_is_still_allowed_after_the_forced_answer_nudge() {
         assistant_tool_call("l2", "list_files", serde_json::json!({"path": "src"})),
         assistant_tool_call("l3", "list_files", serde_json::json!({"path": "src"})),
         // The model takes the hint differently: it looks at something NEW.
-        assistant_tool_call("g1", "grep", serde_json::json!({"pattern": "beta", "path": "src"})),
+        assistant_tool_call(
+            "g1",
+            "grep",
+            serde_json::json!({"pattern": "beta", "path": "src"}),
+        ),
         assistant_text("found it"),
     ];
     let runtime = Arc::new(MockRuntime::new(responses));
@@ -2075,9 +2091,17 @@ async fn a_parallel_round_mixing_a_repeat_with_novel_work_is_not_thrash() {
         std::process::id() as u64 * 43 + 19
     ));
     std::fs::create_dir_all(dir.join("src")).unwrap();
-    for (name, sym) in [("a", "alpha"), ("b", "beta"), ("c", "gamma"), ("d", "delta")] {
-        std::fs::write(dir.join(format!("src/{name}.rs")), format!("pub fn {sym}() {{}}\n"))
-            .unwrap();
+    for (name, sym) in [
+        ("a", "alpha"),
+        ("b", "beta"),
+        ("c", "gamma"),
+        ("d", "delta"),
+    ] {
+        std::fs::write(
+            dir.join(format!("src/{name}.rs")),
+            format!("pub fn {sym}() {{}}\n"),
+        )
+        .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -2161,11 +2185,19 @@ async fn a_mixed_round_with_novel_work_is_not_thrash() {
         // the turn — that is what makes this test discriminate.
         assistant_parallel_calls(&[
             ("r3", "read_file", serde_json::json!({"path": "src/a.rs"})),
-            ("g1", "grep", serde_json::json!({"pattern": "beta", "path": "src"})),
+            (
+                "g1",
+                "grep",
+                serde_json::json!({"pattern": "beta", "path": "src"}),
+            ),
         ]),
         assistant_parallel_calls(&[
             ("r4", "read_file", serde_json::json!({"path": "src/a.rs"})),
-            ("g2", "grep", serde_json::json!({"pattern": "alpha", "path": "src"})),
+            (
+                "g2",
+                "grep",
+                serde_json::json!({"pattern": "alpha", "path": "src"}),
+            ),
         ]),
         assistant_text("done"),
     ];
@@ -2199,7 +2231,10 @@ async fn a_mixed_round_with_novel_work_is_not_thrash() {
             leveler_agent::AgentEvent::ToolResult { id, is_error: false, .. }
                 if id.as_str() == "g1")
     });
-    assert!(g1_ok, "the novel grep beside the refused repeat must execute");
+    assert!(
+        g1_ok,
+        "the novel grep beside the refused repeat must execute"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
