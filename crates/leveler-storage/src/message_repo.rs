@@ -52,7 +52,7 @@ impl<'a> MessageRepository<'a> {
         .await?;
 
         for (offset, payload) in payloads.iter().enumerate() {
-            let redacted = leveler_core::redact_secrets(payload);
+            let redacted = crate::redact_json_payload("session message", payload)?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
@@ -94,7 +94,7 @@ impl<'a> MessageRepository<'a> {
         .fetch_one(&mut *tx)
         .await?;
         for (offset, payload) in payloads.iter().enumerate() {
-            let redacted = leveler_core::redact_secrets(payload);
+            let redacted = crate::redact_json_payload("session message", payload)?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at, turn_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -153,7 +153,7 @@ impl<'a> MessageRepository<'a> {
         .await
         .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
         for (offset, payload) in payloads.iter().enumerate() {
-            let redacted = leveler_core::redact_secrets(payload);
+            let redacted = crate::redact_json_payload("session message", payload)?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at, turn_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -283,7 +283,7 @@ impl<'a> MessageRepository<'a> {
             .execute(&mut *tx)
             .await?;
         for (ordinal, payload) in payloads.iter().enumerate() {
-            let redacted = leveler_core::redact_secrets(payload);
+            let redacted = crate::redact_json_payload("session message", payload)?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
@@ -313,14 +313,14 @@ mod tests {
         let id = SessionId::new(session.id.clone());
 
         let repo = MessageRepository::new(&db);
-        repo.append(&id, &["a".into(), "b".into()], leveler_core::now())
+        repo.append(&id, &[r#""a""#.into(), r#""b""#.into()], leveler_core::now())
             .await
             .unwrap();
-        repo.append(&id, &["c".into()], leveler_core::now())
+        repo.append(&id, &[r#""c""#.into()], leveler_core::now())
             .await
             .unwrap();
 
-        assert_eq!(repo.load(&id).await.unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(repo.load(&id).await.unwrap(), vec![r#""a""#, r#""b""#, r#""c""#]);
     }
 
     #[tokio::test]
@@ -333,14 +333,14 @@ mod tests {
         let repo = MessageRepository::new(&db);
         repo.append(
             &id,
-            &["a".into(), "b".into(), "c".into(), "d".into()],
+            &[r#""a""#.into(), r#""b""#.into(), r#""c""#.into(), r#""d""#.into()],
             leveler_core::now(),
         )
         .await
         .unwrap();
 
         repo.truncate_after(&id, 2).await.unwrap();
-        assert_eq!(repo.load(&id).await.unwrap(), vec!["a", "b"]);
+        assert_eq!(repo.load(&id).await.unwrap(), vec![r#""a""#, r#""b""#]);
     }
 
     #[tokio::test]
@@ -367,25 +367,25 @@ mod tests {
         repo.append_in_turn(
             &session,
             &a_id,
-            &["m1".into(), "m2".into()],
+            &[r#""m1""#.into(), r#""m2""#.into()],
             leveler_core::now(),
         )
         .await
         .unwrap();
-        repo.append_in_turn(&session, &b_id, &["m3".into()], leveler_core::now())
+        repo.append_in_turn(&session, &b_id, &[r#""m3""#.into()], leveler_core::now())
             .await
             .unwrap();
 
         // Whole-session ordering is preserved across turns…
-        assert_eq!(repo.load(&session).await.unwrap(), vec!["m1", "m2", "m3"]);
+        assert_eq!(repo.load(&session).await.unwrap(), vec![r#""m1""#, r#""m2""#, r#""m3""#]);
         // …and each turn owns exactly its own messages.
         assert_eq!(
             repo.load_for_turn(&session, &a_id).await.unwrap(),
-            vec!["m1", "m2"]
+            vec![r#""m1""#, r#""m2""#]
         );
         assert_eq!(
             repo.load_for_turn(&session, &b_id).await.unwrap(),
-            vec!["m3"]
+            vec![r#""m3""#]
         );
     }
 
@@ -398,15 +398,15 @@ mod tests {
         let repo = MessageRepository::new(&db);
         repo.append(
             &id,
-            &["a".into(), "b".into(), "c".into()],
+            &[r#""a""#.into(), r#""b""#.into(), r#""c""#.into()],
             leveler_core::now(),
         )
         .await
         .unwrap();
-        repo.replace_all(&id, &["summary-only".into()], leveler_core::now())
+        repo.replace_all(&id, &[r#""summary-only""#.into()], leveler_core::now())
             .await
             .unwrap();
-        assert_eq!(repo.load(&id).await.unwrap(), vec!["summary-only"]);
+        assert_eq!(repo.load(&id).await.unwrap(), vec![r#""summary-only""#]);
     }
 
     #[tokio::test]

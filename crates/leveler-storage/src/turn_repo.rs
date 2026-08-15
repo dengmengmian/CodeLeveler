@@ -52,7 +52,11 @@ impl<'a> TurnRepository<'a> {
         now: Timestamp,
     ) -> Result<TurnRecord, StorageError> {
         let id = TurnId::generate().into_inner();
-        let payload = payload.map(leveler_core::redact_secrets);
+        // TurnRecord.payload is kind-specific JSON by contract — redact
+        // structure-aware and refuse non-JSON loudly (R007 F2).
+        let payload = payload
+            .map(|p| crate::redact_json_payload("turn", p))
+            .transpose()?;
         // The ordinal is assigned inside the INSERT so concurrent starts on
         // one connection pool cannot race a read-then-write.
         sqlx::query(

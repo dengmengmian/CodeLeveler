@@ -58,7 +58,11 @@ impl<'a> EventRepository<'a> {
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         let id = leveler_core::EventId::generate().into_inner();
-        let payload = leveler_core::redact_secrets(payload);
+        // Structure-aware redaction (R007 F2): scrub string values only, never
+        // the serialized document — and refuse loudly BEFORE the INSERT, so a
+        // rejected payload can never corrupt the log or consume a sequence.
+        let payload =
+            crate::redact_json_payload(&format!("event (type '{event_type}')"), payload)?;
         // The sequence is assigned inside the INSERT so concurrent appends on
         // one connection pool cannot race a read-then-write; the UNIQUE index on
         // (session_id, sequence) is the backstop that turns any residual race
@@ -297,6 +301,74 @@ mod tests {
         assert_eq!(sandbox, 0);
         assert_eq!(kind, "direct");
         assert_eq!(outcome, None);
+    }
+
+    /// R007 F2 accident regression: an assistant narration containing
+    /// `secret PASSWORD:"…"` must never persist as malformed JSON. Pre-fix,
+    /// the serialized-text scrubber swallowed the JSON string's closing quote
+    /// and the structural bytes after it; replay then hard-failed the whole
+    /// session ("unreplayable event payload"). If this test is deleted, that
+    /// exact R007 corruption can return unnoticed.
+    #[tokio::test]
+    async fn append_never_persists_malformed_json_when_redacting() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        // Byte-exact R007 corrupting shape (narration ends with `PASSWORD:` at
+        // the string boundary) + a companion shape carrying a real secret.
+        let accident = r#"{"payload":{"text":"Secrets 标签页有 \"Add new\" 按钮。点击添加 secret PASSWORD:"},"type":"assistant_message"}"#;
+        let with_secret = r#"{"payload":{"text":"add secret PASSWORD:\"hunter2-secret-value\""},"type":"assistant_message"}"#;
+        for payload in [accident, with_secret] {
+            let record = repo
+                .append(&session, None, "assistant_message", payload, leveler_core::now())
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&record.payload)
+                .expect("persisted payload must stay valid JSON");
+            assert_eq!(value["type"], "assistant_message");
+        }
+        assert!(
+            !repo.load(&session).await.unwrap()[1]
+                .payload
+                .contains("hunter2-secret-value"),
+            "secret must not persist"
+        );
+        // The whole log must stay loadable AND parseable — the replay contract.
+        for row in repo.load(&session).await.unwrap() {
+            serde_json::from_str::<serde_json::Value>(&row.payload)
+                .expect("every persisted event must parse");
+        }
+    }
+
+    /// A payload that is not valid JSON is refused loudly BEFORE any sequence
+    /// is assigned — a failed append must never leave a gap (§42).
+    #[tokio::test]
+    async fn invalid_payload_is_refused_without_consuming_a_sequence() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        repo.append(&session, None, "x", r#"{"i":1}"#, leveler_core::now())
+            .await
+            .unwrap();
+        let err = repo
+            .append(&session, None, "x", r#"{"truncated":"#, leveler_core::now())
+            .await
+            .expect_err("malformed payload must be refused");
+        assert!(
+            matches!(err, StorageError::InvalidData(_)),
+            "refusal must be the typed invalid-data error, got: {err:?}"
+        );
+        let rec = repo
+            .append(&session, None, "x", r#"{"i":2}"#, leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(rec.sequence, 2, "failed append must not consume a sequence");
+        let seqs: Vec<i64> = repo
+            .load(&session)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(seqs, vec![1, 2], "gapless after a refused append");
     }
 
     #[tokio::test]
