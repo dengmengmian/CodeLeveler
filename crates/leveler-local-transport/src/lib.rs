@@ -117,6 +117,21 @@ pub trait LocalRuntimeService: InteractiveRuntimeClient {
         request: CreateSessionRequest,
     ) -> Result<SessionBootstrap, ClientError>;
 
+    /// Re-assert the effective approval policy for an EXISTING session on
+    /// attach/resume (R006 R6-P2: `tui --session --auto-approve` silently lost
+    /// the policy). Gated at the transport exactly like `create_session`; the
+    /// default errs so test doubles and older daemons fail loudly instead of
+    /// silently downgrading.
+    async fn attach_session_policy(
+        &self,
+        _session_id: &SessionId,
+        _policy: ApprovalPolicy,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Runtime(
+            "attach_session_policy is not supported by this runtime".to_string(),
+        ))
+    }
+
     /// How many local interactive UIs are attached to this runtime right now.
     ///
     /// The remote approval timeout needs this: it must not expire a prompt while
@@ -188,6 +203,16 @@ enum WireRequest {
         #[serde(default)]
         client_kind: ClientKind,
     },
+    /// Re-assert the approval policy for an existing session on attach/resume.
+    /// Same trust gate as `CreateSession` (R006 R6-P2). Additive: daemons built
+    /// before this variant fail the request; clients surface that instead of
+    /// silently downgrading.
+    AttachSessionPolicy {
+        session_id: SessionId,
+        approval_policy: ApprovalPolicy,
+        #[serde(default)]
+        client_kind: ClientKind,
+    },
     /// How many local interactive UIs are attached. Asked by the remote agent,
     /// which cannot see this machine's terminals from its own process.
     LocalWaiters,
@@ -220,6 +245,9 @@ impl WireRequest {
             | WireRequest::Snapshot { .. }
             | WireRequest::LocalWaiters
             | WireRequest::RuntimeInfo
+            // Idempotent per-session policy assertion — replaying it after a
+            // transport failure converges to the same state.
+            | WireRequest::AttachSessionPolicy { .. }
             | WireRequest::Deliver(_) => true,
             WireRequest::Send(_)
             | WireRequest::CreateSession { .. }
@@ -449,6 +477,45 @@ mod unix {
                         .create_session(request)
                         .await
                         .map(WireResponse::SessionCreated),
+                )
+                .await
+            }
+            WireRequest::AttachSessionPolicy {
+                session_id,
+                approval_policy,
+                client_kind,
+            } => {
+                // Identical trust boundary to CreateSession: AutoApprove only
+                // for a LocalInteractive client on a trusted-local transport;
+                // remote/TCP origins are rejected observably (R006 R6-P2).
+                let effective_kind = if transport_trusted {
+                    client_kind
+                } else {
+                    ClientKind::Remote
+                };
+                if effective_kind == ClientKind::Remote
+                    && approval_policy == ApprovalPolicy::AutoApprove
+                {
+                    return send_result(
+                        &mut stream,
+                        Err::<WireResponse, _>(ClientError::Runtime(
+                            "auto-approve may only be requested from the trusted local transport"
+                                .to_string(),
+                        )),
+                    )
+                    .await;
+                }
+                let policy = if effective_kind == ClientKind::Remote {
+                    ApprovalPolicy::Interactive
+                } else {
+                    approval_policy
+                };
+                send_result(
+                    &mut stream,
+                    runtime
+                        .attach_session_policy(&session_id, policy)
+                        .await
+                        .map(|()| WireResponse::Ack),
                 )
                 .await
             }
@@ -846,6 +913,26 @@ mod unix {
     /// delegates to the inherent method of the same name.
     #[async_trait]
     impl LocalRuntimeService for LocalSocketRuntimeClient {
+        async fn attach_session_policy(
+            &self,
+            session_id: &SessionId,
+            policy: ApprovalPolicy,
+        ) -> Result<(), ClientError> {
+            match self
+                .request(WireRequest::AttachSessionPolicy {
+                    session_id: session_id.clone(),
+                    approval_policy: policy,
+                    client_kind: self.client_kind,
+                })
+                .await
+                .map_err(transport_client_error)?
+            {
+                WireResponse::Ack => Ok(()),
+                WireResponse::Error(error) => Err(error.into_client_error()),
+                response => Err(unexpected_response(response)),
+            }
+        }
+
         async fn create_session(
             &self,
             request: CreateSessionRequest,
@@ -1456,6 +1543,8 @@ mod tests {
         /// The approval policy the runtime actually received on the last
         /// CreateSession — lets a test assert the daemon boundary normalized it.
         last_approval: Mutex<Option<ApprovalPolicy>>,
+        /// The policy received on the last AttachSessionPolicy (R006 R6-P2).
+        last_attach: Mutex<Option<ApprovalPolicy>>,
         snapshot: Arc<Mutex<UiSessionSnapshot>>,
     }
 
@@ -1468,6 +1557,7 @@ mod tests {
                 deliveries: Mutex::new(Vec::new()),
                 creates: std::sync::atomic::AtomicUsize::new(0),
                 last_approval: Mutex::new(None),
+                last_attach: Mutex::new(None),
                 snapshot: Arc::new(Mutex::new(UiSessionSnapshot {
                     id: SessionId::new("s1"),
                     repository: "/repo".to_string(),
@@ -1538,6 +1628,15 @@ mod tests {
 
     #[async_trait]
     impl LocalRuntimeService for TestRuntime {
+        async fn attach_session_policy(
+            &self,
+            _session_id: &SessionId,
+            policy: ApprovalPolicy,
+        ) -> Result<(), ClientError> {
+            *self.last_attach.lock().unwrap() = Some(policy);
+            Ok(())
+        }
+
         async fn create_session(
             &self,
             request: CreateSessionRequest,
@@ -2101,6 +2200,61 @@ mod tests {
             "the rejected create must never have reached the runtime"
         );
         assert!(runtime.last_approval.lock().unwrap().is_none());
+        shutdown.cancel();
+    }
+
+    /// R006 R6-P2 — the resume door is gated exactly like the create door:
+    /// a trusted-local client may re-assert AutoApprove on an existing
+    /// session; a Remote client (or any TCP origin) is rejected observably.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_local_may_attach_auto_approve_but_remote_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let sid = SessionId::new("s1");
+
+        // Trusted local: honored, reaches the runtime.
+        let local = LocalSocketRuntimeClient::connect_as(&path, ClientKind::LocalInteractive)
+            .await
+            .unwrap();
+        local
+            .attach_session_policy(&sid, ApprovalPolicy::AutoApprove)
+            .await
+            .unwrap();
+        assert_eq!(
+            *runtime.last_attach.lock().unwrap(),
+            Some(ApprovalPolicy::AutoApprove)
+        );
+
+        // Remote kind: rejected, never reaches the runtime.
+        *runtime.last_attach.lock().unwrap() = None;
+        let bridge = LocalSocketRuntimeClient::connect_as(&path, ClientKind::Remote)
+            .await
+            .unwrap();
+        let result = bridge
+            .attach_session_policy(&sid, ApprovalPolicy::AutoApprove)
+            .await;
+        assert!(
+            result.is_err(),
+            "a remote client must not re-assert auto-approve: {result:?}"
+        );
+        assert!(runtime.last_attach.lock().unwrap().is_none());
+
+        // Remote asserting Interactive is allowed (downgrade direction is safe).
+        bridge
+            .attach_session_policy(&sid, ApprovalPolicy::Interactive)
+            .await
+            .unwrap();
+        assert_eq!(
+            *runtime.last_attach.lock().unwrap(),
+            Some(ApprovalPolicy::Interactive)
+        );
         shutdown.cancel();
     }
 

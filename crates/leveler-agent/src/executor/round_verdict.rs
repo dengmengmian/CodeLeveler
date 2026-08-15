@@ -36,7 +36,7 @@ pub enum RoundVerdict {
     /// Refused, but by the plan-repair gate — deliberately not penalized, so the
     /// generic all-refused watchdog cannot preempt a later valid plan. Absolute
     /// round and resource budgets still bound the retries.
-    NeutralPlanRepair,
+    NeutralPolicyBlocked,
     /// Real work happened; the no-progress streak resets.
     Progress,
 }
@@ -45,7 +45,7 @@ impl RoundVerdict {
     /// Whether this verdict leaves the no-progress streak untouched. Neither a
     /// penalty nor a reset — the two exploration/exemption cases.
     pub fn is_neutral(self) -> bool {
-        matches!(self, Self::ObserveExploring | Self::NeutralPlanRepair)
+        matches!(self, Self::ObserveExploring | Self::NeutralPolicyBlocked)
     }
 }
 
@@ -64,8 +64,9 @@ pub struct RoundInput {
     pub had_calls: bool,
     /// Every issued call was refused before execution.
     pub all_denied: bool,
-    /// The refusals came from the forced-`update_plan` repair gate.
-    pub plan_repair: bool,
+    /// Every refusal came from a HARNESS POLICY gate (plan gate, budgets,
+    /// allowlist) — the harness blocked itself; not agent stagnation.
+    pub policy_blocked: bool,
 }
 
 /// Grade one finished round. Order matters: closeout thrash outranks observe
@@ -84,8 +85,8 @@ pub fn classify(input: &RoundInput) -> RoundVerdict {
             RoundVerdict::ObserveExploring
         }
     } else if input.had_calls && input.all_denied {
-        if input.plan_repair {
-            RoundVerdict::NeutralPlanRepair
+        if input.policy_blocked {
+            RoundVerdict::NeutralPolicyBlocked
         } else {
             RoundVerdict::AllRefused
         }
@@ -118,7 +119,7 @@ mod tests {
             repeated_observation: false,
             had_calls: false,
             all_denied: false,
-            plan_repair: false,
+            policy_blocked: false,
         }
     }
 
@@ -175,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_repair_refusals_are_exempt_from_the_all_refused_streak() {
+    fn policy_blocked_refusals_are_exempt_from_the_all_refused_streak() {
         let refused = RoundInput {
             had_calls: true,
             all_denied: true,
@@ -184,10 +185,10 @@ mod tests {
         assert_eq!(classify(&refused), RoundVerdict::AllRefused);
         assert!(!classify(&refused).is_neutral());
         let repair = RoundInput {
-            plan_repair: true,
+            policy_blocked: true,
             ..refused
         };
-        assert_eq!(classify(&repair), RoundVerdict::NeutralPlanRepair);
+        assert_eq!(classify(&repair), RoundVerdict::NeutralPolicyBlocked);
         assert!(classify(&repair).is_neutral());
     }
 

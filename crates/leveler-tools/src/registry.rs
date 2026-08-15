@@ -11,6 +11,35 @@ use leveler_model::ToolDefinition;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
+/// The canonical observe-class (read-only) tool list. This is THE single
+/// source for "may run without a plan / read-only subset" decisions — the
+/// R006 incident came from a second, narrower copy of this list drifting
+/// (git_status missing) and the plan gate refusing a read-only tool.
+pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
+    "blast_radius",
+    "diagnostics",
+    "expand_tools",
+    "find_files",
+    "find_references",
+    "find_symbol",
+    "get_task",
+    "git_diff",
+    "git_status",
+    "grep",
+    "list_files",
+    "load_skill",
+    "memory",
+    "read_file",
+    "read_symbol",
+    "update_plan",
+    "view_image",
+];
+
+/// True when `name` is in the canonical observe-class list.
+pub fn is_observe_class_tool(name: &str) -> bool {
+    OBSERVE_CLASS_TOOLS.contains(&name)
+}
+
 /// Holds the available tools and validates arguments before dispatching.
 #[derive(Default)]
 pub struct ToolRegistry {
@@ -90,25 +119,7 @@ impl ToolRegistry {
 
     pub fn read_only_subset(&self) -> ToolRegistry {
         use leveler_execution::RiskLevel;
-        const READ_ONLY_TOOLS: &[&str] = &[
-            "blast_radius",
-            "diagnostics",
-            "expand_tools",
-            "find_files",
-            "find_references",
-            "find_symbol",
-            "get_task",
-            "git_diff",
-            "git_status",
-            "grep",
-            "list_files",
-            "load_skill",
-            "memory",
-            "read_file",
-            "read_symbol",
-            "update_plan",
-            "view_image",
-        ];
+        const READ_ONLY_TOOLS: &[&str] = OBSERVE_CLASS_TOOLS;
         let mut subset = ToolRegistry::new();
         for tool in self.tools.values() {
             // Belt and braces: allowlisted AND still Safe-risk, so a future

@@ -450,6 +450,12 @@ pub enum StopReason {
     TurnLimitReached,
     /// Goal mode: the model declared the goal unreachable via `update_goal(blocked)`.
     Blocked,
+    /// The turn ended because HARNESS POLICY refused every attempted action
+    /// for several rounds (plan gate / budgets / allowlist) and the injected
+    /// corrective directive was also ignored. This is the harness blocking
+    /// itself — distinct from `Incomplete` (agent stagnation) so a policy
+    /// dead-end is never reported as "the model made no progress" (R006 R6-P1).
+    PolicyBlocked,
     /// Goal mode: the model went quiet without ever resolving the goal via
     /// `update_goal`, even after the quiet-nudge cap. Not a success.
     Stalled,

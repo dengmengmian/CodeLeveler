@@ -152,12 +152,14 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .map(|secs| secs.saturating_mul(1000))
 }
 
-/// Provider-level retries are the owner of request-start failures. Once they
-/// are exhausted, mark the error terminal so an outer agent retry loop cannot
-/// multiply N provider attempts into N×M identical waits. Mid-stream failures
-/// bypass this function and remain retryable by the agent.
+/// Provider-level retries own the FAST retry budget for request-start
+/// failures. Once they are exhausted, the error is flagged so an outer layer
+/// switches to its slow, small budget instead of multiplying N provider
+/// attempts into N×M identical fast waits. `retryable` stays kind-derived:
+/// destroying it here silently made every request-start timeout terminal for
+/// the whole goal (R006 R6-P3 — a continuation window died on one timeout).
 fn exhausted(mut error: ModelError) -> ModelError {
-    error.retryable = false;
+    error.provider_retries_exhausted = true;
     error
 }
 

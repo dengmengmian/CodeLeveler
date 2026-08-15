@@ -46,6 +46,14 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
                 StopReason::Blocked => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
                 },
+                // Harness policy refused every action and the corrective
+                // directive was ignored — needs the policy step or the user,
+                // never "no progress" (R006 R6-P1).
+                StopReason::PolicyBlocked => RuntimeEvent::TurnIncomplete {
+                    reason: detail.unwrap_or_else(|| {
+                        "被策略门拦截（如需 update_plan）· 需要处理后继续".into()
+                    }),
+                },
                 StopReason::Stalled => RuntimeEvent::TurnIncomplete {
                     reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
                 },

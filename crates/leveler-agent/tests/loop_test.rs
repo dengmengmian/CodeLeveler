@@ -6132,3 +6132,266 @@ async fn assisted_gates_a_shell_deletion_before_it_runs() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── R006 R6-P1: harness-policy refusals must not become a stagnation kill ───
+
+/// The R006 accident, verbatim: a multi-step task, the model never calls
+/// update_plan and keeps attempting a gated (non-observe) tool. The plan
+/// gate refuses every round. Those refusals are HARNESS policy — they must
+/// escalate on their own bounded track and stop as PolicyBlocked, never be
+/// counted as agent no-progress (Incomplete) at the 2-round kill cap.
+#[tokio::test]
+async fn plan_gate_refusals_escalate_as_policy_blocked_not_stagnation() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-policy-blocked-{}",
+        std::process::id() as u64 * 131 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
+    let edit = |i: usize| {
+        assistant_tool_call(
+            &format!("c{i}"),
+            "apply_patch",
+            serde_json::json!({"patch": patch}),
+        )
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        edit(1),
+        edit(2),
+        edit(3),
+        edit(4),
+        edit(5),
+        edit(6),
+        edit(7),
+        edit(8),
+        edit(9),
+        assistant_text("all done"),
+    ]));
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    )
+    .with_structure(true)
+    .run(
+        "1. inspect the current implementation\n2. change the behavior\n3. run verification",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::PolicyBlocked,
+        "policy refusals must stop as PolicyBlocked, not Incomplete: {outcome:?}"
+    );
+    assert!(
+        outcome.rounds >= 5,
+        "the policy track must be more patient than the 2-round kill (got {} rounds)",
+        outcome.rounds
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "old\n",
+        "the gated edit must never have run"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R006: `git_status` (and shell-wrapped `git status`) are observe-class and
+/// must run BEFORE any plan exists — the incident's very first refusal was a
+/// read-only `git_status` at event 6.
+#[tokio::test]
+async fn observe_tools_including_git_status_run_without_a_plan() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-observe-noplan-{}",
+        std::process::id() as u64 * 137 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("c1", "git_status", serde_json::json!({})),
+        assistant_tool_call(
+            "c2",
+            "shell_command",
+            serde_json::json!({"cmd": "git status --short"}),
+        ),
+        assistant_text("observed"),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_structure(true)
+    .run(
+        "1. inspect the current implementation\n2. change the behavior\n3. run verification",
+        &mut |event| events.push(event),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    for id in ["c1", "c2"] {
+        let refused = events.iter().any(|event| {
+            matches!(event,
+                AgentEvent::ToolResult { id: got, is_error: true, preview, .. }
+                    if got == id && preview.contains("update_plan"))
+        });
+        assert!(
+            !refused,
+            "observe call {id} must not be plan-gated: {events:?}"
+        );
+    }
+    assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── R006 R6-P3: request-start timeout after provider exhaustion retries ─────
+
+/// The R006 accident: a continuation window's FIRST model request failed with
+/// a provider-exhausted Timeout and the whole goal died. The executor must
+/// retry such errors on its slow lane and succeed.
+struct ExhaustedTimeoutRuntime {
+    fails_left: Mutex<u32>,
+    kind: leveler_model::ModelErrorKind,
+}
+
+#[async_trait]
+impl ModelRuntime for ExhaustedTimeoutRuntime {
+    async fn generate(
+        &self,
+        _r: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        unimplemented!()
+    }
+    async fn stream(
+        &self,
+        _request: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        use leveler_model::ModelEvent;
+        {
+            let mut left = self.fails_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                let mut err = ModelError::new(self.kind, "error sending request for url");
+                err.provider_retries_exhausted = true;
+                return Err(err);
+            }
+        }
+        let events: Vec<Result<ModelEvent, ModelError>> = vec![
+            Ok(ModelEvent::MessageStarted {
+                request_id: RequestId::new("ok-1"),
+            }),
+            Ok(ModelEvent::TextDelta {
+                delta: "recovered".into(),
+            }),
+            Ok(ModelEvent::MessageCompleted {
+                finish_reason: leveler_model::FinishReason::Stop,
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn exhausted_request_start_timeout_is_retried_on_the_slow_lane() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-exhausted-retry-{}",
+        std::process::id() as u64 * 139 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(ExhaustedTimeoutRuntime {
+        fails_left: Mutex::new(1),
+        kind: leveler_model::ModelErrorKind::Timeout,
+    });
+    let mut attempts = 0u32;
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .run(
+        "answer",
+        &mut |event| {
+            if matches!(event, AgentEvent::StreamAttemptStarted) {
+                attempts += 1;
+            }
+        },
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2, "one exhausted-timeout retry then success");
+    assert!(outcome.final_text.contains("recovered"), "{outcome:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Negative control: a permanent error (auth) is NEVER retried, exhausted or
+/// not — fail fast with a single attempt.
+#[tokio::test]
+async fn exhausted_auth_failure_is_not_retried() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-exhausted-auth-{}",
+        std::process::id() as u64 * 149 + 9
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(ExhaustedTimeoutRuntime {
+        fails_left: Mutex::new(5),
+        kind: leveler_model::ModelErrorKind::Auth,
+    });
+    let mut attempts = 0u32;
+    let result = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .run(
+        "answer",
+        &mut |event| {
+            if matches!(event, AgentEvent::StreamAttemptStarted) {
+                attempts += 1;
+            }
+        },
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_err(), "auth must fail fast");
+    assert_eq!(attempts, 1, "no retry for a permanent error");
+    std::fs::remove_dir_all(&dir).ok();
+}

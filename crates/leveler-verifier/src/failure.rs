@@ -40,10 +40,41 @@ pub struct ClassifiedFailure {
     pub suggested_recovery: RecoveryStrategy,
 }
 
+/// Whether a check's output is a toolchain/version mismatch between the
+/// verification environment and what the tree requires — cargo's MSRV refusal
+/// or a missing rustup toolchain (R005 F-P1: the gate ran the HOST default
+/// rustc against a tree pinned newer, and the refusal was mis-reported as a
+/// code failure). Deliberately narrow: only compiler/toolchain wording trips
+/// it, so ordinary build/test failures keep gating.
+pub fn is_environment_mismatch(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    // cargo ≥1.56 MSRV refusal: "rustc 1.96.0 is not supported by the
+    // following package(s): …" — cargo uses the singular "package" for one
+    // offender, so match the singular prefix (contained in the plural too).
+    lower.contains("is not supported by the following package")
+        // older cargo wording: "requires rustc 1.97.0 or newer, while the
+        // currently active rustc version is 1.96.0".
+        || (lower.contains("requires rustc") && lower.contains("currently active rustc version"))
+        // rustup: "toolchain '1.97.0-…' is not installed".
+        || (lower.contains("toolchain") && lower.contains("is not installed"))
+}
+
 /// Classify a failed check from its command kind and captured output.
 pub fn classify(kind: CheckKind, output: &str) -> ClassifiedFailure {
     let likely_files = extract_paths(output);
     let lower = output.to_lowercase();
+
+    if is_environment_mismatch(output) {
+        return ClassifiedFailure {
+            kind: FailureKind::EnvironmentFailure,
+            summary: "toolchain mismatch: the verification environment's compiler \
+                      does not satisfy what the tree requires — not a code defect"
+                .to_string(),
+            likely_files,
+            retryable: false,
+            suggested_recovery: RecoveryStrategy::StopAndReport,
+        };
+    }
 
     // Environment problems are not the code's fault — don't try to "repair".
     if lower.contains("command not found")
@@ -129,6 +160,37 @@ mod tests {
         let f = classify(CheckKind::Test, "test tests::it ... FAILED");
         assert_eq!(f.kind, FailureKind::TestFailure);
         assert!(f.retryable);
+    }
+
+    /// R005 F-P1: the gate ran `cargo` under the HOST default rustc (1.96)
+    /// while the task's tree required 1.97 — cargo's MSRV refusal is an
+    /// environment mismatch, never a code defect to "repair".
+    #[test]
+    fn cargo_msrv_refusal_is_environment_mismatch() {
+        let bulk = "error: rustc 1.96.0 is not supported by the following packages:\n  foo@0.1.0 requires rustc 1.97";
+        let single = "error: rustc 1.96.0 is not supported by the following package:\n  envsmoke@0.1.0 requires rustc 1.99.0";
+        let legacy = "error: package `foo v0.1.0` cannot be built because it requires rustc 1.97.0 or newer, while the currently active rustc version is 1.96.0";
+        let rustup = "error: toolchain '1.97.0-aarch64-apple-darwin' is not installed";
+        for output in [bulk, single, legacy, rustup] {
+            assert!(is_environment_mismatch(output), "not detected: {output}");
+            let f = classify(CheckKind::Build, output);
+            assert_eq!(f.kind, FailureKind::EnvironmentFailure, "{output}");
+            assert!(!f.retryable);
+            assert_eq!(f.suggested_recovery, RecoveryStrategy::StopAndReport);
+        }
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_environment_mismatch() {
+        assert!(!is_environment_mismatch("test tests::it ... FAILED"));
+        assert!(!is_environment_mismatch(
+            "error[E0308]: mismatched types\n --> src/lib.rs:12:5"
+        ));
+        // "is not installed" alone (e.g. an npm hint) must not trip the gate
+        // without toolchain context.
+        assert!(!is_environment_mismatch(
+            "warning: package foo is not installed"
+        ));
     }
 
     #[test]

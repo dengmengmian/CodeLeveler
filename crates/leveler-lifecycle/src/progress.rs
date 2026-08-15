@@ -29,6 +29,12 @@ pub struct ProgressCaps {
     /// catches the common "edit → run a check that keeps failing" spin. Set
     /// higher so legitimate fail→fix→pass iteration is not cut short.
     pub stagnation_rounds: u32,
+    /// Consecutive rounds where EVERY attempted call was refused by a harness
+    /// POLICY gate (plan gate / budgets / allowlist). These are the harness
+    /// blocking itself, not agent stagnation (R006 R6-P1): at this cap a
+    /// corrective directive is injected; at 2× the cap the turn stops with an
+    /// honest policy-blocked reason instead of a fake "no progress".
+    pub policy_blocked_rounds: u32,
 }
 
 impl Default for ProgressCaps {
@@ -38,6 +44,7 @@ impl Default for ProgressCaps {
             closeout_deny_rounds: 2,
             continue_streak_cap: 2,
             stagnation_rounds: 4,
+            policy_blocked_rounds: 3,
         }
     }
 }
@@ -54,6 +61,9 @@ pub struct ProgressLedger {
     /// check keeps failing" loop accumulates here and is force-stopped.
     #[serde(default)]
     pub stagnation_streak: u32,
+    /// Consecutive all-policy-refused rounds (see `ProgressCaps::policy_blocked_rounds`).
+    #[serde(default)]
+    pub policy_blocked_streak: u32,
     pub closeout_deny_rounds: u32,
     pub closing: bool,
     pub phase: TurnPhase,
@@ -185,6 +195,28 @@ impl ProgressLedger {
     pub fn note_no_progress_round(&mut self, round: u32) {
         self.round = round;
         self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+    }
+
+    /// A round where every attempted call was refused by harness policy.
+    pub fn note_policy_blocked_round(&mut self, round: u32) {
+        self.round = round;
+        self.policy_blocked_streak = self.policy_blocked_streak.saturating_add(1);
+    }
+
+    /// Any non-policy-blocked round clears the policy streak.
+    pub fn clear_policy_blocked(&mut self) {
+        self.policy_blocked_streak = 0;
+    }
+
+    /// At the cap: inject a corrective directive (do not stop yet).
+    pub fn should_escalate_policy_blocked(&self, caps: ProgressCaps) -> bool {
+        self.policy_blocked_streak == caps.policy_blocked_rounds
+    }
+
+    /// At 2x the cap the model has ignored both the per-call refusals AND the
+    /// injected directive: stop honestly as policy-blocked.
+    pub fn should_hard_stop_policy_blocked(&self, caps: ProgressCaps) -> bool {
+        self.policy_blocked_streak >= caps.policy_blocked_rounds.saturating_mul(2)
     }
 
     pub fn note_closeout_deny_round(&mut self) {

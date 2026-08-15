@@ -13,7 +13,8 @@ pub mod tool;
 pub mod tools;
 
 pub use registry::{
-    ToolRegistry, core_registry, default_registry, expand_tool_category, full_registry,
+    OBSERVE_CLASS_TOOLS, ToolRegistry, core_registry, default_registry, expand_tool_category,
+    full_registry, is_observe_class_tool,
 };
 pub use tool::{Tool, ToolContext, ToolError, ToolOutput};
 

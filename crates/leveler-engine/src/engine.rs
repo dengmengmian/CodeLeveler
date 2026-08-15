@@ -173,7 +173,9 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
         S::Incomplete | S::BudgetExhausted | S::TurnLimitReached | S::Stalled => {
             (SessionStatus::Incomplete, AgentState::Execute)
         }
-        S::Blocked => (SessionStatus::Blocked, AgentState::Execute),
+        // A harness-policy dead end needs attention, not silent retry: same
+        // resumable-with-attention class as a model-declared block (R006 R6-P1).
+        S::Blocked | S::PolicyBlocked => (SessionStatus::Blocked, AgentState::Execute),
     }
 }
 
@@ -466,6 +468,31 @@ impl TaskEngine {
                 ))
         ) {
             return Ok(());
+        }
+        // Settle this session's background tasks at the terminal fact — the
+        // ONE choke point every path shares (run/chat/resume/continuation,
+        // completed/failed/budget_limited). R006 R6-P4: the reap used to hang
+        // off one spawn function in the app layer, so a goal continued via
+        // ordinary messages (chat-routed) leaked its dev servers. Interrupted
+        // (user cancel) deliberately keeps them inspectable. Daemon-owned
+        // services (browser/MCP/LSP) have no session scope and are untouched.
+        let interrupted = matches!(
+            result,
+            Err(EngineError::Agent(leveler_agent::AgentError::Cancelled))
+        );
+        if !interrupted
+            && let (Some(scope), Some(registry)) = (
+                self.factory.tool_context.session_scope.as_deref(),
+                self.factory.tool_context.services.background_tasks.as_ref(),
+            )
+        {
+            let reaped = registry.kill_scope(scope).await;
+            if reaped > 0 {
+                tracing::info!(
+                    session = scope,
+                    "terminal settlement reaped {reaped} session-owned background task(s)"
+                );
+            }
         }
         match result {
             Ok(report) => {
@@ -1576,6 +1603,7 @@ impl TaskEngine {
                         check.status,
                         leveler_verifier::CheckStatus::Failed
                             | leveler_verifier::CheckStatus::ToolMissing
+                            | leveler_verifier::CheckStatus::EnvironmentUnavailable
                     )
                     .then(|| check.evidence.clone()),
                 },
@@ -1991,8 +2019,9 @@ pub(crate) fn direct_non_success_outcome(stop: leveler_agent::StopReason) -> Opt
         // decided to stop opening more), a ceiling stop is BudgetLimited —
         // incomplete and resumable — the same class as an exhausted budget.
         S::BudgetExhausted | S::TurnLimitReached => Some(TaskOutcome::BudgetLimited),
-        // Incomplete thrash, stalled quiet, blocked, etc. — never success.
-        S::Incomplete | S::Blocked | S::Stalled | S::CompletedUnverified => {
+        // Incomplete thrash, stalled quiet, blocked (model- or policy-side),
+        // etc. — never success.
+        S::Incomplete | S::Blocked | S::PolicyBlocked | S::Stalled | S::CompletedUnverified => {
             Some(TaskOutcome::Failed)
         }
     }

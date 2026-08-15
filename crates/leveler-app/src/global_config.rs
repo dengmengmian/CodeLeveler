@@ -50,7 +50,7 @@ use leveler_model::{
     CompatibilityConfig, ModelCapabilities, ModelLimits, ModelProfile, ProtocolKind,
     ReasoningConfig, ReasoningEffort, ReasoningStyle,
 };
-use leveler_provider::{ModelConfigFile, ProviderConfig, RetryConfig, Timeouts};
+use leveler_provider::{ModelConfigFile, ProviderConfig};
 use leveler_tools::mcp::McpServerConfig;
 
 /// The parsed global config.
@@ -145,6 +145,15 @@ struct GlobalProvider {
     /// (e.g. a `user-agent` an endpoint gates on). Empty → nothing extra.
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    /// Request/stream timeouts. Compact-config users previously could NOT
+    /// raise these off the tight defaults (60 s idle-read doubles as the
+    /// time-to-first-header budget for huge continuation transcripts — a
+    /// contributor to R006's window-boundary timeout, R6-P3).
+    #[serde(default)]
+    timeouts: Option<leveler_provider::Timeouts>,
+    /// Provider-level retry budget/backoff.
+    #[serde(default)]
+    retry: Option<leveler_provider::RetryConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,8 +384,8 @@ impl GlobalConfig {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
                 headers: p.headers,
-                timeouts: Timeouts::default(),
-                retry: RetryConfig::default(),
+                timeouts: p.timeouts.unwrap_or_default(),
+                retry: p.retry.unwrap_or_default(),
             })
             .collect();
 

@@ -66,6 +66,13 @@ pub struct ModelError {
     /// must prefer this over their own backoff schedule when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// The provider transport already spent its own retry budget on this
+    /// request-start failure. Outer layers may still retry a retryable KIND,
+    /// but must use a slower, smaller budget (R006 R6-P3: this used to be
+    /// encoded by destroying `retryable`, which silently made every
+    /// request-start timeout terminal for the whole goal).
+    #[serde(default)]
+    pub provider_retries_exhausted: bool,
 }
 
 impl ModelError {
@@ -77,6 +84,7 @@ impl ModelError {
             status: None,
             retryable: kind.is_retryable(),
             retry_after_ms: None,
+            provider_retries_exhausted: false,
         }
     }
 

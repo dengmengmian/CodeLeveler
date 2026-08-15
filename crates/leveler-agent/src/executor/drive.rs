@@ -868,6 +868,12 @@ impl Executor {
             // budgets, allowlist, permission). A round consisting solely of
             // refusals is no progress — it must not reset the AC3 streak.
             let mut denied_calls_this_round: usize = 0;
+            // Subset of the above that came from HARNESS POLICY (plan gate,
+            // search budget, write allowlist) rather than genuine-loop guards.
+            // A round consisting solely of policy refusals is the harness
+            // blocking itself — it must be neutral for the kill streak and
+            // escalate separately (R006 R6-P1).
+            let mut policy_blocked_calls_this_round: usize = 0;
             // User cancel observed inside this batch. The batch stops, but the
             // round is still committed (results + spend) before Cancelled
             // surfaces — completed tools' side effects are already on disk.
@@ -897,7 +903,7 @@ impl Executor {
                 if let gates::GateVerdict::Refuse(msg) = gates::plan_gate(&gates::PlanGate {
                     required: structured_plan_required,
                     plan_started: structured_plan_started,
-                    tool_is_explore: is_plan_explore_tool(&call.name),
+                    tool_is_explore: is_plan_explore_tool(&call.name, &call.arguments),
                     tool_is_exempt: matches!(
                         call.name.as_str(),
                         "update_plan"
@@ -908,6 +914,7 @@ impl Executor {
                 }) {
                     metrics.plan_first_write_blocked += 1;
                     denied_calls_this_round += 1;
+                    policy_blocked_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -924,6 +931,7 @@ impl Executor {
                     self.policy.max_search_calls_per_step,
                 ) {
                     denied_calls_this_round += 1;
+                    policy_blocked_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -1215,6 +1223,7 @@ impl Executor {
                              the next model step; review them, then retry the edit."
                         );
                         denied_calls_this_round += 1;
+                        policy_blocked_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
                     }
@@ -2039,9 +2048,12 @@ impl Executor {
                         .any(|(_, n)| *n >= LOOP_GUARD_THRESHOLD),
                     had_calls: !call_snapshot.is_empty(),
                     all_denied: denied_calls_this_round == call_snapshot.len(),
-                    // Forced plan-repair rounds no longer exist (C2.3A); keep
-                    // the field false so all-refused streaks count normally.
-                    plan_repair: false,
+                    // ALL of this round's refusals came from harness policy
+                    // (plan gate / budgets / allowlist): the harness blocked
+                    // itself, so the round is neutral for the kill streak and
+                    // escalates on its own bounded track (R006 R6-P1).
+                    policy_blocked: !call_snapshot.is_empty()
+                        && policy_blocked_calls_this_round == call_snapshot.len(),
                 })
             };
             if verdict == RoundVerdict::CloseoutThrash {
@@ -2130,11 +2142,39 @@ impl Executor {
                         "Stopped: no progress (every attempted action was refused)."
                     );
                 }
+            } else if verdict == RoundVerdict::NeutralPolicyBlocked {
+                // Every call this round was refused by HARNESS POLICY. That is
+                // the harness blocking itself — neutral for the kill streak
+                // (R006: plan-gate refusals fed the all-refused guard and a
+                // well-behaving agent was killed in 4 minutes). Escalate on a
+                // separate bounded track instead: at the cap inject a
+                // corrective directive; if the model ignores that too, stop
+                // honestly as policy-blocked, never as "no progress".
+                progress.note_policy_blocked_round(round);
+                observer(AgentEvent::ProgressUpdated {
+                    ledger: progress.clone(),
+                });
+                if self.depth == 0 && progress.should_hard_stop_policy_blocked(progress_caps) {
+                    stop_now!(
+                        StopReason::PolicyBlocked,
+                        "policy-blocked streak; corrective directive ignored",
+                        "Stopped: a harness policy (plan gate / budget / allowlist)                          refused every attempted action for several rounds and the                          corrective instruction was not followed. The task needs the                          required policy step (e.g. update_plan) or user attention —                          this is not agent stagnation."
+                    );
+                }
+                if progress.should_escalate_policy_blocked(progress_caps) {
+                    let directive = Message::text(
+                        Role::User,
+                        "POLICY: every action you attempted was refused by a harness                          policy gate. Read the refusal messages and satisfy the stated                          requirement now (for the plan gate: call update_plan with one                          in_progress step and the remaining steps pending). Read-only                          navigation stays available. Do not retry refused calls                          unchanged.",
+                    );
+                    sink.append(std::slice::from_ref(&directive)).await?;
+                    messages.push(directive);
+                }
             } else if !verdict.is_neutral() {
                 // Successful non-observe work resets the streak. Exploration and
-                // plan-repair refusals are neutral: they neither grow it nor
+                // policy-blocked refusals are neutral: they neither grow it nor
                 // clear one that earlier rounds earned.
                 progress.note_progress(round);
+                progress.clear_policy_blocked();
             }
 
             // Stagnation guard (top-level turns only): the observe-only guard
