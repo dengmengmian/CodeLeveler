@@ -1680,6 +1680,18 @@ impl Executor {
                             repeated_observe_this_round = true;
                         }
                         _ => {
+                            // Same novelty accounting as the sequential path:
+                            // without it a PARALLEL round mixing one repeat
+                            // with real new observation would still grade as
+                            // pure thrash (R007 F1).
+                            if !is_error
+                                && is_observe_result_tool(
+                                    &job.admitted.call.name,
+                                    &job.admitted.call.arguments,
+                                )
+                            {
+                                novel_observe_this_round = true;
+                            }
                             call_history.insert(job.loop_key.clone(), (content.clone(), 1));
                         }
                     }

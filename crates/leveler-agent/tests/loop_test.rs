@@ -2063,6 +2063,78 @@ async fn novel_observation_is_still_allowed_after_the_forced_answer_nudge() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// R007 F1, parallel path: rounds where TWO observes actually execute — one
+/// returning an identical earlier result, one genuinely new — must grade as
+/// exploration. The parallel result loop originally counted the repeat but
+/// never credited the novel sibling, so a batch of "re-check this + look at
+/// that" rounds accumulated thrash and hard-stopped a turn doing real work.
+#[tokio::test]
+async fn a_parallel_round_mixing_a_repeat_with_novel_work_is_not_thrash() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-parallel-mixed-{}",
+        std::process::id() as u64 * 43 + 19
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for (name, sym) in [("a", "alpha"), ("b", "beta"), ("c", "gamma"), ("d", "delta")] {
+        std::fs::write(dir.join(format!("src/{name}.rs")), format!("pub fn {sym}() {{}}\n"))
+            .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let grep = |id: &str, pat: &str| {
+        (
+            id.to_string(),
+            "grep".to_string(),
+            serde_json::json!({"pattern": pat, "path": "src"}),
+        )
+    };
+    let pair = |a: (String, String, serde_json::Value), b: (String, String, serde_json::Value)| {
+        assistant_parallel_calls(&[
+            (a.0.as_str(), a.1.as_str(), a.2.clone()),
+            (b.0.as_str(), b.1.as_str(), b.2.clone()),
+        ])
+    };
+    let responses = vec![
+        // Seed two distinct observations.
+        pair(grep("s1", "alpha"), grep("s2", "beta")),
+        // Each later round re-obtains one earlier result (identical output)
+        // alongside a genuinely new one. Three such rounds would exhaust the
+        // no-progress cap AND the forced-answer second chance if they were
+        // mis-graded as pure thrash.
+        pair(grep("m1", "alpha"), grep("m2", "gamma")),
+        pair(grep("m3", "beta"), grep("m4", "delta")),
+        pair(grep("m5", "gamma"), grep("m6", "pub fn")),
+        assistant_text("all four located"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .run(
+        "locate the four helpers",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Answered,
+        "parallel rounds carrying real new observation must not accumulate \
+         thrash: {:?}",
+        outcome.stop_detail
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// R007 F1 §32 Case C/D: a mixed round (one refused true repeat + one novel
 /// observation) is exploration, not thrash — the turn continues and answers.
 /// The single repeat refusal must neither escalate as ordinary stagnation nor
@@ -2083,11 +2155,17 @@ async fn a_mixed_round_with_novel_work_is_not_thrash() {
     let responses = vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/a.rs"})),
         assistant_tool_call("r2", "read_file", serde_json::json!({"path": "src/a.rs"})),
-        // Mixed round: the third identical read is refused by the per-key
-        // guard, while the novel grep in the same round executes.
+        // Mixed rounds: the identical re-read is refused by the per-key guard
+        // while the novel grep beside it executes. TWO of them, so a
+        // mis-grading as pure thrash would reach the no-progress cap and kill
+        // the turn — that is what makes this test discriminate.
         assistant_parallel_calls(&[
             ("r3", "read_file", serde_json::json!({"path": "src/a.rs"})),
             ("g1", "grep", serde_json::json!({"pattern": "beta", "path": "src"})),
+        ]),
+        assistant_parallel_calls(&[
+            ("r4", "read_file", serde_json::json!({"path": "src/a.rs"})),
+            ("g2", "grep", serde_json::json!({"pattern": "alpha", "path": "src"})),
         ]),
         assistant_text("done"),
     ];
