@@ -29,12 +29,12 @@ use super::dispatch::{
 };
 use super::host::AdmitError;
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor, LOOP_GUARD_THRESHOLD,
-    ModelRequestRecord, StopReason, TranscriptSink,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor, ModelRequestRecord, StopReason,
+    TranscriptSink,
 };
 use crate::authorization::{
     collect_scoped_paths_from_call, counts_as_verification_evidence, extract_command,
-    is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
+    is_observe_result_tool, is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
     write_targets_outside_allowlist,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
@@ -210,7 +210,8 @@ impl Executor {
         // Observe thrash second chance: once the no-progress cap is hit, give
         // the model one forced "answer from findings" round instead of dying
         // with Incomplete and an empty reply (common on pure Q&A / investigate
-        // turns). A second thrash after that still hard-stops (AC3).
+        // turns). A second genuine-thrash round after that still hard-stops
+        // (AC3); novel observation stays legal throughout (R007 F1).
         let mut observe_thrash_answer_forced = false;
         // Hard step limits (spec §27): wall clock from run start, commands
         // executed so far, and the reason once a limit trips. The round that
@@ -890,6 +891,11 @@ impl Executor {
             // penalized), so this never fires on them.
             let mut verify_passed_this_round = false;
             let mut novel_observe_this_round = false;
+            // R007 F1: whether THIS round actually repeated an observation
+            // (identical result re-obtained, or a repeat refused by the loop
+            // guard). The thrash verdict keys off this per-round fact — never
+            // off the whole-history latch that killed novel exploration.
+            let mut repeated_observe_this_round = false;
             let mut command_ran_this_round = false;
             let mut command_success_this_round = false;
             // Distinct files touched before this round — a growth means the round
@@ -1245,19 +1251,11 @@ impl Executor {
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
-                // Post-thrash force-answer: refuse further pure observes so the
-                // model must synthesize from results already in the transcript.
-                if observe_thrash_answer_forced && is_pure_observe_call(&call.name, &call.arguments)
-                {
-                    observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
-                    let msg = "Observation thrash was detected. Do not re-list, re-search, or \
-                         re-read — answer the user's question from the tool results already \
-                         in this conversation, then stop calling tools."
-                        .to_string();
-                    denied_calls_this_round += 1;
-                    results[index] = Some(deny_call(observer, call, msg));
-                    continue;
-                }
+                // R007 F1: there is deliberately NO blanket observe refusal
+                // after the forced-answer nudge. Novel observation is legal at
+                // any point (the killed W1 agent needed exactly two more novel
+                // reads); true repeats stay bounded by the per-key loop guard
+                // below, and a further genuine-thrash round still hard-stops.
                 if is_pure_observe_call(&call.name, &call.arguments) {
                     observe_only_tools_this_round = observe_only_tools_this_round.saturating_add(1);
                 }
@@ -1273,7 +1271,16 @@ impl Executor {
                     0
                 };
                 if let gates::GateVerdict::Refuse(msg) = gates::loop_guard(&call.name, repeats) {
+                    // A refused repeat IS this round repeating itself…
+                    repeated_observe_this_round = true;
                     denied_calls_this_round += 1;
+                    // …and it stays on the no-progress track ON PURPOSE. The
+                    // loop guard only refuses after the SAME key produced
+                    // IDENTICAL content twice, so the refusal is evidence of
+                    // agent repetition, not of the harness blocking work the
+                    // agent could otherwise do (the plan gate's R6-P1 case).
+                    // Routing it to PolicyBlocked would report "this is not
+                    // agent stagnation" about a turn that is exactly that.
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
@@ -1497,15 +1504,16 @@ impl Executor {
                 // Update the loop-guard window: identical output → count up,
                 // any change (progress) → reset to this new result.
                 match call_history.get_mut(&loop_key) {
-                    Some(entry) if entry.0 == content => entry.1 += 1,
+                    Some(entry) if entry.0 == content => {
+                        entry.1 += 1;
+                        repeated_observe_this_round = true;
+                    }
                     _ => {
                         // A novel, successful read/search is real exploration —
                         // it resets the stagnation guard. A repeated (stale)
-                        // result does not.
-                        if !is_error
-                            && (is_pure_observe_call(&call.name, &call.arguments)
-                                || is_search_tool(&call.name))
-                        {
+                        // result does not. Read-class tools without an observe
+                        // key (read_file, git_diff) count too (R007 F1).
+                        if !is_error && is_observe_result_tool(&call.name, &call.arguments) {
                             novel_observe_this_round = true;
                         }
                         call_history.insert(loop_key, (content.clone(), 1));
@@ -1667,8 +1675,23 @@ impl Executor {
                         pending_images.push(part);
                     }
                     match call_history.get_mut(&job.loop_key) {
-                        Some(entry) if entry.0 == content => entry.1 += 1,
+                        Some(entry) if entry.0 == content => {
+                            entry.1 += 1;
+                            repeated_observe_this_round = true;
+                        }
                         _ => {
+                            // Same novelty accounting as the sequential path:
+                            // without it a PARALLEL round mixing one repeat
+                            // with real new observation would still grade as
+                            // pure thrash (R007 F1).
+                            if !is_error
+                                && is_observe_result_tool(
+                                    &job.admitted.call.name,
+                                    &job.admitted.call.arguments,
+                                )
+                            {
+                                novel_observe_this_round = true;
+                            }
                             call_history.insert(job.loop_key.clone(), (content.clone(), 1));
                         }
                     }
@@ -2042,10 +2065,11 @@ impl Executor {
                     closing: progress.closing,
                     substantive: substantive_round,
                     pure_observe: pure_observe_round,
-                    // Repeated output is fingerprinted by the loop guard's history.
-                    repeated_observation: call_history
-                        .values()
-                        .any(|(_, n)| *n >= LOOP_GUARD_THRESHOLD),
+                    // R007 F1: a property of THIS round, never a whole-history
+                    // latch. A round that re-obtained (or was refused re-
+                    // obtaining) an identical observation AND produced nothing
+                    // novel is thrash; any novel observation is exploration.
+                    repeated_observation: repeated_observe_this_round && !novel_observe_this_round,
                     had_calls: !call_snapshot.is_empty(),
                     all_denied: denied_calls_this_round == call_snapshot.len(),
                     // ALL of this round's refusals came from harness policy

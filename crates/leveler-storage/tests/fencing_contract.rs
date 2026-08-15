@@ -90,7 +90,13 @@ async fn assert_fencing_contract(
         .unwrap();
     ports
         .messages
-        .append_in_turn_owned(current, session, &turn_id, &["msg-1".to_string()], now())
+        .append_in_turn_owned(
+            current,
+            session,
+            &turn_id,
+            &[r#""msg-1""#.to_string()],
+            now(),
+        )
         .await
         .unwrap();
 
@@ -102,7 +108,7 @@ async fn assert_fencing_contract(
                 stale,
                 session,
                 &turn_id,
-                &["SHOULD_NOT_LAND".to_string()],
+                &[r#""SHOULD_NOT_LAND""#.to_string()],
                 now(),
             )
             .await,
@@ -111,7 +117,7 @@ async fn assert_fencing_contract(
     let transcript = ports.messages.load(session).await.unwrap();
     assert_eq!(
         transcript,
-        vec!["msg-1"],
+        vec![r#""msg-1""#],
         "stale transcript writes must not land"
     );
 

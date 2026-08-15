@@ -16,6 +16,11 @@ use leveler_core::{SessionId, Timestamp, TurnId};
 use crate::event_repo::EVENT_SCHEMA_VERSION;
 use crate::{Database, EventRecord, EventRepository, StorageError};
 
+/// Structure-aware redaction + validation for one event payload (R007 F2).
+fn redact_validated(event_type: &str, payload: &str) -> Result<String, StorageError> {
+    crate::redact_json_payload(&format!("event (type '{event_type}')"), payload)
+}
+
 /// Append/load access to the canonical event log, abstracted over the backing
 /// store. Deliberately narrow: only what `EventLog` and incremental readers
 /// need.
@@ -120,7 +125,9 @@ impl EventStore for Database {
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError> {
         let id = leveler_core::EventId::generate().into_inner();
-        let payload = leveler_core::redact_secrets(payload);
+        // Structure-aware redaction (R007 F2): fail loud before the INSERT.
+        let payload =
+            redact_validated(event_type, payload).map_err(crate::OwnershipError::Storage)?;
         // One guarded statement: sequence assignment AND the ownership check
         // happen inside the INSERT itself, so there is no window between
         // "token verified" and "row written".
@@ -191,20 +198,33 @@ impl MemoryEventStore {
         self.events.lock().unwrap().push(record);
     }
 
+    /// Test-only: push a raw record BELOW the validating write boundary,
+    /// simulating a legacy row persisted by the pre-R007-fix scrubber.
+    /// Production code must never call this — new writes go through
+    /// [`redact_validated`] and can no longer produce such rows.
+    #[doc(hidden)]
+    pub fn inject_legacy_row_for_tests(&self, record: EventRecord) {
+        self.events.lock().unwrap().push(record);
+    }
+
     /// Crate-internal synchronous append for the memory terminal store,
-    /// whose commit body must run under the ownership lock.
-    pub(crate) fn append_record_for_terminal(
+    /// whose commit body must run under the ownership lock. Redacts and
+    /// validates the payload up front; a refused payload never reaches the log.
+    pub(crate) fn append_record_for_terminal_validated(
         &self,
         session_id: &SessionId,
         turn_id: Option<&TurnId>,
         event_type: &str,
         payload: &str,
         now: Timestamp,
-    ) -> EventRecord {
-        self.append_record(session_id, turn_id, event_type, payload, now)
+    ) -> Result<EventRecord, StorageError> {
+        let payload = redact_validated(event_type, payload)?;
+        Ok(self.append_record(session_id, turn_id, event_type, &payload, now))
     }
 
-    /// The synchronous append shared by the fenced and unfenced paths.
+    /// The synchronous append shared by the fenced and unfenced paths. The
+    /// payload MUST already be redacted+validated by the caller (all public
+    /// entry points go through [`redact_validated`]).
     fn append_record(
         &self,
         session_id: &SessionId,
@@ -227,7 +247,7 @@ impl MemoryEventStore {
             turn_id: turn_id.map(|t| t.as_str().to_string()),
             sequence,
             event_type: event_type.to_string(),
-            payload: leveler_core::redact_secrets(payload),
+            payload: payload.to_string(),
             created_at: now.to_rfc3339(),
             schema_version: EVENT_SCHEMA_VERSION,
         };
@@ -246,7 +266,8 @@ impl EventStore for MemoryEventStore {
         payload: &str,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
-        Ok(self.append_record(session_id, turn_id, event_type, payload, now))
+        let payload = redact_validated(event_type, payload)?;
+        Ok(self.append_record(session_id, turn_id, event_type, &payload, now))
     }
 
     async fn append_owned(
@@ -263,9 +284,11 @@ impl EventStore for MemoryEventStore {
                 "memory event store has no ownership authority configured".to_string(),
             )));
         };
+        let payload =
+            redact_validated(event_type, payload).map_err(crate::OwnershipError::Storage)?;
         // Ownership lock held across the append — no interleaved CAS window.
         ownership.with_current(token, || {
-            self.append_record(session_id, turn_id, event_type, payload, now)
+            self.append_record(session_id, turn_id, event_type, &payload, now)
         })
     }
 

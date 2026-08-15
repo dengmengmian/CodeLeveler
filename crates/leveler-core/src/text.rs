@@ -160,6 +160,84 @@ pub fn redact_secrets(input: &str) -> String {
     redact_kv_assignments(&with_keys)
 }
 
+/// Redact secrets inside a serialized JSON document without ever touching its
+/// structure: parse, scrub only string VALUES with [`redact_secrets`], and
+/// re-serialize. Keys, discriminators, numbers, and delimiters are never
+/// rewritten, so the output is valid JSON (and schema-compatible with the
+/// input) by construction.
+///
+/// R007 F2: running the plain-text scrubber over an already-serialized event
+/// payload let a keyword match swallow the JSON string's own closing quote and
+/// the structural bytes after it, persisting unparseable rows that made the
+/// whole session unreplayable. Durable JSON planes must use this entry point;
+/// the plain [`redact_secrets`] remains for non-JSON text (e.g. artifacts).
+///
+/// An input that is not valid JSON is a caller bug, not data to "best-effort"
+/// scrub: the error is returned so the write boundary can fail loud instead of
+/// persisting an unvalidated payload.
+pub fn redact_secrets_json(payload: &str) -> Result<String, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(payload)?;
+    redact_json_string_values(&mut value);
+    serde_json::to_string(&value)
+}
+
+fn redact_json_string_values(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            let redacted = redact_secrets(s);
+            if redacted != *s {
+                *s = redacted;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(redact_json_string_values);
+        }
+        serde_json::Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                // The serialized-text scrubber used to see `"password":"…"` as
+                // one text span and redact by KEY name; after moving to
+                // value-level scrubbing that signal lives here: a sensitive key
+                // redacts its whole string value.
+                match entry {
+                    serde_json::Value::String(s) if is_sensitive_key(key) && !s.is_empty() => {
+                        *s = "[REDACTED]".to_string();
+                    }
+                    _ => redact_json_string_values(entry),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Key names whose string values are credentials by contract. Mirrors (and
+/// slightly widens, toward over-redaction) the serialized-text coverage of
+/// [`redact_kv_assignments`] + the Authorization-header scrubber.
+fn is_sensitive_key(key: &str) -> bool {
+    const KEY_MARKERS: &[&str] = &[
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "access-token",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "auth_token",
+        "auth-token",
+        "refresh_token",
+        "refresh-token",
+        "private_key",
+        "private-key",
+        "signing_key",
+        "signing-key",
+        "authorization",
+    ];
+    let lower = key.to_ascii_lowercase();
+    KEY_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 /// `Authorization: Bearer <token>`, JSON `"Authorization":"Bearer …"`, etc.
 fn redact_authorization_values(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -584,6 +662,120 @@ mod tests {
     fn leaves_ordinary_text_alone() {
         let raw = "run cargo test in src/lib.rs";
         assert_eq!(redact_secrets(raw), raw);
+    }
+
+    /// R007 F2 accident shape: the plain scrubber over a serialized event
+    /// payload swallowed the JSON string's closing quote and the structural
+    /// bytes after it. The JSON-aware entry point must keep the document
+    /// parseable while still removing the secret.
+    #[test]
+    fn json_redaction_survives_the_r007_accident_payload() {
+        // Byte-exact R007 shape: the narration ENDS with `PASSWORD:` at the
+        // JSON string boundary. The serialized-text scrubber mistook the
+        // document's own closing quote for the value's opening quote and ate
+        // `},"` — producing exactly the corrupt row R007 persisted. There is
+        // no secret here at all; structure must survive untouched.
+        let payload = r#"{"payload":{"text":"Secrets 标签页有 \"Add new\" 按钮。点击添加 secret PASSWORD:"},"type":"assistant_message"}"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&redact_secrets(payload)).is_err(),
+            "pre-fix scrubber must corrupt this shape or the accident no longer reproduces"
+        );
+        let redacted = redact_secrets_json(payload).expect("redaction must not fail");
+        let value: serde_json::Value =
+            serde_json::from_str(&redacted).expect("redacted payload must stay valid JSON");
+        assert_eq!(value["type"], "assistant_message", "discriminator intact");
+        assert_eq!(
+            value["payload"]["text"],
+            "Secrets 标签页有 \"Add new\" 按钮。点击添加 secret PASSWORD:",
+            "no secret present — text must be unchanged"
+        );
+
+        // Companion shape WITH a real secret value inside the narration: the
+        // secret must go, the structure must stay.
+        let with_secret = r#"{"payload":{"text":"add secret PASSWORD:\"hunter2-secret-value\""},"type":"assistant_message"}"#;
+        let redacted = redact_secrets_json(with_secret).unwrap();
+        serde_json::from_str::<serde_json::Value>(&redacted).expect("valid JSON");
+        assert!(!redacted.contains("hunter2-secret-value"), "{redacted}");
+    }
+
+    /// Table coverage: secrets in every structural position must be removed
+    /// while the document stays valid JSON and keeps its shape (§39).
+    #[test]
+    fn json_redaction_is_structure_preserving_across_positions() {
+        let cases = [
+            // plain string value
+            r#"{"note":"password: swordfish-77"}"#,
+            // nested object
+            r#"{"a":{"b":{"c":"Authorization: Bearer tok-1234567890abcdef"}}}"#,
+            // array element
+            r#"{"lines":["ok","secret: deep-array-value-1","ok"]}"#,
+            // escaped-JSON-like content INSIDE a string value
+            r#"{"text":"config was {\"token\":\"tok-abcdefabcdef\"}"}"#,
+            // markdown/shell narration
+            r#"{"out":"$ export API_TOKEN=sk-abcdefghijklmnop1234\ndone"}"#,
+            // multiline with colon/comma/braces around the secret
+            "{\"text\":\"line1\\npassword: p@ss,with{braces}\\nline3\"}",
+            // unicode neighbours
+            r#"{"text":"密码 password: 秘密值abc 之后"}"#,
+            // context-snapshot-like nesting
+            r#"{"payload":{"messages":[{"content":[{"text":"secret: snap-value-9"}]}]},"type":"context_snapshot"}"#,
+        ];
+        for payload in cases {
+            let before: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let redacted = redact_secrets_json(payload)
+                .unwrap_or_else(|e| panic!("redaction failed for {payload}: {e}"));
+            let after: serde_json::Value = serde_json::from_str(&redacted)
+                .unwrap_or_else(|e| panic!("invalid JSON after redaction of {payload}: {e}"));
+            assert_eq!(
+                shape_of(&before),
+                shape_of(&after),
+                "structure changed for {payload}: {redacted}"
+            );
+        }
+    }
+
+    /// Numbers, bools, nulls, and keys are never rewritten.
+    #[test]
+    fn json_redaction_touches_only_string_values() {
+        let payload =
+            r#"{"password_attempts":3,"ok":true,"none":null,"secret":"real-secret-value"}"#;
+        let redacted = redact_secrets_json(payload).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(value["password_attempts"], 3);
+        assert_eq!(value["ok"], true);
+        assert!(value["none"].is_null());
+        assert!(value.get("secret").is_some(), "key must survive");
+        assert!(!redacted.contains("real-secret-value"), "{redacted}");
+    }
+
+    /// Non-JSON input is a caller bug at a durable JSON boundary: fail loud,
+    /// never best-effort scrub.
+    #[test]
+    fn json_redaction_rejects_non_json_input() {
+        assert!(redact_secrets_json("password: plain, not json").is_err());
+        assert!(redact_secrets_json(r#"{"truncated":"#).is_err());
+    }
+
+    /// Structural fingerprint: object keys + container shapes, ignoring string
+    /// leaf contents (which redaction may rewrite).
+    fn shape_of(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Object(map) => {
+                let inner: Vec<String> = map
+                    .iter()
+                    .map(|(k, v)| format!("{k}:{}", shape_of(v)))
+                    .collect();
+                format!("{{{}}}", inner.join(","))
+            }
+            serde_json::Value::Array(items) => {
+                let inner: Vec<String> = items.iter().map(shape_of).collect();
+                format!("[{}]", inner.join(","))
+            }
+            serde_json::Value::String(_) => "s".into(),
+            serde_json::Value::Number(_) => "n".into(),
+            serde_json::Value::Bool(_) => "b".into(),
+            serde_json::Value::Null => "0".into(),
+        }
     }
 
     #[test]

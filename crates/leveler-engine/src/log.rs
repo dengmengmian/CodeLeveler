@@ -18,6 +18,23 @@ fn check_version(row: &EventRecord) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Decode one persisted row, fail-close with FULL provenance on corruption.
+///
+/// The event log is the authoritative plane: a row that cannot be decoded is
+/// never silently skipped (R007 F2 policy). The error names the session,
+/// sequence, and event type so a corrupt legacy row is diagnosable and
+/// repairable offline — but it must never echo payload bytes, which may
+/// contain exactly the secret material redaction was trying to remove.
+fn decode_row(row: &EventRecord) -> Result<EngineEvent, EngineError> {
+    check_version(row)?;
+    EngineEvent::from_payload(&row.payload).map_err(|e| {
+        EngineError::Corrupt(format!(
+            "corrupt authoritative event: session {} sequence {} type '{}': {e}",
+            row.session_id, row.sequence, row.event_type
+        ))
+    })
+}
+
 /// Sequenced, persist-before-forward event sink for one session. Depends on the
 /// [`EventStore`] port, not a concrete database, so it can be exercised against
 /// an in-memory store without SQLite.
@@ -97,12 +114,7 @@ impl<'a> EventLog<'a> {
     /// Unknown event types are hard errors (never silently skipped).
     pub async fn replay(&self) -> Result<Vec<EngineEvent>, EngineError> {
         let rows = self.store.load(&self.session_id).await?;
-        rows.iter()
-            .map(|row| {
-                check_version(row)?;
-                EngineEvent::from_payload(&row.payload)
-            })
-            .collect()
+        rows.iter().map(decode_row).collect()
     }
 
     /// The newest durable model-visible context, optionally scoped to one
@@ -122,8 +134,7 @@ impl<'a> EventLog<'a> {
         else {
             return Ok(None);
         };
-        check_version(&row)?;
-        match EngineEvent::from_payload(&row.payload)? {
+        match decode_row(&row)? {
             EngineEvent::ContextSnapshot {
                 messages,
                 through_ordinal,
@@ -149,8 +160,7 @@ impl<'a> EventLog<'a> {
         else {
             return Ok(None);
         };
-        check_version(&row)?;
-        match EngineEvent::from_payload(&row.payload)? {
+        match decode_row(&row)? {
             EngineEvent::ContextExpanded { to, .. } => Ok(Some(to)),
             _ => Err(EngineError::Corrupt(
                 "context_expanded row carried a different event".into(),
@@ -169,8 +179,7 @@ impl<'a> EventLog<'a> {
         let rows = self.store.load(&self.session_id).await?;
         let mut open: Vec<DanglingCall> = Vec::new();
         for row in &rows {
-            check_version(row)?;
-            match EngineEvent::from_payload(&row.payload)? {
+            match decode_row(row)? {
                 EngineEvent::ToolCallStarted {
                     call_id,
                     name,
@@ -741,5 +750,101 @@ mod tests {
         let log = EventLog::new(&db, session);
         let err = log.replay().await.expect_err("must not silently skip");
         assert!(matches!(err, EngineError::Corrupt(_)));
+    }
+
+    /// R007 F2 whole-session regression: normal events + a secret-bearing
+    /// narration + more normal events must persist, stay gapless, and replay
+    /// end-to-end with the secret gone (§40 — not just a single-event parse).
+    #[tokio::test]
+    async fn whole_session_replays_across_a_secret_bearing_event() {
+        let (db, session) = db_with_session().await;
+        let log = EventLog::new(&db, session.clone());
+        let events = [
+            EngineEvent::AssistantMessage {
+                text: "starting".into(),
+            },
+            // The R007 accident narration (ends with `PASSWORD:` at the string
+            // boundary) plus a real secret in the same session.
+            EngineEvent::AssistantMessage {
+                text: "Secrets 标签页有 \"Add new\" 按钮。点击添加 secret PASSWORD:".into(),
+            },
+            EngineEvent::AssistantMessage {
+                text: "and the value is password: hunter2-durable-secret".into(),
+            },
+            EngineEvent::AssistantMessage {
+                text: "done".into(),
+            },
+        ];
+        for event in events {
+            log.append(None, event, &mut |_| {}).await.unwrap();
+        }
+
+        let rows = EventRepository::new(&db).load(&session).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "gapless"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| !r.payload.contains("hunter2-durable-secret")),
+            "secret must not persist"
+        );
+
+        let replayed = log.replay().await.expect("whole session must replay");
+        assert_eq!(replayed.len(), 4);
+        assert!(matches!(
+            &replayed[1],
+            EngineEvent::AssistantMessage { text } if text.ends_with("PASSWORD:")
+        ));
+    }
+
+    /// A legacy row corrupted by the pre-fix scrubber (injected via raw SQL,
+    /// below the validating write boundary) must fail replay CLOSED with full
+    /// provenance — session, sequence, event type — and must not echo payload
+    /// bytes (which may contain the secret redaction failed to remove).
+    #[tokio::test]
+    async fn corrupt_legacy_row_fails_closed_with_provenance_and_no_payload_echo() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let log = EventLog::new(&store, session.clone());
+        log.append(
+            None,
+            EngineEvent::AssistantMessage { text: "ok".into() },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        // The exact malformed bytes R007 persisted (truncated structure),
+        // injected BELOW the validating write boundary as a legacy row.
+        let corrupt =
+            r#"{"payload":{"text":"secret PASSWORD:"[REDACTED]"type":"assistant_message"}"#;
+        store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
+            id: leveler_core::EventId::generate().into_inner(),
+            session_id: session.as_str().to_string(),
+            turn_id: None,
+            sequence: 2,
+            event_type: "assistant_message".to_string(),
+            payload: corrupt.to_string(),
+            created_at: leveler_core::now().to_rfc3339(),
+            schema_version: 1,
+        });
+
+        let err = log
+            .replay()
+            .await
+            .expect_err("corrupt row must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("corrupt authoritative event"), "{msg}");
+        assert!(msg.contains(session.as_str()), "session provenance: {msg}");
+        assert!(msg.contains("sequence 2"), "sequence provenance: {msg}");
+        assert!(msg.contains("assistant_message"), "type provenance: {msg}");
+        assert!(
+            !msg.contains("[REDACTED]") && !msg.contains("PASSWORD"),
+            "diagnostics must not echo payload bytes: {msg}"
+        );
+        // The same fail-close applies to the dangling-call scan on resume.
+        let err = log.dangling_tool_calls().await.expect_err("fail closed");
+        assert!(err.to_string().contains("corrupt authoritative event"));
     }
 }

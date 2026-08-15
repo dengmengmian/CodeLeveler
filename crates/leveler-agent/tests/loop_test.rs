@@ -413,6 +413,27 @@ fn assistant_tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelRe
     }
 }
 
+fn assistant_parallel_calls(calls: &[(&str, &str, serde_json::Value)]) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            role: Role::Assistant,
+            content: calls
+                .iter()
+                .map(|(id, name, args)| ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new(*id),
+                        name: (*name).to_string(),
+                        arguments: args.clone(),
+                    },
+                })
+                .collect(),
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    }
+}
+
 fn assistant_text(text: &str) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
@@ -1816,7 +1837,9 @@ async fn repeated_identical_call_is_blocked_by_loop_guard() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The model calls the same list_files 4 times (identical output), then stops.
+    // The model calls the same list_files 4 times (identical output), then
+    // stops. R007 F1 must NOT weaken this: a genuine repeat is still refused
+    // per key and still ends the turn bounded (§32 Case B).
     let mut responses: Vec<ModelResponse> = (0..4)
         .map(|i| {
             assistant_tool_call(
@@ -1887,6 +1910,330 @@ async fn repeated_identical_call_is_blocked_by_loop_guard() {
     assert!(
         orphans.is_empty(),
         "every tool result must have a matching tool call; orphaned results: {orphans:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R007 F1 accident regression (W1 shape): ONE benign exact re-read early in
+/// the turn must not latch every later novel observation as thrash. Pre-fix,
+/// `repeated_observation` was a whole-history `any()` — after `bearer.ts` was
+/// read twice, rounds of NOVEL greps/lists classified ObserveThrash, the
+/// forced-answer blanket then refused novel calls, and the turn was killed
+/// Incomplete ("重复观察已中止") nine minutes into a healthy diagnosis. If this
+/// test is deleted, that false kill can return unnoticed.
+#[tokio::test]
+async fn an_early_benign_repeat_must_not_latch_later_novel_observation_as_thrash() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-novel-after-repeat-{}",
+        std::process::id() as u64 * 31 + 3
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+    std::fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+    std::fs::write(dir.join("src/c.rs"), "pub fn gamma() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let responses = vec![
+        // The benign repeat: same file read twice with identical content
+        // (LOOP_GUARD_THRESHOLD is reached for this one key).
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/a.rs"})),
+        assistant_tool_call("r2", "read_file", serde_json::json!({"path": "src/a.rs"})),
+        // …followed by rounds of purely NOVEL observation (the W1 tail that
+        // was refused and killed pre-fix).
+        assistant_tool_call(
+            "g1",
+            "grep",
+            serde_json::json!({"pattern": "alpha", "path": "src"}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "grep",
+            serde_json::json!({"pattern": "beta", "path": "src"}),
+        ),
+        assistant_tool_call("l1", "list_files", serde_json::json!({"path": "src"})),
+        assistant_tool_call(
+            "g3",
+            "grep",
+            serde_json::json!({"pattern": "gamma", "path": "src"}),
+        ),
+        assistant_text("diagnosis complete"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "investigate the alpha/beta/gamma helpers",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Answered,
+        "novel observation after one benign repeat must run to the answer, \
+         never die as thrash: {:?}",
+        outcome.stop_detail
+    );
+    let novel_refused: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            leveler_agent::AgentEvent::ToolResult {
+                id,
+                is_error: true,
+                preview,
+                ..
+            } if ["g1", "g2", "g3", "l1"].contains(&id.as_str()) => {
+                Some((id.clone(), preview.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        novel_refused.is_empty(),
+        "no novel observe call may be refused: {novel_refused:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R007 F1 §31: even AFTER the forced-answer nudge fires (a genuine thrash
+/// streak reached the cap), a NOVEL observation must still be allowed to run.
+/// Pre-fix a blanket refusal rejected every observe-class call once that flag
+/// was set — regardless of novelty, and inconsistently (read_file escaped it
+/// because it has no observe key, contradicting the refusal's own wording).
+/// That blanket is what turned "answer from what you have" into "you may never
+/// look at anything new again", and it is the second half of the R007 W1 kill.
+#[tokio::test]
+async fn novel_observation_is_still_allowed_after_the_forced_answer_nudge() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-post-forced-novel-{}",
+        std::process::id() as u64 * 41 + 17
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+    std::fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let responses = vec![
+        // Genuine thrash: identical list twice, then a refused third — this
+        // drives the no-progress streak to the cap and arms forced-answer.
+        assistant_tool_call("l1", "list_files", serde_json::json!({"path": "src"})),
+        assistant_tool_call("l2", "list_files", serde_json::json!({"path": "src"})),
+        assistant_tool_call("l3", "list_files", serde_json::json!({"path": "src"})),
+        // The model takes the hint differently: it looks at something NEW.
+        assistant_tool_call(
+            "g1",
+            "grep",
+            serde_json::json!({"pattern": "beta", "path": "src"}),
+        ),
+        assistant_text("found it"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "find the beta helper",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let g1_ran = events.iter().any(|e| {
+        matches!(e,
+            leveler_agent::AgentEvent::ToolResult { id, is_error: false, .. }
+                if id.as_str() == "g1")
+    });
+    assert!(
+        g1_ran,
+        "a novel grep after the forced-answer nudge must execute, not be \
+         blanket-refused: {events:?}"
+    );
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Answered,
+        "recovering via novel observation must reach the answer: {:?}",
+        outcome.stop_detail
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R007 F1, parallel path: rounds where TWO observes actually execute — one
+/// returning an identical earlier result, one genuinely new — must grade as
+/// exploration. The parallel result loop originally counted the repeat but
+/// never credited the novel sibling, so a batch of "re-check this + look at
+/// that" rounds accumulated thrash and hard-stopped a turn doing real work.
+#[tokio::test]
+async fn a_parallel_round_mixing_a_repeat_with_novel_work_is_not_thrash() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-parallel-mixed-{}",
+        std::process::id() as u64 * 43 + 19
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for (name, sym) in [
+        ("a", "alpha"),
+        ("b", "beta"),
+        ("c", "gamma"),
+        ("d", "delta"),
+    ] {
+        std::fs::write(
+            dir.join(format!("src/{name}.rs")),
+            format!("pub fn {sym}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let grep = |id: &str, pat: &str| {
+        (
+            id.to_string(),
+            "grep".to_string(),
+            serde_json::json!({"pattern": pat, "path": "src"}),
+        )
+    };
+    let pair = |a: (String, String, serde_json::Value), b: (String, String, serde_json::Value)| {
+        assistant_parallel_calls(&[
+            (a.0.as_str(), a.1.as_str(), a.2.clone()),
+            (b.0.as_str(), b.1.as_str(), b.2.clone()),
+        ])
+    };
+    let responses = vec![
+        // Seed two distinct observations.
+        pair(grep("s1", "alpha"), grep("s2", "beta")),
+        // Each later round re-obtains one earlier result (identical output)
+        // alongside a genuinely new one. Three such rounds would exhaust the
+        // no-progress cap AND the forced-answer second chance if they were
+        // mis-graded as pure thrash.
+        pair(grep("m1", "alpha"), grep("m2", "gamma")),
+        pair(grep("m3", "beta"), grep("m4", "delta")),
+        pair(grep("m5", "gamma"), grep("m6", "pub fn")),
+        assistant_text("all four located"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .run(
+        "locate the four helpers",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Answered,
+        "parallel rounds carrying real new observation must not accumulate \
+         thrash: {:?}",
+        outcome.stop_detail
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R007 F1 §32 Case C/D: a mixed round (one refused true repeat + one novel
+/// observation) is exploration, not thrash — the turn continues and answers.
+/// The single repeat refusal must neither escalate as ordinary stagnation nor
+/// poison the novel work beside it.
+#[tokio::test]
+async fn a_mixed_round_with_novel_work_is_not_thrash() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-mixed-round-{}",
+        std::process::id() as u64 * 37 + 11
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+    std::fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let responses = vec![
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/a.rs"})),
+        assistant_tool_call("r2", "read_file", serde_json::json!({"path": "src/a.rs"})),
+        // Mixed rounds: the identical re-read is refused by the per-key guard
+        // while the novel grep beside it executes. TWO of them, so a
+        // mis-grading as pure thrash would reach the no-progress cap and kill
+        // the turn — that is what makes this test discriminate.
+        assistant_parallel_calls(&[
+            ("r3", "read_file", serde_json::json!({"path": "src/a.rs"})),
+            (
+                "g1",
+                "grep",
+                serde_json::json!({"pattern": "beta", "path": "src"}),
+            ),
+        ]),
+        assistant_parallel_calls(&[
+            ("r4", "read_file", serde_json::json!({"path": "src/a.rs"})),
+            (
+                "g2",
+                "grep",
+                serde_json::json!({"pattern": "alpha", "path": "src"}),
+            ),
+        ]),
+        assistant_text("done"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "inspect the helpers",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Answered,
+        "a mixed round must not end the turn: {:?}",
+        outcome.stop_detail
+    );
+    let g1_ok = events.iter().any(|e| {
+        matches!(e,
+            leveler_agent::AgentEvent::ToolResult { id, is_error: false, .. }
+                if id.as_str() == "g1")
+    });
+    assert!(
+        g1_ok,
+        "the novel grep beside the refused repeat must execute"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

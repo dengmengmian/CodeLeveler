@@ -44,3 +44,18 @@ pub use terminal_repo::TerminalRepository;
 pub use terminal_store::{MemoryTerminalStore, TerminalStore};
 pub use turn_repo::{TurnRecord, TurnRepository};
 pub use turn_store::{MemoryTurnStore, TurnStore};
+
+/// Redact secrets in a durable JSON payload without touching its structure,
+/// refusing loudly when the input is not valid JSON (R007 F2).
+///
+/// Every writer of a JSON-contract column (events, session messages, turn
+/// payloads) must go through this boundary: the serialized-text scrubber used
+/// to swallow JSON structural bytes and persist unreplayable rows. `context`
+/// names the plane for the error message and must never contain payload bytes.
+pub(crate) fn redact_json_payload(context: &str, payload: &str) -> Result<String, StorageError> {
+    leveler_core::redact_secrets_json(payload).map_err(|e| {
+        StorageError::InvalidData(format!(
+            "refusing to persist non-JSON {context} payload: {e}"
+        ))
+    })
+}

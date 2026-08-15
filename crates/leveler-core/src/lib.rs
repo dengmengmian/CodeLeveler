@@ -27,7 +27,7 @@ pub use ids::{
 };
 pub use ownership::{OwnerEpoch, OwnershipToken};
 pub use text::{
-    ceil_char_boundary, floor_char_boundary, redact_secrets, sanitize_terminal_output,
-    truncate_head_bytes, truncate_tail_bytes,
+    ceil_char_boundary, floor_char_boundary, redact_secrets, redact_secrets_json,
+    sanitize_terminal_output, truncate_head_bytes, truncate_tail_bytes,
 };
 pub use time::{Timestamp, now};

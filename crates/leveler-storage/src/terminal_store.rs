@@ -234,7 +234,7 @@ impl MemoryTerminalStore {
         self.check_injected_failure()?;
         let record = self
             .events
-            .append_record_for_terminal(session_id, None, event_type, payload, now);
+            .append_record_for_terminal_validated(session_id, None, event_type, payload, now)?;
         {
             let mut rows = self.sessions.rows.lock().unwrap();
             if let Some(session) = rows.get_mut(session_id.as_str()) {
@@ -270,13 +270,13 @@ impl MemoryTerminalStore {
             )));
         }
         self.check_injected_failure()?;
-        let record = self.events.append_record_for_terminal(
+        let record = self.events.append_record_for_terminal_validated(
             session_id,
             Some(turn_id),
             event_type,
             payload,
             now,
-        );
+        )?;
         {
             let mut rows = self.turns.rows.lock().unwrap();
             if let Some(turn) = rows.iter_mut().find(|t| t.id == turn_id.as_str()) {

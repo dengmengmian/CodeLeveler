@@ -78,7 +78,10 @@ impl TurnStore for Database {
         now: Timestamp,
     ) -> Result<TurnRecord, crate::OwnershipError> {
         let id = TurnId::generate().into_inner();
-        let payload = payload.map(leveler_core::redact_secrets);
+        let payload = payload
+            .map(|p| crate::redact_json_payload("turn", p))
+            .transpose()
+            .map_err(crate::OwnershipError::Storage)?;
         // Ordinal assignment AND ownership guard inside one INSERT.
         let inserted = sqlx::query(
             "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at) \
@@ -154,6 +157,9 @@ impl TurnStore for MemoryTurnStore {
         payload: Option<&str>,
         now: Timestamp,
     ) -> Result<TurnRecord, StorageError> {
+        let payload = payload
+            .map(|p| crate::redact_json_payload("turn", p))
+            .transpose()?;
         let mut rows = self.rows.lock().unwrap();
         let ordinal = rows
             .iter()
@@ -167,7 +173,7 @@ impl TurnStore for MemoryTurnStore {
             session_id: session_id.as_str().to_string(),
             ordinal,
             kind: kind.to_string(),
-            payload: payload.map(leveler_core::redact_secrets),
+            payload,
             status: "running".to_string(),
             created_at: now.to_rfc3339(),
             finished_at: None,
@@ -211,6 +217,10 @@ impl TurnStore for MemoryTurnStore {
                 "memory turn store has no ownership authority configured".to_string(),
             )));
         };
+        let payload = payload
+            .map(|p| crate::redact_json_payload("turn", p))
+            .transpose()
+            .map_err(crate::OwnershipError::Storage)?;
         ownership.with_current(token, || {
             let mut rows = self.rows.lock().unwrap();
             let ordinal = rows
@@ -225,7 +235,7 @@ impl TurnStore for MemoryTurnStore {
                 session_id: session_id.as_str().to_string(),
                 ordinal,
                 kind: kind.to_string(),
-                payload: payload.map(leveler_core::redact_secrets),
+                payload: payload.clone(),
                 status: "running".to_string(),
                 created_at: now.to_rfc3339(),
                 finished_at: None,

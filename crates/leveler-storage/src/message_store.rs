@@ -117,14 +117,22 @@ impl MemoryMessageStore {
         self
     }
 
-    fn append_records(&self, session_id: &SessionId, payloads: &[String]) {
+    fn append_records(
+        &self,
+        session_id: &SessionId,
+        payloads: &[String],
+    ) -> Result<(), StorageError> {
+        // Redact+validate every payload BEFORE touching the rows, so a refused
+        // message can never leave a partial batch behind (R007 F2).
+        let redacted: Vec<String> = payloads
+            .iter()
+            .map(|p| crate::redact_json_payload("session message", p))
+            .collect::<Result<_, _>>()?;
         let mut rows = self.rows.lock().unwrap();
-        for payload in payloads {
-            rows.push((
-                session_id.as_str().to_string(),
-                leveler_core::redact_secrets(payload),
-            ));
+        for payload in redacted {
+            rows.push((session_id.as_str().to_string(), payload));
         }
+        Ok(())
     }
 }
 
@@ -137,8 +145,7 @@ impl MessageStore for MemoryMessageStore {
         payloads: &[String],
         _now: Timestamp,
     ) -> Result<(), StorageError> {
-        self.append_records(session_id, payloads);
-        Ok(())
+        self.append_records(session_id, payloads)
     }
 
     async fn append_in_turn_owned(
@@ -154,7 +161,9 @@ impl MessageStore for MemoryMessageStore {
                 "memory message store has no ownership authority configured".to_string(),
             )));
         };
-        ownership.with_current(token, || self.append_records(session_id, payloads))
+        ownership
+            .with_current(token, || self.append_records(session_id, payloads))
+            .and_then(|r| r.map_err(crate::OwnershipError::Storage))
     }
 
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
@@ -219,7 +228,7 @@ mod tests {
             .append_in_turn(
                 session_a,
                 turn_a,
-                &["one".to_string(), "two".to_string()],
+                &[r#""one""#.to_string(), r#""two""#.to_string()],
                 leveler_core::now(),
             )
             .await
@@ -237,7 +246,7 @@ mod tests {
             .append_in_turn(
                 session_a,
                 turn_a,
-                &["three".to_string()],
+                &[r#""three""#.to_string()],
                 leveler_core::now(),
             )
             .await
@@ -245,7 +254,7 @@ mod tests {
 
         assert_eq!(
             store.load(session_a).await.unwrap(),
-            vec!["one", "two", "three"],
+            vec![r#""one""#, r#""two""#, r#""three""#],
             "append order must be load order"
         );
         let b = store.load(session_b).await.unwrap();
