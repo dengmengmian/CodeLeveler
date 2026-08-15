@@ -198,6 +198,15 @@ impl MemoryEventStore {
         self.events.lock().unwrap().push(record);
     }
 
+    /// Test-only: push a raw record BELOW the validating write boundary,
+    /// simulating a legacy row persisted by the pre-R007-fix scrubber.
+    /// Production code must never call this — new writes go through
+    /// [`redact_validated`] and can no longer produce such rows.
+    #[doc(hidden)]
+    pub fn inject_legacy_row_for_tests(&self, record: EventRecord) {
+        self.events.lock().unwrap().push(record);
+    }
+
     /// Crate-internal synchronous append for the memory terminal store,
     /// whose commit body must run under the ownership lock. Redacts and
     /// validates the payload up front; a refused payload never reaches the log.
