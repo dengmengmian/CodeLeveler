@@ -6742,3 +6742,130 @@ async fn exhausted_auth_failure_is_not_retried() {
     assert_eq!(attempts, 1, "no retry for a permanent error");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// R007 F6 accident regression, model-visible half. A credential the agent
+/// reads must not reach the model's context OR the provider request — only
+/// the value is removed, so the agent can still see which keys exist and
+/// reason about the file's shape.
+///
+/// Pre-fix, redaction happened only on the way to storage: the model saw the
+/// plaintext, repeated it in prose, and the plaintext persisted anyway.
+#[tokio::test]
+async fn secret_values_never_reach_the_model_or_the_provider() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-f6-model-boundary-{}",
+        std::process::id() as u64 * 53 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    const SECRET: &str = "hunter2-provider-unique-value";
+    std::fs::write(
+        dir.join("credentials.env"),
+        format!("SERVICE_USER=test-user\nSERVICE_PASSWORD={SECRET}\nENDPOINT=localhost:8080\n"),
+    )
+    .unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "read_file",
+            serde_json::json!({"path": "credentials.env"}),
+        ),
+        assistant_text("read the credentials file"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "look at credentials.env and tell me what is configured",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // The provider request is the strongest assertion: it is what actually
+    // leaves the machine.
+    let sent = format!("{:?}", runtime.recorded_requests());
+    assert!(
+        !sent.contains(SECRET),
+        "secret value reached the provider request"
+    );
+    // …and the agent still receives the structure it needs to work.
+    assert!(sent.contains("SERVICE_PASSWORD"), "key must survive");
+    assert!(sent.contains("SERVICE_USER"), "non-secret key must survive");
+    assert!(sent.contains("test-user"), "non-secret VALUE must survive");
+    assert!(sent.contains("localhost:8080"), "endpoint must survive");
+    assert!(sent.contains("[REDACTED]"), "value must be marked redacted");
+
+    // Nothing in the observable event stream carries it either.
+    let observed = format!("{events:?}");
+    assert!(
+        !observed.contains(SECRET),
+        "secret value leaked into the event stream"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ordinary source code that merely mentions credential words must reach the
+/// model byte-identical. This is the regression that makes relocating the old
+/// keyword scrubber to this boundary unacceptable.
+#[tokio::test]
+async fn source_code_mentioning_credentials_reaches_the_model_intact() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-f6-code-intact-{}",
+        std::process::id() as u64 * 59 + 13
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let source = "pub struct Creds {\n    pub password: String,\n}\n\nfn load(config: &Config) -> String {\n    let password = config.password;\n    password\n}\n";
+    std::fs::write(dir.join("src/creds.rs"), source).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "read_file",
+            serde_json::json!({"path": "src/creds.rs"}),
+        ),
+        assistant_text("read it"),
+    ]));
+    Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "read src/creds.rs",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let sent = format!("{:?}", runtime.recorded_requests());
+    for line in ["pub password: String,", "let password = config.password;"] {
+        assert!(
+            sent.contains(line),
+            "source line was rewritten on the way to the model: {line:?}"
+        );
+    }
+    assert!(
+        !sent.contains("[REDACTED]"),
+        "ordinary code must not be redacted at all"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

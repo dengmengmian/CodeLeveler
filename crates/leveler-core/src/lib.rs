@@ -12,6 +12,7 @@ pub mod environment;
 pub mod home;
 pub mod ids;
 pub mod ownership;
+pub mod secret;
 pub mod text;
 pub mod time;
 
@@ -26,8 +27,13 @@ pub use ids::{
     RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, UserShellId, new_uuid_string,
 };
 pub use ownership::{OwnerEpoch, OwnershipToken};
+pub use secret::{
+    DetectedSecret, SECRET_PLACEHOLDER, clear_session_secrets, register_session_secrets,
+    sanitize_model_visible, scrub_registered_secrets,
+};
 pub use text::{
     ceil_char_boundary, floor_char_boundary, redact_secrets, redact_secrets_json,
-    sanitize_terminal_output, truncate_head_bytes, truncate_tail_bytes,
+    redact_secrets_json_for_session, sanitize_terminal_output, truncate_head_bytes,
+    truncate_tail_bytes,
 };
 pub use time::{Timestamp, now};

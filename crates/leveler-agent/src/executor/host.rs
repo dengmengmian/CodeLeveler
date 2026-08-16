@@ -533,6 +533,32 @@ impl Executor {
             ),
             Err(e) => (format!("tool error: {e}"), true, serde_json::Value::Null),
         };
+        // F6 SECURITY BOUNDARY. Every tool result — read_file, shell, browser,
+        // web, MCP, git — passes through this one function exactly once, so
+        // sanitizing here keeps concrete secret values out of the model's
+        // context AND out of the provider request, instead of only scrubbing
+        // them on the way to the database (which is what let R007's agent see
+        // a credential, paraphrase it, and persist the plaintext anyway).
+        // Values found are remembered for this session so the same plaintext
+        // can be scrubbed if it reappears in durable text from another path.
+        let outcome = {
+            let (content, is_error, metadata) = outcome;
+            let (sanitized, found) = leveler_core::sanitize_model_visible(&content);
+            if !found.is_empty() {
+                if let Some(session) = admitted.ctx.session_scope.as_deref() {
+                    leveler_core::register_session_secrets(session, &found);
+                }
+                // Names only — never the values.
+                tracing::debug!(
+                    tool = %call.name,
+                    redacted = found.len(),
+                    keys = ?found.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+                    "redacted secret values from tool output before the model saw them"
+                );
+            }
+            (sanitized, is_error, metadata)
+        };
+
         // Close a delegated call's canonical record here, not in `dispatch`:
         // read-only tools run in the concurrent batch, which calls this
         // directly, so recording upstream would leave every parallel child

@@ -52,7 +52,11 @@ impl<'a> MessageRepository<'a> {
         .await?;
 
         for (offset, payload) in payloads.iter().enumerate() {
-            let redacted = crate::redact_json_payload("session message", payload)?;
+            let redacted = crate::redact_json_payload_for_session(
+                "session message",
+                payload,
+                Some(session_id.as_str()),
+            )?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
@@ -94,7 +98,11 @@ impl<'a> MessageRepository<'a> {
         .fetch_one(&mut *tx)
         .await?;
         for (offset, payload) in payloads.iter().enumerate() {
-            let redacted = crate::redact_json_payload("session message", payload)?;
+            let redacted = crate::redact_json_payload_for_session(
+                "session message",
+                payload,
+                Some(session_id.as_str()),
+            )?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at, turn_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -153,7 +161,11 @@ impl<'a> MessageRepository<'a> {
         .await
         .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
         for (offset, payload) in payloads.iter().enumerate() {
-            let redacted = crate::redact_json_payload("session message", payload)?;
+            let redacted = crate::redact_json_payload_for_session(
+                "session message",
+                payload,
+                Some(session_id.as_str()),
+            )?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at, turn_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -283,7 +295,11 @@ impl<'a> MessageRepository<'a> {
             .execute(&mut *tx)
             .await?;
         for (ordinal, payload) in payloads.iter().enumerate() {
-            let redacted = crate::redact_json_payload("session message", payload)?;
+            let redacted = crate::redact_json_payload_for_session(
+                "session message",
+                payload,
+                Some(session_id.as_str()),
+            )?;
             sqlx::query(
                 "INSERT INTO session_messages (session_id, ordinal, payload, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
