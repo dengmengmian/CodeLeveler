@@ -515,7 +515,7 @@ pub(crate) async fn last_persisted_plan(
 }
 
 /// Last EvidenceLedger snapshot from the event log (SoT for Delivery resume).
-async fn last_persisted_ledger(
+pub(crate) async fn last_persisted_ledger(
     events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::EvidenceLedger>, EngineError> {

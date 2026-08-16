@@ -1541,6 +1541,23 @@ impl TaskEngine {
         {
             task_outcome = TaskOutcome::CompletedUnverified;
         }
+        // R007b N2: the same rule applied to verification EVIDENCE. A check
+        // that passed before this task changed anything says the tree already
+        // satisfied it — on a goal that was expected to change code, that is
+        // not proof the work was done. R007b's agent watched a reproduction go
+        // green on an untouched tree, concluded the defect did not exist, and
+        // drifted to an unrelated fix; the runtime must not call that verified.
+        if task_outcome == TaskOutcome::Verified
+            && expected.has_mutation
+            && let Ok(Some(ledger)) = crate::turn::last_persisted_ledger(
+                runner.stores.events.as_ref(),
+                &runner.session_id,
+            )
+            .await
+            && ledger.only_baseline_green_evidence()
+        {
+            task_outcome = TaskOutcome::CompletedUnverified;
+        }
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
             verification: Some(report),
