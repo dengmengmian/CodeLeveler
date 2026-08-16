@@ -13,7 +13,24 @@ use super::{
     SubAgentProgressSink,
 };
 use crate::authorization::action_fingerprint;
-use crate::sub_agent::AgentRole;
+use crate::sub_agent::{AgentRole, ChildResult};
+
+/// Plain words for why a run ended, for a parent model rather than a log.
+fn stop_reason_wording(reason: StopReason) -> String {
+    match reason {
+        StopReason::BudgetExhausted => "its token or cost budget ran out",
+        StopReason::TurnLimitReached => "it hit the round ceiling",
+        StopReason::Blocked => "it declared the task blocked",
+        StopReason::PolicyBlocked => "harness policy refused its actions",
+        StopReason::Stalled => "it went quiet without resolving the task",
+        StopReason::Incomplete => "it stopped without finishing",
+        StopReason::Completed
+        | StopReason::Answered
+        | StopReason::CompletedUnverified
+        | StopReason::CloseoutForced => "",
+    }
+    .to_string()
+}
 
 impl Executor {
     /// Answer a `request_user_input` / `ask_user` tool call via the clarifier.
@@ -196,8 +213,8 @@ impl Executor {
             observer(event);
         }
         DelegatedChildResult {
-            ok: result.ok,
-            text: result.text,
+            ok: result.result.status.completed(),
+            result: result.result,
             modified_files: result.modified_files,
         }
     }
@@ -227,8 +244,11 @@ impl Executor {
             Ok(slot) => slot,
             Err(_) => {
                 return SubAgentRunResult {
-                    text: "sub-agent failed: concurrency slot closed".to_string(),
-                    ok: false,
+                    result: ChildResult::new(
+                        false,
+                        "",
+                        "no concurrency slot was available to run it",
+                    ),
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
                 };
@@ -279,12 +299,22 @@ impl Executor {
         // start/finish as attributed SubAgentActivity for the UI.
         let partial = std::sync::Arc::new(std::sync::Mutex::new(ProgressLedger::default()));
         let partial_obs = partial.clone();
+        // R007b N1: a child stopped by its budget used to hand back only the
+        // stop string, throwing away everything it had already established.
+        // Keep its last report so an interrupted run is partial, not empty.
+        let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let said_obs = said.clone();
         let activity_id = id.clone();
         let activity_tx = progress.clone();
         let mut capture = move |event: AgentEvent| match &event {
             AgentEvent::ProgressUpdated { ledger } => {
                 if let Ok(mut guard) = partial_obs.lock() {
                     *guard = ledger.clone();
+                }
+            }
+            AgentEvent::AssistantText(text) if !text.trim().is_empty() => {
+                if let Ok(mut guard) = said_obs.lock() {
+                    *guard = text.clone();
                 }
             }
             AgentEvent::ToolCall {
@@ -330,18 +360,30 @@ impl Executor {
                 )
                 .await;
         }
+        let said_before_stopping = || said.lock().map(|g| g.clone()).unwrap_or_default();
         match outcome {
             Ok(outcome) => {
-                let ok = matches!(
+                let completed = matches!(
                     outcome.stop_reason,
                     StopReason::Completed
                         | StopReason::Answered
                         | StopReason::CompletedUnverified
                         | StopReason::CloseoutForced
                 );
+                // An interrupted run's `final_text` can be empty even though the
+                // child said something useful earlier; fall back to that.
+                let findings = if outcome.final_text.trim().is_empty() && !completed {
+                    said_before_stopping()
+                } else {
+                    outcome.final_text
+                };
+                let stop_reason = if completed {
+                    String::new()
+                } else {
+                    stop_reason_wording(outcome.stop_reason)
+                };
                 SubAgentRunResult {
-                    text: outcome.final_text,
-                    ok,
+                    result: ChildResult::new(completed, &findings, stop_reason),
                     progress: outcome.progress,
                     modified_files: outcome.modified_files,
                 }
@@ -352,8 +394,11 @@ impl Executor {
                 let ledger = partial.lock().map(|g| g.clone()).unwrap_or_default();
                 let paths = ledger.cumulative_modified_paths.clone();
                 SubAgentRunResult {
-                    text: "sub-agent cancelled".to_string(),
-                    ok: false,
+                    result: ChildResult::new(
+                        false,
+                        &said_before_stopping(),
+                        "stopped before it could finish",
+                    ),
                     progress: ledger,
                     modified_files: paths,
                 }
@@ -362,8 +407,7 @@ impl Executor {
                 let ledger = partial.lock().map(|g| g.clone()).unwrap_or_default();
                 let paths = ledger.cumulative_modified_paths.clone();
                 SubAgentRunResult {
-                    text: format!("sub-agent failed: {e}"),
-                    ok: false,
+                    result: ChildResult::new(false, &said_before_stopping(), e.to_string()),
                     progress: ledger,
                     modified_files: paths,
                 }
@@ -378,17 +422,17 @@ impl Executor {
 pub struct DelegatedChildResult {
     /// Whether the child reached a clean terminal state.
     pub ok: bool,
-    /// The child's report, verbatim.
-    pub text: String,
+    /// What the child established, and how its run ended.
+    pub result: ChildResult,
     /// Files the child touched (a reviewer is read-only, so normally empty).
     pub modified_files: Vec<String>,
 }
 
-/// Spend + text returned from one sub-agent so the parent can roll up budgets.
+/// Spend + structured result from one sub-agent so the parent can roll up
+/// budgets and read what actually happened.
 #[derive(Debug, Clone)]
 pub(crate) struct SubAgentRunResult {
-    pub text: String,
-    pub ok: bool,
+    pub result: ChildResult,
     pub progress: ProgressLedger,
     pub modified_files: Vec<String>,
 }

@@ -125,6 +125,108 @@ pub(crate) fn agent_nickname(seq: usize) -> String {
     }
 }
 
+/// How a child's run ended, in the four readings a parent must tell apart.
+///
+/// R007b N1: a child died on its wall budget and returned only a stop string.
+/// The parent read that as "investigated, nothing to report" and closed the task
+/// without ever opening the file the child had been reading. "Finished and found
+/// nothing" and "stopped before finding anything" are opposite instructions, and
+/// a bare text field cannot carry the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildStatus {
+    /// Ran to a clean end and reported something.
+    CompletedWithFindings,
+    /// Ran to a clean end with nothing to flag. This IS a result.
+    CompletedNoFindings,
+    /// Stopped early, but what it had established survives in `findings`.
+    IncompletePartial,
+    /// Stopped early with nothing to show. NOT the same as "no findings".
+    IncompleteNoResult,
+}
+
+impl ChildStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            ChildStatus::CompletedWithFindings => "COMPLETED_WITH_FINDINGS",
+            ChildStatus::CompletedNoFindings => "COMPLETED_NO_FINDINGS",
+            ChildStatus::IncompletePartial => "INCOMPLETE_PARTIAL",
+            ChildStatus::IncompleteNoResult => "INCOMPLETE_NO_RESULT",
+        }
+    }
+
+    /// Whether the child reached the end of its task.
+    pub fn completed(self) -> bool {
+        matches!(
+            self,
+            ChildStatus::CompletedWithFindings | ChildStatus::CompletedNoFindings
+        )
+    }
+}
+
+/// What a child hands back to whoever launched it.
+#[derive(Debug, Clone)]
+pub struct ChildResult {
+    pub status: ChildStatus,
+    /// The child's report — empty only for the two "no result / no findings"
+    /// statuses, which say so explicitly.
+    pub findings: String,
+    /// Why the run ended, in plain words (empty when it ended normally).
+    pub stop_reason: String,
+    /// True when `findings` is what the child had reached, not what it set out
+    /// to deliver.
+    pub partial: bool,
+}
+
+impl ChildResult {
+    /// Classify a terminal run: `findings` decides between the "with" and
+    /// "without" readings, `completed` between the two pairs.
+    pub(crate) fn new(completed: bool, findings: &str, stop_reason: impl Into<String>) -> Self {
+        let findings = findings.trim().to_string();
+        let status = match (completed, findings.is_empty()) {
+            (true, false) => ChildStatus::CompletedWithFindings,
+            (true, true) => ChildStatus::CompletedNoFindings,
+            (false, false) => ChildStatus::IncompletePartial,
+            (false, true) => ChildStatus::IncompleteNoResult,
+        };
+        Self {
+            status,
+            findings,
+            stop_reason: stop_reason.into(),
+            partial: status == ChildStatus::IncompletePartial,
+        }
+    }
+
+    /// The text the parent model reads. The status line comes first so a
+    /// truncated result still says what kind of result it is.
+    pub fn for_parent(&self, nickname: &str) -> String {
+        let mut out = format!("[sub-agent {nickname}] status: {}", self.status.label());
+        if !self.stop_reason.is_empty() {
+            out.push_str(&format!(" (stopped: {})", self.stop_reason));
+        }
+        out.push('\n');
+        match self.status {
+            ChildStatus::CompletedWithFindings => out.push_str(&self.findings),
+            ChildStatus::CompletedNoFindings => out.push_str(
+                "The sub-agent finished its task and had nothing to report. This IS its \
+                 result — the work was done and turned up nothing to flag.",
+            ),
+            ChildStatus::IncompletePartial => {
+                out.push_str(
+                    "PARTIAL: the sub-agent was stopped before finishing. Everything it had \
+                     established follows; the rest of the task is NOT done.\n",
+                );
+                out.push_str(&self.findings);
+            }
+            ChildStatus::IncompleteNoResult => out.push_str(
+                "The sub-agent produced NO result. This is NOT \"nothing to report\": the task \
+                 was not carried out. Do it yourself or delegate it again — do not treat the \
+                 subject as investigated.",
+            ),
+        }
+        out
+    }
+}
+
 /// A sub-agent's role: its toolset and how it is prompted. Delegation is CC-style
 /// star topology — the parent spawns focused workers/explorers and collects their
 /// reports; sub-agents don't talk to each other.

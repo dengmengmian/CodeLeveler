@@ -566,7 +566,11 @@ impl TurnRunner<'_> {
                     id,
                     nickname: "reviewer".to_string(),
                     ok: result.ok,
-                    summary: leveler_core::truncate_head_bytes(result.text.trim(), 4000, "…"),
+                    summary: leveler_core::truncate_head_bytes(
+                        result.result.for_parent("reviewer").trim(),
+                        4000,
+                        "…",
+                    ),
                 },
                 observer,
             )

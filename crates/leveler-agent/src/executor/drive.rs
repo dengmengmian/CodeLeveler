@@ -1962,8 +1962,8 @@ impl Executor {
                             observer(AgentEvent::SubAgentFinished {
                                 id,
                                 nickname: nickname.clone(),
-                                ok: result.ok,
-                                summary: preview(&result.text),
+                                ok: result.result.status.completed(),
+                                summary: preview(&result.result.for_parent(&nickname)),
                             });
                             // Roll sub-agent spend into the parent task epoch.
                             // Parent same-batch spend was pinned before absorb.
@@ -1976,8 +1976,11 @@ impl Executor {
                                     modified_files.push(path);
                                 }
                             }
-                            let content =
-                                format!("[sub-agent {nickname} result]\n{}", result.text);
+                            // N1: the status line leads, so the parent can tell
+                            // "finished, nothing to flag" from "stopped before it
+                            // found anything" — opposite instructions that a bare
+                            // report text cannot carry.
+                            let content = result.result.for_parent(&nickname);
                             results[index] = Some(ContentPart::ToolResult {
                                 result: ToolResultContent {
                                     call_id,
@@ -1987,7 +1990,7 @@ impl Executor {
                                         &content,
                                         self.tool_context.policy.tool_output_budget,
                                     ),
-                                    is_error: !result.ok,
+                                    is_error: !result.result.status.completed(),
                                 },
                             });
                         }

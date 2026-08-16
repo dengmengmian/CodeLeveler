@@ -42,4 +42,5 @@ pub use leveler_lifecycle::{
     ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps,
     ProgressLedger, TaskContract, TurnPhase, WorkProfile, check, task_looks_like_implementation,
 };
+pub use sub_agent::{ChildResult, ChildStatus};
 pub use sub_agent::{multi_agent_steer_hint, task_suggests_delegation};
