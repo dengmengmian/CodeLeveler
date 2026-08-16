@@ -73,6 +73,51 @@ impl Verifier {
         }
     }
 
+    /// A sentence naming the requirement, the toolchain that actually ran and
+    /// where the requirement was declared — or `None` when the environment
+    /// satisfies the repo (or the repo declares nothing).
+    ///
+    /// Only consulted on the failure path, so a green run never pays for it,
+    /// and only claims a mismatch it can prove: an unknown version leaves the
+    /// failure attributed to the code, where it belongs by default.
+    async fn unmet_declared_toolchain(
+        &self,
+        program: &str,
+        resolved: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let declared = crate::toolchain::declared_for(program, &self.workspace_root)?;
+        let args = crate::toolchain::version_args(program)?;
+        // Ask the installed toolchain, from OUTSIDE the module. Go reads
+        // `go.mod` even for `go version` and tries to switch to the declared
+        // toolchain first — inside the repo the probe fails for exactly the
+        // reason we are trying to measure, and proves nothing.
+        let mut request = process_request_for_verify_check(
+            resolved.display().to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+            self.environment.temp_dir().to_path_buf(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        request.timeout = Duration::from_secs(30);
+        let output = self
+            .runner
+            .run(request, cancellation.child_token())
+            .await
+            .ok()?;
+        let actual = crate::toolchain::parse_actual(&combine(&output.stdout, &output.stderr))?;
+        crate::toolchain::is_below(&actual, &declared.version).then(|| {
+            format!(
+                "environment does not meet the toolchain this repository declares \
+                 (`{}` in {} requires {}, but `{}` is {})",
+                program,
+                declared.source,
+                declared.version,
+                resolved.display(),
+                actual
+            )
+        })
+    }
+
     async fn run_check(
         &self,
         command: &VerificationCommand,
@@ -130,6 +175,25 @@ impl Verifier {
                             resolved.display(),
                             truncate(&combined)
                         ),
+                        failure: Some(classify(command.kind, &combined)),
+                        failed_tests: BTreeSet::new(),
+                    }
+                } else if let Some(mismatch) = self
+                    .unmet_declared_toolchain(&command.program, &resolved, cancellation)
+                    .await
+                {
+                    // R005-F-P2: the repo declares a toolchain this environment
+                    // does not provide, so the check failed before the code was
+                    // ever judged. F-P1 only caught the tools that say so
+                    // themselves; a stale toolchain usually fails in an
+                    // ordinary way (R005 in Rust, R009 in Go) and was gating as
+                    // a code failure.
+                    CheckOutcome {
+                        name: command.name.clone(),
+                        kind: command.kind,
+                        gating: command.gating,
+                        status: CheckStatus::EnvironmentUnavailable,
+                        evidence: format!("{mismatch}: {}", truncate(&combined)),
                         failure: Some(classify(command.kind, &combined)),
                         failed_tests: BTreeSet::new(),
                     }
@@ -815,5 +879,141 @@ mod tests {
         );
         assert!(find_in_path("gate", &env).is_some());
         assert!(find_in_path("missing-gate", &env).is_none());
+    }
+}
+
+/// R005-F-P2: the repo declares a toolchain the environment does not provide.
+///
+/// F-P1 fixed the case where the tool *says so itself* ("package requires rustc
+/// 1.85"). A stale toolchain more often fails with an ordinary compile error,
+/// and that was gating as a code failure — the agent was told its code was
+/// wrong when the code had never been judged. R009 hit the same shape in Go.
+#[cfg(test)]
+mod toolchain_provenance_tests {
+    use super::*;
+
+    fn failing_cargo_check() -> VerificationPlan {
+        VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "build".into(),
+                program: "cargo".into(),
+                // Fails immediately, without the tool naming a version itself.
+                args: vec!["--this-flag-does-not-exist".into()],
+                kind: CheckKind::Build,
+                gating: true,
+                timeout_seconds: 60,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        }
+    }
+
+    async fn run_in(repo: &std::path::Path) -> CheckOutcome {
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let report = Verifier::with_environment(repo.to_path_buf(), environment)
+            .verify(
+                &failing_cargo_check(),
+                &[],
+                &[],
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        report.checks.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn unmet_rust_requirement_is_environment_not_code_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nrust-version = \"99.0\"\n",
+        )
+        .unwrap();
+        let check = run_in(dir.path()).await;
+        if check.status == CheckStatus::ToolMissing {
+            eprintln!("skipping: cargo is not on PATH");
+            return;
+        }
+        assert_eq!(
+            check.status,
+            CheckStatus::EnvironmentUnavailable,
+            "a repo needing rust 99.0 was never judged on its code: {}",
+            check.evidence
+        );
+        assert!(
+            check.evidence.contains("99.0") && check.evidence.contains("Cargo.toml"),
+            "the evidence must name the requirement and where it was declared: {}",
+            check.evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn unmet_go_requirement_is_environment_not_code_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/x\n\ngo 1.99.0\n",
+        )
+        .unwrap();
+        let plan = VerificationPlan {
+            commands: vec![VerificationCommand {
+                name: "test".into(),
+                program: "go".into(),
+                args: vec!["--this-flag-does-not-exist".into()],
+                kind: CheckKind::Test,
+                gating: true,
+                timeout_seconds: 60,
+                scope_policy: ScopePolicy::Exact,
+            }],
+        };
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os().collect::<Vec<_>>(),
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        let report = Verifier::with_environment(dir.path().to_path_buf(), environment)
+            .verify(&plan, &[], &[], &CancellationToken::new(), &mut |_| {})
+            .await;
+        let check = &report.checks[0];
+        if check.status == CheckStatus::ToolMissing {
+            eprintln!("skipping: go is not on PATH");
+            return;
+        }
+        assert_eq!(
+            check.status,
+            CheckStatus::EnvironmentUnavailable,
+            "a repo needing go 1.99.0 was never judged on its code: {}",
+            check.evidence
+        );
+        assert!(
+            check.evidence.contains("go.mod"),
+            "the evidence must name where the requirement was declared: {}",
+            check.evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn a_met_requirement_still_reports_a_real_failure_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nrust-version = \"1.0\"\n",
+        )
+        .unwrap();
+        let check = run_in(dir.path()).await;
+        if check.status == CheckStatus::ToolMissing {
+            eprintln!("skipping: cargo is not on PATH");
+            return;
+        }
+        assert_eq!(
+            check.status,
+            CheckStatus::Failed,
+            "a satisfied requirement must not excuse a genuine failure: {}",
+            check.evidence
+        );
     }
 }
