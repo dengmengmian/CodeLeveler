@@ -155,8 +155,8 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
             .map_or(key_start, |(i, _)| i);
         let key = line[name_start..key_end].to_string();
         let mut cursor = key_end;
-        // Optional closing quote on a JSON/YAML key: "password"
-        if matches!(bytes.get(cursor), Some(b'"') | Some(b'\'')) {
+        // Optional closing quote on a JSON/YAML/markdown key: "password", `password`
+        if matches!(bytes.get(cursor), Some(b'"') | Some(b'\'') | Some(b'`')) {
             cursor += 1;
         }
         cursor = skip_spaces(bytes, cursor);
@@ -300,7 +300,7 @@ fn value_span(line: &str, from: usize) -> Option<(usize, usize, bool)> {
     let bytes = line.as_bytes();
     match bytes.get(from) {
         None | Some(b'\n') | Some(b'\r') => None,
-        Some(&q @ (b'"' | b'\'')) => {
+        Some(&q @ (b'"' | b'\'' | b'`')) => {
             let start = from + 1;
             let mut i = start;
             while i < line.len() {
@@ -317,7 +317,7 @@ fn value_span(line: &str, from: usize) -> Option<(usize, usize, bool)> {
         }
         _ => {
             let end = line[from..]
-                .find(|c: char| c.is_whitespace() || c == ',' || c == '}' || c == ';')
+                .find(|c: char| c.is_whitespace() || c == ',' || c == '}' || c == ';' || c == '`')
                 .map(|rel| from + rel)
                 .unwrap_or(line.len());
             (end > from).then_some((from, end, false))
@@ -624,6 +624,25 @@ mod tests {
         assert_eq!(out.lines().count(), 3, "{out}");
         assert!(out.starts_with("line one\n"), "{out}");
         assert!(out.ends_with("line three\n"), "{out}");
+    }
+
+    /// Markdown inline code is how an assistant naturally writes about types
+    /// and fields. A backtick must delimit the value, or `password: String`
+    /// gets redacted and the closing backtick swallowed — which is exactly
+    /// what mangled a correct answer in the Gate 1 daemon smoke.
+    #[test]
+    fn markdown_inline_code_is_not_a_credential() {
+        for input in [
+            "- `password: String`",
+            "- `token: Option<String>`",
+            "the field `api_key: string` is required",
+        ] {
+            assert_eq!(sanitize(input), input, "markdown mangled: {input:?}");
+        }
+        // A real secret inside backticks is still redacted, and the closing
+        // backtick survives.
+        let out = sanitize("`password: hunter2-abc`");
+        assert_eq!(out, "`password: [REDACTED]`");
     }
 
     /// Multi-byte text must never panic the sanitizer. A credential
