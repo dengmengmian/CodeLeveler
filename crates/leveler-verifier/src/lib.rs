@@ -11,6 +11,7 @@ pub mod outcome;
 pub mod plan;
 pub mod report;
 pub mod test_results;
+mod toolchain;
 mod verifier;
 
 pub use failure::{ClassifiedFailure, FailureKind, RecoveryStrategy, classify};

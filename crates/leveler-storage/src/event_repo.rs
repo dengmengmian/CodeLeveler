@@ -61,7 +61,11 @@ impl<'a> EventRepository<'a> {
         // Structure-aware redaction (R007 F2): scrub string values only, never
         // the serialized document — and refuse loudly BEFORE the INSERT, so a
         // rejected payload can never corrupt the log or consume a sequence.
-        let payload = crate::redact_json_payload(&format!("event (type '{event_type}')"), payload)?;
+        let payload = crate::redact_json_payload_for_session(
+            &format!("event (type '{event_type}')"),
+            payload,
+            Some(session_id.as_str()),
+        )?;
         // The sequence is assigned inside the INSERT so concurrent appends on
         // one connection pool cannot race a read-then-write; the UNIQUE index on
         // (session_id, sequence) is the backstop that turns any residual race
@@ -374,6 +378,110 @@ mod tests {
             .map(|e| e.sequence)
             .collect();
         assert_eq!(seqs, vec![1, 2], "gapless after a refused append");
+    }
+
+    /// R007 F6 accident regression, durable-echo half: once a value has been
+    /// identified as a secret for this session, it must not re-enter durable
+    /// storage even when it arrives as ordinary prose with no key/value shape
+    /// left for the structural pass to recognise.
+    #[tokio::test]
+    async fn registered_session_secret_is_scrubbed_from_assistant_prose() {
+        let (db, session) = db_with_session().await;
+        let secret = "hunter2-durable-echo-unique";
+        leveler_core::clear_session_secrets(session.as_str());
+        leveler_core::register_session_secrets(
+            session.as_str(),
+            &[leveler_core::DetectedSecret {
+                value: secret.to_string(),
+                key: "API_PASSWORD".to_string(),
+            }],
+        );
+
+        let payload = serde_json::json!({
+            "type": "assistant_message",
+            "payload": {"text": format!("The API password is {secret}, noted.")}
+        })
+        .to_string();
+        let record = EventRepository::new(&db)
+            .append(
+                &session,
+                None,
+                "assistant_message",
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !record.payload.contains(secret),
+            "prose echo of a known secret must not persist: {}",
+            record.payload
+        );
+        // The sentence around it survives, and the row is still valid JSON.
+        let value: serde_json::Value = serde_json::from_str(&record.payload).unwrap();
+        assert!(
+            value["payload"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("The API password is"),
+            "{record:?}"
+        );
+        leveler_core::clear_session_secrets(session.as_str());
+    }
+
+    /// A secret registered for one session must not be scrubbed out of a
+    /// different session's rows — the registry is session-scoped.
+    #[tokio::test]
+    async fn registered_secrets_do_not_cross_sessions() {
+        let (db, session_a) = db_with_session().await;
+        let record = SessionRecord::new("/repo", "other", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session_b = SessionId::new(record.id);
+
+        let secret = "alpha-cross-session-value";
+        leveler_core::clear_session_secrets(session_a.as_str());
+        leveler_core::clear_session_secrets(session_b.as_str());
+        leveler_core::register_session_secrets(
+            session_a.as_str(),
+            &[leveler_core::DetectedSecret {
+                value: secret.to_string(),
+                key: "TOKEN".to_string(),
+            }],
+        );
+
+        let payload =
+            serde_json::json!({"type": "diagnostic", "payload": {"text": secret}}).to_string();
+        let repo = EventRepository::new(&db);
+        let in_a = repo
+            .append(
+                &session_a,
+                None,
+                "diagnostic",
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let in_b = repo
+            .append(
+                &session_b,
+                None,
+                "diagnostic",
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!in_a.payload.contains(secret), "own session must scrub");
+        assert!(
+            in_b.payload.contains(secret),
+            "another session must be unaffected: {}",
+            in_b.payload
+        );
+        leveler_core::clear_session_secrets(session_a.as_str());
+        leveler_core::clear_session_secrets(session_b.as_str());
     }
 
     #[tokio::test]

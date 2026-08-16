@@ -28,6 +28,7 @@ pub use compaction::{
     COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages, estimate_tokens,
     summarize_with_model,
 };
+pub use executor::DelegatedChildResult;
 pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
     AdvisoryKind, AgentError, AgentEvent, AgentOutcome, AgentVerificationStatus, AutoClarify,
@@ -41,4 +42,5 @@ pub use leveler_lifecycle::{
     ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps,
     ProgressLedger, TaskContract, TurnPhase, WorkProfile, check, task_looks_like_implementation,
 };
+pub use sub_agent::{ChildResult, ChildStatus};
 pub use sub_agent::{multi_agent_steer_hint, task_suggests_delegation};

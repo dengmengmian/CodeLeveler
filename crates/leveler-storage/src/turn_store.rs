@@ -79,7 +79,7 @@ impl TurnStore for Database {
     ) -> Result<TurnRecord, crate::OwnershipError> {
         let id = TurnId::generate().into_inner();
         let payload = payload
-            .map(|p| crate::redact_json_payload("turn", p))
+            .map(|p| crate::redact_json_payload_for_session("turn", p, Some(session_id.as_str())))
             .transpose()
             .map_err(crate::OwnershipError::Storage)?;
         // Ordinal assignment AND ownership guard inside one INSERT.
@@ -158,7 +158,7 @@ impl TurnStore for MemoryTurnStore {
         now: Timestamp,
     ) -> Result<TurnRecord, StorageError> {
         let payload = payload
-            .map(|p| crate::redact_json_payload("turn", p))
+            .map(|p| crate::redact_json_payload_for_session("turn", p, Some(session_id.as_str())))
             .transpose()?;
         let mut rows = self.rows.lock().unwrap();
         let ordinal = rows
@@ -218,7 +218,7 @@ impl TurnStore for MemoryTurnStore {
             )));
         };
         let payload = payload
-            .map(|p| crate::redact_json_payload("turn", p))
+            .map(|p| crate::redact_json_payload_for_session("turn", p, Some(session_id.as_str())))
             .transpose()
             .map_err(crate::OwnershipError::Storage)?;
         ownership.with_current(token, || {

@@ -2452,3 +2452,267 @@ mod child_side_effects_are_recoverable {
         );
     }
 }
+
+// ── Gate 5 / N1: a child's terminal result must be legible to the parent ────
+//
+// R007b: a child died on its wall budget and returned only a stop string. The
+// parent could not tell that apart from "investigated and found nothing", so it
+// closed the task without ever opening the file the child had been reading.
+// These four cases are the whole contract, asserted on the tool result the
+// parent model actually receives.
+
+/// Captures the transcript so a test can read the tool result the parent saw.
+struct RecordingSink {
+    messages: Arc<Mutex<Vec<Message>>>,
+}
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for RecordingSink {
+    async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_agent::AgentError> {
+        self.messages.lock().unwrap().extend_from_slice(messages);
+        Ok(())
+    }
+}
+
+/// The `spawn_agent` tool result for `call_id`, as (content, is_error).
+fn spawn_result(messages: &[Message], call_id: &str) -> (String, bool) {
+    for message in messages {
+        for part in &message.content {
+            if let ContentPart::ToolResult { result } = part
+                && result.call_id.as_str() == call_id
+            {
+                return (result.content.clone(), result.is_error);
+            }
+        }
+    }
+    panic!("no tool result for {call_id} in {messages:?}");
+}
+
+fn child_result_harness(
+    tag: &str,
+    salt: u64,
+    responses: Vec<ModelResponse>,
+    delay: Duration,
+) -> (std::path::PathBuf, Arc<SleepyRuntime>, ToolContext) {
+    let dir = tmp(tag, salt);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    (
+        dir,
+        Arc::new(SleepyRuntime::new(responses, delay)),
+        tool_context,
+    )
+}
+
+/// A: the child completed and produced findings.
+#[tokio::test]
+async fn child_completed_with_findings_is_reported_as_such() {
+    let (dir, runtime, tool_context) = child_result_harness(
+        "child-result-a",
+        301,
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "audit Headers"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Headers.vue drops the auth header on retry."),
+            assistant_text("parent done"),
+        ],
+        Duration::from_millis(0),
+    );
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    let _ = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .await;
+
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    assert!(
+        content.contains("COMPLETED_WITH_FINDINGS"),
+        "status must be explicit: {content}"
+    );
+    assert!(
+        content.contains("Headers.vue drops the auth header"),
+        "the findings themselves must survive: {content}"
+    );
+    assert!(!is_error, "a completed child is not an error");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// B: the child completed and had nothing to report. This is a RESULT, and must
+/// not read as a failure.
+#[tokio::test]
+async fn child_completed_without_findings_is_distinguishable_from_failure() {
+    let (dir, runtime, tool_context) = child_result_harness(
+        "child-result-b",
+        302,
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "audit Headers"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // A silent child is nudged before its silence is accepted, so it
+            // takes several empty rounds to reach a clean end with an empty
+            // report — the one shape that means "finished, nothing to say".
+            assistant_text("   "),
+            assistant_text("   "),
+            assistant_text("   "),
+            assistant_text("parent done"),
+        ],
+        Duration::from_millis(0),
+    );
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    let _ = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .await;
+
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    assert!(
+        content.contains("COMPLETED_NO_FINDINGS"),
+        "completing with nothing to say needs its own status: {content}"
+    );
+    assert!(
+        !content.contains("INCOMPLETE"),
+        "a completed child must never be labelled incomplete: {content}"
+    );
+    assert!(!is_error, "reporting nothing is not an error");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C: the child ran out of budget mid-investigation. What it had already
+/// learned must reach the parent, marked partial.
+#[tokio::test]
+async fn budget_limited_child_preserves_its_partial_findings() {
+    let (dir, runtime, tool_context) = child_result_harness(
+        "child-result-c",
+        303,
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "audit Headers"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Child round 1: says what it found so far, then keeps working.
+            assistant_with(
+                vec![
+                    ContentPart::Text {
+                        text: "so far: Headers.vue sets the header in two places".to_string(),
+                    },
+                    tool_call_part(
+                        "c1",
+                        "run_command",
+                        serde_json::json!({"program": "echo", "args": ["still reading"]}),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            // Child round 2 is slow; the budget (cancellation) lands during it.
+            assistant_text("never delivered"),
+            assistant_text("parent unused"),
+        ],
+        Duration::from_millis(80),
+    );
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        cancel.cancel();
+    });
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    let _ = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run("delegate", &mut |_| {}, &mut sink, token)
+    .await;
+
+    let (content, _) = spawn_result(&transcript.lock().unwrap(), "s1");
+    assert!(
+        content.contains("INCOMPLETE"),
+        "a child stopped by its budget did not complete: {content}"
+    );
+    assert!(
+        content.contains("Headers.vue sets the header in two places"),
+        "work the child had already done must not be discarded: {content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// D: the child failed before producing anything. The parent must be told there
+/// is NO result — the one reading that R007b got wrong.
+#[tokio::test]
+async fn failed_child_reports_no_result_rather_than_no_findings() {
+    let (dir, runtime, tool_context) = child_result_harness(
+        "child-result-d",
+        304,
+        // Only the parent's spawn round is scripted: the child's first model
+        // call errors out.
+        vec![assistant_with(
+            vec![spawn_call(
+                "s1",
+                serde_json::json!({"task": "audit Headers"}),
+            )],
+            FinishReason::ToolCalls,
+        )],
+        Duration::from_millis(0),
+    );
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    let _ = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .await;
+
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    assert!(
+        content.contains("INCOMPLETE_NO_RESULT"),
+        "producing nothing must be its own status: {content}"
+    );
+    assert!(
+        !content.contains("NO_FINDINGS"),
+        "a child that produced nothing did NOT report 'no findings': {content}"
+    );
+    assert!(
+        is_error,
+        "a child that never ran is an error for the parent"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

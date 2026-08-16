@@ -77,10 +77,28 @@ pub fn classify(kind: CheckKind, output: &str) -> ClassifiedFailure {
     }
 
     // Environment problems are not the code's fault — don't try to "repair".
+    //
+    // R003 F1: a correct hugo fix was recorded `failed` because the repo-wide
+    // suite exhausted the sandbox disk and wanted a global npm package.
+    // Exhausted resources and absent tooling say nothing about the code, so
+    // they must never reach the repair loop as a defect.
     if lower.contains("command not found")
         || lower.contains("could not find `cargo.toml`")
         || lower.contains("no such file or directory")
         || lower.contains("permission denied")
+        // resource exhaustion
+        || lower.contains("no space left on device")
+        || lower.contains("os error 28")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("too many open files")
+        || lower.contains("os error 24")
+        || lower.contains("out of memory")
+        || lower.contains("cannot allocate memory")
+        || lower.contains("killed: 9")
+        // tooling the environment does not provide
+        || lower.contains("executable not found")
+        || lower.contains("externally-managed-environment")
+        || lower.contains("npm err! code enoent")
     {
         return ClassifiedFailure {
             kind: FailureKind::EnvironmentFailure,
@@ -177,6 +195,42 @@ mod tests {
             assert_eq!(f.kind, FailureKind::EnvironmentFailure, "{output}");
             assert!(!f.retryable);
             assert_eq!(f.suggested_recovery, RecoveryStrategy::StopAndReport);
+        }
+    }
+
+    /// R003 F1: hugo's whole-repo `go test ./...` failed with
+    /// `no space left on device` and a missing global npm dependency — both
+    /// limits of the machine, not defects in the agent's (correct) fix. The
+    /// run was nonetheless recorded `failed`. A correct deliverable must not
+    /// be blamed on the environment it happened to run in.
+    #[test]
+    fn resource_and_missing_global_tooling_are_environment_failures() {
+        let cases = [
+            // R003's literal trigger.
+            "mkdir /var/folders/g0/T/sandboxes/abc: no space left on device",
+            "error: No space left on device (os error 28)",
+            // The other half of R003: a global tool the sandbox lacks.
+            "npm ERR! code ENOENT\nnpm ERR! syscall spawn\nexecutable not found",
+            "error: externally-managed-environment",
+            // Resource exhaustion that is equally not a code defect.
+            "fork failed: Resource temporarily unavailable",
+            "error: too many open files (os error 24)",
+            "Killed: 9",
+            "fatal error: out of memory",
+        ];
+        for output in cases {
+            let f = classify(CheckKind::Test, output);
+            assert_eq!(
+                f.kind,
+                FailureKind::EnvironmentFailure,
+                "should be environment, not a code defect: {output}"
+            );
+            assert!(!f.retryable, "{output}");
+            assert_eq!(
+                f.suggested_recovery,
+                RecoveryStrategy::StopAndReport,
+                "{output}"
+            );
         }
     }
 

@@ -55,6 +55,14 @@ async fn main() -> std::process::ExitCode {
     // Record panics before anything else can install a hook — the TUI's
     // terminal-restore hook chains to this one.
     crash::install(env!("CARGO_PKG_VERSION"));
+    // Build provenance is part of the version string: an official binary must
+    // be traceable to a commit, and one built from a dirty tree must say so
+    // rather than let a reader assume it IS that commit. Handled before clap
+    // so it replaces the default --version output.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("{}", build_provenance());
+        return std::process::ExitCode::SUCCESS;
+    }
     let args = Cli::parse();
     // No subcommand or `tui` takes over the terminal (ratatui alternate
     // screen). Logs written to stderr there paint straight over the UI and
@@ -323,5 +331,60 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             force,
             version,
         } => upgrade_cmd::cmd_upgrade(check, force, version).await,
+    }
+}
+
+/// One line identifying exactly which source this binary was built from.
+///
+/// `UNTRUSTED` is not decoration: a binary built from a dirty tree is not the
+/// commit it names, and Batch #1 lost an investigation cycle to exactly that
+/// confusion.
+fn build_provenance() -> String {
+    let commit = env!("LEVELER_BUILD_COMMIT");
+    let dirty = env!("LEVELER_BUILD_DIRTY") == "true";
+    format_provenance(env!("CARGO_PKG_VERSION"), commit, dirty)
+}
+
+fn format_provenance(version: &str, commit: &str, dirty: bool) -> String {
+    let short = commit.get(..12).unwrap_or(commit);
+    if dirty {
+        format!("leveler {version} ({short}-dirty) UNTRUSTED: built from a modified working tree")
+    } else {
+        format!("leveler {version} ({short})")
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::format_provenance;
+
+    /// A clean build names its commit and claims nothing more.
+    #[test]
+    fn a_clean_build_reports_its_commit() {
+        let line = format_provenance("0.1.4", "c3bf11ba01c3d5e5ef66244dcc3a6ae787036268", false);
+        assert!(line.contains("0.1.4"), "{line}");
+        assert!(line.contains("c3bf11ba01c3"), "{line}");
+        assert!(!line.contains("UNTRUSTED"), "{line}");
+    }
+
+    /// The accident this exists for: HEAD said one commit, the binary carried
+    /// another session's uncommitted work, and nothing in the binary said so.
+    #[test]
+    fn a_dirty_build_marks_itself_untrusted() {
+        let line = format_provenance("0.1.4", "c3bf11ba01c3d5e5ef66244dcc3a6ae787036268", true);
+        assert!(line.contains("UNTRUSTED"), "{line}");
+        assert!(line.contains("dirty"), "{line}");
+        assert!(
+            line.contains("c3bf11ba01c3"),
+            "the commit is still named so the drift is diagnosable: {line}"
+        );
+    }
+
+    /// A short or absent commit must not panic the version path.
+    #[test]
+    fn an_unknown_commit_is_reported_not_fatal() {
+        let line = format_provenance("0.1.4", "unknown", true);
+        assert!(line.contains("unknown"), "{line}");
+        assert!(line.contains("UNTRUSTED"), "{line}");
     }
 }

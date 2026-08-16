@@ -96,6 +96,35 @@ impl EvidenceLedger {
             .any(|v| v.exit_code == 0 && v.after_mutation_seq >= last_mut && last_mut > 0)
     }
 
+    /// Verifications that PASSED before this task changed anything.
+    ///
+    /// R007b N2: on a bug-fix goal the agent added a reproduction, watched it
+    /// go green on the untouched tree, and concluded the defect did not
+    /// exist — then drifted to an unrelated fix. A check that passes before
+    /// any mutation has demonstrated that the current code satisfies it; on a
+    /// fix goal that is the *opposite* of reproducing the bug, so it must
+    /// never be presented as proof that the work is done.
+    ///
+    /// This is evidence semantics, not a policy: nothing is blocked, the
+    /// verification is simply not counted as reproduction proof.
+    pub fn baseline_green_verifications(&self) -> Vec<&VerifyRecord> {
+        self.verifications
+            .iter()
+            .filter(|v| v.exit_code == 0 && v.after_mutation_seq == 0)
+            .collect()
+    }
+
+    /// Whether every successful verification so far ran on an unmodified
+    /// tree — i.e. nothing has been proven about a change that was never made.
+    pub fn only_baseline_green_evidence(&self) -> bool {
+        let successful: Vec<_> = self
+            .verifications
+            .iter()
+            .filter(|v| v.exit_code == 0)
+            .collect();
+        !successful.is_empty() && successful.iter().all(|v| v.after_mutation_seq == 0)
+    }
+
     pub fn find_successful_verify(&self, evidence_ref: &str) -> Option<&VerifyRecord> {
         self.verifications
             .iter()
@@ -159,5 +188,38 @@ mod tests {
         });
         assert_eq!(led.step_receipts.len(), 1);
         assert_eq!(led.step_receipts[0].evidence_ref, "v1");
+    }
+
+    /// R007b N2 accident shape: a reproduction that passes on the untouched
+    /// tree proves nothing about a fix that has not been written.
+    #[test]
+    fn a_verification_that_passes_before_any_change_is_not_proof() {
+        let mut led = EvidenceLedger::default();
+        led.record_verify("c1", "vitest run repro", 0);
+        assert_eq!(led.baseline_green_verifications().len(), 1);
+        assert!(
+            led.only_baseline_green_evidence(),
+            "green on an unmodified tree must not read as proof"
+        );
+        assert!(
+            !led.has_fresh_successful_verify(),
+            "and it must not satisfy the fresh-verify gate either"
+        );
+
+        led.record_mutation("c2", "apply_patch", vec!["src/lib.rs".into()]);
+        led.record_verify("c3", "vitest run repro", 0);
+        assert!(!led.only_baseline_green_evidence());
+        assert!(led.has_fresh_successful_verify());
+        assert_eq!(led.baseline_green_verifications().len(), 1);
+    }
+
+    /// A FAILING check on an unmodified tree is exactly what a reproduction
+    /// should look like, and must not be flagged.
+    #[test]
+    fn a_red_reproduction_on_the_baseline_is_not_flagged() {
+        let mut led = EvidenceLedger::default();
+        led.record_verify("c1", "vitest run repro", 1);
+        assert!(led.baseline_green_verifications().is_empty());
+        assert!(!led.only_baseline_green_evidence());
     }
 }

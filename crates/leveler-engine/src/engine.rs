@@ -480,7 +480,16 @@ impl TaskEngine {
             result,
             Err(EngineError::Agent(leveler_agent::AgentError::Cancelled))
         );
+        // R007 F3: a WORK-WINDOW boundary is not a goal terminal. When the
+        // round/step budget runs out the session stays resumable
+        // (`AgentState::Execute`), and the goal's services must outlive the
+        // window — R007 hit the ceiling twice and spent each next window
+        // rebuilding the dev server this reap had just killed. A genuine goal
+        // terminal still reaps, so R6-P4 is unaffected.
+        let goal_continues = matches!(&result, Ok(report)
+            if terminal_status_for(report).1 == AgentState::Execute);
         if !interrupted
+            && !goal_continues
             && let (Some(scope), Some(registry)) = (
                 self.factory.tool_context.session_scope.as_deref(),
                 self.factory.tool_context.services.background_tasks.as_ref(),
@@ -1541,6 +1550,57 @@ impl TaskEngine {
         {
             task_outcome = TaskOutcome::CompletedUnverified;
         }
+        // R007b N2: the same rule applied to verification EVIDENCE. A check
+        // that passed before this task changed anything says the tree already
+        // satisfied it — on a goal that was expected to change code, that is
+        // not proof the work was done. R007b's agent watched a reproduction go
+        // green on an untouched tree, concluded the defect did not exist, and
+        // drifted to an unrelated fix; the runtime must not call that verified.
+        if task_outcome == TaskOutcome::Verified
+            && expected.has_mutation
+            && let Ok(Some(ledger)) = crate::turn::last_persisted_ledger(
+                runner.stores.events.as_ref(),
+                &runner.session_id,
+            )
+            .await
+            && ledger.only_baseline_green_evidence()
+        {
+            task_outcome = TaskOutcome::CompletedUnverified;
+        }
+        // R007b N7: an independent review that policy says is warranted, and
+        // that never happened, is missing evidence — not a detail. R008 and
+        // R009 both carried REQUIRED_REVIEWER and ignored it because the
+        // product had never heard of the designation. A change shaped like one
+        // that needs review can no longer close as verified without one.
+        if task_outcome == TaskOutcome::Verified
+            && crate::policy_resolver::ReviewTrigger::from_modified_paths(
+                &outcome.modified_files,
+                false,
+            )
+            .review_required()
+            && !crate::turn::session_had_review(runner.stores.events.as_ref(), &runner.session_id)
+                .await
+                .unwrap_or(false)
+        {
+            // The designation only means something if the runtime can act on
+            // it, so the harness launches the review itself rather than hoping
+            // the model delegates. Downgrade only when the review could not be
+            // obtained — an absent review is missing evidence either way, but a
+            // review that ran is the evidence the policy asked for.
+            let reviewed = runner
+                .run_review(
+                    goal_profile(spec),
+                    review_brief(&spec.runtime.goal, &outcome.modified_files),
+                    outcome.modified_files.clone(),
+                    observer,
+                    cancellation.clone(),
+                )
+                .await
+                .unwrap_or(false);
+            if !reviewed {
+                task_outcome = TaskOutcome::CompletedUnverified;
+            }
+        }
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
             verification: Some(report),
@@ -1636,6 +1696,38 @@ fn verification_is_repairable(report: &VerificationReport) -> bool {
 
 /// Compose the repair goal from the failed report (engine-local equivalent of
 /// the app layer's compose_repair_goal).
+/// The brief handed to a harness-launched reviewer.
+///
+/// It names the task and the files that changed and nothing else: the reviewer
+/// is read-only and must reach its own conclusions from the code, not from the
+/// implementing agent's account of what it did.
+fn review_brief(goal: &str, files: &[String]) -> String {
+    // A wide diff is exactly the case that triggers review; listing hundreds of
+    // paths would spend the reviewer's context before it reads anything.
+    const MAX_LISTED: usize = 40;
+    let listed = files
+        .iter()
+        .take(MAX_LISTED)
+        .map(|path| format!("- {path}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let elided = files.len().saturating_sub(MAX_LISTED);
+    let more = if elided > 0 {
+        format!("\n- …and {elided} more file(s)")
+    } else {
+        String::new()
+    };
+    format!(
+        "Independently review the change that was just made for this task.\n\n\
+         Task: {goal}\n\n\
+         Files changed:\n{listed}{more}\n\n\
+         Read the changed files and the code they interact with, then report the \
+         concrete defects you can point at — correctness, security, concurrency \
+         and error paths first. Name the file and the specific problem for each. \
+         If you find nothing blocking, say so."
+    )
+}
+
 fn repair_goal(goal: &str, report: &VerificationReport) -> String {
     let mut failures = String::new();
     for check in report.failed_gates() {

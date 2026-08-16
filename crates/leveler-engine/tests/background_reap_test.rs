@@ -372,3 +372,49 @@ async fn interrupted_turn_keeps_session_owned_tasks_alive() {
     );
     h.registry.kill_all().await;
 }
+
+/// R007 F3 accident shape: a goal that runs out of WORK-WINDOW budget is not
+/// a goal that finished. R007 hit the 100-round ceiling twice; each time the
+/// terminal settlement reaped the dev server the agent had started, and the
+/// next window spent its rounds rebuilding the same environment instead of
+/// doing the task.
+///
+/// A window boundary leaves the session resumable (`Incomplete` / `Execute`),
+/// so a service the goal started must survive it. R6-P4 is unaffected: a
+/// genuine goal terminal still reaps, which the sibling tests pin.
+#[tokio::test]
+async fn a_work_window_boundary_keeps_goal_owned_services_alive() {
+    // One round of budget: the turn spawns the server and immediately runs
+    // out of window, which is exactly the ceiling shape.
+    let h = harness(vec![spawn_sleep_server(), text("still working")]).await;
+    let mut s = spec(&h, "start the dev server, then keep working");
+    s.runtime.limits = StepLimits {
+        max_rounds: Some(1),
+        ..StepLimits::default()
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("run should settle at the window boundary");
+    assert!(
+        matches!(
+            report.stop_reason,
+            leveler_agent::StopReason::TurnLimitReached
+                | leveler_agent::StopReason::BudgetExhausted
+        ),
+        "test needs a window-budget terminal, got {:?}",
+        report.stop_reason
+    );
+
+    // The service must still be running: the goal is resumable, and the next
+    // window should find its environment intact.
+    let survivors = h.registry.kill_scope(SESSION_SCOPE).await;
+    assert_eq!(
+        survivors, 1,
+        "a goal-owned service must survive a work-window boundary so the next \
+         window does not rebuild the environment"
+    );
+}

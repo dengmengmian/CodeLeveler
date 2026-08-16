@@ -280,7 +280,11 @@ async fn append_event(
     now: &Timestamp,
 ) -> Result<EventRecord, StorageError> {
     let id = leveler_core::EventId::generate().into_inner();
-    let payload = crate::redact_json_payload(&format!("event (type '{event_type}')"), payload)?;
+    let payload = crate::redact_json_payload_for_session(
+        &format!("event (type '{event_type}')"),
+        payload,
+        Some(session_id.as_str()),
+    )?;
     sqlx::query(
         "INSERT INTO events \
          (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \

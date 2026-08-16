@@ -514,8 +514,111 @@ pub(crate) async fn last_persisted_plan(
     )
 }
 
+impl TurnRunner<'_> {
+    /// Run one independent reviewer child over work this session already did,
+    /// and report whether the review actually completed.
+    ///
+    /// R007b N7 (mechanism half): the harness decides the review is warranted
+    /// and launches it here, through the same child primitive the `spawn_agent`
+    /// tool uses — same registry, limits, cancellation and ownership fence. It
+    /// is not a turn: no turn row, no plan/ledger seeding, no goal state. The
+    /// started/finished pair is persisted because "was this reviewed?" has to be
+    /// answerable from durable history rather than from a task card.
+    pub(crate) async fn run_review(
+        &self,
+        profile: TurnProfile,
+        brief: String,
+        files: Vec<String>,
+        observer: &mut dyn FnMut(EngineEvent),
+        cancellation: CancellationToken,
+    ) -> Result<bool, EngineError> {
+        let executor = self
+            .factory
+            .build(profile, None)
+            .await?
+            .with_execution_fence(Arc::new(OwnershipFence {
+                ownership: self.stores.ownership.clone(),
+                token: self.token.clone(),
+            }));
+        let id = format!("reviewer-{}", leveler_core::RequestId::generate());
+        self.log
+            .append(
+                None,
+                EngineEvent::SubAgentStarted {
+                    id: id.clone(),
+                    nickname: "reviewer".to_string(),
+                    role: "reviewer".to_string(),
+                    task: brief.clone(),
+                },
+                observer,
+            )
+            .await?;
+        let result = {
+            let mut forward = |event: leveler_agent::AgentEvent| observer(EngineEvent::from(event));
+            executor
+                .run_reviewer_child(id.clone(), brief, files, &mut forward, cancellation)
+                .await
+        };
+        self.log
+            .append(
+                None,
+                EngineEvent::SubAgentFinished {
+                    id,
+                    nickname: "reviewer".to_string(),
+                    ok: result.ok,
+                    summary: leveler_core::truncate_head_bytes(
+                        result.result.for_parent("reviewer").trim(),
+                        4000,
+                        "…",
+                    ),
+                },
+                observer,
+            )
+            .await?;
+        Ok(result.ok)
+    }
+}
+
+/// Whether this session has an independent review on record.
+///
+/// R007b N7: the reviewer designation only means something if the runtime can
+/// answer "was this reviewed?" from durable history rather than from a task
+/// card. The role lives on `SubAgentStarted` and the terminal on
+/// `SubAgentFinished`, so a review counts only when the same agent id appears
+/// in both — a reviewer that started and died without finishing has not
+/// reviewed anything (N1's shape, deliberately not credited).
+pub(crate) async fn session_had_review(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<bool, EngineError> {
+    let mut reviewers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in events.load(session_id).await? {
+        match row.event_type.as_str() {
+            "sub_agent_started" => {
+                if let Ok(EngineEvent::SubAgentStarted { id, role, .. }) =
+                    EngineEvent::from_payload(&row.payload)
+                    && role.eq_ignore_ascii_case("reviewer")
+                {
+                    reviewers.insert(id);
+                }
+            }
+            "sub_agent_finished" => {
+                if let Ok(EngineEvent::SubAgentFinished { id, ok, .. }) =
+                    EngineEvent::from_payload(&row.payload)
+                    && ok
+                    && reviewers.contains(&id)
+                {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 /// Last EvidenceLedger snapshot from the event log (SoT for Delivery resume).
-async fn last_persisted_ledger(
+pub(crate) async fn last_persisted_ledger(
     events: &dyn EventStore,
     session_id: &SessionId,
 ) -> Result<Option<leveler_lifecycle::EvidenceLedger>, EngineError> {

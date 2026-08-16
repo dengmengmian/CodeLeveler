@@ -126,7 +126,13 @@ impl MemoryMessageStore {
         // message can never leave a partial batch behind (R007 F2).
         let redacted: Vec<String> = payloads
             .iter()
-            .map(|p| crate::redact_json_payload("session message", p))
+            .map(|p| {
+                crate::redact_json_payload_for_session(
+                    "session message",
+                    p,
+                    Some(session_id.as_str()),
+                )
+            })
             .collect::<Result<_, _>>()?;
         let mut rows = self.rows.lock().unwrap();
         for payload in redacted {

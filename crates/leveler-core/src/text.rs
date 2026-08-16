@@ -176,15 +176,56 @@ pub fn redact_secrets(input: &str) -> String {
 /// scrub: the error is returned so the write boundary can fail loud instead of
 /// persisting an unvalidated payload.
 pub fn redact_secrets_json(payload: &str) -> Result<String, serde_json::Error> {
+    redact_secrets_json_for_session(payload, None)
+}
+
+/// As [`redact_secrets_json`], but also scrubs any concrete secret value this
+/// session has already had redacted on the way to the model (R007 F6).
+///
+/// The shape-based pass cannot recognise a credential the model repeated in
+/// prose — "the API password is hunter2" carries no key/value structure — so
+/// exact registered values are removed as a second pass over the same string
+/// leaves. Structure is still never touched, preserving the F2 invariant.
+pub fn redact_secrets_json_for_session(
+    payload: &str,
+    session: Option<&str>,
+) -> Result<String, serde_json::Error> {
     let mut value: serde_json::Value = serde_json::from_str(payload)?;
     redact_json_string_values(&mut value);
+    if let Some(session) = session.filter(|s| !s.is_empty()) {
+        scrub_registered_in_json(&mut value, session);
+    }
     serde_json::to_string(&value)
+}
+
+fn scrub_registered_in_json(value: &mut serde_json::Value, session: &str) {
+    match value {
+        serde_json::Value::String(s) => {
+            let scrubbed = crate::secret::scrub_registered_secrets(session, s);
+            if scrubbed != *s {
+                *s = scrubbed;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            items
+                .iter_mut()
+                .for_each(|v| scrub_registered_in_json(v, session));
+        }
+        serde_json::Value::Object(map) => {
+            map.values_mut()
+                .for_each(|v| scrub_registered_in_json(v, session));
+        }
+        _ => {}
+    }
 }
 
 fn redact_json_string_values(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
-            let redacted = redact_secrets(s);
+            // Value-position aware, so a stored record keeps ordinary code and
+            // prose intact — the old keyword scrubber rewrote an assistant's
+            // correct answer about `pub password: String` into `[REDACTED]`.
+            let (redacted, _) = crate::secret::sanitize_model_visible(s);
             if redacted != *s {
                 *s = redacted;
             }
@@ -297,7 +338,7 @@ fn redact_authorization_values(input: &str) -> String {
 }
 
 /// `sk-…` (len ≥ 16 body) and `AKIA` + 16 alnum.
-fn redact_prefixed_keys(input: &str) -> String {
+pub(crate) fn redact_prefixed_keys(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {

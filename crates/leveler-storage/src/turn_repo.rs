@@ -55,7 +55,7 @@ impl<'a> TurnRepository<'a> {
         // TurnRecord.payload is kind-specific JSON by contract — redact
         // structure-aware and refuse non-JSON loudly (R007 F2).
         let payload = payload
-            .map(|p| crate::redact_json_payload("turn", p))
+            .map(|p| crate::redact_json_payload_for_session("turn", p, Some(session_id.as_str())))
             .transpose()?;
         // The ordinal is assigned inside the INSERT so concurrent starts on
         // one connection pool cannot race a read-then-write.
