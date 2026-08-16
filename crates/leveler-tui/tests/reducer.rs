@@ -2282,10 +2282,10 @@ fn slash_theme_opens_picker_and_named_arg_sets() {
         matches!(s.overlay, Some(Overlay::ThemePicker(_))),
         "bare /theme opens the theme picker"
     );
-    // Cursor starts on current (day, last in the picker list); Up → night.
-    reduce(&mut s, key(KeyCode::Up));
+    // Cursor starts on current (day); Down → ion, Enter confirms.
+    reduce(&mut s, key(KeyCode::Down));
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.theme.id, ThemeId::Night);
+    assert_eq!(s.theme.id, ThemeId::Ion);
     assert!(s.overlay.is_none());
     typed(&mut s, "/theme day");
     reduce(&mut s, key(KeyCode::Enter));

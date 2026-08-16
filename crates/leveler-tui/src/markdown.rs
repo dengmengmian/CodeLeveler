@@ -422,7 +422,7 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     spans,
                     width,
                     theme,
-                    Style::default().fg(theme.text),
+                    Style::default().fg(theme.assistant_message),
                 ));
             }
             MdBlock::Quote(spans) => {
@@ -442,7 +442,12 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     };
                     let indent = " ".repeat(marker.width());
                     let inner = width.saturating_sub(marker.width()).max(1);
-                    let wrapped = wrap_spans(item, inner, theme, Style::default().fg(theme.text));
+                    let wrapped = wrap_spans(
+                        item,
+                        inner,
+                        theme,
+                        Style::default().fg(theme.assistant_message),
+                    );
                     for (li, line) in wrapped.into_iter().enumerate() {
                         let lead = if li == 0 {
                             marker.clone()
@@ -1163,6 +1168,19 @@ mod tests {
             .iter()
             .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
         assert!(bold);
+    }
+
+    #[test]
+    fn paragraph_uses_assistant_message_color() {
+        let theme = Theme::day();
+        let lines = MdDoc::parse("plain body").to_lines(40, &theme);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(theme.assistant_message)),
+            "assistant prose must use the reading-text role, not a muted/dim fg"
+        );
     }
 
     #[test]
