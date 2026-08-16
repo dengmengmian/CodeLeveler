@@ -1,10 +1,9 @@
-# Beta Closure Candidate — `90d06db`
+# Beta Closure Candidate — `a00c60c`
 
 Branch `beta-closure/unattended`. Not merged, not tagged, not released.
 
-**Verdict: READY pending one external commit.** Every Beta blocker and every Beta-required finding
-from Real Usage Batch #1 is closed except R007-F4, whose fix already exists — written by a
-concurrent session and sitting uncommitted in its working tree.
+**Verdict: READY.** Every Beta blocker and every Beta-required finding from Real Usage Batch #1 is
+closed. See `docs/BETA_CLOSURE_FINALIZATION.md` for the last round (R007-F4).
 
 ## What this train changed
 
@@ -17,6 +16,7 @@ concurrent session and sitting uncommitted in its working tree.
 | **Child result** | Children return `ChildResult { status, findings, stop_reason, partial }`, and an interrupted child keeps what it learned | **N1**, N4 |
 | **Toolchain** | A repo-declared toolchain the environment lacks is an environment fact, not a code failure | **R005-F-P2** |
 | Build provenance | `--version` reports the commit; a dirty build labels itself UNTRUSTED | Gate 7 |
+| **TUI contrast** | Body text inherits the terminal foreground; one explicit `ThemeId::DEFAULT` | **R007-F4** |
 
 Per-gate detail: `docs/GATE_4_CHILD_EXECUTION_AUDIT.md`,
 `docs/GATE_4_REVIEWER_MECHANISM_CLOSEOUT.md`, `docs/GATE_5_CHILD_RESULT_CLOSEOUT.md`,
@@ -24,11 +24,9 @@ Per-gate detail: `docs/GATE_4_CHILD_EXECUTION_AUDIT.md`,
 
 ## Validation
 
-`cargo test --workspace --all-targets` 2809 passed / 0 failed · clippy clean · fmt clean ·
-F6 security smokes 12/12 on this binary · reviewer launch smoke 5/5 against a live model.
-
-One browser test failed once under full parallelism and passed 3/3 in isolation;
-`leveler-browser` depends only on `leveler-core`, which this train does not touch.
+`cargo test --workspace --all-targets --no-fail-fast` 2811 passed / 0 failed · clippy `-D warnings`
+clean · fmt clean · F6 security smokes 12/12 · reviewer launch smoke 5/5 against a live model ·
+F4 contrast smoke 6/6 · P0-P4 and Recovery Truth PASS.
 
 ## Known limits
 
