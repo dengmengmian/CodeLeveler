@@ -147,6 +147,61 @@ impl Executor {
         Ok((granted, message, grants))
     }
 
+    /// Run one independent reviewer child.
+    ///
+    /// R007b N7: this is the second entrance to the same child primitive the
+    /// `spawn_agent` tool uses — same lifecycle, registry, limits, cancellation
+    /// and event attribution. It exists because the reviewer designation was
+    /// only honoured when a model chose to delegate, which R008 and R009 both
+    /// declined to do. `AgentRole::parse` deliberately does not accept
+    /// "reviewer", so this role can only be entered from here.
+    ///
+    /// The caller owns the `SubAgentStarted` / `SubAgentFinished` pair, exactly
+    /// as `drive.rs` does for the model-facing entrance; the transient
+    /// progress/activity events are forwarded into `observer` when the child
+    /// returns.
+    pub async fn run_reviewer_child(
+        &self,
+        id: String,
+        brief: String,
+        files: Vec<String>,
+        observer: &mut dyn FnMut(AgentEvent),
+        cancellation: CancellationToken,
+    ) -> DelegatedChildResult {
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let parent_wall = ParentWallBudget {
+            cap: self.step_limits.max_duration,
+            epoch_duration_at_start: std::time::Duration::ZERO,
+            run_started: std::time::Instant::now(),
+        };
+        let result = self
+            .run_one_sub_agent_on(
+                id,
+                AgentRole::Reviewer,
+                files,
+                None,
+                Vec::new(),
+                0,
+                brief,
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                progress_tx,
+                self.step_limits,
+                cancellation,
+                parent_wall,
+            )
+            .await;
+        // The sender was moved into the call, so the channel is closed by now
+        // and this drains what the child emitted while it ran.
+        while let Ok(event) = progress_rx.try_recv() {
+            observer(event);
+        }
+        DelegatedChildResult {
+            ok: result.ok,
+            text: result.text,
+            modified_files: result.modified_files,
+        }
+    }
+
     /// Run one spawned sub-agent to completion on its own fresh conversation,
     /// returning text + ok + spend for parent rollup. A permit from the shared
     /// semaphore bounds how many run at once. The child streams silently —
@@ -315,6 +370,18 @@ impl Executor {
             }
         }
     }
+}
+
+/// Outcome of a child the **harness** launched, rather than one a model asked
+/// for with `spawn_agent`.
+#[derive(Debug, Clone)]
+pub struct DelegatedChildResult {
+    /// Whether the child reached a clean terminal state.
+    pub ok: bool,
+    /// The child's report, verbatim.
+    pub text: String,
+    /// Files the child touched (a reviewer is read-only, so normally empty).
+    pub modified_files: Vec<String>,
 }
 
 /// Spend + text returned from one sub-agent so the parent can roll up budgets.

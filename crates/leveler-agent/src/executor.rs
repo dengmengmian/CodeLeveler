@@ -5,6 +5,7 @@ mod dispatch;
 mod drive;
 mod gates;
 mod handlers;
+pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
 pub mod round_verdict;
 mod stream;
@@ -748,7 +749,9 @@ impl SubAgentExecutionPolicies {
     fn for_role(self, role: AgentRole) -> SubAgentExecutionPolicy {
         match role {
             AgentRole::Default => self.default,
-            AgentRole::Explorer => self.explorer,
+            // A reviewer is an explorer with a different brief: same read-only
+            // shape, same loop budget.
+            AgentRole::Explorer | AgentRole::Reviewer => self.explorer,
             AgentRole::Worker => self.worker,
         }
     }
@@ -1155,7 +1158,7 @@ impl Executor {
         // Explorer gets a read-only toolset (physically no write tools); others
         // inherit the full registry. Worker is additionally pinned to `files`.
         let registry = match role {
-            AgentRole::Explorer => Arc::new(self.registry.read_only_subset()),
+            AgentRole::Explorer | AgentRole::Reviewer => Arc::new(self.registry.read_only_subset()),
             _ => self.registry.clone(),
         };
         let write_allowlist = match role {
@@ -1167,7 +1170,9 @@ impl Executor {
                 max_search_calls_per_step: self.policy.max_search_calls_per_step,
                 max_parallel_tools: match role {
                     AgentRole::Worker => 1,
-                    AgentRole::Default | AgentRole::Explorer => self.policy.max_parallel_tools,
+                    AgentRole::Default | AgentRole::Explorer | AgentRole::Reviewer => {
+                        self.policy.max_parallel_tools
+                    }
                 },
                 require_explicit_plan: self.policy.require_explicit_plan,
                 reasoning_effort: self.policy.reasoning_effort,
@@ -1417,6 +1422,15 @@ impl Executor {
                     ));
                 }
             }
+            AgentRole::Reviewer => prompt.push_str(
+                "\n\nYou are a REVIEWER sub-agent. Another agent has already made the change \
+                 described in your task; your job is to judge it independently, not to redo or \
+                 extend it. You have read-only tools and CANNOT modify files. Read the changed \
+                 files and the code they touch, then report concrete defects — correctness, \
+                 security, concurrency, and error paths first — each naming the file and the \
+                 specific problem. If you find nothing blocking, say so plainly; do not invent \
+                 findings to look thorough.",
+            ),
             AgentRole::Default => {}
         }
         if self.policy.goal_mode {

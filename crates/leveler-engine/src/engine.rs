@@ -1582,7 +1582,24 @@ impl TaskEngine {
                 .await
                 .unwrap_or(false)
         {
-            task_outcome = TaskOutcome::CompletedUnverified;
+            // The designation only means something if the runtime can act on
+            // it, so the harness launches the review itself rather than hoping
+            // the model delegates. Downgrade only when the review could not be
+            // obtained — an absent review is missing evidence either way, but a
+            // review that ran is the evidence the policy asked for.
+            let reviewed = runner
+                .run_review(
+                    goal_profile(spec),
+                    review_brief(&spec.runtime.goal, &outcome.modified_files),
+                    outcome.modified_files.clone(),
+                    observer,
+                    cancellation.clone(),
+                )
+                .await
+                .unwrap_or(false);
+            if !reviewed {
+                task_outcome = TaskOutcome::CompletedUnverified;
+            }
         }
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
@@ -1679,6 +1696,38 @@ fn verification_is_repairable(report: &VerificationReport) -> bool {
 
 /// Compose the repair goal from the failed report (engine-local equivalent of
 /// the app layer's compose_repair_goal).
+/// The brief handed to a harness-launched reviewer.
+///
+/// It names the task and the files that changed and nothing else: the reviewer
+/// is read-only and must reach its own conclusions from the code, not from the
+/// implementing agent's account of what it did.
+fn review_brief(goal: &str, files: &[String]) -> String {
+    // A wide diff is exactly the case that triggers review; listing hundreds of
+    // paths would spend the reviewer's context before it reads anything.
+    const MAX_LISTED: usize = 40;
+    let listed = files
+        .iter()
+        .take(MAX_LISTED)
+        .map(|path| format!("- {path}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let elided = files.len().saturating_sub(MAX_LISTED);
+    let more = if elided > 0 {
+        format!("\n- …and {elided} more file(s)")
+    } else {
+        String::new()
+    };
+    format!(
+        "Independently review the change that was just made for this task.\n\n\
+         Task: {goal}\n\n\
+         Files changed:\n{listed}{more}\n\n\
+         Read the changed files and the code they interact with, then report the \
+         concrete defects you can point at — correctness, security, concurrency \
+         and error paths first. Name the file and the specific problem for each. \
+         If you find nothing blocking, say so."
+    )
+}
+
 fn repair_goal(goal: &str, report: &VerificationReport) -> String {
     let mut failures = String::new();
     for check in report.failed_gates() {

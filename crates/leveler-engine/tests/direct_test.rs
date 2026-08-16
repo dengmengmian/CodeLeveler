@@ -1592,3 +1592,141 @@ async fn a_supervisor_policy_that_never_continues_leaves_one_turn() {
         "a no-continuation supervisor must not open a second turn: {turns:?}"
     );
 }
+
+/// R007b N7 (mechanism half): a change policy classifies as review-worthy gets
+/// an independent review that the **harness** launches. The model never calls
+/// `spawn_agent` here — before this, the reviewer designation could only be
+/// honoured by a model that chose to delegate, which R008 and R009 both did not.
+#[tokio::test]
+async fn security_shaped_change_gets_a_harness_launched_review() {
+    let mut responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+    ];
+    // The reviewer child drives its own rounds against the same mock runtime.
+    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
+    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
+
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let reviewers: Vec<String> = seen
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::SubAgentStarted { id, role, .. } if role == "reviewer" => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reviewers.len(),
+        1,
+        "the harness must launch exactly one reviewer for a security-shaped change"
+    );
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            EngineEvent::SubAgentFinished { id, ok: true, .. } if *id == reviewers[0]
+        )),
+        "the reviewer must reach a terminal result, not merely be announced"
+    );
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "a review that actually happened must not leave the task downgraded"
+    );
+}
+
+/// The reviewer is not a tax on every task: an ordinary edit that policy does
+/// not classify as review-worthy runs no reviewer at all.
+#[tokio::test]
+async fn ordinary_change_launches_no_reviewer() {
+    let h = harness(patch_then_resolve()).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, EngineEvent::SubAgentStarted { .. })),
+        "a narrow, non-security edit must not pay for an independent review"
+    );
+    assert_eq!(report.outcome, TaskOutcome::Verified);
+}
+
+/// A harness-launched reviewer judges the change; it must not become a second
+/// author of it. The role is physically read-only (no write tools in its
+/// registry), so an attempt to patch is refused rather than merely discouraged.
+#[tokio::test]
+async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
+    let mut responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+    ];
+    // The reviewer's first move is to "fix" what it is reviewing.
+    responses.push(tool_call(
+        "r1",
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/auth.rs\n-pub fn login() {}\n+pub fn login() { todo!() }\n*** End Patch"
+        }),
+    ));
+    responses.push(text("reviewed src/auth.rs: login() has no rate limiting"));
+    responses.push(text("reviewed src/auth.rs: login() has no rate limiting"));
+
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let written = std::fs::read_to_string(h.dir.path().join("src/auth.rs")).unwrap();
+    assert_eq!(
+        written, "pub fn login() {}\n",
+        "the reviewer must not be able to edit the change it is judging"
+    );
+}

@@ -136,6 +136,10 @@ pub(crate) enum AgentRole {
     Explorer,
     /// Writes code, pinned to an explicit set of owned files.
     Worker,
+    /// Read-only independent review of a change the parent already made.
+    /// Launched by the harness when policy says the change warrants one, so it
+    /// is the one role a model cannot ask for.
+    Reviewer,
 }
 
 impl AgentRole {
@@ -152,6 +156,7 @@ impl AgentRole {
             AgentRole::Default => "default",
             AgentRole::Explorer => "explorer",
             AgentRole::Worker => "worker",
+            AgentRole::Reviewer => "reviewer",
         }
     }
 }
