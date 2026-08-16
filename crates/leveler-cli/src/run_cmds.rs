@@ -1113,7 +1113,7 @@ async fn resumable_session_hint(layout: &Layout) -> Option<String> {
         .iter()
         .map(|s| (s.id.clone(), s.status.as_str().to_string(), s.goal.clone()))
         .collect();
-    format_resumable_hint(&rows).map(|body| format!("{}", Line::warn(&body)))
+    format_resumable_hint(&rows).map(|body| Line::warn(&body).to_string())
 }
 
 /// Pure formatting half of [`resumable_session_hint`], split out so the rule
