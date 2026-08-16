@@ -514,6 +514,44 @@ pub(crate) async fn last_persisted_plan(
     )
 }
 
+/// Whether this session has an independent review on record.
+///
+/// R007b N7: the reviewer designation only means something if the runtime can
+/// answer "was this reviewed?" from durable history rather than from a task
+/// card. The role lives on `SubAgentStarted` and the terminal on
+/// `SubAgentFinished`, so a review counts only when the same agent id appears
+/// in both — a reviewer that started and died without finishing has not
+/// reviewed anything (N1's shape, deliberately not credited).
+pub(crate) async fn session_had_review(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<bool, EngineError> {
+    let mut reviewers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in events.load(session_id).await? {
+        match row.event_type.as_str() {
+            "sub_agent_started" => {
+                if let Ok(EngineEvent::SubAgentStarted { id, role, .. }) =
+                    EngineEvent::from_payload(&row.payload)
+                    && role.eq_ignore_ascii_case("reviewer")
+                {
+                    reviewers.insert(id);
+                }
+            }
+            "sub_agent_finished" => {
+                if let Ok(EngineEvent::SubAgentFinished { id, ok, .. }) =
+                    EngineEvent::from_payload(&row.payload)
+                    && ok
+                    && reviewers.contains(&id)
+                {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 /// Last EvidenceLedger snapshot from the event log (SoT for Delivery resume).
 pub(crate) async fn last_persisted_ledger(
     events: &dyn EventStore,

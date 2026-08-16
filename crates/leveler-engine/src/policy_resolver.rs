@@ -33,6 +33,84 @@ pub enum ExecutionRole {
     Explorer,
     /// Writing sub-agent pinned to owned files.
     Worker,
+    /// Independent read-only reviewer of work the main agent already did.
+    ///
+    /// R007b N7: `REQUIRED_REVIEWER` existed only as a supervisor label — the
+    /// harness had never heard of it, so R008 and R009 were both designated
+    /// and both ignored it. A reviewer has to be a seat the product knows
+    /// about before any of it can be measured.
+    Reviewer,
+}
+
+/// When an independent review is warranted.
+///
+/// The batch refutes "always review": R008 and R009 both passed with no
+/// reviewer at all, so making every task pay for one would be cost without
+/// evidence. It equally refutes "never" — the tasks that went wrong went
+/// wrong in ways a second pair of eyes is built for. The trigger is therefore
+/// the shape of the change, not the difficulty of the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewTrigger {
+    /// Distinct files the task modified.
+    pub modified_files: usize,
+    /// The change touches security-relevant surface (auth, crypto, secrets,
+    /// permissions) by path.
+    pub security_relevant: bool,
+    /// The change touches concurrency surface, where a reviewer's independent
+    /// reasoning is worth most (R009's race was invisible to its own tests).
+    pub concurrency_relevant: bool,
+    /// The user or eval policy asked for review explicitly.
+    pub explicitly_requested: bool,
+}
+
+/// Files at or above which a diff is "wide" enough that independent review
+/// pays for itself. Deliberately generous: R008 (2 files) and R009 (3 files)
+/// both succeeded solo and must NOT start demanding a reviewer.
+const WIDE_DIFF_FILES: usize = 6;
+
+impl ReviewTrigger {
+    /// Whether this change warrants an independent review.
+    pub fn review_required(self) -> bool {
+        self.explicitly_requested
+            || self.security_relevant
+            || self.concurrency_relevant
+            || self.modified_files >= WIDE_DIFF_FILES
+    }
+
+    /// Classify a change from the paths it touched.
+    pub fn from_modified_paths(paths: &[String], explicitly_requested: bool) -> Self {
+        let hit = |needles: &[&str]| {
+            paths.iter().any(|p| {
+                let lower = p.to_ascii_lowercase();
+                needles.iter().any(|n| lower.contains(n))
+            })
+        };
+        Self {
+            modified_files: paths.len(),
+            security_relevant: hit(&[
+                "auth",
+                "crypt",
+                "secret",
+                "credential",
+                "permission",
+                "token",
+                "password",
+                "sandbox",
+                "policy",
+            ]),
+            concurrency_relevant: hit(&[
+                "concurren",
+                "parallel",
+                "thread",
+                "mutex",
+                "atomic",
+                "async",
+                "lock",
+                "race",
+            ]),
+            explicitly_requested,
+        }
+    }
 }
 
 /// eval-only injection seam for single-variable ablation. Production assembly
@@ -206,9 +284,12 @@ pub fn resolve_execution_policy(
     let o = overrides.cloned().unwrap_or_default();
 
     let role_parallel = match role {
-        ExecutionRole::Main | ExecutionRole::Default | ExecutionRole::Explorer => {
-            DEFAULT_PARALLEL_TOOLS
-        }
+        // A reviewer reads the same way an explorer does — it just reads work
+        // that already exists rather than code it is about to change.
+        ExecutionRole::Main
+        | ExecutionRole::Default
+        | ExecutionRole::Explorer
+        | ExecutionRole::Reviewer => DEFAULT_PARALLEL_TOOLS,
         // Write path stays serial: parallel writes conflict and amplify errors.
         ExecutionRole::Worker => 1,
     };
@@ -531,5 +612,81 @@ mod tests {
             resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&complex_task));
         assert!(!r.explicit_plan);
         assert_eq!(r.max_search_calls_per_step, 6);
+    }
+}
+#[cfg(test)]
+mod review_trigger_tests {
+    use super::*;
+
+    fn paths(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The batch's own successes are the negative cases. R008 changed two
+    /// files and R009 three, both passed solo, and neither may start
+    /// demanding a reviewer — "always review" is refuted by evidence.
+    #[test]
+    fn small_ordinary_changes_do_not_require_review() {
+        let r008 = ReviewTrigger::from_modified_paths(
+            &paths(&["crates/core/flags/hiargs.rs", "tests/feature.rs"]),
+            false,
+        );
+        assert!(!r008.review_required(), "R008 succeeded solo: {r008:?}");
+
+        let r010 = ReviewTrigger::from_modified_paths(
+            &paths(&[
+                "src/components/tables/BasicTableOne.tsx",
+                "src/components/tables/basicTableLogic.ts",
+            ]),
+            false,
+        );
+        assert!(!r010.review_required(), "{r010:?}");
+    }
+
+    /// A wide diff is where an independent read pays for itself.
+    #[test]
+    fn a_wide_diff_requires_review() {
+        let wide: Vec<String> = (0..WIDE_DIFF_FILES)
+            .map(|i| format!("src/module_{i}.rs"))
+            .collect();
+        assert!(ReviewTrigger::from_modified_paths(&wide, false).review_required());
+        // One file below the line stays solo.
+        assert!(!ReviewTrigger::from_modified_paths(&wide[1..], false).review_required());
+    }
+
+    /// Security surface: the class F6 came from. A small diff here still
+    /// warrants review precisely because it is small and easy to wave through.
+    #[test]
+    fn security_relevant_changes_require_review_however_small() {
+        for path in [
+            "crates/leveler-core/src/secret.rs",
+            "src/auth/session.rs",
+            "internal/permission/policy.go",
+        ] {
+            let t = ReviewTrigger::from_modified_paths(&paths(&[path]), false);
+            assert!(t.review_required(), "{path} should require review: {t:?}");
+        }
+    }
+
+    /// Concurrency surface: R009's race was invisible to the repo's own tests
+    /// and needed reasoning, not more assertions.
+    #[test]
+    fn concurrency_relevant_changes_require_review() {
+        let t = ReviewTrigger::from_modified_paths(&paths(&["internal/parallel/runner.go"]), false);
+        assert!(t.review_required(), "{t:?}");
+    }
+
+    /// An explicit request always wins — this is how an eval or a user policy
+    /// asks for review WITHOUT putting it in the agent-visible goal.
+    #[test]
+    fn an_explicit_request_requires_review_regardless_of_shape() {
+        let t = ReviewTrigger::from_modified_paths(&paths(&["README.md"]), true);
+        assert!(t.review_required(), "{t:?}");
+    }
+
+    /// A task that changed nothing has nothing to review.
+    #[test]
+    fn a_change_free_task_needs_no_review() {
+        assert!(!ReviewTrigger::from_modified_paths(&[], false).review_required());
     }
 }

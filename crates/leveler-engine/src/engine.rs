@@ -1567,6 +1567,23 @@ impl TaskEngine {
         {
             task_outcome = TaskOutcome::CompletedUnverified;
         }
+        // R007b N7: an independent review that policy says is warranted, and
+        // that never happened, is missing evidence — not a detail. R008 and
+        // R009 both carried REQUIRED_REVIEWER and ignored it because the
+        // product had never heard of the designation. A change shaped like one
+        // that needs review can no longer close as verified without one.
+        if task_outcome == TaskOutcome::Verified
+            && crate::policy_resolver::ReviewTrigger::from_modified_paths(
+                &outcome.modified_files,
+                false,
+            )
+            .review_required()
+            && !crate::turn::session_had_review(runner.stores.events.as_ref(), &runner.session_id)
+                .await
+                .unwrap_or(false)
+        {
+            task_outcome = TaskOutcome::CompletedUnverified;
+        }
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
             verification: Some(report),
