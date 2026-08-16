@@ -67,7 +67,33 @@ pub fn sanitize_model_visible(text: &str) -> (String, Vec<DetectedSecret>) {
 
 fn sanitize_line(line: &str, found: &mut Vec<DetectedSecret>) -> String {
     let step = redact_url_userinfo(line, found);
-    redact_sensitive_assignments(&step, found)
+    let step = redact_sensitive_assignments(&step, found);
+    // Self-identifying key shapes (`sk-…`, `ghp_…`, `AKIA…`) need no key
+    // position at all — they ARE the credential. Carried over from the
+    // pre-F6 scrubber so durable coverage never regresses.
+    redact_prefixed_key_shapes(&step, found)
+}
+
+/// Provider key prefixes that identify a credential by their own shape.
+fn redact_prefixed_key_shapes(line: &str, found: &mut Vec<DetectedSecret>) -> String {
+    let scrubbed = crate::text::redact_prefixed_keys(line);
+    if scrubbed != line {
+        // Recover the concrete values so they can also be registered.
+        for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
+            let is_key = (token.starts_with("sk-") && token.len() >= 19)
+                || (token.starts_with("AKIA") && token.len() == 20)
+                || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+                    .iter()
+                    .any(|p| token.starts_with(p) && token.len() > p.len() + 7);
+            if is_key {
+                found.push(DetectedSecret {
+                    value: token.to_string(),
+                    key: "provider-key-prefix".to_string(),
+                });
+            }
+        }
+    }
+    scrubbed
 }
 
 // ── URL userinfo: scheme://user:secret@host ─────────────────────────────────
@@ -156,7 +182,12 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
         cursor = skip_spaces(bytes, cursor);
         // `Authorization: Bearer <token>` — the scheme word is not the secret.
         for scheme in ["bearer ", "basic ", "token "] {
+            // `is_char_boundary` guards the slice: the value may begin with a
+            // multi-byte character (Chinese prose around a credential is a
+            // real case), and slicing mid-character panics.
             if line.len() >= cursor + scheme.len()
+                && line.is_char_boundary(cursor)
+                && line.is_char_boundary(cursor + scheme.len())
                 && line[cursor..cursor + scheme.len()].eq_ignore_ascii_case(scheme)
             {
                 cursor += scheme.len();
@@ -593,6 +624,35 @@ mod tests {
         assert_eq!(out.lines().count(), 3, "{out}");
         assert!(out.starts_with("line one\n"), "{out}");
         assert!(out.ends_with("line three\n"), "{out}");
+    }
+
+    /// Multi-byte text must never panic the sanitizer. A credential
+    /// surrounded by Chinese prose slices mid-character unless every index is
+    /// guarded — this is the shape that actually occurred.
+    #[test]
+    fn multibyte_text_is_sanitized_without_panicking() {
+        for input in [
+            "密码 password: 秘密值abc 之后",
+            "配置里 API_PASSWORD=值值值值值值 就是它",
+            "authorization: 令牌值令牌值",
+            "注释：token= 之后没有值",
+        ] {
+            let _ = sanitize_model_visible(input);
+        }
+    }
+
+    /// Self-identifying provider keys carry no key position, so they need
+    /// their own rule. Coverage must not regress from the pre-F6 scrubber.
+    #[test]
+    fn detects_self_identifying_provider_keys() {
+        for input in [
+            "sk-abcdefghijklmnop1234",
+            "ghp_abcdefghijklmnopqrst",
+            "AKIAIOSFODNN7EXAMPLE",
+        ] {
+            let (out, _) = sanitize_model_visible(input);
+            assert_ne!(out, input, "provider key not detected: {input}");
+        }
     }
 
     // ── Layer B: session-scoped registry ──────────────────────────────────

@@ -222,7 +222,10 @@ fn scrub_registered_in_json(value: &mut serde_json::Value, session: &str) {
 fn redact_json_string_values(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
-            let redacted = redact_secrets(s);
+            // Value-position aware, so a stored record keeps ordinary code and
+            // prose intact — the old keyword scrubber rewrote an assistant's
+            // correct answer about `pub password: String` into `[REDACTED]`.
+            let (redacted, _) = crate::secret::sanitize_model_visible(s);
             if redacted != *s {
                 *s = redacted;
             }
@@ -335,7 +338,7 @@ fn redact_authorization_values(input: &str) -> String {
 }
 
 /// `sk-…` (len ≥ 16 body) and `AKIA` + 16 alnum.
-fn redact_prefixed_keys(input: &str) -> String {
+pub(crate) fn redact_prefixed_keys(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
