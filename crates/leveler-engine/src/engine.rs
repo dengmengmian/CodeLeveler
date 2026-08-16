@@ -480,7 +480,16 @@ impl TaskEngine {
             result,
             Err(EngineError::Agent(leveler_agent::AgentError::Cancelled))
         );
+        // R007 F3: a WORK-WINDOW boundary is not a goal terminal. When the
+        // round/step budget runs out the session stays resumable
+        // (`AgentState::Execute`), and the goal's services must outlive the
+        // window — R007 hit the ceiling twice and spent each next window
+        // rebuilding the dev server this reap had just killed. A genuine goal
+        // terminal still reaps, so R6-P4 is unaffected.
+        let goal_continues = matches!(&result, Ok(report)
+            if terminal_status_for(report).1 == AgentState::Execute);
         if !interrupted
+            && !goal_continues
             && let (Some(scope), Some(registry)) = (
                 self.factory.tool_context.session_scope.as_deref(),
                 self.factory.tool_context.services.background_tasks.as_ref(),

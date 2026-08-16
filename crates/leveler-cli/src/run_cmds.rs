@@ -450,6 +450,13 @@ pub(crate) async fn cmd_tui(
             // Daemon path has no local registry; gauge may show 0 until first turn.
             (session_id, 0u32)
         } else {
+            // R006 R6-P5: bare `leveler tui` silently starts a NEW session, so
+            // an interrupted long-running goal is easy to abandon by accident —
+            // every resume in Batch #1 needed a session UUID the user has no
+            // way to know. Surface resumable work before creating another one.
+            if let Some(hint) = resumable_session_hint(&layout).await {
+                eprintln!("{hint}");
+            }
             let bootstrap = client
                 .create_session(CreateSessionRequest {
                     goal: "interactive session".to_string(),
@@ -1088,6 +1095,52 @@ async fn list_sessions_for_resume(layout: Layout) -> anyhow::Result<std::process
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// A one-line notice when this repository has work that could be resumed.
+///
+/// R6-P5: the affordance gap is not that resume is missing — it is that
+/// starting fresh is the silent default, so an interrupted long-running goal
+/// is easy to abandon by accident. Returns `None` when there is nothing to
+/// resume, and never fails the launch: a hint that cannot be produced is not
+/// a reason to refuse to start.
+async fn resumable_session_hint(layout: &Layout) -> Option<String> {
+    let app = Application::assemble(layout.clone()).ok()?;
+    let db = app.open_database().await.ok()?;
+    let sessions = leveler_storage::SessionRepository::new(&db)
+        .list()
+        .await
+        .ok()?;
+    let rows: Vec<(String, String, String)> = sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.status.as_str().to_string(), s.goal.clone()))
+        .collect();
+    format_resumable_hint(&rows).map(|body| format!("{}", Line::warn(&body)))
+}
+
+/// Pure formatting half of [`resumable_session_hint`], split out so the rule
+/// (which statuses count, what the user is told) is testable without a daemon.
+fn format_resumable_hint(sessions: &[(String, String, String)]) -> Option<String> {
+    let resumable: Vec<_> = sessions
+        .iter()
+        .filter(|(_, status, _)| matches!(status.as_str(), "incomplete" | "blocked"))
+        .collect();
+    let (id, status, goal) = resumable.first()?;
+    let first_line = goal.lines().next().unwrap_or("").trim();
+    let goal = if first_line.chars().count() > 60 {
+        let cut: String = first_line.chars().take(60).collect();
+        format!("{cut}…")
+    } else {
+        first_line.to_string()
+    };
+    let more = match resumable.len() {
+        1 => String::new(),
+        n => format!(" (+{} more — `leveler resume`)", n - 1),
+    };
+    Some(format!(
+        "Starting a NEW session. Unfinished work here: {id} [{status}] {goal}{more}\n  \
+         resume it with: leveler --session {id}"
+    ))
+}
+
 /// Headless recovery of an interrupted non-interactive run (`run --resume`).
 pub(crate) async fn cmd_run_resume(
     layout: Layout,
@@ -1597,5 +1650,63 @@ mod daemon_bind_tests {
             second.is_err(),
             "同一仓库上的第二个 daemon 必须 bind 失败（否则会把第一个的活跃 turn 当僵尸 reap）"
         );
+    }
+}
+
+#[cfg(test)]
+mod resume_hint_tests {
+    use super::format_resumable_hint;
+
+    fn row(id: &str, status: &str, goal: &str) -> (String, String, String) {
+        (id.to_string(), status.to_string(), goal.to_string())
+    }
+
+    /// R6-P5: an interrupted goal must be visible BEFORE another session is
+    /// silently created, and the notice must carry the id the user needs.
+    #[test]
+    fn unfinished_work_is_announced_with_the_command_to_resume() {
+        let hint = format_resumable_hint(&[row("sess-1", "incomplete", "fix inherited auth")])
+            .expect("an incomplete session must produce a hint");
+        assert!(hint.contains("sess-1"), "{hint}");
+        assert!(hint.contains("leveler --session sess-1"), "{hint}");
+        assert!(hint.contains("fix inherited auth"), "{hint}");
+    }
+
+    /// Finished work is not unfinished work — no nagging.
+    #[test]
+    fn completed_sessions_produce_no_hint() {
+        assert!(format_resumable_hint(&[row("s", "completed", "done")]).is_none());
+        assert!(format_resumable_hint(&[]).is_none());
+    }
+
+    /// A blocked session needs attention and is resumable, so it counts.
+    #[test]
+    fn blocked_sessions_count_as_resumable() {
+        assert!(format_resumable_hint(&[row("s", "blocked", "needs input")]).is_some());
+    }
+
+    /// Several resumable sessions: name the newest, point at the list for the
+    /// rest rather than printing a wall of ids at launch.
+    #[test]
+    fn extra_sessions_are_summarised_not_listed() {
+        let hint = format_resumable_hint(&[
+            row("newest", "incomplete", "goal a"),
+            row("older", "incomplete", "goal b"),
+            row("oldest", "blocked", "goal c"),
+        ])
+        .unwrap();
+        assert!(hint.contains("newest"), "{hint}");
+        assert!(hint.contains("+2 more"), "{hint}");
+        assert!(!hint.contains("oldest"), "must not list every id: {hint}");
+    }
+
+    /// A long multi-line goal must not flood the launch line.
+    #[test]
+    fn long_goals_are_truncated_to_one_line() {
+        let goal = "x".repeat(200) + "\nsecond line";
+        let hint = format_resumable_hint(&[row("s", "incomplete", &goal)]).unwrap();
+        assert!(hint.contains('…'), "{hint}");
+        assert!(!hint.contains("second line"), "{hint}");
+        assert!(hint.lines().count() <= 2, "{hint}");
     }
 }
