@@ -161,8 +161,17 @@ mechanism under test.
 1. Repo clones at a pinned upstream SHA into a fresh `batch-02` workspace; the Batch #1 checkouts
    are dirty from earlier runs and are **not** reused in place.
 2. Baseline builds and the repo's own suite runs, green, before any agent touches it — recorded.
-3. The verifier is written and demonstrated to **fail on the untouched baseline** and pass on a
-   supervisor-written reference fix. A verifier that is green before the work is not a verifier.
+3. The verifier is written, and its admission depends on what it claims to be:
+   - **A direct reproducer of the target defect must FAIL on the untouched baseline.** If it
+     claims to reproduce the bug and the bug is there, it has to see it.
+   - **A positive capability check, regression guard, invariant, concurrency/performance property,
+     or one leg of a multi-evidence set does not have to be baseline-RED.** It must instead be
+     shown to distinguish *goal not met* from *goal met* — usually against a supervisor reference
+     fix.
+
+   Requiring every verifier to be baseline-RED would re-import the confusion N2 fixed. N2 says
+   baseline-green evidence **cannot be read as proof of post-mutation completion**; it does not say
+   baseline-green evidence is worthless.
 4. The frozen goal reads like a user bug report and names no capability. Byte length and SHA256
    recorded.
 5. The relevant paths and expected policy triggers are recorded as metrics — never rendered into
