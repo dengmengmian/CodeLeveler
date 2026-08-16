@@ -6,17 +6,20 @@ use ratatui::style::Color;
 /// Stable theme identifiers selectable via `/theme` and stored in config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThemeId {
-    /// Cool cyan brand palette (historical default "Ion").
+    /// Cool cyan brand palette for dark terminals.
     Ion,
     /// Deeper blue-tinted night palette.
     Night,
-    /// Light palette for bright terminals.
+    /// Light palette for bright terminals (product default).
     Day,
 }
 
 impl ThemeId {
-    /// All named (non-monochrome) themes, in cycle order.
-    pub const ALL: [ThemeId; 3] = [ThemeId::Ion, ThemeId::Night, ThemeId::Day];
+    /// Product default when config has no `ui.theme`.
+    pub const DEFAULT: ThemeId = ThemeId::Day;
+
+    /// All named (non-monochrome) themes, in cycle order (default first).
+    pub const ALL: [ThemeId; 3] = [ThemeId::Day, ThemeId::Ion, ThemeId::Night];
 
     /// Wire / config / slash value.
     pub fn as_str(self) -> &'static str {
@@ -41,9 +44,9 @@ impl ThemeId {
     /// Next theme in the cycle (for bare `/theme`).
     pub fn cycle_next(self) -> Self {
         match self {
+            Self::Day => Self::Ion,
             Self::Ion => Self::Night,
             Self::Night => Self::Day,
-            Self::Day => Self::Ion,
         }
     }
 }
@@ -88,12 +91,16 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Cool cyan brand palette (default).
+    /// Cool cyan brand palette for dark terminals.
     pub fn ion() -> Self {
         Self {
             id: ThemeId::Ion,
             monochrome: false,
-            text: Color::Rgb(0xD6, 0xD9, 0xDC),
+            // Inherit the terminal default fg. An explicit light-gray RGB
+            // washes out on light profiles (near-white on white); Reset
+            // keeps dark-on-light and light-on-dark contrast without
+            // requiring the user to switch to `day`.
+            text: Color::Reset,
             muted: Color::Rgb(0x90, 0x97, 0x9F),
             dim: Color::Rgb(0x69, 0x70, 0x78),
             accent: Color::Rgb(0x56, 0xB6, 0xE9),
@@ -102,10 +109,10 @@ impl Theme {
             warning: Color::Rgb(0xD7, 0xBA, 0x7D),
             error: Color::Rgb(0xF0, 0x6A, 0x7A),
             border: Color::Rgb(0x4A, 0x51, 0x58),
-            // Match `text` so user and assistant turns share one readable fg on
-            // dark terminals; the heading bar + bold carry the turn distinction.
-            user_message: Color::Rgb(0xD6, 0xD9, 0xDC),
-            assistant_message: Color::Rgb(0xD6, 0xD9, 0xDC),
+            // Same inherited fg for both turns; heading bar + bold mark
+            // the user, `●` marks the assistant.
+            user_message: Color::Reset,
+            assistant_message: Color::Reset,
             tool: Color::Rgb(0x56, 0xB6, 0xE9),
             diff_add: Color::Rgb(0x73, 0xC9, 0x91),
             diff_remove: Color::Rgb(0xF0, 0x6A, 0x7A),
@@ -126,7 +133,7 @@ impl Theme {
         Self {
             id: ThemeId::Night,
             monochrome: false,
-            text: Color::Rgb(0xD6, 0xD9, 0xDC),
+            text: Color::Reset,
             muted: Color::Rgb(0x90, 0x97, 0x9F),
             dim: Color::Rgb(0x69, 0x70, 0x78),
             accent: Color::Rgb(0x56, 0xB6, 0xE9),
@@ -135,9 +142,8 @@ impl Theme {
             warning: Color::Rgb(0xD7, 0xBA, 0x7D),
             error: Color::Rgb(0xF0, 0x6A, 0x7A),
             border: Color::Rgb(0x4A, 0x51, 0x58),
-            // Night keeps its blue-tinted turn colors (existing semantics).
-            user_message: Color::Rgb(0xC0, 0xCA, 0xF5),
-            assistant_message: Color::Rgb(0xA9, 0xB1, 0xD6),
+            user_message: Color::Reset,
+            assistant_message: Color::Reset,
             tool: Color::Rgb(0x56, 0xB6, 0xE9),
             diff_add: Color::Rgb(0x73, 0xC9, 0x91),
             diff_remove: Color::Rgb(0xF0, 0x6A, 0x7A),
@@ -153,7 +159,7 @@ impl Theme {
         Self {
             id: ThemeId::Day,
             monochrome: false,
-            text: Color::Rgb(0x1F, 0x23, 0x28),
+            text: Color::Rgb(0x11, 0x11, 0x11),
             muted: Color::Rgb(0x57, 0x60, 0x6A),
             dim: Color::Rgb(0x8C, 0x95, 0x9F),
             accent: Color::Rgb(0x09, 0x69, 0xDA),
@@ -162,8 +168,8 @@ impl Theme {
             warning: Color::Rgb(0x9A, 0x67, 0x00),
             error: Color::Rgb(0xCF, 0x22, 0x2E),
             border: Color::Rgb(0xD0, 0xD7, 0xDE),
-            user_message: Color::Rgb(0x24, 0x29, 0x2F),
-            assistant_message: Color::Rgb(0x1F, 0x23, 0x28),
+            user_message: Color::Rgb(0x11, 0x11, 0x11),
+            assistant_message: Color::Rgb(0x11, 0x11, 0x11),
             tool: Color::Rgb(0x09, 0x69, 0xDA),
             diff_add: Color::Rgb(0x1A, 0x7F, 0x37),
             diff_remove: Color::Rgb(0xCF, 0x22, 0x2E),
@@ -187,7 +193,7 @@ impl Theme {
     /// carried by symbols, not color (`NO_COLOR`).
     pub fn no_color() -> Self {
         Self {
-            id: ThemeId::Ion,
+            id: ThemeId::DEFAULT,
             monochrome: true,
             text: Color::Reset,
             muted: Color::Reset,
@@ -226,9 +232,9 @@ impl Theme {
         }
     }
 
-    /// Resolve from a config/slash string. Unknown values fall back to Ion.
+    /// Resolve from a config/slash string. Unknown values fall back to Day.
     pub fn resolve_str(raw: &str, no_color: bool) -> Self {
-        Self::resolve(ThemeId::parse(raw).unwrap_or(ThemeId::Ion), no_color)
+        Self::resolve(ThemeId::parse(raw).unwrap_or(ThemeId::DEFAULT), no_color)
     }
 
     /// Whether `NO_COLOR` is set in the environment.
@@ -244,7 +250,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::ion()
+        Self::day()
     }
 }
 
@@ -272,13 +278,38 @@ mod tests {
 
     #[test]
     fn ion_message_turns_follow_text_color() {
-        // ion uses an explicit light-on-dark fg; user and assistant turns share
-        // it. Distinction comes from the heading bar + bold, not hue. Light
-        // terminals are served by day(), not by Reset adaptation.
         let t = Theme::ion();
         assert_eq!(t.user_message, t.text);
         assert_eq!(t.assistant_message, t.text);
-        assert_ne!(t.text, Color::Reset, "ion text is an explicit palette fg");
+    }
+
+    #[test]
+    fn dark_themes_inherit_terminal_foreground_for_reading_text() {
+        // Painting a light-on-dark RGB onto a light terminal washes the
+        // conversation out (near-white on white). Reading roles follow the
+        // terminal default so light profiles get dark text and dark profiles
+        // get light text — same contrast model as Claude Code.
+        for theme in [Theme::ion(), Theme::night()] {
+            assert_eq!(theme.text, Color::Reset, "{:?} text", theme.id);
+            assert_eq!(
+                theme.user_message,
+                Color::Reset,
+                "{:?} user_message",
+                theme.id
+            );
+            assert_eq!(
+                theme.assistant_message,
+                Color::Reset,
+                "{:?} assistant_message",
+                theme.id
+            );
+        }
+        let day = Theme::day();
+        assert_ne!(
+            day.text,
+            Color::Reset,
+            "day keeps an explicit dark fg for light terminals"
+        );
     }
 
     #[test]
@@ -303,15 +334,18 @@ mod tests {
         assert_eq!(ThemeId::parse("light"), Some(ThemeId::Day));
         assert_eq!(ThemeId::parse("night"), Some(ThemeId::Night));
         assert_eq!(ThemeId::parse("nope"), None);
+        assert_eq!(ThemeId::Day.cycle_next(), ThemeId::Ion);
         assert_eq!(ThemeId::Ion.cycle_next(), ThemeId::Night);
         assert_eq!(ThemeId::Night.cycle_next(), ThemeId::Day);
-        assert_eq!(ThemeId::Day.cycle_next(), ThemeId::Ion);
     }
 
     #[test]
-    fn resolve_str_unknown_falls_back_to_ion() {
+    fn default_theme_is_day() {
+        assert_eq!(ThemeId::DEFAULT, ThemeId::Day);
+        assert_eq!(Theme::default().id, ThemeId::Day);
+        assert_eq!(ThemeId::ALL[0], ThemeId::Day);
         let t = Theme::resolve_str("unknown-theme", false);
-        assert_eq!(t.id, ThemeId::Ion);
+        assert_eq!(t.id, ThemeId::Day);
         assert!(!t.is_monochrome());
     }
 }

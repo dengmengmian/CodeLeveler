@@ -302,15 +302,15 @@ pub(super) fn open_theme_picker(state: &mut AppState) {
     let current = state.theme.id.as_str();
     let t = state.t();
     let options = vec![
+        SelectionOption::new(ThemeId::Day.as_str(), t.theme_day_label)
+            .description(t.theme_day_desc)
+            .current(current == ThemeId::Day.as_str()),
         SelectionOption::new(ThemeId::Ion.as_str(), t.theme_ion_label)
             .description(t.theme_ion_desc)
             .current(current == ThemeId::Ion.as_str()),
         SelectionOption::new(ThemeId::Night.as_str(), t.theme_night_label)
             .description(t.theme_night_desc)
             .current(current == ThemeId::Night.as_str()),
-        SelectionOption::new(ThemeId::Day.as_str(), t.theme_day_label)
-            .description(t.theme_day_desc)
-            .current(current == ThemeId::Day.as_str()),
     ];
     let model = SelectionModel::new(t.overlay_theme, options, false).focus_key(current);
     state.overlay = Some(Overlay::ThemePicker(Box::new(model)));

@@ -265,6 +265,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(theme: Theme, boot: Boot) -> Self {
+        let dark = !matches!(theme.id, crate::theme::ThemeId::Day) && !theme.monochrome;
         Self {
             running: true,
             runtime_connected: true,
@@ -336,7 +337,7 @@ impl AppState {
             tick: 0,
             turn_started_at: None,
             elapsed_secs: 0,
-            dark: true,
+            dark,
             jump_to_bottom: false,
             locale: boot.locale,
             untrusted_config: boot.untrusted_config.clone(),
