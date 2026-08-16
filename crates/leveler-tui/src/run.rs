@@ -87,7 +87,7 @@ pub async fn run(
     let (mut guard, mut stdout) = TerminalGuard::enter()?;
     execute!(stdout, Clear(ClearType::Purge), cursor::MoveTo(0, 0))?;
 
-    let theme_id = crate::theme_config::load_theme_id().unwrap_or(crate::theme::ThemeId::Ion);
+    let theme_id = crate::theme_config::load_theme_id().unwrap_or(crate::theme::ThemeId::DEFAULT);
     let mut state = AppState::new(Theme::resolve(theme_id, Theme::env_no_color()), boot);
     let (cols, rows) = size().unwrap_or((80, 24));
     state.size = (cols, rows);

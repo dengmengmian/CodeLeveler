@@ -2273,15 +2273,17 @@ fn slash_theme_opens_picker_and_named_arg_sets() {
     use leveler_tui::ThemeId;
     use leveler_tui::overlay::Overlay;
     let mut s = opened();
-    assert_eq!(s.theme.id, ThemeId::Ion);
+    // A session that never chose a theme starts on the one explicit default
+    // (R007-F4) — not on whichever id happens to be listed first.
+    assert_eq!(s.theme.id, ThemeId::DEFAULT);
     typed(&mut s, "/theme");
     reduce(&mut s, key(KeyCode::Enter));
     assert!(
         matches!(s.overlay, Some(Overlay::ThemePicker(_))),
         "bare /theme opens the theme picker"
     );
-    // Cursor starts on current (ion); Down → night, Enter confirms.
-    reduce(&mut s, key(KeyCode::Down));
+    // Cursor starts on current (day, last in the picker list); Up → night.
+    reduce(&mut s, key(KeyCode::Up));
     reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(s.theme.id, ThemeId::Night);
     assert!(s.overlay.is_none());
@@ -2291,7 +2293,7 @@ fn slash_theme_opens_picker_and_named_arg_sets() {
     assert!(!s.dark, "day theme clears the dark flag");
     typed(&mut s, "/theme ion");
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.theme.id, ThemeId::Ion);
+    assert_eq!(s.theme.id, ThemeId::Ion, "an explicit choice still wins");
 }
 
 #[test]
