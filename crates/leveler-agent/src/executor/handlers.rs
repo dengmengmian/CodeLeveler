@@ -192,11 +192,13 @@ impl Executor {
             run_started: std::time::Instant::now(),
         };
         // R013r: an unbounded reviewer burned the full 100-round turn ceiling
-        // reading a repo it was only asked to judge. Reading a diff is a
-        // bounded job; a reviewer that has not concluded by now returns what
-        // it has (INCOMPLETE_PARTIAL keeps its findings) instead of burning
-        // the parent's budget.
-        const REVIEWER_MAX_ROUNDS: u32 = 20;
+        // reading a repo it was only asked to judge. The bound now lives on
+        // the role's capability profile; a reviewer that has not concluded by
+        // then returns what it has (INCOMPLETE_PARTIAL keeps its findings)
+        // instead of burning the parent's budget.
+        let reviewer_rounds = crate::sub_agent::ChildProfile::resolve(AgentRole::Reviewer)
+            .max_rounds
+            .unwrap_or(0);
         let result = self
             .run_one_sub_agent_on(
                 id,
@@ -204,7 +206,7 @@ impl Executor {
                 files,
                 None,
                 Vec::new(),
-                REVIEWER_MAX_ROUNDS,
+                reviewer_rounds,
                 brief,
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 progress_tx,
