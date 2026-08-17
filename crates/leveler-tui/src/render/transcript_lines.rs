@@ -459,6 +459,7 @@ pub(crate) fn sub_agent_display_name(
     let role = match block.role.as_str() {
         "explorer" => t.sub_agent_explorer,
         "worker" => t.sub_agent_worker,
+        "reviewer" => t.sub_agent_reviewer,
         _ => t.sub_agent_default,
     };
     match block.id.strip_prefix("agent-").filter(|n| !n.is_empty()) {
@@ -543,6 +544,16 @@ fn sub_agent_lines(
         format!(" · {}", sub_agent_status(block, t)),
         Style::default().fg(theme.muted),
     ));
+    if block.finding_count > 0 {
+        head_spans.push(Span::styled(
+            format!(
+                " · {}",
+                t.sub_agent_findings
+                    .replace("{}", &block.finding_count.to_string())
+            ),
+            Style::default().fg(theme.muted),
+        ));
+    }
     let elapsed = sub_agent_elapsed(block, now_elapsed_secs);
     if !elapsed.is_empty() {
         head_spans.push(Span::styled(
@@ -758,7 +769,20 @@ fn sub_agent_tree_group_lines(
             };
             (text, theme.accent)
         } else if all_ok {
-            (sub_agent_tree_child_usage(block), theme.dim)
+            let usage = sub_agent_tree_child_usage(block);
+            if block.finding_count > 0 {
+                let findings = t
+                    .sub_agent_findings
+                    .replace("{}", &block.finding_count.to_string());
+                let text = if usage.is_empty() {
+                    findings
+                } else {
+                    format!("{usage} · {findings}")
+                };
+                (text, theme.dim)
+            } else {
+                (usage, theme.dim)
+            }
         } else {
             sub_agent_tree_child_status(block, theme, t)
         };
@@ -1176,6 +1200,7 @@ mod tests {
             recent_step: None,
             started_elapsed_secs: 0,
             expanded: false,
+            finding_count: 0,
         }
     }
 
@@ -1225,6 +1250,23 @@ mod tests {
         assert!(
             text.contains("结论第 20 条"),
             "expanded must be complete: {text}"
+        );
+    }
+
+    #[test]
+    fn a_finished_explorer_shows_its_finding_count() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
+        a.finding_count = 3;
+        let lines = sub_agent_tree_lines(&[&a], &theme, 80, t, 0);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            text.contains("3 项发现"),
+            "finding count must be on the head line: {text}"
         );
     }
 

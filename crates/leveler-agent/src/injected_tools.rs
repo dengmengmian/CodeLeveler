@@ -197,6 +197,78 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
     }
 }
 
+/// The tool a CHILD calls to report one typed finding as it is confirmed.
+pub(crate) const REPORT_FINDING_TOOL: &str = "report_finding";
+
+/// The tool the PARENT calls to judge an adopted finding.
+pub(crate) const RESOLVE_FINDING_TOOL: &str = "resolve_finding";
+
+pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REPORT_FINDING_TOOL.to_string(),
+        description: "Report ONE concrete finding the moment you confirm it \
+            (do not batch them into your final prose). Each finding is recorded \
+            durably and handed to the agent that spawned you even if your run is \
+            cut short. Use one call per finding; keep `summary` specific and \
+            evidence-backed, naming the file/symbol where it applies."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "relevant_file", "relevant_symbol", "dependency",
+                        "callsite", "risk", "test", "config", "observation",
+                        "correctness"
+                    ],
+                    "description": "What kind of thing this finding is."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One specific, evidence-backed sentence."
+                },
+                "file": { "type": "string", "description": "The file it concerns, if any." },
+                "symbol": { "type": "string", "description": "The symbol it concerns, if any." },
+                "blocking": {
+                    "type": "boolean",
+                    "description": "Reviewer only: this defect must be resolved before the change can be considered verified."
+                }
+            },
+            "required": ["kind", "summary"]
+        }),
+    }
+}
+
+pub(crate) fn resolve_finding_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: RESOLVE_FINDING_TOOL.to_string(),
+        description: "Judge one finding a sub-agent reported (ids look like \
+            `f-3`). accepted = relevant, act on it; rejected = will not act, \
+            requires `reason`; addressed = you made the fix for an accepted \
+            finding (it is auto-verified once fresh verification passes). A \
+            blocking finding must reach rejected or verified before the goal \
+            can complete."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The finding id, e.g. f-3." },
+                "resolution": {
+                    "type": "string",
+                    "enum": ["accepted", "rejected", "addressed"],
+                    "description": "Your judgment."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Required for rejected: why this finding will not be acted on."
+                }
+            },
+            "required": ["id", "resolution"]
+        }),
+    }
+}
+
 /// Turn-scoped elevations from an approved `request_permissions` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TurnPermissionGrants {

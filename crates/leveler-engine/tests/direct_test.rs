@@ -2190,3 +2190,192 @@ async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
          stop sentence: {summary}"
     );
 }
+
+// ── Multi-agent product closure: reviewer findings + blocking closure truth ──
+
+/// The last persisted EvidenceLedger snapshot for one session.
+async fn persisted_ledger(
+    db: &Database,
+    session: &leveler_core::SessionId,
+) -> Option<leveler_lifecycle::EvidenceLedger> {
+    let store = leveler_storage::EngineStores::from_database(db);
+    let mut out = None;
+    for row in store.events.load(session).await.unwrap() {
+        if row.event_type == "evidence_ledger_updated"
+            && let Ok(leveler_engine::EngineEvent::EvidenceLedgerUpdated { ledger }) =
+                leveler_engine::EngineEvent::from_payload(&row.payload)
+        {
+            out = Some(ledger);
+        }
+    }
+    out
+}
+
+/// A reviewer's blocking correctness finding refuses a Verified closure and
+/// survives durably: adopted into the persisted ledger at Acknowledged, with
+/// the refusal staged as a review_stage row — never a silent downgrade.
+#[tokio::test]
+async fn a_blocking_reviewer_finding_refuses_verified_closure() {
+    let responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+        // Reviewer child rounds: one typed blocking finding, then prose.
+        tool_call(
+            "rf1",
+            "report_finding",
+            serde_json::json!({
+                "kind": "correctness",
+                "summary": "login() accepts any password",
+                "file": "src/auth.rs",
+                "blocking": true
+            }),
+        ),
+        text("reviewed src/auth.rs: one blocking defect reported"),
+        text("reviewed src/auth.rs: one blocking defect reported"),
+    ];
+
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::CompletedUnverified,
+        "an open blocking finding must refuse Verified"
+    );
+
+    let stages = review_stage_rows(&h.db, &session).await;
+    assert!(
+        stages
+            .iter()
+            .any(|(required, action, _)| *required && action == "blocking_finding_open"),
+        "the refusal must be staged durably: {stages:?}"
+    );
+
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("adoption must persist a ledger snapshot");
+    assert_eq!(ledger.findings.len(), 1);
+    let f = &ledger.findings[0];
+    assert_eq!(f.state, leveler_lifecycle::FindingState::Acknowledged);
+    assert_eq!(f.role, "reviewer");
+    assert!(f.source_child.starts_with("reviewer-"));
+    assert!(f.blocking);
+    assert_eq!(f.summary, "login() accepts any password");
+}
+
+/// A reviewer finding that is NOT blocking is knowledge, not a gate: it is
+/// adopted durably but the verified closure stands.
+#[tokio::test]
+async fn a_non_blocking_reviewer_finding_does_not_refuse_verified() {
+    let responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+        tool_call(
+            "rf1",
+            "report_finding",
+            serde_json::json!({
+                "kind": "observation",
+                "summary": "consider rate limiting later",
+                "file": "src/auth.rs"
+            }),
+        ),
+        text("reviewed src/auth.rs: nothing blocking"),
+        text("reviewed src/auth.rs: nothing blocking"),
+    ];
+
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Verified,
+        "a non-blocking finding must not downgrade a reviewed task"
+    );
+    let ledger = persisted_ledger(&h.db, &session)
+        .await
+        .expect("the finding must still be adopted durably");
+    assert_eq!(ledger.findings.len(), 1);
+    assert!(!ledger.findings[0].blocking);
+}
+
+/// EventLog replay: reloading the last EvidenceLedgerUpdated after a
+/// reviewer adoption returns the same single Acknowledged finding. Resume of
+/// a CompletedUnverified session is refused by the engine (start a new
+/// task); the durable contract is the snapshot, not a second drive.
+#[tokio::test]
+async fn persisted_findings_reload_without_duplication() {
+    let responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added login"}),
+        ),
+        tool_call(
+            "rf1",
+            "report_finding",
+            serde_json::json!({
+                "kind": "correctness",
+                "summary": "login() accepts any password",
+                "file": "src/auth.rs",
+                "blocking": true
+            }),
+        ),
+        text("reviewed: one blocking defect"),
+        text("reviewed: one blocking defect"),
+    ];
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let first = persisted_ledger(&h.db, &session).await.unwrap();
+    let second = persisted_ledger(&h.db, &session).await.unwrap();
+    assert_eq!(first.findings.len(), 1);
+    assert_eq!(first, second, "reload must be identical, not duplicated");
+    assert_eq!(
+        first.findings[0].state,
+        leveler_lifecycle::FindingState::Acknowledged
+    );
+}

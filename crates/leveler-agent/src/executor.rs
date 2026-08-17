@@ -1155,30 +1155,41 @@ impl Executor {
         files: Vec<String>,
         model_override: Option<ModelRef>,
     ) -> Executor {
-        // Explorer gets a read-only toolset (physically no write tools); others
-        // inherit the full registry. Worker is additionally pinned to `files`.
-        let registry = match role {
-            AgentRole::Explorer | AgentRole::Reviewer => Arc::new(self.registry.read_only_subset()),
-            _ => self.registry.clone(),
+        // The role's capability profile decides the toolset shape in ONE
+        // place: read-only roles get a registry that physically holds no
+        // write tools; a writer is pinned to `files` and runs its tools
+        // serially. See [`crate::sub_agent::ChildProfile`].
+        let profile = crate::sub_agent::ChildProfile::resolve(role);
+        let registry = if profile.read_only {
+            Arc::new(self.registry.read_only_subset())
+        } else {
+            self.registry.clone()
         };
-        let write_allowlist = match role {
-            AgentRole::Worker if !files.is_empty() => Some(files),
-            _ => None,
-        };
+        let write_allowlist = (!profile.read_only && !files.is_empty()).then_some(files);
         let child_policy = self.sub_agent_policies.map_or(
             SubAgentExecutionPolicy {
                 max_search_calls_per_step: self.policy.max_search_calls_per_step,
-                max_parallel_tools: match role {
-                    AgentRole::Worker => 1,
-                    AgentRole::Default | AgentRole::Explorer | AgentRole::Reviewer => {
-                        self.policy.max_parallel_tools
-                    }
+                max_parallel_tools: if profile.serial_tools {
+                    1
+                } else {
+                    self.policy.max_parallel_tools
                 },
                 require_explicit_plan: self.policy.require_explicit_plan,
                 reasoning_effort: self.policy.reasoning_effort,
             },
             |policies| policies.for_role(role),
         );
+        // The profile's serial-tools contract binds regardless of which policy
+        // source resolved the loop shape: a writer sharing the workspace never
+        // runs tools in parallel.
+        let child_policy = SubAgentExecutionPolicy {
+            max_parallel_tools: if profile.serial_tools {
+                1
+            } else {
+                child_policy.max_parallel_tools
+            },
+            ..child_policy
+        };
         let switched = model_override.is_some();
         Executor {
             // A sub-agent runs the parent's model, so it inherits that model's
@@ -1407,13 +1418,19 @@ impl Executor {
             AgentRole::Explorer => prompt.push_str(
                 "\n\nYou are an EXPLORER sub-agent: investigate and report back. You have \
                  read-only tools and CANNOT modify files or run commands. Answer the task \
-                 precisely, citing the specific files/symbols you inspected; do not speculate.",
+                 precisely, citing the specific files/symbols you inspected; do not speculate. \
+                 Call report_finding the moment you confirm each concrete discovery \
+                 (relevant file/symbol, dependency, callsite, risk…) — findings reported \
+                 early survive even if your run is cut short; prose written only at the \
+                 end does not.",
             ),
             AgentRole::Worker => {
                 prompt.push_str(
                     "\n\nYou are a WORKER sub-agent implementing a bounded change. Other agents \
                      may be editing the same workspace in parallel, so stay strictly within \
-                     your assigned files and do not touch anything else.",
+                     your assigned files and do not touch anything else. Call report_finding \
+                     for each concrete note (risk, test, observation) you want the parent \
+                     to judge; do not bury them only in the final prose.",
                 );
                 if let Some(files) = &self.write_allowlist {
                     prompt.push_str(&format!(
@@ -1427,9 +1444,11 @@ impl Executor {
                  described in your task; your job is to judge it independently, not to redo or \
                  extend it. You have read-only tools and CANNOT modify files. Read the changed \
                  files and the code they touch, then report concrete defects — correctness, \
-                 security, concurrency, and error paths first — each naming the file and the \
-                 specific problem. If you find nothing blocking, say so plainly; do not invent \
-                 findings to look thorough.",
+                 security, concurrency, and error paths first. Report EACH defect with one \
+                 report_finding call as you confirm it (kind=correctness/risk, naming the \
+                 file), setting blocking=true only for a defect that must be fixed before \
+                 the change can ship. If you find nothing blocking, say so plainly; do not \
+                 invent findings to look thorough.",
             ),
             AgentRole::Default => {}
         }

@@ -38,6 +38,7 @@
 
 mod axes;
 mod contract;
+mod findings;
 mod impact;
 mod ledger;
 mod objective;
@@ -49,6 +50,7 @@ pub mod workflow;
 
 pub use axes::{CollaborationMode, DepthUseMetrics, WorkProfile};
 pub use contract::TaskContract;
+pub use findings::{FindingError, FindingKind, FindingRecord, FindingState, transition_allowed};
 pub use impact::{ChangeImpact, is_build_relevant};
 pub use ledger::{
     CompleteStepReceipt, EvidenceLedger, InterceptRecord, MutationRecord, VerifyRecord,

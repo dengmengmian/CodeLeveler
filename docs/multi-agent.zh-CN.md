@@ -20,11 +20,14 @@ CodeLeveler 可以对**彼此独立**的调查或**互不重叠**的改动并行
 
 | `role` | 行为 |
 | --- | --- |
-| `explorer` | 只读工具集（不能改工作区）。 |
-| `worker` | 可写；必须提供独占的 `files`。 |
+| `explorer` | 只读调查，回报结构化 finding，不能改代码。 |
+| `worker` | 在独占 `files` 内改代码。未完成会变成一条阻塞 finding。 |
 | `default` | 全工具（未指定时）。 |
+| Reviewer | 由 Harness 启动，不是 `spawn_agent` 角色。只读，20 轮上限。 |
 
-并行 worker 的 `files` 必须**互斥**，避免改同一路径。
+并行 worker 的 `files` 必须**互斥**。同一轮重叠 scope 会被拒绝。子 agent
+用 `report_finding` 上报；父 agent 用 `resolve_finding` 裁决。未拒绝、未验证
+的 blocking finding 会挡住 `Verified` 收口。
 
 ## 硬限制
 
@@ -63,7 +66,8 @@ delegation = false
 ## TUI 上看到什么
 
 并发子 agent 以**树**展示。运行中每个子节点显示运行时上报的**真实**最近工具/步骤
-（如 `list_files`），不编造统计。token 用量仍来自 `SubAgentProgress`（若有）。
+（如 `list_files`），不编造统计。结束后会显示采纳了多少条结构化 finding。
+token 用量仍来自 `SubAgentProgress`（若有）。
 
 ## 浏览器
 

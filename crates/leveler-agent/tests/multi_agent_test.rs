@@ -444,6 +444,98 @@ async fn worker_ownership_rejects_out_of_scope_edit() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Human-review P2: a Worker must not keep a shell mutation outside its
+/// exclusive files. The existing command_write_allowlist + snapshot restore
+/// is the close — this test proves it is wired through spawn_agent, not
+/// only the isolated run_command unit test.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_cannot_keep_a_shell_write_outside_its_scope() {
+    let dir = tmp("worker-shell-escape", 110);
+    std::fs::write(dir.join("owned.rs"), "owned\n").unwrap();
+    std::fs::write(dir.join("other.rs"), "other\n").unwrap();
+    init_git(&dir);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": "edit owned.rs",
+                        "role": "worker",
+                        "files": ["owned.rs"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "run_command",
+                    serde_json::json!({
+                        "program": "sh",
+                        "args": ["-c", "echo hacked > other.rs"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("tried the shell write"),
+            assistant_text("parent wrap-up"),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let other = std::fs::read_to_string(dir.join("other.rs")).unwrap();
+    assert_eq!(
+        other, "other\n",
+        "out-of-scope shell write must not survive"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn init_git(dir: &std::path::Path) {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "core.autocrlf", "false"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+}
+
 #[tokio::test]
 async fn explorer_can_finish_after_more_than_six_rounds() {
     let dir = tmp("explorer-budget", 31);
@@ -2714,5 +2806,1025 @@ async fn failed_child_reports_no_result_rather_than_no_findings() {
         is_error,
         "a child that never ran is an error for the parent"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The `spawn_agent` schema promises a worker "MUST be given `files` it
+/// exclusively owns". Before capability admission, an empty `files` silently
+/// produced a worker with UNRESTRICTED write access — the opposite.
+#[tokio::test]
+async fn a_worker_spawn_without_a_file_scope_is_refused() {
+    let dir = tmp("worker-noscope", 91);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "edit something", "role": "worker"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentStarted { .. })),
+        "an unscoped worker must never start"
+    );
+    let refusal = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "spawn_agent" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("the spawn must be refused with a reason");
+    assert!(
+        refusal.contains("files"),
+        "the denial must name the missing scope: {refusal}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A read-only role asking for a write scope is an incoherent capability
+/// request: deny honestly instead of silently ignoring the `files`.
+#[tokio::test]
+async fn an_explorer_spawn_with_a_write_scope_is_refused() {
+    let dir = tmp("explorer-scope", 92);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": "look around",
+                        "role": "explorer",
+                        "files": ["src/a.rs"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentStarted { .. })),
+        "the incoherent spawn must not start"
+    );
+    let refusal = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "spawn_agent" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("the spawn must be refused with a reason");
+    assert!(
+        refusal.contains("read-only"),
+        "the denial must say why: {refusal}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two same-batch workers whose "exclusive" scopes overlap cannot both be
+/// admitted — that is last-writer-wins waiting to happen. The first keeps its
+/// scope; the second is refused honestly.
+#[tokio::test]
+async fn overlapping_worker_scopes_refuse_the_second_spawn() {
+    let dir = tmp("worker-overlap", 93);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![
+                    spawn_call(
+                        "s1",
+                        serde_json::json!({
+                            "task": "edit auth",
+                            "role": "worker",
+                            "files": ["src/auth.rs"]
+                        }),
+                    ),
+                    // Directory prefix overlap with the first scope.
+                    spawn_call(
+                        "s2",
+                        serde_json::json!({
+                            "task": "edit src tree",
+                            "role": "worker",
+                            "files": ["src"]
+                        }),
+                    ),
+                    // Disjoint: must be admitted.
+                    spawn_call(
+                        "s3",
+                        serde_json::json!({
+                            "task": "edit docs",
+                            "role": "worker",
+                            "files": ["docs/README.md"]
+                        }),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("auth edited"),
+            assistant_text("docs edited"),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let started_n = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::SubAgentStarted { .. }))
+        .count();
+    assert_eq!(
+        started_n, 2,
+        "the overlapping worker must be refused; the disjoint pair runs"
+    );
+    let refusal = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                id,
+                name,
+                is_error: true,
+                preview,
+            } if name == "spawn_agent" && id == "s2" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("the overlapping spawn must be refused");
+    assert!(
+        refusal.contains("overlap"),
+        "the denial must name the collision: {refusal}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── Structured findings flow ────────────────────────────────────────────────
+
+fn finding_call(id: &str, args: serde_json::Value) -> ContentPart {
+    tool_call_part(id, "report_finding", args)
+}
+
+fn resolve_call(id: &str, args: serde_json::Value) -> ContentPart {
+    tool_call_part(id, "resolve_finding", args)
+}
+
+/// The last ledger snapshot the PARENT emitted (adoption is a parent-side,
+/// durable act — receipt must be observable, not implied).
+fn last_ledger(events: &[AgentEvent]) -> leveler_lifecycle::EvidenceLedger {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::EvidenceLedgerUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .expect("adoption must persist a ledger snapshot")
+}
+
+/// 50.A/D: an explorer's typed finding reaches the parent ledger at
+/// Acknowledged, attributed to the child, and the parent-facing tool result
+/// names the adopted id so the model can judge it.
+#[tokio::test]
+async fn an_explorer_finding_is_adopted_by_the_parent_at_acknowledged() {
+    let dir = tmp("finding-adopt", 94);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "find the config loader", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Child round 1: a typed finding…
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({
+                        "kind": "relevant_file",
+                        "summary": "config loader lives here",
+                        "file": "src/config.rs"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // …child round 2: prose wrap-up.
+            assistant_text("Found it: src/config.rs."),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut sink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let ledger = last_ledger(&events);
+    assert_eq!(ledger.findings.len(), 1, "one adopted finding");
+    let f = &ledger.findings[0];
+    assert_eq!(f.state, leveler_lifecycle::FindingState::Acknowledged);
+    assert_eq!(f.source_child, "agent-1");
+    assert_eq!(f.role, "explorer");
+    assert_eq!(f.summary, "config loader lives here");
+    assert_eq!(f.file.as_deref(), Some("src/config.rs"));
+    assert!(!f.blocking);
+
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    assert!(!is_error);
+    assert!(
+        content.contains(&f.id),
+        "the parent-facing result must name the adopted finding id: {content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Only the reviewer role may raise blocking findings; an explorer's
+/// blocking=true is recorded, but non-blocking.
+#[tokio::test]
+async fn a_non_reviewer_blocking_flag_is_not_honored() {
+    let dir = tmp("finding-blocking", 95);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "investigate", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({
+                        "kind": "risk",
+                        "summary": "this feels risky",
+                        "blocking": true
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Done."),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let ledger = last_ledger(&events);
+    assert_eq!(ledger.findings.len(), 1);
+    assert!(
+        !ledger.findings[0].blocking,
+        "an explorer cannot gate closure with a blocking finding"
+    );
+    assert!(ledger.open_blocking_findings().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 50.C: a child that dies mid-run keeps what it had already established —
+/// its typed findings survive into the parent ledger even though the child's
+/// own run is an INCOMPLETE error for the parent.
+#[tokio::test]
+async fn a_stopped_child_still_delivers_its_partial_findings() {
+    let dir = tmp("finding-partial", 96);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // The child reports one finding, then the runtime dies (no more scripted
+    // responses) — an abnormal termination, not a clean end.
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "investigate", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({
+                        "kind": "callsite",
+                        "summary": "handler registered in router.rs"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .ok();
+
+    let ledger = last_ledger(&events);
+    assert_eq!(
+        ledger.findings.len(),
+        1,
+        "partial findings must survive an abnormal child stop"
+    );
+    assert_eq!(
+        ledger.findings[0].summary,
+        "handler registered in router.rs"
+    );
+    assert_eq!(
+        ledger.findings[0].state,
+        leveler_lifecycle::FindingState::Acknowledged
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The parent's judgment runs through the audited lifecycle: accept works,
+/// rejecting without a reason is refused, rejecting with one lands and is
+/// durable.
+#[tokio::test]
+async fn the_parent_resolves_findings_through_the_audited_lifecycle() {
+    let dir = tmp("finding-resolve", 97);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "investigate", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({"kind": "risk", "summary": "duplicated lock"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Done."),
+            assistant_with(
+                vec![
+                    resolve_call(
+                        "r1",
+                        serde_json::json!({"id": "f-1", "resolution": "accepted"}),
+                    ),
+                    resolve_call(
+                        "r2",
+                        serde_json::json!({"id": "f-1", "resolution": "rejected"}),
+                    ),
+                    resolve_call(
+                        "r3",
+                        serde_json::json!({
+                            "id": "f-1",
+                            "resolution": "rejected",
+                            "reason": "duplicate of known issue"
+                        }),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let ok_results: Vec<(String, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult {
+                id, name, is_error, ..
+            } if name == "resolve_finding" => Some((id.clone(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ok_results.len(), 3);
+    assert!(!ok_results[0].1, "accept must succeed");
+    assert!(ok_results[1].1, "reject without a reason must be refused");
+    assert!(!ok_results[2].1, "reject with a reason must succeed");
+
+    let ledger = last_ledger(&events);
+    let f = ledger.finding("f-1").expect("finding survives");
+    assert_eq!(f.state, leveler_lifecycle::FindingState::Rejected);
+    assert_eq!(
+        f.resolution_reason.as_deref(),
+        Some("duplicate of known issue")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Completion truth: an open blocking finding refuses update_goal(complete);
+/// an explicitly rejected one no longer blocks.
+#[tokio::test]
+async fn an_open_blocking_finding_refuses_goal_completion_until_resolved() {
+    let dir = tmp("finding-gate", 98);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Seed the parent with a reviewer-raised blocking finding, as a resumed
+    // turn would after a harness review.
+    let mut seeded = leveler_lifecycle::EvidenceLedger::default();
+    let reviewer_rec = {
+        let mut child = leveler_lifecycle::EvidenceLedger::default();
+        let id = child.record_finding(
+            leveler_lifecycle::FindingKind::Correctness,
+            "unlocked shared counter",
+            Some("src/state.rs".into()),
+            None,
+            true,
+        );
+        child.finding(&id).unwrap().clone()
+    };
+    seeded.adopt_finding("reviewer-1", "reviewer", &reviewer_rec);
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({"status": "complete", "summary": "done"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![
+                    resolve_call(
+                        "r1",
+                        serde_json::json!({
+                            "id": "f-1",
+                            "resolution": "rejected",
+                            "reason": "code path unreachable in this build"
+                        }),
+                    ),
+                    tool_call_part(
+                        "g2",
+                        "update_goal",
+                        serde_json::json!({"status": "complete", "summary": "done"}),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_seeded_ledger(seeded)
+    .run(
+        "finish the task",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let goal_results: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult { name, is_error, .. } if name == "update_goal" => {
+                Some(*is_error)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(goal_results.len(), 2);
+    assert!(
+        goal_results[0],
+        "completion with an open blocking finding must be refused"
+    );
+    assert!(!goal_results[1], "completion after rejection must pass");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "blocking_finding"
+        )),
+        "the interception must be observable"
+    );
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A Worker that dies before finishing is original-goal debt: the host
+/// records a blocking finding so the parent cannot silently Verified.
+#[tokio::test]
+async fn an_incomplete_worker_raises_a_blocking_finding() {
+    let dir = tmp("worker-incomplete-block", 99);
+    std::fs::write(dir.join("owned.rs"), "pub fn owned() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Only the parent's spawn is scripted: the child's first model call
+    // errors, which is INCOMPLETE_NO_RESULT — and must become a blocking
+    // parent finding.
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![assistant_with(
+            vec![spawn_call(
+                "s1",
+                serde_json::json!({
+                    "task": "edit owned.rs",
+                    "role": "worker",
+                    "files": ["owned.rs"]
+                }),
+            )],
+            FinishReason::ToolCalls,
+        )],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    let _ = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let ledger = last_ledger(&events);
+    let open = ledger.open_blocking_findings();
+    assert_eq!(open.len(), 1, "an incomplete worker must block: {open:?}");
+    assert_eq!(open[0].role, "worker");
+    assert_eq!(open[0].source_child, "agent-1");
+    assert!(
+        open[0].summary.contains("did not complete"),
+        "the finding must name the incomplete work: {}",
+        open[0].summary
+    );
+
+    let started = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentStarted { role, task, .. } => Some((role.clone(), task.clone())),
+        _ => None,
+    });
+    let (role, task) = started.expect("worker must have started");
+    assert_eq!(role, "worker");
+    assert!(
+        task.contains("[scope: owned.rs]"),
+        "worker start must disclose scope: {task}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A child that only calls report_finding and writes no wrap-up prose still
+/// completed WITH findings — structured records are a result.
+#[tokio::test]
+async fn structured_findings_without_prose_are_still_a_result() {
+    let dir = tmp("structured-is-result", 103);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "find it", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({
+                        "kind": "relevant_file",
+                        "summary": "loader is here",
+                        "file": "src/config.rs"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Quiet wrap-up is nudged before it is accepted (same shape as
+            // child_completed_without_findings). The typed finding must still
+            // count as a result.
+            assistant_text("   "),
+            assistant_text("   "),
+            assistant_text("   "),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .await
+    .unwrap();
+
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    assert!(!is_error, "typed findings are a clean result: {content}");
+    assert!(
+        content.contains("COMPLETED_WITH_FINDINGS"),
+        "empty prose must not erase structured findings: {content}"
+    );
+    assert!(
+        !content.contains("COMPLETED_NO_FINDINGS"),
+        "must not be classified as no-findings: {content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Explorer incomplete is knowledge loss, not a closure gate.
+#[tokio::test]
+async fn an_incomplete_explorer_does_not_raise_a_blocking_finding() {
+    let dir = tmp("explorer-incomplete-noblock", 100);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![assistant_with(
+            vec![spawn_call(
+                "s1",
+                serde_json::json!({"task": "investigate", "role": "explorer"}),
+            )],
+            FinishReason::ToolCalls,
+        )],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    let _ = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::EvidenceLedgerUpdated { .. }))
+            || last_ledger(&events).open_blocking_findings().is_empty(),
+        "an incomplete explorer must not invent a blocking finding"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Replay: a finding accepted in one drive is still Accepted — and still
+/// exactly one — when a fresh executor is seeded from that ledger snapshot.
+#[tokio::test]
+async fn accepted_findings_survive_a_seeded_replay_without_duplication() {
+    let dir = tmp("finding-replay", 101);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "investigate", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({"kind": "risk", "summary": "duplicated lock"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Done."),
+            assistant_with(
+                vec![resolve_call(
+                    "r1",
+                    serde_json::json!({"id": "f-1", "resolution": "accepted"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry.clone(),
+        tool_context.clone(),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let snapshot = last_ledger(&events);
+    assert_eq!(snapshot.findings.len(), 1);
+    assert_eq!(
+        snapshot.finding("f-1").unwrap().state,
+        leveler_lifecycle::FindingState::Accepted
+    );
+
+    // "Crash": a fresh executor seeded from the persisted snapshot.
+    let runtime2 = Arc::new(SleepyRuntime::new(
+        vec![assistant_text("resumed wrap-up.")],
+        Duration::from_millis(0),
+    ));
+    let mut events2 = Vec::new();
+    Executor::new(
+        runtime2,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_seeded_ledger(snapshot.clone())
+    .run(
+        "continue",
+        &mut |e| events2.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // The seeded ledger is the in-memory starting point; a quiet resume
+    // emits no new snapshot. The contract is: we did not create a second
+    // finding, and the snapshot we would persist is still Accepted.
+    let after = events2
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::EvidenceLedgerUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .unwrap_or(snapshot);
+    assert_eq!(after.findings.len(), 1, "replay must not duplicate");
+    assert_eq!(
+        after.finding("f-1").unwrap().state,
+        leveler_lifecycle::FindingState::Accepted
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Authoritative events reconstruct role / status / scope / finding count.
+#[tokio::test]
+async fn child_observability_reconstructs_from_authoritative_events() {
+    let dir = tmp("obs-rebuild", 102);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "find the config loader", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({
+                        "kind": "relevant_file",
+                        "summary": "config loader lives here",
+                        "file": "src/config.rs"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Found it."),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let started = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentStarted { id, role, task, .. } => {
+            Some((id.clone(), role.clone(), task.clone()))
+        }
+        _ => None,
+    });
+    let finished = events.iter().rev().find_map(|e| match e {
+        AgentEvent::SubAgentFinished {
+            id, ok, summary, ..
+        } => Some((id.clone(), *ok, summary.clone())),
+        _ => None,
+    });
+    let (id, role, _task) = started.expect("start");
+    let (fid, ok, summary) = finished.expect("finish");
+    assert_eq!(id, fid);
+    assert_eq!(role, "explorer");
+    assert!(ok, "explorer finished cleanly");
+    assert!(
+        summary.contains("Structured findings adopted"),
+        "finish summary must name adopted findings: {summary}"
+    );
+    let ledger = last_ledger(&events);
+    assert_eq!(ledger.findings.len(), 1);
+    assert_eq!(ledger.findings[0].role, "explorer");
     std::fs::remove_dir_all(&dir).ok();
 }

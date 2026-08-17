@@ -119,6 +119,9 @@ pub struct SubAgentBlock {
     /// show each agent's own running time (`now_elapsed - started`). `0` when the
     /// start time is unknown (finish-without-start fallback).
     pub started_elapsed_secs: u64,
+    /// Typed findings adopted from this child (from the durable finish
+    /// summary). Zero until the child finishes.
+    pub finding_count: usize,
 }
 
 /// Ephemeral side question (`/btw`) — rendered in the UI but never loaded
@@ -708,7 +711,27 @@ impl TranscriptState {
             progress: SubAgentProgress::default(),
             recent_step: None,
             started_elapsed_secs,
+            finding_count: 0,
         }));
+    }
+
+    /// Count typed findings named in the durable finish summary. The runtime
+    /// writes `Structured findings adopted: f-1, f-2` — this is a projection
+    /// of that authoritative line, not a second source of truth.
+    pub(crate) fn count_adopted_findings(summary: &str) -> usize {
+        const MARK: &str = "Structured findings adopted: ";
+        summary
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix(MARK)?;
+                let ids = rest.split('—').next().unwrap_or(rest);
+                let n = ids
+                    .split(',')
+                    .filter(|s| s.trim().starts_with("f-"))
+                    .count();
+                (n > 0).then_some(n)
+            })
+            .unwrap_or(0)
     }
 
     /// Mark a sub-agent done, updating its status and result summary in place. If
@@ -721,10 +744,12 @@ impl TranscriptState {
         } else {
             ToolStatus::Failed
         };
+        let finding_count = Self::count_adopted_findings(&summary);
         if let Some(block) = self.sub_agent_mut(id) {
             block.status = status;
             block.detail = summary;
             block.progress.active = false;
+            block.finding_count = finding_count;
             return;
         }
         self.close_tool_group();
@@ -738,6 +763,7 @@ impl TranscriptState {
             progress: SubAgentProgress::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            finding_count,
         }));
     }
 
@@ -882,5 +908,45 @@ mod tests {
             })
             .collect();
         assert_eq!(groups, vec![false, false]);
+    }
+
+    #[test]
+    fn count_adopted_findings_reads_the_authoritative_line() {
+        assert_eq!(
+            TranscriptState::count_adopted_findings(
+                "[sub-agent Euclid] status: COMPLETED_WITH_FINDINGS\n\
+                 found it\n\n\
+                 Structured findings adopted: f-1, f-2 — judge each with resolve_finding."
+            ),
+            2
+        );
+        assert_eq!(
+            TranscriptState::count_adopted_findings("no findings here"),
+            0
+        );
+    }
+
+    #[test]
+    fn completing_a_sub_agent_records_its_finding_count() {
+        let mut ts = TranscriptState::default();
+        ts.push_sub_agent_started(
+            "agent-1".into(),
+            "Euclid".into(),
+            "explorer".into(),
+            "look around".into(),
+            0,
+        );
+        ts.complete_sub_agent(
+            "agent-1",
+            "Euclid",
+            true,
+            "Structured findings adopted: f-1 — judge each with resolve_finding.".into(),
+        );
+        let block = match ts.items.last() {
+            Some(TranscriptItem::SubAgent(b)) => b,
+            _ => panic!("expected sub-agent"),
+        };
+        assert_eq!(block.finding_count, 1);
+        assert_eq!(block.status, ToolStatus::Ok);
     }
 }

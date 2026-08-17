@@ -263,6 +263,183 @@ impl AgentRole {
     }
 }
 
+/// The capability contract of one child role, resolved in exactly one place.
+///
+/// This formalises what was previously scattered across the drive-loop spawn
+/// admission, `child_for_role_on`, and `run_reviewer_child`: which registry a
+/// role gets, whether it must own an explicit file scope, whether its
+/// `report_finding(blocking=true)` is honoured, and how long it may run.
+/// Capability is expressed per semantic class, never per role × tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildProfile {
+    pub role: AgentRole,
+    /// Physically read-only toolset (`read_only_subset`): no mutating tool is
+    /// even advertised, so denial is structural, not behavioral.
+    pub read_only: bool,
+    /// Spawn admission requires a non-empty exclusive `files` scope.
+    pub requires_scope: bool,
+    /// `report_finding(blocking=true)` is honoured; other roles are recorded
+    /// non-blocking so an explorer observation can never gate closure.
+    pub may_report_blocking: bool,
+    /// Hard round bound (None = run until terminal within budgets).
+    pub max_rounds: Option<u32>,
+    /// Force serial tool execution (a writer sharing the workspace).
+    pub serial_tools: bool,
+}
+
+impl ChildProfile {
+    pub(crate) fn resolve(role: AgentRole) -> Self {
+        match role {
+            AgentRole::Default => Self {
+                role,
+                read_only: false,
+                requires_scope: false,
+                may_report_blocking: false,
+                max_rounds: None,
+                serial_tools: false,
+            },
+            AgentRole::Explorer => Self {
+                role,
+                read_only: true,
+                requires_scope: false,
+                may_report_blocking: false,
+                max_rounds: None,
+                serial_tools: false,
+            },
+            AgentRole::Worker => Self {
+                role,
+                read_only: false,
+                requires_scope: true,
+                may_report_blocking: false,
+                max_rounds: None,
+                serial_tools: true,
+            },
+            // R013r: an unbounded reviewer burned the parent's whole round
+            // ceiling reading a repo it was only asked to judge. Reading a
+            // diff is a bounded job.
+            AgentRole::Reviewer => Self {
+                role,
+                read_only: true,
+                requires_scope: false,
+                may_report_blocking: true,
+                max_rounds: Some(20),
+                serial_tools: false,
+            },
+        }
+    }
+
+    /// Minimal capability negotiation at spawn admission: the requested
+    /// capabilities (role + file scope) against the role's profile.
+    /// `Err` is an honest denial fed back to the model — never a silent
+    /// downgrade.
+    pub(crate) fn admit(role: AgentRole, files: &[String]) -> Result<Self, String> {
+        let profile = Self::resolve(role);
+        if profile.requires_scope && files.is_empty() {
+            return Err(format!(
+                "role='{}' requires a non-empty `files` list naming the files it \
+                 exclusively owns; an unscoped writer is not admitted.",
+                role.label()
+            ));
+        }
+        if profile.read_only && !files.is_empty() {
+            return Err(format!(
+                "role='{}' is read-only and cannot take a `files` write scope. \
+                 Use role='worker' for edits, or drop `files` to investigate.",
+                role.label()
+            ));
+        }
+        Ok(profile)
+    }
+}
+
+/// Whether two worker scopes overlap (equal path, or one is a directory
+/// prefix of the other), after `./` normalization. Used to refuse same-batch
+/// workers whose exclusive scopes are not actually exclusive.
+pub(crate) fn scopes_overlap(a: &[String], b: &[String]) -> bool {
+    let norm = |p: &String| p.trim().trim_start_matches("./").to_string();
+    let covers = |x: &str, y: &str| x == y || y.starts_with(&format!("{x}/"));
+    a.iter().map(&norm).any(|pa| {
+        b.iter()
+            .map(&norm)
+            .any(|pb| covers(&pa, &pb) || covers(&pb, &pa))
+    })
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn explorer_and_reviewer_are_structurally_read_only() {
+        for role in [AgentRole::Explorer, AgentRole::Reviewer] {
+            let p = ChildProfile::resolve(role);
+            assert!(p.read_only, "{role:?} must hold no write tools");
+            assert!(!p.requires_scope);
+            assert!(!p.serial_tools);
+        }
+    }
+
+    #[test]
+    fn only_the_reviewer_may_raise_blocking_findings() {
+        for role in [AgentRole::Default, AgentRole::Explorer, AgentRole::Worker] {
+            assert!(!ChildProfile::resolve(role).may_report_blocking, "{role:?}");
+        }
+        assert!(ChildProfile::resolve(AgentRole::Reviewer).may_report_blocking);
+    }
+
+    #[test]
+    fn the_reviewer_is_bounded_and_the_worker_is_serial() {
+        assert_eq!(
+            ChildProfile::resolve(AgentRole::Reviewer).max_rounds,
+            Some(20)
+        );
+        let worker = ChildProfile::resolve(AgentRole::Worker);
+        assert!(worker.serial_tools);
+        assert!(!worker.read_only);
+        assert!(worker.requires_scope);
+    }
+
+    #[test]
+    fn a_worker_without_a_scope_is_refused_not_unleashed() {
+        // Before this contract an empty `files` silently produced a worker
+        // with UNRESTRICTED write access — the opposite of what the schema
+        // promises ("MUST be given files it exclusively owns").
+        let err = ChildProfile::admit(AgentRole::Worker, &[]).unwrap_err();
+        assert!(
+            err.contains("files"),
+            "denial must name the missing scope: {err}"
+        );
+        assert!(ChildProfile::admit(AgentRole::Worker, &["src/a.rs".into()]).is_ok());
+    }
+
+    #[test]
+    fn a_read_only_role_asking_for_write_scope_is_refused() {
+        let err = ChildProfile::admit(AgentRole::Explorer, &["src/a.rs".into()]).unwrap_err();
+        assert!(
+            err.contains("read-only"),
+            "denial must say why, not silently ignore the request: {err}"
+        );
+        assert!(ChildProfile::admit(AgentRole::Explorer, &[]).is_ok());
+        assert!(ChildProfile::admit(AgentRole::Default, &[]).is_ok());
+    }
+
+    #[test]
+    fn overlapping_scopes_are_detected_by_path_and_directory_prefix() {
+        let a = vec!["src/auth.rs".to_string()];
+        assert!(scopes_overlap(&a, &["src/auth.rs".to_string()]));
+        assert!(scopes_overlap(&a, &["./src/auth.rs".to_string()]));
+        assert!(scopes_overlap(&["src".to_string()], &a));
+        assert!(scopes_overlap(&a, &["src".to_string()]));
+        assert!(!scopes_overlap(&a, &["src/config.rs".to_string()]));
+        // Prefix means DIRECTORY prefix, not string prefix.
+        assert!(!scopes_overlap(
+            &["src/auth.rs".to_string()],
+            &["src/auth.rs.bak".to_string()]
+        ));
+        assert!(!scopes_overlap(&a, &[]));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

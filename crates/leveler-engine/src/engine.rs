@@ -1710,6 +1710,68 @@ impl TaskEngine {
         if task_outcome == TaskOutcome::Verified && !review.satisfies_required() {
             task_outcome = TaskOutcome::CompletedUnverified;
         }
+        // Blocking-finding closure truth: an open blocking finding (raised by
+        // the reviewer, not yet rejected or verified) refuses Verified. The
+        // check runs AFTER the review stage so a finding adopted moments ago
+        // is seen; Addressed findings are host-promoted first when fresh
+        // post-mutation verification exists, so a fixed-and-proven finding
+        // never blocks. The refusal is staged durably — never silent.
+        if task_outcome == TaskOutcome::Verified {
+            match crate::turn::last_persisted_ledger(
+                runner.stores.events.as_ref(),
+                &runner.session_id,
+            )
+            .await
+            {
+                Err(e) => {
+                    // Fail closed: if we cannot read the ledger we cannot
+                    // prove there is no open blocking finding.
+                    task_outcome = TaskOutcome::CompletedUnverified;
+                    log.append(
+                        None,
+                        EngineEvent::ReviewStage {
+                            required: true,
+                            action: "blocking_finding_open".to_string(),
+                            detail: format!("findings ledger unreadable: {e}"),
+                        },
+                        observer,
+                    )
+                    .await?;
+                }
+                Ok(None) => {}
+                Ok(Some(ledger)) if ledger.findings.is_empty() => {}
+                Ok(Some(mut ledger)) => {
+                    if ledger.promote_addressed_findings(ledger.has_fresh_successful_verify()) > 0 {
+                        log.append(
+                            None,
+                            EngineEvent::EvidenceLedgerUpdated {
+                                ledger: ledger.clone(),
+                            },
+                            observer,
+                        )
+                        .await?;
+                    }
+                    let open: Vec<String> = ledger
+                        .open_blocking_findings()
+                        .iter()
+                        .map(|f| format!("{} ({}: {})", f.id, f.state.label(), f.summary))
+                        .collect();
+                    if !open.is_empty() {
+                        task_outcome = TaskOutcome::CompletedUnverified;
+                        log.append(
+                            None,
+                            EngineEvent::ReviewStage {
+                                required: true,
+                                action: "blocking_finding_open".to_string(),
+                                detail: open.join("; "),
+                            },
+                            observer,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
             verification: Some(report),

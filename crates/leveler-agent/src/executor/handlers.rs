@@ -192,11 +192,13 @@ impl Executor {
             run_started: std::time::Instant::now(),
         };
         // R013r: an unbounded reviewer burned the full 100-round turn ceiling
-        // reading a repo it was only asked to judge. Reading a diff is a
-        // bounded job; a reviewer that has not concluded by now returns what
-        // it has (INCOMPLETE_PARTIAL keeps its findings) instead of burning
-        // the parent's budget.
-        const REVIEWER_MAX_ROUNDS: u32 = 20;
+        // reading a repo it was only asked to judge. The bound now lives on
+        // the role's capability profile; a reviewer that has not concluded by
+        // then returns what it has (INCOMPLETE_PARTIAL keeps its findings)
+        // instead of burning the parent's budget.
+        let reviewer_rounds = crate::sub_agent::ChildProfile::resolve(AgentRole::Reviewer)
+            .max_rounds
+            .unwrap_or(0);
         let result = self
             .run_one_sub_agent_on(
                 id,
@@ -204,7 +206,7 @@ impl Executor {
                 files,
                 None,
                 Vec::new(),
-                REVIEWER_MAX_ROUNDS,
+                reviewer_rounds,
                 brief,
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 progress_tx,
@@ -222,6 +224,7 @@ impl Executor {
             ok: result.result.status.completed(),
             result: result.result,
             modified_files: result.modified_files,
+            findings: result.findings,
         }
     }
 
@@ -257,6 +260,7 @@ impl Executor {
                     ),
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
+                    findings: Vec::new(),
                 };
             }
         };
@@ -310,12 +314,23 @@ impl Executor {
         // Keep its last report so an interrupted run is partial, not empty.
         let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let said_obs = said.clone();
+        // Typed findings the child has reported so far. Captured from every
+        // ledger snapshot — not just a terminal one — so an interrupted child
+        // still hands over what it had established (the same principle as
+        // `said` above).
+        let findings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let findings_obs = findings.clone();
         let activity_id = id.clone();
         let activity_tx = progress.clone();
         let mut capture = move |event: AgentEvent| match &event {
             AgentEvent::ProgressUpdated { ledger } => {
                 if let Ok(mut guard) = partial_obs.lock() {
                     *guard = ledger.clone();
+                }
+            }
+            AgentEvent::EvidenceLedgerUpdated { ledger } => {
+                if let Ok(mut guard) = findings_obs.lock() {
+                    *guard = ledger.findings.clone();
                 }
             }
             AgentEvent::AssistantText(text) if !text.trim().is_empty() => {
@@ -367,6 +382,7 @@ impl Executor {
                 .await;
         }
         let said_before_stopping = || said.lock().map(|g| g.clone()).unwrap_or_default();
+        let reported_findings = findings.lock().map(|g| g.clone()).unwrap_or_default();
         match outcome {
             Ok(outcome) => {
                 let completed = matches!(
@@ -381,7 +397,7 @@ impl Executor {
                 // findings — R013r lost a voiced finding to exactly that. For
                 // interrupted runs, prefer what the child actually said; the
                 // stop reason is carried separately.
-                let findings = if completed {
+                let mut findings = if completed {
                     outcome.final_text
                 } else {
                     let said = said_before_stopping();
@@ -391,6 +407,15 @@ impl Executor {
                         said
                     }
                 };
+                // Typed findings ARE a result. An empty prose wrap-up must
+                // not be classified COMPLETED_NO_FINDINGS when the child
+                // already recorded structured findings.
+                if findings.trim().is_empty() && !reported_findings.is_empty() {
+                    findings = format!(
+                        "{} structured finding(s) reported.",
+                        reported_findings.len()
+                    );
+                }
                 let stop_reason = if completed {
                     String::new()
                 } else {
@@ -400,6 +425,7 @@ impl Executor {
                     result: ChildResult::new(completed, &findings, stop_reason),
                     progress: outcome.progress,
                     modified_files: outcome.modified_files,
+                    findings: reported_findings,
                 }
             }
             Err(AgentError::Cancelled) => {
@@ -415,6 +441,7 @@ impl Executor {
                     ),
                     progress: ledger,
                     modified_files: paths,
+                    findings: reported_findings,
                 }
             }
             Err(e) => {
@@ -424,6 +451,7 @@ impl Executor {
                     result: ChildResult::new(false, &said_before_stopping(), e.to_string()),
                     progress: ledger,
                     modified_files: paths,
+                    findings: reported_findings,
                 }
             }
         }
@@ -440,6 +468,9 @@ pub struct DelegatedChildResult {
     pub result: ChildResult,
     /// Files the child touched (a reviewer is read-only, so normally empty).
     pub modified_files: Vec<String>,
+    /// Typed findings the child reported (partial ones survive an abnormal
+    /// stop). Still keyed by the CHILD's ids — the consumer adopts them.
+    pub findings: Vec<leveler_lifecycle::FindingRecord>,
 }
 
 /// Spend + structured result from one sub-agent so the parent can roll up
@@ -449,6 +480,8 @@ pub(crate) struct SubAgentRunResult {
     pub result: ChildResult,
     pub progress: ProgressLedger,
     pub modified_files: Vec<String>,
+    /// Typed findings captured from the child's ledger snapshots.
+    pub findings: Vec<leveler_lifecycle::FindingRecord>,
 }
 
 /// Cap UI previews so concurrent sub-agent activity cannot flood the event bus.

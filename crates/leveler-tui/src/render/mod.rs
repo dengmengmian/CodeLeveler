@@ -961,6 +961,7 @@ mod tests {
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            finding_count: 0,
         });
         let text: String = item_render(
             &item,
@@ -994,6 +995,7 @@ mod tests {
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            finding_count: 0,
         });
         let text: String = item_render(
             &item,
@@ -1031,6 +1033,7 @@ mod tests {
             },
             recent_step: None,
             started_elapsed_secs: 0,
+            finding_count: 0,
         });
         let text = item_render(
             &item,
