@@ -150,6 +150,12 @@ pub(crate) struct DelegationDecisionPoint {
     offer_visible: bool,
     kept_recorded: bool,
     delegated_recorded: bool,
+    /// Rounds (not calls) in which at least one mutation succeeded. The
+    /// fallback offer waits for the SECOND such round: probe evidence (xsv ×2)
+    /// showed a lone prep edit (Cargo.toml) one round before `update_plan`
+    /// consuming the one-shot offer, so the plan-anchored per-step form never
+    /// fired on exactly the runs that needed it.
+    mutation_rounds_seen: u32,
     // Round-local facts, cleared by `end_round`.
     plan_open_steps: Vec<String>,
     mutated_this_round: bool,
@@ -164,6 +170,7 @@ impl DelegationDecisionPoint {
             offer_visible: already_offered,
             kept_recorded: false,
             delegated_recorded: false,
+            mutation_rounds_seen: 0,
             plan_open_steps: Vec::new(),
             mutated_this_round: false,
             worker_scope_this_round: None,
@@ -212,6 +219,9 @@ impl DelegationDecisionPoint {
             self.kept_recorded = true;
             actions.push(DelegationRoundAction::RecordKept);
         }
+        if self.mutated_this_round {
+            self.mutation_rounds_seen = self.mutation_rounds_seen.saturating_add(1);
+        }
         if !self.offered && !self.delegated_recorded {
             if self.plan_open_steps.len() >= 2 {
                 self.offered = true;
@@ -219,10 +229,13 @@ impl DelegationDecisionPoint {
                     trigger: "plan",
                     steps: std::mem::take(&mut self.plan_open_steps),
                 });
-            } else if self.mutated_this_round {
+            } else if self.mutation_rounds_seen >= 2 {
+                // Plan-less fallback, deliberately one mutating round late:
+                // a prep edit followed by update_plan next round still gets
+                // the plan-anchored per-step form instead of this generic one.
                 self.offered = true;
                 actions.push(DelegationRoundAction::Offer {
-                    trigger: "first_mutation",
+                    trigger: "mutation_fallback",
                     steps: Vec::new(),
                 });
             }
@@ -743,18 +756,42 @@ mod decision_point_tests {
     }
 
     #[test]
-    fn first_mutation_is_the_fallback_trigger_for_plan_less_runs() {
+    fn the_mutation_fallback_fires_on_the_second_mutating_round() {
         let mut dp = DelegationDecisionPoint::new(true, false);
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "one mutating round leaves room for a plan to land first"
+        );
         dp.note_mutation();
         assert_eq!(
             dp.end_round(),
             vec![DelegationRoundAction::Offer {
-                trigger: "first_mutation",
+                trigger: "mutation_fallback",
                 steps: Vec::new(),
             }]
         );
         dp.note_mutation();
         assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+    }
+
+    /// Iteration 3 (xsv probes ×2): a lone prep edit one round before
+    /// update_plan must NOT consume the one-shot offer — the plan-anchored
+    /// per-step form is the one that produces reviewable dispositions.
+    #[test]
+    fn a_prep_edit_then_a_plan_still_gets_the_per_step_form() {
+        let mut dp = DelegationDecisionPoint::new(true, false);
+        dp.note_mutation(); // Cargo.toml prep edit
+        assert!(dp.end_round().is_empty());
+        dp.note_plan_registered(&steps(&["frequency --json", "stats --json", "dedup"]));
+        let actions = dp.end_round();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [DelegationRoundAction::Offer { trigger: "plan", steps }] if steps.len() == 3
+            ),
+            "{actions:?}"
+        );
     }
 
     #[test]
@@ -763,10 +800,12 @@ mod decision_point_tests {
         dp.note_plan_registered(&steps(&["do it"]));
         assert!(dp.end_round().is_empty(), "one step is not a decomposition");
         dp.note_mutation();
+        dp.end_round();
+        dp.note_mutation();
         assert_eq!(
             dp.end_round(),
             vec![DelegationRoundAction::Offer {
-                trigger: "first_mutation",
+                trigger: "mutation_fallback",
                 steps: Vec::new(),
             }]
         );
@@ -793,6 +832,8 @@ mod decision_point_tests {
         let mut dp = DelegationDecisionPoint::new(true, false);
         dp.note_mutation();
         dp.end_round();
+        dp.note_mutation();
+        dp.end_round(); // second mutating round → offer
         dp.note_mutation();
         assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
         dp.note_worker_admitted(&["src/a.rs".into()]);

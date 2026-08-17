@@ -3970,8 +3970,9 @@ async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded()
 }
 
 /// Fallback trigger: a run that never registers a structured plan still gets
-/// exactly one decision point at its first mutation, and the next mutation
-/// records KEEP.
+/// exactly one decision point — at its SECOND mutating round (a lone prep
+/// edit leaves room for a plan to land first) — and a later mutation records
+/// KEEP.
 #[tokio::test]
 async fn first_mutation_is_the_fallback_decision_point_without_a_plan() {
     let dir = tmp("decision-mutation", 42);
@@ -3987,6 +3988,10 @@ async fn first_mutation_is_the_fallback_decision_point_without_a_plan() {
             ),
             assistant_with(
                 vec![patch_call("e2", "a.txt", "new", "newer")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("e3", "a.txt", "newer", "newest")],
                 FinishReason::ToolCalls,
             ),
             assistant_text("done"),
@@ -4023,7 +4028,7 @@ async fn first_mutation_is_the_fallback_decision_point_without_a_plan() {
     assert!(
         stages
             .iter()
-            .any(|(action, detail)| action == "offered" && detail == "first_mutation"),
+            .any(|(action, detail)| action == "offered" && detail == "mutation_fallback"),
         "{stages:?}"
     );
     assert_eq!(
