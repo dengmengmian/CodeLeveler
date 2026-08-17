@@ -346,6 +346,19 @@ impl EventBridge {
                     label: format!("gate refused {kind}: {detail}"),
                 });
             }
+            EngineEvent::ReviewStage {
+                required,
+                action,
+                detail,
+            } => {
+                // A required review's fate is user-relevant; the rest is audit
+                // trail only (durable, not surfaced).
+                if required {
+                    let _ = self.events.send(RuntimeEvent::AgentActivity {
+                        label: format!("review {action}: {detail}"),
+                    });
+                }
+            }
             EngineEvent::EvidenceLedgerUpdated { .. } => {
                 // Persisted by engine; no dedicated UI cell in v1.
             }

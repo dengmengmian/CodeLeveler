@@ -1882,3 +1882,231 @@ async fn pure_observation_windows_still_terminate() {
         "a goal that stopped making progress must not read as success"
     );
 }
+
+// ── R011-F2 / R013-F1: reviewer reach and observability ─────────────────────
+
+/// Collect persisted review_stage events for one session.
+async fn review_stage_rows(
+    db: &Database,
+    session: &leveler_core::SessionId,
+) -> Vec<(bool, String, String)> {
+    use leveler_storage::EventStore;
+    let store = leveler_storage::EngineStores::from_database(db);
+    let mut out = Vec::new();
+    for row in store.events.load(session).await.unwrap() {
+        if row.event_type == "review_stage"
+            && let Ok(leveler_engine::EngineEvent::ReviewStage {
+                required,
+                action,
+                detail,
+            }) = leveler_engine::EngineEvent::from_payload(&row.payload)
+        {
+            out.push((required, action, detail));
+        }
+    }
+    out
+}
+
+/// R011's accident: a security-shaped, wide diff whose goal dies at the round
+/// ceiling. The review that policy requires must still run before the terminal
+/// fact is written — a failed high-risk change needs eyes more, not less.
+#[tokio::test]
+async fn required_review_runs_even_when_the_goal_fails_at_the_ceiling() {
+    let h = harness(vec![
+        // Window 1 (the only one this spec allows): touch a security path,
+        // then keep "working" until the 2-round ceiling.
+        patch_add("c1", "src/auth.rs", "pub fn login() {}"),
+        read_call_named("c2", "src/auth.rs"),
+        // The reviewer child answers once launched.
+        text("reviewed the auth change: no blocking defect"),
+        text("reviewed the auth change: no blocking defect"),
+        text("unused"),
+    ])
+    .await;
+    let mut s = spec_windowed(&h, "harden the login path", 2);
+    // Pin the round budget so the ceiling is the GOAL terminal (no next window)
+    // — exactly R011's ending, minus the wait.
+    s.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(2);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !report.outcome.is_success(),
+        "the goal still fails — review must not launder a ceiling stop: {:?}",
+        report.outcome
+    );
+    let reviewers = seen
+        .iter()
+        .filter(|e| matches!(e, EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"))
+        .count();
+    assert_eq!(
+        reviewers, 1,
+        "a required review must run before the failed terminal is sealed"
+    );
+}
+
+/// R013's accident, made loud: when the review cannot even be launched, the
+/// failure must persist as a review_stage event — never a silent downgrade.
+struct FailingProfileRuntime {
+    inner: MockRuntime,
+    profile_calls: std::sync::atomic::AtomicUsize,
+    fail_from: usize,
+}
+
+#[async_trait]
+impl ModelRuntime for FailingProfileRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        self.inner.generate(request, cancellation).await
+    }
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.inner.stream(request, cancellation).await
+    }
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        let n = self
+            .profile_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n >= self.fail_from {
+            return Err(ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "profile store unavailable (injected)",
+            ));
+        }
+        self.inner.profile(model).await
+    }
+}
+
+#[tokio::test]
+async fn unlaunchable_review_leaves_a_persisted_trace() {
+    // Same shape as the passing security review, but the reviewer's executor
+    // cannot be built: the SECOND profile fetch (run_review's factory.build)
+    // fails while the main turn's succeeds.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let tool_context = ToolContext::with_environment(
+        workspace,
+        PermissionProfile::Assisted,
+        Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )),
+    );
+    let runtime = Arc::new(FailingProfileRuntime {
+        inner: MockRuntime::new(vec![
+            tool_call(
+                "c1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+                }),
+            ),
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "login added"}),
+            ),
+        ]),
+        profile_calls: std::sync::atomic::AtomicUsize::new(0),
+        fail_from: 1,
+    });
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = TaskEngine {
+        stores: leveler_storage::EngineStores::from_database(&db),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        factory: ExecutorFactory {
+            runtime,
+            registry: Arc::new(default_registry()),
+            tool_context,
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: None,
+            work_profile: leveler_agent::WorkProfile::Balanced,
+            memory_index: String::new(),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            grants_state_dir: None,
+            steering: None,
+            allow_delegation: true,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+        supervisor: None,
+    };
+    let s = TaskSpec {
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: "add a login entry point".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+            limits: leveler_agent::StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: dir.path().to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: gate("ok", "true"),
+            base_commit: None,
+        },
+    };
+    let session = engine.create_task(&s).await.unwrap();
+    let report = engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::CompletedUnverified,
+        "an unlaunchable required review still refuses Verified"
+    );
+    let stages = review_stage_rows(&db, &session).await;
+    assert!(
+        stages.iter().any(|(req, action, detail)| *req
+            && action == "launch_failed"
+            && detail.contains("profile store unavailable")),
+        "the launch failure must be persisted with its cause — silence was the \
+         R013 defect; got {stages:?}"
+    );
+}
+
+/// The cheap half of observability: even a change that needs no review leaves
+/// an eligibility record, so \"no reviewer\" is always explainable.
+#[tokio::test]
+async fn not_required_review_is_still_recorded() {
+    let h = harness(patch_then_resolve()).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let _ = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    let stages = review_stage_rows(&h.db, &session).await;
+    assert!(
+        stages
+            .iter()
+            .any(|(req, action, _)| !req && action == "not_required"),
+        "eligibility must be evaluated and persisted even when review is not \
+         required; got {stages:?}"
+    );
+}

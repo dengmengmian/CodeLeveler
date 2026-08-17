@@ -1462,6 +1462,94 @@ impl TaskEngine {
 
     /// Shared tail of fresh and resumed direct runs: map the stop reason,
     /// then verify + bounded repair.
+    /// Evaluate and (when required) run the independent review at the CLOSURE
+    /// boundary — once per task, for every conclude_direct exit that follows a
+    /// real product mutation. R011-F2: binding this to the Verified label meant
+    /// a failed wide-diff goal — where a reviewer pays most — could never get
+    /// one. R013-F1: a launch failure was swallowed into an unexplained
+    /// downgrade; every branch here persists a `review_stage` event first.
+    ///
+    /// The review result never upgrades or downgrades a non-Verified outcome;
+    /// only the Verified label depends on it (a required review that did not
+    /// complete keeps refusing Verified, exactly as before).
+    async fn closure_review_stage(
+        &self,
+        log: &EventLog<'_>,
+        runner: &TurnRunner<'_>,
+        spec: &TaskSpec,
+        outcome: &leveler_agent::AgentOutcome,
+        observer: &mut dyn FnMut(EngineEvent),
+        cancellation: &CancellationToken,
+    ) -> Result<ClosureReview, EngineError> {
+        let stage = |required: bool, action: &str, detail: String| EngineEvent::ReviewStage {
+            required,
+            action: action.to_string(),
+            detail,
+        };
+        if outcome.modified_files.is_empty() {
+            log.append(
+                None,
+                stage(false, "not_required", "no product mutation".to_string()),
+                observer,
+            )
+            .await?;
+            return Ok(ClosureReview::NotRequired);
+        }
+        let trigger = crate::policy_resolver::ReviewTrigger::from_modified_paths(
+            &outcome.modified_files,
+            false,
+        );
+        let reason = review_reason(&trigger);
+        if !trigger.review_required() {
+            log.append(None, stage(false, "not_required", reason), observer)
+                .await?;
+            return Ok(ClosureReview::NotRequired);
+        }
+        if crate::turn::session_had_review(runner.stores.events.as_ref(), &runner.session_id)
+            .await
+            .unwrap_or(false)
+        {
+            log.append(None, stage(true, "already_reviewed", reason), observer)
+                .await?;
+            return Ok(ClosureReview::AlreadyReviewed);
+        }
+        // Persist the attempt BEFORE it runs, so even a crash mid-launch
+        // leaves a breadcrumb instead of silence.
+        log.append(None, stage(true, "launching", reason.clone()), observer)
+            .await?;
+        match runner
+            .run_review(
+                goal_profile(spec),
+                review_brief(&spec.runtime.goal, &outcome.modified_files),
+                outcome.modified_files.clone(),
+                observer,
+                cancellation.clone(),
+            )
+            .await
+        {
+            Ok(true) => {
+                log.append(None, stage(true, "finished_ok", reason), observer)
+                    .await?;
+                Ok(ClosureReview::Completed)
+            }
+            Ok(false) => {
+                log.append(None, stage(true, "finished_incomplete", reason), observer)
+                    .await?;
+                Ok(ClosureReview::Incomplete)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "required review could not be launched");
+                log.append(
+                    None,
+                    stage(true, "launch_failed", format!("{reason}: {error}")),
+                    observer,
+                )
+                .await?;
+                Ok(ClosureReview::LaunchFailed)
+            }
+        }
+    }
+
     async fn conclude_direct(
         &self,
         log: &EventLog<'_>,
@@ -1485,6 +1573,12 @@ impl TaskEngine {
             let incomplete_with_work =
                 outcome.stop_reason == StopReason::Incomplete && !outcome.modified_files.is_empty();
             if !incomplete_with_work {
+                // R011-F2: a failed high-risk change needs the required review
+                // MORE, not less. The result is recorded for the user; the
+                // failed outcome itself never changes.
+                let _ = self
+                    .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
+                    .await?;
                 return Ok(report_from_agent_outcome(outcome, terminal));
             }
         }
@@ -1492,6 +1586,9 @@ impl TaskEngine {
         // K19 early short-circuit: no mutation or no gates → never claim Verified
         // (pure Q&A over a green repo must stay CompletedUnverified).
         if outcome.modified_files.is_empty() || !spec.coding.verification.has_gates() {
+            let _ = self
+                .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
+                .await?;
             return Ok(report_from_agent_outcome(
                 outcome,
                 TaskOutcome::CompletedUnverified,
@@ -1603,39 +1700,15 @@ impl TaskEngine {
         {
             task_outcome = TaskOutcome::CompletedUnverified;
         }
-        // R007b N7: an independent review that policy says is warranted, and
-        // that never happened, is missing evidence — not a detail. R008 and
-        // R009 both carried REQUIRED_REVIEWER and ignored it because the
-        // product had never heard of the designation. A change shaped like one
-        // that needs review can no longer close as verified without one.
-        if task_outcome == TaskOutcome::Verified
-            && crate::policy_resolver::ReviewTrigger::from_modified_paths(
-                &outcome.modified_files,
-                false,
-            )
-            .review_required()
-            && !crate::turn::session_had_review(runner.stores.events.as_ref(), &runner.session_id)
-                .await
-                .unwrap_or(false)
-        {
-            // The designation only means something if the runtime can act on
-            // it, so the harness launches the review itself rather than hoping
-            // the model delegates. Downgrade only when the review could not be
-            // obtained — an absent review is missing evidence either way, but a
-            // review that ran is the evidence the policy asked for.
-            let reviewed = runner
-                .run_review(
-                    goal_profile(spec),
-                    review_brief(&spec.runtime.goal, &outcome.modified_files),
-                    outcome.modified_files.clone(),
-                    observer,
-                    cancellation.clone(),
-                )
-                .await
-                .unwrap_or(false);
-            if !reviewed {
-                task_outcome = TaskOutcome::CompletedUnverified;
-            }
+        // R007b N7 / R013-F1: the closure-boundary review, staged with durable
+        // eligibility/launch/terminal events so an absent reviewer is always
+        // explainable. A required review that did not complete keeps refusing
+        // Verified, exactly as before — but never silently.
+        let review = self
+            .closure_review_stage(log, runner, spec, &outcome, observer, &cancellation)
+            .await?;
+        if task_outcome == TaskOutcome::Verified && !review.satisfies_required() {
+            task_outcome = TaskOutcome::CompletedUnverified;
         }
         let base = report_from_agent_outcome(outcome, task_outcome);
         Ok(TaskReport {
@@ -1732,6 +1805,39 @@ fn verification_is_repairable(report: &VerificationReport) -> bool {
 
 /// Compose the repair goal from the failed report (engine-local equivalent of
 /// the app layer's compose_repair_goal).
+/// How the closure-boundary review ended, for the Verified label decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosureReview {
+    NotRequired,
+    AlreadyReviewed,
+    Completed,
+    Incomplete,
+    LaunchFailed,
+}
+
+impl ClosureReview {
+    /// Whether this result satisfies a required-review obligation.
+    fn satisfies_required(self) -> bool {
+        matches!(
+            self,
+            ClosureReview::NotRequired | ClosureReview::AlreadyReviewed | ClosureReview::Completed
+        )
+    }
+}
+
+/// One sentence naming why policy required (or did not require) a review.
+fn review_reason(trigger: &crate::policy_resolver::ReviewTrigger) -> String {
+    let mut parts = Vec::new();
+    if trigger.security_relevant {
+        parts.push("security-sensitive path".to_string());
+    }
+    if trigger.concurrency_relevant {
+        parts.push("concurrency-sensitive path".to_string());
+    }
+    parts.push(format!("{} modified file(s)", trigger.modified_files));
+    parts.join(", ")
+}
+
 /// The brief handed to a harness-launched reviewer.
 ///
 /// It names the task and the files that changed and nothing else: the reviewer

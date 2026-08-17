@@ -275,6 +275,20 @@ pub enum EngineEvent {
         kind: String,
         detail: String,
     },
+    /// The closure-boundary review decision (R013-F1): why a required review
+    /// ran, was skipped, or could not be launched. Persisted so "no reviewer"
+    /// is always explainable from durable history — the silent-swallow failure
+    /// mode this replaces left a downgraded task with zero trace.
+    ///
+    /// `action`: `not_required` | `already_reviewed` | `launching` |
+    /// `launch_failed` | `finished_ok` | `finished_incomplete`.
+    /// `detail` carries the policy reason or the launch error — never file
+    /// contents or secrets.
+    ReviewStage {
+        required: bool,
+        action: String,
+        detail: String,
+    },
     /// Delivery process-evidence ledger snapshot (SoT for resume seed).
     EvidenceLedgerUpdated {
         ledger: leveler_lifecycle::EvidenceLedger,
@@ -547,6 +561,7 @@ impl EngineEvent {
             | EngineEvent::RunFinished { .. }
             | EngineEvent::PlanUpdated { .. }
             | EngineEvent::GoalIntercepted { .. }
+            | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
             | EngineEvent::VerificationCheck { .. }
             | EngineEvent::RequirementReady { .. }
@@ -684,6 +699,7 @@ impl EngineEvent {
             | EngineEvent::RunFinished { .. }
             | EngineEvent::PlanUpdated { .. }
             | EngineEvent::GoalIntercepted { .. }
+            | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
             | EngineEvent::VerificationCheck { .. }
             | EngineEvent::RequirementReady { .. }
