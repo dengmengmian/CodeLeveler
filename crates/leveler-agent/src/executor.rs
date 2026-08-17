@@ -1418,7 +1418,11 @@ impl Executor {
             AgentRole::Explorer => prompt.push_str(
                 "\n\nYou are an EXPLORER sub-agent: investigate and report back. You have \
                  read-only tools and CANNOT modify files or run commands. Answer the task \
-                 precisely, citing the specific files/symbols you inspected; do not speculate.",
+                 precisely, citing the specific files/symbols you inspected; do not speculate. \
+                 Call report_finding the moment you confirm each concrete discovery \
+                 (relevant file/symbol, dependency, callsite, risk…) — findings reported \
+                 early survive even if your run is cut short; prose written only at the \
+                 end does not.",
             ),
             AgentRole::Worker => {
                 prompt.push_str(
@@ -1438,9 +1442,11 @@ impl Executor {
                  described in your task; your job is to judge it independently, not to redo or \
                  extend it. You have read-only tools and CANNOT modify files. Read the changed \
                  files and the code they touch, then report concrete defects — correctness, \
-                 security, concurrency, and error paths first — each naming the file and the \
-                 specific problem. If you find nothing blocking, say so plainly; do not invent \
-                 findings to look thorough.",
+                 security, concurrency, and error paths first. Report EACH defect with one \
+                 report_finding call as you confirm it (kind=correctness/risk, naming the \
+                 file), setting blocking=true only for a defect that must be fixed before \
+                 the change can ship. If you find nothing blocking, say so plainly; do not \
+                 invent findings to look thorough.",
             ),
             AgentRole::Default => {}
         }

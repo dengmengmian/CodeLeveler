@@ -6,9 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{load_scoped_rules, render_instructions};
 use leveler_lifecycle::{
-    ChangeImpact, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, GateConfig,
-    ObjectiveAnchor, PlanState, ProgressCaps, TaskContract, TurnPhase, check, is_build_relevant,
-    task_looks_like_implementation,
+    ChangeImpact, CompleteStepReceipt, DepthUseMetrics, EvidenceLedger, FindingKind, FindingState,
+    GateConfig, ObjectiveAnchor, PlanState, ProgressCaps, TaskContract, TurnPhase, check,
+    is_build_relevant, task_looks_like_implementation,
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelRequest, Role, ToolCall, ToolChoice,
@@ -39,9 +39,11 @@ use crate::authorization::{
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
-    COMPLETE_STEP_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL,
+    COMPLETE_STEP_TOOL, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL,
+    SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL,
     apply_turn_grants, ask_user_tool_definition, complete_step_tool_definition, is_user_input_tool,
-    request_permissions_tool_definition, request_user_input_tool_definition,
+    report_finding_tool_definition, request_permissions_tool_definition,
+    request_user_input_tool_definition, resolve_finding_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
 use crate::nudges::{first_user_text, goal_resolve_nudge};
@@ -82,6 +84,14 @@ impl Executor {
         // can also hide spawn_agent entirely.
         if self.policy.allow_delegation && self.depth < MAX_SUB_AGENT_DEPTH {
             tools.push(spawn_agent_tool_definition());
+        }
+        // Children report typed findings; the parent judges adopted ones.
+        // The parent also gets resolve_finding with delegation off when a
+        // seeded ledger already carries findings (a harness reviewer ran).
+        if self.depth > 0 {
+            tools.push(report_finding_tool_definition());
+        } else if self.policy.allow_delegation || !self.seeded_ledger.findings.is_empty() {
+            tools.push(resolve_finding_tool_definition());
         }
         // Goal mode: the model resolves the objective explicitly.
         if self.policy.goal_mode {
@@ -1036,6 +1046,157 @@ impl Executor {
                     continue;
                 }
 
+                // A child reports one typed finding: validated at the tool
+                // boundary, recorded in ITS ledger (the parent adopts on
+                // join), persisted through the same EvidenceLedgerUpdated
+                // events as every other ledger change.
+                if call.name == REPORT_FINDING_TOOL && self.depth > 0 {
+                    observer(AgentEvent::ToolCall {
+                        id: call.id.as_str().to_string(),
+                        name: REPORT_FINDING_TOOL.to_string(),
+                        arguments: compact_json(&call.arguments),
+                        parallel: false,
+                    });
+                    let kind = call
+                        .arguments
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .and_then(FindingKind::parse);
+                    let summary = call
+                        .arguments
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    let (ok, msg) = match kind {
+                        None => (
+                            false,
+                            "report_finding requires a `kind` from the documented list."
+                                .to_string(),
+                        ),
+                        Some(_) if summary.is_empty() => (
+                            false,
+                            "report_finding requires a non-empty `summary`.".to_string(),
+                        ),
+                        Some(kind) => {
+                            let field = |name: &str| {
+                                call.arguments
+                                    .get(name)
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from)
+                            };
+                            // Only a reviewer's blocking flag is honoured, so
+                            // an explorer observation can never gate closure.
+                            let blocking = call
+                                .arguments
+                                .get("blocking")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                                && ChildProfile::resolve(self.agent_role).may_report_blocking;
+                            let id = ledger.record_finding(
+                                kind,
+                                summary,
+                                field("file"),
+                                field("symbol"),
+                                blocking,
+                            );
+                            observer(AgentEvent::EvidenceLedgerUpdated {
+                                ledger: ledger.clone(),
+                            });
+                            (true, format!("Finding {id} recorded."))
+                        }
+                    };
+                    observer(AgentEvent::ToolResult {
+                        id: call.id.as_str().to_string(),
+                        name: REPORT_FINDING_TOOL.to_string(),
+                        is_error: !ok,
+                        preview: preview(&msg),
+                    });
+                    results[index] = Some(ContentPart::ToolResult {
+                        result: ToolResultContent {
+                            call_id: call.id,
+                            content: msg,
+                            is_error: !ok,
+                        },
+                    });
+                    continue;
+                }
+
+                // The parent judges an adopted finding through the audited
+                // lifecycle. The ledger enforces legality (reject needs a
+                // reason; verified is host-promotion only).
+                if call.name == RESOLVE_FINDING_TOOL && self.depth == 0 {
+                    observer(AgentEvent::ToolCall {
+                        id: call.id.as_str().to_string(),
+                        name: RESOLVE_FINDING_TOOL.to_string(),
+                        arguments: compact_json(&call.arguments),
+                        parallel: false,
+                    });
+                    let id_arg = call
+                        .arguments
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    let resolution = call
+                        .arguments
+                        .get("resolution")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let reason = call.arguments.get("reason").and_then(|v| v.as_str());
+                    let target = match resolution {
+                        "accepted" => Some(FindingState::Accepted),
+                        "rejected" => Some(FindingState::Rejected),
+                        "addressed" => Some(FindingState::Addressed),
+                        _ => None,
+                    };
+                    let (ok, msg) = match target {
+                        None => (
+                            false,
+                            "resolve_finding requires `resolution` of accepted, rejected \
+                             or addressed."
+                                .to_string(),
+                        ),
+                        Some(target) => {
+                            let fresh = ledger.has_fresh_successful_verify();
+                            match ledger.resolve_finding(&id_arg, target, reason, fresh) {
+                                Ok(final_state) => {
+                                    observer(AgentEvent::EvidenceLedgerUpdated {
+                                        ledger: ledger.clone(),
+                                    });
+                                    (
+                                        true,
+                                        format!(
+                                            "Finding {id_arg} is now {}.",
+                                            final_state.label()
+                                        ),
+                                    )
+                                }
+                                Err(e) => (false, format!("resolve_finding refused: {e}")),
+                            }
+                        }
+                    };
+                    observer(AgentEvent::ToolResult {
+                        id: call.id.as_str().to_string(),
+                        name: RESOLVE_FINDING_TOOL.to_string(),
+                        is_error: !ok,
+                        preview: preview(&msg),
+                    });
+                    results[index] = Some(ContentPart::ToolResult {
+                        result: ToolResultContent {
+                            call_id: call.id,
+                            content: msg,
+                            is_error: !ok,
+                        },
+                    });
+                    continue;
+                }
+
                 // Goal mode: the model explicitly resolves the objective. Record
                 // the resolution; the run ends after this round's results are
                 // committed (so the transcript stays well-formed).
@@ -1081,6 +1242,50 @@ impl Executor {
                     };
                     // S2/S4 Gate: todos + (Delivery) EvidenceLedger.
                     if reason == StopReason::Completed {
+                        // Blocking-finding truth: an open blocking finding
+                        // (not rejected, not verified) refuses completion.
+                        // Fresh verification first promotes addressed ones,
+                        // so a fixed-and-proven finding never blocks.
+                        ledger.promote_addressed_findings(ledger.has_fresh_successful_verify());
+                        let open: Vec<String> = ledger
+                            .open_blocking_findings()
+                            .iter()
+                            .map(|f| format!("{} ({}: {})", f.id, f.state.label(), f.summary))
+                            .collect();
+                        if !open.is_empty() {
+                            let detail = format!(
+                                "open blocking finding(s): {}",
+                                open.join("; ")
+                            );
+                            ledger.record_intercept("blocking_finding", detail.clone());
+                            observer(AgentEvent::GoalIntercepted {
+                                kind: "blocking_finding".into(),
+                                detail: detail.clone(),
+                            });
+                            observer(AgentEvent::EvidenceLedgerUpdated {
+                                ledger: ledger.clone(),
+                            });
+                            let feedback = format!(
+                                "update_goal(complete) refused: {detail}. Each blocking \
+                                 finding must be resolved first — fix it and call \
+                                 resolve_finding(addressed) with fresh verification, or \
+                                 resolve_finding(rejected) with a reason."
+                            );
+                            observer(AgentEvent::ToolResult {
+                                id: call.id.as_str().to_string(),
+                                name: UPDATE_GOAL_TOOL.to_string(),
+                                is_error: true,
+                                preview: preview(&feedback),
+                            });
+                            results[index] = Some(ContentPart::ToolResult {
+                                result: ToolResultContent {
+                                    call_id: call.id,
+                                    content: feedback,
+                                    is_error: true,
+                                },
+                            });
+                            continue;
+                        }
                         let gate = GateConfig {
                             goal_todo_gate: self.policy.goal_todo_gate,
                             todo_override_allowed: true,
@@ -1983,7 +2188,7 @@ impl Executor {
                                 parent_wall,
                             )
                             .await;
-                        (index, call_id, id, nickname, result)
+                        (index, call_id, id, nickname, role, result)
                     });
                 }
                 drop(progress_tx);
@@ -1992,9 +2197,9 @@ impl Executor {
                     tokio::select! {
                         biased;
                         Some(progress_ev) = progress_rx.recv() => observer(progress_ev),
-                        Some((index, call_id, id, nickname, result)) = futs.next() => {
+                        Some((index, call_id, id, nickname, role, result)) = futs.next() => {
                             observer(AgentEvent::SubAgentFinished {
-                                id,
+                                id: id.clone(),
                                 nickname: nickname.clone(),
                                 ok: result.result.status.completed(),
                                 summary: preview(&result.result.for_parent(&nickname)),
@@ -2010,11 +2215,33 @@ impl Executor {
                                     modified_files.push(path);
                                 }
                             }
+                            // Adopt the child's typed findings into the parent
+                            // ledger at Acknowledged (receipt is not judgment)
+                            // and persist the snapshot. The parent-facing text
+                            // names the adopted ids so the model can judge
+                            // them with resolve_finding.
+                            let adopted: Vec<String> = result
+                                .findings
+                                .iter()
+                                .map(|f| ledger.adopt_finding(&id, role.label(), f))
+                                .collect();
+                            if !adopted.is_empty() {
+                                observer(AgentEvent::EvidenceLedgerUpdated {
+                                    ledger: ledger.clone(),
+                                });
+                            }
                             // N1: the status line leads, so the parent can tell
                             // "finished, nothing to flag" from "stopped before it
                             // found anything" — opposite instructions that a bare
                             // report text cannot carry.
-                            let content = result.result.for_parent(&nickname);
+                            let mut content = result.result.for_parent(&nickname);
+                            if !adopted.is_empty() {
+                                content.push_str(&format!(
+                                    "\n\nStructured findings adopted: {} — judge each \
+                                     with resolve_finding.",
+                                    adopted.join(", ")
+                                ));
+                            }
                             results[index] = Some(ContentPart::ToolResult {
                                 result: ToolResultContent {
                                     call_id,
