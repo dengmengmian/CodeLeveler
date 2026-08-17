@@ -48,7 +48,7 @@ use crate::injected_tools::{
 use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, multi_agent_steer_hint,
-    scopes_overlap, task_suggests_delegation,
+    scopes_overlap, should_inject_delegation_hint,
 };
 
 struct CancelOnDrop(CancellationToken);
@@ -139,11 +139,10 @@ impl Executor {
         {
             messages.push(Message::text(Role::User, contract_injection));
         }
-        // Product steer: when delegation is on and the task looks multi-part /
-        // parallel, remind the model once that concurrent spawn_agent is OK.
-        if self.policy.allow_delegation
-            && self.depth == 0
-            && task_suggests_delegation(&original_task)
+        // Product steer: top-level runs see keep-vs-delegate once. Parallel
+        // keywords are not required — ordinary implementation goals must still
+        // evaluate bounded Worker work.
+        if should_inject_delegation_hint(self.policy.allow_delegation, self.depth)
             && !messages.iter().any(|m| {
                 m.role == Role::User && m.text_content().contains("## Multi-agent delegation")
             })

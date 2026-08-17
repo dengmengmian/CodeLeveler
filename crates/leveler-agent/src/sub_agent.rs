@@ -80,15 +80,30 @@ pub fn task_suggests_delegation(task: &str) -> bool {
     false
 }
 
-/// One-shot user injection when [`task_suggests_delegation`] is true.
+/// Whether the top-level executor should inject the keep-vs-delegate planning
+/// hint. Keyword heuristics (`task_suggests_delegation`) do **not** gate this:
+/// ordinary implementation goals must still see the policy. Children (`depth > 0`)
+/// never get it.
+pub fn should_inject_delegation_hint(allow_delegation: bool, depth: u32) -> bool {
+    allow_delegation && depth == 0
+}
+
+/// One-shot user injection when [`should_inject_delegation_hint`] is true.
 pub fn multi_agent_steer_hint() -> String {
     "## Multi-agent delegation\n\
-     This request looks multi-part or parallel. Prefer emitting several \
-     `spawn_agent` calls **in the same assistant turn** so they run concurrently \
-     (explorer for investigation, worker + disjoint `files` for edits). Put a \
-     complete self-contained `task` in each spawn — children do not see parent \
-     tool history. After children return, synthesize one answer yourself; do not \
-     re-run the same investigation. Do not spawn for trivial single-step work.\n\
+     Before substantial implementation, decide whether any bounded subtask \
+     should leave this trajectory. Prefer `spawn_agent` with role='worker' when \
+     the subtask has a clear file/module/symbol scope, can be independently \
+     verified, needs little shared mutable context, can produce a concrete \
+     implementation, and would reduce main-trajectory context or latency. A \
+     worker performs scoped writes inside `files` and can run targeted tests; \
+     put a complete self-contained `task` in the spawn — children do not see \
+     parent tool history. After a child returns, inspect and integrate; do not \
+     silently redo the same writes.\n\
+     Keep work on the main trajectory when delegation would introduce more \
+     coordination cost than value, or the step is a single trivial edit. If \
+     several subtasks are independent, emit several `spawn_agent` calls in one \
+     turn. Do not spawn for its own sake.\n\
      Long work stays in this direct tool loop: keep calling tools / spawn_agent \
      until the goal is proven; do not stop early with a plan-only summary."
         .to_string()
@@ -465,6 +480,33 @@ mod tests {
         assert!(h.contains("## Multi-agent delegation"));
         assert!(h.contains("spawn_agent"));
         assert!(h.contains("direct tool loop"));
+    }
+
+    #[test]
+    fn steer_hint_is_keep_vs_delegate_not_always_spawn() {
+        let h = multi_agent_steer_hint();
+        let lower = h.to_ascii_lowercase();
+        assert!(lower.contains("bounded"));
+        assert!(lower.contains("independently verif") || lower.contains("independent verif"));
+        assert!(lower.contains("scoped") && (lower.contains("write") || lower.contains("edit")));
+        assert!(lower.contains("coordination") || lower.contains("keep work on the main"));
+        assert!(!lower.contains("always spawn"));
+        assert!(!lower.contains("must spawn"));
+    }
+
+    #[test]
+    fn keep_vs_delegate_hint_is_offered_on_ordinary_implementation_goals() {
+        assert!(should_inject_delegation_hint(true, 0));
+        assert!(!should_inject_delegation_hint(true, 1));
+        assert!(!should_inject_delegation_hint(false, 0));
+        // A real GitHub-issue goal without parallel/spawn words still gets the hint.
+        let goal = "Add `--export-toml FILE`. When that flag is passed, write \
+                    the timing summary as TOML. Existing export flags must keep working.";
+        assert!(
+            !task_suggests_delegation(goal),
+            "ordinary implementation goals must stay unsteered by the keyword heuristic"
+        );
+        assert!(should_inject_delegation_hint(true, 0));
     }
 
     #[test]

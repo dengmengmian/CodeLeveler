@@ -43,4 +43,6 @@ pub use leveler_lifecycle::{
     ProgressLedger, TaskContract, TurnPhase, WorkProfile, check, task_looks_like_implementation,
 };
 pub use sub_agent::{ChildResult, ChildStatus};
-pub use sub_agent::{multi_agent_steer_hint, task_suggests_delegation};
+pub use sub_agent::{
+    multi_agent_steer_hint, should_inject_delegation_hint, task_suggests_delegation,
+};
