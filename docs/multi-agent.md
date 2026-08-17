@@ -4,12 +4,10 @@ CodeLeveler can run several focused **sub-agents** in parallel for independent
 investigation or disjoint edits. The parent agent keeps the conversation and
 synthesizes child results. Sub-agents do not talk to each other (star topology).
 
-> Future evolution is intentionally evidence-gated. The current `spawn_agent`
-> surface is the shipped behavior; structured child results, capability profiles,
-> provider seams and continuable children are **not** implied by this document.
-> See [`HARNESS_EVOLUTION_PLAN.md`](HARNESS_EVOLUTION_PLAN.md) for the Batch #1 ->
-> Spawn Utility -> Spawn Reliability -> SubAgent Capability roadmap and the
-> explicit DeepSeek Harness adoption/rejection decisions.
+> Structured child results, role profiles, and a durable findings lifecycle
+> are now shipped on top of the existing `spawn_agent` primitive. Provider
+> seams and continuable children are still **not** implied. See
+> [`MULTI_AGENT_PRODUCT_DESIGN.md`](MULTI_AGENT_PRODUCT_DESIGN.md).
 
 ## When it runs
 
@@ -29,11 +27,15 @@ tasks should stay on the parent.
 
 | `role` | Behavior |
 | --- | --- |
-| `explorer` | Read-only toolset (cannot edit the workspace). |
-| `worker` | May write; must pass exclusive `files` it owns. |
+| `explorer` | Read-only investigation. Reports typed findings. Cannot edit. |
+| `worker` | Writes inside exclusive `files`. Incomplete work becomes a blocking finding. |
 | `default` | Full tools (when unspecified). |
+| Reviewer | Harness-launched, not a `spawn_agent` role. Read-only, 20-round bound. |
 
-Assign **disjoint** `files` to parallel workers so they never edit the same path.
+Assign **disjoint** `files` to parallel workers. Overlapping scopes in the same
+turn are refused. Children report via `report_finding`; the parent judges via
+`resolve_finding`. A blocking finding that is not rejected or verified refuses
+a `Verified` closeout.
 
 ## Hard limits
 
@@ -74,7 +76,8 @@ must allow), `spawn_agent` is **not** advertised in the tool list.
 
 Concurrent children appear as a **sub-agent tree**. While running, each child
 shows its latest real tool/step from the runtime (e.g. `list_files`), not
-invented stats. Token totals still come from `SubAgentProgress` when reported.
+invented stats. A finished child also shows how many typed findings were
+adopted. Token totals still come from `SubAgentProgress` when reported.
 
 ## Browser UI
 

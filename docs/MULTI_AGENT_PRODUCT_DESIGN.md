@@ -32,15 +32,15 @@ discovery/defect as it is confirmed (which also gives every abnormal stop real p
 
 ## C. Flow to the parent
 
-`ChildResult.structured: Vec<FindingRecord>` — captured from the child's ledger by the existing
-capture closure (same seam as partial progress). On join, the parent host adopts them into ITS
-ledger at `Acknowledged` (automatic, deterministic — receipt is not judgment).
+Typed records travel on `SubAgentRunResult` / `DelegatedChildResult` (the existing child-join
+structs). `ChildResult` keeps the N1 prose status line. On join, the parent adopts the typed
+records into ITS ledger at `Acknowledged` (automatic, deterministic — receipt is not judgment).
 
 ## D. Parent judgment
 
 Parent-side injected tool **`resolve_finding { id, resolution: accepted|rejected|addressed,
-reason? }`** (offered only while open findings exist). Reject requires a reason. All transitions
-durable through the same ledger events.
+reason? }`**. Reject requires a reason. All transitions durable through the same ledger events.
+An incomplete Worker also produces a host blocking finding the parent must settle.
 
 ## E. Closure truth
 
