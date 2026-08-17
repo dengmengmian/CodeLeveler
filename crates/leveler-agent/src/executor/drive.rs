@@ -1753,11 +1753,12 @@ impl Executor {
                                 structured_plan_started = true;
                                 metrics.plan_updated += 1;
                                 delegation_decision.note_plan_registered(
-                                    plan_state
+                                    &plan_state
                                         .steps
                                         .iter()
                                         .filter(|s| s.status != "completed")
-                                        .count(),
+                                        .map(|s| s.step.clone())
+                                        .collect::<Vec<_>>(),
                                 );
                                 observer(AgentEvent::PlanUpdated {
                                     steps: plan_state.steps.clone(),
@@ -2376,7 +2377,7 @@ impl Executor {
                             detail: String::new(),
                         });
                     }
-                    DelegationRoundAction::Offer(trigger) => {
+                    DelegationRoundAction::Offer { trigger, steps } => {
                         progress.delegation_decision_offered = true;
                         observer(AgentEvent::DelegationStage {
                             action: "offered".to_string(),
@@ -2385,7 +2386,10 @@ impl Executor {
                         observer(AgentEvent::ProgressUpdated {
                             ledger: progress.clone(),
                         });
-                        messages.push(Message::text(Role::User, delegation_decision_request()));
+                        messages.push(Message::text(
+                            Role::User,
+                            delegation_decision_request(&steps),
+                        ));
                     }
                 }
             }

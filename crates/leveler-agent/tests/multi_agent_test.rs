@@ -3957,6 +3957,15 @@ async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded()
         1,
         "the offer is injected once and never repeated"
     );
+    let offer_text = last
+        .iter()
+        .find(|m| m.role == Role::User && m.text_content().contains("## Delegation disposition"))
+        .unwrap()
+        .text_content();
+    assert!(
+        offer_text.contains("1. edit the file") && offer_text.contains("2. verify"),
+        "the plan-triggered offer enumerates the model's own open steps: {offer_text}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
