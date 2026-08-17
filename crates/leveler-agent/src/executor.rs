@@ -1428,7 +1428,9 @@ impl Executor {
                 prompt.push_str(
                     "\n\nYou are a WORKER sub-agent implementing a bounded change. Other agents \
                      may be editing the same workspace in parallel, so stay strictly within \
-                     your assigned files and do not touch anything else.",
+                     your assigned files and do not touch anything else. Call report_finding \
+                     for each concrete note (risk, test, observation) you want the parent \
+                     to judge; do not bury them only in the final prose.",
                 );
                 if let Some(files) = &self.write_allowlist {
                     prompt.push_str(&format!(

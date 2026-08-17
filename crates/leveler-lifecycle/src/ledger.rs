@@ -199,12 +199,7 @@ impl EvidenceLedger {
     /// Adopt a child's finding into this (parent) ledger. Adoption re-keys the
     /// id and lands the record at `Acknowledged` — receipt is not judgment.
     /// Returns the parent-side id.
-    pub fn adopt_finding(
-        &mut self,
-        source_child: &str,
-        role: &str,
-        rec: &FindingRecord,
-    ) -> String {
+    pub fn adopt_finding(&mut self, source_child: &str, role: &str, rec: &FindingRecord) -> String {
         self.next_finding_seq = self.next_finding_seq.saturating_add(1);
         let id = format!("f-{}", self.next_finding_seq);
         self.findings.push(FindingRecord {
@@ -270,9 +265,60 @@ impl EvidenceLedger {
         promoted
     }
 
+    /// Record a host-authored finding on the parent ledger (not a child's
+    /// `report_finding`). Lands at `Acknowledged` — receipt is still not
+    /// judgment. Used when a Worker fails to finish scoped work: the parent
+    /// must settle this before a verified closure.
+    pub fn record_parent_finding(
+        &mut self,
+        source_child: &str,
+        role: &str,
+        kind: FindingKind,
+        summary: impl Into<String>,
+        blocking: bool,
+    ) -> String {
+        self.next_finding_seq = self.next_finding_seq.saturating_add(1);
+        let id = format!("f-{}", self.next_finding_seq);
+        self.findings.push(FindingRecord {
+            id: id.clone(),
+            source_child: source_child.to_string(),
+            role: role.to_string(),
+            kind,
+            summary: summary.into(),
+            file: None,
+            symbol: None,
+            blocking,
+            state: FindingState::Acknowledged,
+            resolution_reason: None,
+        });
+        id
+    }
+
     /// Findings that still stand in the way of a verified closure.
     pub fn open_blocking_findings(&self) -> Vec<&FindingRecord> {
         self.findings.iter().filter(|f| f.open_blocking()).collect()
+    }
+
+    /// A fresh-epoch ledger carrying ONLY this ledger's unsettled findings
+    /// (session review debt), never its mutation/verification evidence — a new
+    /// epoch must prove its own work (N2). Settled findings (Rejected /
+    /// Verified) stay in history; the id sequence is preserved so carried and
+    /// new findings can never collide. `None` when there is nothing to carry.
+    pub fn carry_forward_findings(&self) -> Option<EvidenceLedger> {
+        let open: Vec<FindingRecord> = self
+            .findings
+            .iter()
+            .filter(|f| !matches!(f.state, FindingState::Rejected | FindingState::Verified))
+            .cloned()
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        Some(EvidenceLedger {
+            findings: open,
+            next_finding_seq: self.next_finding_seq,
+            ..EvidenceLedger::default()
+        })
     }
 
     pub fn finding(&self, id: &str) -> Option<&FindingRecord> {
@@ -496,6 +542,27 @@ mod finding_tests {
     }
 
     #[test]
+    fn a_parent_finding_lands_acknowledged_and_can_block() {
+        let mut led = EvidenceLedger::default();
+        let id = led.record_parent_finding(
+            "agent-1",
+            "worker",
+            FindingKind::Observation,
+            "Worker Euclid did not complete scoped work",
+            true,
+        );
+        let rec = led.finding(&id).expect("recorded");
+        assert_eq!(rec.state, FindingState::Acknowledged);
+        assert_eq!(rec.source_child, "agent-1");
+        assert_eq!(rec.role, "worker");
+        assert!(rec.blocking);
+        assert_eq!(led.open_blocking_findings().len(), 1);
+        led.resolve_finding(&id, FindingState::Rejected, Some("I'll finish it"), false)
+            .unwrap();
+        assert!(led.open_blocking_findings().is_empty());
+    }
+
+    #[test]
     fn open_blocking_ignores_non_blocking_and_settled_findings() {
         let mut led = EvidenceLedger::default();
         let blocking = {
@@ -512,6 +579,46 @@ mod finding_tests {
         led.resolve_finding(&b, FindingState::Rejected, Some("not reachable"), false)
             .unwrap();
         assert!(led.open_blocking_findings().is_empty());
+    }
+
+    /// Session review debt carries into a fresh epoch; epoch evidence and
+    /// settled findings do not, and the id sequence never restarts.
+    #[test]
+    fn carry_forward_keeps_open_findings_and_drops_epoch_evidence() {
+        let mut led = EvidenceLedger::default();
+        led.record_mutation("m1", "apply_patch", vec!["a.rs".into()]);
+        led.record_verify("v1", "cargo\u{1f}test", 0);
+        let open = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let settled = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let a = led.adopt_finding("reviewer-1", "reviewer", &open);
+        let b = led.adopt_finding("reviewer-1", "reviewer", &settled);
+        led.resolve_finding(&b, FindingState::Rejected, Some("dup"), false)
+            .unwrap();
+
+        let carried = led.carry_forward_findings().expect("open debt carries");
+        assert_eq!(carried.findings.len(), 1);
+        assert_eq!(carried.findings[0].id, a);
+        assert!(
+            carried.mutations.is_empty() && carried.verifications.is_empty(),
+            "a new epoch must prove its own work"
+        );
+        assert_eq!(
+            carried.next_finding_seq, led.next_finding_seq,
+            "ids must never collide across epochs"
+        );
+
+        led.resolve_finding(&a, FindingState::Rejected, Some("also dup"), false)
+            .unwrap();
+        assert!(
+            led.carry_forward_findings().is_none(),
+            "nothing carries once every finding is settled"
+        );
     }
 
     /// The replay contract: a pre-findings snapshot deserializes with empty

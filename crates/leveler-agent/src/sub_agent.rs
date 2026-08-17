@@ -389,7 +389,10 @@ mod profile_tests {
 
     #[test]
     fn the_reviewer_is_bounded_and_the_worker_is_serial() {
-        assert_eq!(ChildProfile::resolve(AgentRole::Reviewer).max_rounds, Some(20));
+        assert_eq!(
+            ChildProfile::resolve(AgentRole::Reviewer).max_rounds,
+            Some(20)
+        );
         let worker = ChildProfile::resolve(AgentRole::Worker);
         assert!(worker.serial_tools);
         assert!(!worker.read_only);
@@ -402,7 +405,10 @@ mod profile_tests {
         // with UNRESTRICTED write access — the opposite of what the schema
         // promises ("MUST be given files it exclusively owns").
         let err = ChildProfile::admit(AgentRole::Worker, &[]).unwrap_err();
-        assert!(err.contains("files"), "denial must name the missing scope: {err}");
+        assert!(
+            err.contains("files"),
+            "denial must name the missing scope: {err}"
+        );
         assert!(ChildProfile::admit(AgentRole::Worker, &["src/a.rs".into()]).is_ok());
     }
 

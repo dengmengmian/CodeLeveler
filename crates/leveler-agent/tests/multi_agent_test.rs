@@ -3167,8 +3167,14 @@ async fn a_stopped_child_still_delivers_its_partial_findings() {
         1,
         "partial findings must survive an abnormal child stop"
     );
-    assert_eq!(ledger.findings[0].summary, "handler registered in router.rs");
-    assert_eq!(ledger.findings[0].state, leveler_lifecycle::FindingState::Acknowledged);
+    assert_eq!(
+        ledger.findings[0].summary,
+        "handler registered in router.rs"
+    );
+    assert_eq!(
+        ledger.findings[0].state,
+        leveler_lifecycle::FindingState::Acknowledged
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3201,8 +3207,14 @@ async fn the_parent_resolves_findings_through_the_audited_lifecycle() {
             assistant_text("Done."),
             assistant_with(
                 vec![
-                    resolve_call("r1", serde_json::json!({"id": "f-1", "resolution": "accepted"})),
-                    resolve_call("r2", serde_json::json!({"id": "f-1", "resolution": "rejected"})),
+                    resolve_call(
+                        "r1",
+                        serde_json::json!({"id": "f-1", "resolution": "accepted"}),
+                    ),
+                    resolve_call(
+                        "r2",
+                        serde_json::json!({"id": "f-1", "resolution": "rejected"}),
+                    ),
                     resolve_call(
                         "r3",
                         serde_json::json!({
@@ -3240,10 +3252,7 @@ async fn the_parent_resolves_findings_through_the_audited_lifecycle() {
         .iter()
         .filter_map(|e| match e {
             AgentEvent::ToolResult {
-                id,
-                name,
-                is_error,
-                ..
+                id, name, is_error, ..
             } if name == "resolve_finding" => Some((id.clone(), *is_error)),
             _ => None,
         })
@@ -3256,7 +3265,10 @@ async fn the_parent_resolves_findings_through_the_audited_lifecycle() {
     let ledger = last_ledger(&events);
     let f = ledger.finding("f-1").expect("finding survives");
     assert_eq!(f.state, leveler_lifecycle::FindingState::Rejected);
-    assert_eq!(f.resolution_reason.as_deref(), Some("duplicate of known issue"));
+    assert_eq!(
+        f.resolution_reason.as_deref(),
+        Some("duplicate of known issue")
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3339,9 +3351,9 @@ async fn an_open_blocking_finding_refuses_goal_completion_until_resolved() {
     let goal_results: Vec<bool> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::ToolResult {
-                name, is_error, ..
-            } if name == "update_goal" => Some(*is_error),
+            AgentEvent::ToolResult { name, is_error, .. } if name == "update_goal" => {
+                Some(*is_error)
+            }
             _ => None,
         })
         .collect();
@@ -3359,5 +3371,368 @@ async fn an_open_blocking_finding_refuses_goal_completion_until_resolved() {
         "the interception must be observable"
     );
     assert_eq!(outcome.stop_reason, StopReason::Completed);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A Worker that dies before finishing is original-goal debt: the host
+/// records a blocking finding so the parent cannot silently Verified.
+#[tokio::test]
+async fn an_incomplete_worker_raises_a_blocking_finding() {
+    let dir = tmp("worker-incomplete-block", 99);
+    std::fs::write(dir.join("owned.rs"), "pub fn owned() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Only the parent's spawn is scripted: the child's first model call
+    // errors, which is INCOMPLETE_NO_RESULT — and must become a blocking
+    // parent finding.
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![assistant_with(
+            vec![spawn_call(
+                "s1",
+                serde_json::json!({
+                    "task": "edit owned.rs",
+                    "role": "worker",
+                    "files": ["owned.rs"]
+                }),
+            )],
+            FinishReason::ToolCalls,
+        )],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    let _ = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let ledger = last_ledger(&events);
+    let open = ledger.open_blocking_findings();
+    assert_eq!(open.len(), 1, "an incomplete worker must block: {open:?}");
+    assert_eq!(open[0].role, "worker");
+    assert_eq!(open[0].source_child, "agent-1");
+    assert!(
+        open[0].summary.contains("did not complete"),
+        "the finding must name the incomplete work: {}",
+        open[0].summary
+    );
+
+    let started = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentStarted { role, task, .. } => Some((role.clone(), task.clone())),
+        _ => None,
+    });
+    let (role, task) = started.expect("worker must have started");
+    assert_eq!(role, "worker");
+    assert!(
+        task.contains("[scope: owned.rs]"),
+        "worker start must disclose scope: {task}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A child that only calls report_finding and writes no wrap-up prose still
+/// completed WITH findings — structured records are a result.
+#[tokio::test]
+async fn structured_findings_without_prose_are_still_a_result() {
+    let dir = tmp("structured-is-result", 103);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink {
+        messages: transcript.clone(),
+    };
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "find it", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({
+                        "kind": "relevant_file",
+                        "summary": "loader is here",
+                        "file": "src/config.rs"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Quiet wrap-up is nudged before it is accepted (same shape as
+            // child_completed_without_findings). The typed finding must still
+            // count as a result.
+            assistant_text("   "),
+            assistant_text("   "),
+            assistant_text("   "),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run("delegate", &mut |_| {}, &mut sink, CancellationToken::new())
+    .await
+    .unwrap();
+
+    let (content, is_error) = spawn_result(&transcript.lock().unwrap(), "s1");
+    assert!(!is_error, "typed findings are a clean result: {content}");
+    assert!(
+        content.contains("COMPLETED_WITH_FINDINGS"),
+        "empty prose must not erase structured findings: {content}"
+    );
+    assert!(
+        !content.contains("COMPLETED_NO_FINDINGS"),
+        "must not be classified as no-findings: {content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Explorer incomplete is knowledge loss, not a closure gate.
+#[tokio::test]
+async fn an_incomplete_explorer_does_not_raise_a_blocking_finding() {
+    let dir = tmp("explorer-incomplete-noblock", 100);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![assistant_with(
+            vec![spawn_call(
+                "s1",
+                serde_json::json!({"task": "investigate", "role": "explorer"}),
+            )],
+            FinishReason::ToolCalls,
+        )],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    let _ = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::EvidenceLedgerUpdated { .. }))
+            || last_ledger(&events).open_blocking_findings().is_empty(),
+        "an incomplete explorer must not invent a blocking finding"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Replay: a finding accepted in one drive is still Accepted — and still
+/// exactly one — when a fresh executor is seeded from that ledger snapshot.
+#[tokio::test]
+async fn accepted_findings_survive_a_seeded_replay_without_duplication() {
+    let dir = tmp("finding-replay", 101);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "investigate", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({"kind": "risk", "summary": "duplicated lock"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Done."),
+            assistant_with(
+                vec![resolve_call(
+                    "r1",
+                    serde_json::json!({"id": "f-1", "resolution": "accepted"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry.clone(),
+        tool_context.clone(),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let snapshot = last_ledger(&events);
+    assert_eq!(snapshot.findings.len(), 1);
+    assert_eq!(
+        snapshot.finding("f-1").unwrap().state,
+        leveler_lifecycle::FindingState::Accepted
+    );
+
+    // "Crash": a fresh executor seeded from the persisted snapshot.
+    let runtime2 = Arc::new(SleepyRuntime::new(
+        vec![assistant_text("resumed wrap-up.")],
+        Duration::from_millis(0),
+    ));
+    let mut events2 = Vec::new();
+    Executor::new(
+        runtime2,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_seeded_ledger(snapshot.clone())
+    .run(
+        "continue",
+        &mut |e| events2.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // The seeded ledger is the in-memory starting point; a quiet resume
+    // emits no new snapshot. The contract is: we did not create a second
+    // finding, and the snapshot we would persist is still Accepted.
+    let after = events2
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::EvidenceLedgerUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .unwrap_or(snapshot);
+    assert_eq!(after.findings.len(), 1, "replay must not duplicate");
+    assert_eq!(
+        after.finding("f-1").unwrap().state,
+        leveler_lifecycle::FindingState::Accepted
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Authoritative events reconstruct role / status / scope / finding count.
+#[tokio::test]
+async fn child_observability_reconstructs_from_authoritative_events() {
+    let dir = tmp("obs-rebuild", 102);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "find the config loader", "role": "explorer"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![finding_call(
+                    "f1",
+                    serde_json::json!({
+                        "kind": "relevant_file",
+                        "summary": "config loader lives here",
+                        "file": "src/config.rs"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Found it."),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let started = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentStarted { id, role, task, .. } => {
+            Some((id.clone(), role.clone(), task.clone()))
+        }
+        _ => None,
+    });
+    let finished = events.iter().rev().find_map(|e| match e {
+        AgentEvent::SubAgentFinished {
+            id, ok, summary, ..
+        } => Some((id.clone(), *ok, summary.clone())),
+        _ => None,
+    });
+    let (id, role, _task) = started.expect("start");
+    let (fid, ok, summary) = finished.expect("finish");
+    assert_eq!(id, fid);
+    assert_eq!(role, "explorer");
+    assert!(ok, "explorer finished cleanly");
+    assert!(
+        summary.contains("Structured findings adopted"),
+        "finish summary must name adopted findings: {summary}"
+    );
+    let ledger = last_ledger(&events);
+    assert_eq!(ledger.findings.len(), 1);
+    assert_eq!(ledger.findings[0].role, "explorer");
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -2329,3 +2329,53 @@ async fn a_non_blocking_reviewer_finding_does_not_refuse_verified() {
     assert_eq!(ledger.findings.len(), 1);
     assert!(!ledger.findings[0].blocking);
 }
+
+/// EventLog replay: reloading the last EvidenceLedgerUpdated after a
+/// reviewer adoption returns the same single Acknowledged finding. Resume of
+/// a CompletedUnverified session is refused by the engine (start a new
+/// task); the durable contract is the snapshot, not a second drive.
+#[tokio::test]
+async fn persisted_findings_reload_without_duplication() {
+    let responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added login"}),
+        ),
+        tool_call(
+            "rf1",
+            "report_finding",
+            serde_json::json!({
+                "kind": "correctness",
+                "summary": "login() accepts any password",
+                "file": "src/auth.rs",
+                "blocking": true
+            }),
+        ),
+        text("reviewed: one blocking defect"),
+        text("reviewed: one blocking defect"),
+    ];
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let first = persisted_ledger(&h.db, &session).await.unwrap();
+    let second = persisted_ledger(&h.db, &session).await.unwrap();
+    assert_eq!(first.findings.len(), 1);
+    assert_eq!(first, second, "reload must be identical, not duplicated");
+    assert_eq!(
+        first.findings[0].state,
+        leveler_lifecycle::FindingState::Acknowledged
+    );
+}

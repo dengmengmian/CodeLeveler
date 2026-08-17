@@ -146,6 +146,8 @@ impl std::fmt::Display for FindingError {
     }
 }
 
+impl std::error::Error for FindingError {}
+
 /// The audited state machine. Everything not listed is illegal — in
 /// particular `Created → Verified` cannot happen by construction.
 pub fn transition_allowed(from: FindingState, to: FindingState) -> bool {
@@ -176,7 +178,14 @@ mod tests {
             (Accepted, Rejected),
             (Addressed, Verified),
         ];
-        let all = [Created, Acknowledged, Accepted, Rejected, Addressed, Verified];
+        let all = [
+            Created,
+            Acknowledged,
+            Accepted,
+            Rejected,
+            Addressed,
+            Verified,
+        ];
         for from in all {
             for to in all {
                 assert_eq!(
@@ -203,7 +212,14 @@ mod tests {
     fn terminal_states_admit_nothing() {
         use FindingState::*;
         for terminal in [Rejected, Verified] {
-            for to in [Created, Acknowledged, Accepted, Rejected, Addressed, Verified] {
+            for to in [
+                Created,
+                Acknowledged,
+                Accepted,
+                Rejected,
+                Addressed,
+                Verified,
+            ] {
                 assert!(!transition_allowed(terminal, to));
             }
         }
@@ -225,7 +241,11 @@ mod tests {
             let kind = FindingKind::parse(raw).unwrap_or_else(|| panic!("{raw} must parse"));
             assert_eq!(kind.label(), raw);
         }
-        assert_eq!(FindingKind::parse("vibe"), None, "unknown kinds are refused");
+        assert_eq!(
+            FindingKind::parse("vibe"),
+            None,
+            "unknown kinds are refused"
+        );
     }
 
     #[test]

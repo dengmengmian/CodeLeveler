@@ -295,6 +295,14 @@ impl TurnRunner<'_> {
                 if let Some(progress) = progress {
                     executor = executor.with_seeded_progress(progress);
                 }
+            } else if let Some(ledger) =
+                last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
+                && let Some(carried) = ledger.carry_forward_findings()
+            {
+                // Fresh epoch: drop mutation/verify evidence (N2) but keep
+                // unsettled review debt so an open blocking finding cannot
+                // vanish between windows.
+                executor = executor.with_seeded_ledger(carried);
             }
             let expanded_budget = self.expanded_context_budget.clone();
             let mut forward = |event: leveler_agent::AgentEvent| {
@@ -559,6 +567,40 @@ impl TurnRunner<'_> {
                 .run_reviewer_child(id.clone(), brief, files, &mut forward, cancellation)
                 .await
         };
+        // Unified findings: adopt first so the finish summary can name the
+        // parent-side ids the TUI projects as a finding count.
+        let mut summary = result.result.for_parent("reviewer");
+        if !result.findings.is_empty() {
+            let mut ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
+                .await?
+                .unwrap_or_default();
+            let adopted: Vec<String> = result
+                .findings
+                .iter()
+                .map(|finding| ledger.adopt_finding(&id, "reviewer", finding))
+                .collect();
+            if let Some(pos) = summary.find('\n') {
+                summary.insert_str(
+                    pos + 1,
+                    &format!(
+                        "Structured findings adopted: {} — judge each with resolve_finding.\n",
+                        adopted.join(", ")
+                    ),
+                );
+            } else {
+                summary.push_str(&format!(
+                    "\nStructured findings adopted: {} — judge each with resolve_finding.",
+                    adopted.join(", ")
+                ));
+            }
+            self.log
+                .append(
+                    None,
+                    EngineEvent::EvidenceLedgerUpdated { ledger },
+                    observer,
+                )
+                .await?;
+        }
         self.log
             .append(
                 None,
@@ -566,32 +608,11 @@ impl TurnRunner<'_> {
                     id: id.clone(),
                     nickname: "reviewer".to_string(),
                     ok: result.ok,
-                    summary: leveler_core::truncate_head_bytes(
-                        result.result.for_parent("reviewer").trim(),
-                        4000,
-                        "…",
-                    ),
+                    summary: leveler_core::truncate_head_bytes(summary.trim(), 4000, "…"),
                 },
                 observer,
             )
             .await?;
-        // Unified findings: the reviewer's typed findings are adopted into the
-        // session's durable ledger at Acknowledged (receipt is not judgment),
-        // through the SAME EvidenceLedgerUpdated snapshot every other ledger
-        // change persists through. Partial findings from an incomplete
-        // reviewer are adopted too — that is the point of typing them.
-        if !result.findings.is_empty() {
-            let mut ledger =
-                last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
-                    .await?
-                    .unwrap_or_default();
-            for finding in &result.findings {
-                ledger.adopt_finding(&id, "reviewer", finding);
-            }
-            self.log
-                .append(None, EngineEvent::EvidenceLedgerUpdated { ledger }, observer)
-                .await?;
-        }
         Ok(result.ok)
     }
 }

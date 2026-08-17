@@ -397,7 +397,7 @@ impl Executor {
                 // findings — R013r lost a voiced finding to exactly that. For
                 // interrupted runs, prefer what the child actually said; the
                 // stop reason is carried separately.
-                let findings = if completed {
+                let mut findings = if completed {
                     outcome.final_text
                 } else {
                     let said = said_before_stopping();
@@ -407,6 +407,15 @@ impl Executor {
                         said
                     }
                 };
+                // Typed findings ARE a result. An empty prose wrap-up must
+                // not be classified COMPLETED_NO_FINDINGS when the child
+                // already recorded structured findings.
+                if findings.trim().is_empty() && !reported_findings.is_empty() {
+                    findings = format!(
+                        "{} structured finding(s) reported.",
+                        reported_findings.len()
+                    );
+                }
                 let stop_reason = if completed {
                     String::new()
                 } else {

@@ -40,11 +40,10 @@ use crate::authorization::{
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
     COMPLETE_STEP_TOOL, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL,
-    SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL,
-    apply_turn_grants, ask_user_tool_definition, complete_step_tool_definition, is_user_input_tool,
-    report_finding_tool_definition, request_permissions_tool_definition,
-    request_user_input_tool_definition, resolve_finding_tool_definition,
-    spawn_agent_tool_definition, update_goal_tool_definition,
+    SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL, apply_turn_grants, ask_user_tool_definition,
+    complete_step_tool_definition, is_user_input_tool, report_finding_tool_definition,
+    request_permissions_tool_definition, request_user_input_tool_definition,
+    resolve_finding_tool_definition, spawn_agent_tool_definition, update_goal_tool_definition,
 };
 use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
@@ -1171,10 +1170,7 @@ impl Executor {
                                     });
                                     (
                                         true,
-                                        format!(
-                                            "Finding {id_arg} is now {}.",
-                                            final_state.label()
-                                        ),
+                                        format!("Finding {id_arg} is now {}.", final_state.label()),
                                     )
                                 }
                                 Err(e) => (false, format!("resolve_finding refused: {e}")),
@@ -1253,10 +1249,7 @@ impl Executor {
                             .map(|f| format!("{} ({}: {})", f.id, f.state.label(), f.summary))
                             .collect();
                         if !open.is_empty() {
-                            let detail = format!(
-                                "open blocking finding(s): {}",
-                                open.join("; ")
-                            );
+                            let detail = format!("open blocking finding(s): {}", open.join("; "));
                             ledger.record_intercept("blocking_finding", detail.clone());
                             observer(AgentEvent::GoalIntercepted {
                                 kind: "blocking_finding".into(),
@@ -2115,11 +2108,16 @@ impl Executor {
                     agents_spawned += 1;
                     let id = format!("agent-{agents_spawned}");
                     let nickname = agent_nickname(agents_spawned);
+                    let started_task = if role == AgentRole::Worker && !files.is_empty() {
+                        format!("{task}\n[scope: {}]", files.join(", "))
+                    } else {
+                        task.clone()
+                    };
                     observer(AgentEvent::SubAgentStarted {
                         id: id.clone(),
                         nickname: nickname.clone(),
                         role: role.label().to_string(),
-                        task: task.clone(),
+                        task: started_task,
                     });
                     accepted.push((
                         index,
@@ -2198,21 +2196,15 @@ impl Executor {
                         biased;
                         Some(progress_ev) = progress_rx.recv() => observer(progress_ev),
                         Some((index, call_id, id, nickname, role, result)) = futs.next() => {
-                            observer(AgentEvent::SubAgentFinished {
-                                id: id.clone(),
-                                nickname: nickname.clone(),
-                                ok: result.result.status.completed(),
-                                summary: preview(&result.result.for_parent(&nickname)),
-                            });
                             // Roll sub-agent spend into the parent task epoch.
                             // Parent same-batch spend was pinned before absorb.
                             progress.absorb_child_spend(&result.progress);
                             commands_run = progress.cumulative_commands;
                             model_tokens_spent = progress.cumulative_model_tokens;
                             cost_spent_micros = progress.cumulative_cost_usd_micros;
-                            for path in result.modified_files {
-                                if !modified_files.iter().any(|p| p == &path) {
-                                    modified_files.push(path);
+                            for path in &result.modified_files {
+                                if !modified_files.iter().any(|p| p == path) {
+                                    modified_files.push(path.clone());
                                 }
                             }
                             // Adopt the child's typed findings into the parent
@@ -2220,11 +2212,35 @@ impl Executor {
                             // and persist the snapshot. The parent-facing text
                             // names the adopted ids so the model can judge
                             // them with resolve_finding.
-                            let adopted: Vec<String> = result
+                            let mut adopted: Vec<String> = result
                                 .findings
                                 .iter()
                                 .map(|f| ledger.adopt_finding(&id, role.label(), f))
                                 .collect();
+                            // A Worker that did not finish its scoped subtask
+                            // is original-goal debt: the parent must settle
+                            // it (finish the work and reject this finding,
+                            // or address it) before a verified closure.
+                            // Explorer incomplete is knowledge loss, not a
+                            // closure gate.
+                            if role == AgentRole::Worker && !result.result.status.completed() {
+                                let reason = if result.result.stop_reason.is_empty() {
+                                    result.result.status.label().to_string()
+                                } else {
+                                    result.result.stop_reason.clone()
+                                };
+                                adopted.push(ledger.record_parent_finding(
+                                    &id,
+                                    role.label(),
+                                    FindingKind::Observation,
+                                    format!(
+                                        "Worker {nickname} did not complete scoped work \
+                                         ({reason}). Finish it yourself, then reject this \
+                                         finding with a reason, or spawn the worker again."
+                                    ),
+                                    true,
+                                ));
+                            }
                             if !adopted.is_empty() {
                                 observer(AgentEvent::EvidenceLedgerUpdated {
                                     ledger: ledger.clone(),
@@ -2235,13 +2251,34 @@ impl Executor {
                             // found anything" — opposite instructions that a bare
                             // report text cannot carry.
                             let mut content = result.result.for_parent(&nickname);
-                            if !adopted.is_empty() {
+                            if !result.modified_files.is_empty() {
                                 content.push_str(&format!(
-                                    "\n\nStructured findings adopted: {} — judge each \
-                                     with resolve_finding.",
-                                    adopted.join(", ")
+                                    "\nFiles touched: {}",
+                                    result.modified_files.join(", ")
                                 ));
                             }
+                            if !adopted.is_empty() {
+                                // Keep this line near the top so a truncated
+                                // SubAgentFinished preview still names the ids
+                                // (TUI finding-count is a projection of it).
+                                let adopted_line = format!(
+                                    "Structured findings adopted: {} — judge each \
+                                     with resolve_finding.",
+                                    adopted.join(", ")
+                                );
+                                if let Some(pos) = content.find('\n') {
+                                    content.insert_str(pos + 1, &format!("{adopted_line}\n"));
+                                } else {
+                                    content.push('\n');
+                                    content.push_str(&adopted_line);
+                                }
+                            }
+                            observer(AgentEvent::SubAgentFinished {
+                                id: id.clone(),
+                                nickname: nickname.clone(),
+                                ok: result.result.status.completed(),
+                                summary: preview(&content),
+                            });
                             results[index] = Some(ContentPart::ToolResult {
                                 result: ToolResultContent {
                                     call_id,
