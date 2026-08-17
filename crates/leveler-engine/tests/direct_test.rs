@@ -1739,7 +1739,7 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
 // as no progress and the goal died with `outcome=failed` while work was landing.
 
 fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
-    let mut s = spec(&h_ref(h), VerificationPlan::default());
+    let mut s = spec(h, VerificationPlan::default());
     s.runtime.goal = goal.to_string();
     // UntilTerminal keeps the round budget UNPINNED, so hitting the per-turn
     // ceiling ends a WORK WINDOW (policy opens the next one), not the goal.
@@ -1749,10 +1749,6 @@ fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
         ..leveler_agent::StepLimits::default()
     };
     s
-}
-
-fn h_ref(h: &Harness) -> &Harness {
-    h
 }
 
 fn patch_add(id: &str, path: &str, line: &str) -> ModelResponse {
@@ -1890,7 +1886,6 @@ async fn review_stage_rows(
     db: &Database,
     session: &leveler_core::SessionId,
 ) -> Vec<(bool, String, String)> {
-    use leveler_storage::EventStore;
     let store = leveler_storage::EngineStores::from_database(db);
     let mut out = Vec::new();
     for row in store.events.load(session).await.unwrap() {
