@@ -2716,3 +2716,232 @@ async fn failed_child_reports_no_result_rather_than_no_findings() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The `spawn_agent` schema promises a worker "MUST be given `files` it
+/// exclusively owns". Before capability admission, an empty `files` silently
+/// produced a worker with UNRESTRICTED write access — the opposite.
+#[tokio::test]
+async fn a_worker_spawn_without_a_file_scope_is_refused() {
+    let dir = tmp("worker-noscope", 91);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": "edit something", "role": "worker"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentStarted { .. })),
+        "an unscoped worker must never start"
+    );
+    let refusal = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "spawn_agent" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("the spawn must be refused with a reason");
+    assert!(
+        refusal.contains("files"),
+        "the denial must name the missing scope: {refusal}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A read-only role asking for a write scope is an incoherent capability
+/// request: deny honestly instead of silently ignoring the `files`.
+#[tokio::test]
+async fn an_explorer_spawn_with_a_write_scope_is_refused() {
+    let dir = tmp("explorer-scope", 92);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": "look around",
+                        "role": "explorer",
+                        "files": ["src/a.rs"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentStarted { .. })),
+        "the incoherent spawn must not start"
+    );
+    let refusal = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "spawn_agent" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("the spawn must be refused with a reason");
+    assert!(
+        refusal.contains("read-only"),
+        "the denial must say why: {refusal}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two same-batch workers whose "exclusive" scopes overlap cannot both be
+/// admitted — that is last-writer-wins waiting to happen. The first keeps its
+/// scope; the second is refused honestly.
+#[tokio::test]
+async fn overlapping_worker_scopes_refuse_the_second_spawn() {
+    let dir = tmp("worker-overlap", 93);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![
+                    spawn_call(
+                        "s1",
+                        serde_json::json!({
+                            "task": "edit auth",
+                            "role": "worker",
+                            "files": ["src/auth.rs"]
+                        }),
+                    ),
+                    // Directory prefix overlap with the first scope.
+                    spawn_call(
+                        "s2",
+                        serde_json::json!({
+                            "task": "edit src tree",
+                            "role": "worker",
+                            "files": ["src"]
+                        }),
+                    ),
+                    // Disjoint: must be admitted.
+                    spawn_call(
+                        "s3",
+                        serde_json::json!({
+                            "task": "edit docs",
+                            "role": "worker",
+                            "files": ["docs/README.md"]
+                        }),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("auth edited"),
+            assistant_text("docs edited"),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let mut events = Vec::new();
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let started_n = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::SubAgentStarted { .. }))
+        .count();
+    assert_eq!(
+        started_n, 2,
+        "the overlapping worker must be refused; the disjoint pair runs"
+    );
+    let refusal = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                id,
+                name,
+                is_error: true,
+                preview,
+            } if name == "spawn_agent" && id == "s2" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("the overlapping spawn must be refused");
+    assert!(
+        refusal.contains("overlap"),
+        "the denial must name the collision: {refusal}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -46,8 +46,8 @@ use crate::injected_tools::{
 };
 use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
-    AgentRole, MAX_SUB_AGENT_DEPTH, agent_nickname, multi_agent_steer_hint,
-    task_suggests_delegation,
+    AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, multi_agent_steer_hint,
+    scopes_overlap, task_suggests_delegation,
 };
 
 struct CancelOnDrop(CancellationToken);
@@ -1769,6 +1769,11 @@ impl Executor {
                     Vec<String>,
                     u32,
                 )> = Vec::new();
+                // Exclusive scopes of workers already admitted in THIS batch.
+                // "Exclusive" is only true if admission enforces it: two
+                // overlapping scopes in one batch is last-writer-wins waiting
+                // to happen, so the second one is refused honestly.
+                let mut admitted_worker_scopes: Vec<Vec<String>> = Vec::new();
                 for (index, call) in spawn_jobs {
                     let task = call
                         .arguments
@@ -1857,6 +1862,22 @@ impl Executor {
                         ))
                     } else if task.is_empty() {
                         Some("spawn_agent requires a non-empty task.".to_string())
+                    } else if let Err(msg) = ChildProfile::admit(role, &files) {
+                        // Capability negotiation: the requested role + scope
+                        // against the role's profile. Honest denial, never a
+                        // silent downgrade.
+                        Some(msg)
+                    } else if role == AgentRole::Worker
+                        && admitted_worker_scopes
+                            .iter()
+                            .any(|scope| scopes_overlap(scope, &files))
+                    {
+                        Some(format!(
+                            "Worker scope {} overlaps a worker already admitted in this \
+                             batch. Parallel workers must own DISJOINT files; fold the \
+                             overlapping work into one worker or re-scope it.",
+                            files.join(", ")
+                        ))
                     } else if agents_spawned >= self.policy.max_total_agents {
                         Some(format!(
                             "Sub-agent limit reached ({} max this run). Do the remaining work \
@@ -1883,6 +1904,9 @@ impl Executor {
                         continue;
                     }
 
+                    if role == AgentRole::Worker {
+                        admitted_worker_scopes.push(files.clone());
+                    }
                     agents_spawned += 1;
                     let id = format!("agent-{agents_spawned}");
                     let nickname = agent_nickname(agents_spawned);
