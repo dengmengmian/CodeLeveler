@@ -136,6 +136,23 @@ fn merge_continued_outcome(
 /// `MAX_NO_PROGRESS_WINDOWS`, so a stuck goal converges in a couple of windows
 /// rather than burning the absolute `MAX_SUPERVISED_TURNS` ceiling. Extracted so
 /// the hard-bound termination is unit-testable without a live model.
+/// Window-progress marks from the persisted evidence ledger: (total mutation
+/// operations, does a green verification cover the latest mutations). Absent
+/// or unreadable ledger degrades to zeros — the file-set signal still works,
+/// so a load failure can only under-credit, never spin a goal forever.
+async fn evidence_progress_marks(
+    events: &dyn leveler_storage::EventStore,
+    session_id: &SessionId,
+) -> (u64, bool) {
+    match crate::turn::last_persisted_ledger(events, session_id).await {
+        Ok(Some(ledger)) => (
+            ledger.total_mutation_ops,
+            ledger.has_fresh_successful_verify(),
+        ),
+        _ => (0, false),
+    }
+}
+
 pub(crate) fn advance_no_progress_windows(current: u32, made_progress: bool) -> u32 {
     if made_progress {
         0
@@ -1242,10 +1259,18 @@ impl TaskEngine {
         let mut extensions = 0u32;
         let mut limits = spec.runtime.limits;
         // Goal-invocation-scoped, in-memory (not persisted): how many windows in
-        // a row have failed to grow the modified-file set. Bounds multi-window
+        // a row have produced no effective work. Bounds multi-window
         // continuation so a stuck goal converges without a durable window ledger.
         let mut windows_without_progress = 0u32;
         let mut progress_mark = outcome.modified_files.len();
+        // R011-F1: the file-set mark alone starved refinement windows (fixing
+        // files already written read as no progress and killed the goal). The
+        // persisted evidence ledger carries two more window-grained signals:
+        // total mutation OPERATIONS (re-edits included) and whether a green
+        // verification now covers the latest mutations. Loaded per window —
+        // windows are rare, so the full-log scan is affordable here.
+        let (mut ops_mark, mut fresh_verify_mark) =
+            evidence_progress_marks(runner.stores.events.as_ref(), &runner.session_id).await;
 
         for _ in 0..MAX_SUPERVISED_TURNS {
             if cancellation.is_cancelled() {
@@ -1298,11 +1323,22 @@ impl TaskEngine {
                 }
             };
             merge_continued_outcome(&mut outcome, continued);
-            // A window that grew the modified-file set made material progress and
-            // resets the counter; one that touched nothing new counts toward the
-            // no-progress-window cap the policy enforces on the next decision.
-            let made_progress = outcome.modified_files.len() > progress_mark;
+            // Effective work this window, from three independent signals:
+            //   1. the modified-file set grew (first-touch writes),
+            //   2. mutation OPERATIONS advanced — refinement of files already
+            //      written counts (R011-F1),
+            //   3. a green verification newly covers the latest mutations
+            //      (a window spent turning red checks green is progress).
+            // Repeated reads/searches and rerunning an already-green check move
+            // none of these, so genuine spinning still hits the cap.
+            let (ops_now, fresh_now) =
+                evidence_progress_marks(runner.stores.events.as_ref(), &runner.session_id).await;
+            let made_progress = outcome.modified_files.len() > progress_mark
+                || ops_now > ops_mark
+                || (fresh_now && !fresh_verify_mark);
             progress_mark = outcome.modified_files.len();
+            ops_mark = ops_mark.max(ops_now);
+            fresh_verify_mark = fresh_now;
             windows_without_progress =
                 advance_no_progress_windows(windows_without_progress, made_progress);
         }

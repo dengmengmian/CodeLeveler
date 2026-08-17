@@ -1730,3 +1730,155 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
         "the reviewer must not be able to edit the change it is judging"
     );
 }
+
+// ── R011-F1: window progress must recognise refinement ──────────────────────
+//
+// R011 measured: turn 1 touched 9 new files; turns 2–3 touched 0 new files but
+// performed 5 real write operations (compile-fix-test refinement). The window
+// judge counted only modified-file-set growth, so two refinement windows read
+// as no progress and the goal died with `outcome=failed` while work was landing.
+
+fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
+    let mut s = spec(&h_ref(h), VerificationPlan::default());
+    s.runtime.goal = goal.to_string();
+    // UntilTerminal keeps the round budget UNPINNED, so hitting the per-turn
+    // ceiling ends a WORK WINDOW (policy opens the next one), not the goal.
+    s.runtime.continuation = leveler_agent::ContinuationPolicy::UntilTerminal;
+    s.runtime.limits = leveler_agent::StepLimits {
+        max_rounds: Some(rounds_per_window),
+        ..leveler_agent::StepLimits::default()
+    };
+    s
+}
+
+fn h_ref(h: &Harness) -> &Harness {
+    h
+}
+
+fn patch_add(id: &str, path: &str, line: &str) -> ModelResponse {
+    tool_call(
+        id,
+        "apply_patch",
+        serde_json::json!({
+            "patch": format!("*** Begin Patch\n*** Add File: {path}\n+{line}\n*** End Patch")
+        }),
+    )
+}
+
+fn patch_update(id: &str, path: &str, old: &str, new: &str) -> ModelResponse {
+    tool_call(
+        id,
+        "apply_patch",
+        serde_json::json!({
+            "patch": format!(
+                "*** Begin Patch\n*** Update File: {path}\n-{old}\n+{new}\n*** End Patch"
+            )
+        }),
+    )
+}
+
+fn read_call_named(id: &str, path: &str) -> ModelResponse {
+    tool_call(id, "read_file", serde_json::json!({"path": path}))
+}
+
+/// Refinement windows — real writes to files the goal already touched — are
+/// progress. The goal must survive them and reach its natural finish.
+#[tokio::test]
+async fn refinement_windows_count_as_progress() {
+    let h = harness(vec![
+        // Window 1 (2 rounds): create the file, then read it → round ceiling.
+        patch_add("w1a", "src/feature.rs", "pub fn feature() { /* v1 */ }"),
+        read_call_named("w1b", "src/feature.rs"),
+        // Window 2: REWRITE the same file (no new paths), then read → ceiling.
+        patch_update(
+            "w2a",
+            "src/feature.rs",
+            "pub fn feature() { /* v1 */ }",
+            "pub fn feature() { /* v2 */ }",
+        ),
+        read_call_named("w2b", "src/feature.rs"),
+        // Window 3: rewrite again — still no new paths.
+        patch_update(
+            "w3a",
+            "src/feature.rs",
+            "pub fn feature() { /* v2 */ }",
+            "pub fn feature() { /* v3 */ }",
+        ),
+        read_call_named("w3b", "src/feature.rs"),
+        // Window 4: the model closes the goal out explicitly. (Continued
+        // windows run in goal mode, where bare prose never ends the turn.)
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "refinement done"}),
+        ),
+        // Slack for advisory calls; unused responses are harmless.
+        text("unused"),
+        text("unused"),
+    ])
+    .await;
+    let s = spec_windowed(&h, "add the feature and polish it", 2);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            report.stop_reason,
+            leveler_agent::StopReason::Completed
+                | leveler_agent::StopReason::Answered
+                | leveler_agent::StopReason::CompletedUnverified
+        ),
+        "three windows of real work must reach the natural finish, not a \
+         no-progress kill; got {:?} ({:?})",
+        report.stop_reason,
+        report.outcome,
+    );
+    let file = std::fs::read_to_string(h.dir.path().join("src/feature.rs")).unwrap();
+    assert!(
+        file.contains("v3"),
+        "every refinement window's write must have landed: {file}"
+    );
+}
+
+/// The counter-guard: windows that only re-observe — no mutation, no
+/// verification advancement — must still terminate the goal.
+#[tokio::test]
+async fn pure_observation_windows_still_terminate() {
+    let h = harness(vec![
+        // Window 1: real work.
+        patch_add("s1", "src/feature.rs", "pub fn feature() {}"),
+        read_call_named("s2", "src/feature.rs"),
+        // Windows 2..: nothing but re-reads. The engine must stop granting
+        // windows once the no-progress cap is hit; extra responses stay unused.
+        read_call_named("s3", "src/feature.rs"),
+        read_call_named("s4", "src/feature.rs"),
+        read_call_named("s5", "src/feature.rs"),
+        read_call_named("s6", "src/feature.rs"),
+        read_call_named("s7", "src/feature.rs"),
+        read_call_named("s8", "src/feature.rs"),
+        text("should never be reached"),
+    ])
+    .await;
+    let s = spec_windowed(&h, "add the feature", 2);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::TurnLimitReached,
+        "pure re-observation must exhaust the no-progress cap, not run forever: {:?}",
+        report.stop_reason
+    );
+    assert!(
+        !report.outcome.is_success(),
+        "a goal that stopped making progress must not read as success"
+    );
+}

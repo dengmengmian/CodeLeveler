@@ -42,19 +42,25 @@ pub(crate) fn newly_modified_paths(before: &[String], after: &[String]) -> Vec<S
         .collect()
 }
 
-/// Record mutation evidence for any tool that produced new modified_files.
+/// Record mutation evidence for any tool call that modified files.
+///
+/// `record_paths` keeps its original meaning per call site (the first-touch
+/// delta on the sequential path); `MutationRecord` gating semantics are
+/// unchanged. What IS new: every mutating call — including a re-edit of a file
+/// already in the modified set — bumps `total_mutation_ops` and persists the
+/// ledger, because refinement used to be invisible here (R011-F1).
 pub(crate) fn note_tool_side_effects(
     ledger: &mut EvidenceLedger,
     tool_call_id: &str,
     tool: &str,
-    newly: Vec<String>,
+    record_paths: Vec<String>,
     plan_state: &PlanState,
     observer: &mut dyn FnMut(AgentEvent),
 ) {
-    if newly.is_empty() {
-        return;
+    ledger.note_mutation_op();
+    if !record_paths.is_empty() {
+        ledger.record_mutation(tool_call_id, tool, record_paths);
     }
-    ledger.record_mutation(tool_call_id, tool, newly);
     ledger.plan = plan_state.clone();
     observer(AgentEvent::EvidenceLedgerUpdated {
         ledger: ledger.clone(),
