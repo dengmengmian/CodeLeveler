@@ -621,6 +621,24 @@ mod finding_tests {
         );
     }
 
+    /// Carrying twice must not invent new ids or extra records. A fresh
+    /// epoch seeds this snapshot; it must not look like a second adopt.
+    #[test]
+    fn carry_forward_is_idempotent() {
+        let mut led = EvidenceLedger::default();
+        let rec = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let id = led.adopt_finding("reviewer-1", "reviewer", &rec);
+        let first = led.carry_forward_findings().expect("open debt");
+        let second = first.carry_forward_findings().expect("still open");
+        assert_eq!(first.findings, second.findings);
+        assert_eq!(first.next_finding_seq, second.next_finding_seq);
+        assert_eq!(second.findings[0].id, id);
+        assert_eq!(second.findings.len(), 1);
+    }
+
     /// The replay contract: a pre-findings snapshot deserializes with empty
     /// findings, and a snapshot with findings restores states exactly.
     #[test]

@@ -444,6 +444,98 @@ async fn worker_ownership_rejects_out_of_scope_edit() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Human-review P2: a Worker must not keep a shell mutation outside its
+/// exclusive files. The existing command_write_allowlist + snapshot restore
+/// is the close — this test proves it is wired through spawn_agent, not
+/// only the isolated run_command unit test.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_cannot_keep_a_shell_write_outside_its_scope() {
+    let dir = tmp("worker-shell-escape", 110);
+    std::fs::write(dir.join("owned.rs"), "owned\n").unwrap();
+    std::fs::write(dir.join("other.rs"), "other\n").unwrap();
+    init_git(&dir);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": "edit owned.rs",
+                        "role": "worker",
+                        "files": ["owned.rs"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "run_command",
+                    serde_json::json!({
+                        "program": "sh",
+                        "args": ["-c", "echo hacked > other.rs"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("tried the shell write"),
+            assistant_text("parent wrap-up"),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "delegate",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let other = std::fs::read_to_string(dir.join("other.rs")).unwrap();
+    assert_eq!(
+        other, "other\n",
+        "out-of-scope shell write must not survive"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn init_git(dir: &std::path::Path) {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "core.autocrlf", "false"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+}
+
 #[tokio::test]
 async fn explorer_can_finish_after_more_than_six_rounds() {
     let dir = tmp("explorer-budget", 31);
