@@ -2105,3 +2105,88 @@ async fn not_required_review_is_still_recorded() {
          required; got {stages:?}"
     );
 }
+
+/// R013r's production finding: an unbounded reviewer burned the FULL 100-round
+/// turn ceiling, and when the ceiling stopped it the synthetic stop sentence
+/// replaced the findings it had already voiced. A reviewer reading a diff must
+/// be cheaply bounded, and a ceilinged review must keep what it established.
+#[tokio::test]
+async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
+    let mut responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "login added"}),
+        ),
+    ];
+    // The reviewer voices a finding in its first round, then wanders: reads
+    // forever without concluding. Without a bound it would consume every
+    // response below; with one it stops early and the finding survives.
+    responses.push(ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::Text {
+                    text: "FINDING: login() accepts empty credentials".to_string(),
+                },
+                ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new("r1"),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path": "src/auth.rs"}),
+                    },
+                },
+            ],
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    });
+    for i in 0..60 {
+        responses.push(tool_call(
+            &format!("r{}", i + 2),
+            "read_file",
+            serde_json::json!({"path": "src/auth.rs"}),
+        ));
+    }
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let _ = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let total_requests = h.requests.lock().unwrap().len();
+    assert!(
+        total_requests <= 30,
+        "a reviewer reading a diff must be bounded, not free to burn the full \
+         turn ceiling: {total_requests} model calls"
+    );
+    let summary = seen
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::SubAgentFinished { summary, .. } => Some(summary.clone()),
+            _ => None,
+        })
+        .expect("the reviewer must reach a terminal event");
+    assert!(
+        summary.contains("FINDING: login() accepts empty credentials"),
+        "a ceilinged review must keep the findings it voiced, not just the \
+         stop sentence: {summary}"
+    );
+}
