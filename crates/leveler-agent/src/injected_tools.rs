@@ -184,7 +184,7 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                 "files": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "For role='worker': the files this agent exclusively owns and may edit. Edits outside them are rejected."
+                    "description": "For role='worker': the paths this agent exclusively owns and may edit. Each entry is a relative file path or a directory (a directory grants its whole subtree, e.g. 'src/output/'). Edits outside them are rejected."
                 },
                 "agent": {
                     "type": "string",
@@ -431,6 +431,22 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_scope_advertises_directory_grants() {
+        // Ergonomics (MA-WA1): at decision time Main often knows the module,
+        // not every file. Directory scope has always been enforced (allowlist
+        // + overlap both use directory-prefix semantics) — the schema must say
+        // so, or the model believes it needs perfect file knowledge to spawn.
+        let def = spawn_agent_tool_definition();
+        let files_desc = def.input_schema["properties"]["files"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            files_desc.contains("directory"),
+            "files scope must advertise directory grants: {files_desc}"
+        );
+    }
 
     #[test]
     fn spawn_agent_description_prefers_bounded_write_delegation() {

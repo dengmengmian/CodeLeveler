@@ -109,6 +109,145 @@ pub fn multi_agent_steer_hint() -> String {
         .to_string()
 }
 
+/// What the drive loop must do at a round boundary for the delegation
+/// decision point (MA-WA1). Ordering: facts (`RecordDelegated` / `RecordKept`)
+/// come before `Offer`, so the offer is never emitted after the decision it
+/// would ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DelegationRoundAction {
+    /// Inject the one-shot keep-vs-delegate request. Payload = trigger label
+    /// (`plan` | `first_mutation`) for the durable `offered` fact.
+    Offer(&'static str),
+    /// First mutation after a visible offer with no Worker: durable `kept`.
+    RecordKept,
+    /// First Worker admitted: durable `delegated` with its file scope.
+    RecordDelegated(String),
+}
+
+/// One-shot keep-vs-delegate decision point (MA-WA1).
+///
+/// The prior architecture had no decision layer at all: the only delegation
+/// input was a round-1 hint, never re-anchored at the moment the model's own
+/// decomposition made the judgment possible. This struct guarantees exactly one
+/// neutral decision point per goal epoch — at plan registration (decomposition
+/// written down) or, for plan-less runs, at the first mutation — and derives an
+/// observable disposition from behavior, never from self-report or hidden
+/// reasoning. It never blocks a call, never repeats, and treats KEEP as a
+/// first-class outcome.
+#[derive(Debug, Clone)]
+pub(crate) struct DelegationDecisionPoint {
+    /// depth == 0 ∧ allow_delegation. Children never see any of this.
+    eligible: bool,
+    /// The offer was injected (this window or a prior one, via ProgressLedger).
+    offered: bool,
+    /// The model has had a full round to read the offer; only mutations after
+    /// that count as a KEEP commitment.
+    offer_visible: bool,
+    kept_recorded: bool,
+    delegated_recorded: bool,
+    // Round-local facts, cleared by `end_round`.
+    plan_incomplete_steps: usize,
+    mutated_this_round: bool,
+    worker_scope_this_round: Option<String>,
+}
+
+impl DelegationDecisionPoint {
+    pub(crate) fn new(eligible: bool, already_offered: bool) -> Self {
+        Self {
+            eligible,
+            offered: already_offered,
+            offer_visible: already_offered,
+            kept_recorded: false,
+            delegated_recorded: false,
+            plan_incomplete_steps: 0,
+            mutated_this_round: false,
+            worker_scope_this_round: None,
+        }
+    }
+
+    /// A ModelExplicit plan was registered/replaced with `incomplete` open steps.
+    pub(crate) fn note_plan_registered(&mut self, incomplete: usize) {
+        self.plan_incomplete_steps = self.plan_incomplete_steps.max(incomplete);
+    }
+
+    /// A tool call successfully mutated the workspace this round.
+    pub(crate) fn note_mutation(&mut self) {
+        self.mutated_this_round = true;
+    }
+
+    /// A Worker child passed spawn admission this round.
+    pub(crate) fn note_worker_admitted(&mut self, files: &[String]) {
+        if self.worker_scope_this_round.is_none() {
+            self.worker_scope_this_round = Some(files.join(", "));
+        }
+    }
+
+    /// Resolve this round's facts into actions. At most one `Offer` per epoch;
+    /// `kept`/`delegated` each at most once.
+    pub(crate) fn end_round(&mut self) -> Vec<DelegationRoundAction> {
+        let mut actions = Vec::new();
+        if !self.eligible {
+            self.clear_round();
+            return actions;
+        }
+        if let Some(scope) = self.worker_scope_this_round.take()
+            && !self.delegated_recorded
+        {
+            self.delegated_recorded = true;
+            actions.push(DelegationRoundAction::RecordDelegated(scope));
+        }
+        if self.mutated_this_round
+            && self.offer_visible
+            && !self.kept_recorded
+            && !self.delegated_recorded
+        {
+            self.kept_recorded = true;
+            actions.push(DelegationRoundAction::RecordKept);
+        }
+        if !self.offered && !self.delegated_recorded {
+            if self.plan_incomplete_steps >= 2 {
+                self.offered = true;
+                actions.push(DelegationRoundAction::Offer("plan"));
+            } else if self.mutated_this_round {
+                self.offered = true;
+                actions.push(DelegationRoundAction::Offer("first_mutation"));
+            }
+        }
+        // Anything offered up to and including this round is readable next round.
+        self.offer_visible = self.offered;
+        self.clear_round();
+        actions
+    }
+
+    fn clear_round(&mut self) {
+        self.plan_incomplete_steps = 0;
+        self.mutated_this_round = false;
+        self.worker_scope_this_round = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn offered(&self) -> bool {
+        self.offered
+    }
+}
+
+/// The one-shot decision-point message. Deliberately neutral: it names both
+/// outcomes as valid, directs nothing, and says it will not repeat.
+pub(crate) fn delegation_decision_request() -> String {
+    "## Delegation disposition (one-time)\n\
+     Your task decomposition is on record. Decide once, before continuing \
+     implementation: does any remaining piece form a bounded independent \
+     workstream — a clear file/module scope, independently verifiable, needing \
+     little of your in-flight context?\n\
+     - If yes: you may delegate it now via `spawn_agent` with role='worker', a \
+     complete self-contained `task`, and the exact `files` it will own; inspect \
+     and integrate its result when it returns.\n\
+     - If no: keep all the work and continue exactly as you were. KEEP is a \
+     fully valid outcome.\n\
+     This is the only time the harness raises this; you will not be asked again."
+        .to_string()
+}
+
 /// A delegated unit must eventually return control to its parent even if a
 /// provider or tool keeps making progress without reaching a terminal answer.
 /// Parent goal turns are not capped here; only children are, so a hung sub-agent
@@ -513,5 +652,134 @@ mod tests {
     fn nicknames_cycle() {
         assert_eq!(agent_nickname(1), "Euclid");
         assert_eq!(agent_nickname(AGENT_NICKNAMES.len() + 1), "Euclid #2");
+    }
+}
+
+#[cfg(test)]
+mod decision_point_tests {
+    use super::*;
+
+    #[test]
+    fn plan_registration_triggers_one_offer_and_mutations_then_record_keep() {
+        let mut dp = DelegationDecisionPoint::new(true, false);
+        dp.note_plan_registered(2);
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::Offer("plan")],
+            "decomposition on record → one offer"
+        );
+        // Same round as the offer: the model has not read it yet, so a
+        // mutation that raced it in a later round is the KEEP commitment.
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "keep is recorded once, never nagged"
+        );
+    }
+
+    #[test]
+    fn first_mutation_is_the_fallback_trigger_for_plan_less_runs() {
+        let mut dp = DelegationDecisionPoint::new(true, false);
+        dp.note_mutation();
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::Offer("first_mutation")]
+        );
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+    }
+
+    #[test]
+    fn a_single_step_plan_waits_for_the_mutation_fallback() {
+        let mut dp = DelegationDecisionPoint::new(true, false);
+        dp.note_plan_registered(1);
+        assert!(dp.end_round().is_empty(), "one step is not a decomposition");
+        dp.note_mutation();
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::Offer("first_mutation")]
+        );
+    }
+
+    #[test]
+    fn worker_admission_records_delegated_and_suppresses_offer_and_keep() {
+        let mut dp = DelegationDecisionPoint::new(true, false);
+        dp.note_worker_admitted(&["src/a.rs".into(), "src/b.rs".into()]);
+        dp.note_mutation();
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordDelegated(
+                "src/a.rs, src/b.rs".into()
+            )],
+            "a model that already decided is not offered and not marked kept"
+        );
+        dp.note_worker_admitted(&["src/c.rs".into()]);
+        assert!(dp.end_round().is_empty(), "delegated is recorded once");
+    }
+
+    #[test]
+    fn delegation_after_keep_is_still_recorded_as_a_fact() {
+        let mut dp = DelegationDecisionPoint::new(true, false);
+        dp.note_mutation();
+        dp.end_round();
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+        dp.note_worker_admitted(&["src/a.rs".into()]);
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordDelegated("src/a.rs".into())]
+        );
+    }
+
+    #[test]
+    fn children_and_disabled_delegation_are_fully_silent() {
+        for mut dp in [
+            DelegationDecisionPoint::new(false, false),
+            DelegationDecisionPoint::new(false, true),
+        ] {
+            dp.note_plan_registered(5);
+            dp.note_mutation();
+            dp.note_worker_admitted(&["a".into()]);
+            assert!(dp.end_round().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_prior_window_offer_is_never_re_asked() {
+        // Resume: ProgressLedger says the offer already happened. The next
+        // mutation records KEEP; no second offer this epoch.
+        let mut dp = DelegationDecisionPoint::new(true, true);
+        assert!(dp.offered());
+        dp.note_plan_registered(4);
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+    }
+
+    #[test]
+    fn the_request_is_neutral_names_both_outcomes_and_promises_no_repeat() {
+        let text = delegation_decision_request();
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.contains("## delegation disposition"));
+        assert!(lower.contains("spawn_agent") && lower.contains("worker"));
+        assert!(lower.contains("keep is a fully valid outcome"));
+        assert!(lower.contains("not be asked again"));
+        // Forbidden directive framings (gate §5): the decision point asks,
+        // it never steers.
+        for banned in [
+            "you should delegate",
+            "prefer worker",
+            "prefer delegation",
+            "delegate when possible",
+            "always",
+            "parallelize aggressively",
+            "for complex tasks",
+        ] {
+            assert!(
+                !lower.contains(banned),
+                "banned phrase `{banned}` in: {text}"
+            );
+        }
     }
 }

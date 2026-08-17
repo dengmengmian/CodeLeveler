@@ -195,6 +195,13 @@ pub enum AgentEvent {
     /// Host process gate refused `update_goal(complete)` (or similar).
     /// Persisted so resume/UI can show intercept history (not only ToolResult).
     GoalIntercepted { kind: String, detail: String },
+    /// MA-WA1 delegation decision observability. `action`: `offered` (the
+    /// one-shot keep-vs-delegate decision point was injected; `detail` names
+    /// the trigger: `plan` | `first_mutation`), `delegated` (first Worker
+    /// admitted; `detail` = its file scope), `kept` (first mutation after the
+    /// offer with no Worker spawned — a first-class outcome, not a failure).
+    /// Facts only: never a gate, never completion-relevant.
+    DelegationStage { action: String, detail: String },
     /// Full process-evidence ledger snapshot after a mutation/verify/receipt/
     /// intercept change. SoT for resume of Delivery gates (last snapshot wins).
     EvidenceLedgerUpdated { ledger: EvidenceLedger },

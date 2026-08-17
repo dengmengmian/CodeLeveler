@@ -158,6 +158,9 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }
         }
+        EngineEvent::DelegationStage { action, detail } => {
+            AgentEvent::DelegationStage { action, detail }
+        }
         EngineEvent::EvidenceLedgerUpdated { ledger } => {
             AgentEvent::EvidenceLedgerUpdated { ledger }
         }

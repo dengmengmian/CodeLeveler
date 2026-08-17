@@ -275,6 +275,13 @@ pub enum EngineEvent {
         kind: String,
         detail: String,
     },
+    /// MA-WA1 delegation decision fact (`offered` / `delegated` / `kept`).
+    /// Persisted so a KEEP run is distinguishable from a run where delegation
+    /// was never evaluated. `detail` may carry file paths → LocalOnly.
+    DelegationStage {
+        action: String,
+        detail: String,
+    },
     /// The closure-boundary review decision (R013-F1): why a required review
     /// ran, was skipped, or could not be launched. Persisted so "no reviewer"
     /// is always explainable from durable history — the silent-swallow failure
@@ -561,6 +568,7 @@ impl EngineEvent {
             | EngineEvent::RunFinished { .. }
             | EngineEvent::PlanUpdated { .. }
             | EngineEvent::GoalIntercepted { .. }
+            | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
             | EngineEvent::VerificationCheck { .. }
@@ -699,6 +707,7 @@ impl EngineEvent {
             | EngineEvent::RunFinished { .. }
             | EngineEvent::PlanUpdated { .. }
             | EngineEvent::GoalIntercepted { .. }
+            | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
             | EngineEvent::VerificationCheck { .. }
@@ -924,6 +933,9 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
             }
             A::PlanUpdated { steps } => EngineEvent::PlanUpdated { steps },
             A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
+            A::DelegationStage { action, detail } => {
+                EngineEvent::DelegationStage { action, detail }
+            }
             A::EvidenceLedgerUpdated { ledger } => EngineEvent::EvidenceLedgerUpdated { ledger },
             A::ProgressUpdated { ledger } => EngineEvent::ProgressUpdated { ledger },
             A::ContextSnapshot { messages } => EngineEvent::ContextSnapshot {
