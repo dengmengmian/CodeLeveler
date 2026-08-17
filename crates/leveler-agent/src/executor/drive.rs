@@ -1394,91 +1394,99 @@ impl Executor {
                 // requires the AdmittedCall it returns; `parallel` (computed
                 // above) decides deferral to the batch — every other admitted
                 // call runs here, in order.
-                let (content, is_error, image, workspace_snapshot, plan, newly_modified, call) =
-                    match self
-                        .admit(call, ctx, parallel, &mut session_approved, &cancellation)
-                        .await
-                    {
-                        Ok(admitted) if parallel => {
-                            if self.registry.runs_command(&admitted.call.name) {
-                                commands_run += 1;
-                            }
-                            parallel_jobs.push(ParallelJob {
-                                index,
-                                admitted,
-                                loop_key,
-                            });
-                            continue;
+                let (
+                    content,
+                    is_error,
+                    image,
+                    workspace_snapshot,
+                    plan,
+                    newly_modified,
+                    call_mutated,
+                    call,
+                ) = match self
+                    .admit(call, ctx, parallel, &mut session_approved, &cancellation)
+                    .await
+                {
+                    Ok(admitted) if parallel => {
+                        if self.registry.runs_command(&admitted.call.name) {
+                            commands_run += 1;
                         }
-                        Ok(admitted) => {
-                            if self.registry.runs_command(&admitted.call.name) {
-                                commands_run += 1;
-                            }
-                            let files_before = modified_files.clone();
-                            // Heartbeat: while a long command runs, emit a
-                            // CommandProgress every few seconds so the UI shows
-                            // "运行 cargo test · <elapsed>" instead of a bare
-                            // "等待模型". select! keeps this in the same task, so
-                            // calling `observer` from the ticker branch is sound.
-                            let progress_label =
-                                command_progress_label(&self.registry, &admitted.call);
-                            let (content, is_error, image, workspace_snapshot, plan) = {
-                                let started = std::time::Instant::now();
-                                let dispatch_fut =
-                                    self.dispatch(&admitted, &mut modified_files, &cancellation);
-                                tokio::pin!(dispatch_fut);
-                                let mut ticker = tokio::time::interval(
-                                    std::time::Duration::from_secs(COMMAND_HEARTBEAT_SECS),
-                                );
-                                ticker.tick().await; // drop the immediate first tick
-                                loop {
-                                    tokio::select! {
-                                        r = &mut dispatch_fut => break r,
-                                        _ = ticker.tick() => {
-                                            if let Some(label) = &progress_label {
-                                                observer(AgentEvent::CommandProgress {
-                                                    label: label.clone(),
-                                                    elapsed_ms: started.elapsed().as_millis() as u64,
-                                                });
-                                            }
+                        parallel_jobs.push(ParallelJob {
+                            index,
+                            admitted,
+                            loop_key,
+                        });
+                        continue;
+                    }
+                    Ok(admitted) => {
+                        if self.registry.runs_command(&admitted.call.name) {
+                            commands_run += 1;
+                        }
+                        let files_before = modified_files.clone();
+                        // Heartbeat: while a long command runs, emit a
+                        // CommandProgress every few seconds so the UI shows
+                        // "运行 cargo test · <elapsed>" instead of a bare
+                        // "等待模型". select! keeps this in the same task, so
+                        // calling `observer` from the ticker branch is sound.
+                        let progress_label = command_progress_label(&self.registry, &admitted.call);
+                        let (content, is_error, image, workspace_snapshot, plan, call_files) = {
+                            let started = std::time::Instant::now();
+                            let dispatch_fut =
+                                self.dispatch(&admitted, &mut modified_files, &cancellation);
+                            tokio::pin!(dispatch_fut);
+                            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                                COMMAND_HEARTBEAT_SECS,
+                            ));
+                            ticker.tick().await; // drop the immediate first tick
+                            loop {
+                                tokio::select! {
+                                    r = &mut dispatch_fut => break r,
+                                    _ = ticker.tick() => {
+                                        if let Some(label) = &progress_label {
+                                            observer(AgentEvent::CommandProgress {
+                                                label: label.clone(),
+                                                elapsed_ms: started.elapsed().as_millis() as u64,
+                                            });
                                         }
                                     }
                                 }
-                            };
-                            // Cancel during a long tool must stop the batch — do not
-                            // keep running subsequent tools after the user hit Ctrl+C.
-                            // This call's own result still flows through: it ran, so
-                            // its outcome and spend must reach the transcript/ledger.
-                            if cancellation.is_cancelled()
-                                && !deadline_expired.load(Ordering::Acquire)
-                            {
-                                cancelled_mid_batch = true;
                             }
-                            let newly = newly_modified_paths(&files_before, &modified_files);
-                            (
-                                content,
-                                is_error,
-                                image,
-                                workspace_snapshot,
-                                plan,
-                                newly,
-                                admitted.into_call(),
-                            )
+                        };
+                        // Cancel during a long tool must stop the batch — do not
+                        // keep running subsequent tools after the user hit Ctrl+C.
+                        // This call's own result still flows through: it ran, so
+                        // its outcome and spend must reach the transcript/ledger.
+                        if cancellation.is_cancelled() && !deadline_expired.load(Ordering::Acquire)
+                        {
+                            cancelled_mid_batch = true;
                         }
-                        Err(AdmitError::Fatal(error)) => return Err(error),
-                        Err(AdmitError::Refused { call, reason }) => {
-                            denied_calls_this_round += 1;
-                            (
-                                format!("action not permitted: {reason}"),
-                                true,
-                                None,
-                                None,
-                                None,
-                                Vec::new(),
-                                call,
-                            )
-                        }
-                    };
+                        let newly = newly_modified_paths(&files_before, &modified_files);
+                        (
+                            content,
+                            is_error,
+                            image,
+                            workspace_snapshot,
+                            plan,
+                            newly,
+                            !call_files.is_empty(),
+                            admitted.into_call(),
+                        )
+                    }
+                    Err(AdmitError::Fatal(error)) => return Err(error),
+                    Err(AdmitError::Refused { call, reason }) => {
+                        denied_calls_this_round += 1;
+                        (
+                            format!("action not permitted: {reason}"),
+                            true,
+                            None,
+                            None,
+                            None,
+                            Vec::new(),
+                            false,
+                            call,
+                        )
+                    }
+                };
                 if let Some(snapshot) = workspace_snapshot {
                     observer(AgentEvent::WorkspaceSnapshot {
                         call_id: call.id.as_str().to_string(),
@@ -1582,12 +1590,14 @@ impl Executor {
                 }
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.
-                if !is_error && !newly_modified.is_empty() {
-                    if self.registry.mutates_files(&call.name) {
-                        non_observe_success_this_round =
-                            non_observe_success_this_round.saturating_add(1);
+                if !is_error && call_mutated {
+                    if !newly_modified.is_empty() {
+                        if self.registry.mutates_files(&call.name) {
+                            non_observe_success_this_round =
+                                non_observe_success_this_round.saturating_add(1);
+                        }
+                        verification_ran = false;
                     }
-                    verification_ran = false;
                     note_tool_side_effects(
                         &mut ledger,
                         call.id.as_str(),

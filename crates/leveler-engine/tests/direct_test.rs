@@ -1730,3 +1730,463 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
         "the reviewer must not be able to edit the change it is judging"
     );
 }
+
+// ── R011-F1: window progress must recognise refinement ──────────────────────
+//
+// R011 measured: turn 1 touched 9 new files; turns 2–3 touched 0 new files but
+// performed 5 real write operations (compile-fix-test refinement). The window
+// judge counted only modified-file-set growth, so two refinement windows read
+// as no progress and the goal died with `outcome=failed` while work was landing.
+
+fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
+    let mut s = spec(h, VerificationPlan::default());
+    s.runtime.goal = goal.to_string();
+    // UntilTerminal keeps the round budget UNPINNED, so hitting the per-turn
+    // ceiling ends a WORK WINDOW (policy opens the next one), not the goal.
+    s.runtime.continuation = leveler_agent::ContinuationPolicy::UntilTerminal;
+    s.runtime.limits = leveler_agent::StepLimits {
+        max_rounds: Some(rounds_per_window),
+        ..leveler_agent::StepLimits::default()
+    };
+    s
+}
+
+fn patch_add(id: &str, path: &str, line: &str) -> ModelResponse {
+    tool_call(
+        id,
+        "apply_patch",
+        serde_json::json!({
+            "patch": format!("*** Begin Patch\n*** Add File: {path}\n+{line}\n*** End Patch")
+        }),
+    )
+}
+
+fn patch_update(id: &str, path: &str, old: &str, new: &str) -> ModelResponse {
+    tool_call(
+        id,
+        "apply_patch",
+        serde_json::json!({
+            "patch": format!(
+                "*** Begin Patch\n*** Update File: {path}\n-{old}\n+{new}\n*** End Patch"
+            )
+        }),
+    )
+}
+
+fn read_call_named(id: &str, path: &str) -> ModelResponse {
+    tool_call(id, "read_file", serde_json::json!({"path": path}))
+}
+
+/// Refinement windows — real writes to files the goal already touched — are
+/// progress. The goal must survive them and reach its natural finish.
+#[tokio::test]
+async fn refinement_windows_count_as_progress() {
+    let h = harness(vec![
+        // Window 1 (2 rounds): create the file, then read it → round ceiling.
+        patch_add("w1a", "src/feature.rs", "pub fn feature() { /* v1 */ }"),
+        read_call_named("w1b", "src/feature.rs"),
+        // Window 2: REWRITE the same file (no new paths), then read → ceiling.
+        patch_update(
+            "w2a",
+            "src/feature.rs",
+            "pub fn feature() { /* v1 */ }",
+            "pub fn feature() { /* v2 */ }",
+        ),
+        read_call_named("w2b", "src/feature.rs"),
+        // Window 3: rewrite again — still no new paths.
+        patch_update(
+            "w3a",
+            "src/feature.rs",
+            "pub fn feature() { /* v2 */ }",
+            "pub fn feature() { /* v3 */ }",
+        ),
+        read_call_named("w3b", "src/feature.rs"),
+        // Window 4: the model closes the goal out explicitly. (Continued
+        // windows run in goal mode, where bare prose never ends the turn.)
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "refinement done"}),
+        ),
+        // Slack for advisory calls; unused responses are harmless.
+        text("unused"),
+        text("unused"),
+    ])
+    .await;
+    let s = spec_windowed(&h, "add the feature and polish it", 2);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            report.stop_reason,
+            leveler_agent::StopReason::Completed
+                | leveler_agent::StopReason::Answered
+                | leveler_agent::StopReason::CompletedUnverified
+        ),
+        "three windows of real work must reach the natural finish, not a \
+         no-progress kill; got {:?} ({:?})",
+        report.stop_reason,
+        report.outcome,
+    );
+    let file = std::fs::read_to_string(h.dir.path().join("src/feature.rs")).unwrap();
+    assert!(
+        file.contains("v3"),
+        "every refinement window's write must have landed: {file}"
+    );
+}
+
+/// The counter-guard: windows that only re-observe — no mutation, no
+/// verification advancement — must still terminate the goal.
+#[tokio::test]
+async fn pure_observation_windows_still_terminate() {
+    let h = harness(vec![
+        // Window 1: real work.
+        patch_add("s1", "src/feature.rs", "pub fn feature() {}"),
+        read_call_named("s2", "src/feature.rs"),
+        // Windows 2..: nothing but re-reads. The engine must stop granting
+        // windows once the no-progress cap is hit; extra responses stay unused.
+        read_call_named("s3", "src/feature.rs"),
+        read_call_named("s4", "src/feature.rs"),
+        read_call_named("s5", "src/feature.rs"),
+        read_call_named("s6", "src/feature.rs"),
+        read_call_named("s7", "src/feature.rs"),
+        read_call_named("s8", "src/feature.rs"),
+        text("should never be reached"),
+    ])
+    .await;
+    let s = spec_windowed(&h, "add the feature", 2);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::TurnLimitReached,
+        "pure re-observation must exhaust the no-progress cap, not run forever: {:?}",
+        report.stop_reason
+    );
+    assert!(
+        !report.outcome.is_success(),
+        "a goal that stopped making progress must not read as success"
+    );
+}
+
+// ── R011-F2 / R013-F1: reviewer reach and observability ─────────────────────
+
+/// Collect persisted review_stage events for one session.
+async fn review_stage_rows(
+    db: &Database,
+    session: &leveler_core::SessionId,
+) -> Vec<(bool, String, String)> {
+    let store = leveler_storage::EngineStores::from_database(db);
+    let mut out = Vec::new();
+    for row in store.events.load(session).await.unwrap() {
+        if row.event_type == "review_stage"
+            && let Ok(leveler_engine::EngineEvent::ReviewStage {
+                required,
+                action,
+                detail,
+            }) = leveler_engine::EngineEvent::from_payload(&row.payload)
+        {
+            out.push((required, action, detail));
+        }
+    }
+    out
+}
+
+/// R011's accident: a security-shaped, wide diff whose goal dies at the round
+/// ceiling. The review that policy requires must still run before the terminal
+/// fact is written — a failed high-risk change needs eyes more, not less.
+#[tokio::test]
+async fn required_review_runs_even_when_the_goal_fails_at_the_ceiling() {
+    let h = harness(vec![
+        // Window 1 (the only one this spec allows): touch a security path,
+        // then keep "working" until the 2-round ceiling.
+        patch_add("c1", "src/auth.rs", "pub fn login() {}"),
+        read_call_named("c2", "src/auth.rs"),
+        // The reviewer child answers once launched.
+        text("reviewed the auth change: no blocking defect"),
+        text("reviewed the auth change: no blocking defect"),
+        text("unused"),
+    ])
+    .await;
+    let mut s = spec_windowed(&h, "harden the login path", 2);
+    // Pin the round budget so the ceiling is the GOAL terminal (no next window)
+    // — exactly R011's ending, minus the wait.
+    s.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(2);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !report.outcome.is_success(),
+        "the goal still fails — review must not launder a ceiling stop: {:?}",
+        report.outcome
+    );
+    let reviewers = seen
+        .iter()
+        .filter(|e| matches!(e, EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"))
+        .count();
+    assert_eq!(
+        reviewers, 1,
+        "a required review must run before the failed terminal is sealed"
+    );
+}
+
+/// R013's accident, made loud: when the review cannot even be launched, the
+/// failure must persist as a review_stage event — never a silent downgrade.
+struct FailingProfileRuntime {
+    inner: MockRuntime,
+    profile_calls: std::sync::atomic::AtomicUsize,
+    fail_from: usize,
+}
+
+#[async_trait]
+impl ModelRuntime for FailingProfileRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        self.inner.generate(request, cancellation).await
+    }
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.inner.stream(request, cancellation).await
+    }
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        let n = self
+            .profile_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n >= self.fail_from {
+            return Err(ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "profile store unavailable (injected)",
+            ));
+        }
+        self.inner.profile(model).await
+    }
+}
+
+#[tokio::test]
+async fn unlaunchable_review_leaves_a_persisted_trace() {
+    // Same shape as the passing security review, but the reviewer's executor
+    // cannot be built: the SECOND profile fetch (run_review's factory.build)
+    // fails while the main turn's succeeds.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let tool_context = ToolContext::with_environment(
+        workspace,
+        PermissionProfile::Assisted,
+        Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )),
+    );
+    let runtime = Arc::new(FailingProfileRuntime {
+        inner: MockRuntime::new(vec![
+            tool_call(
+                "c1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+                }),
+            ),
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "login added"}),
+            ),
+        ]),
+        profile_calls: std::sync::atomic::AtomicUsize::new(0),
+        fail_from: 1,
+    });
+    let db = Database::connect_in_memory().await.unwrap();
+    let engine = TaskEngine {
+        stores: leveler_storage::EngineStores::from_database(&db),
+        runtime_id: leveler_core::RuntimeId::new("rt-test"),
+        factory: ExecutorFactory {
+            runtime,
+            registry: Arc::new(default_registry()),
+            tool_context,
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: None,
+            work_profile: leveler_agent::WorkProfile::Balanced,
+            memory_index: String::new(),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            grants_state_dir: None,
+            steering: None,
+            allow_delegation: true,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+        supervisor: None,
+    };
+    let s = TaskSpec {
+        runtime: leveler_engine::RuntimeTaskSpec {
+            goal: "add a login entry point".to_string(),
+            kind: ExecutionKind::Direct,
+            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+            limits: leveler_agent::StepLimits::default(),
+        },
+        coding: leveler_engine::CodingTaskSpec {
+            repository: dir.path().to_path_buf(),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            verification: gate("ok", "true"),
+            base_commit: None,
+        },
+    };
+    let session = engine.create_task(&s).await.unwrap();
+    let report = engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::CompletedUnverified,
+        "an unlaunchable required review still refuses Verified"
+    );
+    let stages = review_stage_rows(&db, &session).await;
+    assert!(
+        stages.iter().any(|(req, action, detail)| *req
+            && action == "launch_failed"
+            && detail.contains("profile store unavailable")),
+        "the launch failure must be persisted with its cause — silence was the \
+         R013 defect; got {stages:?}"
+    );
+}
+
+/// The cheap half of observability: even a change that needs no review leaves
+/// an eligibility record, so \"no reviewer\" is always explainable.
+#[tokio::test]
+async fn not_required_review_is_still_recorded() {
+    let h = harness(patch_then_resolve()).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let _ = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    let stages = review_stage_rows(&h.db, &session).await;
+    assert!(
+        stages
+            .iter()
+            .any(|(req, action, _)| !req && action == "not_required"),
+        "eligibility must be evaluated and persisted even when review is not \
+         required; got {stages:?}"
+    );
+}
+
+/// R013r's production finding: an unbounded reviewer burned the FULL 100-round
+/// turn ceiling, and when the ceiling stopped it the synthetic stop sentence
+/// replaced the findings it had already voiced. A reviewer reading a diff must
+/// be cheaply bounded, and a ceilinged review must keep what it established.
+#[tokio::test]
+async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
+    let mut responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "login added"}),
+        ),
+    ];
+    // The reviewer voices a finding in its first round, then wanders: reads
+    // forever without concluding. Without a bound it would consume every
+    // response below; with one it stops early and the finding survives.
+    responses.push(ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::Text {
+                    text: "FINDING: login() accepts empty credentials".to_string(),
+                },
+                ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new("r1"),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path": "src/auth.rs"}),
+                    },
+                },
+            ],
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    });
+    for i in 0..60 {
+        responses.push(tool_call(
+            &format!("r{}", i + 2),
+            "read_file",
+            serde_json::json!({"path": "src/auth.rs"}),
+        ));
+    }
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let _ = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let total_requests = h.requests.lock().unwrap().len();
+    assert!(
+        total_requests <= 30,
+        "a reviewer reading a diff must be bounded, not free to burn the full \
+         turn ceiling: {total_requests} model calls"
+    );
+    let summary = seen
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::SubAgentFinished { summary, .. } => Some(summary.clone()),
+            _ => None,
+        })
+        .expect("the reviewer must reach a terminal event");
+    assert!(
+        summary.contains("FINDING: login() accepts empty credentials"),
+        "a ceilinged review must keep the findings it voiced, not just the \
+         stop sentence: {summary}"
+    );
+}

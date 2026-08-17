@@ -191,6 +191,12 @@ impl Executor {
             epoch_duration_at_start: std::time::Duration::ZERO,
             run_started: std::time::Instant::now(),
         };
+        // R013r: an unbounded reviewer burned the full 100-round turn ceiling
+        // reading a repo it was only asked to judge. Reading a diff is a
+        // bounded job; a reviewer that has not concluded by now returns what
+        // it has (INCOMPLETE_PARTIAL keeps its findings) instead of burning
+        // the parent's budget.
+        const REVIEWER_MAX_ROUNDS: u32 = 20;
         let result = self
             .run_one_sub_agent_on(
                 id,
@@ -198,7 +204,7 @@ impl Executor {
                 files,
                 None,
                 Vec::new(),
-                0,
+                REVIEWER_MAX_ROUNDS,
                 brief,
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 progress_tx,
@@ -370,12 +376,20 @@ impl Executor {
                         | StopReason::CompletedUnverified
                         | StopReason::CloseoutForced
                 );
-                // An interrupted run's `final_text` can be empty even though the
-                // child said something useful earlier; fall back to that.
-                let findings = if outcome.final_text.trim().is_empty() && !completed {
-                    said_before_stopping()
-                } else {
+                // A non-clean stop's `final_text` is usually the SYNTHETIC stop
+                // sentence ("reached the N-round ceiling…"), not the child's
+                // findings — R013r lost a voiced finding to exactly that. For
+                // interrupted runs, prefer what the child actually said; the
+                // stop reason is carried separately.
+                let findings = if completed {
                     outcome.final_text
+                } else {
+                    let said = said_before_stopping();
+                    if said.trim().is_empty() {
+                        outcome.final_text
+                    } else {
+                        said
+                    }
                 };
                 let stop_reason = if completed {
                     String::new()

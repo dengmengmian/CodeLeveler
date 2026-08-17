@@ -493,16 +493,26 @@ impl Executor {
         Option<ContentPart>,
         Option<String>,
         Option<Vec<PlanStep>>,
+        Vec<String>,
     ) {
         let (content, is_error, metadata) = self.dispatch_raw(admitted, cancellation).await;
-        collect_modified(&metadata, modified_files);
+        // The call's own modified paths, BEFORE merging into the epoch set:
+        // a re-edit of an already-modified file is invisible in the merged
+        // list, and the caller needs to know the call mutated at all (R011-F1).
+        let mut call_files = Vec::new();
+        collect_modified(&metadata, &mut call_files);
+        for path in &call_files {
+            if !modified_files.iter().any(|existing| existing == path) {
+                modified_files.push(path.clone());
+            }
+        }
         let image = extract_image(&metadata);
         let snapshot = metadata
             .get("workspace_snapshot")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
         let plan = extract_plan(&metadata);
-        (content, is_error, image, snapshot, plan)
+        (content, is_error, image, snapshot, plan, call_files)
     }
 
     /// Execute one admitted call, returning `(content, is_error, metadata)`

@@ -50,9 +50,21 @@ pub struct EvidenceLedger {
     pub step_receipts: Vec<CompleteStepReceipt>,
     pub intercepts: Vec<InterceptRecord>,
     pub next_seq: u64,
+    /// Every successful mutating tool call, INCLUDING repeat edits of files
+    /// already in the modified set. `mutations` records only first-touch paths
+    /// (its gating semantics are unchanged); this counter exists because R011
+    /// showed that refinement — fixing files you already wrote — was invisible
+    /// to every ledger, so the window judge starved it of progress credit.
+    #[serde(default)]
+    pub total_mutation_ops: u64,
 }
 
 impl EvidenceLedger {
+    /// One successful mutating tool call happened (new paths or a re-edit).
+    pub fn note_mutation_op(&mut self) {
+        self.total_mutation_ops = self.total_mutation_ops.saturating_add(1);
+    }
+
     pub fn last_mutation_seq(&self) -> u64 {
         self.mutations.last().map(|m| m.seq).unwrap_or(0)
     }
