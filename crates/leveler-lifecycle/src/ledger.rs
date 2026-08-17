@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::findings::{FindingError, FindingKind, FindingRecord, FindingState, transition_allowed};
 use crate::plan::PlanState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +58,13 @@ pub struct EvidenceLedger {
     /// to every ledger, so the window judge starved it of progress credit.
     #[serde(default)]
     pub total_mutation_ops: u64,
+    /// Durable multi-agent findings (self-reported and adopted from children).
+    /// Serde-default so pre-findings snapshots still replay.
+    #[serde(default)]
+    pub findings: Vec<FindingRecord>,
+    /// Monotonic id source for findings owned by THIS ledger.
+    #[serde(default)]
+    pub next_finding_seq: u64,
 }
 
 impl EvidenceLedger {
@@ -161,6 +169,116 @@ impl EvidenceLedger {
         });
     }
 
+    /// Record a finding this agent itself established (state `Created`).
+    /// Returns the assigned id.
+    pub fn record_finding(
+        &mut self,
+        kind: FindingKind,
+        summary: impl Into<String>,
+        file: Option<String>,
+        symbol: Option<String>,
+        blocking: bool,
+    ) -> String {
+        self.next_finding_seq = self.next_finding_seq.saturating_add(1);
+        let id = format!("f-{}", self.next_finding_seq);
+        self.findings.push(FindingRecord {
+            id: id.clone(),
+            source_child: String::new(),
+            role: String::new(),
+            kind,
+            summary: summary.into(),
+            file,
+            symbol,
+            blocking,
+            state: FindingState::Created,
+            resolution_reason: None,
+        });
+        id
+    }
+
+    /// Adopt a child's finding into this (parent) ledger. Adoption re-keys the
+    /// id and lands the record at `Acknowledged` — receipt is not judgment.
+    /// Returns the parent-side id.
+    pub fn adopt_finding(
+        &mut self,
+        source_child: &str,
+        role: &str,
+        rec: &FindingRecord,
+    ) -> String {
+        self.next_finding_seq = self.next_finding_seq.saturating_add(1);
+        let id = format!("f-{}", self.next_finding_seq);
+        self.findings.push(FindingRecord {
+            id: id.clone(),
+            source_child: source_child.to_string(),
+            role: role.to_string(),
+            state: FindingState::Acknowledged,
+            ..rec.clone()
+        });
+        id
+    }
+
+    /// Apply a parent judgment to one finding. `Rejected` requires a reason;
+    /// `Addressed` is host-promoted straight on to `Verified` when fresh
+    /// post-mutation verification already exists. Returns the final state.
+    pub fn resolve_finding(
+        &mut self,
+        id: &str,
+        to: FindingState,
+        reason: Option<&str>,
+        has_fresh_verify: bool,
+    ) -> Result<FindingState, FindingError> {
+        let rec = self
+            .findings
+            .iter_mut()
+            .find(|f| f.id == id)
+            .ok_or_else(|| FindingError::UnknownId(id.to_string()))?;
+        if !transition_allowed(rec.state, to) {
+            return Err(FindingError::IllegalTransition {
+                from: rec.state,
+                to,
+            });
+        }
+        if to == FindingState::Rejected {
+            let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+            let Some(reason) = reason else {
+                return Err(FindingError::RejectNeedsReason);
+            };
+            rec.resolution_reason = Some(reason.to_string());
+        }
+        rec.state = to;
+        // Host promotion, never a model claim: an addressed finding becomes
+        // verified only on the strength of fresh post-mutation verification.
+        if to == FindingState::Addressed && has_fresh_verify {
+            rec.state = FindingState::Verified;
+        }
+        Ok(rec.state)
+    }
+
+    /// Promote every `Addressed` finding to `Verified` once fresh
+    /// post-mutation verification exists. Returns how many were promoted.
+    pub fn promote_addressed_findings(&mut self, has_fresh_verify: bool) -> usize {
+        if !has_fresh_verify {
+            return 0;
+        }
+        let mut promoted = 0;
+        for rec in &mut self.findings {
+            if rec.state == FindingState::Addressed {
+                rec.state = FindingState::Verified;
+                promoted += 1;
+            }
+        }
+        promoted
+    }
+
+    /// Findings that still stand in the way of a verified closure.
+    pub fn open_blocking_findings(&self) -> Vec<&FindingRecord> {
+        self.findings.iter().filter(|f| f.open_blocking()).collect()
+    }
+
+    pub fn finding(&self, id: &str) -> Option<&FindingRecord> {
+        self.findings.iter().find(|f| f.id == id)
+    }
+
     pub fn normalize_command_fingerprint(program: &str, args: &[String]) -> String {
         let mut parts = vec![program.trim().to_string()];
         parts.extend(args.iter().map(|a| a.trim().to_string()));
@@ -233,5 +351,190 @@ mod tests {
         led.record_verify("c1", "vitest run repro", 1);
         assert!(led.baseline_green_verifications().is_empty());
         assert!(!led.only_baseline_green_evidence());
+    }
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+    use crate::findings::{FindingError, FindingKind, FindingState};
+
+    fn child_finding(led: &mut EvidenceLedger, blocking: bool) -> FindingRecord {
+        let id = led.record_finding(
+            FindingKind::Correctness,
+            "boundary check missing",
+            Some("src/auth.rs".into()),
+            None,
+            blocking,
+        );
+        led.finding(&id).expect("recorded").clone()
+    }
+
+    #[test]
+    fn recording_assigns_stable_monotonic_ids_and_created_state() {
+        let mut led = EvidenceLedger::default();
+        let a = led.record_finding(FindingKind::Risk, "r1", None, None, false);
+        let b = led.record_finding(FindingKind::Test, "r2", None, None, false);
+        assert_ne!(a, b);
+        assert_eq!(a, "f-1");
+        assert_eq!(b, "f-2");
+        let rec = led.finding(&a).expect("recorded finding is queryable");
+        assert_eq!(rec.state, FindingState::Created);
+        assert_eq!(rec.summary, "r1");
+    }
+
+    #[test]
+    fn adoption_rekeys_and_lands_at_acknowledged() {
+        let mut child = EvidenceLedger::default();
+        let rec = child_finding(&mut child, true);
+        let mut parent = EvidenceLedger::default();
+        // Parent already owns a finding — child ids must not collide.
+        parent.record_finding(FindingKind::Observation, "mine", None, None, false);
+        let pid = parent.adopt_finding("agent-2", "reviewer", &rec);
+        assert_eq!(pid, "f-2", "adoption uses the PARENT id sequence");
+        let adopted = parent.finding(&pid).expect("adopted");
+        assert_eq!(adopted.state, FindingState::Acknowledged);
+        assert_eq!(adopted.source_child, "agent-2");
+        assert_eq!(adopted.role, "reviewer");
+        assert_eq!(adopted.summary, rec.summary);
+        assert!(adopted.blocking, "blocking survives adoption");
+    }
+
+    #[test]
+    fn resolution_walks_the_audited_lifecycle() {
+        let mut led = EvidenceLedger::default();
+        let rec = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let id = led.adopt_finding("agent-1", "reviewer", &rec);
+        assert_eq!(
+            led.resolve_finding(&id, FindingState::Accepted, None, false),
+            Ok(FindingState::Accepted)
+        );
+        assert_eq!(
+            led.resolve_finding(&id, FindingState::Addressed, None, false),
+            Ok(FindingState::Addressed)
+        );
+        // No fresh verification yet: it stays addressed and still blocks.
+        assert_eq!(led.open_blocking_findings().len(), 1);
+        assert_eq!(led.promote_addressed_findings(false), 0);
+        assert_eq!(led.promote_addressed_findings(true), 1);
+        assert_eq!(
+            led.finding(&id).unwrap().state,
+            FindingState::Verified,
+            "fresh green verification promotes addressed findings"
+        );
+        assert!(led.open_blocking_findings().is_empty());
+    }
+
+    #[test]
+    fn addressing_with_fresh_verification_promotes_immediately() {
+        let mut led = EvidenceLedger::default();
+        let rec = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let id = led.adopt_finding("agent-1", "reviewer", &rec);
+        led.resolve_finding(&id, FindingState::Accepted, None, false)
+            .unwrap();
+        assert_eq!(
+            led.resolve_finding(&id, FindingState::Addressed, None, true),
+            Ok(FindingState::Verified)
+        );
+    }
+
+    #[test]
+    fn rejection_requires_a_reason_and_is_durable() {
+        let mut led = EvidenceLedger::default();
+        let rec = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let id = led.adopt_finding("agent-1", "reviewer", &rec);
+        assert_eq!(
+            led.resolve_finding(&id, FindingState::Rejected, None, false),
+            Err(FindingError::RejectNeedsReason)
+        );
+        assert_eq!(
+            led.resolve_finding(&id, FindingState::Rejected, Some("stale diff"), false),
+            Ok(FindingState::Rejected)
+        );
+        let rec = led.finding(&id).unwrap();
+        assert_eq!(rec.resolution_reason.as_deref(), Some("stale diff"));
+        assert!(!rec.open_blocking(), "a rejected finding no longer blocks");
+    }
+
+    #[test]
+    fn illegal_jumps_are_refused_with_the_states_named() {
+        let mut led = EvidenceLedger::default();
+        let rec = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, false)
+        };
+        let id = led.adopt_finding("agent-1", "explorer", &rec);
+        // Acknowledged -> Addressed skips judgment.
+        assert_eq!(
+            led.resolve_finding(&id, FindingState::Addressed, None, false),
+            Err(FindingError::IllegalTransition {
+                from: FindingState::Acknowledged,
+                to: FindingState::Addressed,
+            })
+        );
+        // The model can never write Verified directly.
+        assert_eq!(
+            led.resolve_finding(&id, FindingState::Verified, None, true),
+            Err(FindingError::IllegalTransition {
+                from: FindingState::Acknowledged,
+                to: FindingState::Verified,
+            })
+        );
+        assert_eq!(
+            led.resolve_finding("f-99", FindingState::Accepted, None, false),
+            Err(FindingError::UnknownId("f-99".into()))
+        );
+    }
+
+    #[test]
+    fn open_blocking_ignores_non_blocking_and_settled_findings() {
+        let mut led = EvidenceLedger::default();
+        let blocking = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let plain = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, false)
+        };
+        let b = led.adopt_finding("agent-1", "reviewer", &blocking);
+        led.adopt_finding("agent-1", "explorer", &plain);
+        assert_eq!(led.open_blocking_findings().len(), 1);
+        led.resolve_finding(&b, FindingState::Rejected, Some("not reachable"), false)
+            .unwrap();
+        assert!(led.open_blocking_findings().is_empty());
+    }
+
+    /// The replay contract: a pre-findings snapshot deserializes with empty
+    /// findings, and a snapshot with findings restores states exactly.
+    #[test]
+    fn ledger_snapshots_replay_findings_state() {
+        let mut led = EvidenceLedger::default();
+        let rec = {
+            let mut child = EvidenceLedger::default();
+            child_finding(&mut child, true)
+        };
+        let id = led.adopt_finding("agent-1", "reviewer", &rec);
+        led.resolve_finding(&id, FindingState::Accepted, None, false)
+            .unwrap();
+        let json = serde_json::to_string(&led).unwrap();
+        let back: EvidenceLedger = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.finding(&id).unwrap().state, FindingState::Accepted);
+        assert_eq!(back.next_finding_seq, led.next_finding_seq);
+
+        let legacy: EvidenceLedger = serde_json::from_str(
+            r#"{"plan":{"steps":[],"origin":"model"},"mutations":[],"verifications":[],"step_receipts":[],"intercepts":[],"next_seq":0}"#,
+        )
+        .unwrap();
+        assert!(legacy.findings.is_empty());
     }
 }
