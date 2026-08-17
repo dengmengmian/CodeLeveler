@@ -563,7 +563,7 @@ impl TurnRunner<'_> {
             .append(
                 None,
                 EngineEvent::SubAgentFinished {
-                    id,
+                    id: id.clone(),
                     nickname: "reviewer".to_string(),
                     ok: result.ok,
                     summary: leveler_core::truncate_head_bytes(
@@ -575,6 +575,23 @@ impl TurnRunner<'_> {
                 observer,
             )
             .await?;
+        // Unified findings: the reviewer's typed findings are adopted into the
+        // session's durable ledger at Acknowledged (receipt is not judgment),
+        // through the SAME EvidenceLedgerUpdated snapshot every other ledger
+        // change persists through. Partial findings from an incomplete
+        // reviewer are adopted too — that is the point of typing them.
+        if !result.findings.is_empty() {
+            let mut ledger =
+                last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
+                    .await?
+                    .unwrap_or_default();
+            for finding in &result.findings {
+                ledger.adopt_finding(&id, "reviewer", finding);
+            }
+            self.log
+                .append(None, EngineEvent::EvidenceLedgerUpdated { ledger }, observer)
+                .await?;
+        }
         Ok(result.ok)
     }
 }
