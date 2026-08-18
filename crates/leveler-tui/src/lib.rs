@@ -14,6 +14,7 @@
 
 pub mod action;
 mod activity_stream;
+mod brand;
 mod code_block;
 pub mod composer;
 pub mod conversation;

@@ -113,6 +113,9 @@ pub struct CloseoutInput<'a> {
     pub can_continue: bool,
     /// Nudges left in the shared per-turn budget.
     pub budget_remaining: u8,
+    /// The user explicitly denied a permission this task epoch.
+    /// Harness must not buy extra model rounds to pressure past that boundary.
+    pub human_boundary_seen: bool,
 }
 
 /// Decide the fate of one quiet round. At most one nudge per round, chosen by
@@ -130,6 +133,17 @@ pub fn decide(input: &CloseoutInput) -> CloseoutAction {
     let Some(reason) = candidate else {
         return CloseoutAction::Finish;
     };
+    // Human denial is authoritative: the model may adapt on its own next
+    // tool-using round, but the harness must not inject GoalUnresolved
+    // pressure after the user said no. Empty-answer still gets one chance
+    // (the model said nothing at all).
+    if input.human_boundary_seen && reason == CloseoutReason::GoalUnresolved {
+        return if input.goal_mode {
+            CloseoutAction::Stall(reason)
+        } else {
+            CloseoutAction::Finish
+        };
+    }
     if input.can_continue && input.budget_remaining > 0 {
         CloseoutAction::NudgeOnce(reason)
     } else if input.goal_mode {
@@ -178,7 +192,40 @@ mod tests {
             cancelled: false,
             can_continue: true,
             budget_remaining: CLOSEOUT_NUDGE_BUDGET,
+            human_boundary_seen: false,
         }
+    }
+
+    #[test]
+    fn human_denial_blocks_goal_unresolved_nudge() {
+        let impact = quiet_impact();
+        let mut i = input(&impact);
+        i.goal_mode = true;
+        i.human_boundary_seen = true;
+        assert_eq!(
+            decide(&i),
+            CloseoutAction::Stall(CloseoutReason::GoalUnresolved),
+            "goal + human denial + quiet must not buy another model round"
+        );
+
+        i.goal_mode = false;
+        assert_eq!(
+            decide(&i),
+            CloseoutAction::Finish,
+            "chat + human denial + quiet yields to the user"
+        );
+    }
+
+    #[test]
+    fn human_denial_still_allows_empty_answer_nudge() {
+        let impact = quiet_impact();
+        let mut i = input(&impact);
+        i.human_boundary_seen = true;
+        i.has_final_text = false;
+        assert_eq!(
+            decide(&i),
+            CloseoutAction::NudgeOnce(CloseoutReason::EmptyAnswer)
+        );
     }
 
     #[test]

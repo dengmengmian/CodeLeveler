@@ -298,8 +298,18 @@ impl TurnContext {
         }
         rules.push_str(
             "- If the user denies an approval, that answer is final: do NOT reach for another \
-             tool, a script, or a shell trick to accomplish the same thing. Report what you \
-             could not do and carry on with the rest of the task.",
+             tool, a script, or a shell trick to accomplish the same thing. Continue with \
+             already-available capabilities. If you need the user to run a command or paste \
+             output, call request_user_input — do not only write that request in prose and \
+             keep going. Do not request the same or a broader permission again.\n",
+        );
+        rules.push_str(
+            "- Diagnosis: separate confirmed facts from speculation. A sandbox reproduction \
+             is not a host reproduction. A CONNECT 502 is not proof the sandbox blocked \
+             the network unless a policy denial said so. A SQLite readonly error is not \
+             proof of a leftover process lock. Do not recommend destructive first steps \
+             (pkill -f, deleting WAL/SHM, chmod of large trees) without direct evidence; \
+             inspect safely first, then ask the user to verify host state you cannot see.",
         );
         rules
     }
@@ -767,6 +777,29 @@ mod tests {
         assert!(
             prompt.contains("do NOT reach for another tool"),
             "denial must not be routed around"
+        );
+        assert!(
+            prompt.contains("request_user_input"),
+            "denial that needs the user must use the structured wait"
+        );
+    }
+
+    #[test]
+    fn diagnosis_must_not_overclaim_or_lead_with_destruction() {
+        let prompt = PromptBuilder::new()
+            .turn_context(context(PermissionProfile::Assisted, false))
+            .build();
+        assert!(
+            prompt.contains("sandbox reproduction"),
+            "sandbox vs host must be named: {prompt}"
+        );
+        assert!(
+            prompt.contains("pkill -f"),
+            "destructive remediations must be called out: {prompt}"
+        );
+        assert!(
+            prompt.contains("direct evidence"),
+            "must require evidence before destructive steps"
         );
     }
 

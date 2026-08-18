@@ -76,6 +76,17 @@ impl SupervisorPolicy for DefaultSupervisorPolicy {
         {
             return Continuation::DriveGoalAgain;
         }
+        // Human denial is already in allows_engine_continue; Blocked never
+        // continues. Keep TurnLimitReached from opening a new window that
+        // would re-ask a permission the user just refused.
+        if ended.progress.human_boundary_seen()
+            && matches!(
+                ended.stop_reason,
+                StopReason::Stalled | StopReason::TurnLimitReached
+            )
+        {
+            return Continuation::Stop;
+        }
         // The per-turn round ceiling ends a WORK WINDOW, not the goal: open the
         // next bounded window (a fresh objective-restated turn), unless the goal
         // has been spinning without material workspace progress across windows.
@@ -154,6 +165,25 @@ mod tests {
             closing: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn human_denial_stops_stalled_and_turn_limit_continuation() {
+        let mut progress = active();
+        progress.record_human_denial(false, true);
+        let policy = DefaultSupervisorPolicy::default();
+        assert_eq!(
+            policy.after_turn(&ended(StopReason::Stalled, &progress, &[], None)),
+            Continuation::Stop
+        );
+        assert_eq!(
+            policy.after_turn(&ended(StopReason::TurnLimitReached, &progress, &[], None)),
+            Continuation::Stop
+        );
+        assert_eq!(
+            policy.after_turn(&ended(StopReason::Blocked, &progress, &[], None)),
+            Continuation::Stop
+        );
     }
 
     #[test]

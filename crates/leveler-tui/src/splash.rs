@@ -1,12 +1,13 @@
-//! Conversation empty-state: a terminal-native hero card.
+//! Conversation empty-state: a terminal-native brand hero card.
 //!
 //! Shown only while Conversation has no real work. First real message hides
-//! it. Copy comes from [`UiText`]; command descriptions reuse slash briefs.
+//! it. Copy comes from [`UiText`]; the Level Mark comes from [`crate::brand`].
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use crate::brand::{BrandMarkSize, BrandStyles, level_mark, level_mark_width, paint_mark_row};
 use crate::i18n::UiText;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -16,12 +17,17 @@ use crate::transcript::TranscriptItem;
 const TIP_COMMANDS: &[&str] = &["/feature-dev", "/model", "/help"];
 
 const CTA_CARET: &str = "› ";
+const WORDMARK: &str = "CodeLeveler";
 
-const PREFERRED_BOX_W: usize = 78;
+const PREFERRED_BOX_W: usize = 80;
+const PREFERRED_BOX_H: usize = 16;
 const MIN_BOX_W: usize = 56;
-const MAX_BOX_W: usize = 84;
-const H_MARGIN: usize = 2;
+const MAX_BOX_W: usize = 86;
+const WIDE_H_MARGIN: usize = 4;
+const NARROW_H_MARGIN: usize = 2;
 const INNER_PAD_X: usize = 2;
+const WIDE_GAP: usize = 5;
+const WIDE_CONTENT_W: usize = 42;
 
 /// Whether Conversation is still empty of real turns (welcome/btw ignored).
 pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
@@ -55,7 +61,7 @@ pub(crate) fn splash_lines(
     let sty = SplashStyle::from_theme(theme);
 
     let version_s = state.version();
-    let brand_text = format!("CodeLeveler  v{version_s}");
+    let brand_text = format!("{WORDMARK}  v{version_s}");
     let name_col = command_name_col();
     let extras = untrusted_extras(state, t);
     let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
@@ -66,59 +72,78 @@ pub(crate) fn splash_lines(
         return fallback_stack(&brand_text, t, name_col, width, &sty);
     }
 
-    let mascot = match mode {
-        Mode::Wide => Some(MascotKind::Wide),
-        Mode::Medium => Some(MascotKind::Medium),
-        Mode::Narrow => Some(MascotKind::Mark),
-        Mode::Stack => None,
+    let h_margin = match mode {
+        Mode::Wide => WIDE_H_MARGIN,
+        Mode::Medium | Mode::Narrow | Mode::Stack => NARROW_H_MARGIN,
     };
-    let (mascot_rows, mascot_w) = mascot
-        .map(|k| (k.rows(), k.width()))
-        .unwrap_or((&[] as &[MascotRow], 0));
     let gap = match mode {
-        Mode::Wide => 3,
+        Mode::Wide => WIDE_GAP,
         Mode::Medium => 2,
         Mode::Narrow | Mode::Stack => 2,
     };
+    let mark_size = match mode {
+        Mode::Wide => Some(BrandMarkSize::Master),
+        Mode::Medium => Some(BrandMarkSize::Compact),
+        Mode::Narrow => Some(BrandMarkSize::Micro),
+        Mode::Stack => None,
+    };
 
-    let chrome = 2 + INNER_PAD_X * 2; // │…│ plus inner pads
-    let inner_needed = mascot_w.saturating_add(gap).saturating_add(right_needed);
+    let chrome = 2 + INNER_PAD_X * 2;
     let mut box_w = PREFERRED_BOX_W
-        .min(width.saturating_sub(H_MARGIN))
-        .clamp(MIN_BOX_W.min(width.saturating_sub(H_MARGIN)), MAX_BOX_W);
-    box_w = box_w.max((inner_needed + chrome).min(MAX_BOX_W));
-    box_w = box_w.min(width.saturating_sub(H_MARGIN));
+        .min(width.saturating_sub(h_margin))
+        .clamp(MIN_BOX_W.min(width.saturating_sub(h_margin)), MAX_BOX_W);
+    box_w = box_w.min(width.saturating_sub(h_margin));
     if box_w < 20 {
         return fallback_stack(&brand_text, t, name_col, width, &sty);
     }
 
     let inner = box_w.saturating_sub(2);
     let content_budget = inner.saturating_sub(INNER_PAD_X * 2);
-    let right_w = content_budget
-        .saturating_sub(mascot_w)
-        .saturating_sub(if mascot_w > 0 { gap } else { 0 });
+
+    // Wordmark always beats the graphic. Hide the mark when it would clip copy.
+    let mark_size = mark_size.filter(|size| {
+        let mark_w = level_mark_width(*size);
+        mark_w + gap + right_needed <= content_budget
+    });
+    let (mark_rows, mark_w) = match mark_size {
+        Some(size) => (level_mark(size), level_mark_width(size)),
+        None => (&[] as &[_], 0),
+    };
+
+    let inner_needed = mark_w.saturating_add(gap).saturating_add(right_needed);
+    box_w = box_w.max((inner_needed + chrome).min(MAX_BOX_W));
+    box_w = box_w.min(width.saturating_sub(h_margin));
+    if box_w < 20 {
+        return fallback_stack(&brand_text, t, name_col, width, &sty);
+    }
+
+    let inner = box_w.saturating_sub(2);
+    let content_budget = inner.saturating_sub(INNER_PAD_X * 2);
+    let content_w = hero_content_width(mode, right_needed, content_budget, mark_w, gap);
+    let group_w = mark_w + if mark_w > 0 { gap } else { 0 } + content_w;
+    let group_left = content_budget.saturating_sub(group_w) / 2;
     let box_left_pad = width.saturating_sub(box_w) / 2;
     let show_section_gap = height >= 14;
 
     let mut right: Vec<Vec<Span<'static>>> = Vec::new();
     right.push(vec![
-        Span::styled("CodeLeveler".to_string(), sty.brand),
+        Span::styled(WORDMARK.to_string(), sty.brand),
         Span::styled(format!("  v{version_s}"), sty.version),
     ]);
     right.push(vec![Span::styled(
-        truncate_w(t.splash_tagline, right_w),
+        truncate_w(t.splash_tagline, content_w),
         sty.tagline,
     )]);
     if show_section_gap {
         right.push(Vec::new());
     }
-    right.push(cta_spans(t, right_w, &sty));
+    right.push(cta_spans(t, content_w, &sty));
     if show_section_gap {
         right.push(Vec::new());
     }
     for name in TIP_COMMANDS {
         let label = crate::screen::slash_popup_label(name, t);
-        let label = truncate_w(label, right_w.saturating_sub(name_col));
+        let label = truncate_w(label, content_w.saturating_sub(name_col));
         right.push(vec![
             Span::styled(pad_to(name, name_col), sty.cmd),
             Span::styled(label, sty.desc),
@@ -127,61 +152,86 @@ pub(crate) fn splash_lines(
     if show_section_gap {
         right.push(Vec::new());
     }
-    right.push(vec![Span::styled(
-        truncate_w(t.splash_more_commands, right_w),
-        sty.muted,
-    )]);
+    right.push(more_spans(t.splash_more_commands, content_w, &sty));
 
     if !state.untrusted_config.is_empty() {
         let warn = Style::default().fg(theme.status.warning);
         right.push(Vec::new());
         right.push(vec![Span::styled(
-            truncate_w(&format!("⚠ {}", t.untrusted_config_title), right_w),
+            truncate_w(&format!("⚠ {}", t.untrusted_config_title), content_w),
             warn,
         )]);
         for path in &state.untrusted_config {
             right.push(vec![Span::styled(
-                truncate_w(&format!("  {path}"), right_w),
+                truncate_w(&format!("  {path}"), content_w),
                 sty.muted,
             )]);
         }
         right.push(vec![Span::styled(
-            truncate_w(t.untrusted_config_hint, right_w),
+            truncate_w(t.untrusted_config_hint, content_w),
             sty.muted,
         )]);
     }
 
-    let body_rows = right.len().max(mascot_rows.len());
+    let body_rows = right.len().max(mark_rows.len());
     while right.len() < body_rows {
         right.push(Vec::new());
     }
 
-    let show_vpad = height >= 16;
-    let mut out = Vec::new();
-    out.push(border_line("╭", "╮", box_w, box_left_pad, sty.border));
-    if show_vpad {
-        out.push(blank_row(box_w, box_left_pad, sty.border));
-    }
+    let mut body = Vec::new();
     for (i, right_spans) in right.into_iter().enumerate() {
-        let mascot_spans = mascot_rows
+        let mark_spans = mark_rows
             .get(i)
-            .map(|row| paint_mascot_row(row, &sty))
+            .map(|row| paint_mark_row(row, sty.mark))
             .unwrap_or_default();
-        out.push(content_row(
-            mascot_spans,
-            mascot_w,
+        body.push(hero_row(
+            mark_spans,
+            mark_w,
             gap,
             right_spans,
-            right_w,
+            content_w,
+            group_left,
             box_left_pad,
+            box_w,
             &sty,
         ));
     }
-    if show_vpad {
+
+    let min_h = body.len() + 2;
+    let box_h = PREFERRED_BOX_H.min(height.max(min_h)).max(min_h);
+    let extra = box_h.saturating_sub(2).saturating_sub(body.len());
+    let vpad_top = extra / 2;
+    let vpad_bot = extra - vpad_top;
+
+    let mut out = Vec::new();
+    out.push(border_line("╭", "╮", box_w, box_left_pad, sty.border));
+    for _ in 0..vpad_top {
+        out.push(blank_row(box_w, box_left_pad, sty.border));
+    }
+    out.extend(body);
+    for _ in 0..vpad_bot {
         out.push(blank_row(box_w, box_left_pad, sty.border));
     }
     out.push(border_line("╰", "╯", box_w, box_left_pad, sty.border));
     out
+}
+
+fn hero_content_width(
+    mode: Mode,
+    needed: usize,
+    budget: usize,
+    mark_w: usize,
+    gap: usize,
+) -> usize {
+    let reserved = mark_w + if mark_w > 0 { gap } else { 0 };
+    let max_fit = budget.saturating_sub(reserved);
+    if max_fit == 0 {
+        return 0;
+    }
+    match mode {
+        Mode::Wide => WIDE_CONTENT_W.min(max_fit),
+        Mode::Medium | Mode::Narrow | Mode::Stack => needed.min(max_fit),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +263,19 @@ fn cta_spans(t: &UiText, right_w: usize, sty: &SplashStyle) -> Vec<Span<'static>
     ]
 }
 
+fn more_spans(text: &str, right_w: usize, sty: &SplashStyle) -> Vec<Span<'static>> {
+    let clipped = truncate_w(text, right_w);
+    if let Some(i) = clipped.find('/') {
+        vec![
+            Span::styled(clipped[..i].to_string(), sty.muted),
+            Span::styled("/".to_string(), sty.caret),
+            Span::styled(clipped[i + 1..].to_string(), sty.muted),
+        ]
+    } else {
+        vec![Span::styled(clipped, sty.muted)]
+    }
+}
+
 fn untrusted_extras(state: &AppState, t: &UiText) -> Vec<String> {
     if state.untrusted_config.is_empty() {
         return Vec::new();
@@ -233,10 +296,7 @@ struct SplashStyle {
     cmd: Style,
     desc: Style,
     border: Style,
-    fur: Style,
-    dark: Style,
-    face: Style,
-    detail: Style,
+    mark: BrandStyles,
 }
 
 impl SplashStyle {
@@ -255,182 +315,9 @@ impl SplashStyle {
             cmd: Style::default().fg(theme.accent.primary),
             desc: Style::default().fg(theme.text.secondary),
             border: Style::default().fg(theme.border.subtle),
-            fur: Style::default().fg(theme.mascot.fur),
-            dark: Style::default().fg(theme.mascot.dark),
-            face: Style::default().fg(theme.mascot.face),
-            detail: Style::default().fg(theme.mascot.detail),
+            mark: BrandStyles::from_theme(theme),
         }
     }
-
-    fn ink(&self, ink: Ink) -> Style {
-        match ink {
-            Ink::Fur => self.fur,
-            Ink::Dark => self.dark,
-            Ink::Face => self.face,
-            Ink::Detail => self.detail,
-            Ink::Brand => self.brand,
-            Ink::Blank => Style::default(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Ink {
-    Fur,
-    Dark,
-    Face,
-    Detail,
-    Brand,
-    Blank,
-}
-
-#[derive(Clone, Copy)]
-struct MascotSpan {
-    text: &'static str,
-    ink: Ink,
-}
-
-type MascotRow = &'static [MascotSpan];
-
-#[derive(Clone, Copy)]
-enum MascotKind {
-    Wide,
-    Medium,
-    Mark,
-}
-
-impl MascotKind {
-    fn rows(self) -> &'static [MascotRow] {
-        match self {
-            Self::Wide => MASCOT_WIDE,
-            Self::Medium => MASCOT_MEDIUM,
-            Self::Mark => MASCOT_MARK,
-        }
-    }
-
-    fn width(self) -> usize {
-        self.rows()
-            .iter()
-            .map(|row| row.iter().map(|s| disp_w(s.text)).sum())
-            .max()
-            .unwrap_or(0)
-    }
-}
-
-/// 14×8 red-panda mark. Rows are display-width aligned.
-const MASCOT_WIDE: &[MascotRow] = &[
-    &[
-        sp("    ", Ink::Blank),
-        sp("▄▄██▄▄", Ink::Fur),
-        sp("    ", Ink::Blank),
-    ],
-    &[
-        sp("  ", Ink::Blank),
-        sp("▄████████▄", Ink::Fur),
-        sp("  ", Ink::Blank),
-    ],
-    &[
-        sp(" ", Ink::Blank),
-        sp("██", Ink::Fur),
-        sp(" ", Ink::Blank),
-        sp("▀████▀", Ink::Dark),
-        sp(" ", Ink::Blank),
-        sp("██", Ink::Fur),
-        sp(" ", Ink::Blank),
-    ],
-    &[
-        sp(" ", Ink::Blank),
-        sp("██", Ink::Fur),
-        sp("  ", Ink::Blank),
-        sp("•", Ink::Detail),
-        sp("  ", Ink::Blank),
-        sp("•", Ink::Detail),
-        sp("  ", Ink::Blank),
-        sp("██", Ink::Fur),
-        sp(" ", Ink::Blank),
-    ],
-    &[
-        sp("  ", Ink::Blank),
-        sp("█▄", Ink::Fur),
-        sp("  ", Ink::Blank),
-        sp("▽", Ink::Face),
-        sp("  ", Ink::Blank),
-        sp("▄█", Ink::Fur),
-        sp("   ", Ink::Blank),
-    ],
-    &[
-        sp("   ", Ink::Blank),
-        sp("▀██████▀", Ink::Fur),
-        sp("   ", Ink::Blank),
-    ],
-    &[
-        sp("  ", Ink::Blank),
-        sp("▄██▀", Ink::Fur),
-        sp("  ", Ink::Blank),
-        sp("▀██▄", Ink::Fur),
-        sp("  ", Ink::Blank),
-    ],
-    &[
-        sp("    ", Ink::Blank),
-        sp("╲", Ink::Fur),
-        sp(" ", Ink::Blank),
-        sp("CL", Ink::Brand),
-        sp(" ", Ink::Blank),
-        sp("╱", Ink::Fur),
-        sp("    ", Ink::Blank),
-    ],
-];
-
-/// 10×6 compact variant.
-const MASCOT_MEDIUM: &[MascotRow] = &[
-    &[
-        sp("  ", Ink::Blank),
-        sp("▄▄██▄▄", Ink::Fur),
-        sp("  ", Ink::Blank),
-    ],
-    &[sp("▄████████▄", Ink::Fur)],
-    &[
-        sp("██", Ink::Fur),
-        sp(" ", Ink::Blank),
-        sp("•", Ink::Detail),
-        sp("  ", Ink::Blank),
-        sp("•", Ink::Detail),
-        sp(" ", Ink::Blank),
-        sp("██", Ink::Fur),
-    ],
-    &[
-        sp(" ", Ink::Blank),
-        sp("█▄", Ink::Fur),
-        sp(" ", Ink::Blank),
-        sp("▽", Ink::Face),
-        sp(" ", Ink::Blank),
-        sp("▄█", Ink::Fur),
-        sp("  ", Ink::Blank),
-    ],
-    &[
-        sp("  ", Ink::Blank),
-        sp("▀████▀", Ink::Fur),
-        sp("  ", Ink::Blank),
-    ],
-    &[
-        sp("   ", Ink::Blank),
-        sp("╲", Ink::Fur),
-        sp("CL", Ink::Brand),
-        sp("╱", Ink::Fur),
-        sp("   ", Ink::Blank),
-    ],
-];
-
-const MASCOT_MARK: &[MascotRow] = &[&[sp("CL", Ink::Brand)]];
-
-const fn sp(text: &'static str, ink: Ink) -> MascotSpan {
-    MascotSpan { text, ink }
-}
-
-fn paint_mascot_row(row: MascotRow, sty: &SplashStyle) -> Vec<Span<'static>> {
-    row.iter()
-        .map(|cell| Span::styled(cell.text.to_string(), sty.ink(cell.ink)))
-        .collect()
 }
 
 fn command_name_col() -> usize {
@@ -457,43 +344,58 @@ fn content_width(t: &UiText, brand_text: &str, name_col: usize, extras: &[&str])
     w
 }
 
-fn content_row(
-    mascot: Vec<Span<'static>>,
-    mascot_w: usize,
+fn hero_row(
+    mark: Vec<Span<'static>>,
+    mark_w: usize,
     gap: usize,
-    right_spans: Vec<Span<'static>>,
-    right_w: usize,
-    left_pad: usize,
+    content_spans: Vec<Span<'static>>,
+    content_w: usize,
+    group_left: usize,
+    box_left_pad: usize,
+    box_w: usize,
     sty: &SplashStyle,
 ) -> Line<'static> {
     let mut spans = Vec::new();
-    if left_pad > 0 {
-        spans.push(Span::raw(" ".repeat(left_pad)));
+    if box_left_pad > 0 {
+        spans.push(Span::raw(" ".repeat(box_left_pad)));
     }
     spans.push(Span::styled("│".to_string(), sty.border));
     spans.push(Span::raw(" ".repeat(INNER_PAD_X)));
+    if group_left > 0 {
+        spans.push(Span::raw(" ".repeat(group_left)));
+    }
 
     let mut used_m = 0usize;
-    for s in mascot {
+    for s in mark {
         used_m += disp_w(s.content.as_ref());
         spans.push(s);
     }
-    if mascot_w > used_m {
-        spans.push(Span::raw(" ".repeat(mascot_w - used_m)));
+    if mark_w > used_m {
+        spans.push(Span::raw(" ".repeat(mark_w - used_m)));
     }
-    if mascot_w > 0 {
+    if mark_w > 0 {
         spans.push(Span::raw(" ".repeat(gap)));
     }
 
     let mut used = 0usize;
-    for s in right_spans {
+    for s in content_spans {
         used += disp_w(s.content.as_ref());
         spans.push(s);
     }
-    if right_w > used {
-        spans.push(Span::raw(" ".repeat(right_w - used)));
+    if content_w > used {
+        spans.push(Span::raw(" ".repeat(content_w - used)));
     }
 
+    let used_inner = INNER_PAD_X
+        + group_left
+        + mark_w
+        + if mark_w > 0 { gap } else { 0 }
+        + content_w
+        + INNER_PAD_X;
+    let inner = box_w.saturating_sub(2);
+    if inner > used_inner {
+        spans.push(Span::raw(" ".repeat(inner - used_inner)));
+    }
     spans.push(Span::raw(" ".repeat(INNER_PAD_X)));
     spans.push(Span::styled("│".to_string(), sty.border));
     Line::from(spans)
@@ -552,10 +454,7 @@ fn fallback_stack(
             Span::styled(label, sty.desc),
         ]));
     }
-    out.push(Line::from(Span::styled(
-        truncate_w(t.splash_more_commands, width),
-        sty.muted,
-    )));
+    out.push(Line::from(more_spans(t.splash_more_commands, width, sty)));
     out
 }
 
@@ -574,6 +473,7 @@ fn truncate_w(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brand::{candidate_plain, mark_plain};
     use crate::i18n::Locale;
     use crate::state::Boot;
     use crate::theme::ThemeId;
@@ -623,17 +523,13 @@ mod tests {
             .unwrap_or(0)
     }
 
-    #[test]
-    fn mascot_rows_are_display_aligned() {
-        for kind in [MascotKind::Wide, MascotKind::Medium, MascotKind::Mark] {
-            let w = kind.width();
-            for row in kind.rows() {
-                let row_w: usize = row.iter().map(|s| disp_w(s.text)).sum();
-                assert_eq!(row_w, w, "mascot row misaligned: {row_w} != {w}");
-            }
-            assert!(w <= 16, "mascot wider than 16: {w}");
-            assert!(kind.rows().len() <= 9, "mascot taller than 9");
-        }
+    fn box_height(text: &str) -> usize {
+        text.lines()
+            .filter(|l| {
+                let t = l.trim_end();
+                t.contains('╭') || t.contains('╰') || t.ends_with('│')
+            })
+            .count()
     }
 
     #[test]
@@ -739,25 +635,70 @@ mod tests {
     fn wide_card_is_a_hero_not_a_hint() {
         let text = paint(&state(Locale::Zh), 120, 36);
         let w = box_width(&text);
+        let h = box_height(&text);
         assert!(
-            (72..=84).contains(&w),
-            "120-col card should be 72–84, got {w}:\n{text}"
+            (76..=86).contains(&w),
+            "120-col card should be 76–86, got {w}:\n{text}"
         );
-        assert!(text.contains('▄') || text.contains('▀'), "mascot missing");
-        assert!(text.contains("CL"), "brand mark on mascot: {text}");
+        assert!(
+            (15..=18).contains(&h),
+            "tall viewport card should be ~16 rows, got {h}:\n{text}"
+        );
+        assert!(
+            text.contains("██      █████"),
+            "master pier+runway missing:\n{text}"
+        );
+        assert!(!text.contains('◆'), "ghost core leaked:\n{text}");
+        assert!(!text.contains('▿'), "ghost mouth leaked:\n{text}");
     }
 
     #[test]
-    fn mascot_hides_on_narrow_layout() {
+    fn medium_uses_compact_mark() {
+        let text = paint(&state(Locale::Zh), 64, 20);
+        assert!(
+            text.contains("██  ████"),
+            "compact pier+runway missing:\n{text}"
+        );
+        assert!(
+            !text.contains("    ██████"),
+            "master mark leaked into medium:\n{text}"
+        );
+        assert!(text.contains("CodeLeveler"), "{text}");
+    }
+
+    #[test]
+    fn narrow_uses_micro_or_hides_mark() {
         let wide = paint(&state(Locale::Zh), 80, 24);
-        assert!(wide.contains('▄') || wide.contains('▀'), "{wide}");
-        let narrow = paint(&state(Locale::Zh), 40, 16);
+        assert!(wide.contains("    ██████"), "master on wide:\n{wide}");
+        let narrow = paint(&state(Locale::Zh), 48, 16);
         assert!(narrow.contains("CodeLeveler"), "{narrow}");
         assert!(narrow.contains("/feature-dev"), "{narrow}");
         assert!(
-            !narrow.contains("▀██████▀"),
-            "full mascot leaked into narrow: {narrow}"
+            !narrow.contains("    ██████"),
+            "master leaked into narrow:\n{narrow}"
         );
+        assert!(!narrow.contains('◆'), "{narrow}");
+    }
+
+    #[test]
+    fn very_narrow_keeps_wordmark_over_mark() {
+        let s = state(Locale::Zh);
+        let text = paint(&s, 40, 16);
+        assert!(text.contains("CodeLeveler"), "{text}");
+        assert!(text.contains("让模型真正可靠地完成任务"), "{text}");
+        assert!(text.contains("/feature-dev"), "{text}");
+        assert!(
+            !text.contains("    ██████"),
+            "master leaked into 40-col:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wordmark_is_codeleveler_not_screaming() {
+        let text = paint(&state(Locale::Zh), 80, 24);
+        assert!(text.contains("CodeLeveler"), "{text}");
+        assert!(!text.contains("CODELEVELER"), "{text}");
+        assert!(!text.contains("Code Leveler"), "{text}");
     }
 
     #[test]
@@ -816,10 +757,9 @@ mod tests {
                 theme.border.subtle,
                 theme.border.normal,
                 theme.status.warning,
-                theme.mascot.fur,
-                theme.mascot.dark,
-                theme.mascot.face,
-                theme.mascot.detail,
+                theme.brand.foundation,
+                theme.brand.primary,
+                theme.brand.highlight,
             ];
             for line in &lines {
                 for span in &line.spans {
@@ -890,5 +830,309 @@ mod tests {
         assert!(text.contains("CodeLeveler"), "{text}");
         assert!(text.contains("让模型真正可靠地完成任务"), "{text}");
         assert!(text.contains("/feature-dev"), "{text}");
+    }
+
+    fn col_of(line: &str, needle: &str) -> Option<usize> {
+        let i = line.find(needle)?;
+        Some(disp_w(&line[..i]))
+    }
+
+    fn first_pipe(line: &str) -> Option<usize> {
+        col_of(line, "│")
+    }
+
+    fn last_pipe(line: &str) -> Option<usize> {
+        let i = line.rfind('│')?;
+        Some(disp_w(&line[..i]))
+    }
+
+    /// Horizontal geometry of the hero group inside the card.
+    fn hero_group_metrics(text: &str) -> Option<(usize, usize, usize, usize, usize)> {
+        let runway = text.lines().find(|l| l.contains("██      █████"))?;
+        let brand = text.lines().find(|l| l.contains("CodeLeveler"))?;
+        let mark_left = col_of(runway, "██      █████")?;
+        let content_x = col_of(brand, "CodeLeveler")?;
+        let inner_left = first_pipe(brand)? + 1 + INNER_PAD_X;
+        let inner_right = last_pipe(brand)?.saturating_sub(INNER_PAD_X);
+        Some((
+            mark_left,
+            content_x,
+            inner_left,
+            inner_right,
+            level_mark_width(BrandMarkSize::Master),
+        ))
+    }
+
+    fn blank_inner(line: &str) -> bool {
+        let Some(l) = first_pipe(line) else {
+            return false;
+        };
+        let Some(r) = last_pipe(line) else {
+            return false;
+        };
+        if r <= l + 1 {
+            return true;
+        }
+        let inner_start = line.find('│').unwrap() + '│'.len_utf8();
+        let inner_end = line.rfind('│').unwrap();
+        line[inner_start..inner_end].chars().all(|c| c == ' ')
+    }
+
+    #[test]
+    fn hero_group_is_centered_in_the_card() {
+        for locale in [Locale::Zh, Locale::En] {
+            for (w, h) in [(120usize, 36usize), (100, 30), (80, 24)] {
+                let text = paint(&state(locale), w, h);
+                let (mark_left, content_x, inner_left, inner_right, mark_w) =
+                    hero_group_metrics(&text)
+                        .unwrap_or_else(|| panic!("{locale:?} {w}x{h}:\n{text}"));
+                let gap = content_x.saturating_sub(mark_left + mark_w);
+                assert!(
+                    (4..=5).contains(&gap),
+                    "{locale:?} {w}x{h} gap {gap} (mark_left={mark_left} content_x={content_x}):\n{text}"
+                );
+                let content_w = 42; // wide content column
+                let group_w = mark_w + gap + content_w;
+                assert!(
+                    (58..=64).contains(&group_w),
+                    "{locale:?} {w}x{h} group_w {group_w}:\n{text}"
+                );
+                let left_slack = mark_left.saturating_sub(inner_left);
+                let right_slack = inner_right.saturating_sub(mark_left + group_w);
+                let drift = left_slack as i32 - right_slack as i32;
+                assert!(
+                    drift.abs() <= 1,
+                    "{locale:?} {w}x{h} group not centered (left_slack={left_slack} right_slack={right_slack} drift={drift}):\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_content_shares_one_left_edge() {
+        for locale in [Locale::Zh, Locale::En] {
+            let mut s = state(locale);
+            s.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+            let text = paint(&s, 120, 36);
+            let brand_x = col_of(
+                text.lines().find(|l| l.contains("CodeLeveler")).unwrap(),
+                "CodeLeveler",
+            )
+            .unwrap();
+            let cta_x = col_of(text.lines().find(|l| l.contains('›')).unwrap(), "›").unwrap();
+            let cmd_x = col_of(
+                text.lines().find(|l| l.contains("/feature-dev")).unwrap(),
+                "/feature-dev",
+            )
+            .unwrap();
+            let more_x = text
+                .lines()
+                .find_map(|l| col_of(l, "输入 /").or_else(|| col_of(l, "Type /")))
+                .unwrap();
+            let warn_x = col_of(text.lines().find(|l| l.contains('⚠')).unwrap(), "⚠").unwrap();
+            assert_eq!(brand_x, cta_x, "cta drifted:\n{text}");
+            assert_eq!(brand_x, cmd_x, "commands drifted:\n{text}");
+            assert_eq!(brand_x, more_x, "more hint drifted:\n{text}");
+            assert_eq!(brand_x, warn_x, "warning drifted:\n{text}");
+        }
+    }
+
+    #[test]
+    fn warning_is_its_own_section_and_does_not_leave_a_hole() {
+        let mut s = state(Locale::Zh);
+        let off = paint(&s, 120, 36);
+        s.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+        let on = paint(&s, 120, 36);
+
+        assert!(!off.contains('⚠'), "{off}");
+        assert!(on.contains('⚠'), "{on}");
+
+        let more_idx = on
+            .lines()
+            .position(|l| l.contains("输入 /") || l.contains("Type /"))
+            .unwrap();
+        let warn_idx = on.lines().position(|l| l.contains('⚠')).unwrap();
+        assert!(
+            warn_idx >= more_idx + 2,
+            "need a blank row between more and warning:\n{on}"
+        );
+        assert!(
+            on.lines().nth(more_idx + 1).is_some_and(blank_inner),
+            "row after more should be blank:\n{on}"
+        );
+
+        let off_body = off
+            .lines()
+            .filter(|l| !blank_inner(l) && l.contains('│'))
+            .count();
+        let on_body = on
+            .lines()
+            .filter(|l| !blank_inner(l) && l.contains('│'))
+            .count();
+        assert!(
+            on_body > off_body,
+            "warning should add real rows, not fill a reserved hole (off={off_body} on={on_body})\nOFF:\n{off}\nON:\n{on}"
+        );
+
+        // No warning-sized hole when hidden: last non-blank inner row is the more hint.
+        let off_lines: Vec<&str> = off.lines().collect();
+        let last_content = off_lines
+            .iter()
+            .rposition(|l| l.contains('│') && !blank_inner(l))
+            .unwrap();
+        assert!(
+            off_lines[last_content].contains("输入 /")
+                || off_lines[last_content].contains("Type /"),
+            "hidden warning left a hole after more:\n{off}"
+        );
+    }
+
+    #[test]
+    fn card_stays_hero_sized_when_group_is_centered() {
+        for (w, h) in [(120usize, 36usize), (100, 30), (80, 24)] {
+            let text = paint(&state(Locale::Zh), w, h);
+            let bw = box_width(&text);
+            let bh = box_height(&text);
+            assert!(
+                (76..=86).contains(&bw),
+                "{w}x{h} card width {bw} shrank:\n{text}"
+            );
+            assert!(
+                (15..=18).contains(&bh),
+                "{w}x{h} card height {bh} is not a hero:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_commands_slash_uses_accent_token() {
+        let theme = Theme::dark();
+        let mut s = state(Locale::Zh);
+        s.theme = theme.clone();
+        let lines = splash_lines(&s, 80, 24, &s.theme, s.t());
+        let mut saw_slash = false;
+        for line in &lines {
+            for span in &line.spans {
+                if span.content.as_ref() == "/" {
+                    saw_slash = true;
+                    assert_eq!(span.style.fg, Some(theme.accent.primary));
+                }
+            }
+        }
+        assert!(saw_slash, "more-commands slash missing");
+    }
+
+    fn ansi_fg(color: Color, bold: bool, text: &str) -> String {
+        let reset = "\x1b[0m";
+        let bold_s = if bold { "\x1b[1m" } else { "" };
+        match color {
+            Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m{bold_s}{text}{reset}"),
+            Color::Reset => format!("{bold_s}{text}{reset}"),
+            _ => text.to_string(),
+        }
+    }
+
+    fn line_ansi(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|sp| {
+                let fg = sp.style.fg.unwrap_or(Color::Reset);
+                let bold = sp.style.add_modifier.contains(Modifier::BOLD);
+                ansi_fg(fg, bold, sp.content.as_ref())
+            })
+            .collect()
+    }
+
+    fn paint_ansi(s: &AppState, width: usize, height: usize) -> String {
+        splash_lines(s, width, height, &s.theme, s.t())
+            .iter()
+            .map(line_ansi)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Manual board: candidates, then the selected mark on real splash layouts.
+    #[test]
+    #[ignore = "manual splash preview; run with --ignored --nocapture"]
+    fn dump_hero_splash() {
+        eprintln!("\n======== LEVEL MARK CANDIDATES ========");
+        for (id, name, note) in [
+            (
+                'A',
+                "Cantilever (SELECTED)",
+                "notch + left pier + forward runway; 13×5",
+            ),
+            (
+                'B',
+                "Spine Rise",
+                "tighter notch, heavier right spine; 11×5",
+            ),
+            (
+                'C',
+                "Tall Wedge",
+                "six-row progression; closer to stairs; 14×6",
+            ),
+        ] {
+            eprintln!("\n──────── {id}  {name} ────────");
+            eprintln!("{note}");
+            eprintln!("{}", candidate_plain(id));
+        }
+
+        eprintln!("\n======== SELECTED SIZES ========");
+        for size in [
+            BrandMarkSize::Master,
+            BrandMarkSize::Compact,
+            BrandMarkSize::Micro,
+        ] {
+            eprintln!("\n── {size:?} ──");
+            eprintln!("{}", mark_plain(size));
+        }
+
+        for (label, mut theme) in [
+            ("DARK", Theme::dark()),
+            ("LIGHT", Theme::light()),
+            ("HIGH CONTRAST", Theme::high_contrast()),
+            ("NO_COLOR", Theme::no_color()),
+        ] {
+            let mut zh = state(Locale::Zh);
+            zh.theme = theme.clone();
+            eprintln!("\n======== {label} ZH 80x24 ========");
+            eprintln!("{}", paint_ansi(&zh, 80, 24));
+            if label == "DARK" {
+                theme = Theme::dark();
+                zh.theme = theme.clone();
+                for (w, h) in [(120u16, 36u16), (100, 30), (80, 24)] {
+                    eprintln!("\n-------- DARK ZH {w}x{h} warning OFF --------");
+                    eprintln!("{}", paint_ansi(&zh, w as usize, h as usize));
+                    zh.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+                    eprintln!("\n-------- DARK ZH {w}x{h} warning ON --------");
+                    eprintln!("{}", paint_ansi(&zh, w as usize, h as usize));
+                    zh.untrusted_config.clear();
+                }
+                let mut en = state(Locale::En);
+                en.theme = theme;
+                for (w, h) in [(120u16, 36u16), (80, 24)] {
+                    eprintln!("\n-------- DARK EN {w}x{h} warning OFF --------");
+                    eprintln!("{}", paint_ansi(&en, w as usize, h as usize));
+                    en.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
+                    eprintln!("\n-------- DARK EN {w}x{h} warning ON --------");
+                    eprintln!("{}", paint_ansi(&en, w as usize, h as usize));
+                    en.untrusted_config.clear();
+                }
+                let mut mid = state(Locale::Zh);
+                mid.theme = Theme::dark();
+                eprintln!("\n-------- DARK ZH 64x20 medium --------");
+                eprintln!("{}", paint_ansi(&mid, 64, 20));
+                eprintln!("\n-------- DARK ZH 48x16 narrow --------");
+                eprintln!("{}", paint_ansi(&mid, 48, 16));
+                eprintln!("\n-------- DARK ZH 40x16 very narrow --------");
+                eprintln!("{}", paint_ansi(&mid, 40, 16));
+            }
+        }
+
+        let mut en = state(Locale::En);
+        en.theme = Theme::dark();
+        eprintln!("\n======== DARK EN 80x24 ========");
+        eprintln!("{}", paint_ansi(&en, 80, 24));
     }
 }

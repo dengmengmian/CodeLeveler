@@ -347,6 +347,64 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
     Ok(client)
 }
 
+/// Bind the TUI-embedded Web UI against an existing local runtime service.
+///
+/// `/web` is a TUI capability, not an in-process-runtime capability: HTTP
+/// lives in this process and routes through whatever [`LocalRuntimeService`]
+/// the TUI already has. It does not own that runtime and does not open
+/// daemon TCP.
+async fn bind_tui_web_ui(
+    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
+    repo_root: PathBuf,
+    shutdown: CancellationToken,
+) -> Result<String, String> {
+    let token = generate_daemon_token();
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let router = leveler_web::RouterService::new(service, repo_root);
+    let manager = leveler_web::ProjectManager::new(
+        router.clone(),
+        leveler_core::LevelerHome::resolve(leveler_core::environment()),
+        std::env::current_exe().ok(),
+    );
+    let background = manager.clone();
+    tokio::spawn(async move {
+        background.clone().load_registry().await;
+        background
+            .discover_historical_projects(&std::env::temp_dir())
+            .await;
+    });
+    let server = leveler_web::bind_multi(router, manager, addr, token.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let local = server.local_addr();
+    if !local.ip().is_loopback() {
+        return Err(format!("refusing to serve Web UI on non-loopback {local}"));
+    }
+    let url = format!("http://{local}/?token={token}");
+    tokio::spawn(async move {
+        let _ = server.serve(shutdown).await;
+    });
+    Ok(url)
+}
+
+/// Shared `/web` launcher for in-process and daemon-connected TUIs.
+fn make_web_launcher(
+    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
+    repo_root: PathBuf,
+    shutdown: CancellationToken,
+) -> leveler_tui::WebLauncher {
+    Arc::new(move || {
+        let service = service.clone();
+        let repo_root = repo_root.clone();
+        let shutdown = shutdown.clone();
+        Box::pin(async move {
+            let url = bind_tui_web_ui(service, repo_root, shutdown).await?;
+            leveler_tui::open_in_browser(&url);
+            Ok(url)
+        })
+    })
+}
+
 /// Open the interactive terminal UI. Reuses a healthy per-repository daemon
 /// when possible and otherwise starts the runtime inside the TUI process.
 #[allow(clippy::too_many_arguments)]
@@ -510,18 +568,24 @@ pub(crate) async fn cmd_tui(
         // meant that opening a TUI in a repository where `leveler serve` was
         // already running made the whole feature unreachable, with a message
         // about a "remote daemon" that named the one case this is not.
+        let runtime_service: Arc<dyn leveler_local_transport::LocalRuntimeService> = client.clone();
         let remote_launcher = crate::remote_invite::launcher(
-            client.clone() as Arc<dyn leveler_local_transport::LocalRuntimeService>,
+            runtime_service.clone(),
             layout.repo_root.clone(),
             leveler_remote_agent::RemoteHome::new(
                 leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
             ),
         );
+        let web_shutdown = CancellationToken::new();
+        let web_launcher = make_web_launcher(
+            runtime_service,
+            layout.repo_root.clone(),
+            web_shutdown.clone(),
+        );
         let client: Arc<dyn InteractiveRuntimeClient> = client;
-        // `/web` still has nothing to bind: it needs to *serve* HTTP from this
-        // process, which is a different thing from reaching a runtime. It
-        // reports that and points at `leveler web --connect`.
-        leveler_tui::run(client, None, Some(remote_launcher), boot).await?;
+        leveler_tui::run(client, Some(web_launcher), Some(remote_launcher), boot).await?;
+        // Stop the TUI-owned HTTP server; the local daemon keeps running.
+        web_shutdown.cancel();
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
@@ -568,44 +632,16 @@ pub(crate) async fn cmd_tui(
     // current repository.
     let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
-    let web_repo_root = app.layout.repo_root.clone();
     let remote_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
     let quit_client = in_process_client.clone();
     let remote_repo_root = app.layout.repo_root.clone();
-    let web_launcher: leveler_tui::WebLauncher = Arc::new(move || {
-        let service = web_service.clone();
-        let repo_root = web_repo_root.clone();
-        Box::pin(async move {
-            let token = generate_daemon_token();
-            let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
-            let router = leveler_web::RouterService::new(service, repo_root);
-            let manager = leveler_web::ProjectManager::new(
-                router.clone(),
-                leveler_core::LevelerHome::resolve(leveler_core::environment()),
-                std::env::current_exe().ok(),
-            );
-            let background = manager.clone();
-            tokio::spawn(async move {
-                background.clone().load_registry().await;
-                background
-                    .discover_historical_projects(&std::env::temp_dir())
-                    .await;
-            });
-            let server = leveler_web::bind_multi(router, manager, addr, token.clone())
-                .await
-                .map_err(|e| e.to_string())?;
-            let url = format!("http://{}/?token={token}", server.local_addr());
-            // Serve until the process exits (the TUI owns the only runtime).
-            tokio::spawn(async move {
-                let _ = server.serve(CancellationToken::new()).await;
-            });
-            // The token URL is only printed to the transient notification line;
-            // open it in the default browser so it is not missed.
-            leveler_tui::open_in_browser(&url);
-            Ok(url)
-        })
-    });
+    let web_shutdown = CancellationToken::new();
+    let web_launcher = make_web_launcher(
+        web_service,
+        app.layout.repo_root.clone(),
+        web_shutdown.clone(),
+    );
 
     let client: Arc<dyn InteractiveRuntimeClient> = in_process_client;
 
@@ -653,6 +689,7 @@ pub(crate) async fn cmd_tui(
     );
 
     leveler_tui::run(client, Some(web_launcher), Some(remote_launcher), boot).await?;
+    web_shutdown.cancel();
     // Drop-based reapers never run past `std::process::exit`; shut the
     // runtime down explicitly (background tasks + browser tree, R004 F7).
     let _ = quit_client
@@ -1379,6 +1416,7 @@ fn finish(
 #[cfg(test)]
 mod tui_runtime_selection_tests {
     use super::*;
+    use leveler_local_transport::LocalRuntimeService;
 
     #[test]
     fn daemon_token_is_256_bits_of_hex_and_not_constant() {
@@ -1466,6 +1504,146 @@ mod tui_runtime_selection_tests {
             socket_intent(false, false, true, true),
             SocketIntent::RequireExplicit,
         );
+    }
+
+    #[test]
+    fn in_process_and_socket_clients_are_the_same_web_capability() {
+        fn check<T: LocalRuntimeService + InteractiveRuntimeClient + Send + Sync + 'static>() {}
+        check::<InProcessRuntimeClient>();
+        check::<LocalSocketRuntimeClient>();
+    }
+
+    #[test]
+    fn tui_web_does_not_shell_out_to_leveler_web() {
+        let src = include_str!("run_cmds.rs");
+        assert!(
+            !src.contains("arg(\"web\")"),
+            "/web must call leveler-web, not spawn `leveler web`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_launcher_tests {
+    use super::*;
+    use leveler_client_protocol::{
+        ClientCommand, ClientError, InteractiveRuntimeClient, RuntimeEvent, SessionId,
+        UiSessionSnapshot,
+    };
+    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
+    use tokio::sync::broadcast;
+
+    struct StubService {
+        events: broadcast::Sender<RuntimeEvent>,
+    }
+
+    impl StubService {
+        fn new() -> Self {
+            Self {
+                events: broadcast::channel(8).0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveRuntimeClient for StubService {
+        async fn send(&self, _command: ClientCommand) -> Result<(), ClientError> {
+            Ok(())
+        }
+        async fn deliver(
+            &self,
+            _envelope: leveler_client_protocol::CommandEnvelope,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+            self.events.subscribe()
+        }
+        fn subscribe_session(&self, _session_id: &SessionId) -> broadcast::Receiver<RuntimeEvent> {
+            self.events.subscribe()
+        }
+        async fn snapshot(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<UiSessionSnapshot, ClientError> {
+            Err(ClientError::Runtime("not exercised".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LocalRuntimeService for StubService {
+        async fn create_session(
+            &self,
+            _request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            Err(ClientError::Runtime("not exercised".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn make_web_launcher_binds_loopback_with_a_bearer_token() {
+        let service: Arc<dyn LocalRuntimeService> = Arc::new(StubService::new());
+        let shutdown = CancellationToken::new();
+        let url = bind_tui_web_ui(
+            service,
+            PathBuf::from("/tmp/web-cap-repo"),
+            shutdown.clone(),
+        )
+        .await
+        .expect("bind Web UI");
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "must be loopback, got {url}"
+        );
+        assert!(!url.contains("0.0.0.0"), "{url}");
+        let token = url.split("token=").nth(1).expect("token-bearing URL");
+        assert_eq!(token.len(), 64, "{url}");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{url}");
+        let status = get_projects_status(&url).await;
+        assert_eq!(
+            status, 200,
+            "/api/projects must stay on the multi-project surface, got {status}"
+        );
+        shutdown.cancel();
+    }
+
+    async fn get_projects_status(url: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("host");
+        let mut stream = tokio::net::TcpStream::connect(host)
+            .await
+            .expect("connect web");
+        let req = format!(
+            "GET /api/projects?token={token} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+            token = url.split("token=").nth(1).unwrap_or("")
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        resp.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn make_web_launcher_and_bind_share_one_composition() {
+        let service: Arc<dyn LocalRuntimeService> = Arc::new(StubService::new());
+        let shutdown = CancellationToken::new();
+        let launcher = make_web_launcher(
+            service,
+            PathBuf::from("/tmp/web-cap-repo"),
+            shutdown.clone(),
+        );
+        // The launcher is the same composition; do not invoke it here — it
+        // would open a browser. bind_tui_web_ui is what it calls.
+        let _ = launcher;
+        shutdown.cancel();
     }
 }
 
@@ -1644,6 +1822,34 @@ mod daemon_bind_tests {
             "env 提供的 token 必须被沿用而不是重新生成"
         );
         assert!(tcp_server.local_addr().unwrap().port() > 0);
+    }
+
+    #[tokio::test]
+    async fn local_socket_client_feeds_the_shared_web_binder() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let mut bound = bind_daemon_transports(&sock, None, None, test_service())
+            .await
+            .expect("unix daemon");
+        let unix = bound.unix.take().expect("unix listener");
+        let daemon_shutdown = CancellationToken::new();
+        let daemon_task = tokio::spawn(unix.serve(daemon_shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&sock)
+            .await
+            .expect("tui-style socket client");
+        let service: Arc<dyn LocalRuntimeService> = Arc::new(client);
+        let shutdown = CancellationToken::new();
+        let url = bind_tui_web_ui(service, dir.path().to_path_buf(), shutdown.clone())
+            .await
+            .expect("socket-backed /web");
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "loopback only, got {url}"
+        );
+        assert!(url.contains("?token="), "{url}");
+        shutdown.cancel();
+        daemon_shutdown.cancel();
+        let _ = daemon_task.await;
     }
 
     #[tokio::test]

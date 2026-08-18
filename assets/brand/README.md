@@ -1,6 +1,17 @@
 # CodeLeveler brand mark
 
-Minimal geometric **CL** monogram for CodeLeveler — an AI coding agent that helps developers level up their code.
+Two surfaces, two marks:
+
+| Surface | Mark | Where |
+| --- | --- | --- |
+| **Terminal / TUI** | **Level Mark** (no letters) | `docs/TERMINAL_BRAND.md`, `crates/leveler-tui/src/brand.rs`, `logo_ascii.txt` |
+| **App icon / web / favicon** | Geometric **CL** monogram | SVG / PNG in this directory |
+
+Do not use a ghost, animal, or cute character as the product logo.
+
+## App-icon monogram
+
+Minimal geometric **CL** monogram — an AI coding agent that helps developers level up their code.
 
 ## Concept
 
@@ -30,6 +41,7 @@ The two forms share a spine so they read as one symbol, not plain typography.
 - Flat monochrome (or single brand color via `currentColor`)
 - No gradients, mascots, robots, brains, or circuit clichés
 - Must stay legible at 16×16
+- TUI splash does **not** reuse this CL monogram; it uses Level Mark (see `docs/TERMINAL_BRAND.md`)
 
 ## Usage
 

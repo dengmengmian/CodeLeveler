@@ -97,26 +97,27 @@ impl Executor {
     }
 
     /// Handle a `request_permissions` call: ask the user to approve elevated
-    /// network and/or filesystem access. Returns `(granted, message, grants)`.
+    /// network and/or filesystem access.
     pub(crate) async fn handle_request_permissions(
         &self,
         call: &ToolCall,
         cancellation: &CancellationToken,
-    ) -> Result<(bool, String, crate::injected_tools::TurnPermissionGrants), AgentError> {
+    ) -> Result<crate::injected_tools::PermissionRequestOutcome, AgentError> {
         use crate::injected_tools::{
-            parse_permission_request, permission_grant_message, permission_request_description,
+            PermissionRequestOutcome, parse_permission_request, permission_denied_by_user_message,
+            permission_denied_unattended_message, permission_grant_message,
+            permission_request_description,
         };
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
         let (action, reason, grants) = parse_permission_request(&call.arguments);
         if grants.is_empty() {
-            return Ok((
-                false,
-                "未请求任何可识别权限:请设置 network、filesystem=unrestricted 或 full_access。"
-                    .to_string(),
-                grants,
-            ));
+            return Ok(PermissionRequestOutcome::Invalid {
+                message:
+                    "未请求任何可识别权限:请设置 network、filesystem=unrestricted 或 full_access。"
+                        .to_string(),
+            });
         }
         // 完全访问 means no prompts at all. This path calls the approver
         // directly, so without this check it bypasses `ApprovalPolicy::evaluate`
@@ -124,7 +125,10 @@ impl Executor {
         // interrupts a user who opted out of prompting, to grant a permission
         // they already hold.
         if self.tool_context.policy.mode == leveler_execution::PermissionProfile::FullAccess {
-            return Ok((true, permission_grant_message(true, grants), grants));
+            return Ok(PermissionRequestOutcome::Granted {
+                message: permission_grant_message(true, grants),
+                grants,
+            });
         }
         let description = permission_request_description(&action, &reason, grants);
         // Risk: filesystem elevation is at least as sensitive as network.
@@ -160,8 +164,23 @@ impl Executor {
                 | ApprovalDecision::ApproveSession
                 | ApprovalDecision::ApproveAlways
         );
-        let message = permission_grant_message(granted, grants);
-        Ok((granted, message, grants))
+        if granted {
+            return Ok(PermissionRequestOutcome::Granted {
+                message: permission_grant_message(true, grants),
+                grants,
+            });
+        }
+        if self.approver.has_human() {
+            Ok(PermissionRequestOutcome::DeniedByUser {
+                requested: grants,
+                message: permission_denied_by_user_message(),
+            })
+        } else {
+            Ok(PermissionRequestOutcome::DeniedUnattended {
+                requested: grants,
+                message: permission_denied_unattended_message(),
+            })
+        }
     }
 
     /// Run one independent reviewer child.

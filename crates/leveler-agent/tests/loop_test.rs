@@ -10,7 +10,8 @@ use tokio_util::sync::CancellationToken;
 use leveler_agent::{AgentError, AgentEvent, Executor, NoopSink, StopReason};
 use leveler_core::{RequestId, ToolCallId};
 use leveler_execution::{
-    ApprovalRequest, AutoReviewer, PermissionProfile, ReviewVerdict, Workspace,
+    ApprovalDecision, ApprovalRequest, Approver, AutoDeny, AutoReviewer, PermissionProfile,
+    ReviewVerdict, Workspace,
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
@@ -6866,6 +6867,286 @@ async fn source_code_mentioning_credentials_reaches_the_model_intact() {
     assert!(
         !sent.contains("[REDACTED]"),
         "ordinary code must not be redacted at all"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+struct HeadlessPermissionDeny;
+
+#[async_trait]
+impl Approver for HeadlessPermissionDeny {
+    fn has_human(&self) -> bool {
+        false
+    }
+    async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::Deny
+    }
+}
+
+#[tokio::test]
+async fn human_denial_then_quiet_does_not_nudge() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-human-deny-quiet-{}",
+        std::process::id() as u64 * 17 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "request_permissions",
+            serde_json::json!({
+                "action": "read ~/.leveler",
+                "filesystem": "unrestricted"
+            }),
+        ),
+        assistant_text("我无法继续读取 ~/.leveler。请在本机执行 ls ~/.leveler，把输出贴给我。"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(AutoDeny));
+
+    let outcome = executor
+        .run(
+            "为什么 web 命令不能启动了",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert!(
+        outcome.progress.human_boundary_seen(),
+        "human denial must be on the ledger"
+    );
+    assert_eq!(
+        runtime.requests.lock().unwrap().len(),
+        2,
+        "closeout must not buy extra model rounds after a human no"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn human_denial_still_allows_workspace_tools() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-human-deny-adapt-{}",
+        std::process::id() as u64 * 19 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "request_permissions",
+            serde_json::json!({
+                "action": "read home",
+                "filesystem": "unrestricted"
+            }),
+        ),
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "Cargo.toml"})),
+        assistant_text("仓库里有 Cargo.toml，我改用本地文件继续。"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(AutoDeny));
+
+    let outcome = executor
+        .run(
+            "why is web broken",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert!(
+        outcome.final_text.contains("Cargo.toml"),
+        "workspace tools must still run after deny: {}",
+        outcome.final_text
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn same_or_broader_permission_is_not_prompted_again() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-human-deny-repeat-{}",
+        std::process::id() as u64 * 23 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let asks = Arc::new(Mutex::new(0usize));
+
+    struct CountingDeny {
+        asks: Arc<Mutex<usize>>,
+    }
+    #[async_trait]
+    impl Approver for CountingDeny {
+        async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+            *self.asks.lock().unwrap() += 1;
+            ApprovalDecision::Deny
+        }
+    }
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "request_permissions",
+            serde_json::json!({"action": "net", "network": true}),
+        ),
+        assistant_tool_call(
+            "p2",
+            "request_permissions",
+            serde_json::json!({"action": "net again", "network": true}),
+        ),
+        assistant_tool_call(
+            "p3",
+            "request_permissions",
+            serde_json::json!({"action": "everything", "full_access": true}),
+        ),
+        assistant_text("blocked without that access"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(CountingDeny { asks: asks.clone() }));
+
+    let outcome = executor
+        .run(
+            "need net",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        *asks.lock().unwrap(),
+        1,
+        "repeat and broader requests must not re-prompt the user"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn goal_mode_human_denial_quiet_is_blocked_not_stalled() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-human-deny-goal-{}",
+        std::process::id() as u64 * 29 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "request_permissions",
+            serde_json::json!({
+                "action": "read home",
+                "filesystem": "unrestricted"
+            }),
+        ),
+        assistant_text("cannot proceed without that path"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_approver(Arc::new(AutoDeny));
+
+    let outcome = executor
+        .run(
+            "finish the goal",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert_ne!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        runtime.requests.lock().unwrap().len(),
+        2,
+        "goal unresolved must not nudge past a human no"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn headless_denial_is_not_labeled_as_user_refusal() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-headless-deny-{}",
+        std::process::id() as u64 * 31 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "request_permissions",
+            serde_json::json!({"action": "net", "network": true}),
+        ),
+        assistant_text("continuing without network"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(HeadlessPermissionDeny));
+
+    let _ = executor
+        .run(
+            "need net",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let sent = format!("{:?}", runtime.requests.lock().unwrap());
+    assert!(
+        sent.contains("no human was available"),
+        "headless deny must not pose as the user: {sent}"
+    );
+    assert!(
+        !sent.contains("explicitly denied"),
+        "must not claim the user said no: {sent}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

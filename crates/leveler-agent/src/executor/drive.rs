@@ -39,9 +39,10 @@ use crate::authorization::{
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
-    COMPLETE_STEP_TOOL, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL,
-    SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL, apply_turn_grants, ask_user_tool_definition,
-    complete_step_tool_definition, is_user_input_tool, report_finding_tool_definition,
+    COMPLETE_STEP_TOOL, PermissionRequestOutcome, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL,
+    RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL, apply_turn_grants,
+    ask_user_tool_definition, complete_step_tool_definition, is_user_input_tool,
+    parse_permission_request, permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     resolve_finding_tool_definition, spawn_agent_tool_definition, update_goal_tool_definition,
 };
@@ -943,6 +944,7 @@ impl Executor {
                     cancelled: cancellation.is_cancelled(),
                     can_continue: has_next_round,
                     budget_remaining: closeout_budget.remaining(),
+                    human_boundary_seen: progress.human_boundary_seen(),
                 });
                 // Whether the harness accepted the quiet round or bought itself
                 // another model call is the difference between "the model is
@@ -991,7 +993,21 @@ impl Executor {
                 // is a stall, not a proven completion. The detail carries the
                 // closeout reason so an engine continuation knows what the
                 // previous turn stalled on.
-                let (stop_reason, stop_detail) = if self.policy.goal_mode {
+                let (stop_reason, stop_detail) = if self.policy.goal_mode
+                    && progress.human_boundary_seen()
+                {
+                    // User said no, model went quiet without resolving the
+                    // goal. That is blocked, not a stall the supervisor
+                    // should DriveGoalAgain.
+                    progress.enter_terminal();
+                    observer(AgentEvent::ProgressUpdated {
+                        ledger: progress.clone(),
+                    });
+                    (
+                        StopReason::Blocked,
+                        Some("user denied a required permission; goal left unresolved".to_string()),
+                    )
+                } else if self.policy.goal_mode {
                     // One no-progress tick per stalled drive so Engine
                     // continue_active_goal cannot open unbounded turns.
                     progress.note_no_progress_round(round);
@@ -1013,6 +1029,12 @@ impl Executor {
                         )),
                     )
                 } else {
+                    if progress.human_boundary_seen() {
+                        progress.enter_terminal();
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
+                    }
                     (StopReason::Answered, None)
                 };
                 flush_epoch!(round);
@@ -1618,17 +1640,39 @@ impl Executor {
 
                 // request_permissions is answered by the user, not the registry.
                 if call.name == REQUEST_PERMISSIONS_TOOL {
-                    let (granted, message, grants) = self
+                    let (_, _, requested) = parse_permission_request(&call.arguments);
+                    if progress.covers_denied_request(requested.network, requested.unrestricted_fs)
+                    {
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: permission_already_denied_message(),
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                    let outcome = self
                         .handle_request_permissions(&call, &cancellation)
                         .await?;
-                    if granted {
-                        turn_grants = turn_grants.merge(grants);
+                    match &outcome {
+                        PermissionRequestOutcome::Granted { grants, .. } => {
+                            turn_grants = turn_grants.merge(*grants);
+                        }
+                        PermissionRequestOutcome::DeniedByUser { requested, .. } => {
+                            progress
+                                .record_human_denial(requested.network, requested.unrestricted_fs);
+                            observer(AgentEvent::ProgressUpdated {
+                                ledger: progress.clone(),
+                            });
+                        }
+                        _ => {}
                     }
                     results[index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
                             call_id: call.id,
-                            content: message,
-                            is_error: !granted,
+                            content: outcome.message().to_string(),
+                            is_error: outcome.is_error(),
                         },
                     });
                     continue;

@@ -6,10 +6,23 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- After a user denies a permission request, the harness no longer auto-nudges
+  or `DriveGoalAgain` past that boundary. The agent can still adapt with
+  already-available tools; same or broader elevations are not re-prompted
+  in the task epoch. Goal mode that cannot proceed becomes `Blocked`, not
+  an 8-minute “等待模型” spin.
+- `/web` in the default daemon-backed TUI now opens the Web UI against the
+  same local runtime the TUI already has (Unix socket → daemon). It no
+  longer requires `--in-process` or `leveler web --connect`, and no longer
+  calls a local daemon a "remote daemon".
+
 ### Changed
-- Empty-session splash is a terminal-native hero card: colored red-panda
-  mascot, product mission, and three first-run commands (`/feature-dev`,
-  `/model`, `/help`). `/plan` stays a slash command, not an onboarding step.
+- Empty-session splash is a terminal-native hero card: the Level Mark
+  (Master / Compact / Micro), product mission, and three first-run
+  commands (`/feature-dev`, `/model`, `/help`). `/plan` stays a slash
+  command, not an onboarding step. Brand geometry lives in
+  `crates/leveler-tui/src/brand.rs`; see `docs/TERMINAL_BRAND.md`.
 - Reasoning effort is resolved in one place: model `supported_efforts` +
   CodeLeveler `default_effort`, then user override, then upward-or-clamp
   normalization. Protocol adapters encode the effective value only.
@@ -28,7 +41,7 @@ All notable changes to CodeLeveler are documented here. The format follows
   gap + clipped description). Conversation CJK underneath is cleared so
   descriptions no longer lose every ideograph after the first.
 - TUI themes are a semantic token system (`surface` / `text` / `border` /
-  `accent` / `status` / `diff`) with an opaque canvas. Body text is no longer
+  `accent` / `status` / `diff` / `brand`) with an opaque canvas. Body text is no longer
   `Color::Reset`, so readability does not depend on the terminal profile.
   Default id is `auto` (detect polarity, then load Dark or Light).
   Wire values are `auto` / `dark` / `light` / `high-contrast` only.

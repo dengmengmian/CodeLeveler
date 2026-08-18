@@ -380,9 +380,14 @@ pub(crate) fn permission_request_description(
 }
 
 pub(crate) fn permission_grant_message(granted: bool, grants: TurnPermissionGrants) -> String {
-    if !granted {
-        return "用户未批准该权限,请改用不需要它的方式,或不要重复请求。".to_string();
+    if granted {
+        permission_granted_message(grants)
+    } else {
+        permission_denied_by_user_message()
     }
+}
+
+fn permission_granted_message(grants: TurnPermissionGrants) -> String {
     let mut parts = Vec::new();
     if grants.network {
         parts.push("网络访问");
@@ -394,6 +399,70 @@ pub(crate) fn permission_grant_message(granted: bool, grants: TurnPermissionGran
         "已获授权。".to_string()
     } else {
         format!("已获授权:本轮允许{}。", parts.join("、"))
+    }
+}
+
+/// Model-facing result when a person clicked Deny. English is protocol
+/// guidance for the model, not TUI copy.
+pub(crate) fn permission_denied_by_user_message() -> String {
+    "The user explicitly denied this permission request. \
+     Continue only with capabilities already available. \
+     Do not request the same or broader permission again for this task \
+     unless the user explicitly changes their decision. \
+     If you now need the user to perform an action or provide information, \
+     use request_user_input. \
+     If the task cannot proceed without the denied capability, \
+     report the task as blocked rather than repeatedly retrying."
+        .to_string()
+}
+
+pub(crate) fn permission_already_denied_message() -> String {
+    "The user already denied this permission for the current task. \
+     Do not request it again. Continue only with capabilities already available, \
+     or use request_user_input if you need the user to act."
+        .to_string()
+}
+
+pub(crate) fn permission_denied_unattended_message() -> String {
+    "Permission was not granted (no human was available to approve). \
+     Continue only with capabilities already available. \
+     Do not treat this as a user refusal."
+        .to_string()
+}
+
+/// Outcome of `request_permissions`. Human Deny is not the same fact as
+/// a headless auto-deny.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionRequestOutcome {
+    Granted {
+        grants: TurnPermissionGrants,
+        message: String,
+    },
+    DeniedByUser {
+        requested: TurnPermissionGrants,
+        message: String,
+    },
+    DeniedUnattended {
+        requested: TurnPermissionGrants,
+        message: String,
+    },
+    Invalid {
+        message: String,
+    },
+}
+
+impl PermissionRequestOutcome {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Granted { message, .. }
+            | Self::DeniedByUser { message, .. }
+            | Self::DeniedUnattended { message, .. }
+            | Self::Invalid { message } => message,
+        }
+    }
+
+    pub(crate) fn is_error(&self) -> bool {
+        !matches!(self, Self::Granted { .. })
     }
 }
 
@@ -420,7 +489,10 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
             workspace sandbox. Fields: `network` (bool), `filesystem` \
             (\"workspace\"|\"unrestricted\"), or `full_access` (bool) for both. \
             Legacy calls with only `action` still mean network-only. On approval, \
-            grants last for the rest of this turn."
+            grants last for the rest of this turn. If the user denies, keep \
+            working with already-available capabilities; do not re-request the \
+            same or a broader permission. If you need the user to run a command \
+            or paste output, call request_user_input instead of asking in prose."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -572,6 +644,17 @@ mod tests {
         assert!(!elevated.policy.network_denied());
         assert!(elevated.policy.unrestricted_fs());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn human_denial_message_is_not_a_bare_false() {
+        let msg = permission_denied_by_user_message();
+        assert!(msg.contains("explicitly denied"));
+        assert!(msg.contains("request_user_input"));
+        assert!(!msg.contains("用户未批准"));
+        let unattended = permission_denied_unattended_message();
+        assert!(!unattended.contains("explicitly denied"));
+        assert!(unattended.contains("no human"));
     }
 
     #[test]

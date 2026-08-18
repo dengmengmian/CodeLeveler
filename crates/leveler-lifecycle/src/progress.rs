@@ -112,6 +112,14 @@ pub struct ProgressLedger {
     /// and clears it. Normally drained to empty before a run returns.
     #[serde(default)]
     pub outstanding_children: Vec<String>,
+    /// The user explicitly denied network elevation this task epoch.
+    /// Host-side re-request guard; not a durable project rule.
+    #[serde(default)]
+    pub denied_network: bool,
+    /// The user explicitly denied unrestricted-filesystem elevation this
+    /// task epoch.
+    #[serde(default)]
+    pub denied_unrestricted_fs: bool,
 }
 
 impl ProgressLedger {
@@ -285,6 +293,28 @@ impl ProgressLedger {
     pub fn allows_engine_continue(&self, caps: ProgressCaps) -> bool {
         self.no_progress_streak < caps.continue_streak_cap
             && self.closeout_deny_rounds < caps.closeout_deny_rounds
+            && !self.human_boundary_seen()
+    }
+
+    /// Record a human explicit denial. Capabilities accumulate for the epoch.
+    pub fn record_human_denial(&mut self, network: bool, unrestricted_fs: bool) {
+        if network {
+            self.denied_network = true;
+        }
+        if unrestricted_fs {
+            self.denied_unrestricted_fs = true;
+        }
+    }
+
+    /// True when the user said no to at least one elevation this epoch.
+    pub fn human_boundary_seen(&self) -> bool {
+        self.denied_network || self.denied_unrestricted_fs
+    }
+
+    /// True when `request` overlaps a capability the user already denied
+    /// (same or broader — `full_access` includes a denied `network`).
+    pub fn covers_denied_request(&self, network: bool, unrestricted_fs: bool) -> bool {
+        (network && self.denied_network) || (unrestricted_fs && self.denied_unrestricted_fs)
     }
 }
 
@@ -316,6 +346,48 @@ mod tests {
         led2.note_no_progress_round(2);
         assert!(led2.should_hard_stop_no_progress(caps));
         assert!(!led2.allows_engine_continue(caps));
+    }
+
+    #[test]
+    fn human_denial_covers_same_and_broader_but_not_other_axis() {
+        let mut led = ProgressLedger::default();
+        assert!(!led.human_boundary_seen());
+        led.record_human_denial(true, false);
+        assert!(led.human_boundary_seen());
+        assert!(led.covers_denied_request(true, false));
+        assert!(
+            led.covers_denied_request(true, true),
+            "full_access includes denied network"
+        );
+        assert!(
+            !led.covers_denied_request(false, true),
+            "unrelated filesystem request is still askable"
+        );
+        led.record_human_denial(false, true);
+        assert!(led.covers_denied_request(false, true));
+        assert!(led.covers_denied_request(true, true));
+    }
+
+    #[test]
+    fn human_denial_blocks_engine_continue() {
+        let caps = ProgressCaps::default();
+        let mut led = ProgressLedger::default();
+        assert!(led.allows_engine_continue(caps));
+        led.record_human_denial(false, true);
+        assert!(
+            !led.allows_engine_continue(caps),
+            "supervisor must not DriveGoalAgain past a human no"
+        );
+    }
+
+    #[test]
+    fn missing_denial_fields_default_on_old_snapshots() {
+        let led: ProgressLedger = serde_json::from_str(
+            r#"{"round":0,"last_progress_round":0,"no_progress_streak":0,"closeout_deny_rounds":0,"closing":false,"phase":"active","objective_version":0}"#,
+        )
+        .unwrap();
+        assert!(!led.denied_network);
+        assert!(!led.denied_unrestricted_fs);
     }
 
     #[test]

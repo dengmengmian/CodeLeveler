@@ -166,11 +166,11 @@ pub enum RemoteOutcome {
     Failed(String),
 }
 
-/// Injected at startup by the CLI: binds and serves the browser Web UI over the
-/// current in-process runtime, returning the token-carrying URL (or an error
-/// message). Kept as an opaque closure so `leveler-tui` need not depend on the
-/// web server or the local-transport service trait. `None` when the runtime
-/// cannot back a Web UI (e.g. a TUI attached to a remote daemon).
+/// Injected at startup by the CLI: binds and serves the browser Web UI over
+/// the current local runtime service (in-process client or local Unix-socket
+/// daemon), returning the token-carrying URL (or an error). Opaque so
+/// `leveler-tui` need not depend on the web server. `None` only when the
+/// host could not provide any local runtime service.
 pub type WebLauncher = std::sync::Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
         + Send

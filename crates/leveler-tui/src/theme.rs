@@ -3,6 +3,7 @@
 //!
 //! Named themes paint an opaque canvas. Body text is a real token, not
 //! `Color::Reset`, so readability does not depend on the terminal profile.
+//! Level Mark inks live on `theme.brand` (`foundation` / `primary` / `highlight`).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -126,18 +127,16 @@ pub struct StatusColors {
     pub running: Color,
 }
 
-/// Splash mascot inks. Decorative, not body text — contrast is gated
-/// separately from typography. Never construct these in a renderer.
+/// Level Mark inks. Geometry first; these only tint the rise.
+/// Never construct these in a renderer — always take them from a [`Theme`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MascotColors {
-    /// Fur / warm body.
-    pub fur: Color,
-    /// Ear / eye-mask darks.
-    pub dark: Color,
-    /// Face plate.
-    pub face: Color,
-    /// Eyes and small marks.
-    pub detail: Color,
+pub struct BrandColors {
+    /// Base / foundation (deeper CodeLeveler Blue).
+    pub foundation: Color,
+    /// Mid levels (primary CodeLeveler Blue).
+    pub primary: Color,
+    /// Apex (brighter accent blue).
+    pub highlight: Color,
 }
 
 /// Diff / edit highlighting. Markers (`+`/`-`) carry meaning alongside color.
@@ -164,7 +163,7 @@ pub struct Theme {
     pub accent: AccentColors,
     pub status: StatusColors,
     pub diff: DiffColors,
-    pub mascot: MascotColors,
+    pub brand: BrandColors,
 }
 
 const fn rgb(hex: u32) -> Color {
@@ -222,11 +221,10 @@ impl Theme {
                 added_bg: rgb(0x14301C),
                 removed_bg: rgb(0x3A181A),
             },
-            mascot: MascotColors {
-                fur: rgb(0xE07A3D),
-                dark: rgb(0x3A2418),
-                face: rgb(0xF3E6D8),
-                detail: rgb(0x1A120E),
+            brand: BrandColors {
+                foundation: rgb(0x2F7FE0),
+                primary: rgb(0x4EA1FF),
+                highlight: rgb(0x8EC8FF),
             },
         }
     }
@@ -278,11 +276,10 @@ impl Theme {
                 added_bg: rgb(0xE6F4EA),
                 removed_bg: rgb(0xFCE8E8),
             },
-            mascot: MascotColors {
-                fur: rgb(0xC45C20),
-                dark: rgb(0x3D2418),
-                face: rgb(0x4A3A30),
-                detail: rgb(0x1A120E),
+            brand: BrandColors {
+                foundation: rgb(0x0550AE),
+                primary: rgb(0x0969DA),
+                highlight: rgb(0x218BFF),
             },
         }
     }
@@ -332,11 +329,10 @@ impl Theme {
                 added_bg: rgb(0x002200),
                 removed_bg: rgb(0x330000),
             },
-            mascot: MascotColors {
-                fur: rgb(0xFF9933),
-                dark: rgb(0xFFFFFF),
-                face: rgb(0xFFFFFF),
-                detail: rgb(0xFFFF00),
+            brand: BrandColors {
+                foundation: rgb(0x4DA6FF),
+                primary: rgb(0x80C0FF),
+                highlight: rgb(0xB8DEFF),
             },
         }
     }
@@ -406,11 +402,10 @@ impl Theme {
                 added_bg: Color::Reset,
                 removed_bg: Color::Reset,
             },
-            mascot: MascotColors {
-                fur: Color::Reset,
-                dark: Color::Reset,
-                face: Color::Reset,
-                detail: Color::Reset,
+            brand: BrandColors {
+                foundation: Color::Reset,
+                primary: Color::Reset,
+                highlight: Color::Reset,
             },
         }
     }

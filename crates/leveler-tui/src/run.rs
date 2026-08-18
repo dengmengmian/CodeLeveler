@@ -69,6 +69,10 @@ const INPUT_BURST_WINDOW: Duration = Duration::from_millis(2);
 /// How many history entries persist across restarts.
 const HISTORY_CAP: usize = 100;
 
+/// Fallback when the host did not inject a Web launcher. Local Unix-socket
+/// daemons are not this case — they carry a launcher. Do not call them remote.
+const WEB_LAUNCHER_UNAVAILABLE: &str = "当前 TUI 没有可用的 Web UI 启动器";
+
 /// Errors running the terminal UI.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
@@ -470,9 +474,7 @@ fn dispatch_effects(
                 }
                 None => {
                     let _ = completion_tx.send(Action::WebLaunched(Err(
-                        "当前 TUI 连接的是远程 daemon，不能就地起 Web UI；\
-                         请改用 `leveler web --connect`"
-                            .to_string(),
+                        WEB_LAUNCHER_UNAVAILABLE.to_string()
                     )));
                 }
             },
@@ -796,6 +798,22 @@ mod tests {
             level: NotificationLevel::Info,
             message: "hi".into(),
         }
+    }
+
+    #[test]
+    fn missing_web_launcher_does_not_call_a_local_daemon_remote() {
+        assert!(
+            !WEB_LAUNCHER_UNAVAILABLE.contains("远程"),
+            "{WEB_LAUNCHER_UNAVAILABLE}"
+        );
+        assert!(
+            !WEB_LAUNCHER_UNAVAILABLE.contains("remote"),
+            "{WEB_LAUNCHER_UNAVAILABLE}"
+        );
+        assert!(
+            !WEB_LAUNCHER_UNAVAILABLE.contains("leveler web --connect"),
+            "{WEB_LAUNCHER_UNAVAILABLE}"
+        );
     }
 
     #[test]

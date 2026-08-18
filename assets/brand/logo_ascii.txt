@@ -1,8 +1,20 @@
-# Terminal splash wordmark — plain CL block letters
-# Used by crates/leveler-tui/src/splash.rs
- ██████╗ ██
-██╔════╝ ██
-██║      ██
-██║      ██
-╚██████╗ ███████╗
- ╚═════╝ ╚══════╝
+# CodeLeveler Level Mark — TUI primary brand
+# Source of truth: crates/leveler-tui/src/brand.rs
+# Spec: docs/TERMINAL_BRAND.md
+#
+# Master (13×5) — Candidate A "Cantilever"
+        ██
+      ████
+    ██████
+  ████  ██
+██      █████
+#
+# Compact (8×4)
+     ██
+   ████
+ ██  ██
+██  ████
+#
+# Micro (5×2)
+  ██
+█ ███
