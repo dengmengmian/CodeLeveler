@@ -22,6 +22,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
 
+    // Publish before building lines so the empty-state card can size to this
+    // viewport (splash is not cached on transcript version).
+    state.conv.rect = Some((content.x, content.y, content.width, content.height));
+
     let all = state.conversation_lines(width);
     // Plain text only backs mouse selection / clipboard. Rebuild it from this
     // frame's lines while a selection is live; otherwise clear it (the mouse-down
@@ -37,12 +41,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     let total = all.len();
     let max_scroll = crate::conversation::geometry::max_scroll(total, height);
-    let scroll = crate::conversation::geometry::effective_scroll(
-        state.conv.scroll,
-        state.conv.auto_scroll,
-        total,
-        height,
-    );
+    // Empty-state card is read top-down (brand → commands). Following the
+    // live edge would hide the product name on a short terminal.
+    let follow = state.conv.auto_scroll && !crate::splash::conversation_is_empty(state);
+    let scroll =
+        crate::conversation::geometry::effective_scroll(state.conv.scroll, follow, total, height);
 
     // Only the visible window is cloned + highlighted; the rest stays in the Rc.
     let mut lines: Vec<Line> = all
@@ -85,10 +88,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ),
         content,
     );
-
-    // Published rect is the content area (after gutter) so wrap width,
-    // selection columns, and hit-testing share one coordinate system.
-    state.conv.rect = Some((content.x, content.y, content.width, content.height));
 
     // Scroll-to-bottom affordance: only when pinned away from live edge.
     // Hide while selecting/copying so the badge cannot cover or steal mouse

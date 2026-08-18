@@ -93,7 +93,16 @@ pub fn build_conversation_lines_with_hits(
 
     // Empty session: brand splash (logo + tagline) instead of a blank void.
     if crate::splash::conversation_is_empty(state) {
-        return (crate::splash::splash_lines(state, width, theme, t), hits);
+        let height = state
+            .conv
+            .rect
+            .map(|(_, _, _, h)| h as usize)
+            .filter(|h| *h > 0)
+            .unwrap_or(24);
+        return (
+            crate::splash::splash_lines(state, width, height, theme, t),
+            hits,
+        );
     }
 
     let items = state.transcript.items();

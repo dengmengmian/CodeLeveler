@@ -187,14 +187,12 @@ pub struct UiText {
 
     // Welcome / help shell
     pub welcome_back: &'static str, // "欢迎回来，{}"
-    /// Empty Conversation splash tagline.
+    /// Empty Conversation splash tagline (product mission, one locale).
     pub splash_tagline: &'static str,
-    /// Empty Conversation one-line hint.
-    pub splash_hint: &'static str,
-    /// Splash "getting started" column heading.
-    pub splash_tips_title: &'static str,
-    /// Splash lead line above the command list.
-    pub splash_tips_lead: &'static str,
+    /// Splash primary CTA above the command list.
+    pub splash_start_task: &'static str,
+    /// Splash footer pointing at the slash palette.
+    pub splash_more_commands: &'static str,
     pub branch_label: &'static str,
     pub help_commands: &'static str,
     pub help_keys: &'static str,
@@ -604,10 +602,9 @@ static ZH: UiText = UiText {
     activity_found_locations: "找到 {} 个相关代码位置",
     file_mention: "文件",
     welcome_back: "欢迎回来，{}",
-    splash_tagline: "AI Coding Agent · 不同模型 · 同一工程标准",
-    splash_hint: "输入任务开始 · / 查看命令 · ↑ 历史",
-    splash_tips_title: "上手提示",
-    splash_tips_lead: "输入任务直接开始，或用命令：",
+    splash_tagline: "让模型真正可靠地完成任务",
+    splash_start_task: "输入任务，直接开始",
+    splash_more_commands: "输入 / 查看更多命令",
     branch_label: "分支 ",
     help_commands: "命令",
     help_keys: "快捷键",
@@ -966,10 +963,9 @@ static EN: UiText = UiText {
     activity_found_locations: "Found {} related code locations",
     file_mention: "file",
     welcome_back: "Welcome back, {}",
-    splash_tagline: "AI Coding Agent · different models · one standard",
-    splash_hint: "type a task · / commands · ↑ history",
-    splash_tips_title: "Getting started",
-    splash_tips_lead: "Type a task to start, or use a command:",
+    splash_tagline: "Make models reliably complete tasks",
+    splash_start_task: "Start by entering a task",
+    splash_more_commands: "Type / for more commands",
     branch_label: "branch ",
     help_commands: "Commands",
     help_keys: "Keys",
@@ -1072,7 +1068,7 @@ static EN: UiText = UiText {
         quit: "quit",
     },
     slash_brief: SlashText {
-        model: "switch model",
+        model: "Switch model",
         permission: "permission approval",
         goal: "set goal",
         btw: "quick question",
@@ -1082,7 +1078,7 @@ static EN: UiText = UiText {
         memory: "project memory",
         skill: "run a skill",
         skill_entry: "skill",
-        feature_dev: "feature implementation",
+        feature_dev: "Implement a feature",
         diff: "view changes",
         tools: "tool log",
         sessions: "sessions",
@@ -1099,7 +1095,7 @@ static EN: UiText = UiText {
         theme: "switch theme",
         clear: "new chat",
         doctor: "self-check",
-        help: "help",
+        help: "View help",
         quit: "quit",
     },
     slash_ghost: SlashGhost {

@@ -7,6 +7,9 @@ All notable changes to CodeLeveler are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- Empty-session splash is a terminal-native hero card: colored red-panda
+  mascot, product mission, and three first-run commands (`/feature-dev`,
+  `/model`, `/help`). `/plan` stays a slash command, not an onboarding step.
 - Reasoning effort is resolved in one place: model `supported_efforts` +
   CodeLeveler `default_effort`, then user override, then upward-or-clamp
   normalization. Protocol adapters encode the effective value only.

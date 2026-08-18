@@ -953,7 +953,7 @@ mod ghost_tests {
             .find(|(n, _)| n == "/feature-dev")
             .map(|(_, d)| d)
             .expect("en feature-dev row");
-        assert_eq!(en_label, "feature implementation");
+        assert_eq!(en_label, "Implement a feature");
     }
 
     #[test]
@@ -961,14 +961,14 @@ mod ghost_tests {
         let zh = Locale::Zh.text();
         let en = Locale::En.text();
         let pairs = [
-            ("/model", "切换模型", "switch model"),
+            ("/model", "切换模型", "Switch model"),
             ("/permission", "权限审批", "permission approval"),
             ("/goal", "设置目标", "set goal"),
             ("/btw", "临时提问", "quick question"),
             ("/work-mode", "执行策略", "work strategy"),
             ("/collab", "协作模式", "collaboration mode"),
             ("/plan", "生成计划", "generate plan"),
-            ("/feature-dev", "功能实现", "feature implementation"),
+            ("/feature-dev", "功能实现", "Implement a feature"),
             ("/diff", "查看改动", "view changes"),
         ];
         for (name, zh_want, en_want) in pairs {

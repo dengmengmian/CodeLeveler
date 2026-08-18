@@ -191,6 +191,50 @@ fn empty_session_shows_splash_with_logo() {
         text.contains("CodeLeveler") && text.contains('█'),
         "empty session splash missing brand/logo: {text}"
     );
+    assert!(
+        text.contains("让模型真正可靠地完成任务"),
+        "zh mission missing: {text}"
+    );
+    assert!(text.contains("/feature-dev"), "{text}");
+    assert!(!text.contains("/plan"), "plan must stay off splash: {text}");
+}
+
+#[test]
+fn splash_render_review_sizes() {
+    let mut zh = opened_state();
+    let mut en = opened_state();
+    en.locale = leveler_tui::Locale::En;
+    for (w, h) in [(120u16, 36u16), (80, 24), (60, 20)] {
+        let z = render_at(w, h, &mut zh);
+        let e = render_at(w, h, &mut en);
+        assert!(z.contains("CodeLeveler"), "zh {w}x{h}: {z}");
+        assert!(e.contains("CodeLeveler"), "en {w}x{h}: {e}");
+        assert!(
+            z.contains("让模型真正可靠地完成任务"),
+            "zh mission {w}x{h}: {z}"
+        );
+        assert!(
+            e.contains("Make models reliably complete tasks"),
+            "en mission {w}x{h}: {e}"
+        );
+        assert!(!z.contains("Make models reliably complete tasks"), "{z}");
+        assert!(!e.contains("让模型真正可靠地完成任务"), "{e}");
+        for cmd in ["/feature-dev", "/model", "/help"] {
+            assert!(z.contains(cmd), "zh {w}x{h} {cmd}");
+            assert!(e.contains(cmd), "en {w}x{h} {cmd}");
+        }
+    }
+    // 48×16 leaves only a few conversation rows after header + composer.
+    // Brand + mission stay; commands may clip. Must not panic.
+    let tiny_z = render_at(48, 16, &mut zh);
+    let tiny_e = render_at(48, 16, &mut en);
+    assert!(tiny_z.contains("CodeLeveler"), "{tiny_z}");
+    assert!(tiny_e.contains("CodeLeveler"), "{tiny_e}");
+    assert!(tiny_z.contains("让模型真正可靠地完成任务"), "{tiny_z}");
+    assert!(
+        tiny_e.contains("Make models reliably complete tasks"),
+        "{tiny_e}"
+    );
 }
 
 /// End-to-end through the real render path: a repository shipping ignored
