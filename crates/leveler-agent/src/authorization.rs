@@ -99,21 +99,21 @@ pub(crate) fn write_targets_outside_allowlist(
     call: &ToolCall,
     allowlist: &[String],
 ) -> Vec<String> {
-    // Trailing slashes are stripped so a directory grant written either way
-    // (`src/output` / `src/output/`, the spawn_agent schema shows the latter)
-    // covers its subtree. A bare "/" normalizes to "" and matches nothing.
-    let norm = |p: &str| {
-        p.trim()
-            .trim_start_matches("./")
-            .trim_end_matches('/')
-            .to_string()
-    };
     let allow: Vec<String> = allowlist
         .iter()
-        .map(|p| norm(p))
+        .map(|p| norm_scope_path(p))
         .filter(|p| !p.is_empty())
         .collect();
-    let targets: Vec<String> = match call.name.as_str() {
+    write_targets(call)
+        .into_iter()
+        .map(|p| norm_scope_path(&p))
+        .filter(|target| !allow.iter().any(|a| scope_covers(a, target)))
+        .collect()
+}
+
+/// The paths a direct write tool would touch, unnormalized.
+fn write_targets(call: &ToolCall) -> Vec<String> {
+    match call.name.as_str() {
         "apply_patch" => {
             let patch = call
                 .arguments
@@ -129,15 +129,40 @@ pub(crate) fn write_targets_outside_allowlist(
             .map(|p| vec![p.to_string()])
             .unwrap_or_default(),
         _ => Vec::new(),
-    };
-    targets
+    }
+}
+
+/// Normalize a scope/target path: `./` prefix and trailing slashes stripped so
+/// a directory grant written either way (`src/output` / `src/output/`, the
+/// spawn_agent schema shows the latter) covers its subtree. A bare "/"
+/// normalizes to "" and matches nothing.
+pub(crate) fn norm_scope_path(p: &str) -> String {
+    p.trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Whether normalized scope entry `a` covers normalized `target` (equal path
+/// or directory prefix).
+fn scope_covers(a: &str, target: &str) -> bool {
+    !a.is_empty() && (target == a || target.starts_with(&format!("{a}/")))
+}
+
+/// V2 parent write fence: the paths this call would write that fall INSIDE any
+/// of `scopes` (the exclusive scopes of still-running background Workers). A
+/// parent edit there would race the child it delegated to — integration waits
+/// for settlement.
+pub(crate) fn write_targets_inside_scopes(call: &ToolCall, scopes: &[String]) -> Vec<String> {
+    let owned: Vec<String> = scopes
+        .iter()
+        .map(|p| norm_scope_path(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    write_targets(call)
         .into_iter()
-        .map(|p| norm(&p))
-        .filter(|target| {
-            !allow
-                .iter()
-                .any(|a| target == a || target.starts_with(&format!("{a}/")))
-        })
+        .map(|p| norm_scope_path(&p))
+        .filter(|target| owned.iter().any(|a| scope_covers(a, target)))
         .collect()
 }
 

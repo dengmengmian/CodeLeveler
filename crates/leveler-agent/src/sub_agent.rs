@@ -89,24 +89,86 @@ pub fn should_inject_delegation_hint(allow_delegation: bool, depth: u32) -> bool
 }
 
 /// One-shot user injection when [`should_inject_delegation_hint`] is true.
+/// V2: this is the canonical coordination policy — Main is both the coding
+/// agent and the coordinator of this workspace.
 pub fn multi_agent_steer_hint() -> String {
-    "## Multi-agent delegation\n\
-     Before substantial implementation, decide whether any bounded subtask \
-     should leave this trajectory. Prefer `spawn_agent` with role='worker' when \
-     the subtask has a clear file/module/symbol scope, can be independently \
-     verified, needs little shared mutable context, can produce a concrete \
-     implementation, and would reduce main-trajectory context or latency. A \
-     worker performs scoped writes inside `files` and can run targeted tests; \
-     put a complete self-contained `task` in the spawn — children do not see \
-     parent tool history. After a child returns, inspect and integrate; do not \
-     silently redo the same writes.\n\
-     Keep work on the main trajectory when delegation would introduce more \
-     coordination cost than value, or the step is a single trivial edit. If \
-     several subtasks are independent, emit several `spawn_agent` calls in one \
-     turn. Do not spawn for its own sake.\n\
+    "## Multi-agent coordination\n\
+     You are both the coding agent and the coordinator of this workspace. \
+     Delegate focused, INDEPENDENT work to `spawn_agent` children so it does \
+     not consume this conversation's context: role='worker' with the exact \
+     `files` or directories it will exclusively own for a bounded \
+     implementation, role='explorer' for read-only investigation. Put a \
+     complete self-contained `task` in each spawn — children do not see your \
+     history.\n\
+     Children run in the background by default: the call returns immediately \
+     with the child's id, and the runtime tells you when each settles — do not \
+     poll. Start independent delegations together in one assistant message and \
+     CONTINUE USEFUL WORK while they run: another disjoint area, integration \
+     boundaries, test preparation. Never edit files a running child owns (the \
+     runtime refuses it) and do not redo child-owned work — inspect and \
+     integrate its result when it settles. Set run_in_background=false only \
+     when your next action depends on that child's result.\n\
+     Keep work yourself when it is small, tightly coupled, needs your \
+     in-flight context, or has no safe ownership boundary — KEEP is a \
+     first-class outcome. Do not spawn for its own sake.\n\
      Long work stays in this direct tool loop: keep calling tools / spawn_agent \
      until the goal is proven; do not stop early with a plan-only summary."
         .to_string()
+}
+
+/// The settlement notice injected into the parent's context when a BACKGROUND
+/// child finishes. Runtime-owned and unconditional (a child killed by its
+/// budget is exactly the child that never got to report); `result_for_parent`
+/// is [`ChildResult::for_parent`] output, so the four-way completion truth and
+/// partial findings arrive verbatim.
+pub(crate) fn settlement_notice(
+    nickname: &str,
+    id: &str,
+    role: AgentRole,
+    scope: &[String],
+    result_for_parent: &str,
+) -> String {
+    let scope_line = if scope.is_empty() {
+        String::new()
+    } else {
+        format!("Its exclusive scope ({}) is released.\n", scope.join(", "))
+    };
+    format!(
+        "## Background sub-agent settled\n\
+         {nickname} ({id}, role={}) has finished and will do no further work.\n\
+         {scope_line}{result_for_parent}\n\
+         Inspect and integrate this result where it matters; do not redo work \
+         it completed.",
+        role.label()
+    )
+}
+
+/// Truthful note for a resumed run whose previous window still had background
+/// children running: in-process children do not survive a restart.
+pub(crate) fn lost_children_note(outstanding: &[String]) -> String {
+    let mut out = String::from(
+        "## Delegations lost at restart\n\
+         The previous session window ended while these background sub-agents \
+         were still running. They did NOT survive the restart — their work is \
+         NOT done, their exclusive scopes are released, and no settlement will \
+         arrive. Re-delegate or do the work yourself if it is still needed:\n",
+    );
+    for entry in outstanding {
+        // id|nickname|role|scope
+        let mut parts = entry.splitn(4, '|');
+        let id = parts.next().unwrap_or("?");
+        let nickname = parts.next().unwrap_or("?");
+        let role = parts.next().unwrap_or("?");
+        let scope = parts.next().unwrap_or("");
+        if scope.is_empty() {
+            out.push_str(&format!("- {nickname} ({id}, role={role})\n"));
+        } else {
+            out.push_str(&format!(
+                "- {nickname} ({id}, role={role}, scope: {scope})\n"
+            ));
+        }
+    }
+    out
 }
 
 /// What the drive loop must do at a round boundary for the delegation
@@ -714,21 +776,29 @@ mod tests {
     #[test]
     fn steer_hint_names_spawn_agent() {
         let h = multi_agent_steer_hint();
-        assert!(h.contains("## Multi-agent delegation"));
+        assert!(h.contains("## Multi-agent coordination"));
         assert!(h.contains("spawn_agent"));
         assert!(h.contains("direct tool loop"));
     }
 
+    /// V2 coordination policy contract: the four load-bearing sentences must
+    /// stay present, and forced-spawn framing stays banned. Delegation-
+    /// preferred-for-INDEPENDENT-work is deliberate product policy; "always/
+    /// must spawn" is not.
     #[test]
-    fn steer_hint_is_keep_vs_delegate_not_always_spawn() {
+    fn steer_hint_is_coordinator_policy_not_always_spawn() {
         let h = multi_agent_steer_hint();
         let lower = h.to_ascii_lowercase();
-        assert!(lower.contains("bounded"));
-        assert!(lower.contains("independently verif") || lower.contains("independent verif"));
-        assert!(lower.contains("scoped") && (lower.contains("write") || lower.contains("edit")));
-        assert!(lower.contains("coordination") || lower.contains("keep work on the main"));
+        assert!(lower.contains("coordinator"));
+        assert!(lower.contains("independent"));
+        assert!(lower.contains("background by default"));
+        assert!(lower.contains("continue useful work"));
+        assert!(lower.contains("run_in_background=false only"));
+        assert!(lower.contains("keep is a first-class outcome"));
+        assert!(lower.contains("do not spawn for its own sake"));
         assert!(!lower.contains("always spawn"));
         assert!(!lower.contains("must spawn"));
+        assert!(!lower.contains("every task"));
     }
 
     #[test]

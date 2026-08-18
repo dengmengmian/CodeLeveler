@@ -3,7 +3,7 @@
 //! approver into the async, broadcast-shaped client protocol the TUI consumes
 //! .
 //!
-//! The runtime exposes progress as a synchronous `&mut dyn FnMut(AgentEvent)`
+//! The runtime exposes progress as a synchronous `&mut (dyn FnMut(AgentEvent) + Send)`
 //! observer with no channel. This client wraps that callback in a closure that
 //! forwards each event into a `tokio::sync::broadcast`, and drives the turn on a
 //! blocking thread (the turn future is not `Send`) so `send` returns

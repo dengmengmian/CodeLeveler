@@ -155,7 +155,7 @@ impl TurnRunner<'_> {
         kind: TurnKind,
         profile: TurnProfile,
         input: TurnInput,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TurnRecordedOutcome, EngineError> {
         let is_repair_turn = matches!(kind, TurnKind::Repair { .. });
@@ -563,7 +563,7 @@ impl TurnRunner<'_> {
         profile: TurnProfile,
         brief: String,
         files: Vec<String>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<bool, EngineError> {
         let executor = self

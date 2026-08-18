@@ -76,7 +76,7 @@ impl<'a> EventLog<'a> {
         &self,
         turn_id: Option<&TurnId>,
         event: EngineEvent,
-        forward: &mut dyn FnMut(EngineEvent),
+        forward: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         if !event.is_transient() {
             let (event_type, payload) = event.to_row()?;

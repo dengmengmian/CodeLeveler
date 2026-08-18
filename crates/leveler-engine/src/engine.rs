@@ -437,7 +437,7 @@ impl TaskEngine {
         stop: Option<StopReason>,
         status: SessionStatus,
         state: AgentState,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         let event = EngineEvent::TaskFinished {
             outcome,
@@ -469,7 +469,7 @@ impl TaskEngine {
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         result: &Result<TaskReport, EngineError>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         // A stale runtime has no authority to write a terminal fact - not even
         // Failed. Abort silently here; the current owner decides the task's
@@ -674,7 +674,7 @@ impl TaskEngine {
         &self,
         session_id: &SessionId,
         spec: &TaskSpec,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         let token = self.mark_running(session_id).await?;
@@ -759,7 +759,7 @@ impl TaskEngine {
         session_id: &SessionId,
         spec: &TaskSpec,
         content: Vec<leveler_model::ContentPart>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         // Anchor the baseline for THIS turn before it edits anything, exactly as
@@ -872,7 +872,7 @@ impl TaskEngine {
         &self,
         session_id: &SessionId,
         spec: &TaskSpec,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         let (_, _, kind, outcome) = self
@@ -1007,7 +1007,7 @@ impl TaskEngine {
     async fn recover_crash_window(
         &self,
         log: &EventLog<'_>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(), EngineError> {
         for call in log.dangling_tool_calls().await? {
@@ -1067,7 +1067,7 @@ impl TaskEngine {
         call: &DanglingCall,
         args: serde_json::Value,
         turn_ref: Option<&TurnId>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(), EngineError> {
         // Execution during recovery goes through the host's reconciliation
@@ -1110,7 +1110,7 @@ impl TaskEngine {
         call: &DanglingCall,
         turn_ref: Option<&TurnId>,
         reason: &str,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         log.append(
             turn_ref,
@@ -1133,7 +1133,7 @@ impl TaskEngine {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         prior: Vec<leveler_model::Message>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         let recorded = runner
@@ -1165,7 +1165,7 @@ impl TaskEngine {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         // Multi-turn Goal: inject bounded session history so follow-ups can
@@ -1252,7 +1252,7 @@ impl TaskEngine {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         mut outcome: leveler_agent::AgentOutcome,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<leveler_agent::AgentOutcome, EngineError> {
         let policy = self.supervisor_policy();
@@ -1353,7 +1353,7 @@ impl TaskEngine {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         outcome: &leveler_agent::AgentOutcome,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<leveler_agent::AgentOutcome, EngineError> {
         // Announce BEFORE the transcript load / compaction / model call.
@@ -1433,7 +1433,7 @@ impl TaskEngine {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         limits: StepLimits,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<Option<leveler_agent::AgentOutcome>, EngineError> {
         let raw = crate::RawTranscript::load_strict(
@@ -1478,7 +1478,7 @@ impl TaskEngine {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         outcome: &leveler_agent::AgentOutcome,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<ClosureReview, EngineError> {
         let stage = |required: bool, action: &str, detail: String| EngineEvent::ReviewStage {
@@ -1557,7 +1557,7 @@ impl TaskEngine {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         mut outcome: leveler_agent::AgentOutcome,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         // Goal continuation and bounded budget extension already happened in
@@ -1786,7 +1786,7 @@ impl TaskEngine {
         spec: &TaskSpec,
         allowed_paths: &[String],
         modified_files: &[String],
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<VerificationReport, EngineError> {
         log.append(None, EngineEvent::VerificationStarted, observer)
