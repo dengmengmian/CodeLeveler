@@ -31,15 +31,16 @@ use leveler_core::{CheckpointId, SessionId};
 use leveler_execution::{Approver, AutoApprove, PermissionProfile};
 use leveler_media::MediaStore;
 use leveler_model::{
-    ContentPart, ImageSource, Message, ModelRef, ModelRequest, ModelRuntime, Role, ToolChoice,
+    ContentPart, ImageSource, Message, ModelProfile, ModelRef, ModelRequest, ModelRuntime, Role,
+    ToolChoice, resolve_reasoning_effort,
 };
 use leveler_storage::{MessageRepository, SessionRepository};
 
 use leveler_client_protocol::{
     ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
     AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
-    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot,
-    UiSessionSummary,
+    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiReasoningState, UiRole,
+    UiSessionSnapshot, UiSessionSummary,
 };
 
 /// Whether a turn auto-approves risky actions. True when the session opted in
@@ -49,6 +50,18 @@ use leveler_client_protocol::{
 /// same time, while `serve --auto-approve` still auto-approves everything.
 fn should_auto_approve(session_policy: Option<ApprovalPolicy>, global_auto_approve: bool) -> bool {
     matches!(session_policy, Some(ApprovalPolicy::AutoApprove)) || global_auto_approve
+}
+
+/// New runtimes always project this block so the TUI can tell "no knob"
+/// (`effective: None`) from "old runtime, field absent".
+fn ui_reasoning_state(profile: Option<&ModelProfile>) -> Option<UiReasoningState> {
+    Some(UiReasoningState {
+        effective: profile.and_then(|p| {
+            resolve_reasoning_effort(None, &p.reasoning)
+                .effective
+                .map(|e| e.as_wire().to_string())
+        }),
+    })
 }
 
 fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalDecision {
@@ -2138,14 +2151,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
 
         let config = self.runtime_config(session_id).await?;
         let model = config.model.clone();
+        let profile = self.app.registry.profile(&model).await.ok();
         // Whether the current model accepts images (spec §42).
-        let vision = self
-            .app
-            .registry
-            .profile(&model)
-            .await
+        let vision = profile
+            .as_ref()
             .map(|p| p.capabilities.vision)
             .unwrap_or(false);
+        let reasoning = ui_reasoning_state(profile.as_ref());
 
         let last_sequence = leveler_storage::EventRepository::new(&db)
             .latest_sequence(session_id)
@@ -2207,6 +2219,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             checkpoints,
             user_shells: self.user_shells.snapshot(session_id),
             completion_report: live.completion_report,
+            reasoning,
         })
     }
 }
@@ -2427,12 +2440,12 @@ async fn compact_conversation(
             .collect();
         let mut available_models = app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
-        let vision = app
-            .registry
-            .profile(model)
-            .await
+        let profile = app.registry.profile(model).await.ok();
+        let vision = profile
+            .as_ref()
             .map(|p| p.capabilities.vision)
             .unwrap_or(false);
+        let reasoning = ui_reasoning_state(profile.as_ref());
         let last_sequence = leveler_storage::EventRepository::new(&db)
             .latest_sequence(session_id)
             .await
@@ -2466,6 +2479,7 @@ async fn compact_conversation(
                 checkpoints: Vec::new(),
                 user_shells: Vec::new(),
                 completion_report: live.completion_report,
+                reasoning,
             },
         });
     }

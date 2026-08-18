@@ -315,7 +315,11 @@ pub fn resolve_execution_policy(
         // Safety rails: only the eval seam may lower them.
         completion_evidence: o.completion_evidence.unwrap_or(true),
         repeated_read_guard: o.repeated_read_guard.unwrap_or(true),
-        reasoning_effort: o.reasoning_effort.or(profile.reasoning.effort),
+        reasoning_effort: leveler_model::resolve_reasoning_effort(
+            o.reasoning_effort,
+            &profile.reasoning,
+        )
+        .effective,
         // Explicit configuration only (no auto-tuning in v1): eval seam, then
         // the model profile, then the global default cap.
         max_tool_output_bytes: o
@@ -580,12 +584,27 @@ mod tests {
     #[test]
     fn reasoning_effort_prefers_override_then_profile_recommendation() {
         let mut p = profile();
-        p.reasoning.effort = Some(ReasoningEffort::Low);
+        p.reasoning.default_effort = Some(ReasoningEffort::Low);
+        p.reasoning.supported_efforts = vec![ReasoningEffort::Low, ReasoningEffort::High];
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
         assert_eq!(r.reasoning_effort, Some(ReasoningEffort::Low));
 
         let task = ExecutionOverrides {
             reasoning_effort: Some(ReasoningEffort::High),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&task));
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn reasoning_effort_upgrades_unsupported_override() {
+        let mut p = profile();
+        p.capabilities.reasoning = true;
+        p.reasoning.default_effort = Some(ReasoningEffort::Max);
+        p.reasoning.supported_efforts = vec![ReasoningEffort::High, ReasoningEffort::Max];
+        let task = ExecutionOverrides {
+            reasoning_effort: Some(ReasoningEffort::Medium),
             ..ExecutionOverrides::default()
         };
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&task));

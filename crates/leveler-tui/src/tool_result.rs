@@ -24,8 +24,8 @@ pub(crate) fn result_lines(
     debug_assert_ne!(call.status, ToolStatus::Running);
     let parsed = ParsedOutput::from_call(call);
     let (glyph, color, status) = match call.status {
-        ToolStatus::Ok => ("✓", theme.success, t.tool_status_succeeded),
-        ToolStatus::Failed => ("✗", theme.error, t.tool_status_failed),
+        ToolStatus::Ok => ("✓", theme.status.success, t.tool_status_succeeded),
+        ToolStatus::Failed => ("✗", theme.status.error, t.tool_status_failed),
         ToolStatus::Running => unreachable!("running calls use Tool Activity"),
     };
     let mut summary = format!("{status} · {}", tool_target(call, locale, t));
@@ -43,7 +43,7 @@ pub(crate) fn result_lines(
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
             truncate_display(&summary, width.saturating_sub(2)),
-            Style::default().fg(theme.text),
+            Style::default().fg(theme.text.primary),
         ),
     ])];
 
@@ -57,7 +57,7 @@ pub(crate) fn result_lines(
         Span::styled(
             format!("{disclosure} {}", t.tool_details),
             Style::default()
-                .fg(theme.muted)
+                .fg(theme.text.secondary)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -66,11 +66,11 @@ pub(crate) fn result_lines(
                 t.tool_output_lines
                     .replace("{}", &parsed.content_lines.to_string())
             ),
-            Style::default().fg(theme.border),
+            Style::default().fg(theme.border.normal),
         ),
         Span::styled(
             if expanded { "" } else { " · Ctrl+O" }.to_string(),
-            Style::default().fg(theme.border),
+            Style::default().fg(theme.border.normal),
         ),
     ]));
 
@@ -158,7 +158,7 @@ fn append_details(
             DetailRow::Section(label) => out.push(Line::from(Span::styled(
                 format!("    {label}"),
                 Style::default()
-                    .fg(theme.border)
+                    .fg(theme.border.normal)
                     .add_modifier(Modifier::BOLD),
             ))),
             DetailRow::Content(content) => {
@@ -166,8 +166,8 @@ fn append_details(
                     if shown == MAX_DETAIL_LINES {
                         break;
                     }
-                    let base = Style::default().fg(theme.muted);
-                    let link = crate::url_link::link_style(theme.accent);
+                    let base = Style::default().fg(theme.text.secondary);
+                    let link = crate::url_link::link_style(theme.accent.primary);
                     let mut spans =
                         crate::url_link::spans_with_bare_urls(&format!("      {line}"), base, link);
                     out.push(Line::from(std::mem::take(&mut spans)));
@@ -186,7 +186,7 @@ fn append_details(
                 t.tool_output_lines
                     .replace("{}", &(parsed.content_lines - shown).to_string())
             ),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         )));
     }
 }

@@ -40,11 +40,11 @@ pub fn assistant_split(
         // Streaming cursor is part of the live tail.
         lines.push(Line::from(Span::styled(
             "▌",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
     }
     // Bulleting maps lines 1:1, so the stable boundary is preserved.
-    let bulleted = bulleted(lines, "●", Style::default().fg(theme.accent));
+    let bulleted = bulleted(lines, "●", Style::default().fg(theme.accent.primary));
     (bulleted, stable)
 }
 
@@ -62,10 +62,10 @@ pub fn item_render(
             // A continuous heading left-bar + bold text marks a user turn clearly
             // apart from the assistant's "●" bullet + normal-weight prose.
             let bar = Style::default()
-                .fg(theme.heading)
+                .fg(theme.text.primary)
                 .add_modifier(Modifier::BOLD);
             let body = Style::default()
-                .fg(theme.user_message)
+                .fg(theme.text.primary)
                 .add_modifier(Modifier::BOLD);
             let inner = wrap_width.saturating_sub(2).max(1);
             let mut wrapped = wrap(text, inner);
@@ -107,7 +107,7 @@ pub fn item_render(
                 &mut out,
                 "✗ ",
                 text,
-                Style::default().fg(theme.error),
+                Style::default().fg(theme.status.error),
                 wrap_width,
             );
         }
@@ -116,7 +116,7 @@ pub fn item_render(
                 &mut out,
                 "◆ ",
                 text,
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
                 wrap_width,
             );
         }
@@ -130,7 +130,7 @@ pub fn item_render(
                 &mut out,
                 &format!("※ {}: ", t.recap_label),
                 &text,
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
                 wrap_width,
             );
         }
@@ -147,11 +147,11 @@ pub(crate) fn btw_card_lines(
     wrap_width: usize,
     t: &crate::i18n::UiText,
 ) -> Vec<Line<'static>> {
-    let border = Style::default().fg(theme.attachment);
-    let muted = Style::default().fg(theme.muted);
-    let text = Style::default().fg(theme.text);
-    let err = Style::default().fg(theme.error);
-    let accent = Style::default().fg(theme.attachment);
+    let border = Style::default().fg(theme.accent.secondary);
+    let muted = Style::default().fg(theme.text.secondary);
+    let text = Style::default().fg(theme.text.primary);
+    let err = Style::default().fg(theme.status.error);
+    let accent = Style::default().fg(theme.accent.secondary);
 
     let box_w = wrap_width.max(16);
     let inner_w = box_w.saturating_sub(2).max(8);
@@ -298,9 +298,12 @@ fn turn_end_lines(
     // not a warning, so it keeps its own low-key wording.
     let (label, color) = match block.status {
         TurnEndStatus::Completed | TurnEndStatus::Answered => {
-            (format!("✓ {}", t.turn_end_completed), theme.success)
+            (format!("✓ {}", t.turn_end_completed), theme.status.success)
         }
-        TurnEndStatus::Truncated => (format!("⚠ {}", t.final_completed_warnings), theme.warning),
+        TurnEndStatus::Truncated => (
+            format!("⚠ {}", t.final_completed_warnings),
+            theme.status.warning,
+        ),
         // Incomplete = the run stopped mid-task on its own (budget / loop guard /
         // failed verification gate / model gave up). None of these are a *system*
         // block, so the honest word is "未完成"; the detail says how to continue.
@@ -313,18 +316,21 @@ fn turn_end_lines(
             } else {
                 t.final_blocked
             };
-            (format!("⚠ {word}"), theme.warning)
+            (format!("⚠ {word}"), theme.status.warning)
         }
         TurnEndStatus::Unverified if no_code_changes => {
-            (t.turn_no_code_changes.to_string(), theme.success)
+            (t.turn_no_code_changes.to_string(), theme.status.success)
         }
         TurnEndStatus::Unverified if no_auto_verify => {
-            (t.turn_unverified.to_string(), theme.success)
+            (t.turn_unverified.to_string(), theme.status.success)
         }
-        TurnEndStatus::Unverified => (format!("⚠ {}", t.final_completed_warnings), theme.warning),
-        TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.error),
+        TurnEndStatus::Unverified => (
+            format!("⚠ {}", t.final_completed_warnings),
+            theme.status.warning,
+        ),
+        TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.status.error),
         // Cancelled is user-initiated, not a failure: stopped glyph, muted.
-        TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.muted),
+        TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.text.secondary),
     };
     let mut stats = String::new();
     if matches!(
@@ -364,13 +370,13 @@ fn turn_end_lines(
         + 1;
     let tail = "─".repeat(width.saturating_sub(used));
     out.push(Line::from(vec![
-        Span::styled(lead, Style::default().fg(theme.border)),
+        Span::styled(lead, Style::default().fg(theme.border.normal)),
         Span::styled(
             label,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(stats, Style::default().fg(theme.muted)),
-        Span::styled(format!(" {tail}"), Style::default().fg(theme.border)),
+        Span::styled(stats, Style::default().fg(theme.text.secondary)),
+        Span::styled(format!(" {tail}"), Style::default().fg(theme.border.normal)),
     ]));
     // Very long residual reasons wrap onto a second dim line.
     if !folded && let Some(detail) = &block.detail {
@@ -379,7 +385,7 @@ fn turn_end_lines(
             for line in wrap(d, width.saturating_sub(4).max(8)) {
                 out.push(Line::from(Span::styled(
                     format!("   {line}"),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.text.secondary),
                 )));
             }
         }
@@ -527,22 +533,22 @@ fn sub_agent_lines(
     now_elapsed_secs: u64,
 ) {
     let (glyph, color) = match block.status {
-        ToolStatus::Running => ("◌", theme.accent),
-        ToolStatus::Ok => ("✓", theme.success),
-        ToolStatus::Failed => ("✗", theme.error),
+        ToolStatus::Running => ("◌", theme.accent.primary),
+        ToolStatus::Ok => ("✓", theme.status.success),
+        ToolStatus::Failed => ("✗", theme.status.error),
     };
     let mut head_spans = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
             sub_agent_display_name(block, t),
             Style::default()
-                .fg(theme.accent)
+                .fg(theme.accent.primary)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
     head_spans.push(Span::styled(
         format!(" · {}", sub_agent_status(block, t)),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     ));
     if block.finding_count > 0 {
         head_spans.push(Span::styled(
@@ -551,27 +557,27 @@ fn sub_agent_lines(
                 t.sub_agent_findings
                     .replace("{}", &block.finding_count.to_string())
             ),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ));
     }
     let elapsed = sub_agent_elapsed(block, now_elapsed_secs);
     if !elapsed.is_empty() {
         head_spans.push(Span::styled(
             format!(" · {elapsed}"),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ));
     }
     if let Some(step) = block.recent_step.as_deref().filter(|s| !s.is_empty()) {
         head_spans.push(Span::styled(
             format!(" · {step}"),
-            Style::default().fg(theme.accent),
+            Style::default().fg(theme.accent.primary),
         ));
     }
     let usage = sub_agent_usage(block, t);
     if !usage.is_empty() {
         head_spans.push(Span::styled(
             format!(" · {usage}"),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ));
     }
     let head = Line::from(head_spans);
@@ -596,7 +602,7 @@ fn sub_agent_lines(
         for line in rows.iter().take(shown) {
             out.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(line.clone(), Style::default().fg(theme.muted)),
+                Span::styled(line.clone(), Style::default().fg(theme.text.secondary)),
             ]));
         }
         if cut {
@@ -606,7 +612,7 @@ fn sub_agent_lines(
                     t.fold_more_lines
                         .replace("{}", &(rows.len() - shown).to_string())
                 ),
-                Style::default().fg(theme.dim),
+                Style::default().fg(theme.text.muted),
             )));
         }
     }
@@ -658,19 +664,19 @@ fn sub_agent_tree_group_lines(
     let (glyph, color, header) = if any_running {
         (
             "◌",
-            theme.accent,
+            theme.accent.primary,
             t.agents_running_header.replacen("{}", &count, 1),
         )
     } else if all_ok {
         (
             "✓",
-            theme.success,
+            theme.status.success,
             t.agents_done_header.replacen("{}", &count, 1),
         )
     } else {
         (
             "⚠",
-            theme.warning,
+            theme.status.warning,
             t.agents_ended_header.replacen("{}", &count, 1),
         )
     };
@@ -715,9 +721,11 @@ fn sub_agent_tree_group_lines(
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
             header,
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(stats, Style::default().fg(theme.dim)),
+        Span::styled(stats, Style::default().fg(theme.text.muted)),
     ]));
 
     // Children: nickname first, then the localized role name. Stats/status in
@@ -744,8 +752,11 @@ fn sub_agent_tree_group_lines(
             "├─"
         };
         let mut spans = vec![
-            Span::styled(format!("  {branch} "), Style::default().fg(theme.border)),
-            Span::styled(name.clone(), Style::default().fg(theme.text)),
+            Span::styled(
+                format!("  {branch} "),
+                Style::default().fg(theme.border.normal),
+            ),
+            Span::styled(name.clone(), Style::default().fg(theme.text.primary)),
         ];
         // Only an imperfect run spells out each child's outcome; a fully
         // successful batch shows usage stats instead of repeating "completed".
@@ -767,7 +778,7 @@ fn sub_agent_tree_group_lines(
                 (true, false) => detail,
                 (true, true) => String::new(),
             };
-            (text, theme.accent)
+            (text, theme.accent.primary)
         } else if all_ok {
             let usage = sub_agent_tree_child_usage(block);
             if block.finding_count > 0 {
@@ -779,9 +790,9 @@ fn sub_agent_tree_group_lines(
                 } else {
                     format!("{usage} · {findings}")
                 };
-                (text, theme.dim)
+                (text, theme.text.muted)
             } else {
-                (usage, theme.dim)
+                (usage, theme.text.muted)
             }
         } else {
             sub_agent_tree_child_status(block, theme, t)
@@ -823,14 +834,17 @@ fn sub_agent_tree_child_status(
 ) -> (String, ratatui::style::Color) {
     match block.status {
         ToolStatus::Running if block.progress.active => {
-            (t.agent_status_running.to_string(), theme.accent)
+            (t.agent_status_running.to_string(), theme.accent.primary)
         }
-        ToolStatus::Running => (t.sub_agent_waiting.to_string(), theme.muted),
-        ToolStatus::Ok => (format!("✓ {}", t.agent_status_completed), theme.success),
+        ToolStatus::Running => (t.sub_agent_waiting.to_string(), theme.text.secondary),
+        ToolStatus::Ok => (
+            format!("✓ {}", t.agent_status_completed),
+            theme.status.success,
+        ),
         ToolStatus::Failed if sub_agent_hit_round_limit(block) => {
-            (format!("✗ {}", t.agent_status_timeout), theme.error)
+            (format!("✗ {}", t.agent_status_timeout), theme.status.error)
         }
-        ToolStatus::Failed => (format!("✗ {}", t.sub_agent_incomplete), theme.error),
+        ToolStatus::Failed => (format!("✗ {}", t.sub_agent_incomplete), theme.status.error),
     }
 }
 
@@ -874,9 +888,9 @@ fn completion_lines(
     t: &crate::i18n::UiText,
 ) {
     let (glyph, color) = if report.success {
-        ("✓", theme.success)
+        ("✓", theme.status.success)
     } else {
-        ("✗", theme.warning)
+        ("✗", theme.status.warning)
     };
     out.push(Line::from(Span::styled(
         format!("{glyph} {}", t.turn_end_completed),
@@ -890,7 +904,7 @@ fn completion_lines(
             report.added,
             report.removed
         ),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     if report.checks_total > 0 {
         out.push(Line::from(Span::styled(
@@ -900,12 +914,12 @@ fn completion_lines(
                     .replacen("{}", &report.checks_passed.to_string(), 1)
                     .replacen("{}", &report.checks_total.to_string(), 1)
             ),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
     }
     out.push(Line::from(Span::styled(
         format!("  {}", t.completion_diff_hint),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
 }
 
@@ -955,12 +969,12 @@ pub(crate) fn user_shell_lines(
             String::new()
         };
         out.push(Line::from(vec![
-            Span::styled("◌ ".to_string(), Style::default().fg(theme.accent)),
+            Span::styled("◌ ".to_string(), Style::default().fg(theme.accent.primary)),
             Span::styled(
                 crate::render::truncate_display(&label, wrap_width.saturating_sub(8)),
-                Style::default().fg(theme.text),
+                Style::default().fg(theme.text.primary),
             ),
-            Span::styled(suffix, Style::default().fg(theme.dim)),
+            Span::styled(suffix, Style::default().fg(theme.text.muted)),
         ]));
         return out;
     }
@@ -1001,14 +1015,14 @@ pub(crate) fn user_shell_lines(
     if shell.output_truncated {
         out.push(Line::from(Span::styled(
             format!("  {}", t.shell_truncated),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         )));
     }
     for raw in shell.output.lines() {
         let line = crate::render::sanitize_terminal_line(raw);
         out.push(Line::from(Span::styled(
             crate::render::truncate_display(&format!("  {line}"), wrap_width),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
     }
     out
@@ -1181,8 +1195,8 @@ mod tests {
         // lead border / label / stats / tail: stats must not take the status color.
         let stats = &lines[0].spans[2];
         assert!(stats.content.contains("boom"), "{stats:?}");
-        assert_eq!(stats.style.fg, Some(theme.muted), "{stats:?}");
-        assert_eq!(lines[0].spans[1].style.fg, Some(theme.error));
+        assert_eq!(stats.style.fg, Some(theme.text.secondary), "{stats:?}");
+        assert_eq!(lines[0].spans[1].style.fg, Some(theme.status.error));
     }
 
     fn sub_agent(id: &str, nickname: &str, status: ToolStatus) -> crate::transcript::SubAgentBlock {

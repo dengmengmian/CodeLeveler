@@ -170,10 +170,12 @@ pub fn render_diff_view(
 
     // Compact header — not a black box.
     out.push(Line::from(vec![
-        Span::styled("▼ ", Style::default().fg(theme.accent)),
+        Span::styled("▼ ", Style::default().fg(theme.accent.primary)),
         Span::styled(
             truncate_display(&header, width.saturating_sub(2).max(4)),
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
 
@@ -188,7 +190,7 @@ pub fn render_diff_view(
             Folded::Omitted(n) => {
                 out.push(Line::from(Span::styled(
                     format!("  ⋮ {n} lines hidden"),
-                    Style::default().fg(theme.dim),
+                    Style::default().fg(theme.text.muted),
                 )));
             }
         }
@@ -271,14 +273,11 @@ fn fold_diff_lines(lines: &[DiffLine]) -> Vec<Folded<'_>> {
 
 fn render_diff_line(line: &DiffLine, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let (prefix, style) = match line.kind {
-        DiffLineKind::Add => ("  ", Style::default().fg(theme.diff_add)),
-        DiffLineKind::Remove => ("  ", Style::default().fg(theme.diff_remove)),
-        DiffLineKind::HunkHeader => (
-            "  ",
-            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-        ),
-        DiffLineKind::Meta => ("  ", Style::default().fg(theme.border)),
-        DiffLineKind::Context => ("  ", Style::default().fg(theme.muted)),
+        DiffLineKind::Add => ("  ", Style::default().fg(theme.diff.added)),
+        DiffLineKind::Remove => ("  ", Style::default().fg(theme.diff.removed)),
+        DiffLineKind::HunkHeader => ("  ", Style::default().fg(theme.text.muted)),
+        DiffLineKind::Meta => ("  ", Style::default().fg(theme.border.normal)),
+        DiffLineKind::Context => ("  ", Style::default().fg(theme.text.secondary)),
     };
     let inner = width.saturating_sub(prefix.len()).max(1);
     let text = if line.kind == DiffLineKind::HunkHeader {
@@ -293,7 +292,7 @@ fn render_diff_line(line: &DiffLine, width: usize, theme: &Theme) -> Vec<Line<'s
         .map(|(i, row)| {
             let lead = if i == 0 { prefix } else { "  " };
             Line::from(vec![
-                Span::styled(lead.to_string(), Style::default().fg(theme.border)),
+                Span::styled(lead.to_string(), Style::default().fg(theme.border.normal)),
                 Span::styled(row, style),
             ])
         })

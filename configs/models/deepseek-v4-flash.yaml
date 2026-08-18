@@ -1,5 +1,9 @@
 # DeepSeek-V4-Flash — https://api-docs.deepseek.com/zh-cn/quick_start/pricing
-# Context 1M, max output 384K. Thinking on; effort max (wire: low|high|max).
+# Context 1M, max output 384K.
+# Reasoning (https://api-docs.deepseek.com/guides/thinking_mode/ 2026-08-18):
+#   native wire: low | high | max
+#   provider default: high (thinking on)
+#   CodeLeveler default: max
 # Price (CNY / MTok, cache miss): input 1, output 2. pricing field is USD
 # (~7.2 CNY/USD): 0.1389 / 0.2778.
 id: deepseek-v4-flash
@@ -15,7 +19,8 @@ capabilities:
   vision: false
 reasoning:
   style: thinking_flag
-  effort: max
+  supported_efforts: [low, high, max]
+  default_effort: max
 limits:
   context_window: 1048576
   reliable_context: 786432

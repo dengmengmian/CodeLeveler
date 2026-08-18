@@ -60,6 +60,8 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
             SelectionOutcome::Confirm(key) => match ModelRef::parse(&key) {
                 Some(model) => {
                     state.model_label = model.to_string();
+                    // Effort is model-specific; do not keep the previous model's value.
+                    state.reasoning_effort = None;
                     state.notification = Some(Notification {
                         level: NotificationLevel::Info,
                         message: format!("已切换模型并设为默认: {model}"),
@@ -98,6 +100,22 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 apply_theme_id(state, &key);
                 Vec::new()
             }
+        },
+        Overlay::WorkModePicker(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::WorkModePicker(sel));
+                Vec::new()
+            }
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => super::submit::apply_work_profile(state, &key),
+        },
+        Overlay::CollabPicker(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::CollabPicker(sel));
+                Vec::new()
+            }
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => super::submit::apply_collab(state, &key),
         },
         Overlay::Clarification(mut ov) => match ov.on_key(effective) {
             ClarificationOutcome::None => {
@@ -280,37 +298,76 @@ pub(super) fn open_checkpoint_picker(state: &mut AppState) {
 }
 
 pub(super) fn open_mode_picker(state: &mut AppState) {
-    let current = mode_key(state.mode);
+    let current = mode_chip_key(state.mode);
     let t = state.t();
-    // Permission tiers (not collaboration-plan steps).
+    // Same three PermissionProfile values; labels are the footer chips.
     let options = vec![
-        SelectionOption::new("request_approval", t.perm_readonly)
-            .description(t.mode_plan_desc)
-            .current(current == "request_approval"),
-        SelectionOption::new("assisted", t.perm_workspace)
-            .description(t.mode_write_desc)
-            .current(current == "assisted"),
-        SelectionOption::new("full_access", t.perm_full)
-            .description(t.mode_full_desc)
-            .current(current == "full_access"),
+        SelectionOption::new("ask", "ask")
+            .description(t.perm_ask)
+            .current(current == "ask"),
+        SelectionOption::new("auto", "auto")
+            .description(t.perm_auto)
+            .current(current == "auto"),
+        SelectionOption::new("full", "full")
+            .description(t.perm_full_short)
+            .current(current == "full"),
     ];
     let model = SelectionModel::new(t.overlay_mode, options, false).focus_key(current);
     state.overlay = Some(Overlay::ModePicker(Box::new(model)));
+}
+
+pub(super) fn open_work_mode_picker(state: &mut AppState) {
+    let current = state.work_profile.as_str();
+    let t = state.t();
+    let options = vec![
+        SelectionOption::new("balanced", "balanced")
+            .description(t.work_mode_balanced)
+            .current(current == "balanced"),
+        SelectionOption::new("economy", "economy")
+            .description(t.work_mode_economy)
+            .current(current == "economy"),
+        SelectionOption::new("delivery", "delivery")
+            .description(t.work_mode_delivery)
+            .current(current == "delivery"),
+    ];
+    let model = SelectionModel::new(t.overlay_work_mode, options, false).focus_key(current);
+    state.overlay = Some(Overlay::WorkModePicker(Box::new(model)));
+}
+
+pub(super) fn open_collab_picker(state: &mut AppState) {
+    let current = state.collaboration.as_str();
+    let t = state.t();
+    let options = vec![
+        SelectionOption::new("chat", "chat")
+            .description(t.collab_chat)
+            .current(current == "chat"),
+        SelectionOption::new("plan", "plan")
+            .description(t.collab_plan)
+            .current(current == "plan"),
+        SelectionOption::new("goal", "goal")
+            .description(t.collab_goal)
+            .current(current == "goal"),
+    ];
+    let model = SelectionModel::new(t.overlay_collab, options, false).focus_key(current);
+    state.overlay = Some(Overlay::CollabPicker(Box::new(model)));
 }
 
 pub(super) fn open_theme_picker(state: &mut AppState) {
     let current = state.theme.id.as_str();
     let t = state.t();
     let options = vec![
-        SelectionOption::new(ThemeId::Day.as_str(), t.theme_day_label)
-            .description(t.theme_day_desc)
-            .current(current == ThemeId::Day.as_str()),
-        SelectionOption::new(ThemeId::Ion.as_str(), t.theme_ion_label)
-            .description(t.theme_ion_desc)
-            .current(current == ThemeId::Ion.as_str()),
-        SelectionOption::new(ThemeId::Night.as_str(), t.theme_night_label)
-            .description(t.theme_night_desc)
-            .current(current == ThemeId::Night.as_str()),
+        SelectionOption::new(ThemeId::Auto.as_str(), t.theme_auto_label)
+            .description(t.theme_auto_desc)
+            .current(current == ThemeId::Auto.as_str()),
+        SelectionOption::new(ThemeId::Dark.as_str(), t.theme_dark_label)
+            .description(t.theme_dark_desc)
+            .current(current == ThemeId::Dark.as_str()),
+        SelectionOption::new(ThemeId::Light.as_str(), t.theme_light_label)
+            .description(t.theme_light_desc)
+            .current(current == ThemeId::Light.as_str()),
+        SelectionOption::new(ThemeId::HighContrast.as_str(), t.theme_hc_label)
+            .description(t.theme_hc_desc)
+            .current(current == ThemeId::HighContrast.as_str()),
     ];
     let model = SelectionModel::new(t.overlay_theme, options, false).focus_key(current);
     state.overlay = Some(Overlay::ThemePicker(Box::new(model)));
@@ -335,7 +392,7 @@ pub(super) fn apply_theme_id(state: &mut AppState, raw: &str) {
         return;
     };
     state.theme = Theme::resolve(next, no_color);
-    state.dark = !matches!(next, ThemeId::Day) && !no_color;
+    state.dark = state.theme.is_dark();
     if let Err(err) = crate::theme_config::save_theme_id(next) {
         tracing::warn!(%err, "failed to persist theme id");
     }
@@ -347,9 +404,18 @@ pub(super) fn apply_theme_id(state: &mut AppState, raw: &str) {
 }
 
 fn parse_mode(key: &str) -> PermissionProfile {
-    PermissionProfile::parse(key).unwrap_or(PermissionProfile::Assisted)
+    match key {
+        "ask" => PermissionProfile::RequestApproval,
+        "auto" => PermissionProfile::Assisted,
+        "full" => PermissionProfile::FullAccess,
+        other => PermissionProfile::parse(other).unwrap_or(PermissionProfile::Assisted),
+    }
 }
 
-fn mode_key(mode: PermissionProfile) -> &'static str {
-    mode.as_str()
+fn mode_chip_key(mode: PermissionProfile) -> &'static str {
+    match mode {
+        PermissionProfile::RequestApproval => "ask",
+        PermissionProfile::Assisted => "auto",
+        PermissionProfile::FullAccess => "full",
+    }
 }

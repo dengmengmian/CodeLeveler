@@ -49,6 +49,17 @@ pub enum BusyPolicy {
     IdleOnly,
 }
 
+/// How a command appears in the `/` popup. Help still uses [`SlashDef::listed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashVisibility {
+    /// Shown on a bare `/`.
+    Quick,
+    /// Hidden until the user types a matching prefix.
+    Searchable,
+    /// Never listed, never searchable.
+    Internal,
+}
+
 /// One slash command: single source of truth for menu, aliases, and busy rules.
 #[derive(Debug, Clone, Copy)]
 pub struct SlashDef {
@@ -57,213 +68,228 @@ pub struct SlashDef {
     /// Alternate tokens including leading `/` (accepted, may be unlisted).
     pub aliases: &'static [&'static str],
     pub category: SlashCategory,
-    /// Shown in help and the `/` popup when listed.
+    /// Shown in `/help`. Independent of popup visibility.
     pub listed: bool,
+    /// Empty-`/` vs prefix-search vs never.
+    pub visibility: SlashVisibility,
     pub busy: BusyPolicy,
+}
+
+const fn slash(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    category: SlashCategory,
+    visibility: SlashVisibility,
+    busy: BusyPolicy,
+) -> SlashDef {
+    SlashDef {
+        name,
+        aliases,
+        category,
+        listed: !matches!(visibility, SlashVisibility::Internal),
+        visibility,
+        busy,
+    }
 }
 
 /// Registry order = help order within each category and completion sort order.
 pub const SLASH_DEFS: &[SlashDef] = &[
     // Agent
-    SlashDef {
-        name: "/model",
-        aliases: &[],
-        category: SlashCategory::Agent,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
+    slash(
+        "/model",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
     // Primary name is permission; /mode kept as alias for muscle memory.
-    SlashDef {
-        name: "/permission",
-        aliases: &["/mode"],
-        category: SlashCategory::Agent,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/goal",
-        aliases: &[],
-        category: SlashCategory::Agent,
-        listed: true,
-        busy: BusyPolicy::Always, // steers when busy
-    },
-    SlashDef {
-        name: "/btw",
-        aliases: &[],
-        category: SlashCategory::Agent,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/work-mode",
-        aliases: &["/work_mode"],
-        category: SlashCategory::Agent,
-        listed: true,
-        busy: BusyPolicy::IdleOnly,
-    },
-    SlashDef {
-        name: "/collab",
-        aliases: &[],
-        category: SlashCategory::Agent,
-        listed: true,
-        busy: BusyPolicy::IdleOnly,
-    },
-    SlashDef {
-        name: "/plan",
-        aliases: &[],
-        category: SlashCategory::Agent,
-        listed: true,
-        busy: BusyPolicy::IdleOnly,
-    },
+    slash(
+        "/permission",
+        &["/mode"],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/goal",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/btw",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/work-mode",
+        &["/work_mode"],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::IdleOnly,
+    ),
+    slash(
+        "/collab",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::IdleOnly,
+    ),
+    slash(
+        "/plan",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::IdleOnly,
+    ),
     // View
-    SlashDef {
-        name: "/diff",
-        aliases: &[],
-        category: SlashCategory::View,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/tools",
-        aliases: &[],
-        category: SlashCategory::View,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/sessions",
-        aliases: &[],
-        category: SlashCategory::View,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
+    slash(
+        "/diff",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/tools",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/sessions",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // Session
-    SlashDef {
-        name: "/memory",
-        aliases: &[],
-        category: SlashCategory::Session,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        // `/rewind` is what every other agent CLI calls this, so it is accepted
-        // as a first-class alias for muscle memory.
-        name: "/restore",
-        aliases: &["/checkpoint", "/rewind"],
-        category: SlashCategory::Session,
-        listed: true,
-        busy: BusyPolicy::IdleOnly,
-    },
-    SlashDef {
-        // Copying a transcript mid-turn would capture half a turn, so this
-        // waits for idle like the other session-shaping commands.
-        name: "/fork",
-        aliases: &[],
-        category: SlashCategory::Session,
-        listed: true,
-        busy: BusyPolicy::IdleOnly,
-    },
-    SlashDef {
-        name: "/compact",
-        aliases: &[],
-        category: SlashCategory::Session,
-        listed: true,
-        busy: BusyPolicy::IdleOnly,
-    },
-    SlashDef {
-        name: "/export",
-        aliases: &["/save"],
-        category: SlashCategory::Session,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/clear",
-        aliases: &["/new"],
-        category: SlashCategory::Session,
-        listed: true,
-        busy: BusyPolicy::IdleOnly,
-    },
+    slash(
+        "/memory",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    // `/rewind` is what every other agent CLI calls this.
+    slash(
+        "/restore",
+        &["/checkpoint", "/rewind"],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::IdleOnly,
+    ),
+    slash(
+        "/fork",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::IdleOnly,
+    ),
+    slash(
+        "/compact",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Quick,
+        BusyPolicy::IdleOnly,
+    ),
+    slash(
+        "/export",
+        &["/save"],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/clear",
+        &["/new"],
+        SlashCategory::Session,
+        SlashVisibility::Quick,
+        BusyPolicy::IdleOnly,
+    ),
     // Input
-    SlashDef {
-        name: "/skill",
-        aliases: &[],
-        category: SlashCategory::Input,
-        listed: true,
-        busy: BusyPolicy::Always, // steers when busy
-    },
-    SlashDef {
-        name: "/attach",
-        aliases: &["/image"],
-        category: SlashCategory::Input,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/paste",
-        aliases: &[],
-        category: SlashCategory::Input,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/editor",
-        aliases: &[],
-        category: SlashCategory::Input,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
+    slash(
+        "/skill",
+        &[],
+        SlashCategory::Input,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/attach",
+        &["/image"],
+        SlashCategory::Input,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/paste",
+        &[],
+        SlashCategory::Input,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/editor",
+        &[],
+        SlashCategory::Input,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // System
-    SlashDef {
-        name: "/theme",
-        aliases: &[],
-        category: SlashCategory::System,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/web",
-        aliases: &[],
-        category: SlashCategory::System,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/remote",
-        aliases: &[],
-        category: SlashCategory::System,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    // Same-network path: listed but copy marks it as local/testing.
-    SlashDef {
-        name: "/remote-loc",
-        aliases: &[],
-        category: SlashCategory::System,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/doctor",
-        aliases: &[],
-        category: SlashCategory::System,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/help",
-        aliases: &[],
-        category: SlashCategory::System,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
-    SlashDef {
-        name: "/quit",
-        aliases: &["/q"],
-        category: SlashCategory::System,
-        listed: true,
-        busy: BusyPolicy::Always,
-    },
+    slash(
+        "/theme",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/web",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/remote",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/remote-loc",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/doctor",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/help",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/quit",
+        &["/q"],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
 ];
 
 /// All tokens (primary + aliases) that parse as local slash commands.
@@ -349,7 +375,15 @@ pub fn slash_def(token: &str) -> Option<&'static SlashDef> {
 }
 
 fn slash_description(name: &str, t: &UiText) -> &'static str {
-    let s = &t.slash;
+    slash_copy(name, &t.slash)
+}
+
+/// One-line palette label. Help keeps the longer [`slash_description`].
+pub fn slash_popup_label(name: &str, t: &UiText) -> &'static str {
+    slash_copy(name, &t.slash_brief)
+}
+
+fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
     match name {
         "/model" => s.model,
         "/permission" | "/mode" => s.permission,
@@ -360,6 +394,7 @@ fn slash_description(name: &str, t: &UiText) -> &'static str {
         "/plan" => s.plan_collab,
         "/memory" => s.memory,
         "/skill" => s.skill,
+        "/feature-dev" => s.feature_dev,
         "/diff" => s.diff,
         "/tools" => s.tools,
         "/sessions" => s.sessions,
@@ -435,14 +470,29 @@ pub fn skill_mention_message(skill_name: &str, rest: &str) -> String {
     }
 }
 
+/// Whether `def` belongs in the `/` popup for this typed `prefix`.
+pub(crate) fn include_in_slash_popup(def: &SlashDef, prefix: &str) -> bool {
+    match def.visibility {
+        SlashVisibility::Internal => false,
+        SlashVisibility::Quick => {
+            def.name.starts_with(prefix) || def.aliases.iter().any(|a| a.starts_with(prefix))
+        }
+        SlashVisibility::Searchable => {
+            prefix != "/"
+                && (def.name.starts_with(prefix)
+                    || def.aliases.iter().any(|a| a.starts_with(prefix)))
+        }
+    }
+}
+
 /// Slash commands whose primary name or alias starts with `prefix` (with `/`).
 /// Rows always use the **primary** name so Tab completes the canonical form.
+/// A bare `/` is the Quick list only; a longer prefix also searches the rest.
 pub fn slash_matches(prefix: &str, t: &UiText) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for d in SLASH_DEFS.iter().filter(|d| d.listed) {
-        let hit = d.name.starts_with(prefix) || d.aliases.iter().any(|a| a.starts_with(prefix));
-        if hit {
-            out.push((d.name.to_string(), slash_description(d.name, t).to_string()));
+    for d in SLASH_DEFS {
+        if include_in_slash_popup(d, prefix) {
+            out.push((d.name.to_string(), slash_popup_label(d.name, t).to_string()));
         }
     }
     out
@@ -454,14 +504,27 @@ pub fn skill_slash_matches(state: &crate::state::AppState, prefix: &str) -> Vec<
     state
         .skill_catalog
         .iter()
-        .filter(|(name, _)| name.starts_with(prefix_name) || format!("/{name}").starts_with(prefix))
+        .filter(|(name, _)| {
+            let keyed = format!("/{name}");
+            let hit = name.starts_with(prefix_name) || keyed.starts_with(prefix);
+            if !hit {
+                return false;
+            }
+            // Product skills (those with a popup brief) stay on the empty `/`
+            // list. Project/user skills are searchable only.
+            prefix != "/" || !slash_popup_label(&keyed, state.t()).is_empty()
+        })
         .map(|(name, desc)| {
-            let label = if desc.is_empty() {
+            let keyed = format!("/{name}");
+            let localized = slash_popup_label(&keyed, state.t());
+            let label = if !localized.is_empty() {
+                localized.to_string()
+            } else if desc.is_empty() {
                 state.t().slash.skill_entry.to_string()
             } else {
                 desc.clone()
             };
-            (format!("/{name}"), label)
+            (keyed, label)
         })
         .collect()
 }
@@ -577,8 +640,6 @@ pub fn slash_arg_ghost(text: &str, t: &UiText) -> Option<&'static str> {
         "/goal" => (g.goal, g.goal_spaced),
         "/skill" => (g.skill, g.skill_spaced),
         "/attach" => (g.path, g.path_spaced),
-        "/work-mode" => (g.work_mode, g.work_mode_spaced),
-        "/collab" => (g.collab, g.collab_spaced),
         _ => return None,
     };
     if text.ends_with(|c: char| c.is_whitespace()) {
@@ -637,9 +698,10 @@ mod ghost_tests {
         assert_eq!(slash_arg_ghost("/attach", zh), Some(" <文件路径>"));
         assert_eq!(
             slash_arg_ghost("/work-mode", zh),
-            Some(" economy|balanced|delivery")
+            None,
+            "option commands use a picker, not a CLI ghost"
         );
-        assert_eq!(slash_arg_ghost("/collab ", zh), Some("chat|plan|goal"));
+        assert_eq!(slash_arg_ghost("/collab ", zh), None);
     }
 
     #[test]
@@ -650,6 +712,269 @@ mod ghost_tests {
         assert_eq!(slash_arg_ghost("/collab chat", zh), None);
         assert_eq!(slash_arg_ghost("hello", zh), None);
         assert_eq!(slash_arg_ghost("", zh), None);
+    }
+
+    #[test]
+    fn popup_labels_are_brief_help_stays_long() {
+        let t = t();
+        assert_eq!(super::slash_popup_label("/model", t), "切换模型");
+        assert_eq!(super::slash_popup_label("/goal", t), "设置目标");
+        assert_eq!(super::slash_popup_label("/permission", t), "权限审批");
+        let help: Vec<_> = slash_commands(t);
+        let goal_help = help
+            .iter()
+            .find(|(n, _)| *n == "/goal")
+            .map(|(_, d)| *d)
+            .unwrap();
+        assert!(
+            goal_help.contains("status") || goal_help.contains("任务"),
+            "help copy must stay detailed: {goal_help}"
+        );
+        let matches = super::slash_matches("/", t);
+        let model = matches.iter().find(|(n, _)| n == "/model").unwrap();
+        assert_eq!(model.1, "切换模型");
+    }
+
+    #[test]
+    fn empty_slash_lists_only_quick_commands() {
+        let rows = super::slash_matches("/", t());
+        let names: Vec<_> = rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.len() <= 13,
+            "empty / must stay a short capability list: {names:?}"
+        );
+        for must in [
+            "/model",
+            "/permission",
+            "/goal",
+            "/btw",
+            "/work-mode",
+            "/collab",
+            "/plan",
+            "/diff",
+            "/skill",
+            "/compact",
+            "/clear",
+            "/help",
+        ] {
+            assert!(names.contains(&must), "missing quick {must}: {names:?}");
+        }
+        for hidden in [
+            "/tools",
+            "/sessions",
+            "/memory",
+            "/restore",
+            "/fork",
+            "/export",
+            "/attach",
+            "/paste",
+            "/editor",
+            "/theme",
+            "/web",
+            "/remote",
+            "/remote-loc",
+            "/doctor",
+            "/quit",
+        ] {
+            assert!(!names.contains(&hidden), "searchable leaked on /: {hidden}");
+        }
+        assert!(
+            rows.iter()
+                .all(|(_, d)| !d.contains('|') && !d.contains("economy")),
+            "popup must not list CLI args: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn prefix_search_surfaces_hidden_searchable_commands() {
+        let rows = super::slash_matches("/ses", t());
+        assert!(
+            rows.iter().any(|(n, _)| n == "/sessions"),
+            "/ses must find /sessions: {rows:?}"
+        );
+        let theme = super::slash_matches("/the", t());
+        assert!(
+            theme.iter().any(|(n, _)| n == "/theme"),
+            "/the must find /theme: {theme:?}"
+        );
+    }
+
+    #[test]
+    fn internal_visibility_never_appears_in_popup() {
+        let hidden = super::SlashDef {
+            name: "/debug",
+            aliases: &[],
+            category: super::SlashCategory::System,
+            listed: false,
+            visibility: super::SlashVisibility::Internal,
+            busy: super::BusyPolicy::Always,
+        };
+        assert!(!super::include_in_slash_popup(&hidden, "/"));
+        assert!(!super::include_in_slash_popup(&hidden, "/deb"));
+        assert!(!super::include_in_slash_popup(&hidden, "/debug"));
+    }
+
+    #[test]
+    fn product_skill_is_quick_other_skills_are_searchable() {
+        use crate::state::{AppState, Boot};
+        use crate::theme::Theme;
+        use leveler_client_protocol::SessionId;
+
+        let mut s = AppState::new(
+            Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("vis"),
+                user: "u".into(),
+                version: "0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 0,
+                locale: Locale::Zh,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        s.skill_catalog = vec![
+            ("feature-dev".into(), "分阶段实现".into()),
+            ("repo-lint".into(), "本仓库检查".into()),
+        ];
+        let bare = super::slash_popup("/", t(), &s);
+        assert!(
+            bare.iter()
+                .any(|(n, d)| n == "/feature-dev" && d == "功能实现"),
+            "feature-dev is a quick capability: {bare:?}"
+        );
+        assert!(
+            !bare.iter().any(|(n, _)| n == "/repo-lint"),
+            "project skills stay off the empty / list: {bare:?}"
+        );
+        let search = super::slash_popup("/repo", t(), &s);
+        assert!(
+            search.iter().any(|(n, _)| n == "/repo-lint"),
+            "/repo must find the project skill: {search:?}"
+        );
+    }
+
+    #[test]
+    fn every_listed_slash_has_zh_and_en_popup_and_help() {
+        for d in super::SLASH_DEFS.iter().filter(|d| d.listed) {
+            let zh_brief = super::slash_popup_label(d.name, Locale::Zh.text());
+            let en_brief = super::slash_popup_label(d.name, Locale::En.text());
+            let zh_help = super::slash_description(d.name, Locale::Zh.text());
+            let en_help = super::slash_description(d.name, Locale::En.text());
+            assert!(
+                !zh_brief.is_empty() && !en_brief.is_empty(),
+                "{} missing popup copy zh={zh_brief:?} en={en_brief:?}",
+                d.name
+            );
+            assert!(
+                !zh_help.is_empty() && !en_help.is_empty(),
+                "{} missing help copy zh={zh_help:?} en={en_help:?}",
+                d.name
+            );
+            assert!(
+                !zh_brief.contains("分阶段")
+                    && !en_brief.to_ascii_lowercase().contains("step-by-step"),
+                "{} popup still has workflow internals: zh={zh_brief:?} en={en_brief:?}",
+                d.name
+            );
+        }
+    }
+
+    #[test]
+    fn feature_dev_popup_is_a_capability_label_not_a_workflow() {
+        use crate::state::{AppState, Boot};
+        use crate::theme::Theme;
+        use leveler_client_protocol::SessionId;
+
+        let mut zh = AppState::new(
+            Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s-zh"),
+                user: "u".into(),
+                version: "0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 0,
+                locale: Locale::Zh,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        zh.skill_catalog.push((
+            "feature-dev".into(),
+            "分阶段实现一个新功能：先摸清现状和需求".into(),
+        ));
+        zh.skill_catalog
+            .push(("repo-lint".into(), "本仓库的检查脚本".into()));
+
+        let rows = super::skill_slash_matches(&zh, "/");
+        let feature = rows
+            .iter()
+            .find(|(n, _)| n == "/feature-dev")
+            .map(|(_, d)| d.as_str())
+            .expect("feature-dev row");
+        assert_eq!(feature, "功能实现");
+        assert!(!feature.contains("分阶段"));
+        assert!(
+            rows.iter().all(|(n, _)| n != "/repo-lint"),
+            "project skills stay off a bare /: {rows:?}"
+        );
+        let custom = super::skill_slash_matches(&zh, "/repo")
+            .into_iter()
+            .find(|(n, _)| n == "/repo-lint")
+            .map(|(_, d)| d)
+            .expect("project skill keeps its own copy when searched");
+        assert_eq!(custom, "本仓库的检查脚本");
+
+        let mut en = AppState::new(
+            Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s-en"),
+                user: "u".into(),
+                version: "0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 0,
+                locale: Locale::En,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        en.skill_catalog.push((
+            "feature-dev".into(),
+            "分阶段实现一个新功能：先摸清现状和需求".into(),
+        ));
+        let en_label = super::skill_slash_matches(&en, "/")
+            .into_iter()
+            .find(|(n, _)| n == "/feature-dev")
+            .map(|(_, d)| d)
+            .expect("en feature-dev row");
+        assert_eq!(en_label, "feature implementation");
+    }
+
+    #[test]
+    fn popup_briefs_match_command_capability() {
+        let zh = Locale::Zh.text();
+        let en = Locale::En.text();
+        let pairs = [
+            ("/model", "切换模型", "switch model"),
+            ("/permission", "权限审批", "permission approval"),
+            ("/goal", "设置目标", "set goal"),
+            ("/btw", "临时提问", "quick question"),
+            ("/work-mode", "执行策略", "work strategy"),
+            ("/collab", "协作模式", "collaboration mode"),
+            ("/plan", "生成计划", "generate plan"),
+            ("/feature-dev", "功能实现", "feature implementation"),
+            ("/diff", "查看改动", "view changes"),
+        ];
+        for (name, zh_want, en_want) in pairs {
+            assert_eq!(super::slash_popup_label(name, zh), zh_want, "{name} zh");
+            assert_eq!(super::slash_popup_label(name, en), en_want, "{name} en");
+        }
     }
 
     #[test]

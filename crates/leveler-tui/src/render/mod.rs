@@ -20,13 +20,13 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
     use crate::transcript::UserShellStatus;
     let theme = &state.theme;
     let t = state.t();
-    let dim = Style::default().fg(theme.dim);
-    let text_style = Style::default().fg(theme.text);
+    let dim = Style::default().fg(theme.text.muted);
+    let text_style = Style::default().fg(theme.text.primary);
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
         t.shell_details_title.to_string(),
         Style::default()
-            .fg(theme.heading)
+            .fg(theme.text.primary)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
@@ -36,9 +36,18 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
         return;
     };
     let (status_text, status_style) = match shell.status {
-        UserShellStatus::Running => (t.shell_status_running, Style::default().fg(theme.accent)),
-        UserShellStatus::Success => (t.shell_status_success, Style::default().fg(theme.success)),
-        UserShellStatus::Failed => (t.shell_status_failed, Style::default().fg(theme.warning)),
+        UserShellStatus::Running => (
+            t.shell_status_running,
+            Style::default().fg(theme.accent.primary),
+        ),
+        UserShellStatus::Success => (
+            t.shell_status_success,
+            Style::default().fg(theme.status.success),
+        ),
+        UserShellStatus::Failed => (
+            t.shell_status_failed,
+            Style::default().fg(theme.status.warning),
+        ),
         UserShellStatus::Cancelled => (t.shell_status_cancelled, dim),
     };
     let runtime_secs = match shell.duration_ms {
@@ -79,9 +88,9 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
             Span::styled(
                 code.to_string(),
                 if code == 0 {
-                    Style::default().fg(theme.success)
+                    Style::default().fg(theme.status.success)
                 } else {
-                    Style::default().fg(theme.warning)
+                    Style::default().fg(theme.status.warning)
                 },
             ),
         ));
@@ -105,7 +114,7 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
             let line = sanitize_terminal_line(raw);
             lines.push(Line::from(Span::styled(
                 truncate_display(&format!("  {line}"), width.max(4)),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             )));
         }
     }
@@ -168,6 +177,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    state.theme.paint_canvas(frame, area);
 
     if state.active_screen == Screen::Conversation {
         crate::workbench::render_workbench(frame, state);
@@ -214,6 +224,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         chunks[2],
     );
     render_attachments(frame, chunks[3], state);
+    {
+        let input_bg = state.theme.surface.input;
+        state.theme.paint_surface(frame, chunks[4], input_bg);
+    }
     render_composer(frame, chunks[4], state);
 
     if let Some(overlay) = &state.overlay {
@@ -237,12 +251,12 @@ fn render_remote_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             Line::from(""),
             Line::from(Span::styled(
                 t.remote_preparing.to_string(),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 t.remote_footer.to_string(),
-                Style::default().fg(theme.dim),
+                Style::default().fg(theme.text.muted),
             )),
         ];
         render_scrolled(frame, area, state, lines);
@@ -260,19 +274,21 @@ fn remote_screen_lines(
     theme: &crate::theme::Theme,
     t: &crate::i18n::UiText,
 ) -> Vec<Line<'static>> {
-    let accent = Style::default().fg(theme.accent);
-    let muted = Style::default().fg(theme.muted);
-    let dim = Style::default().fg(theme.dim);
-    let text = Style::default().fg(theme.text);
+    let accent = Style::default().fg(theme.accent.primary);
+    let muted = Style::default().fg(theme.text.secondary);
+    let dim = Style::default().fg(theme.text.muted);
+    let text = Style::default().fg(theme.text.primary);
     let bold_accent = Style::default()
-        .fg(theme.accent)
+        .fg(theme.accent.primary)
         .add_modifier(Modifier::BOLD);
-    let bold_text = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
+    let bold_text = Style::default()
+        .fg(theme.text.primary)
+        .add_modifier(Modifier::BOLD);
     let success = Style::default()
-        .fg(theme.success)
+        .fg(theme.status.success)
         .add_modifier(Modifier::BOLD);
     let warning = Style::default()
-        .fg(theme.warning)
+        .fg(theme.status.warning)
         .add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = vec![
@@ -309,7 +325,7 @@ fn remote_screen_lines(
         t.remote_label_address,
         &remote.invite.relay_url,
         accent,
-        crate::url_link::link_style(theme.accent),
+        crate::url_link::link_style(theme.accent.primary),
         width,
     ));
     lines.push(labeled_row(
@@ -380,7 +396,7 @@ fn remote_screen_lines(
     lines.push(Line::from(Span::styled(
         t.remote_footer.to_string(),
         Style::default()
-            .fg(theme.accent)
+            .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     )));
     lines
@@ -524,11 +540,14 @@ mod tests {
                     area,
                     vec![Line::from("selected row with stale tail")],
                     0,
+                    &Theme::dark(),
                 )
             })
             .unwrap();
         terminal
-            .draw(|frame| render_list_focused(frame, area, vec![Line::from("row")], 0))
+            .draw(|frame| {
+                render_list_focused(frame, area, vec![Line::from("row")], 0, &Theme::dark())
+            })
             .unwrap();
         let first = terminal
             .backend()
@@ -870,6 +889,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         )
     }
@@ -906,6 +926,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         );
         state.active_screen = Screen::Help;

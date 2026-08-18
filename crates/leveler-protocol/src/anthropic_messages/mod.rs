@@ -5,9 +5,10 @@
 //! tool results are `tool_result` blocks inside a `user` message, and auth is
 //! `x-api-key` + `anthropic-version` rather than a bearer token.
 //!
-//! Note: extended-thinking *encoding* is intentionally omitted for now (a request
-//! without a `thinking` field is valid); thinking *deltas* on the way back are
-//! still surfaced as `ReasoningDelta`.
+//! Note: thinking / `output_config.effort` *encoding* is a capability gap
+//! (2026-08-18). A request without those fields is valid; thinking *deltas*
+//! on the way back are still surfaced as `ReasoningDelta`. Do not invent a
+//! default effort here — there is no built-in Claude profile yet.
 
 mod stream;
 mod wire;
@@ -335,7 +336,7 @@ fn request_id_from(id: &Option<String>) -> RequestId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_model::{ModelRef, ReasoningConfig, ToolDefinition};
+    use leveler_model::{ModelRef, ReasoningConfig, ReasoningEffort, ToolDefinition};
 
     fn ctx() -> ProtocolContext {
         ProtocolContext {
@@ -382,6 +383,19 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "anthropic-version" && v == ANTHROPIC_VERSION)
         );
+    }
+
+    #[test]
+    fn encode_does_not_send_thinking_or_effort_yet() {
+        // Capability gap: output_config.effort / thinking are not encoded.
+        let mut req = user_req("hi");
+        req.reasoning_effort = Some(ReasoningEffort::High);
+        let enc = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &ctx(), true)
+            .unwrap();
+        assert!(enc.body.get("thinking").is_none(), "{}", enc.body);
+        assert!(enc.body.get("output_config").is_none(), "{}", enc.body);
+        assert!(enc.body.get("reasoning_effort").is_none(), "{}", enc.body);
     }
 
     #[test]

@@ -206,6 +206,7 @@ mod tests {
             checkpoints: Vec::new(),
             user_shells: Vec::new(),
             completion_report: None,
+            reasoning: None,
         };
         let json =
             serde_json::to_string(&DownstreamMessage::Snapshot { session: snapshot }).unwrap();

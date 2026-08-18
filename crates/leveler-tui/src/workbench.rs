@@ -94,6 +94,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    state.theme.paint_canvas(frame, area);
 
     let attach_rows: u16 = if state.pending_attachments.is_empty() {
         0
@@ -104,18 +105,21 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // An open overlay takes the composer's slot rather than floating over the
     // transcript, so the conversation shrinks by exactly what the decision box
     // needs and the message that raised it stays visible right above it.
+    let workspace_inner = crate::layout::horizontal_inset(area, crate::layout::WORKSPACE_GUTTER_X);
     let composer_rows = match &state.overlay {
-        Some(ov) => crate::overlay::overlay_height(ov, &state.theme, area.width, state.locale)
-            .min(area.height.saturating_sub(8))
-            .max(3),
-        None => {
-            composer_visible_rows(state, area.width as usize).clamp(3, COMPOSER_MAX_ROWS + 2) as u16
+        Some(ov) => {
+            crate::overlay::overlay_height(ov, &state.theme, workspace_inner.width, state.locale)
+                .min(area.height.saturating_sub(8))
+                .max(3)
         }
+        None => composer_visible_rows(state, workspace_inner.width as usize)
+            .clamp(3, COMPOSER_MAX_ROWS + 2) as u16,
     };
     // Header: blank breathing row + status line + hairline separator (3 rows)
     // so the brand strip is not flush against the terminal's top edge. Footer 1.
     let header_rows: u16 = 3;
     let footer_rows: u16 = 1;
+    let footer_bottom: u16 = crate::layout::FOOTER_BOTTOM_PADDING;
     // One blank row between transcript and bottom chrome so the last answer /
     // turn-end marker does not sit flush on the composer border. Status only
     // takes a row when it has content so we do not stack two empty strips
@@ -143,7 +147,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
     // The hint row replaces the blank below the composer rather than adding to
     // it, so hints appearing and disappearing never reflow the transcript.
-    let hints = crate::render::key_hint_line(state, area.width as usize);
+    let hints = crate::render::key_hint_line(state, workspace_inner.width as usize);
     let post_composer_gap: u16 = 1;
 
     let chunks = Layout::vertical([
@@ -157,11 +161,20 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Length(composer_rows),
         Constraint::Length(post_composer_gap),
         Constraint::Length(footer_rows),
+        Constraint::Length(footer_bottom),
     ])
     .split(area);
 
+    let input_slot = crate::layout::horizontal_inset(chunks[7], crate::layout::WORKSPACE_GUTTER_X);
+    let hint_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
+    let footer_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
+
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
+    {
+        let input_bg = state.theme.surface.input;
+        state.theme.paint_surface(frame, input_slot, input_bg);
+    }
     // chunks[2] = gap (leave blank)
     if status_rows > 0 {
         frame.render_widget(Paragraph::new(status_line), chunks[3]);
@@ -171,15 +184,15 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // chunks[6] = pre_composer_gap (leave blank)
     match &state.overlay {
         Some(overlay) => {
-            crate::overlay::render_overlay(frame, chunks[7], overlay, &state.theme, state.locale)
+            crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
         }
-        None => render_input(frame, chunks[7], state),
+        None => render_input(frame, input_slot, state),
     }
     // chunks[8]: the key hints when there are any, otherwise the blank gap.
     if let Some(line) = hints.into_iter().next() {
-        frame.render_widget(Paragraph::new(line), chunks[8]);
+        frame.render_widget(Paragraph::new(line), hint_slot);
     }
-    render_footer(frame, chunks[9], state);
+    render_footer(frame, footer_slot, state);
 
     // /btw floats over the conversation viewport (not in the scroll stream).
     render_btw_overlay(frame, chunks[1], state);
@@ -187,7 +200,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_notification_toast(frame, chunks[1], state);
 
     if state.active_screen == Screen::Conversation && state.overlay.is_none() {
-        render_slash_popup(frame, chunks[1], chunks[7], state);
+        render_slash_popup(frame, chunks[1], input_slot, state);
     }
 }
 
@@ -223,7 +236,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 /// a second indeterminate-progress signal competing for attention.
 fn header_rule_line(width: usize, state: &AppState) -> Line<'static> {
     let theme = &state.theme;
-    let border = Style::default().fg(theme.border);
+    let border = Style::default().fg(theme.border.normal);
     if width == 0 {
         return Line::from("");
     }
@@ -238,10 +251,11 @@ fn header_rule_line(width: usize, state: &AppState) -> Line<'static> {
 fn header_status_line(state: &AppState, width: usize) -> Line<'static> {
     let theme = &state.theme;
     let brand = Style::default()
-        .fg(theme.accent)
+        .fg(theme.accent.primary)
         .add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(theme.muted);
-    let git = Style::default().fg(theme.success);
+    let muted = Style::default().fg(theme.text.muted);
+    let secondary = Style::default().fg(theme.text.secondary);
+    let git = Style::default().fg(theme.status.success);
 
     let version = state.version();
     let branch = dirty_display(state.branch.as_deref().unwrap_or("—"));
@@ -264,11 +278,17 @@ fn header_status_line(state: &AppState, width: usize) -> Line<'static> {
         .unwrap_or_else(|| truncate("CodeLeveler", width));
 
     // Re-style the chosen plain string by scanning known prefixes.
-    style_header_text(&chosen, brand, muted, git)
+    style_header_text(&chosen, brand, muted, secondary, git)
 }
 
-/// Apply brand / muted / git colors onto a pre-sized header string.
-fn style_header_text(text: &str, brand: Style, muted: Style, git: Style) -> Line<'static> {
+/// Apply brand / muted / secondary / git colors onto a pre-sized header string.
+fn style_header_text(
+    text: &str,
+    brand: Style,
+    muted: Style,
+    secondary: Style,
+    git: Style,
+) -> Line<'static> {
     // Split on " · " while preserving separators as muted.
     let mut spans = Vec::new();
     let parts: Vec<&str> = text.split(" · ").collect();
@@ -289,7 +309,7 @@ fn style_header_text(text: &str, brand: Style, muted: Style, git: Style) -> Line
         } else if part.starts_with('') || part.contains('') {
             spans.push(Span::styled((*part).to_string(), git));
         } else {
-            spans.push(Span::styled((*part).to_string(), muted));
+            spans.push(Span::styled((*part).to_string(), secondary));
         }
     }
     Line::from(spans)
@@ -346,18 +366,18 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         title,
         Style::default()
-            .fg(theme.accent)
+            .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     ))];
 
     if !state.plan_collapsed {
         for step in plan.steps.iter().take(area.height as usize - 1) {
             let (g, c) = match step.status {
-                PlanStepStatus::Done => ("✓", theme.success),
-                PlanStepStatus::Running => ("→", theme.accent),
-                PlanStepStatus::Failed => ("✗", theme.error),
-                PlanStepStatus::Skipped => ("–", theme.muted),
-                PlanStepStatus::Pending => ("○", theme.muted),
+                PlanStepStatus::Done => ("✓", theme.status.success),
+                PlanStepStatus::Running => ("→", theme.accent.primary),
+                PlanStepStatus::Failed => ("✗", theme.status.error),
+                PlanStepStatus::Skipped => ("–", theme.text.secondary),
+                PlanStepStatus::Pending => ("○", theme.text.secondary),
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("{g} "), Style::default().fg(c)),
@@ -367,9 +387,9 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                         area.width.saturating_sub(3) as usize,
                     ),
                     Style::default().fg(if step.status == PlanStepStatus::Running {
-                        theme.text
+                        theme.text.primary
                     } else {
-                        theme.muted
+                        theme.text.secondary
                     }),
                 ),
             ]));
@@ -390,9 +410,9 @@ fn render_notification_toast(frame: &mut Frame, conv: Rect, state: &AppState) {
     }
     let theme = &state.theme;
     let color = match note.level {
-        leveler_client_protocol::NotificationLevel::Info => theme.accent,
-        leveler_client_protocol::NotificationLevel::Warning => theme.warning,
-        leveler_client_protocol::NotificationLevel::Error => theme.error,
+        leveler_client_protocol::NotificationLevel::Info => theme.accent.primary,
+        leveler_client_protocol::NotificationLevel::Warning => theme.status.warning,
+        leveler_client_protocol::NotificationLevel::Error => theme.status.error,
     };
     // One-line toast, bottom of conversation, right-aligned margin — no layout slot.
     let msg = truncate(
@@ -417,7 +437,7 @@ fn render_notification_toast(frame: &mut Frame, conv: Rect, state: &AppState) {
             msg,
             Style::default()
                 .fg(color)
-                .bg(theme.code_bg)
+                .bg(theme.surface.elevated)
                 .add_modifier(Modifier::BOLD),
         )),
         area,
@@ -493,7 +513,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
-    let muted = Style::default().fg(theme.muted);
+    let muted = Style::default().fg(theme.text.secondary);
     let width = area.width as usize;
 
     // Footer: Context + optional cache hit rate. Shortcuts live in /help · Ctrl+?.
@@ -529,8 +549,304 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         )
+    }
+
+    fn render_theme(theme: crate::theme::Theme) -> (crate::theme::Theme, ratatui::buffer::Buffer) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(
+            theme,
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        (state.theme.clone(), terminal.backend().buffer().clone())
+    }
+
+    fn buffer_has_bg(buf: &ratatui::buffer::Buffer, want: ratatui::style::Color) -> bool {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).is_some_and(|c| c.bg == want) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn assert_opaque_workbench(theme: crate::theme::Theme) {
+        use ratatui::style::Color;
+
+        let canvas = theme.surface.canvas;
+        let input = theme.surface.input;
+        let (resolved, buf) = render_theme(theme);
+        let header = buf.cell((2, 1)).expect("header cell");
+        let conversation = buf.cell((2, 8)).expect("conversation cell");
+        assert_ne!(header.bg, Color::Reset, "{:?} header leaked", resolved.id);
+        assert_eq!(header.bg, canvas, "{:?} header canvas", resolved.id);
+        assert_eq!(
+            conversation.bg, canvas,
+            "{:?} conversation canvas",
+            resolved.id
+        );
+        assert!(
+            buffer_has_bg(&buf, input),
+            "{:?} input surface missing",
+            resolved.id
+        );
+    }
+
+    #[test]
+    fn input_box_uses_workspace_gutter_and_inner_pad() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let (ix, iy, iw, ih) = state.input_rect.expect("input_rect published");
+        assert_eq!(ix, crate::layout::WORKSPACE_GUTTER_X);
+        assert_eq!(iw, 80 - crate::layout::WORKSPACE_GUTTER_X * 2);
+        let buf = terminal.backend().buffer();
+        let mut border_x = None;
+        let mut prompt_x = None;
+        for y in iy..iy.saturating_add(ih) {
+            for x in 0..buf.area.width {
+                let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+                if border_x.is_none() && sym == "╭" {
+                    border_x = Some(x);
+                }
+                if prompt_x.is_none() && sym == "›" {
+                    prompt_x = Some(x);
+                }
+            }
+        }
+        assert_eq!(border_x, Some(ix), "input border follows the slot");
+        assert_eq!(
+            prompt_x,
+            Some(ix + 1 + crate::layout::INPUT_INTERNAL_PADDING_X),
+            "prompt sits one inner pad after the border"
+        );
+    }
+
+    #[test]
+    fn footer_uses_horizontal_gutter_and_bottom_pad() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        state.context_window_tokens = 1_000_000;
+        state.context_tokens = 15_000;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut context_x = None;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "C") {
+                    // First 'C' of "Context" near the bottom.
+                    if y + 3 >= buf.area.height {
+                        context_x = Some(x);
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            context_x,
+            Some(crate::layout::WORKSPACE_GUTTER_X),
+            "footer text must sit on the workspace gutter"
+        );
+        let last = buf.area.height.saturating_sub(1);
+        for x in 0..buf.area.width {
+            let sym = buf.cell((x, last)).map(|c| c.symbol()).unwrap_or(" ");
+            assert!(
+                sym.trim().is_empty(),
+                "bottom pad row must be blank, col {x} is {sym:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_popup_content_starts_after_border_and_pad() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        state.composer.replace("/");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let (ix, iy, _, _) = state.input_rect.expect("input slot");
+        let buf = terminal.backend().buffer();
+        let mut model_x = None;
+        for y in iy.saturating_sub(12)..iy {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "/") {
+                    model_x = Some(x);
+                    break;
+                }
+            }
+            if model_x.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            model_x,
+            Some(ix + 1 + 1),
+            "first command char is border + inner pad after popup origin"
+        );
+    }
+
+    #[test]
+    fn scrolled_conversation_keeps_top_and_bottom_breathing_room() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        for i in 0..40 {
+            state.transcript.push_user(format!("ROW{i}"));
+        }
+        state.conv.auto_scroll = false;
+        state.conv.scroll = 0;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let (cx, cy, _cw, ch) = state.conv.rect.expect("content rect");
+        assert_eq!(cx, crate::layout::WORKSPACE_GUTTER_X);
+        assert_eq!(
+            cy,
+            3 + crate::layout::CONVERSATION_PADDING_TOP,
+            "content starts one row below the header rule"
+        );
+        assert!(ch >= 1);
+        let buf = terminal.backend().buffer();
+        let mut first_marker_y = None;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "▌") {
+                    first_marker_y = Some(y);
+                    break;
+                }
+            }
+            if first_marker_y.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            first_marker_y,
+            Some(cy),
+            "scrolled-to-top first glyph sits on the content top, not the header"
+        );
+        for x in 0..buf.area.width {
+            let sym = buf.cell((x, cy - 1)).map(|c| c.symbol()).unwrap_or(" ");
+            assert!(
+                sym != "▌" && !sym.starts_with('R'),
+                "row above content must stay empty, col {x} is {sym:?}"
+            );
+        }
+        let bottom_pad = cy.saturating_add(ch);
+        for x in 0..buf.area.width {
+            let sym = buf.cell((x, bottom_pad)).map(|c| c.symbol()).unwrap_or(" ");
+            let badge =
+                sym.contains('▼') || sym.chars().all(|c| c.is_ascii_digit() || c.is_whitespace());
+            assert!(
+                sym.trim().is_empty() || badge,
+                "row below content must stay empty, col {x} is {sym:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_first_glyph_sits_on_the_gutter() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        state.transcript.push_user("GUTTERMARK".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut marker_x = None;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "▌") {
+                    marker_x = Some(x);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            marker_x,
+            Some(crate::conversation::geometry::GUTTER_X),
+            "top-level conversation marker must sit at the gutter, not the edge"
+        );
+    }
+
+    #[test]
+    fn conversation_wrapping_stays_inside_the_right_gutter() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        state.transcript.push_user("字".repeat(80));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let (cx, cy, cw, ch) = state.conv.rect.expect("conversation content rect");
+        let content_right = cx.saturating_add(cw);
+        let buf = terminal.backend().buffer();
+        for y in cy..cy.saturating_add(ch) {
+            for x in content_right..buf.area.width {
+                let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+                assert!(
+                    sym.trim().is_empty() || sym.contains('▼'),
+                    "col {x} row {y} leaked past content right {content_right}: {sym:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dark_automated_render_owns_surfaces() {
+        assert_opaque_workbench(crate::theme::Theme::dark());
+    }
+
+    #[test]
+    fn light_automated_render_owns_surfaces() {
+        assert_opaque_workbench(crate::theme::Theme::light());
     }
 
     fn rule_plain(line: &Line<'static>) -> String {
@@ -705,6 +1021,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         );
         // Busy goal with no plan must not reserve chrome for "等待计划".

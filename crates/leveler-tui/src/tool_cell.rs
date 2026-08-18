@@ -22,9 +22,9 @@ fn tool_glyph(status: ToolStatus) -> &'static str {
 
 fn tool_style(theme: &Theme, status: ToolStatus) -> Style {
     match status {
-        ToolStatus::Running => Style::default().fg(theme.accent),
-        ToolStatus::Ok => Style::default().fg(theme.success),
-        ToolStatus::Failed => Style::default().fg(theme.error),
+        ToolStatus::Running => Style::default().fg(theme.accent.primary),
+        ToolStatus::Ok => Style::default().fg(theme.status.success),
+        ToolStatus::Failed => Style::default().fg(theme.status.error),
     }
 }
 
@@ -78,7 +78,7 @@ fn tool_argument_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         t.tool_label_args,
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     ))];
     let inner = width.saturating_sub(2).max(1);
     let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
@@ -598,7 +598,7 @@ pub(crate) fn tool_lines(
         tool_glyph(block.status)
     };
     let glyph_style = if guard_denial {
-        Style::default().fg(theme.warning)
+        Style::default().fg(theme.status.warning)
     } else {
         tool_style(theme, block.status)
     };
@@ -617,10 +617,10 @@ pub(crate) fn tool_lines(
     };
 
     // Compact default row: glyph + presentation + one-line summary.
-    // Only the glyph carries a status color; the action name is theme.tool.
+    // Only the glyph carries a status color; the action name is theme.accent.secondary.
     let mut head = vec![
         Span::styled(format!("{glyph} "), glyph_style),
-        Span::styled(action.clone(), Style::default().fg(theme.tool)),
+        Span::styled(action.clone(), Style::default().fg(theme.accent.secondary)),
     ];
     let target = tool_summary_for(&block.name, &block.arguments, t);
     if !target.is_empty() && target != "{}" {
@@ -628,21 +628,21 @@ pub(crate) fn tool_lines(
         head.push(Span::raw("  "));
         head.push(Span::styled(
             truncate_display(&target, width.saturating_sub(used + 8).max(8)),
-            Style::default().fg(theme.text),
+            Style::default().fg(theme.text.primary),
         ));
     }
     match block.status {
         ToolStatus::Running => {
             head.push(Span::styled(
                 " …".to_string(),
-                Style::default().fg(theme.dim),
+                Style::default().fg(theme.text.muted),
             ));
         }
         _ => {
             if let Some(ms) = block.duration_ms.filter(|ms| *ms >= 1000) {
                 head.push(Span::styled(
                     format!(" · {:.1}s", ms as f64 / 1000.0),
-                    Style::default().fg(theme.dim),
+                    Style::default().fg(theme.text.muted),
                 ));
             }
         }
@@ -713,9 +713,9 @@ pub(crate) fn tool_lines(
         let shown = lines.len().min(MAX_EXPANDED_PREVIEW);
         for (i, line) in lines.iter().take(shown).enumerate() {
             let lead = if i == 0 { "  └ " } else { "    " };
-            let base = Style::default().fg(theme.muted);
-            let link = crate::url_link::link_style(theme.accent);
-            let mut spans = vec![Span::styled(lead, Style::default().fg(theme.dim))];
+            let base = Style::default().fg(theme.text.secondary);
+            let link = crate::url_link::link_style(theme.accent.primary);
+            let mut spans = vec![Span::styled(lead, Style::default().fg(theme.text.muted))];
             spans.extend(crate::url_link::spans_with_bare_urls(line, base, link));
             out.push(Line::from(spans));
         }
@@ -726,7 +726,7 @@ pub(crate) fn tool_lines(
                     t.fold_more_lines
                         .replace("{}", &(lines.len() - shown).to_string())
                 ),
-                Style::default().fg(theme.dim),
+                Style::default().fg(theme.text.muted),
             )));
         }
     } else {
@@ -748,12 +748,12 @@ pub(crate) fn tool_lines(
         } else {
             String::new()
         };
-        let base = Style::default().fg(theme.muted);
-        let link = crate::url_link::link_style(theme.accent);
-        let mut spans = vec![Span::styled("  └ ", Style::default().fg(theme.dim))];
+        let base = Style::default().fg(theme.text.secondary);
+        let link = crate::url_link::link_style(theme.accent.primary);
+        let mut spans = vec![Span::styled("  └ ", Style::default().fg(theme.text.muted))];
         spans.extend(crate::url_link::spans_with_bare_urls(&one, base, link));
         if !hint.is_empty() {
-            spans.push(Span::styled(hint, Style::default().fg(theme.dim)));
+            spans.push(Span::styled(hint, Style::default().fg(theme.text.muted)));
         }
         out.push(Line::from(spans));
     }
@@ -953,20 +953,22 @@ fn push_edit_diff_body(
         match row {
             EditDiffRow::FileHeader { path } if show_file_headers => {
                 out.push(Line::from(vec![
-                    Span::styled(lead, Style::default().fg(theme.dim)),
+                    Span::styled(lead, Style::default().fg(theme.text.muted)),
                     Span::styled(
                         truncate_display(path, width.saturating_sub(4).max(8)),
-                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.text.primary)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]));
             }
             EditDiffRow::FileHeader { .. } => {}
             EditDiffRow::Meta { text } | EditDiffRow::Hunk { label: text } => {
                 out.push(Line::from(vec![
-                    Span::styled(lead, Style::default().fg(theme.dim)),
+                    Span::styled(lead, Style::default().fg(theme.text.muted)),
                     Span::styled(
                         truncate_display(text, width.saturating_sub(4).max(8)),
-                        Style::default().fg(theme.dim),
+                        Style::default().fg(theme.text.muted),
                     ),
                 ]));
             }
@@ -979,11 +981,11 @@ fn push_edit_diff_body(
                     EditLineKind::Add => (
                         "+ ",
                         Style::default()
-                            .fg(theme.diff_add)
+                            .fg(theme.diff.added)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    EditLineKind::Remove => ("- ", Style::default().fg(theme.diff_remove)),
-                    EditLineKind::Context => ("  ", Style::default().fg(theme.muted)),
+                    EditLineKind::Remove => ("- ", Style::default().fg(theme.diff.removed)),
+                    EditLineKind::Context => ("  ", Style::default().fg(theme.text.secondary)),
                 };
                 let gutter = if has_numbers {
                     match line_no {
@@ -994,8 +996,8 @@ fn push_edit_diff_body(
                     "  ".to_string()
                 };
                 out.push(Line::from(vec![
-                    Span::styled(lead, Style::default().fg(theme.dim)),
-                    Span::styled(gutter, Style::default().fg(theme.dim)),
+                    Span::styled(lead, Style::default().fg(theme.text.muted)),
+                    Span::styled(gutter, Style::default().fg(theme.text.muted)),
                     Span::styled(mark.to_string(), style),
                     Span::styled(truncate_display(text, inner), style),
                 ]));
@@ -1014,7 +1016,7 @@ fn push_edit_diff_body(
         };
         out.push(Line::from(Span::styled(
             hint,
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         )));
     }
 }
@@ -1243,7 +1245,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
     if calls.is_empty() {
         rows.push(Line::from(Span::styled(
             t.tools_none,
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
     }
     let list_width = list_area.width.saturating_sub(2).max(1) as usize;
@@ -1266,32 +1268,32 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
         };
         let label_width = list_width.saturating_sub(4 + dur_width).max(8);
         rows.push(Line::from(vec![
-            Span::styled(cursor, Style::default().fg(theme.accent)),
+            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
             Span::styled(
                 format!("{} ", tool_glyph(block.status)),
                 tool_style(theme, block.status),
             ),
             Span::raw(truncate_display(&label, label_width)),
-            Span::styled(format!("  {dur}"), Style::default().fg(theme.dim)),
+            Span::styled(format!("  {dur}"), Style::default().fg(theme.text.muted)),
         ]));
     }
     let list_block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(theme.border))
+        .border_style(Style::default().fg(theme.border.normal))
         .title(Span::styled(
             format!(" {} · {} ", t.tools_col_tool, filter.label()),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ));
     let list_inner = list_block.inner(list_area);
     frame.render_widget(list_block, list_area);
-    crate::render::render_list_focused(frame, list_inner, rows, selected);
+    crate::render::render_list_focused(frame, list_inner, rows, selected, theme);
 
     let mut detail: Vec<Line> = Vec::new();
     if let Some(block) = calls.get(selected) {
         detail.push(Line::from(vec![
             Span::styled(
                 format!("{}  ", t.tools_col_tool),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             ),
             Span::raw(block.name.clone()),
         ]));
@@ -1309,7 +1311,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
         detail.push(Line::from(vec![
             Span::styled(
                 format!("{}  ", t.tools_col_status),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             ),
             Span::styled(status, tool_style(theme, block.status)),
         ]));
@@ -1317,16 +1319,16 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
             detail.push(Line::from(vec![
                 Span::styled(
                     format!("{}  ", t.tools_col_duration),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.text.secondary),
                 ),
-                Span::styled(format!("{ms}ms"), Style::default().fg(theme.dim)),
+                Span::styled(format!("{ms}ms"), Style::default().fg(theme.text.muted)),
             ]));
         }
         if let Some(preview) = &block.preview {
             detail.push(Line::from(""));
             detail.push(Line::from(Span::styled(
                 t.tools_output,
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             )));
             for line in wrap(preview, detail_area.width.saturating_sub(1).max(1) as usize) {
                 detail.push(Line::from(Span::raw(line)));
@@ -1337,7 +1339,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
     let footer = tools_footer_hint(detail_area.width.saturating_sub(1).max(1) as usize, t);
     detail.push(Line::from(Span::styled(
         footer,
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     crate::render::render_scrolled(frame, detail_area, state, detail);
 }

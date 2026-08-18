@@ -507,6 +507,7 @@ mod tests {
                 checkpoints: Vec::new(),
                 user_shells: Vec::new(),
                 completion_report: None,
+                reasoning: None,
             })
         }
     }

@@ -29,6 +29,7 @@ fn opened_state() -> AppState {
             context_window: 200_000,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
+            reasoning_effort: None,
         },
     );
     let snap = UiSessionSnapshot {
@@ -51,6 +52,7 @@ fn opened_state() -> AppState {
         checkpoints: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
+        reasoning: None,
     };
     reduce(
         &mut s,
@@ -1159,7 +1161,7 @@ fn the_splash_sits_in_the_middle_of_an_empty_session() {
     // The composer box starts at column 0; the splash card is indented.
     let composer = lines
         .iter()
-        .position(|l| l.starts_with('╭'))
+        .rposition(|l| l.trim_start().starts_with('╭'))
         .expect("composer must be on screen");
     // The conversation area begins under the header rule.
     let rule = lines

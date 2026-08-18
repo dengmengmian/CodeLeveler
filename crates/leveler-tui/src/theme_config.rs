@@ -79,8 +79,8 @@ mod tests {
             "default_model = \"deepseek/x\"\n\n[providers.p]\nbase_url = \"http://x\"\n",
         )
         .unwrap();
-        save_theme_id_at(&path, ThemeId::Night).unwrap();
-        assert_eq!(load_theme_id_at(&path), Some(ThemeId::Night));
+        save_theme_id_at(&path, ThemeId::Dark).unwrap();
+        assert_eq!(load_theme_id_at(&path), Some(ThemeId::Dark));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("default_model"),
@@ -89,15 +89,15 @@ mod tests {
         assert!(text.contains("[ui]"), "{text}");
         assert!(text.contains("theme"), "{text}");
         // Re-save day
-        save_theme_id_at(&path, ThemeId::Day).unwrap();
-        assert_eq!(load_theme_id_at(&path), Some(ThemeId::Day));
+        save_theme_id_at(&path, ThemeId::Light).unwrap();
+        assert_eq!(load_theme_id_at(&path), Some(ThemeId::Light));
     }
 
     #[test]
     fn parse_theme_from_inline_toml() {
         assert_eq!(
-            parse_theme_id_from_toml("[ui]\ntheme = \"ion\"\n"),
-            Some(ThemeId::Ion)
+            parse_theme_id_from_toml("[ui]\ntheme = \"dark\"\n"),
+            Some(ThemeId::Dark)
         );
         assert_eq!(parse_theme_id_from_toml("lang = \"zh\"\n"), None);
     }

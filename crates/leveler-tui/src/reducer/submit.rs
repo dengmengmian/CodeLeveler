@@ -5,8 +5,8 @@ use crate::screen::{BusyPolicy, Screen};
 use crate::state::{AppState, Notification};
 
 use super::overlay_keys::{
-    apply_theme_id, open_checkpoint_picker, open_mode_picker, open_model_picker, open_theme_picker,
-    open_unsupported_media,
+    apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
+    open_model_picker, open_theme_picker, open_unsupported_media, open_work_mode_picker,
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{open_diff_screen, open_sessions_screen, toggle_screen};
@@ -273,7 +273,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "btw" => run_btw(state, command),
         "tools" => toggle_screen(state, Screen::Tools),
         // /plan = collaboration Plan mode (read-only planning).
-        "plan" => set_collab(state, "plan"),
+        "plan" => apply_collab(state, "plan"),
         "work-mode" => set_work_mode(state, command),
         "collab" => set_collab_cmd(state, command),
         "memory" => memory_slash(state, command),
@@ -498,14 +498,22 @@ fn set_work_mode(state: &mut AppState, command: &str) -> Vec<Effect> {
         .nth(1)
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(arg.as_str(), "economy" | "balanced" | "delivery") {
+    if arg.is_empty() {
+        open_work_mode_picker(state);
+        return Vec::new();
+    }
+    apply_work_profile(state, &arg)
+}
+
+pub(super) fn apply_work_profile(state: &mut AppState, arg: &str) -> Vec<Effect> {
+    if !matches!(arg, "economy" | "balanced" | "delivery") {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
             message: state.t().work_mode_usage.to_string(),
         });
         return Vec::new();
     }
-    state.work_profile = arg.clone();
+    state.work_profile = arg.to_string();
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
         message: format!("work-mode → {arg}"),
@@ -524,16 +532,13 @@ fn set_collab_cmd(state: &mut AppState, command: &str) -> Vec<Effect> {
         .unwrap_or("")
         .to_ascii_lowercase();
     if arg.is_empty() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: state.t().collab_usage.to_string(),
-        });
+        open_collab_picker(state);
         return Vec::new();
     }
-    set_collab(state, &arg)
+    apply_collab(state, &arg)
 }
 
-fn set_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
+pub(super) fn apply_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
     if !matches!(collab, "chat" | "plan" | "goal") {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
@@ -928,6 +933,7 @@ mod export_tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         );
         s.transcript.push_user("帮我加个导出功能".into());
@@ -1036,6 +1042,7 @@ mod export_tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         );
         let effects = export_conversation(&mut s, "export");

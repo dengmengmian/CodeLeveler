@@ -67,7 +67,7 @@ pub(crate) fn render_group(
         let label = t.parallel_header.replace("{}", &parallel_n.to_string());
         out.push(Line::from(Span::styled(
             truncate_display(&label, width),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         )));
     }
     for unit in plan_units(&group.calls) {
@@ -430,7 +430,7 @@ fn unit_lines(
     let guard_denial = call.status == ToolStatus::Failed
         && matches!(call.name.as_str(), "update_plan" | "update_goal");
     let (glyph, glyph_color) = if guard_denial {
-        ("⚠", theme.warning)
+        ("⚠", theme.status.warning)
     } else {
         status_glyph(call.status, theme)
     };
@@ -461,7 +461,7 @@ fn unit_lines(
 
     let mut head = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-        Span::styled(action.clone(), Style::default().fg(theme.tool)),
+        Span::styled(action.clone(), Style::default().fg(theme.accent.secondary)),
     ];
 
     // The head carries the one-line target inline (text color; `$` highlighted
@@ -484,15 +484,18 @@ fn unit_lines(
             .max(8);
         head.push(Span::raw("  "));
         if shell {
-            head.push(Span::styled("$ ", Style::default().fg(theme.shell_prompt)));
+            head.push(Span::styled(
+                "$ ",
+                Style::default().fg(theme.accent.secondary),
+            ));
         }
         head.push(Span::styled(
             truncate_display(&summary, avail),
-            Style::default().fg(theme.text),
+            Style::default().fg(theme.text.primary),
         ));
     }
     if !tail.is_empty() {
-        head.push(Span::styled(tail, Style::default().fg(theme.dim)));
+        head.push(Span::styled(tail, Style::default().fg(theme.text.muted)));
     }
     // Collapsed, a finished success is one row: the size of what came back
     // rides on the head instead of claiming a row of its own. Failures keep
@@ -504,7 +507,7 @@ fn unit_lines(
             let (pre, post) = split_placeholder(t.tool_output_lines);
             head.push(Span::styled(
                 format!(" · {pre}{n}{post}"),
-                Style::default().fg(theme.dim),
+                Style::default().fg(theme.text.muted),
             ));
         }
         return vec![Line::from(head)];
@@ -539,9 +542,9 @@ fn failed_patch_target(preview: Option<&str>) -> Option<String> {
 
 fn status_glyph(status: ToolStatus, theme: &Theme) -> (&'static str, ratatui::style::Color) {
     match status {
-        ToolStatus::Running => ("◌", theme.accent),
-        ToolStatus::Ok => ("✓", theme.success),
-        ToolStatus::Failed => ("✗", theme.error),
+        ToolStatus::Running => ("◌", theme.accent.primary),
+        ToolStatus::Ok => ("✓", theme.status.success),
+        ToolStatus::Failed => ("✗", theme.status.error),
     }
 }
 
@@ -573,10 +576,10 @@ fn result_lines_for(
             0
         };
         let mut spans = vec![
-            Span::styled("  └ ", Style::default().fg(theme.muted)),
+            Span::styled("  └ ", Style::default().fg(theme.text.secondary)),
             Span::styled(
                 truncate_display(&note, width.saturating_sub(4 + retry_w).max(1)),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             ),
         ];
         if !expanded && !guard_denial {
@@ -587,14 +590,14 @@ fn result_lines_for(
                         " {}",
                         t.fold_more_lines_short.replace("{}", &more.to_string())
                     ),
-                    Style::default().fg(theme.dim),
+                    Style::default().fg(theme.text.muted),
                 ));
             }
         }
         if repeat > 1 {
             spans.push(Span::styled(
                 format!(" ×{repeat}"),
-                Style::default().fg(theme.dim),
+                Style::default().fg(theme.text.muted),
             ));
         }
         return vec![Line::from(spans)];
@@ -616,33 +619,39 @@ fn result_lines_for(
     } else {
         first_content_line(call)
     };
-    let mut spans = vec![Span::styled("  └ ", Style::default().fg(theme.muted))];
+    let mut spans = vec![Span::styled(
+        "  └ ",
+        Style::default().fg(theme.text.secondary),
+    )];
     if let Some(first) = first {
         let count_w =
             UnicodeWidthStr::width(pre) + n.to_string().len() + UnicodeWidthStr::width(post);
         let avail = width.saturating_sub(4 + count_w + 3 + 2).max(8);
         spans.push(Span::styled(
             truncate_display(&first, avail),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ));
         spans.push(Span::styled(
             " · ".to_string(),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         ));
     }
     spans.push(Span::styled(
         pre.to_string(),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     ));
-    spans.push(Span::styled(n.to_string(), Style::default().fg(theme.dim)));
+    spans.push(Span::styled(
+        n.to_string(),
+        Style::default().fg(theme.text.muted),
+    ));
     spans.push(Span::styled(
         post.to_string(),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     ));
     if call_timed_out(call) {
         spans.push(Span::styled(
             t.result_timeout.to_string(),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         ));
     }
     vec![Line::from(spans)]
@@ -705,7 +714,7 @@ fn edit_unit_lines(
     };
     let mut head = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-        Span::styled(action.clone(), Style::default().fg(theme.tool)),
+        Span::styled(action.clone(), Style::default().fg(theme.accent.secondary)),
     ];
     // The touched file(s) ride inline on the head row.
     let files = {
@@ -724,11 +733,11 @@ fn edit_unit_lines(
         head.push(Span::raw("  "));
         head.push(Span::styled(
             truncate_display(&files, avail),
-            Style::default().fg(theme.text),
+            Style::default().fg(theme.text.primary),
         ));
     }
     if !tail.is_empty() {
-        head.push(Span::styled(tail, Style::default().fg(theme.dim)));
+        head.push(Span::styled(tail, Style::default().fg(theme.text.muted)));
     }
     let mut out = vec![Line::from(head)];
 
@@ -751,14 +760,14 @@ fn edit_unit_lines(
     let edits = if hunks == 0 { calls.len() } else { hunks };
     let (pre, post) = split_placeholder(t.edit_merge_summary);
     out.push(Line::from(vec![
-        Span::styled("  └ ", Style::default().fg(theme.muted)),
-        Span::styled(pre.to_string(), Style::default().fg(theme.muted)),
-        Span::styled(edits.to_string(), Style::default().fg(theme.dim)),
-        Span::styled(post.to_string(), Style::default().fg(theme.muted)),
-        Span::styled(" · ".to_string(), Style::default().fg(theme.muted)),
+        Span::styled("  └ ", Style::default().fg(theme.text.secondary)),
+        Span::styled(pre.to_string(), Style::default().fg(theme.text.secondary)),
+        Span::styled(edits.to_string(), Style::default().fg(theme.text.muted)),
+        Span::styled(post.to_string(), Style::default().fg(theme.text.secondary)),
+        Span::styled(" · ".to_string(), Style::default().fg(theme.text.secondary)),
         Span::styled(
             format!("+{added} −{removed}"),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         ),
     ]));
 

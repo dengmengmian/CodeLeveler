@@ -31,10 +31,10 @@ pub(crate) fn render_plan_screen(frame: &mut Frame, area: Rect, state: &AppState
         Some(plan) if !plan.steps.is_empty() => {
             for step in &plan.steps {
                 let color = match step.status {
-                    PlanStepStatus::Done => theme.success,
-                    PlanStepStatus::Failed => theme.error,
-                    PlanStepStatus::Running => theme.accent,
-                    _ => theme.muted,
+                    PlanStepStatus::Done => theme.status.success,
+                    PlanStepStatus::Failed => theme.status.error,
+                    PlanStepStatus::Running => theme.accent.primary,
+                    _ => theme.text.secondary,
                 };
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -47,13 +47,13 @@ pub(crate) fn render_plan_screen(frame: &mut Frame, area: Rect, state: &AppState
         }
         _ => lines.push(Line::from(Span::styled(
             t.no_plan.to_string(),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ))),
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         t.help_scroll.to_string(),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     render_scrolled(frame, area, state, lines);
 }
@@ -80,32 +80,32 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
     if !subs.is_empty() {
         lines.push(Line::from(Span::styled(
             t.agents_sub_agents,
-            Style::default().fg(theme.accent),
+            Style::default().fg(theme.accent.primary),
         )));
         for b in &subs {
             let (glyph, color) = match b.status {
-                ToolStatus::Running => ("●", theme.accent),
-                ToolStatus::Ok => ("✓", theme.success),
-                ToolStatus::Failed => ("✗", theme.error),
+                ToolStatus::Running => ("●", theme.accent.primary),
+                ToolStatus::Ok => ("✓", theme.status.success),
+                ToolStatus::Failed => ("✗", theme.status.error),
             };
             let mut spans = vec![
                 Span::styled(format!("{glyph} "), Style::default().fg(color)),
                 Span::styled(
                     sub_agent_display_name(b, t),
                     Style::default()
-                        .fg(theme.accent)
+                        .fg(theme.accent.primary)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
             ];
             spans.push(Span::styled(
                 format!(" · {}", sub_agent_status(b, t)),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             ));
             let usage = sub_agent_usage(b, t);
             if !usage.is_empty() {
                 spans.push(Span::styled(
                     format!(" · {usage}"),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.text.secondary),
                 ));
             }
             lines.push(Line::from(spans));
@@ -122,7 +122,7 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
                     Span::raw("  "),
                     Span::styled(
                         truncate_display(detail, area.width.saturating_sub(3).max(1) as usize),
-                        Style::default().fg(theme.muted),
+                        Style::default().fg(theme.text.secondary),
                     ),
                 ]));
             }
@@ -140,7 +140,7 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{orch_glyph} {}", t.agents_orchestrator),
-                    Style::default().fg(theme.accent),
+                    Style::default().fg(theme.accent.primary),
                 ),
                 Span::styled(
                     if running {
@@ -148,20 +148,23 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
                     } else {
                         format!("  {}", t.agents_idle)
                     },
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.text.secondary),
                 ),
             ]));
             let last = plan.steps.len().saturating_sub(1);
             for (i, step) in plan.steps.iter().enumerate() {
                 let branch = if i == last { "└─" } else { "├─" };
                 let color = match step.status {
-                    PlanStepStatus::Done => theme.success,
-                    PlanStepStatus::Failed => theme.error,
-                    PlanStepStatus::Running => theme.accent,
-                    _ => theme.muted,
+                    PlanStepStatus::Done => theme.status.success,
+                    PlanStepStatus::Failed => theme.status.error,
+                    PlanStepStatus::Running => theme.accent.primary,
+                    _ => theme.text.secondary,
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{branch} "), Style::default().fg(theme.muted)),
+                    Span::styled(
+                        format!("{branch} "),
+                        Style::default().fg(theme.text.secondary),
+                    ),
                     Span::styled(
                         format!("{} ", plan_glyph(step.status)),
                         Style::default().fg(color),
@@ -173,14 +176,14 @@ pub(crate) fn render_agents_screen(frame: &mut Frame, area: Rect, state: &AppSta
         // Only the empty state when there are neither sub-agents nor plan nodes.
         _ if subs.is_empty() => lines.push(Line::from(Span::styled(
             t.agents_empty,
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ))),
         _ => {}
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         t.agents_scroll_hint,
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     crate::render::render_scrolled(frame, area, state, lines);
 }

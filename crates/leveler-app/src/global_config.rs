@@ -14,7 +14,7 @@
 //! lang = "zh"                 # optional UI language: zh | en (LEVELER_LANG overrides)
 //!
 //! [ui]
-//! theme = "ion"                # optional TUI theme: ion | night | day
+//! theme = "auto"               # optional TUI theme: auto | dark | light | high-contrast
 //!
 //! [vcs]
 //! co_author = true             # optional; append the CodeLeveler/model commit trailer
@@ -99,7 +99,7 @@ impl Default for GlobalAgents {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalUi {
-    /// TUI theme id: `ion` | `night` | `day` (aliases: dark, light).
+    /// TUI theme id: `auto` | `dark` | `light` | `high-contrast`.
     #[serde(default)]
     theme: Option<String>,
 }
@@ -186,7 +186,12 @@ struct GlobalModel {
     /// `thinking_flag` (DeepSeek/GLM). Unset means we send no reasoning field.
     #[serde(default)]
     reasoning_style: ReasoningStyle,
-    /// `minimal` | `low` | `medium` | `high` | `max`. Omitted → provider default.
+    /// Native efforts this model accepts. Omitted → inferred as `[reasoning_effort]`
+    /// when that field is set.
+    #[serde(default)]
+    supported_efforts: Vec<ReasoningEffort>,
+    /// CodeLeveler default: `minimal` | `low` | `medium` | `high` | `xhigh` | `max`.
+    /// This is **not** the provider default. A knob-style model must set it.
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
@@ -230,6 +235,22 @@ struct GlobalModel {
     /// rejected unless the key is present). Defaults to false.
     #[serde(default)]
     passback_reasoning_content: bool,
+}
+
+impl GlobalModel {
+    fn reasoning_config(&self) -> ReasoningConfig {
+        let mut supported = self.supported_efforts.clone();
+        if supported.is_empty()
+            && let Some(default) = self.reasoning_effort
+        {
+            supported = vec![default];
+        }
+        ReasoningConfig {
+            style: self.reasoning_style,
+            supported_efforts: supported,
+            default_effort: self.reasoning_effort,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -298,13 +319,43 @@ impl GlobalConfig {
         let value: toml::Value =
             toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
         reject_mcp_env_secrets(&value)?;
-        toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))
+        let cfg: Self =
+            toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
+        cfg.validate_reasoning()?;
+        Ok(cfg)
+    }
+
+    fn validate_reasoning(&self) -> Result<(), GlobalConfigError> {
+        for (id, model) in &self.models {
+            let config = model.reasoning_config();
+            if let Err(reason) = leveler_model::validate_reasoning_config(model.reasoning, &config)
+            {
+                return Err(GlobalConfigError::Parse(format!(
+                    "model `{id}` has invalid reasoning config: {reason}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Persist `default_model` in the global config (format-preserving).
     ///
     /// Used when the user switches model in the TUI/CLI so the next launch
     /// picks the same model without re-selecting.
+    /// Effective CodeLeveler default for `[models.<id>]` (`provider/model` or
+    /// a bare model id). `None` when the model has no controllable knob.
+    pub fn reasoning_effort_for(&self, model: &str) -> Option<String> {
+        let id = model
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(model);
+        let m = self.models.get(id)?;
+        let config = m.reasoning_config();
+        leveler_model::resolve_reasoning_effort(None, &config)
+            .effective
+            .map(|e| e.as_wire().to_string())
+    }
+
     pub fn save_default_model(model: &str) -> Result<(), GlobalConfigError> {
         let path = Self::path().ok_or_else(|| {
             GlobalConfigError::Parse(
@@ -394,6 +445,7 @@ impl GlobalConfig {
             .into_iter()
             .map(|(id, m)| {
                 let context = m.context_window.unwrap_or(131_072);
+                let reasoning = m.reasoning_config();
                 ModelConfigFile {
                     profile: ModelProfile {
                         model_id: m.model_id.unwrap_or_else(|| id.clone()),
@@ -423,10 +475,7 @@ impl GlobalConfig {
                             max_tool_output_bytes: m.max_tool_output_bytes,
                         },
                         context_quality: None,
-                        reasoning: ReasoningConfig {
-                            style: m.reasoning_style,
-                            effort: m.reasoning_effort,
-                        },
+                        reasoning,
                         compatibility: CompatibilityConfig {
                             supports_temperature: m.supports_temperature,
                             thinking_supports_forced_tool_choice: m
@@ -657,9 +706,27 @@ mod tests {
         "#;
         let cfg: GlobalConfig = toml::from_str(toml).unwrap();
         let bundle = cfg.into_bundle();
-        let r = bundle.models[0].profile.reasoning;
+        let r = &bundle.models[0].profile.reasoning;
         assert_eq!(r.style, ReasoningStyle::ThinkingFlag);
-        assert_eq!(r.effort, Some(ReasoningEffort::High));
+        assert_eq!(r.default_effort, Some(ReasoningEffort::High));
+        assert_eq!(r.supported_efforts, vec![ReasoningEffort::High]);
+    }
+
+    #[test]
+    fn invalid_custom_reasoning_is_a_load_error() {
+        let toml = r#"
+            [providers.deepseek]
+            base_url = "https://api.deepseek.com"
+
+            [models.broken]
+            provider = "deepseek"
+            reasoning = true
+            reasoning_style = "thinking_flag"
+            reasoning_effort = "medium"
+            supported_efforts = ["high", "max"]
+        "#;
+        let err = GlobalConfig::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("not in supported_efforts"), "{err}");
     }
 
     #[test]
@@ -673,9 +740,9 @@ mod tests {
         "#;
         let cfg: GlobalConfig = toml::from_str(toml).unwrap();
         let bundle = cfg.into_bundle();
-        let r = bundle.models[0].profile.reasoning;
+        let r = &bundle.models[0].profile.reasoning;
         assert_eq!(r.style, ReasoningStyle::None);
-        assert_eq!(r.effort, None);
+        assert_eq!(r.default_effort, None);
     }
 
     #[test]

@@ -34,9 +34,12 @@ use clap::Parser;
 
 use leveler_project::Layout;
 
-use cli::{Cli, Command, ConfigCommand, ModelSubcommand, ModelsCommand, RunMode};
+use cli::{Cli, Command, ConfigCommand, ModelSubcommand, ModelsCommand, RunMode, ThemeCommand};
 use eval_cmd::cmd_eval;
-use info_cmds::{cmd_config_show, cmd_doctor, cmd_model_probe, cmd_models_list, cmd_models_show};
+use info_cmds::{
+    cmd_config_show, cmd_doctor, cmd_model_probe, cmd_models_list, cmd_models_show,
+    cmd_theme_preview,
+};
 use mcp_lsp_cmds::{cmd_lsp, cmd_mcp};
 use memory_cmds::cmd_memory;
 use permissions_cmds::cmd_permissions;
@@ -256,6 +259,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
         Command::Remote(command) => crate::remote_cmds::cmd_remote(command).await,
         Command::Config(ConfigCommand::Show) => cmd_config_show(layout),
+        Command::Theme(ThemeCommand::Preview { id }) => cmd_theme_preview(id),
         Command::Models(ModelsCommand::List) => cmd_models_list(layout),
         Command::Models(ModelsCommand::Show { model }) => cmd_models_show(layout, &model).await,
         Command::Model(m) => match m.command {

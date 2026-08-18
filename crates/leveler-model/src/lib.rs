@@ -30,7 +30,8 @@ pub use message::{
 };
 pub use profile::{
     CompatibilityConfig, ModelCapabilities, ModelLimits, ModelPricing, ModelProfile, ProtocolKind,
-    ReasoningConfig, ReasoningEffort, ReasoningStyle,
+    ReasoningConfig, ReasoningEffort, ReasoningEffortSource, ReasoningStyle, ResolvedReasoning,
+    normalize_reasoning_effort, resolve_reasoning_effort, validate_reasoning_config,
 };
 pub use protocol::{
     EncodedRequest, ProtocolAdapter, ProtocolContext, ProtocolError, RawByteStream,

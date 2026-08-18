@@ -97,6 +97,7 @@ pub fn run_with_memory(
     // Config bundle. First install with no models/providers must fail closed —
     // "Environment looks healthy" with zero models is how new users get stuck.
     results.extend(check_model_bundle(config));
+    results.extend(check_reasoning(config));
 
     // Surface global-config load failures (incl. MCP plaintext env) even when
     // the rest of doctor runs against a lenient empty LoadedConfig.
@@ -199,6 +200,58 @@ fn check_model_bundle(config: &LoadedConfig) -> Vec<CheckResult> {
         }
     }
 
+    results
+}
+
+fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
+    use leveler_model::{ReasoningStyle, resolve_reasoning_effort, validate_reasoning_config};
+
+    let mut results = Vec::new();
+    for model in &config.models {
+        let profile = &model.profile;
+        if !profile.capabilities.reasoning {
+            continue;
+        }
+        let name = format!("reasoning: {}/{}", profile.provider, profile.id);
+        if let Err(reason) = validate_reasoning_config(true, &profile.reasoning) {
+            results.push(CheckResult::fail(&name, reason));
+            continue;
+        }
+        let resolved = resolve_reasoning_effort(None, &profile.reasoning);
+        match profile.reasoning.style {
+            ReasoningStyle::None => results.push(CheckResult::ok(
+                &name,
+                "always-on (no effort knob); CodeLeveler default n/a".to_string(),
+            )),
+            ReasoningStyle::OpenAiEffort | ReasoningStyle::ThinkingFlag => {
+                let supported = profile
+                    .reasoning
+                    .supported_efforts
+                    .iter()
+                    .map(|e| e.as_wire())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let default = profile
+                    .reasoning
+                    .default_effort
+                    .map(|e| e.as_wire())
+                    .unwrap_or("missing");
+                match resolved.effective {
+                    Some(effective) => results.push(CheckResult::ok(
+                        &name,
+                        format!(
+                            "supported=[{supported}] default={default} effective={}",
+                            effective.as_wire()
+                        ),
+                    )),
+                    None => results.push(CheckResult::fail(
+                        &name,
+                        format!("reasoning=true but effective effort is unknown (supported=[{supported}])"),
+                    )),
+                }
+            }
+        }
+    }
     results
 }
 
@@ -399,6 +452,38 @@ mod tests {
             "{results:?}"
         );
         assert!(!has_failure(&results));
+    }
+
+    #[test]
+    fn reasoning_knob_model_is_reported() {
+        let mut model = sample_model("deepseek", "deepseek-v4-pro");
+        model.profile.capabilities.reasoning = true;
+        model.profile.reasoning = leveler_model::ReasoningConfig {
+            style: leveler_model::ReasoningStyle::ThinkingFlag,
+            supported_efforts: vec![
+                leveler_model::ReasoningEffort::High,
+                leveler_model::ReasoningEffort::Max,
+            ],
+            default_effort: Some(leveler_model::ReasoningEffort::Max),
+        };
+        let config = LoadedConfig {
+            providers: vec![sample_provider("deepseek")],
+            models: vec![model],
+            ..Default::default()
+        };
+        let results = check_reasoning(&config);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, CheckStatus::Ok);
+        assert!(
+            results[0].detail.contains("default=max"),
+            "{}",
+            results[0].detail
+        );
+        assert!(
+            results[0].detail.contains("effective=max"),
+            "{}",
+            results[0].detail
+        );
     }
 
     #[test]

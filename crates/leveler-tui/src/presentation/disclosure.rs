@@ -43,22 +43,30 @@ pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> L
     let mut spans = vec![
         Span::styled(
             format!("{glyph} "),
-            Style::default().fg(if failed { theme.warning } else { theme.dim }),
+            Style::default().fg(if failed {
+                theme.status.warning
+            } else {
+                theme.text.muted
+            }),
         ),
         Span::styled(
             truncate_display(&p.label, width.saturating_sub(16)),
-            Style::default().fg(if failed { theme.text } else { theme.dim }),
+            Style::default().fg(if failed {
+                theme.text.primary
+            } else {
+                theme.text.muted
+            }),
         ),
     ];
     if failed {
         spans.insert(
             1,
-            Span::styled("✗ ".to_string(), Style::default().fg(theme.warning)),
+            Span::styled("✗ ".to_string(), Style::default().fg(theme.status.warning)),
         );
         if let Some(suffix) = &p.failed_suffix {
             spans.push(Span::styled(
                 format!(" · {suffix}"),
-                Style::default().fg(theme.warning),
+                Style::default().fg(theme.status.warning),
             ));
         }
     }
@@ -67,7 +75,7 @@ pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> L
     {
         spans.push(Span::styled(
             format!(" · {:.1}s", ms as f64 / 1000.0),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text.muted),
         ));
     }
     Line::from(spans)
@@ -83,10 +91,10 @@ pub fn collapsed_lines(
     let mut out = vec![header_line(p, theme, width)];
     if let Some(err) = &p.first_error {
         out.push(Line::from(vec![
-            Span::styled("  └ ".to_string(), Style::default().fg(theme.dim)),
+            Span::styled("  └ ".to_string(), Style::default().fg(theme.text.muted)),
             Span::styled(
                 truncate_display(err, width.saturating_sub(4)),
-                Style::default().fg(theme.warning),
+                Style::default().fg(theme.status.warning),
             ),
         ]));
     }

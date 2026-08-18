@@ -742,6 +742,9 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     state.mode_label = mode_label(session.mode).to_string();
     state.available_models = session.available_models.clone();
     state.vision = session.vision;
+    if let Some(reasoning) = &session.reasoning {
+        state.reasoning_effort = reasoning.effective.clone();
+    }
 }
 
 fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {

@@ -1706,6 +1706,19 @@
         }
       }
     },
+    "UiReasoningState": {
+      "description": "Additive reasoning projection. The client must display `effective` and must not infer an effort from the model name or provider.",
+      "type": "object",
+      "properties": {
+        "effective": {
+          "description": "Wire value the runtime will send (`max`, `high`, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "UiRole": {
       "description": "Who authored a message.",
       "type": "string",
@@ -1827,6 +1840,17 @@
           "anyOf": [
             {
               "$ref": "#/definitions/UiPlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reasoning": {
+          "description": "Runtime-projected reasoning state. Absent on old runtimes so a new client keeps its boot-time value. Present with `effective: None` means the model has no controllable effort knob (do not invent one).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiReasoningState"
             },
             {
               "type": "null"

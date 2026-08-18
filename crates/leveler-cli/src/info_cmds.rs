@@ -78,6 +78,33 @@ pub(crate) fn cmd_config_show(layout: Layout) -> anyhow::Result<std::process::Ex
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// Print a semantic-token preview. No live TUI session.
+pub(crate) fn cmd_theme_preview(id: Option<String>) -> anyhow::Result<std::process::ExitCode> {
+    use std::io::IsTerminal;
+
+    use leveler_tui::{Theme, ThemeId, preview_theme};
+
+    let color = std::io::stdout().is_terminal();
+    let ids = match id.as_deref() {
+        None => vec![ThemeId::Dark, ThemeId::Light, ThemeId::HighContrast],
+        Some(raw) => {
+            let Some(parsed) = ThemeId::parse(raw) else {
+                anyhow::bail!(
+                    "unknown theme `{raw}`; expected auto | dark | light | high-contrast"
+                );
+            };
+            vec![parsed]
+        }
+    };
+    for (i, theme_id) in ids.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        print!("{}", preview_theme(&Theme::named(*theme_id), color));
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
 pub(crate) fn cmd_models_list(layout: Layout) -> anyhow::Result<std::process::ExitCode> {
     let app = Application::assemble(layout)?;
     let mut refs = app.model_refs();
@@ -114,6 +141,43 @@ pub(crate) async fn cmd_models_show(
         "  context:   {} (reliable {})",
         profile.limits.context_window, profile.limits.reliable_context
     );
+    println!();
+    println!("{}", Line::heading("Reasoning"));
+    if !profile.capabilities.reasoning {
+        println!("  capable:    false");
+    } else {
+        let resolved = leveler_model::resolve_reasoning_effort(None, &profile.reasoning);
+        let supported = if profile.reasoning.supported_efforts.is_empty() {
+            "(none)".to_string()
+        } else {
+            profile
+                .reasoning
+                .supported_efforts
+                .iter()
+                .map(|e| e.as_wire())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("  capable:    true");
+        println!("  style:      {:?}", profile.reasoning.style);
+        println!("  supported:  {supported}");
+        println!(
+            "  default:    {}",
+            profile
+                .reasoning
+                .default_effort
+                .map(|e| e.as_wire().to_string())
+                .unwrap_or_else(|| "n/a".into())
+        );
+        println!("  requested:  (none)");
+        println!(
+            "  effective:  {}",
+            resolved
+                .effective
+                .map(|e| e.as_wire().to_string())
+                .unwrap_or_else(|| "n/a".into())
+        );
+    }
     Ok(std::process::ExitCode::SUCCESS)
 }
 

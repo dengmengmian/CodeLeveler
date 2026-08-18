@@ -16,7 +16,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
@@ -31,8 +31,12 @@ pub use selection::{SelectionModel, SelectionOption, SelectionOutcome};
 pub enum Overlay {
     ModelPicker(Box<SelectionModel>),
     ModePicker(Box<SelectionModel>),
-    /// Named TUI palettes (`ion` / `night` / `day`).
+    /// Named TUI palettes (`auto` / `dark` / `light` / `high-contrast`).
     ThemePicker(Box<SelectionModel>),
+    /// `/work-mode` — economy / balanced / delivery.
+    WorkModePicker(Box<SelectionModel>),
+    /// `/collab` — chat / plan / goal.
+    CollabPicker(Box<SelectionModel>),
     Approval(Box<ApprovalOverlay>),
     /// The agent asked the user a question mid-task (spec §35).
     Clarification(Box<ClarificationOverlay>),
@@ -58,6 +62,8 @@ impl Overlay {
             Overlay::ModelPicker(_)
             | Overlay::ModePicker(_)
             | Overlay::ThemePicker(_)
+            | Overlay::WorkModePicker(_)
+            | Overlay::CollabPicker(_)
             | Overlay::CheckpointPicker(_) => None,
         }
     }
@@ -188,6 +194,8 @@ fn build_content(
         Overlay::ModelPicker(model)
         | Overlay::ModePicker(model)
         | Overlay::ThemePicker(model)
+        | Overlay::WorkModePicker(model)
+        | Overlay::CollabPicker(model)
         | Overlay::UnsupportedMedia(model)
         | Overlay::CheckpointPicker(model) => {
             let (lines, cursor) = selection_content(model, theme);
@@ -238,7 +246,7 @@ pub fn render_overlay(
     let [row] = Layout::vertical([Constraint::Length(h)])
         .flex(Flex::End)
         .areas(area);
-    frame.render_widget(Clear, row);
+    theme.paint_surface(frame, row, theme.surface.elevated);
     frame.render_widget(Paragraph::new(lines), row);
 }
 
@@ -250,14 +258,17 @@ fn clarification_content(
     lines.push(Line::from(Span::styled(
         "需要澄清",
         Style::default()
-            .fg(theme.accent)
+            .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(Span::raw(ov.request.question.clone())));
     lines.push(Line::from(""));
     for (i, opt) in ov.request.options.iter().enumerate() {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}. ", i + 1), Style::default().fg(theme.accent)),
+            Span::styled(
+                format!("  {}. ", i + 1),
+                Style::default().fg(theme.accent.primary),
+            ),
             Span::raw(opt.clone()),
         ]));
     }
@@ -267,7 +278,7 @@ fn clarification_content(
     let input_row = lines.len();
     let input_col = 2 + UnicodeWidthStr::width(ov.input());
     lines.push(Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.accent)),
+        Span::styled("› ", Style::default().fg(theme.accent.primary)),
         Span::raw(ov.input().to_string()),
     ]));
     lines.push(Line::from(""));
@@ -289,20 +300,20 @@ fn selection_content(
     lines.push(Line::from(Span::styled(
         model.title.clone(),
         Style::default()
-            .fg(theme.accent)
+            .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     )));
     if let Some(desc) = &model.description {
         lines.push(Line::from(Span::styled(
             desc.clone(),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
         lines.push(Line::from(""));
     }
     if model.is_searchable() {
         cursor = Some((lines.len(), 8 + UnicodeWidthStr::width(model.query())));
         lines.push(Line::from(vec![
-            Span::styled("Search: ", Style::default().fg(theme.muted)),
+            Span::styled("Search: ", Style::default().fg(theme.text.secondary)),
             Span::raw(model.query().to_string()),
         ]));
         lines.push(Line::from(""));
@@ -318,35 +329,38 @@ fn selection_content(
         let base = if opt.is_enabled() {
             if is_cursor {
                 Style::default()
-                    .fg(theme.accent)
+                    .fg(theme.accent.primary)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             }
         } else {
-            Style::default().fg(theme.muted)
+            Style::default().fg(theme.text.secondary)
         };
         let mut spans = vec![Span::styled(format!("{prefix}{number}{}", opt.label), base)];
         if opt.recommended {
             spans.push(Span::styled(
                 "  Recommended",
-                Style::default().fg(theme.success),
+                Style::default().fg(theme.status.success),
             ));
         }
         if opt.current {
-            spans.push(Span::styled(" 当前", Style::default().fg(theme.muted)));
+            spans.push(Span::styled(
+                " 当前",
+                Style::default().fg(theme.text.secondary),
+            ));
         }
         lines.push(Line::from(spans));
         if let Some(desc) = &opt.description {
             lines.push(Line::from(Span::styled(
                 format!("     {desc}"),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             )));
         }
         if let Some(reason) = &opt.disabled_reason {
             lines.push(Line::from(Span::styled(
                 format!("     × {reason}"),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             )));
         }
     }
@@ -376,7 +390,7 @@ fn approval_content(
     let mut spans = vec![Span::styled(
         head.clone(),
         Style::default()
-            .fg(theme.accent)
+            .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     )];
     let budget = width.saturating_sub(UnicodeWidthStr::width(head.as_str()) + 4);
@@ -403,7 +417,7 @@ fn approval_content(
     for risk in &req.risks {
         lines.push(Line::from(Span::styled(
             format!("  ⚠ {risk}"),
-            Style::default().fg(theme.warning),
+            Style::default().fg(theme.status.warning),
         )));
     }
     for (i, (label, is_cursor)) in ov.options().into_iter().enumerate() {
@@ -414,7 +428,9 @@ fn approval_content(
             let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 2);
             lines.push(Line::from(Span::styled(
                 format!("▸ {text}{}", " ".repeat(pad)),
-                Style::default().add_modifier(Modifier::REVERSED),
+                Style::default()
+                    .fg(theme.text.primary)
+                    .bg(theme.surface.selection),
             )));
         } else {
             lines.push(Line::from(Span::raw(format!("  {text}"))));
@@ -436,7 +452,7 @@ fn approval_content(
 fn help_line(theme: &Theme, text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     ))
 }
 

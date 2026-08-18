@@ -12,6 +12,8 @@ capabilities:
   reasoning: true
   vision: false
 reasoning:
+  # Always-on thinking (https://www.kimi.com/code/docs/kimi-code/models 2026-08-18).
+  # No effort knob; do not invent a CodeLeveler default.
   style: none
 limits:
   context_window: 262144

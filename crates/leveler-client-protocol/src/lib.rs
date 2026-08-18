@@ -66,7 +66,7 @@ pub use progress::{
 };
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, UiActiveToolCall, UiCheckpoint,
-    UiMessage, UiRole, UiSessionSnapshot, UiSessionSummary, UiUserShell,
+    UiMessage, UiReasoningState, UiRole, UiSessionSnapshot, UiSessionSummary, UiUserShell,
 };
 pub use version::{PROTOCOL_VERSION, ProtocolEnvelope, ProtocolError, ProtocolVersion};
 pub use wire_types::{ApprovalDecision, ApprovalPolicy, PermissionProfile};

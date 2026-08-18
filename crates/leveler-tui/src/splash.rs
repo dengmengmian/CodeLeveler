@@ -62,10 +62,10 @@ pub(crate) fn splash_lines(
 ) -> Vec<Line<'static>> {
     let width = width.max(24);
     let accent = Style::default()
-        .fg(theme.accent)
+        .fg(theme.accent.primary)
         .add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(theme.muted);
-    let border = Style::default().fg(theme.border);
+    let muted = Style::default().fg(theme.text.secondary);
+    let border = Style::default().fg(theme.border.normal);
 
     let logo_w = LOGO.iter().map(|r| disp_w(r)).max().unwrap_or(0);
     // Smallest box that still leaves a usable text column.
@@ -110,7 +110,7 @@ pub(crate) fn splash_lines(
     // the one command that changes that. Truncated to the column so the box
     // keeps its right-edge alignment.
     if !state.untrusted_config.is_empty() {
-        let warn = Style::default().fg(theme.warning);
+        let warn = Style::default().fg(theme.status.warning);
         right.push(Vec::new());
         right.push(vec![Span::styled(
             truncate_w(&format!("⚠ {}", t.untrusted_config_title), right_w),
@@ -230,9 +230,9 @@ fn fallback_centered(
     t: &UiText,
 ) -> Vec<Line<'static>> {
     let accent = Style::default()
-        .fg(theme.accent)
+        .fg(theme.accent.primary)
         .add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(theme.muted);
+    let muted = Style::default().fg(theme.text.secondary);
 
     let mut out = Vec::new();
     out.push(Line::from(""));
@@ -292,6 +292,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         )
     }

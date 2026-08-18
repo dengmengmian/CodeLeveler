@@ -4,7 +4,7 @@
 //!
 //! - **Header** (1 line): branch · repo path (muted; identity only)
 //! - **Status** (1 line): live activity only (empty when idle; toasts float)
-//! - **Input border**: model · permission (`auto` / `approve` / `full`)
+//! - **Input border**: `{model} [(effort)] · work-mode · permission · session`
 //! - **Footer** (1 line): runtime context only — `Context 8k/1M`
 //!
 //! Vertical breathing (workbench): blank above the input when status/queue/plan
@@ -79,15 +79,90 @@ fn streaming_output_estimate(state: &AppState) -> Option<u32> {
 }
 
 /// Permission mode label and color role (localized chrome, e.g. status screens).
-/// Stable English permission chip for the Input border (`model · auto`).
+/// Stable English permission chip for the Input border (`ask` / `auto` / `full`).
 ///
-/// Keeps the product surface short and language-neutral next to the model id.
+/// These are the user-facing names of [`PermissionProfile`], not inferred
+/// aliases. There is no standing `deny` profile.
 pub(crate) fn permission_chip_label(state: &AppState) -> &'static str {
     match state.mode_label.as_str() {
-        "RequestApproval" => "approve",
+        "RequestApproval" => "ask",
         "FullAccess" => "full",
         _ => "auto",
     }
+}
+
+/// Strip `provider/` when the model name is unambiguous among `available`.
+pub(crate) fn friendly_model_label(
+    raw: &str,
+    available: &[leveler_client_protocol::ModelRef],
+) -> String {
+    let Some(parsed) = leveler_client_protocol::ModelRef::parse(raw) else {
+        return raw.to_string();
+    };
+    let collisions = available.iter().filter(|m| m.model == parsed.model).count();
+    if collisions > 1 {
+        raw.to_string()
+    } else {
+        parsed.model
+    }
+}
+
+/// Input-border runtime summary: `{model} [(effort)] · work · perm · session`.
+///
+/// Every field is a value already on [`AppState`]. Missing `reasoning_effort`
+/// omits the parentheses. When `max_width` is tight, drop from the right:
+/// session, then permission, then work_mode, then effort, then truncate model.
+pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String {
+    let model = friendly_model_label(&state.model_label, &state.available_models);
+    let effort = state
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let perm = permission_chip_label(state);
+    let untrusted = (!state.untrusted_config.is_empty()).then_some(state.t().untrusted_config_chip);
+
+    let mut extras: Vec<String> = Vec::new();
+    extras.push(state.work_profile.clone());
+    extras.push(perm.to_string());
+    extras.push(state.collaboration.clone());
+    if let Some(u) = untrusted {
+        extras.push(u.to_string());
+    }
+
+    let join = |head: &str, extra: &[String]| -> String {
+        let mut parts = Vec::with_capacity(1 + extra.len());
+        if !head.is_empty() {
+            parts.push(head.to_string());
+        }
+        parts.extend(extra.iter().cloned());
+        parts.join(" · ")
+    };
+
+    let head = match effort {
+        Some(e) => format!("{model} ({e})"),
+        None => model.clone(),
+    };
+    let mut shown = extras;
+    loop {
+        let chip = join(&head, &shown);
+        if UnicodeWidthStr::width(chip.as_str()) <= max_width || shown.is_empty() {
+            if UnicodeWidthStr::width(chip.as_str()) <= max_width {
+                return chip;
+            }
+            break;
+        }
+        shown.pop();
+    }
+
+    // Drop effort next, then width-safe truncate the model name.
+    if effort.is_some() {
+        let chip = join(&model, &[]);
+        if UnicodeWidthStr::width(chip.as_str()) <= max_width {
+            return chip;
+        }
+    }
+    crate::render::truncate_display(&model, max_width.max(1))
 }
 
 /// Compact magnitude for footer context: `41181 → 41k`, `1048576 → 1M`.
@@ -239,6 +314,8 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             crate::overlay::Overlay::ModelPicker(_)
             | crate::overlay::Overlay::ModePicker(_)
             | crate::overlay::Overlay::ThemePicker(_)
+            | crate::overlay::Overlay::WorkModePicker(_)
+            | crate::overlay::Overlay::CollabPicker(_)
             | crate::overlay::Overlay::UnsupportedMedia(_)
             | crate::overlay::Overlay::CheckpointPicker(_) => {
                 return StatusPhase::AwaitingUser;
@@ -260,7 +337,7 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
                 if matches!(overlay, crate::overlay::Overlay::Clarification(_)) {
                     return turn_marker(
                         state.t().waiting_reply.to_string(),
-                        theme.accent,
+                        theme.accent.primary,
                         width,
                         state,
                     );
@@ -268,7 +345,10 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
                 // Interrupting overlays: static waiting copy, no spinner.
                 // Pickers return None and fall through to the normal strip.
                 if let Some(hint) = overlay.status_hint(state.t()) {
-                    return Line::from(Span::styled(hint, Style::default().fg(theme.warning)));
+                    return Line::from(Span::styled(
+                        hint,
+                        Style::default().fg(theme.status.warning),
+                    ));
                 }
             }
         }
@@ -315,17 +395,17 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
                 Span::styled(
                     frame.to_string(),
                     Style::default()
-                        .fg(theme.accent)
+                        .fg(theme.accent.primary)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(rest.to_string(), Style::default().fg(theme.muted)),
+                Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
             ])
         }
         RuntimeStatus::Error | RuntimeStatus::Idle => {
             if let Some(label) = &state.activity {
                 Line::from(Span::styled(
                     format!("… {label}"),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.text.secondary),
                 ))
             } else {
                 Line::from("")
@@ -368,7 +448,7 @@ pub(crate) fn header_line(state: &AppState, width: usize) -> Line<'static> {
 
     Line::from(Span::styled(
         truncate_to_width(&text, width),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     ))
 }
 
@@ -389,6 +469,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         )
     }
@@ -469,9 +550,71 @@ mod tests {
         state.mode_label = "Assisted".into();
         assert_eq!(permission_chip_label(&state), "auto");
         state.mode_label = "RequestApproval".into();
-        assert_eq!(permission_chip_label(&state), "approve");
+        assert_eq!(permission_chip_label(&state), "ask");
         state.mode_label = "FullAccess".into();
         assert_eq!(permission_chip_label(&state), "full");
+    }
+
+    #[test]
+    fn runtime_chip_strips_provider_and_shows_effort() {
+        let mut state = test_state();
+        state.model_label = "deepseek/deepseek-v4-flash".into();
+        state.reasoning_effort = Some("max".into());
+        state.work_profile = "balanced".into();
+        state.mode_label = "RequestApproval".into();
+        state.collaboration = "chat".into();
+        assert_eq!(
+            runtime_status_chip(&state, 80),
+            "deepseek-v4-flash (max) · balanced · ask · chat"
+        );
+    }
+
+    #[test]
+    fn runtime_chip_omits_effort_when_unset() {
+        let mut state = test_state();
+        state.model_label = "deepseek/deepseek-v4-flash".into();
+        state.reasoning_effort = None;
+        state.work_profile = "balanced".into();
+        state.mode_label = "RequestApproval".into();
+        state.collaboration = "chat".into();
+        let chip = runtime_status_chip(&state, 80);
+        assert_eq!(chip, "deepseek-v4-flash · balanced · ask · chat");
+        assert!(!chip.contains('('), "{chip}");
+    }
+
+    #[test]
+    fn runtime_chip_keeps_provider_when_model_names_collide() {
+        let mut state = test_state();
+        state.model_label = "openai/gpt-5".into();
+        state.available_models = vec![
+            leveler_client_protocol::ModelRef::parse("openai/gpt-5").unwrap(),
+            leveler_client_protocol::ModelRef::parse("azure/gpt-5").unwrap(),
+        ];
+        state.work_profile = "balanced".into();
+        state.mode_label = "Assisted".into();
+        state.collaboration = "chat".into();
+        assert!(
+            runtime_status_chip(&state, 80).starts_with("openai/gpt-5"),
+            "{}",
+            runtime_status_chip(&state, 80)
+        );
+    }
+
+    #[test]
+    fn runtime_chip_drops_low_priority_fields_when_narrow() {
+        let mut state = test_state();
+        state.model_label = "deepseek/deepseek-v4-flash".into();
+        state.reasoning_effort = Some("max".into());
+        state.work_profile = "balanced".into();
+        state.mode_label = "RequestApproval".into();
+        state.collaboration = "chat".into();
+        let mid = runtime_status_chip(&state, 36);
+        assert!(mid.contains("deepseek-v4-flash"), "{mid}");
+        assert!(mid.contains("balanced"), "{mid}");
+        assert!(!mid.contains("chat"), "session is dropped first: {mid}");
+        let tight = runtime_status_chip(&state, 22);
+        assert!(tight.contains("deepseek-v4-flash"), "{tight}");
+        assert!(!tight.contains("balanced"), "{tight}");
     }
 
     #[test]

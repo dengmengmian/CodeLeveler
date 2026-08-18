@@ -178,7 +178,10 @@ fn render_inline<F>(
 {
     for idx in 0..line_count {
         for row in line_render(idx) {
-            let mut spans = vec![Span::styled("  ", Style::default().fg(theme.muted))];
+            let mut spans = vec![Span::styled(
+                "  ",
+                Style::default().fg(theme.text.secondary),
+            )];
             spans.extend(row);
             out.push(Line::from(spans));
         }
@@ -202,11 +205,11 @@ fn render_container<F>(
         .or_else(|| lang.map(|l| l.to_string()))
         .unwrap_or_else(|| "code".to_string());
     out.push(Line::from(vec![
-        Span::styled("· ", Style::default().fg(theme.border)),
+        Span::styled("· ", Style::default().fg(theme.border.normal)),
         Span::styled(
             truncate_display(&header, width.saturating_sub(2).max(4)),
             Style::default()
-                .fg(theme.muted)
+                .fg(theme.text.secondary)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -224,7 +227,8 @@ fn render_container<F>(
                         if body_rows >= CODE_BLOCK_MAX_BODY {
                             break;
                         }
-                        let mut spans = vec![Span::styled("  ", Style::default().fg(theme.border))];
+                        let mut spans =
+                            vec![Span::styled("  ", Style::default().fg(theme.border.normal))];
                         spans.extend(row);
                         out.push(Line::from(spans));
                         body_rows += 1;
@@ -233,10 +237,10 @@ fn render_container<F>(
             }
             FoldPart::Omitted { count } => {
                 out.push(Line::from(vec![
-                    Span::styled("  ", Style::default().fg(theme.border)),
+                    Span::styled("  ", Style::default().fg(theme.border.normal)),
                     Span::styled(
                         format!("⋮ {count} lines omitted"),
-                        Style::default().fg(theme.dim),
+                        Style::default().fg(theme.text.muted),
                     ),
                 ]));
             }
@@ -252,9 +256,9 @@ pub fn tone_code_rgb(rgb: (u8, u8, u8), theme: &Theme) -> Style {
     let chroma = max - min;
     let lum = (r as u16 + g as u16 + b as u16) / 3;
     let fg = if chroma > 40 || lum > 160 {
-        theme.text
+        theme.text.primary
     } else {
-        theme.muted
+        theme.text.secondary
     };
     Style::default().fg(fg)
 }

@@ -125,6 +125,8 @@ pub enum ConfigError {
         key: String,
         reason: String,
     },
+    #[error("config file {path} has invalid reasoning config: {reason}")]
+    InvalidReasoning { path: String, reason: String },
 }
 
 /// Expand `${VAR}` and `${VAR:-default}` references in a string using a lookup

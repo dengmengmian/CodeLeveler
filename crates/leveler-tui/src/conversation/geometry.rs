@@ -6,7 +6,36 @@
 //! the reducer both call THESE functions; neither keeps its own copy of a
 //! formula.
 
+use ratatui::layout::Rect;
+
 use crate::state::AppState;
+
+/// Horizontal safe margin on each side of the Conversation viewport.
+/// Same token as the rest of the workbench (`WORKSPACE_GUTTER_X`).
+pub const GUTTER_X: u16 = crate::layout::WORKSPACE_GUTTER_X;
+pub const PADDING_TOP: u16 = crate::layout::CONVERSATION_PADDING_TOP;
+pub const PADDING_BOTTOM: u16 = crate::layout::CONVERSATION_PADDING_BOTTOM;
+
+/// Scrollable content rect inside the Conversation outer slot.
+/// Horizontal [`GUTTER_X`] plus one row above and below — wrap, paint, and
+/// hit-testing all use this same rect.
+pub fn content_rect(outer: Rect) -> Rect {
+    let inner = crate::layout::horizontal_inset(outer, GUTTER_X);
+    let height = inner
+        .height
+        .saturating_sub(PADDING_TOP.saturating_add(PADDING_BOTTOM));
+    let y = if height == 0 {
+        inner.y
+    } else {
+        inner.y.saturating_add(PADDING_TOP)
+    };
+    Rect {
+        x: inner.x,
+        y,
+        width: inner.width,
+        height,
+    }
+}
 
 /// Content width for layout, wrapping, and selection. Must match the painted
 /// viewport (`conv.rect`), not the full terminal width — a mismatch re-wraps
@@ -18,7 +47,13 @@ pub fn content_width(state: &AppState) -> usize {
         .rect
         .map(|(_, _, w, _)| w as usize)
         .filter(|w| *w > 0)
-        .unwrap_or_else(|| state.size.0.max(1) as usize)
+        .unwrap_or_else(|| {
+            state
+                .size
+                .0
+                .saturating_sub(GUTTER_X.saturating_mul(2))
+                .max(1) as usize
+        })
 }
 
 /// Viewport height in rows, from the authoritative painted rect. The
@@ -27,7 +62,12 @@ pub fn viewport_height(state: &AppState) -> usize {
     if let Some((_, _, _, rh)) = state.conv.rect {
         rh.max(1) as usize
     } else {
-        state.size.1.saturating_sub(12).max(3) as usize
+        state
+            .size
+            .1
+            .saturating_sub(12)
+            .saturating_sub(PADDING_TOP.saturating_add(PADDING_BOTTOM))
+            .max(3) as usize
     }
 }
 
@@ -122,6 +162,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         );
         s.size = (80, 40);
@@ -148,6 +189,68 @@ mod tests {
                 mapped.row, content_row,
                 "{label}: painted content row {content_row} at screen row {screen_row} \
                  must map back to itself"
+            );
+        }
+    }
+
+    #[test]
+    fn content_rect_insets_two_cells_each_side() {
+        let outer = Rect {
+            x: 10,
+            y: 5,
+            width: 100,
+            height: 20,
+        };
+        let inner = content_rect(outer);
+        assert_eq!(inner.x, 12);
+        assert_eq!(inner.width, 96);
+        assert_eq!(inner.y, 6);
+        assert_eq!(inner.height, 18);
+    }
+
+    #[test]
+    fn content_rect_applies_vertical_safe_area() {
+        let outer = Rect {
+            x: 10,
+            y: 5,
+            width: 100,
+            height: 20,
+        };
+        let inner = content_rect(outer);
+        assert_eq!(inner.y, outer.y + PADDING_TOP);
+        assert_eq!(inner.height, outer.height - PADDING_TOP - PADDING_BOTTOM);
+    }
+
+    #[test]
+    fn content_rect_narrow_widths_do_not_underflow() {
+        for w in [0u16, 1, 2, 3, 4] {
+            let outer = Rect {
+                x: 3,
+                y: 1,
+                width: w,
+                height: 10,
+            };
+            let inner = content_rect(outer);
+            let outer_right = outer.x.saturating_add(outer.width);
+            let inner_right = inner.x.saturating_add(inner.width);
+            assert!(
+                inner_right <= outer_right || w == 0,
+                "w={w}: inner {inner:?} overflows outer {outer:?}"
+            );
+        }
+        for h in [0u16, 1, 2, 3, 4] {
+            let outer = Rect {
+                x: 3,
+                y: 1,
+                width: 20,
+                height: h,
+            };
+            let inner = content_rect(outer);
+            let outer_bottom = outer.y.saturating_add(outer.height);
+            let inner_bottom = inner.y.saturating_add(inner.height);
+            assert!(
+                inner_bottom <= outer_bottom || h == 0,
+                "h={h}: inner {inner:?} overflows outer {outer:?}"
             );
         }
     }

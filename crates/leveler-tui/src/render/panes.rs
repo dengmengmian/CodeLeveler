@@ -16,7 +16,7 @@ pub(crate) fn render_scrolled(
 ) {
     let max = lines.len().saturating_sub(area.height as usize);
     let scroll = state.screen_scroll.min(max);
-    render_pane_filled(frame, area, lines, scroll);
+    render_pane_filled(frame, area, lines, scroll, &state.theme);
 }
 
 /// The scroll offset that keeps line `focus` visible in an `area_h`-tall pane
@@ -34,16 +34,23 @@ pub(crate) fn render_list_focused(
     area: Rect,
     lines: Vec<Line<'static>>,
     focus: usize,
+    theme: &crate::theme::Theme,
 ) {
     let offset = list_scroll_offset(lines.len(), area.height as usize, focus);
-    render_pane_filled(frame, area, lines, offset);
+    render_pane_filled(frame, area, lines, offset, theme);
 }
 
 /// Paint a scrollable pane by materialising every visible row (padded to the
 /// full width). Paragraph alone only writes glyphs, so shorter content can leave
 /// previous frame tails if Clear is skipped or cells get out of sync; filling
 /// each row forces a complete overwrite of the viewport.
-fn render_pane_filled(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, scroll: usize) {
+fn render_pane_filled(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    scroll: usize,
+    theme: &crate::theme::Theme,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -57,7 +64,7 @@ fn render_pane_filled(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, 
             .unwrap_or_else(|| Line::from(""));
         visible.push(pad_line_to_width(line, width));
     }
-    frame.render_widget(ratatui::widgets::Clear, area);
+    theme.paint_canvas(frame, area);
     frame.render_widget(Paragraph::new(visible), area);
 }
 

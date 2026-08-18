@@ -163,7 +163,7 @@ pub fn apply_selection_highlight(
         return line;
     }
 
-    let sel_bg = theme.border;
+    let sel_bg = theme.surface.selection;
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
     for span in line.spans {
@@ -210,11 +210,8 @@ pub fn apply_selection_highlight(
         }
         if !mid.is_empty() {
             // Background only: keep fg from original style so glyphs don't reflow.
-            let mut mid_style = style.bg(sel_bg);
-            // Ensure selected text stays readable if fg was default/dark.
-            if mid_style.fg.is_none() {
-                mid_style = mid_style.fg(theme.text);
-            }
+            // Explicit pair: never inherit a fg that collides with selection.
+            let mid_style = style.bg(sel_bg).fg(theme.text.primary);
             out.push(Span::styled(mid, mid_style));
         }
         if !after.is_empty() {
@@ -310,6 +307,29 @@ mod tests {
                 .intersects(ratatui::style::Modifier::BOLD)),
             "selection must not add BOLD: {out:?}"
         );
+    }
+
+    #[test]
+    fn named_themes_select_with_the_readable_pair() {
+        for theme in [Theme::dark(), Theme::light(), Theme::high_contrast()] {
+            let line = Line::from(Span::styled(
+                "selected",
+                Style::default().fg(theme.text.muted),
+            ));
+            let mut sel = TextSelection::default();
+            sel.begin(TextPos { row: 0, col: 0 });
+            sel.extend(TextPos { row: 0, col: 8 });
+            let out = apply_selection_highlight(line, 0, &sel, &theme);
+            assert!(
+                out.spans.iter().any(|s| {
+                    s.content.as_ref() == "selected"
+                        && s.style.bg == Some(theme.surface.selection)
+                        && s.style.fg == Some(theme.text.primary)
+                }),
+                "{:?} selection pair: {out:?}",
+                theme.id
+            );
+        }
     }
 
     #[test]

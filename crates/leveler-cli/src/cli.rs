@@ -144,6 +144,10 @@ pub enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
+    /// Inspect TUI semantic themes (preview palettes; no live session).
+    #[command(subcommand)]
+    Theme(ThemeCommand),
+
     /// Manage configured models.
     #[command(subcommand)]
     Models(ModelsCommand),
@@ -618,6 +622,18 @@ pub enum RunMode {
 pub enum ConfigCommand {
     /// Show the resolved configuration (secrets are never printed).
     Show,
+}
+
+/// TUI theme inspection.
+#[derive(Debug, Subcommand)]
+pub enum ThemeCommand {
+    /// Print a semantic-token preview. Omit the id to show dark, light, and
+    /// high-contrast.
+    Preview {
+        /// Palette: auto | dark | light | high-contrast
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

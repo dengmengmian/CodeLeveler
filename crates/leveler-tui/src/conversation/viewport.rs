@@ -13,8 +13,9 @@ use crate::state::AppState;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = &state.theme;
-    let width = area.width as usize;
-    let height = area.height as usize;
+    let content = crate::conversation::geometry::content_rect(area);
+    let width = content.width as usize;
+    let height = content.height as usize;
     if height == 0 || width == 0 {
         state.conv.rect = None;
         state.conv.scroll_bottom_rect = None;
@@ -76,10 +77,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         lines = padded;
     }
 
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(
+        Paragraph::new(lines).style(
+            Style::default()
+                .bg(theme.surface.canvas)
+                .fg(theme.text.primary),
+        ),
+        content,
+    );
 
-    // Mouse hit-testing for next events.
-    state.conv.rect = Some((area.x, area.y, area.width, area.height));
+    // Published rect is the content area (after gutter) so wrap width,
+    // selection columns, and hit-testing share one coordinate system.
+    state.conv.rect = Some((content.x, content.y, content.width, content.height));
 
     // Scroll-to-bottom affordance: only when pinned away from live edge.
     // Hide while selecting/copying so the badge cannot cover or steal mouse
@@ -108,8 +117,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Paragraph::new(Span::styled(
                 hint,
                 Style::default()
-                    .fg(theme.accent)
-                    .bg(theme.code_bg)
+                    .fg(theme.accent.primary)
+                    .bg(theme.surface.elevated)
                     .add_modifier(Modifier::BOLD),
             )),
             btn,

@@ -420,6 +420,7 @@ pub(crate) async fn cmd_tui(
             .as_deref()
             .map(crate::common::parse_model_ref)
             .transpose()?;
+        let model_key = model.as_ref().map(|m| m.to_string());
         let client = Arc::new(client);
         let (session_id, context_window) = if let Some(id) = session.as_deref() {
             let session_id = leveler_core::SessionId::new(id);
@@ -484,6 +485,9 @@ pub(crate) async fn cmd_tui(
             (bootstrap.session.id, bootstrap.context_window)
         };
         let global = leveler_app::GlobalConfig::load()?;
+        let effort_key = model_key
+            .or_else(|| global.default_model.clone())
+            .unwrap_or_default();
         let boot = leveler_tui::Boot {
             session_id,
             user: std::env::var("USER").unwrap_or_else(|_| "there".to_string()),
@@ -495,6 +499,7 @@ pub(crate) async fn cmd_tui(
             context_window,
             locale: leveler_tui::Locale::resolve(global.lang.as_deref()),
             untrusted_config: crate::trust_cmds::untrusted_config_display(&layout.repo_root),
+            reasoning_effort: global.reasoning_effort_for(&effort_key),
         };
         // A phone can be served over this connection.
         //
@@ -626,6 +631,15 @@ pub(crate) async fn cmd_tui(
         // LEVELER_LANG → ~/.leveler/config.toml lang → system → zh.
         locale: leveler_tui::Locale::resolve(app.config.lang.as_deref()),
         untrusted_config: crate::trust_cmds::untrusted_config_display(&app.layout.repo_root),
+        reasoning_effort: app
+            .config
+            .models
+            .iter()
+            .find(|m| m.profile.id == model_ref.model && m.profile.provider == model_ref.provider)
+            .and_then(|m| {
+                leveler_model::resolve_reasoning_effort(None, &m.profile.reasoning).effective
+            })
+            .map(|e| e.as_wire().to_string()),
     };
 
     // `/remote`: the agent serves paired phones over this same in-process

@@ -32,7 +32,7 @@
 #     max_parallel_tool_calls = 1
 #     reasoning = true              # model can reason (drives UI rendering)
 #     reasoning_style = "thinking_flag"   # HOW to ask for it — see below
-#     reasoning_effort = "high"     # official default
+#     reasoning_effort = "max"      # CodeLeveler default (provider default is high)
 #     # pricing is USD/MTok (CNY list price ÷ ~7.2; input = cache-miss):
 #     # pricing = { input_usd_per_mtok = 0.4167, output_usd_per_mtok = 0.8333 }
 #
@@ -103,13 +103,16 @@ capabilities:
   vision: false
 # How to spell a reasoning request on the wire. Omit the block entirely and we
 # send no reasoning field at all (safe for providers that reject them).
-#   style: none          — send nothing (default)
-#   style: openai_effort — top-level `reasoning_effort: "high"`
-#   style: thinking_flag — `thinking: {"type": "enabled"}` (+ effort), DeepSeek/GLM
-# effort: minimal | low | medium | high | max. Omit → the provider's default.
+#   style: none            — send nothing (always-on / no knob)
+#   style: open_ai_effort  — top-level `reasoning_effort` (alias: openai_effort)
+#   style: thinking_flag   — `thinking: {"type": "enabled"}` (+ effort)
+# `supported_efforts` is capability. `default_effort` is the CodeLeveler default
+# (alias: `effort`). It is NOT the provider default — do not invent a vendor
+# default here. Built-in reasoning models must set both.
 reasoning:
   style: thinking_flag
-  effort: high               # DeepSeek default
+  supported_efforts: [low, high, max]
+  default_effort: max        # CodeLeveler default; DeepSeek's own default is high
 limits:
   context_window: 1048576    # hard window (DeepSeek v4 = 1M)
   reliable_context: 786432   # auto-compaction threshold

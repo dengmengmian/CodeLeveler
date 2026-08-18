@@ -6,7 +6,7 @@ use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
     ApprovalDecision, ApprovalId, ClientCommand, MessageId, PermissionProfile, RuntimeEvent,
     RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest, UiCheckpoint,
-    UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiRole, UiSessionSnapshot,
+    UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiReasoningState, UiRole, UiSessionSnapshot,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::overlay::Overlay;
@@ -53,6 +53,7 @@ fn state() -> AppState {
             context_window: 0,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
+            reasoning_effort: None,
         },
     )
 }
@@ -81,6 +82,7 @@ fn snapshot() -> UiSessionSnapshot {
         checkpoints: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
+        reasoning: None,
     }
 }
 
@@ -112,6 +114,47 @@ fn session_opened_sets_labels_without_welcome_card() {
         s.transcript.is_empty(),
         "no welcome card or other blocks may be injected on open"
     );
+}
+
+#[test]
+fn session_updated_copies_effective_reasoning_from_snapshot() {
+    let mut s = state();
+    s.reasoning_effort = Some("low".into());
+    let mut snap = snapshot();
+    snap.reasoning = Some(UiReasoningState {
+        effective: Some("max".into()),
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
+    );
+    assert_eq!(s.reasoning_effort.as_deref(), Some("max"));
+}
+
+#[test]
+fn session_updated_without_reasoning_keeps_boot_effort() {
+    let mut s = state();
+    s.reasoning_effort = Some("max".into());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated {
+            session: snapshot(),
+        }),
+    );
+    assert_eq!(s.reasoning_effort.as_deref(), Some("max"));
+}
+
+#[test]
+fn session_updated_clears_effort_when_runtime_says_none() {
+    let mut s = state();
+    s.reasoning_effort = Some("max".into());
+    let mut snap = snapshot();
+    snap.reasoning = Some(UiReasoningState { effective: None });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
+    );
+    assert_eq!(s.reasoning_effort, None);
 }
 
 #[test]
@@ -2282,18 +2325,18 @@ fn slash_theme_opens_picker_and_named_arg_sets() {
         matches!(s.overlay, Some(Overlay::ThemePicker(_))),
         "bare /theme opens the theme picker"
     );
-    // Cursor starts on current (day); Down → ion, Enter confirms.
+    // Cursor starts on current (auto); Down → dark, Enter confirms.
     reduce(&mut s, key(KeyCode::Down));
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.theme.id, ThemeId::Ion);
+    assert_eq!(s.theme.id, ThemeId::Dark);
     assert!(s.overlay.is_none());
-    typed(&mut s, "/theme day");
+    typed(&mut s, "/theme light");
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.theme.id, ThemeId::Day);
-    assert!(!s.dark, "day theme clears the dark flag");
-    typed(&mut s, "/theme ion");
+    assert_eq!(s.theme.id, ThemeId::Light);
+    assert!(!s.dark, "light theme clears the dark flag");
+    typed(&mut s, "/theme dark");
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.theme.id, ThemeId::Ion, "an explicit choice still wins");
+    assert_eq!(s.theme.id, ThemeId::Dark);
 }
 
 #[test]
@@ -2691,6 +2734,89 @@ fn slash_work_mode_sends_product_axes() {
         )),
         "effects={effects:?}"
     );
+}
+
+#[test]
+fn bare_work_mode_opens_picker_on_current_value() {
+    let mut s = opened();
+    assert_eq!(s.work_profile, "balanced");
+    typed(&mut s, "/work-mode");
+    reduce(&mut s, key(KeyCode::Enter));
+    let Some(Overlay::WorkModePicker(model)) = &s.overlay else {
+        panic!(
+            "bare /work-mode must open the shared picker, got {:?}",
+            s.overlay
+        );
+    };
+    let focused = model
+        .visible_rows()
+        .into_iter()
+        .find(|(_, _, on)| *on)
+        .map(|(_, o, _)| o.key.as_str());
+    assert_eq!(focused, Some("balanced"));
+}
+
+#[test]
+fn work_mode_picker_enter_applies_and_updates_state() {
+    let mut s = opened();
+    typed(&mut s, "/work-mode");
+    reduce(&mut s, key(KeyCode::Enter));
+    // Options: balanced, economy, delivery — Down twice lands on delivery.
+    reduce(&mut s, key(KeyCode::Down));
+    reduce(&mut s, key(KeyCode::Down));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.work_profile, "delivery");
+    assert!(s.overlay.is_none());
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Send(ClientCommand::SetProductAxes {
+                work_profile,
+                ..
+            }) if work_profile == "delivery"
+        )),
+        "effects={effects:?}"
+    );
+}
+
+#[test]
+fn work_mode_picker_esc_returns_to_input() {
+    let mut s = opened();
+    typed(&mut s, "/work-mode");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(matches!(s.overlay, Some(Overlay::WorkModePicker(_))));
+    reduce(&mut s, key(KeyCode::Esc));
+    assert!(s.overlay.is_none());
+    assert_eq!(s.work_profile, "balanced", "Esc must not apply a mode");
+}
+
+#[test]
+fn bare_collab_opens_picker() {
+    let mut s = opened();
+    typed(&mut s, "/collab");
+    reduce(&mut s, key(KeyCode::Enter));
+    let Some(Overlay::CollabPicker(model)) = &s.overlay else {
+        panic!("bare /collab must open the picker, got {:?}", s.overlay);
+    };
+    let focused = model
+        .visible_rows()
+        .into_iter()
+        .find(|(_, _, on)| *on)
+        .map(|(_, o, _)| o.key.as_str());
+    assert_eq!(focused, Some("chat"));
+}
+
+#[test]
+fn permission_picker_selects_ask_and_updates_chip() {
+    let mut s = opened();
+    typed(&mut s, "/permission");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(matches!(s.overlay, Some(Overlay::ModePicker(_))));
+    // Default assisted=auto; first row is ask (request_approval).
+    reduce(&mut s, key(KeyCode::Up));
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.mode, PermissionProfile::RequestApproval);
+    assert_eq!(s.mode_label, "RequestApproval");
 }
 
 #[test]

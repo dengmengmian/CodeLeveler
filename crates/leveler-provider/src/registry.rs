@@ -143,7 +143,7 @@ impl ProviderRegistry {
             model_id: profile.model_id.clone(),
             api_key: provider.api_key.clone(),
             extra_headers: Vec::new(),
-            reasoning: profile.reasoning,
+            reasoning: profile.reasoning.clone(),
             parallel_tool_calls: profile.capabilities.parallel_tool_calls,
             supports_temperature: profile.compatibility.supports_temperature,
             thinking_supports_forced_tool_choice: profile

@@ -7,6 +7,28 @@ All notable changes to CodeLeveler are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- Reasoning effort is resolved in one place: model `supported_efforts` +
+  CodeLeveler `default_effort`, then user override, then upward-or-clamp
+  normalization. Protocol adapters encode the effective value only.
+- Input-border status is `{model} [(effort)] · work-mode · permission · session`.
+  The model drops the provider prefix unless names collide; reasoning effort
+  is the runtime-projected **effective** value, never a TUI guess.
+- A bare `/` popup lists only Quick commands (about a dozen everyday
+  entries). The rest stay typed-prefix searchable; `/help` still lists all.
+- Slash commands with a fixed option set (`/work-mode`, `/collab`, plus the
+  existing `/model` `/permission` `/theme` pickers) open the shared selector
+  instead of showing CLI-style arguments. The input chip is now
+  `model · work-mode · permission · session`.
+- `/feature-dev` popup label is now the capability name (功能实现 /
+  feature implementation), not the skill's workflow description.
+- Slash-command popup rows are laid out in terminal cells (command column +
+  gap + clipped description). Conversation CJK underneath is cleared so
+  descriptions no longer lose every ideograph after the first.
+- TUI themes are a semantic token system (`surface` / `text` / `border` /
+  `accent` / `status` / `diff`) with an opaque canvas. Body text is no longer
+  `Color::Reset`, so readability does not depend on the terminal profile.
+  Default id is `auto` (detect polarity, then load Dark or Light).
+  Wire values are `auto` / `dark` / `light` / `high-contrast` only.
 - Executor plan gate (C2.3A): a missing structured plan no longer strips
   navigation tools or forces `ToolChoice=update_plan` after explore rounds.
   Multi-step tasks still require `update_plan` before mutations; after a few
@@ -26,6 +48,13 @@ All notable changes to CodeLeveler are documented here. The format follows
   cannot grant itself hooks or standing permissions. Reads are unchanged.
 
 ### Added
+- Built-in reasoning profiles now declare `supported_efforts` and a
+  CodeLeveler `default_effort` (distinct from the provider default).
+  `leveler models show` / `leveler doctor` print the resolved matrix.
+  CI fails if a reasoning builtin forgets either field (always-on no-knob
+  models use `style: none` instead of inventing a level).
+- TUI themes `auto`, `dark`, `light`, and `high-contrast`, with automated
+  contrast-ratio gates in CI and `leveler theme preview`.
 - `leveler trust` (`allow [--yes]` / `show` / `revoke`) to manage in-repo
   configuration trust per repository.
 - TUI surfaces ignored in-repo config directly: the empty-session splash names

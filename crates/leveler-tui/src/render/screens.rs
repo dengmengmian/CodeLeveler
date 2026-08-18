@@ -19,19 +19,22 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
     let mut lines: Vec<Line> = vec![screen_title(t.help_title, theme), Line::from("")];
     lines.push(Line::from(Span::styled(
         t.help_commands.to_string(),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     for (cat, cmds) in crate::screen::slash_commands_grouped(t) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!("  {}", crate::screen::category_label(cat, t)),
             Style::default()
-                .fg(theme.muted)
+                .fg(theme.text.secondary)
                 .add_modifier(Modifier::BOLD),
         )));
         for (name, desc) in cmds {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {name:<14}"), Style::default().fg(theme.accent)),
+                Span::styled(
+                    format!("  {name:<14}"),
+                    Style::default().fg(theme.accent.primary),
+                ),
                 Span::raw(desc.to_string()),
             ]));
         }
@@ -60,18 +63,21 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
     ];
     lines.push(Line::from(Span::styled(
         t.help_keys.to_string(),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     for (k, d) in keys {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<20}"), Style::default().fg(theme.accent)),
+            Span::styled(
+                format!("  {k:<20}"),
+                Style::default().fg(theme.accent.primary),
+            ),
             Span::raw(d.to_string()),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         t.help_scroll.to_string(),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     render_scrolled(frame, area, state, lines);
 }
@@ -80,7 +86,7 @@ pub(crate) fn screen_title(title: &str, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         title.to_string(),
         Style::default()
-            .fg(theme.accent)
+            .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -92,10 +98,10 @@ pub(super) fn render_verification_screen(frame: &mut Frame, area: Rect, state: &
         Some(v) if !v.checks.is_empty() => {
             for check in &v.checks {
                 let (glyph, color) = match check.status {
-                    CheckState::Passed => ("✓", theme.success),
-                    CheckState::Failed => ("✗", theme.error),
-                    CheckState::Skipped => ("○", theme.muted),
-                    CheckState::Running => ("●", theme.accent),
+                    CheckState::Passed => ("✓", theme.status.success),
+                    CheckState::Failed => ("✗", theme.status.error),
+                    CheckState::Skipped => ("○", theme.text.secondary),
+                    CheckState::Running => ("●", theme.accent.primary),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!("{glyph} "), Style::default().fg(color)),
@@ -108,7 +114,7 @@ pub(super) fn render_verification_screen(frame: &mut Frame, area: Rect, state: &
                     {
                         lines.push(Line::from(Span::styled(
                             format!("    {line}"),
-                            Style::default().fg(theme.muted),
+                            Style::default().fg(theme.text.secondary),
                         )));
                     }
                 }
@@ -116,22 +122,22 @@ pub(super) fn render_verification_screen(frame: &mut Frame, area: Rect, state: &
             if let Some(passed) = v.passed {
                 lines.push(Line::from(""));
                 let (t, c) = if passed {
-                    ("验证通过", theme.success)
+                    ("验证通过", theme.status.success)
                 } else {
-                    ("验证失败", theme.error)
+                    ("验证失败", theme.status.error)
                 };
                 lines.push(Line::from(Span::styled(t, Style::default().fg(c))));
             }
         }
         _ => lines.push(Line::from(Span::styled(
             "暂无验证结果",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         ))),
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑↓/PgUp/PgDn 滚动 · Esc 返回",
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     render_scrolled(frame, area, state, lines);
 }
@@ -140,7 +146,7 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
     let theme = &state.theme;
     // Wipe the whole split first so a shorter file/list can't leave ghosts
     // from the previous selection or scroll position.
-    frame.render_widget(ratatui::widgets::Clear, area);
+    theme.paint_canvas(frame, area);
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
 
@@ -153,8 +159,11 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
 
     let list_block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(theme.border))
-        .title(Span::styled(" 文件 ", Style::default().fg(theme.muted)));
+        .border_style(Style::default().fg(theme.border.normal))
+        .title(Span::styled(
+            " 文件 ",
+            Style::default().fg(theme.text.secondary),
+        ));
     let list_inner = list_block.inner(list_area);
     let list_w = list_inner.width as usize;
 
@@ -162,7 +171,7 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
     if files.is_empty() {
         rows.push(Line::from(Span::styled(
             "无改动",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
     }
     for (i, f) in files.iter().enumerate() {
@@ -174,17 +183,23 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
         let path_budget = list_w.saturating_sub(cursor_w + stats_w).max(1);
         let path = truncate_display(&f.path, path_budget);
         rows.push(Line::from(vec![
-            Span::styled(cursor.to_string(), Style::default().fg(theme.accent)),
+            Span::styled(
+                cursor.to_string(),
+                Style::default().fg(theme.accent.primary),
+            ),
             Span::raw(path),
             Span::styled(
                 format!("  +{}", f.added),
-                Style::default().fg(theme.success),
+                Style::default().fg(theme.status.success),
             ),
-            Span::styled(format!(" -{}", f.removed), Style::default().fg(theme.error)),
+            Span::styled(
+                format!(" -{}", f.removed),
+                Style::default().fg(theme.status.error),
+            ),
         ]));
     }
     frame.render_widget(list_block, list_area);
-    render_list_focused(frame, list_inner, rows, selected);
+    render_list_focused(frame, list_inner, rows, selected, theme);
 
     let mut detail: Vec<Line> = Vec::new();
     if let Some(f) = files.get(selected) {
@@ -195,11 +210,11 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
                     // Tabs / control chars desync cell columns on real terminals.
                     let clean = sanitize_terminal_line(raw);
                     let color = if clean.starts_with('+') && !clean.starts_with("+++") {
-                        theme.diff_add
+                        theme.diff.added
                     } else if clean.starts_with('-') && !clean.starts_with("---") {
-                        theme.diff_remove
+                        theme.diff.removed
                     } else {
-                        theme.muted
+                        theme.text.secondary
                     };
                     // Wrap long patch lines instead of clipping them off-screen.
                     for piece in wrap(&clean, wrap_w) {
@@ -209,14 +224,14 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
             }
             None => detail.push(Line::from(Span::styled(
                 "Ctrl+D 刷新以加载补丁",
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             ))),
         }
     }
     detail.push(Line::from(""));
     detail.push(Line::from(Span::styled(
         "↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回",
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     render_scrolled(frame, detail_area, state, detail);
 }
@@ -224,15 +239,15 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
 fn session_status_dot(status: &str, theme: &Theme) -> (&'static str, ratatui::style::Color) {
     let s = status.to_ascii_lowercase();
     if s.contains("complet") || s.contains("verif") || s == "done" {
-        ("●", theme.success)
+        ("●", theme.status.success)
     } else if s.contains("fail") || s.contains("error") {
-        ("●", theme.error)
+        ("●", theme.status.error)
     } else if s.contains("interrupt") || s.contains("cancel") {
-        ("●", theme.warning)
+        ("●", theme.status.warning)
     } else if s.contains("run") || s.contains("active") || s.contains("busy") {
-        ("●", theme.accent)
+        ("●", theme.accent.primary)
     } else {
-        ("○", theme.muted)
+        ("○", theme.text.secondary)
     }
 }
 
@@ -242,7 +257,7 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
     if state.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             "暂无会话",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
     }
     for (i, s) in state.sessions.iter().enumerate() {
@@ -254,20 +269,23 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
         let (dot, color) = session_status_dot(&s.status, theme);
         let goal = truncate_display(&s.goal, 40);
         lines.push(Line::from(vec![
-            Span::styled(cursor, Style::default().fg(theme.accent)),
+            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
             Span::styled(format!("{dot} "), Style::default().fg(color)),
             Span::raw(format!("{goal}  ")),
-            Span::styled(format!("[{}] ", s.status), Style::default().fg(theme.muted)),
-            Span::styled(s.model.clone(), Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("[{}] ", s.status),
+                Style::default().fg(theme.text.secondary),
+            ),
+            Span::styled(s.model.clone(), Style::default().fg(theme.text.secondary)),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑↓ 选择 · Enter 打开 · d 删除 · Esc 返回",
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     // +2 for the title and blank line that precede the session rows.
-    render_list_focused(frame, area, lines, state.sessions_selected + 2);
+    render_list_focused(frame, area, lines, state.sessions_selected + 2, theme);
 }
 
 pub(super) fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -276,16 +294,16 @@ pub(super) fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppSt
     if state.context_tokens == 0 && state.context_files.is_empty() {
         lines.push(Line::from(Span::styled(
             "暂无上下文信息",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!("估算 token：{}", state.context_tokens),
-            Style::default().fg(theme.text),
+            Style::default().fg(theme.text.primary),
         )));
         lines.push(Line::from(Span::styled(
             format!("候选文件（{}）", state.context_files.len()),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text.secondary),
         )));
         for f in state.context_files.iter().take(40) {
             lines.push(Line::from(Span::raw(format!("  {f}"))));
@@ -294,7 +312,7 @@ pub(super) fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppSt
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑↓/PgUp/PgDn 滚动 · Esc 返回",
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.text.secondary),
     )));
     render_scrolled(frame, area, state, lines);
 }

@@ -1,7 +1,11 @@
 # Kimi K3 — flagship coding model (Kimi Code model id: k3).
 # Docs: https://www.kimi.com/code/docs/kimi-code/models
 # Context up to 1M (Allegretto+); Moderato caps at 256k.
-# Reasoning effort: low / high / max (default max). Keep Thinking on.
+# Reasoning (https://www.kimi.com/code/docs/kimi-code/models 2026-08-18):
+#   native: low | high | max
+#   provider default: high (null → high; unknown → HTTP 400)
+#   CodeLeveler default: max
+# Keep Thinking on — disabling routes to K2.6.
 id: k3
 provider: kimi
 model_id: k3
@@ -15,7 +19,8 @@ capabilities:
   vision: true
 reasoning:
   style: open_ai_effort
-  effort: max
+  supported_efforts: [low, high, max]
+  default_effort: max
 limits:
   context_window: 1048576
   reliable_context: 786432

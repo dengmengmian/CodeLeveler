@@ -940,6 +940,7 @@ mod disclosure_tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                reasoning_effort: None,
             },
         );
         s.size = (80, 40);

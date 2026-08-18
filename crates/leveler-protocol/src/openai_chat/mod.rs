@@ -64,7 +64,9 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         // A reasoning request is spelled differently per provider; the model
         // profile picks the spelling. `None` sends neither field, so a provider
         // that rejects them is unaffected.
-        let effort = request.reasoning_effort.or(context.reasoning.effort);
+        // Effective effort is resolved before encode. The adapter does not
+        // fall back to the profile or remap levels.
+        let effort = request.reasoning_effort;
         let (thinking, reasoning_effort) = if !context.thinking_supports_forced_tool_choice
             && request.tool_choice.forces_tool_call()
         {
@@ -421,16 +423,21 @@ mod tests {
 
     fn ctx_reasoning(style: ReasoningStyle, effort: Option<ReasoningEffort>) -> ProtocolContext {
         ProtocolContext {
-            reasoning: ReasoningConfig { style, effort },
+            reasoning: ReasoningConfig {
+                style,
+                supported_efforts: effort.into_iter().collect(),
+                default_effort: effort,
+            },
             ..ctx()
         }
     }
 
     fn encode_with(context: &ProtocolContext) -> serde_json::Value {
-        let req = ModelRequest::new(
+        let mut req = ModelRequest::new(
             ModelRef::new("deepseek", "deepseek-chat"),
             vec![Message::text(Role::User, "hi")],
         );
+        req.reasoning_effort = context.reasoning.default_effort;
         OpenAiChatAdapter::new()
             .encode_request(&req, context, true)
             .unwrap()
@@ -519,6 +526,7 @@ mod tests {
             ModelRef::new("deepseek", "deepseek-chat"),
             vec![Message::text(Role::User, "hi")],
         );
+        req.reasoning_effort = context.reasoning.default_effort;
         req.tools = vec![ToolDefinition {
             name: "update_plan".into(),
             description: "plan".into(),
@@ -716,6 +724,39 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn adapter_encodes_effective_effort_without_remapping() {
+        // Policy already chose `high`. The adapter must not second-guess it
+        // even if the profile default is `max`.
+        let context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::Max));
+        let mut request = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-v4-pro"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        request.reasoning_effort = Some(ReasoningEffort::High);
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&request, &context, true)
+            .unwrap()
+            .body;
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn style_none_never_sends_effort_even_if_request_has_one() {
+        let mut request = ModelRequest::new(
+            ModelRef::new("kimi", "kimi-for-coding"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        request.reasoning_effort = Some(ReasoningEffort::Max);
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&request, &ctx(), true)
+            .unwrap()
+            .body;
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

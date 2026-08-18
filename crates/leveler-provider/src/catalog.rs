@@ -51,6 +51,15 @@ pub fn load_model_config(path: &Path) -> Result<ModelConfigFile, ConfigError> {
             ),
         });
     }
+    if let Err(reason) = leveler_model::validate_reasoning_config(
+        cfg.profile.capabilities.reasoning,
+        &cfg.profile.reasoning,
+    ) {
+        return Err(ConfigError::InvalidReasoning {
+            path: path.display().to_string(),
+            reason,
+        });
+    }
     Ok(cfg)
 }
 
@@ -162,6 +171,116 @@ limits:
         assert!(
             msg.contains("policy"),
             "error must name the retired key: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_default_effort_is_a_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(
+            &path,
+            r#"
+id: bad
+provider: deepseek
+model_id: deepseek-v4-pro
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: false
+  structured_output: true
+  reasoning: true
+  vision: false
+reasoning:
+  style: thinking_flag
+  supported_efforts: [high, max]
+  default_effort: medium
+limits:
+  context_window: 1000
+  reliable_context: 800
+  max_output_tokens: 100
+  max_tool_schema_bytes: 1000
+  max_parallel_tool_calls: 1
+"#,
+        )
+        .unwrap();
+        let err = load_model_config(&path).unwrap_err().to_string();
+        assert!(err.contains("not in supported_efforts"), "{err}");
+    }
+
+    /// Built-in profiles are the product contract: a reasoning-capable model
+    /// must declare a determinate CodeLeveler default (or explicitly have no
+    /// effort knob). Forgetting either fails CI.
+    #[test]
+    fn builtin_reasoning_models_declare_supported_and_default() {
+        use leveler_model::{ReasoningStyle, resolve_reasoning_effort};
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/models");
+        let mut seen = 0usize;
+        let mut reasoning = 0usize;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
+                continue;
+            }
+            let cfg =
+                load_model_config(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            seen += 1;
+            let profile = &cfg.profile;
+            if !profile.capabilities.reasoning {
+                continue;
+            }
+            reasoning += 1;
+            match profile.reasoning.style {
+                ReasoningStyle::None => {
+                    assert!(
+                        profile.reasoning.supported_efforts.is_empty()
+                            && profile.reasoning.default_effort.is_none(),
+                        "{}: style=none cannot invent an effort ({:?})",
+                        profile.id,
+                        profile.reasoning
+                    );
+                    let resolved = resolve_reasoning_effort(None, &profile.reasoning);
+                    assert_eq!(
+                        resolved.effective, None,
+                        "{}: always-on models have no effective effort",
+                        profile.id
+                    );
+                }
+                ReasoningStyle::OpenAiEffort | ReasoningStyle::ThinkingFlag => {
+                    assert!(
+                        !profile.reasoning.supported_efforts.is_empty(),
+                        "{}: reasoning model must declare supported_efforts",
+                        profile.id
+                    );
+                    let default = profile.reasoning.default_effort.unwrap_or_else(|| {
+                        panic!(
+                            "{}: reasoning model must declare default_effort",
+                            profile.id
+                        )
+                    });
+                    assert!(
+                        profile.reasoning.supported_efforts.contains(&default),
+                        "{}: default {:?} not in {:?}",
+                        profile.id,
+                        default,
+                        profile.reasoning.supported_efforts
+                    );
+                    let resolved = resolve_reasoning_effort(None, &profile.reasoning);
+                    assert_eq!(
+                        resolved.effective,
+                        Some(default),
+                        "{}: default must resolve to itself",
+                        profile.id
+                    );
+                }
+            }
+        }
+        assert!(seen > 0, "expected yaml files in {}", dir.display());
+        assert!(
+            reasoning > 0,
+            "expected at least one reasoning-capable builtin"
         );
     }
 }

@@ -122,10 +122,10 @@ pub fn build_conversation_lines_with_hits(
                 // A solid heading bar + bold body marks the user's turn clearly
                 // apart from the assistant's `●` bullet and normal-weight prose.
                 let bar = Style::default()
-                    .fg(theme.heading)
+                    .fg(theme.text.primary)
                     .add_modifier(Modifier::BOLD);
                 let body = Style::default()
-                    .fg(theme.user_message)
+                    .fg(theme.text.primary)
                     .add_modifier(Modifier::BOLD);
                 for line in wrap_simple(text, width.saturating_sub(2).max(1)) {
                     out.push(Line::from(vec![
@@ -216,7 +216,7 @@ pub fn build_conversation_lines_with_hits(
         out.push(Line::from(vec![
             Span::styled(
                 format!("{disclosure} {} · {n} lines", t.thinking),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text.secondary),
             ),
             Span::styled(
                 if state.reasoning_expanded {
@@ -224,7 +224,7 @@ pub fn build_conversation_lines_with_hits(
                 } else {
                     "  Ctrl+O".to_string()
                 },
-                Style::default().fg(theme.border),
+                Style::default().fg(theme.border.normal),
             ),
         ]));
         if state.reasoning_expanded {
@@ -233,13 +233,13 @@ pub fn build_conversation_lines_with_hits(
             for line in reasoning_lines.iter().take(MAX_EXPANDED_REASONING) {
                 out.push(Line::from(Span::styled(
                     format!("  {line}"),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.text.secondary),
                 )));
             }
             if n > MAX_EXPANDED_REASONING {
                 out.push(Line::from(Span::styled(
                     format!("  … (+{} lines)", n - MAX_EXPANDED_REASONING),
-                    Style::default().fg(theme.border),
+                    Style::default().fg(theme.border.normal),
                 )));
             }
         }

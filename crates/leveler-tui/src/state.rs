@@ -54,6 +54,9 @@ pub struct Boot {
     /// In-repo config files present but ignored for lack of trust, as display
     /// paths. Resolved by the composition root; see [`AppState::untrusted_config`].
     pub untrusted_config: Vec<String>,
+    /// Resolved `reasoning_effort` wire value (`max` / `high` / …). `None`
+    /// when the runtime has not supplied one — the chip must not invent it.
+    pub reasoning_effort: Option<String>,
 }
 
 /// A transient status-line notification.
@@ -219,6 +222,9 @@ pub struct AppState {
     pub repository: String,
     pub branch: Option<String>,
     pub model_label: String,
+    /// Resolved reasoning effort for the active model (`max`, `high`, …).
+    /// `None` means the runtime did not report one.
+    pub reasoning_effort: Option<String>,
     pub mode_label: String,
     /// Local wall clock `HH:MM`, refreshed by the event loop.
     pub clock_label: String,
@@ -265,7 +271,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(theme: Theme, boot: Boot) -> Self {
-        let dark = !matches!(theme.id, crate::theme::ThemeId::Day) && !theme.monochrome;
+        let dark = theme.is_dark();
         Self {
             running: true,
             runtime_connected: true,
@@ -327,6 +333,7 @@ impl AppState {
             repository: String::new(),
             branch: None,
             model_label: "—".to_string(),
+            reasoning_effort: boot.reasoning_effort.clone(),
             mode_label: "—".to_string(),
             clock_label: String::new(),
             context_window_tokens: boot.context_window,

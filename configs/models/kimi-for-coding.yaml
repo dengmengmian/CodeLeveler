@@ -13,7 +13,8 @@ capabilities:
   reasoning: true
   vision: false
 reasoning:
-  # Always-on thinking for K2.7 Code; server enables Thinking without a wire knob.
+  # Always-on thinking (https://www.kimi.com/code/docs/kimi-code/models 2026-08-18).
+  # No effort knob; disabling thinking routes to K2.6. Do not invent a default.
   style: none
 limits:
   context_window: 262144

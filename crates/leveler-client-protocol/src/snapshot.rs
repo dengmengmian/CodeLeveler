@@ -52,6 +52,50 @@ mod tests {
         let id = MessageId::new("msg-42");
         assert_eq!(id.to_string(), "msg-42");
     }
+
+    #[test]
+    fn old_snapshot_json_without_reasoning_stays_compatible() {
+        let json = serde_json::json!({
+            "id": "s1",
+            "repository": "/repo",
+            "goal": "g",
+            "model": null,
+            "mode": "assisted",
+            "branch": null,
+            "status": "idle",
+            "messages": []
+        });
+        let snap: UiSessionSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snap.reasoning, None);
+    }
+
+    #[test]
+    fn snapshot_omits_reasoning_when_unset() {
+        let snap = UiSessionSnapshot {
+            id: crate::SessionId::new("s1"),
+            repository: "/repo".into(),
+            goal: "g".into(),
+            model: None,
+            mode: crate::PermissionProfile::Assisted,
+            branch: None,
+            status: "idle".into(),
+            messages: Vec::new(),
+            pending_interactions: Vec::new(),
+            available_models: Vec::new(),
+            vision: false,
+            last_sequence: None,
+            active_tools: Vec::new(),
+            plan: None,
+            verification: None,
+            diff: None,
+            checkpoints: Vec::new(),
+            user_shells: Vec::new(),
+            completion_report: None,
+            reasoning: None,
+        };
+        let value = serde_json::to_value(&snap).unwrap();
+        assert!(value.get("reasoning").is_none(), "{value}");
+    }
 }
 
 /// Who authored a message.
@@ -242,4 +286,19 @@ pub struct UiSessionSnapshot {
     pub user_shells: Vec<UiUserShell>,
     #[serde(default)]
     pub completion_report: Option<UiCompletionReport>,
+    /// Runtime-projected reasoning state. Absent on old runtimes so a new
+    /// client keeps its boot-time value. Present with `effective: None` means
+    /// the model has no controllable effort knob (do not invent one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<UiReasoningState>,
+}
+
+/// Additive reasoning projection. The client must display `effective` and
+/// must not infer an effort from the model name or provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiReasoningState {
+    /// Wire value the runtime will send (`max`, `high`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<String>,
 }

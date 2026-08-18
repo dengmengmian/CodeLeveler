@@ -400,7 +400,7 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                 // Render as a styled heading (no literal "#" markers). H1/H2
                 // get a heading-colored bar so the level still reads at a glance.
                 let style = Style::default()
-                    .fg(theme.heading)
+                    .fg(theme.text.primary)
                     .add_modifier(Modifier::BOLD);
                 let mut heading = Vec::new();
                 if *level <= 2 {
@@ -422,13 +422,19 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     spans,
                     width,
                     theme,
-                    Style::default().fg(theme.assistant_message),
+                    Style::default().fg(theme.text.primary),
                 ));
             }
             MdBlock::Quote(spans) => {
                 let inner = width.saturating_sub(2).max(1);
-                for line in wrap_spans(spans, inner, theme, Style::default().fg(theme.muted)) {
-                    let mut spans = vec![Span::styled("▌ ", Style::default().fg(theme.border))];
+                for line in wrap_spans(
+                    spans,
+                    inner,
+                    theme,
+                    Style::default().fg(theme.text.secondary),
+                ) {
+                    let mut spans =
+                        vec![Span::styled("▌ ", Style::default().fg(theme.border.normal))];
                     spans.extend(line.spans);
                     out.push(Line::from(spans));
                 }
@@ -442,12 +448,8 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     };
                     let indent = " ".repeat(marker.width());
                     let inner = width.saturating_sub(marker.width()).max(1);
-                    let wrapped = wrap_spans(
-                        item,
-                        inner,
-                        theme,
-                        Style::default().fg(theme.assistant_message),
-                    );
+                    let wrapped =
+                        wrap_spans(item, inner, theme, Style::default().fg(theme.text.primary));
                     for (li, line) in wrapped.into_iter().enumerate() {
                         let lead = if li == 0 {
                             marker.clone()
@@ -455,7 +457,7 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                             indent.clone()
                         };
                         let mut spans =
-                            vec![Span::styled(lead, Style::default().fg(theme.heading))];
+                            vec![Span::styled(lead, Style::default().fg(theme.text.primary))];
                         spans.extend(line.spans);
                         out.push(Line::from(spans));
                     }
@@ -494,7 +496,7 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
             MdBlock::Rule => {
                 out.push(Line::from(Span::styled(
                     "─".repeat(width.min(40)),
-                    Style::default().fg(theme.border),
+                    Style::default().fg(theme.border.normal),
                 )));
             }
         }
@@ -712,9 +714,9 @@ fn table_lines(
         }
     }
 
-    let border = Style::default().fg(theme.border);
+    let border = Style::default().fg(theme.border.normal);
     let head_style = Style::default()
-        .fg(theme.heading)
+        .fg(theme.text.primary)
         .add_modifier(Modifier::BOLD);
 
     // Full-grid layout: an outer box with a rule between every row.
@@ -772,7 +774,7 @@ fn table_lines_stacked(
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let label_style = Style::default()
-        .fg(theme.heading)
+        .fg(theme.text.primary)
         .add_modifier(Modifier::BOLD);
 
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -890,12 +892,12 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
             style = style.add_modifier(Modifier::ITALIC);
         }
         if s.code {
-            style = Style::default().fg(theme.code);
+            style = Style::default().fg(theme.text.secondary);
         }
         if s.link.is_some() {
             // Match bare-URL treatment so markdown links and bare URLs look
             // the same (accent + bold + underline).
-            style = crate::url_link::link_style(theme.accent);
+            style = crate::url_link::link_style(theme.accent.primary);
             if s.bold {
                 style = style.add_modifier(Modifier::BOLD);
             }
@@ -947,7 +949,7 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
             // token starts_with("http") misses those; split with the shared
             // detector used by click hit-testing.
             let pieces: Vec<(String, Style)> = if span.link.is_none() && !span.code {
-                let link = crate::url_link::link_style(theme.accent);
+                let link = crate::url_link::link_style(theme.accent.primary);
                 crate::url_link::spans_with_bare_urls(&token, style, link)
                     .into_iter()
                     .map(|s| (s.content.to_string(), s.style))
@@ -1172,13 +1174,13 @@ mod tests {
 
     #[test]
     fn paragraph_uses_assistant_message_color() {
-        let theme = Theme::day();
+        let theme = Theme::light();
         let lines = MdDoc::parse("plain body").to_lines(40, &theme);
         assert!(
             lines[0]
                 .spans
                 .iter()
-                .any(|s| s.style.fg == Some(theme.assistant_message)),
+                .any(|s| s.style.fg == Some(theme.text.primary)),
             "assistant prose must use the reading-text role, not a muted/dim fg"
         );
     }
@@ -1642,11 +1644,11 @@ mod tests {
         for line in &lines {
             for span in &line.spans {
                 if span.content.contains("+added") {
-                    assert_eq!(span.style.fg, Some(theme.diff_add));
+                    assert_eq!(span.style.fg, Some(theme.diff.added));
                     saw_add = true;
                 }
                 if span.content.contains("-removed") {
-                    assert_eq!(span.style.fg, Some(theme.diff_remove));
+                    assert_eq!(span.style.fg, Some(theme.diff.removed));
                     saw_del = true;
                 }
             }
@@ -1699,7 +1701,7 @@ mod tests {
                 && url.style.add_modifier.contains(Modifier::BOLD),
             "bare http URL must look like a link: {lines:?}"
         );
-        assert_eq!(url.style.fg, Some(theme.accent));
+        assert_eq!(url.style.fg, Some(theme.accent.primary));
     }
 
     /// Real admin-status copy from gitcode-assist-service (CJK colon, fullwidth
@@ -1724,7 +1726,7 @@ mod tests {
             "expected glued + free-standing URLs: {lines:?}"
         );
         for s in urls {
-            assert_eq!(s.style.fg, Some(theme.accent), "span={s:?}");
+            assert_eq!(s.style.fg, Some(theme.accent.primary), "span={s:?}");
             assert!(
                 s.style.add_modifier.contains(Modifier::UNDERLINED)
                     && s.style.add_modifier.contains(Modifier::BOLD),

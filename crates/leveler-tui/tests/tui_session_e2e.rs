@@ -45,6 +45,7 @@ fn opened() -> AppState {
             context_window: 200_000,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
+            reasoning_effort: None,
         },
     );
     s.size = (100, 32);
@@ -74,6 +75,7 @@ fn opened() -> AppState {
                 checkpoints: Vec::new(),
                 user_shells: Vec::new(),
                 completion_report: None,
+                reasoning: None,
             },
         }),
     );
@@ -394,8 +396,14 @@ fn tui_slash_popup_lists_renamed_commands() {
     assert!(names.contains(&"/work-mode"), "got {names:?}");
     assert!(names.contains(&"/collab"), "got {names:?}");
     assert!(names.contains(&"/goal"), "got {names:?}");
-    assert!(names.contains(&"/doctor"), "got {names:?}");
-    assert!(names.contains(&"/fork"), "got {names:?}");
+    assert!(
+        !names.contains(&"/doctor"),
+        "doctor is searchable, not on empty /: {names:?}"
+    );
+    assert!(
+        !names.contains(&"/fork"),
+        "fork is searchable, not on empty /: {names:?}"
+    );
 
     let popup_ui = screen(&mut s);
     assert!(
