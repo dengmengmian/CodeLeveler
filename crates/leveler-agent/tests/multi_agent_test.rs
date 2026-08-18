@@ -4057,6 +4057,169 @@ async fn the_second_mutating_round_is_the_fallback_decision_point_without_a_plan
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// MA-WA1 repair accident regression (EB-3 shape), executor level: the offer
+/// lands at plan registration when the tail steps are dependency-blocked →
+/// rational KEEP; the plan then progresses (a step completes, ≥2 bounded
+/// steps remain) — the harness raises exactly ONE reconsideration, grounded
+/// in the parent's own edited paths, records the durable `reoffered` fact,
+/// and never asks again.
+#[tokio::test]
+async fn plan_progress_after_keep_raises_one_reconsideration_with_parent_scope_facts() {
+    let dir = tmp("decision-reconsider", 44);
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            // r1: decomposition on record → offer this round.
+            assistant_with(
+                vec![tool_call_part(
+                    "p1",
+                    "update_plan",
+                    serde_json::json!({
+                        "plan": [
+                            {"step": "implement core", "status": "in_progress"},
+                            {"step": "add regression tests", "status": "pending"},
+                            {"step": "update docs", "status": "pending"}
+                        ]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: mutation after the visible offer → durable KEEP.
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            // r3: core completed; two bounded steps remain open → the one
+            // reconsideration fires at this round boundary.
+            assistant_with(
+                vec![tool_call_part(
+                    "p2",
+                    "update_plan",
+                    serde_json::json!({
+                        "plan": [
+                            {"step": "implement core", "status": "completed"},
+                            {"step": "add regression tests", "status": "in_progress"},
+                            {"step": "update docs", "status": "pending"}
+                        ]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r4: more progress — must NOT re-ask again.
+            assistant_with(
+                vec![tool_call_part(
+                    "p3",
+                    "update_plan",
+                    serde_json::json!({
+                        "plan": [
+                            {"step": "implement core", "status": "completed"},
+                            {"step": "add regression tests", "status": "completed"},
+                            {"step": "update docs", "status": "in_progress"}
+                        ]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        Duration::from_millis(1),
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "land the feature",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let stages = delegation_stages(&events);
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|(action, _)| action == "offered")
+            .count(),
+        1,
+        "{stages:?}"
+    );
+    assert_eq!(
+        stages.iter().filter(|(action, _)| action == "kept").count(),
+        1,
+        "{stages:?}"
+    );
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|(action, _)| action == "reoffered")
+            .count(),
+        1,
+        "exactly one event-driven reconsideration: {stages:?}"
+    );
+    assert!(
+        stages
+            .iter()
+            .any(|(action, detail)| action == "reoffered" && detail == "plan_progress"),
+        "{stages:?}"
+    );
+
+    // The durable fact survives into the ledger (resume windows never re-ask).
+    let last_ledger = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::ProgressUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .expect("progress ledger updates exist");
+    assert!(last_ledger.delegation_reconsidered);
+    assert!(last_ledger.delegation_kept_recorded);
+
+    // The reconsideration reaches the model exactly once, enumerates the
+    // remaining open steps, and grounds independence in the parent's own
+    // edited paths.
+    let requests = runtime.requests.lock().unwrap();
+    let last = requests.last().unwrap();
+    let reconsider_count = last
+        .iter()
+        .filter(|m| {
+            m.role == Role::User && m.text_content().contains("## Delegation reconsideration")
+        })
+        .count();
+    assert_eq!(reconsider_count, 1, "one reconsideration, never repeated");
+    let text = last
+        .iter()
+        .find(|m| {
+            m.role == Role::User && m.text_content().contains("## Delegation reconsideration")
+        })
+        .unwrap()
+        .text_content();
+    assert!(
+        text.contains("1. add regression tests") && text.contains("2. update docs"),
+        "remaining open steps are enumerated: {text}"
+    );
+    assert!(
+        text.contains("a.txt"),
+        "parent-edited paths ground the boundary: {text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("valid outcome"),
+        "KEEP stays first-class: {text}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A spontaneous Worker spawn IS the delegation decision: record `delegated`
 /// with its scope and never raise the offer afterwards (no nagging a model
 /// that already decided).

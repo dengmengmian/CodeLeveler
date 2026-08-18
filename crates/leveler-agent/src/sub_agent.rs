@@ -116,7 +116,10 @@ pub fn multi_agent_steer_hint() -> String {
      on that child's result.\n\
      Keep work yourself when it is small, tightly coupled, needs your \
      in-flight context, or has no safe ownership boundary — KEEP is a \
-     first-class outcome. Do not spawn for its own sake.\n\
+     first-class outcome. Do not spawn for its own sake. A piece you kept \
+     because it was blocked by unfinished work can still be delegated later, \
+     once its blockers clear: freeze its contract (expected outputs, \
+     interfaces, acceptance commands) in the task text and hand it off.\n\
      Long work stays in this direct tool loop: keep calling tools / spawn_agent \
      until the goal is proven; do not stop early with a plan-only summary."
         .to_string()
@@ -183,10 +186,11 @@ pub(crate) fn lost_children_note(outstanding: &[String]) -> String {
 /// would ask for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DelegationRoundAction {
-    /// Inject the one-shot keep-vs-delegate request. `trigger` (`plan` |
-    /// `mutation_fallback`) labels the durable `offered` fact; `steps` carries
-    /// the model's own open plan steps (empty on the mutation fallback) so the
-    /// request is anchored to the registered decomposition, item by item.
+    /// Inject a keep-vs-delegate request. `trigger` (`plan` |
+    /// `mutation_fallback` | `reconsideration`) labels the durable fact;
+    /// `steps` carries the model's own open plan steps (empty on the mutation
+    /// fallback) so the request is anchored to the registered decomposition,
+    /// item by item.
     Offer {
         trigger: &'static str,
         steps: Vec<String>,
@@ -205,19 +209,32 @@ pub(crate) struct DelegationPrior {
     pub offered: bool,
     pub kept: bool,
     pub delegated: bool,
+    /// The one event-driven reconsideration already happened in a prior window.
+    pub reconsidered: bool,
 }
 
-/// One-shot keep-vs-delegate decision point (MA-WA1).
+/// Keep-vs-delegate decision point (MA-WA1).
 ///
 /// The prior architecture had no decision layer at all: the only delegation
 /// input was a round-1 hint, never re-anchored at the moment the model's own
-/// decomposition made the judgment possible. This struct guarantees exactly one
+/// decomposition made the judgment possible. This struct guarantees one
 /// neutral decision point per goal epoch — at plan registration (decomposition
 /// written down) or, for plan-less runs, at the second mutating round — and
 /// derives an observable disposition from behavior, never from self-report or
-/// hidden
-/// reasoning. It never blocks a call, never repeats, and treats KEEP as a
-/// first-class outcome.
+/// hidden reasoning. It never blocks a call and treats KEEP as a first-class
+/// outcome.
+///
+/// MA-WA1 forensics (12-run gate): the offer lands at plan registration, the
+/// moment the plan's dependency structure is densest, so the mechanical tail
+/// (tests/goldens/docs) is rationally KEPT — and the epoch used to be
+/// one-shot, so when those blockers resolved mid-run no opportunity ever
+/// returned (EB-3; EB-4 delegated exactly that tail on its own). Hence one
+/// EVENT-DRIVEN reconsideration per epoch: when the registered plan materially
+/// changes after a kept disposition — completed steps grew while ≥2 bounded
+/// steps remain open, or a fallback-offered epoch's decomposition becomes
+/// concrete — the per-step request is raised one final time. Identical plan
+/// states never re-ask (fingerprint), resume windows treat their first plan
+/// sight as baseline (no replay duplication), and there is no periodic nag.
 #[derive(Debug, Clone)]
 pub(crate) struct DelegationDecisionPoint {
     /// depth == 0 ∧ allow_delegation. Children never see any of this.
@@ -229,6 +246,20 @@ pub(crate) struct DelegationDecisionPoint {
     offer_visible: bool,
     kept_recorded: bool,
     delegated_recorded: bool,
+    /// The one event-driven reconsideration was raised (ever, this epoch).
+    reconsidered: bool,
+    /// The initial offer enumerated plan steps (trigger=plan). A fallback
+    /// offer without steps leaves this false; a plan landing later is then a
+    /// material change (unknown decomposition → concrete).
+    offer_had_steps: bool,
+    /// Whether the initial offer happened in THIS window. Prior-window offers
+    /// (seeded) have no in-window baseline until the first plan sight.
+    offered_in_window: bool,
+    /// Baseline for material-change detection: completed-step count and open-
+    /// steps fingerprint at the initial offer (in-window) or at the first plan
+    /// sight of a resumed window. Progress is measured strictly against this.
+    baseline_completed: Option<u32>,
+    baseline_fingerprint: Option<u64>,
     /// Rounds (not calls) in which at least one mutation succeeded. The
     /// fallback offer waits for the SECOND such round: probe evidence (xsv ×2)
     /// showed a lone prep edit (Cargo.toml) one round before `update_plan`
@@ -237,8 +268,20 @@ pub(crate) struct DelegationDecisionPoint {
     mutation_rounds_seen: u32,
     // Round-local facts, cleared by `end_round`.
     plan_open_steps: Vec<String>,
+    /// Latest plan update this round: (open step texts, completed count).
+    round_plan: Option<(Vec<String>, u32)>,
     mutated_this_round: bool,
     worker_scope_this_round: Option<String>,
+}
+
+fn steps_fingerprint(steps: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for step in steps {
+        step.hash(&mut hasher);
+    }
+    steps.len().hash(&mut hasher);
+    hasher.finish()
 }
 
 impl DelegationDecisionPoint {
@@ -249,19 +292,27 @@ impl DelegationDecisionPoint {
             offer_visible: prior.offered,
             kept_recorded: prior.kept,
             delegated_recorded: prior.delegated,
+            reconsidered: prior.reconsidered,
+            offer_had_steps: false,
+            offered_in_window: false,
+            baseline_completed: None,
+            baseline_fingerprint: None,
             mutation_rounds_seen: 0,
             plan_open_steps: Vec::new(),
+            round_plan: None,
             mutated_this_round: false,
             worker_scope_this_round: None,
         }
     }
 
     /// A ModelExplicit plan was registered/replaced; `open_steps` are the step
-    /// texts still pending/in_progress, in plan order.
-    pub(crate) fn note_plan_registered(&mut self, open_steps: &[String]) {
+    /// texts still pending/in_progress, in plan order; `completed` counts the
+    /// plan's completed steps (the dependency-resolution signal).
+    pub(crate) fn note_plan_registered(&mut self, open_steps: &[String], completed: u32) {
         if open_steps.len() > self.plan_open_steps.len() {
             self.plan_open_steps = open_steps.to_vec();
         }
+        self.round_plan = Some((open_steps.to_vec(), completed));
     }
 
     /// A tool call successfully mutated the workspace this round.
@@ -276,14 +327,18 @@ impl DelegationDecisionPoint {
         }
     }
 
-    /// Resolve this round's facts into actions. At most one `Offer` per epoch;
-    /// `kept`/`delegated` each at most once.
+    /// Resolve this round's facts into actions. At most one initial `Offer`
+    /// and one `reconsideration` per epoch; `kept`/`delegated` each at most
+    /// once.
     pub(crate) fn end_round(&mut self) -> Vec<DelegationRoundAction> {
         let mut actions = Vec::new();
         if !self.eligible {
             self.clear_round();
             return actions;
         }
+        // The re-ask waits for a round AFTER the kept fact: a model that has
+        // not yet acted on its disposition has nothing new to reconsider.
+        let kept_at_round_start = self.kept_recorded;
         if let Some(scope) = self.worker_scope_this_round.take()
             && !self.delegated_recorded
         {
@@ -304,19 +359,67 @@ impl DelegationDecisionPoint {
         if !self.offered && !self.delegated_recorded {
             if self.plan_open_steps.len() >= 2 {
                 self.offered = true;
+                self.offered_in_window = true;
+                self.offer_had_steps = true;
+                let steps = std::mem::take(&mut self.plan_open_steps);
+                // Material-change baseline: what the offer actually enumerated,
+                // plus the plan's completed count as of this round.
+                self.baseline_fingerprint = Some(steps_fingerprint(&steps));
+                self.baseline_completed =
+                    Some(self.round_plan.as_ref().map(|(_, c)| *c).unwrap_or(0));
                 actions.push(DelegationRoundAction::Offer {
                     trigger: "plan",
-                    steps: std::mem::take(&mut self.plan_open_steps),
+                    steps,
                 });
             } else if self.mutation_rounds_seen >= 2 {
                 // Plan-less fallback, deliberately one mutating round late:
                 // a prep edit followed by update_plan next round still gets
                 // the plan-anchored per-step form instead of this generic one.
                 self.offered = true;
+                self.offered_in_window = true;
                 actions.push(DelegationRoundAction::Offer {
                     trigger: "mutation_fallback",
                     steps: Vec::new(),
                 });
+            }
+        } else if self.offered
+            && !self.delegated_recorded
+            && !self.reconsidered
+            && kept_at_round_start
+            && let Some((open, completed)) = self.round_plan.take()
+        {
+            if self.offered_in_window && !self.offer_had_steps {
+                // Fallback-offered epoch: the decomposition just became
+                // concrete — that IS the material change.
+                if open.len() >= 2 {
+                    self.reconsidered = true;
+                    actions.push(DelegationRoundAction::Offer {
+                        trigger: "reconsideration",
+                        steps: open,
+                    });
+                }
+            } else if let (Some(base_completed), Some(base_fp)) =
+                (self.baseline_completed, self.baseline_fingerprint)
+            {
+                // Progress is strictly against the baseline: completed steps
+                // grew AND ≥2 bounded steps remain AND the open set actually
+                // changed. Identical states never re-ask.
+                if completed > base_completed
+                    && open.len() >= 2
+                    && steps_fingerprint(&open) != base_fp
+                {
+                    self.reconsidered = true;
+                    actions.push(DelegationRoundAction::Offer {
+                        trigger: "reconsideration",
+                        steps: open,
+                    });
+                }
+            } else {
+                // Resumed window (prior-window offer): the first plan sight is
+                // the baseline, never progress — replay cannot duplicate the
+                // opportunity.
+                self.baseline_completed = Some(completed);
+                self.baseline_fingerprint = Some(steps_fingerprint(&open));
             }
         }
         // Anything offered up to and including this round is readable next round.
@@ -327,6 +430,7 @@ impl DelegationDecisionPoint {
 
     fn clear_round(&mut self) {
         self.plan_open_steps.clear();
+        self.round_plan = None;
         self.mutated_this_round = false;
         self.worker_scope_this_round = None;
     }
@@ -388,11 +492,71 @@ pub(crate) fn delegation_decision_request(steps: &[String]) -> String {
              self-contained module, or a broad mechanical update of docs/goldens/\
              fixtures — is a candidate for DELEGATE: the worker runs concurrently \
              and returns a result you inspect and integrate.\n\
+             A step that BUNDLES a self-contained new file/module with small \
+             shared-file glue may be split in your disposition: DELEGATE the \
+             self-contained part with its exact files, KEEP the glue.\n\
              Answer with one short KEEP/DELEGATE line per step, then proceed \
              accordingly. KEEP for every step is a valid outcome.\n",
         );
     }
-    out.push_str("This is the only time the harness raises this; you will not be asked again.");
+    out.push_str(
+        "The harness raises this once now. Only if your plan later materially \
+         changes — completed steps unblocking bounded remaining ones — will it \
+         raise one final reconsideration; otherwise you will not be asked again.",
+    );
+    out
+}
+
+/// How many parent-edited paths the reconsideration enumerates at most.
+const RECONSIDERATION_MAX_FILES: usize = 12;
+
+/// The one event-driven reconsideration (MA-WA1 repair). Raised at most once
+/// per goal epoch, only after a kept disposition when the registered plan
+/// materially changed (see [`DelegationDecisionPoint`]). Neutral like the
+/// initial request; additionally grounds the independence judgment in a
+/// structured fact the harness truly owns: the paths the parent has already
+/// edited (its in-flight context boundary), from the EvidenceLedger.
+pub(crate) fn delegation_reconsideration_request(
+    steps: &[String],
+    parent_edited_files: &[String],
+) -> String {
+    let mut out = String::from("## Delegation reconsideration (final)\n");
+    out.push_str(
+        "Since your disposition, your plan materially changed: earlier steps \
+         completed, and these remain open:\n",
+    );
+    for (i, step) in steps.iter().take(DECISION_REQUEST_MAX_STEPS).enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, step));
+    }
+    if steps.len() > DECISION_REQUEST_MAX_STEPS {
+        out.push_str(&format!(
+            "… and {} more step(s), same choice each.\n",
+            steps.len() - DECISION_REQUEST_MAX_STEPS
+        ));
+    }
+    if !parent_edited_files.is_empty() {
+        out.push_str("Files you have edited so far (they hold your in-flight context):\n");
+        for path in parent_edited_files.iter().take(RECONSIDERATION_MAX_FILES) {
+            out.push_str(&format!("- {path}\n"));
+        }
+        if parent_edited_files.len() > RECONSIDERATION_MAX_FILES {
+            out.push_str(&format!(
+                "… and {} more.\n",
+                parent_edited_files.len() - RECONSIDERATION_MAX_FILES
+            ));
+        }
+    }
+    out.push_str(
+        "Decide once more, for EACH remaining step: KEEP (do it here) or \
+         DELEGATE (`spawn_agent` role='worker', a complete self-contained \
+         `task`, and the exact `files` or directories it will own). A step \
+         that is now unblocked, bounded, independently verifiable, and does \
+         not need the files above is a candidate to DELEGATE — you can freeze \
+         its contract (expected outputs, interfaces, acceptance commands) in \
+         the task text. A step still coupled to your remaining work, or \
+         trivial: KEEP it. KEEP for every step remains a fully valid outcome.\n\
+         This is the final time the harness raises this; you will not be asked again.",
+    );
     out
 }
 
@@ -841,7 +1005,7 @@ mod decision_point_tests {
     #[test]
     fn plan_registration_triggers_one_offer_and_mutations_then_record_keep() {
         let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
-        dp.note_plan_registered(&steps(&["edit head", "edit tail"]));
+        dp.note_plan_registered(&steps(&["edit head", "edit tail"]), 0);
         assert_eq!(
             dp.end_round(),
             vec![DelegationRoundAction::Offer {
@@ -889,7 +1053,7 @@ mod decision_point_tests {
         let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
         dp.note_mutation(); // Cargo.toml prep edit
         assert!(dp.end_round().is_empty());
-        dp.note_plan_registered(&steps(&["frequency --json", "stats --json", "dedup"]));
+        dp.note_plan_registered(&steps(&["frequency --json", "stats --json", "dedup"]), 0);
         let actions = dp.end_round();
         assert!(
             matches!(
@@ -903,7 +1067,7 @@ mod decision_point_tests {
     #[test]
     fn a_single_step_plan_waits_for_the_mutation_fallback() {
         let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
-        dp.note_plan_registered(&steps(&["do it"]));
+        dp.note_plan_registered(&steps(&["do it"]), 0);
         assert!(dp.end_round().is_empty(), "one step is not a decomposition");
         dp.note_mutation();
         dp.end_round();
@@ -959,10 +1123,11 @@ mod decision_point_tests {
                     offered: true,
                     kept: false,
                     delegated: false,
+                    reconsidered: false,
                 },
             ),
         ] {
-            dp.note_plan_registered(&steps(&["a", "b", "c"]));
+            dp.note_plan_registered(&steps(&["a", "b", "c"]), 0);
             dp.note_mutation();
             dp.note_worker_admitted(&["a".into()]);
             assert!(dp.end_round().is_empty());
@@ -979,10 +1144,11 @@ mod decision_point_tests {
                 offered: true,
                 kept: false,
                 delegated: false,
+                reconsidered: false,
             },
         );
         assert!(dp.offered());
-        dp.note_plan_registered(&steps(&["a", "b", "c", "d"]));
+        dp.note_plan_registered(&steps(&["a", "b", "c", "d"]), 0);
         dp.note_mutation();
         assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
     }
@@ -1023,6 +1189,7 @@ mod decision_point_tests {
                 offered: true,
                 kept: true,
                 delegated: false,
+                reconsidered: false,
             },
         );
         dp.note_mutation();
@@ -1043,6 +1210,7 @@ mod decision_point_tests {
                 offered: true,
                 kept: false,
                 delegated: true,
+                reconsidered: false,
             },
         );
         dp.note_mutation();
@@ -1060,6 +1228,215 @@ mod decision_point_tests {
     #[test]
     fn the_generic_request_is_neutral_names_both_outcomes_and_promises_no_repeat() {
         assert_request_is_neutral(&delegation_decision_request(&[]));
+    }
+
+    /// MA-WA1 accident regression (EB-3 shape): offer fires at plan
+    /// registration when the mechanical tail is dependency-blocked → rational
+    /// KEEP; the plan then progresses (steps complete) and the remaining open
+    /// steps become independently actionable — the OLD one-shot epoch never
+    /// surfaced another decision opportunity. NEW: exactly one event-driven
+    /// reconsideration when the plan materially changed.
+    #[test]
+    fn plan_progress_after_keep_reopens_the_decision_exactly_once() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        // Round 1: plan registered (4 open, 0 completed) → offer.
+        dp.note_plan_registered(&steps(&["core", "tests", "goldens", "verify"]), 0);
+        assert!(matches!(
+            dp.end_round().as_slice(),
+            [DelegationRoundAction::Offer {
+                trigger: "plan",
+                ..
+            }]
+        ));
+        // Round 2: model keeps (first mutation after visible offer).
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+        // Round 3: mid-implementation plan update, nothing completed yet —
+        // NOT a material change, no reoffer.
+        dp.note_plan_registered(&steps(&["core", "tests", "goldens", "verify"]), 0);
+        dp.note_mutation();
+        assert!(dp.end_round().is_empty(), "unchanged plan must not re-ask");
+        // Round 4: core completed; 3 bounded steps remain open → the one
+        // reconsideration fires, carrying the remaining open steps.
+        dp.note_plan_registered(&steps(&["tests", "goldens", "verify"]), 1);
+        dp.note_mutation();
+        let actions = dp.end_round();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [DelegationRoundAction::Offer { trigger: "reconsideration", steps }]
+                    if steps.len() == 3 && steps[0] == "tests"
+            ),
+            "{actions:?}"
+        );
+        // Round 5+: further progress never re-asks (one reconsideration per epoch).
+        dp.note_plan_registered(&steps(&["goldens", "verify"]), 2);
+        dp.note_mutation();
+        assert!(dp.end_round().is_empty(), "reconsideration is one-shot too");
+        dp.note_plan_registered(&steps(&["verify", "extra", "more"]), 3);
+        assert!(dp.end_round().is_empty());
+    }
+
+    /// KEEP-control protection: when progress leaves fewer than 2 open steps,
+    /// there is no decomposition left to reconsider — trivial tasks are never
+    /// re-asked on their way to done.
+    #[test]
+    fn reconsideration_needs_at_least_two_remaining_open_steps() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_plan_registered(&steps(&["a", "b"]), 0);
+        dp.end_round();
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+        dp.note_plan_registered(&steps(&["b"]), 1);
+        dp.note_mutation();
+        assert!(dp.end_round().is_empty(), "one open step left → no re-ask");
+    }
+
+    /// A model that already delegated is never re-asked: the decision proved
+    /// itself; further opportunities belong to the model, not the harness.
+    #[test]
+    fn no_reconsideration_after_a_delegated_fact() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_plan_registered(&steps(&["a", "b", "c"]), 0);
+        dp.end_round();
+        dp.note_worker_admitted(&["src/a.rs".into()]);
+        dp.end_round();
+        dp.note_plan_registered(&steps(&["b", "c"]), 1);
+        dp.note_mutation();
+        assert!(dp.end_round().is_empty());
+    }
+
+    /// Replay/resume: a prior window's reconsideration (ProgressLedger) is
+    /// never duplicated, and a resumed window that merely re-registers the
+    /// plan does not treat the seed itself as progress.
+    #[test]
+    fn resume_windows_do_not_duplicate_the_reconsideration() {
+        // Prior window already reconsidered → silent forever.
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+                reconsidered: true,
+            },
+        );
+        dp.note_plan_registered(&steps(&["tests", "goldens", "verify"]), 2);
+        dp.note_mutation();
+        assert!(dp.end_round().is_empty());
+
+        // Prior window offered+kept, not reconsidered: the FIRST plan sight in
+        // this window is the baseline, not progress — no reoffer on resume.
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+                reconsidered: false,
+            },
+        );
+        dp.note_plan_registered(&steps(&["tests", "goldens", "verify"]), 2);
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "the seed snapshot is a baseline, not progress"
+        );
+        // Real in-window progress from that baseline still gets the one re-ask.
+        dp.note_plan_registered(&steps(&["goldens", "verify"]), 3);
+        dp.note_mutation();
+        assert!(matches!(
+            dp.end_round().as_slice(),
+            [DelegationRoundAction::Offer { trigger: "reconsideration", steps }] if steps.len() == 2
+        ));
+    }
+
+    /// A fallback-offered epoch (no plan at offer time) whose decomposition
+    /// LATER becomes concrete gets the per-step reconsideration: the work
+    /// item going from unknown to concrete is exactly a material change.
+    #[test]
+    fn a_plan_landing_after_a_fallback_offer_is_a_material_change() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_mutation();
+        dp.end_round();
+        dp.note_mutation();
+        assert!(matches!(
+            dp.end_round().as_slice(),
+            [DelegationRoundAction::Offer {
+                trigger: "mutation_fallback",
+                ..
+            }]
+        ));
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+        dp.note_plan_registered(&steps(&["verb impl", "tests", "docs"]), 0);
+        dp.note_mutation();
+        assert!(matches!(
+            dp.end_round().as_slice(),
+            [DelegationRoundAction::Offer { trigger: "reconsideration", steps }] if steps.len() == 3
+        ));
+        // And only once.
+        dp.note_plan_registered(&steps(&["tests", "docs"]), 1);
+        assert!(dp.end_round().is_empty());
+    }
+
+    /// The reconsideration must not fire in the same round that records the
+    /// kept fact — the model has not acted on its disposition yet.
+    #[test]
+    fn reconsideration_waits_for_a_round_after_keep() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_plan_registered(&steps(&["a", "b", "c"]), 0);
+        dp.end_round();
+        // Same round: keep lands AND the plan reports progress.
+        dp.note_mutation();
+        dp.note_plan_registered(&steps(&["b", "c"]), 1);
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordKept],
+            "facts land; the re-ask waits for a later material change"
+        );
+    }
+
+    #[test]
+    fn the_reconsideration_request_is_neutral_and_carries_facts() {
+        let text = delegation_reconsideration_request(
+            &steps(&["tests", "goldens"]),
+            &["src/cmd/dedup.rs".to_string(), "src/main.rs".to_string()],
+        );
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.contains("reconsideration"));
+        assert!(text.contains("1. tests"), "{text}");
+        assert!(text.contains("2. goldens"), "{text}");
+        assert!(text.contains("src/cmd/dedup.rs"), "{text}");
+        assert!(lower.contains("keep") && lower.contains("delegate"));
+        assert!(lower.contains("valid outcome"));
+        assert!(lower.contains("not be asked again"));
+        for banned in [
+            "you should delegate",
+            "prefer worker",
+            "prefer delegation",
+            "delegate when possible",
+            "always",
+            "parallelize aggressively",
+            "for complex tasks",
+        ] {
+            assert!(!lower.contains(banned), "banned `{banned}` in: {text}");
+        }
+    }
+
+    /// The initial request tells the truth about reconsideration and offers
+    /// the bundled-step split guidance (EA-1/EA-3 forensics: a step bundling a
+    /// self-contained new file with shared-file glue reads as coupled and
+    /// kills the candidate).
+    #[test]
+    fn the_plan_request_mentions_split_and_conditional_reask() {
+        let text = delegation_decision_request(&steps(&["impl dedup + register", "tests"]));
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.contains("split"), "{text}");
+        assert!(
+            lower.contains("materially changes"),
+            "one-shot promise must be conditional now: {text}"
+        );
     }
 
     /// Iteration 2 (miller probe evidence): the plan-triggered request must

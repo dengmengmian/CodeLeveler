@@ -217,7 +217,8 @@ impl Executor {
             sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
         }
-        // MA-WA1: one-shot keep-vs-delegate decision point. Eligible only for
+        // MA-WA1: keep-vs-delegate decision point (one offer + at most one
+        // event-driven reconsideration per goal epoch). Eligible only for
         // top-level runs with delegation on; a prior window's offer and
         // disposition facts (seeded via ProgressLedger) are never re-asked or
         // re-recorded.
@@ -227,6 +228,7 @@ impl Executor {
                 offered: progress.delegation_decision_offered,
                 kept: progress.delegation_kept_recorded,
                 delegated: progress.delegation_delegated_recorded,
+                reconsidered: progress.delegation_reconsidered,
             },
         );
         // Accumulated elevations from approved request_permissions this turn.
@@ -2071,6 +2073,11 @@ impl Executor {
                                         .filter(|s| s.status != "completed")
                                         .map(|s| s.step.clone())
                                         .collect::<Vec<_>>(),
+                                    plan_state
+                                        .steps
+                                        .iter()
+                                        .filter(|s| s.status == "completed")
+                                        .count() as u32,
                                 );
                                 observer(AgentEvent::PlanUpdated {
                                     steps: plan_state.steps.clone(),
@@ -2718,6 +2725,41 @@ impl Executor {
                         observer(AgentEvent::ProgressUpdated {
                             ledger: progress.clone(),
                         });
+                    }
+                    DelegationRoundAction::Offer {
+                        trigger: "reconsideration",
+                        steps,
+                    } => {
+                        // The one event-driven re-ask: the plan materially
+                        // changed after a kept disposition. Grounded in the
+                        // ledger's first-touch mutation paths — the parent's
+                        // real context boundary, not an inferred scope.
+                        progress.delegation_reconsidered = true;
+                        observer(AgentEvent::DelegationStage {
+                            action: "reoffered".to_string(),
+                            detail: "plan_progress".to_string(),
+                        });
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
+                        let parent_edited: Vec<String> = {
+                            let mut seen = Vec::new();
+                            for m in &ledger.mutations {
+                                for p in &m.paths {
+                                    if !seen.contains(p) {
+                                        seen.push(p.clone());
+                                    }
+                                }
+                            }
+                            seen
+                        };
+                        messages.push(Message::text(
+                            Role::User,
+                            crate::sub_agent::delegation_reconsideration_request(
+                                &steps,
+                                &parent_edited,
+                            ),
+                        ));
                     }
                     DelegationRoundAction::Offer { trigger, steps } => {
                         progress.delegation_decision_offered = true;

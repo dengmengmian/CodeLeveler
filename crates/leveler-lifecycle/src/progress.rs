@@ -105,6 +105,10 @@ pub struct ProgressLedger {
     /// A `delegated` disposition fact was already recorded this goal epoch.
     #[serde(default)]
     pub delegation_delegated_recorded: bool,
+    /// The one event-driven delegation reconsideration was already raised this
+    /// goal epoch (MA-WA1 repair), so later windows never raise it again.
+    #[serde(default)]
+    pub delegation_reconsidered: bool,
     /// V2 background children still running when this snapshot was taken, as
     /// `id|nickname|role|scope` records. In-process children do not survive a
     /// restart: a resumed run reads this, tells the model truthfully which
