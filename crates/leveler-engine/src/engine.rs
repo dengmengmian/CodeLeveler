@@ -1517,10 +1517,11 @@ impl TaskEngine {
         // leaves a breadcrumb instead of silence.
         log.append(None, stage(true, "launching", reason.clone()), observer)
             .await?;
+        let diff = review_diff(&spec.coding.repository, &outcome.modified_files).await;
         match runner
             .run_review(
                 goal_profile(spec),
-                review_brief(&spec.runtime.goal, &outcome.modified_files),
+                review_brief(&spec.runtime.goal, &outcome.modified_files, diff.as_deref()),
                 outcome.modified_files.clone(),
                 observer,
                 cancellation.clone(),
@@ -1900,12 +1901,78 @@ fn review_reason(trigger: &crate::policy_resolver::ReviewTrigger) -> String {
     parts.join(", ")
 }
 
+/// Cap on the unified diff embedded in a reviewer brief. Beyond it the diff is
+/// truncated with an explicit marker — a truncated diff plus an instruction
+/// beats a bare file list, which sent every reviewer into whole-repo
+/// reconstruction (7/7 recent launches died at their round budget with zero
+/// findings, last words "scan the whole tree…").
+const REVIEW_DIFF_MAX_BYTES: usize = 60 * 1024;
+
+/// Best-effort unified diff of `files` in `repo` for the reviewer brief:
+/// `git diff` for tracked changes plus an explicit list of untracked (new)
+/// files. `None` when git is unavailable or shows nothing (fall back to the
+/// file-list brief).
+async fn review_diff(repo: &std::path::Path, files: &[String]) -> Option<String> {
+    let repo = repo.to_path_buf();
+    let files = files.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let run = |args: &[&str]| -> Option<String> {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .arg("--")
+                .args(&files)
+                .output()
+                .ok()?;
+            out.status.success().then(|| {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            })
+        };
+        let diff = run(&["diff"]).unwrap_or_default();
+        let untracked: Vec<String> = run(&["status", "--porcelain"])
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_prefix("?? ").map(|p| p.trim().to_string()))
+            .collect();
+        if diff.trim().is_empty() && untracked.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        if !diff.trim().is_empty() {
+            if diff.len() > REVIEW_DIFF_MAX_BYTES {
+                let mut cut = REVIEW_DIFF_MAX_BYTES;
+                while !diff.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                out.push_str(&diff[..cut]);
+                out.push_str("\n… [diff truncated — run `git diff -- <file>` for the rest]\n");
+            } else {
+                out.push_str(&diff);
+            }
+        }
+        if !untracked.is_empty() {
+            out.push_str("\nNEW (untracked) files — each is entirely part of the change; read it directly:\n");
+            for path in untracked {
+                out.push_str(&format!("- {path}\n"));
+            }
+        }
+        Some(out)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// The brief handed to a harness-launched reviewer.
 ///
-/// It names the task and the files that changed and nothing else: the reviewer
-/// is read-only and must reach its own conclusions from the code, not from the
-/// implementing agent's account of what it did.
-fn review_brief(goal: &str, files: &[String]) -> String {
+/// It names the task, the changed files, and — when derivable — the actual
+/// unified diff, with a bounded conclusion contract. The reviewer is read-only
+/// and must reach its own conclusions from the code, not from the implementing
+/// agent's account of what it did; but it must judge THE CHANGE, not re-derive
+/// it: briefs that only listed file paths sent every recent reviewer into
+/// whole-repository exploration and round-budget death with zero findings.
+fn review_brief(goal: &str, files: &[String], diff: Option<&str>) -> String {
     // A wide diff is exactly the case that triggers review; listing hundreds of
     // paths would spend the reviewer's context before it reads anything.
     const MAX_LISTED: usize = 40;
@@ -1921,14 +1988,33 @@ fn review_brief(goal: &str, files: &[String]) -> String {
     } else {
         String::new()
     };
+    let change = match diff {
+        Some(diff) => format!(
+            "The change, as a unified diff of the changed file(s):\n\
+             ```diff\n{diff}\n```\n\n\
+             Judge THIS diff — do not survey the rest of the repository. Read a \
+             changed file or its direct callers only where the diff's context is \
+             not enough to judge correctness."
+        ),
+        None => format!(
+            "Files changed:\n{listed}{more}\n\n\
+             Start from the change itself: if git is available, run \
+             `git diff -- <file>` on the changed files first; only read beyond \
+             the change where its context is not enough to judge correctness. \
+             Do not survey the rest of the repository."
+        ),
+    };
     format!(
         "Independently review the change that was just made for this task.\n\n\
          Task: {goal}\n\n\
-         Files changed:\n{listed}{more}\n\n\
-         Read the changed files and the code they interact with, then report the \
-         concrete defects you can point at — correctness, security, concurrency \
-         and error paths first. Name the file and the specific problem for each. \
-         If you find nothing blocking, say so."
+         {change}\n\n\
+         Report each concrete defect the moment you confirm it with one \
+         report_finding call — correctness, security, concurrency and error \
+         paths first — naming the file and the specific problem. Your round \
+         budget is small and fixed: when every hunk is judged, conclude \
+         immediately with a short final verdict — the defects found, or an \
+         explicit \"no blocking defects\". Do not re-run builds or tests; do \
+         not invent findings."
     )
 }
 
@@ -1978,6 +2064,110 @@ fn gate_plan(spec: &TaskSpec) -> VerificationPlan {
         leveler_verifier::discover::plan_for_repo(&spec.coding.repository)
     } else {
         spec.coding.verification.clone()
+    }
+}
+
+#[cfg(test)]
+mod review_brief_tests {
+    use super::*;
+
+    /// Accident regression (reviewer stability): a brief that only lists file
+    /// paths makes the reviewer re-derive the change by reading whole files —
+    /// 7/7 recent production launches died at their round budget with zero
+    /// findings. With a diff available, the brief must scope the review to it
+    /// and demand a bounded conclusion.
+    #[test]
+    fn a_brief_with_a_diff_scopes_review_to_the_diff_and_demands_a_verdict() {
+        let files = vec!["src/a.rs".to_string()];
+        let brief = review_brief(
+            "add --json",
+            &files,
+            Some("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new"),
+        );
+        assert!(brief.contains("```diff"), "{brief}");
+        assert!(brief.contains("-old\n+new"), "{brief}");
+        assert!(brief.contains("Judge THIS diff"), "{brief}");
+        assert!(
+            brief.contains("do not survey the rest of the repository"),
+            "{brief}"
+        );
+        assert!(brief.contains("no blocking defects"), "{brief}");
+        assert!(brief.contains("report_finding"), "{brief}");
+    }
+
+    #[test]
+    fn a_brief_without_a_diff_still_directs_diff_first_and_bounded_conclusion() {
+        let files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let brief = review_brief("add --json", &files, None);
+        assert!(brief.contains("- src/a.rs"), "{brief}");
+        assert!(brief.contains("git diff -- <file>"), "{brief}");
+        assert!(brief.contains("Do not survey the rest"), "{brief}");
+        assert!(brief.contains("no blocking defects"), "{brief}");
+    }
+
+    #[tokio::test]
+    async fn review_diff_reports_tracked_hunks_and_untracked_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-review-diff-{}",
+            std::process::id() as u64 * 37 + 5
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("a.txt"), "new\n").unwrap();
+        std::fs::write(dir.join("fresh.txt"), "brand new\n").unwrap();
+
+        let diff = review_diff(&dir, &["a.txt".to_string(), "fresh.txt".to_string()])
+            .await
+            .expect("a real change must produce a diff");
+        assert!(diff.contains("-old"), "{diff}");
+        assert!(diff.contains("+new"), "{diff}");
+        assert!(diff.contains("NEW (untracked)"), "{diff}");
+        assert!(diff.contains("fresh.txt"), "{diff}");
+
+        // No git repo → honest None (brief falls back to the file list form).
+        let bare = std::env::temp_dir().join(format!(
+            "leveler-review-diff-bare-{}",
+            std::process::id() as u64 * 37 + 6
+        ));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("a.txt"), "x\n").unwrap();
+        assert!(review_diff(&bare, &["a.txt".to_string()]).await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn an_oversized_diff_is_truncated_with_an_explicit_marker() {
+        // The truncation lives in review_diff's blocking closure; assert the
+        // brief side stays well-formed with a marker-bearing diff.
+        let big = "x".repeat(10);
+        let brief = review_brief(
+            "goal",
+            &["a".to_string()],
+            Some(&format!(
+                "{big}\n… [diff truncated — run `git diff -- <file>` for the rest]"
+            )),
+        );
+        assert!(brief.contains("diff truncated"), "{brief}");
     }
 }
 
