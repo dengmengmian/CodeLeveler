@@ -43,7 +43,7 @@ A delegation opportunity exists when the current task contains a subtask with al
 Eligibility: `depth == 0 ∧ allow_delegation`. Trigger, whichever comes first:
 
 - **T-plan:** first successful ModelExplicit `update_plan` with more than one incomplete step — the model has just written its own decomposition.
-- **T-mutation (fallback):** first successful file mutation when no structured plan was registered — one edit in, before substantial implementation.
+- **T-mutation (fallback, `mutation_fallback`):** second mutating round with no structured plan registered — deliberately one mutating round late, so a lone prep edit followed by `update_plan` still yields the plan-anchored per-step form.
 
 Effect: inject **one** neutral user message (same mechanism as scoped-rule/contract injections): assess whether any registered step is a bounded independent workstream; if yes, `spawn_agent role='worker'` with self-contained task + exact owned files; if no, keep everything and continue — KEEP is fully valid; this will not be asked again. No forbidden directives ("prefer Worker", "delegate when possible", thresholds, keywords). No tool is stripped, no call is blocked, no reply is required.
 
@@ -53,7 +53,7 @@ Nag control: `ProgressLedger.delegation_decision_offered: bool` (serde-default, 
 
 No new tool, no hidden reasoning. The harness derives and durably records the outcome as a `DelegationStage { action, detail }` event (ReviewStage pattern: persisted, LocalOnly, no public projection):
 
-- `offered` — decision point fired (`detail` = trigger: plan | first_mutation)
+- `offered` — decision point fired (`detail` = trigger: plan | mutation_fallback)
 - `delegated` — first Worker admitted after spawn admission (`detail` = scope)
 - `kept` — first successful mutation *after* the offer with zero Workers spawned so far
 

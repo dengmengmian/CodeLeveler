@@ -3974,7 +3974,7 @@ async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded()
 /// edit leaves room for a plan to land first) — and a later mutation records
 /// KEEP.
 #[tokio::test]
-async fn first_mutation_is_the_fallback_decision_point_without_a_plan() {
+async fn the_second_mutating_round_is_the_fallback_decision_point_without_a_plan() {
     let dir = tmp("decision-mutation", 42);
     std::fs::write(dir.join("a.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();

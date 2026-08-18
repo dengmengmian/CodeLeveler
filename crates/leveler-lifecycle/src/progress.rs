@@ -97,6 +97,14 @@ pub struct ProgressLedger {
     /// (no nag loop across windows).
     #[serde(default)]
     pub delegation_decision_offered: bool,
+    /// A `kept` disposition fact was already recorded this goal epoch, so
+    /// continue/resume/repair windows do not re-record it (one fact per epoch,
+    /// not one per window).
+    #[serde(default)]
+    pub delegation_kept_recorded: bool,
+    /// A `delegated` disposition fact was already recorded this goal epoch.
+    #[serde(default)]
+    pub delegation_delegated_recorded: bool,
 }
 
 impl ProgressLedger {

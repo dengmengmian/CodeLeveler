@@ -1248,6 +1248,23 @@ mod contract_tests {
         assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
     }
 
+    /// MA-WA1: DelegationStage is a persisted disposition fact whose `detail`
+    /// may carry file paths — it must replay exactly, never travel beyond the
+    /// local machine, and never be dropped as transient.
+    #[test]
+    fn delegation_stage_is_persisted_local_only_and_round_trips() {
+        let event = EngineEvent::DelegationStage {
+            action: "delegated".to_string(),
+            detail: "src/output, src/cmd/dedup.rs".to_string(),
+        };
+        assert!(!event.is_transient());
+        assert_eq!(event.data_class(), DataClass::LocalOnly);
+        assert!(event.public_projection().is_none());
+        let (tag, payload) = event.to_row().unwrap();
+        assert_eq!(tag, "delegation_stage");
+        assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
+    }
+
     #[test]
     fn legacy_tool_started_without_risk_remains_readable_and_unknown() {
         let payload = r#"{"type":"tool_call_started","payload":{"call_id":"c1","name":"read_file","arguments":"{}"}}"#;

@@ -160,11 +160,16 @@ impl Executor {
         // Sub-agents spawned so far this run (bounds total delegation).
         let mut agents_spawned = 0usize;
         // MA-WA1: one-shot keep-vs-delegate decision point. Eligible only for
-        // top-level runs with delegation on; a prior window's offer (seeded via
-        // ProgressLedger) is never re-asked.
+        // top-level runs with delegation on; a prior window's offer and
+        // disposition facts (seeded via ProgressLedger) are never re-asked or
+        // re-recorded.
         let mut delegation_decision = DelegationDecisionPoint::new(
             self.policy.allow_delegation && self.depth == 0,
-            progress.delegation_decision_offered,
+            crate::sub_agent::DelegationPrior {
+                offered: progress.delegation_decision_offered,
+                kept: progress.delegation_kept_recorded,
+                delegated: progress.delegation_delegated_recorded,
+            },
         );
         // Accumulated elevations from approved request_permissions this turn.
         let mut turn_grants = crate::injected_tools::TurnPermissionGrants::default();
@@ -2366,15 +2371,23 @@ impl Executor {
             for action in delegation_decision.end_round() {
                 match action {
                     DelegationRoundAction::RecordDelegated(scope) => {
+                        progress.delegation_delegated_recorded = true;
                         observer(AgentEvent::DelegationStage {
                             action: "delegated".to_string(),
                             detail: scope,
                         });
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
                     }
                     DelegationRoundAction::RecordKept => {
+                        progress.delegation_kept_recorded = true;
                         observer(AgentEvent::DelegationStage {
                             action: "kept".to_string(),
                             detail: String::new(),
+                        });
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
                         });
                     }
                     DelegationRoundAction::Offer { trigger, steps } => {

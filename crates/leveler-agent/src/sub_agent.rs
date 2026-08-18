@@ -116,8 +116,8 @@ pub fn multi_agent_steer_hint() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DelegationRoundAction {
     /// Inject the one-shot keep-vs-delegate request. `trigger` (`plan` |
-    /// `first_mutation`) labels the durable `offered` fact; `steps` carries the
-    /// model's own open plan steps (empty on the mutation fallback) so the
+    /// `mutation_fallback`) labels the durable `offered` fact; `steps` carries
+    /// the model's own open plan steps (empty on the mutation fallback) so the
     /// request is anchored to the registered decomposition, item by item.
     Offer {
         trigger: &'static str,
@@ -129,14 +129,25 @@ pub(crate) enum DelegationRoundAction {
     RecordDelegated(String),
 }
 
+/// Disposition facts already recorded in earlier windows of this goal epoch
+/// (seeded from `ProgressLedger`), so continue/resume/repair windows neither
+/// re-ask nor re-record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DelegationPrior {
+    pub offered: bool,
+    pub kept: bool,
+    pub delegated: bool,
+}
+
 /// One-shot keep-vs-delegate decision point (MA-WA1).
 ///
 /// The prior architecture had no decision layer at all: the only delegation
 /// input was a round-1 hint, never re-anchored at the moment the model's own
 /// decomposition made the judgment possible. This struct guarantees exactly one
 /// neutral decision point per goal epoch — at plan registration (decomposition
-/// written down) or, for plan-less runs, at the first mutation — and derives an
-/// observable disposition from behavior, never from self-report or hidden
+/// written down) or, for plan-less runs, at the second mutating round — and
+/// derives an observable disposition from behavior, never from self-report or
+/// hidden
 /// reasoning. It never blocks a call, never repeats, and treats KEEP as a
 /// first-class outcome.
 #[derive(Debug, Clone)]
@@ -163,13 +174,13 @@ pub(crate) struct DelegationDecisionPoint {
 }
 
 impl DelegationDecisionPoint {
-    pub(crate) fn new(eligible: bool, already_offered: bool) -> Self {
+    pub(crate) fn new(eligible: bool, prior: DelegationPrior) -> Self {
         Self {
             eligible,
-            offered: already_offered,
-            offer_visible: already_offered,
-            kept_recorded: false,
-            delegated_recorded: false,
+            offered: prior.offered,
+            offer_visible: prior.offered,
+            kept_recorded: prior.kept,
+            delegated_recorded: prior.delegated,
             mutation_rounds_seen: 0,
             plan_open_steps: Vec::new(),
             mutated_this_round: false,
@@ -579,7 +590,14 @@ impl ChildProfile {
 /// prefix of the other), after `./` normalization. Used to refuse same-batch
 /// workers whose exclusive scopes are not actually exclusive.
 pub(crate) fn scopes_overlap(a: &[String], b: &[String]) -> bool {
-    let norm = |p: &String| p.trim().trim_start_matches("./").to_string();
+    // Trailing slashes stripped for the same reason as the write allowlist:
+    // the schema's directory example is spelled `src/output/`.
+    let norm = |p: &String| {
+        p.trim()
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_string()
+    };
     let covers = |x: &str, y: &str| x == y || y.starts_with(&format!("{x}/"));
     a.iter().map(&norm).any(|pa| {
         b.iter()
@@ -660,6 +678,17 @@ mod profile_tests {
             &["src/auth.rs.bak".to_string()]
         ));
         assert!(!scopes_overlap(&a, &[]));
+        // The schema's directory example carries a trailing slash; overlap
+        // detection must see through it, or two same-batch workers could hold
+        // "src/output/" and "src/output/foo.rs" as disjoint scopes.
+        assert!(scopes_overlap(
+            &["src/output/".to_string()],
+            &["src/output/foo.rs".to_string()]
+        ));
+        assert!(scopes_overlap(
+            &["src/output".to_string()],
+            &["src/output/".to_string()]
+        ));
     }
 }
 
@@ -734,7 +763,7 @@ mod decision_point_tests {
 
     #[test]
     fn plan_registration_triggers_one_offer_and_mutations_then_record_keep() {
-        let mut dp = DelegationDecisionPoint::new(true, false);
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
         dp.note_plan_registered(&steps(&["edit head", "edit tail"]));
         assert_eq!(
             dp.end_round(),
@@ -757,7 +786,7 @@ mod decision_point_tests {
 
     #[test]
     fn the_mutation_fallback_fires_on_the_second_mutating_round() {
-        let mut dp = DelegationDecisionPoint::new(true, false);
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
         dp.note_mutation();
         assert!(
             dp.end_round().is_empty(),
@@ -780,7 +809,7 @@ mod decision_point_tests {
     /// per-step form is the one that produces reviewable dispositions.
     #[test]
     fn a_prep_edit_then_a_plan_still_gets_the_per_step_form() {
-        let mut dp = DelegationDecisionPoint::new(true, false);
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
         dp.note_mutation(); // Cargo.toml prep edit
         assert!(dp.end_round().is_empty());
         dp.note_plan_registered(&steps(&["frequency --json", "stats --json", "dedup"]));
@@ -796,7 +825,7 @@ mod decision_point_tests {
 
     #[test]
     fn a_single_step_plan_waits_for_the_mutation_fallback() {
-        let mut dp = DelegationDecisionPoint::new(true, false);
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
         dp.note_plan_registered(&steps(&["do it"]));
         assert!(dp.end_round().is_empty(), "one step is not a decomposition");
         dp.note_mutation();
@@ -813,7 +842,7 @@ mod decision_point_tests {
 
     #[test]
     fn worker_admission_records_delegated_and_suppresses_offer_and_keep() {
-        let mut dp = DelegationDecisionPoint::new(true, false);
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
         dp.note_worker_admitted(&["src/a.rs".into(), "src/b.rs".into()]);
         dp.note_mutation();
         assert_eq!(
@@ -829,7 +858,7 @@ mod decision_point_tests {
 
     #[test]
     fn delegation_after_keep_is_still_recorded_as_a_fact() {
-        let mut dp = DelegationDecisionPoint::new(true, false);
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
         dp.note_mutation();
         dp.end_round();
         dp.note_mutation();
@@ -846,8 +875,15 @@ mod decision_point_tests {
     #[test]
     fn children_and_disabled_delegation_are_fully_silent() {
         for mut dp in [
-            DelegationDecisionPoint::new(false, false),
-            DelegationDecisionPoint::new(false, true),
+            DelegationDecisionPoint::new(false, DelegationPrior::default()),
+            DelegationDecisionPoint::new(
+                false,
+                DelegationPrior {
+                    offered: true,
+                    kept: false,
+                    delegated: false,
+                },
+            ),
         ] {
             dp.note_plan_registered(&steps(&["a", "b", "c"]));
             dp.note_mutation();
@@ -860,7 +896,14 @@ mod decision_point_tests {
     fn a_prior_window_offer_is_never_re_asked() {
         // Resume: ProgressLedger says the offer already happened. The next
         // mutation records KEEP; no second offer this epoch.
-        let mut dp = DelegationDecisionPoint::new(true, true);
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: false,
+                delegated: false,
+            },
+        );
         assert!(dp.offered());
         dp.note_plan_registered(&steps(&["a", "b", "c", "d"]));
         dp.note_mutation();
@@ -889,6 +932,52 @@ mod decision_point_tests {
                 "banned phrase `{banned}` in: {text}"
             );
         }
+    }
+
+    /// Review finding #2: disposition facts are one-per-epoch, not
+    /// one-per-window. A resumed/repair window seeded with a prior `kept` or
+    /// `delegated` must not re-record it — and must never record a
+    /// contradictory `kept` after a prior-window `delegated`.
+    #[test]
+    fn prior_window_disposition_facts_are_not_re_recorded() {
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+            },
+        );
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "kept already recorded last window"
+        );
+        dp.note_worker_admitted(&["src/a.rs".into()]);
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordDelegated("src/a.rs".into())],
+            "a genuinely new delegated fact is still recordable after kept"
+        );
+
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: false,
+                delegated: true,
+            },
+        );
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "no contradictory kept after a prior-window delegated"
+        );
+        dp.note_worker_admitted(&["src/b.rs".into()]);
+        assert!(
+            dp.end_round().is_empty(),
+            "delegated recorded once per epoch"
+        );
     }
 
     #[test]

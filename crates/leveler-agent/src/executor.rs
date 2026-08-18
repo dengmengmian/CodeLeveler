@@ -197,10 +197,12 @@ pub enum AgentEvent {
     GoalIntercepted { kind: String, detail: String },
     /// MA-WA1 delegation decision observability. `action`: `offered` (the
     /// one-shot keep-vs-delegate decision point was injected; `detail` names
-    /// the trigger: `plan` | `first_mutation`), `delegated` (first Worker
+    /// the trigger: `plan` | `mutation_fallback`), `delegated` (first Worker
     /// admitted; `detail` = its file scope), `kept` (first mutation after the
     /// offer with no Worker spawned — a first-class outcome, not a failure).
-    /// Facts only: never a gate, never completion-relevant.
+    /// Each fact is recorded at most once per goal epoch (ProgressLedger
+    /// carries the flags across continue/resume/repair windows). Facts only:
+    /// never a gate, never completion-relevant.
     DelegationStage { action: String, detail: String },
     /// Full process-evidence ledger snapshot after a mutation/verify/receipt/
     /// intercept change. SoT for resume of Delivery gates (last snapshot wins).
