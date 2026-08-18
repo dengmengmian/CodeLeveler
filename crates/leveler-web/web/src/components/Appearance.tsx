@@ -28,6 +28,74 @@ function swatchFor(choice: ThemeChoice) {
 
 // ── 顶栏快捷切换 ────────────────────────────────────────────────────
 
+/** Header ⋯：外观 / 设置。不占主栏权重。 */
+export function MoreMenu() {
+  const [open, setOpen] = useState(false);
+  const [settings, setSettings] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('click', onDocClick);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', onDocClick);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="more-menu" ref={wrapRef}>
+      <button
+        type="button"
+        className="th-btn more-btn"
+        title="更多"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        ⋯
+      </button>
+      {open && (
+        <div className="th-pop" role="menu">
+          <button
+            type="button"
+            className="th-item"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              setSettings(true);
+            }}
+          >
+            <span className="th-name">Appearance</span>
+          </button>
+          <button
+            type="button"
+            className="th-item"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              setSettings(true);
+            }}
+          >
+            <span className="th-name">Settings</span>
+          </button>
+          <button type="button" className="th-item" role="menuitem" disabled>
+            <span className="th-name">Keyboard Shortcuts</span>
+          </button>
+        </div>
+      )}
+      {settings && <SettingsModal onClose={() => setSettings(false)} />}
+    </div>
+  );
+}
+
 export function ThemeMenu() {
   const choice = useThemeChoice();
   const [open, setOpen] = useState(false);

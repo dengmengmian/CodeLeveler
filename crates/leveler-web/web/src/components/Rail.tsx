@@ -20,10 +20,9 @@ interface ProjectGroup {
 
 type Panel = 'sessions' | 'files' | 'search' | 'git';
 
-const PANELS: ReadonlyArray<readonly [Panel, string]> = [
-  ['sessions', '会话'],
-  ['files', '文件'],
-  ['search', '搜索'],
+const WORKSPACE: ReadonlyArray<readonly [Exclude<Panel, 'sessions'>, string]> = [
+  ['files', 'Files'],
+  ['search', 'Search'],
   ['git', 'Git'],
 ];
 
@@ -33,38 +32,48 @@ export function Rail() {
   const [panel, setPanel] = useState<Panel>('sessions');
 
   return (
-    <aside className="rail">
+    <aside className={`rail${state.railOpen ? '' : ' is-hidden'}`} aria-label="项目与会话">
       <div className="brand" title={`CodeLeveler web · v${__APP_VERSION__}`}>
         <BrandMark />
         <div className="name">CodeLeveler</div>
-        <span className="ver">v{__APP_VERSION__}</span>
       </div>
 
-      <button className="rail-new" onClick={() => bridge.newDraft()}>
+      <button type="button" className="rail-new" onClick={() => bridge.newDraft()}>
         ＋ 新对话
       </button>
-
-      <div className="rail-tabs">
-        {PANELS.map(([key, label]) => (
-          <button
-            key={key}
-            className={`rail-tab${panel === key ? ' on' : ''}`}
-            onClick={() => setPanel(key)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
 
       {panel === 'sessions' && <SessionsPanel />}
       {panel === 'files' && <FilesPanel />}
       {panel === 'search' && <SearchPanel />}
       {panel === 'git' && <GitPanel />}
 
+      <div className="rail-workspace">
+        <div className="rail-ws-label">Workspace</div>
+        <div className="rail-ws-row">
+          <button
+            type="button"
+            className={`rail-tab${panel === 'sessions' ? ' on' : ''}`}
+            onClick={() => setPanel('sessions')}
+          >
+            Sessions
+          </button>
+          {WORKSPACE.map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              className={`rail-tab${panel === key ? ' on' : ''}`}
+              onClick={() => setPanel(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
       <div className="rail-foot">
         <span className={`led${state.connection === 'online' ? '' : ' off'}`} />
         <span>
-          Daemon · {state.connection === 'online' ? '已连接' : '重连中'} · {window.location.host}
+          Daemon · {state.connection === 'online' ? '已连接' : '重连中'}
         </span>
       </div>
     </aside>

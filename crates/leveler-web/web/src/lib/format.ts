@@ -80,6 +80,13 @@ export function toolSummary(name: string, argumentsJson: string): { verb: string
   return { verb: name, main };
 }
 
+/** 回合计时：01:42 */
+export function formatElapsed(totalSecs: number): string {
+  const m = Math.floor(Math.max(0, totalSecs) / 60);
+  const s = Math.max(0, totalSecs) % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 /** 工具耗时展示：12ms / 3.2s。 */
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;

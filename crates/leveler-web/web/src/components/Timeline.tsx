@@ -157,10 +157,10 @@ export function Timeline() {
         <AgentRunBlock />
 
         {current.pendingApprovals.map((a) => (
-          <ApprovalCard key={a.id} request={a} />
+          <ApprovalCard key={a.id} request={a} variant="record" />
         ))}
         {current.pendingClarifications.map((c) => (
-          <ClarificationCard key={c.id} request={c} />
+          <ClarificationCard key={c.id} request={c} variant="record" />
         ))}
       </div>
 

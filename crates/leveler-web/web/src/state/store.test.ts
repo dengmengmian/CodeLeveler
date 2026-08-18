@@ -53,6 +53,22 @@ describe('product axes', () => {
   });
 });
 
+describe('chrome / diff focus', () => {
+  it('focus_diff opens the changes workspace on that file', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'focus_diff', path: 'src/auth.rs' });
+    expect(state.stageView).toBe('diff');
+    expect(state.diffFocus).toBe('src/auth.rs');
+  });
+
+  it('toggle_inspector flips the drawer', () => {
+    const state = structuredClone(initialState);
+    expect(state.inspectorOpen).toBe(true);
+    reducer(state, { type: 'toggle_inspector' });
+    expect(state.inspectorOpen).toBe(false);
+  });
+});
+
 describe('turn terminal truth', () => {
   it('keeps the full outcome and detail on lastTurn', () => {
     const state = stateWithSession();

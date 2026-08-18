@@ -178,6 +178,10 @@ export interface AppState {
   draftProject: string | null;
   /** 待注入到输入框的文本（空状态快捷操作 → Composer 消费后清空） */
   composerSeed: string | null;
+  /** Diff 工作区当前聚焦的文件；null = 用列表第一项 */
+  diffFocus: string | null;
+  railOpen: boolean;
+  inspectorOpen: boolean;
 }
 
 export const initialState: AppState = {
@@ -193,6 +197,9 @@ export const initialState: AppState = {
   projects: [],
   draftProject: null,
   composerSeed: null,
+  diffFocus: null,
+  railOpen: true,
+  inspectorOpen: true,
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -204,6 +211,10 @@ export type Action =
   | { type: 'select_session'; id: SessionId }
   | { type: 'new_draft'; project?: string | null }
   | { type: 'stage_view'; view: StageView }
+  | { type: 'focus_diff'; path: string | null }
+  | { type: 'toggle_rail' }
+  | { type: 'toggle_inspector' }
+  | { type: 'set_inspector'; open: boolean }
   | { type: 'user_message'; id: string; text: string; time: string }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
@@ -373,7 +384,10 @@ export function reducer(state: AppState, action: Action): void {
     }
     case 'select_session':
       state.draft = false;
-      if (state.current?.id !== action.id) state.current = null; // 等 snapshot
+      if (state.current?.id !== action.id) {
+        state.current = null; // 等 snapshot
+        state.diffFocus = null;
+      }
       return;
     case 'new_draft':
       state.draft = true;
@@ -382,6 +396,19 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'stage_view':
       state.stageView = action.view;
+      return;
+    case 'focus_diff':
+      state.stageView = 'diff';
+      state.diffFocus = action.path;
+      return;
+    case 'toggle_rail':
+      state.railOpen = !state.railOpen;
+      return;
+    case 'toggle_inspector':
+      state.inspectorOpen = !state.inspectorOpen;
+      return;
+    case 'set_inspector':
+      state.inspectorOpen = action.open;
       return;
     case 'user_message': {
       if (!state.current) return;

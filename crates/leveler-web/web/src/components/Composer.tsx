@@ -10,10 +10,10 @@ import {
   collaborationLabel,
   modelLabel,
   modelRefString,
-  permissionMeta,
   reasoningLabel,
   workProfileLabel,
 } from '../lib/format';
+import { runConfigSummary } from '../lib/runConfig';
 import { uploadAttachment } from '../lib/api';
 import type { ModelRef, PermissionProfile } from '../types/protocol';
 
@@ -42,7 +42,7 @@ const OPEN_POPUP: Record<string, Popup> = {
   '/perm': 'perm',
 };
 
-type Popup = 'perm' | 'work' | 'collab' | 'model' | null;
+type Popup = 'perm' | 'work' | 'collab' | 'model' | 'run' | null;
 
 const PERMISSIONS: ReadonlyArray<{
   profile: PermissionProfile;
@@ -198,7 +198,6 @@ export function Composer() {
     }
   };
 
-  const perm = permissionMeta(current?.permission ?? 'assisted');
   const workProfile = current?.workProfile ?? 'balanced';
   const collaboration = current?.collaboration ?? 'chat';
   const reasoning = reasoningLabel(current?.reasoningEffort ?? null);
@@ -348,155 +347,93 @@ export function Composer() {
               >
                 {uploading ? '上传中…' : '＋ 附件'}
               </button>
-              <button className="c-chip" title="上下文引用暂未开放" disabled>
-                @ 上下文
-              </button>
-
-              <span className="perm-wrap">
-                <button
-                  className={`c-chip perm-btn ${perm.cls}`}
-                  title="权限档位"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setPopup(popup === 'perm' ? null : 'perm');
-                  }}
-                >
-                  <span className="shield">◈</span>
-                  <span>{perm.label}</span>
-                  <span className="caret">▴</span>
-                </button>
-                {popup === 'perm' && (
-                  <div className="pop">
-                    <div className="pop-head">权限档位 · 全局生效</div>
-                    {PERMISSIONS.map((p) => (
-                      <button
-                        key={p.profile}
-                        className={`pop-item${current?.permission === p.profile ? ' sel' : ''}`}
-                        onClick={() => {
-                          bridge.setPermission(p.profile);
-                          setPopup(null);
-                        }}
-                      >
-                        <span className="cmd" style={{ color: p.color }}>
-                          {p.label}
-                        </span>
-                        <span className="desc">{p.desc}</span>
-                        <span className="cur">{current?.permission === p.profile ? '当前' : p.tag}</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </span>
-
-              <span className="perm-wrap">
-                <button
-                  className="c-chip"
-                  title="工作档（work_profile 轴）"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setPopup(popup === 'work' ? null : 'work');
-                  }}
-                >
-                  <span>{workProfileLabel(workProfile)}</span>
-                  <span className="caret">▴</span>
-                </button>
-                {popup === 'work' && (
-                  <div className="pop">
-                    <div className="pop-head">工作档 · 回合空闲时可切</div>
-                    {WORK_OPTIONS.map(([w, desc]) => (
-                      <button
-                        key={w}
-                        className={`pop-item${workProfile === w ? ' sel' : ''}`}
-                        onClick={() => {
-                          bridge.setAxes(w, collaboration);
-                          setPopup(null);
-                        }}
-                      >
-                        <span className="cmd">{workProfileLabel(w)}</span>
-                        <span className="desc">{desc}</span>
-                        <span className="cur">{workProfile === w ? '当前' : ''}</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </span>
-
-              <span className="perm-wrap">
-                <button
-                  className="c-chip"
-                  title="协作档（collaboration 轴）"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setPopup(popup === 'collab' ? null : 'collab');
-                  }}
-                >
-                  <span>{collaborationLabel(collaboration)}</span>
-                  <span className="caret">▴</span>
-                </button>
-                {popup === 'collab' && (
-                  <div className="pop">
-                    <div className="pop-head">协作档 · goal = 目标闭环，plan = 只读方案</div>
-                    {COLLAB_OPTIONS.map(([c, desc]) => (
-                      <button
-                        key={c}
-                        className={`pop-item${collaboration === c ? ' sel' : ''}`}
-                        onClick={() => {
-                          bridge.setAxes(workProfile, c);
-                          setPopup(null);
-                        }}
-                      >
-                        <span className="cmd">{collaborationLabel(c)}</span>
-                        <span className="desc">{desc}</span>
-                        <span className="cur">{collaboration === c ? '当前' : ''}</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </span>
-
               <span className="spacer" />
 
               <span className="perm-wrap">
                 <button
-                  className="c-chip"
+                  type="button"
+                  className="c-chip run-summary"
+                  title="运行配置"
+                  aria-haspopup="dialog"
+                  aria-expanded={popup === 'run'}
                   onClick={(e) => {
                     e.stopPropagation();
-                    setPopup(popup === 'model' ? null : 'model');
+                    setPopup(popup === 'run' ? null : 'run');
                   }}
                 >
-                  <b style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
-                    {modelLabel(current?.model)}
-                    {/* runtime 决议后的 reasoning effort，只展示不发明（无档位则不显示） */}
-                    {reasoning ? ` · ${reasoning}` : ''}
-                  </b>{' '}
+                  {runConfigSummary({
+                    modelLabel: modelLabel(current?.model),
+                    reasoning,
+                    workProfile,
+                    collaboration,
+                    permission: current?.permission ?? 'assisted',
+                  })}
                   <span className="caret">▴</span>
                 </button>
-                {popup === 'model' && (
-                  <div className="pop pop-right">
-                    <div className="pop-head">模型 · 来自 snapshot.available_models</div>
-                    {models.length === 0 && (
-                      <button className="pop-item" disabled>
-                        <span className="desc">暂无可用模型</span>
-                      </button>
-                    )}
+                {popup === 'run' && (
+                  <div className="pop pop-right run-pop" role="dialog" aria-label="Run Configuration">
+                    <div className="pop-head">Run Configuration</div>
+                    <div className="run-sec">Model</div>
+                    {models.length === 0 && <div className="insp-empty">暂无可用模型</div>}
                     {models.map((m: ModelRef) => {
                       const ref = modelRefString(m);
                       const isCurrent = ref === currentModelRef;
                       return (
                         <button
                           key={ref}
+                          type="button"
                           className={`pop-item${isCurrent ? ' sel' : ''}`}
-                          onClick={() => {
-                            bridge.setModel(m);
-                            setPopup(null);
-                          }}
+                          onClick={() => bridge.setModel(m)}
                         >
                           <span className="cmd">{m.model}</span>
                           <span className="desc">{m.provider}</span>
-                          <span className="cur">{isCurrent ? '当前' : ''}</span>
                         </button>
                       );
                     })}
+                    {reasoning && (
+                      <>
+                        <div className="run-sec">Reasoning</div>
+                        <div className="run-readonly">{reasoning}</div>
+                      </>
+                    )}
+                    <div className="run-sec">Work Profile</div>
+                    {WORK_OPTIONS.map(([w, desc]) => (
+                      <button
+                        key={w}
+                        type="button"
+                        className={`pop-item${workProfile === w ? ' sel' : ''}`}
+                        onClick={() => bridge.setAxes(w, collaboration)}
+                      >
+                        <span className="cmd">{workProfileLabel(w)}</span>
+                        <span className="desc">{desc}</span>
+                      </button>
+                    ))}
+                    <div className="run-sec">Collaboration</div>
+                    {COLLAB_OPTIONS.map(([c, desc]) => (
+                      <button
+                        key={c}
+                        type="button"
+                        className={`pop-item${collaboration === c ? ' sel' : ''}`}
+                        onClick={() => bridge.setAxes(workProfile, c)}
+                      >
+                        <span className="cmd">{collaborationLabel(c)}</span>
+                        <span className="desc">{desc}</span>
+                      </button>
+                    ))}
+                    <div className="run-sec">Permission</div>
+                    {PERMISSIONS.map((p) => (
+                      <button
+                        key={p.profile}
+                        type="button"
+                        className={`pop-item${current?.permission === p.profile ? ' sel' : ''}`}
+                        onClick={() => bridge.setPermission(p.profile)}
+                      >
+                        <span className="cmd" style={{ color: p.color }}>
+                          {p.label}
+                        </span>
+                        <span className="desc">{p.desc}</span>
+                      </button>
+                    ))}
                   </div>
                 )}
               </span>

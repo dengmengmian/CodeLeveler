@@ -1,31 +1,23 @@
-// 右栏任务面板：任务 / 验证 / 历史 / 记忆 四个 tab。
-// 「任务」以执行进度为中心：当前任务与状态、Main/子 agent 树（multi-agent）、
-// 执行计划、改动摘要（点击切中央 Changes 视图，不在右栏重复 diff 明细）、
-// 待确认事项、工具调用统计；「记忆」承载 memory_list 的
-// active/pending/archived 与 接受/遗忘（用户权威操作）。
+// 右栏任务面板：任务 / 验证 / 检查点 / 记忆。
+// 「任务」按状态换优先级：等待操作 > 运行中 > 终态 > 空闲。
+// 不在这里铺完整工具列表或完整 Diff。
 
 import { useEffect, useState } from 'react';
 import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
 import { useBridge } from '../state/bridge';
-import { formatTokens } from '../lib/format';
-import type { CheckState, PlanStepStatus } from '../types/protocol';
+import { formatElapsed, formatTokens } from '../lib/format';
+import { currentPlanProgress, inspectorMode } from '../lib/inspectorModel';
+import { presentTurnEnd } from '../lib/turn';
+import type { CheckState, UiApprovalRequest, UiClarificationRequest } from '../types/protocol';
 
 type Tab = 'task' | 'verify' | 'ckpt' | 'memory';
 
 const TABS: ReadonlyArray<readonly [Tab, string]> = [
   ['task', '任务'],
   ['verify', '验证'],
-  ['ckpt', '历史'],
+  ['ckpt', '检查点'],
   ['memory', '记忆'],
 ];
-
-const STEP_LABEL: Record<PlanStepStatus, string> = {
-  done: '已完成',
-  running: '进行中',
-  failed: '失败',
-  skipped: '跳过',
-  pending: '待执行',
-};
 
 const CHECK_GLYPH: Record<CheckState, string> = {
   passed: '✓',
@@ -34,27 +26,25 @@ const CHECK_GLYPH: Record<CheckState, string> = {
   skipped: '·',
 };
 
-/** 任务状态：待确认 > 运行中 > 空闲 */
-function taskStatus(current: SessionView | null): { cls: 'run' | 'wait' | 'idle'; label: string } {
-  if (!current) return { cls: 'idle', label: '无会话' };
-  if (current.pendingApprovals.length > 0 || current.pendingClarifications.length > 0) {
-    return { cls: 'wait', label: '等待确认' };
-  }
-  if (current.turnActive) return { cls: 'run', label: '运行中' };
-  return { cls: 'idle', label: '空闲' };
-}
-
 export function Inspector() {
   const [tab, setTab] = useState<Tab>('task');
-  const current = useAppState().current;
+  const state = useAppState();
+  const current = state.current;
   const bridge = useBridge();
+  const mode = inspectorMode(current);
+
+  useEffect(() => {
+    if (mode === 'waiting') setTab('task');
+  }, [mode]);
 
   return (
-    <aside className="inspector">
-      <div className="insp-tabs">
+    <aside className={`inspector${state.inspectorOpen ? '' : ' is-hidden'}`} aria-label="任务面板">
+      <div className="insp-tabs" role="tablist">
         {TABS.map(([key, label]) => (
           <button
             key={key}
+            role="tab"
+            aria-selected={tab === key}
             className={`insp-tab${tab === key ? ' on' : ''}`}
             onClick={() => setTab(key)}
           >
@@ -137,10 +127,8 @@ export function Inspector() {
   );
 }
 
-/** 子 agent 一行：状态 + 昵称/角色 + 当前活动/结果 + token 用量。 */
 function AgentRow({ agent }: { agent: SubAgentView }) {
   const glyph = agent.status === 'run' ? '●' : agent.status === 'done' ? '✓' : '✗';
-  const tokens = agent.tokens.input + agent.tokens.output;
   return (
     <div className={`agent-row ${agent.status}`}>
       <span className="ag-glyph">{glyph}</span>
@@ -154,117 +142,233 @@ function AgentRow({ agent }: { agent: SubAgentView }) {
           <span className="ag-step">{agent.recentStep}</span>
         )}
       </span>
-      {tokens > 0 && <span className="ag-tokens">{formatTokens(tokens)} tok</span>}
+    </div>
+  );
+}
+
+function ChangesJump({ current }: { current: SessionView }) {
+  const dispatch = useAppDispatch();
+  const files = current.diff?.files ?? [];
+  const totalAdd = files.reduce((n, f) => n + f.added, 0);
+  const totalDel = files.reduce((n, f) => n + f.removed, 0);
+  if (files.length === 0) return null;
+  return (
+    <button
+      className="changes-sum as-link"
+      title="在中央区域查看完整 diff"
+      onClick={() => dispatch({ type: 'stage_view', view: 'diff' })}
+    >
+      <span className="n">{files.length} files</span>
+      <span className="add">+{totalAdd}</span>
+      <span className="del">−{totalDel}</span>
+      <span className="goto">→</span>
+    </button>
+  );
+}
+
+function ApprovalActions({ request }: { request: UiApprovalRequest }) {
+  const bridge = useBridge();
+  return (
+    <div className="action-block" role="region" aria-label="需要确认">
+      <div className="action-kicker">⚠ 需要确认</div>
+      <div className="action-body">
+        <div>{request.summary}</div>
+        {request.command && <pre className="action-cmd">{request.command}</pre>}
+      </div>
+      <div className="action-ops">
+        <button className="abtn primary" onClick={() => bridge.decideApproval(request.id, 'approve_once')}>
+          允许一次
+        </button>
+        <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_session')}>
+          本会话允许
+        </button>
+        <button className="abtn danger" onClick={() => bridge.decideApproval(request.id, 'deny')}>
+          拒绝
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ClarificationActions({ request }: { request: UiClarificationRequest }) {
+  const bridge = useBridge();
+  const [answer, setAnswer] = useState('');
+  return (
+    <div className="action-block" role="region" aria-label="需要澄清">
+      <div className="action-kicker">需要澄清</div>
+      <div className="action-body">{request.question}</div>
+      {request.options.length > 0 && (
+        <div className="c-options">
+          {request.options.map((opt) => (
+            <button key={opt} className="abtn" onClick={() => bridge.answerClarification(request.id, opt)}>
+              {opt}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="c-input-row">
+        <input
+          value={answer}
+          aria-label="回答"
+          placeholder="输入回答"
+          onChange={(e) => setAnswer(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') bridge.answerClarification(request.id, answer);
+          }}
+        />
+        <button className="abtn primary" onClick={() => bridge.answerClarification(request.id, answer)}>
+          回答
+        </button>
+      </div>
     </div>
   );
 }
 
 function TaskTab({ current }: { current: SessionView | null }) {
-  const status = taskStatus(current);
-  const dispatch = useAppDispatch();
-  const diffFiles = current?.diff?.files ?? [];
-  const totalAdd = diffFiles.reduce((n, f) => n + f.added, 0);
-  const totalDel = diffFiles.reduce((n, f) => n + f.removed, 0);
-  const pending = current?.pendingApprovals ?? [];
-  const pendingClar = current?.pendingClarifications ?? [];
+  const mode = inspectorMode(current);
+  const elapsed = current?.turnStartedAt
+    ? Math.max(0, Math.floor((Date.now() - current.turnStartedAt) / 1000))
+    : 0;
+  const plan = currentPlanProgress(current?.plan);
   const agents = current?.agents ?? [];
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (mode !== 'running') return;
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [mode]);
 
-  // 工具调用按名称聚合：read × 12
-  const toolAgg = new Map<string, number>();
-  for (const t of current?.tools ?? []) {
-    toolAgg.set(t.name, (toolAgg.get(t.name) ?? 0) + 1);
+  if (!current) {
+    return <div className="insp-empty">先进入一个会话。</div>;
+  }
+
+  if (mode === 'waiting') {
+    return (
+      <>
+        {current.pendingApprovals.map((a) => (
+          <ApprovalActions key={a.id} request={a} />
+        ))}
+        {current.pendingClarifications.map((c) => (
+          <ClarificationActions key={c.id} request={c} />
+        ))}
+        <ChangesJump current={current} />
+      </>
+    );
+  }
+
+  if (mode === 'running') {
+    return (
+      <>
+        <div className="task-card">
+          <div className={`t-status run`}>
+            <i className="dot" />
+            {current.activity ?? '正在运行'}
+          </div>
+          <div className="t-elapsed">{formatElapsed(elapsed)}</div>
+        </div>
+        {plan && (
+          <>
+            <div className="insp-sec">当前步骤</div>
+            <div className="plan-now">
+              {plan.current} / {plan.total} {plan.description}
+            </div>
+          </>
+        )}
+        {agents.length > 0 && (
+          <>
+            <div className="insp-sec">Agents</div>
+            <div className="agent-tree">
+              {agents.map((a) => (
+                <AgentRow key={a.id} agent={a} />
+              ))}
+            </div>
+          </>
+        )}
+        <div className="insp-sec">Changes</div>
+        <ChangesJump current={current} />
+        <details className="insp-more">
+          <summary>更多</summary>
+          <MetaFooter current={current} />
+        </details>
+      </>
+    );
+  }
+
+  if (mode === 'terminal' && current.lastTurn) {
+    const p = presentTurnEnd(current.lastTurn);
+    const sec = Math.round(current.lastTurn.ms / 1000);
+    return (
+      <>
+        <div className={`task-card tone-${p.tone}`}>
+          <div className={`t-status term ${p.tone}`}>
+            <span aria-hidden="true">{p.glyph}</span>
+            {p.label}
+          </div>
+          {sec > 0 && <div className="t-elapsed">{formatElapsed(sec)}</div>}
+          {p.detail && <div className="t-detail">{p.detail}</div>}
+        </div>
+        {current.verification && current.verification.checks.length > 0 && (
+          <>
+            <div className="insp-sec">Verification</div>
+            <div className="checks">
+              {current.verification.checks.map((c) => {
+                const cls = c.status === 'passed' ? 'ok' : c.status === 'failed' ? 'bad' : 'wait';
+                return (
+                  <div className={`check ${cls}`} key={c.name}>
+                    <span className="st">{CHECK_GLYPH[c.status]}</span>
+                    <span>{c.name}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+        <div className="insp-sec">Changes</div>
+        <ChangesJump current={current} />
+        {p.detail && (
+          <>
+            <div className="insp-sec">Outcome</div>
+            <div className="t-detail">{p.detail}</div>
+          </>
+        )}
+      </>
+    );
   }
 
   return (
     <>
       <div className="task-card">
-        <div className="t-goal">{current?.title ?? '新任务'}</div>
-        <div className={`t-status ${status.cls}`}>
+        <div className="t-goal">{current.title || '新任务'}</div>
+        <div className="t-status idle">
           <i className="dot" />
-          {status.label}
+          空闲
         </div>
       </div>
-
-      {agents.length > 0 && (
-        <>
-          <div className="insp-sec">子 Agent</div>
-          <div className="agent-tree">
-            {agents.map((a) => (
-              <AgentRow key={a.id} agent={a} />
-            ))}
-          </div>
-        </>
-      )}
-
-      <div className="insp-sec">执行计划</div>
-      {current?.plan && current.plan.steps.length > 0 ? (
-        <div>
-          {current.plan.steps.map((step) => (
-            <div key={step.index} className={`plan-step ${step.status}`}>
-              <span className="idx">{step.index + 1}</span>
-              <span className="desc">{step.description}</span>
-              <span className="st-label">{STEP_LABEL[step.status]}</span>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="insp-empty">暂无计划 —— 计划模式或编排运行后出现。</div>
-      )}
-
-      <div className="insp-sec">改动</div>
-      {diffFiles.length > 0 ? (
-        <button
-          className="changes-sum as-link"
-          title="在中央区域查看完整 diff"
-          onClick={() => dispatch({ type: 'stage_view', view: 'diff' })}
-        >
-          <span className="n">{diffFiles.length} 个文件</span>
-          <span className="add">+{totalAdd}</span>
-          <span className="del">−{totalDel}</span>
-          <span className="goto">→</span>
-        </button>
-      ) : (
-        <div className="insp-empty">无改动。</div>
-      )}
-
-      <div className="insp-sec">待确认</div>
-      {pending.length + pendingClar.length > 0 ? (
-        <>
-          {pending.map((a) => (
-            <div className="confirm-item" key={a.id}>
-              {a.summary}
-            </div>
-          ))}
-          {pendingClar.map((c) => (
-            <div className="confirm-item" key={c.id}>
-              {c.question}
-            </div>
-          ))}
-        </>
-      ) : (
-        <div className="insp-empty">无</div>
-      )}
-
-      <div className="insp-sec">工具调用</div>
-      {toolAgg.size > 0 ? (
-        <div className="tool-agg">
-          {[...toolAgg.entries()].map(([name, cnt]) => (
-            <div className="row" key={name}>
-              <span>{name}</span>
-              <span className="cnt">× {cnt}</span>
-            </div>
-          ))}
-          <div className="row" style={{ marginTop: 6 }}>
-            <span>tokens 输入/输出</span>
-            <span className="cnt">
-              {formatTokens(current?.tokens.input ?? 0)} / {formatTokens(current?.tokens.output ?? 0)}
-            </span>
-          </div>
-        </div>
-      ) : (
-        <div className="insp-empty">本回合暂无工具调用。</div>
-      )}
+      <ChangesJump current={current} />
     </>
+  );
+}
+
+function MetaFooter({ current }: { current: SessionView }) {
+  const toolAgg = new Map<string, number>();
+  for (const t of current.tools) {
+    toolAgg.set(t.name, (toolAgg.get(t.name) ?? 0) + 1);
+  }
+  return (
+    <div className="tool-agg">
+      {[...toolAgg.entries()].map(([name, cnt]) => (
+        <div className="row" key={name}>
+          <span>{name}</span>
+          <span className="cnt">× {cnt}</span>
+        </div>
+      ))}
+      <div className="row" style={{ marginTop: 6 }}>
+        <span>tokens</span>
+        <span className="cnt">
+          {formatTokens(current.tokens.input)} / {formatTokens(current.tokens.output)}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -273,7 +377,6 @@ function MemoryTab({ current }: { current: SessionView | null }) {
   const memory = current?.memory ?? null;
   const sessionId = current?.id ?? null;
 
-  // 打开 tab 时拉一次列表（含 archived）；之后靠操作后的主动刷新。
   useEffect(() => {
     if (sessionId) bridge.listMemory();
   }, [sessionId, bridge]);
