@@ -25,15 +25,15 @@ const APPROVAL_KEYS: Record<string, ApprovalDecision> = {
   n: 'deny',
 };
 
-type StageView = 'chat' | 'diff';
-
 function Shell() {
   const state = useAppState();
   const dispatch = useAppDispatch();
   const stateRef = useRef<AppState>(state);
   stateRef.current = state;
   const [bridge] = useState(() => new RuntimeBridge(dispatch, () => stateRef.current));
-  const [view, setView] = useState<StageView>('chat');
+  // 中央视图在 store（Inspector 的改动摘要可以切过来）
+  const view = state.stageView;
+  const setView = (v: 'chat' | 'diff') => dispatch({ type: 'stage_view', view: v });
 
   useEffect(() => {
     bridge.start();

@@ -6,8 +6,9 @@ import type { Dispatch } from 'react';
 import * as api from './api';
 import { formatClock, modelRefString } from './format';
 import { getToken } from './token';
+import { commandProgressLabel, turnEndFromEvent, turnProgressLabel } from './turn';
 import { deliverFrame, WsClient } from './ws';
-import type { Action, AgentMode, AppState } from '../state/store';
+import type { Action, AppState } from '../state/store';
 import type {
   ApprovalDecision,
   CheckpointId,
@@ -19,7 +20,10 @@ import type {
   SessionId,
   UiSessionSnapshot,
 } from '../types/protocol';
-import { TURN_TERMINAL_TYPES } from '../types/protocol';
+
+/** 产品轴合法值（wire 契约：SetProductAxes 的注释）。 */
+export const WORK_PROFILES = ['economy', 'balanced', 'delivery'] as const;
+export const COLLABORATIONS = ['chat', 'plan', 'goal'] as const;
 
 type GetState = () => AppState;
 
@@ -136,7 +140,7 @@ export class RuntimeBridge {
         this.dispatch({ type: 'assistant_started', id: ev.message_id, time: formatClock() });
         break;
       case 'assistant_attempt_reset':
-        this.dispatch({ type: 'assistant_reset', id: ev.message_id });
+        this.dispatch({ type: 'assistant_reset', id: ev.message_id ?? null });
         break;
       case 'assistant_text_delta':
         this.dispatch({ type: 'assistant_delta', id: ev.message_id, delta: ev.delta });
@@ -219,24 +223,99 @@ export class RuntimeBridge {
         this.dispatch({ type: 'notice', message: `附件处理失败：${ev.error}` });
         break;
       case 'notification':
-        if (ev.level !== 'info') this.dispatch({ type: 'notice', message: ev.message });
+        // info 也展示：runtime 的结构化事实（bg 任务、memory 提示等）不许静默丢。
+        this.dispatch({ type: 'notice', message: ev.message });
+        break;
+      case 'reasoning_delta':
+        this.dispatch({ type: 'reasoning_delta', delta: ev.delta });
+        break;
+      case 'command_progress':
+        this.dispatch({
+          type: 'agent_activity',
+          label: commandProgressLabel(ev.label, ev.elapsed_ms),
+        });
+        break;
+      case 'turn_progress': {
+        const label = turnProgressLabel(ev.phase, ev.closing, ev.no_progress_streak);
+        if (label) this.dispatch({ type: 'agent_activity', label });
+        break;
+      }
+      case 'sub_agent_updated':
+        this.dispatch({
+          type: 'sub_agent_updated',
+          id: ev.id,
+          nickname: ev.nickname,
+          role: ev.role,
+          done: ev.done,
+          ok: ev.ok,
+          detail: ev.detail,
+        });
+        break;
+      case 'sub_agent_progress':
+        this.dispatch({
+          type: 'sub_agent_progress',
+          id: ev.id,
+          active: ev.active,
+          input: ev.input_tokens,
+          output: ev.output_tokens,
+          cached: ev.cached_input_tokens,
+        });
+        break;
+      case 'sub_agent_activity': {
+        // TUI 同款：完成的一步带 ✓/✗，进行中的只显示工具名。
+        const step =
+          ev.phase === 'tool_finished' ? `${ev.tool} ${ev.is_error ? '✗' : '✓'}` : ev.tool;
+        this.dispatch({ type: 'sub_agent_activity', id: ev.id, step });
+        break;
+      }
+      case 'background_task_started':
+        this.dispatch({
+          type: 'background_started',
+          taskId: ev.task_id,
+          program: ev.program,
+          args: ev.args,
+        });
+        break;
+      case 'background_task_exited':
+        this.dispatch({
+          type: 'background_exited',
+          taskId: ev.task_id,
+          exitCode: ev.exit_code ?? null,
+          durationMs: ev.duration_ms,
+          ok: ev.ok,
+        });
+        break;
+      case 'memory_list':
+        this.dispatch({
+          type: 'memory_list',
+          dir: ev.memory_dir,
+          active: ev.active,
+          archived: ev.archived,
+          pending: ev.pending ?? [],
+        });
+        break;
+      case 'context_updated':
+        this.dispatch({ type: 'context_estimate', tokens: ev.estimated_tokens });
+        break;
+      case 'context_compacted':
+        this.dispatch({ type: 'notice', message: `上下文已压缩 ${ev.from} → ${ev.to} 条` });
+        break;
+      case 'context_expanded':
+        this.dispatch({
+          type: 'notice',
+          message: `上下文预算已扩张 ${ev.from_tokens} → ${ev.to_tokens} tokens`,
+        });
         break;
       default:
-        // reasoning_delta / sub_agent_* / background_task_* /
-        // memory_list / context_updated / turn_progress / 未知事件：忽略
+        // user_shell_*（web 无 !command 入口，本期不渲染）/ project_rules_loaded /
+        // 未知（更新的 runtime 新增的）事件：忽略不崩。
         break;
     }
 
-    if (TURN_TERMINAL_TYPES.has(ev.type)) {
-      const outcome =
-        ev.type === 'turn_failed' || ev.type === 'turn_truncated'
-          ? 'failed'
-          : ev.type === 'turn_cancelled'
-            ? 'cancelled'
-            : 'completed';
-      const error =
-        ev.type === 'turn_failed' || ev.type === 'turn_truncated' ? ev.error : undefined;
-      this.dispatch({ type: 'turn_terminal', outcome, error });
+    const end = turnEndFromEvent(ev);
+    if (end) {
+      // 7 个终态逐一保真（Turn Truth）：incomplete/unverified 绝不折叠成 completed。
+      this.dispatch({ type: 'turn_terminal', outcome: end.outcome, detail: end.detail });
       // dispatch 是异步的，getState() 还没落地，强制跳过 turnActive 检查
       this.flushQueue(true);
     }
@@ -514,16 +593,48 @@ export class RuntimeBridge {
     if (current) this.deliver({ type: 'select_model', session_id: current.id, model });
   }
 
-  setAgentMode(mode: AgentMode): void {
+  /** 设置产品轴（work_profile × collaboration）。SoT 在 session record；
+   *  乐观更新本地视图，runtime 回 session_updated 确认。回合运行中不许切
+   *  （与 TUI 的 idle-only 规则一致——runtime 只在空闲时接受）。 */
+  setAxes(workProfile: string, collaboration: string): void {
     const current = this.getState().current;
-    this.dispatch({ type: 'set_agent_mode', mode });
-    if (current) {
-      this.deliver({
-        type: 'set_agent_mode',
-        session_id: current.id,
-        orchestrate: mode === 'plan',
-      });
+    if (!current) return;
+    if (current.turnActive) {
+      this.notice('回合运行中不能切换运行轴，先停止或等它结束');
+      return;
     }
+    this.dispatch({ type: 'set_axes', workProfile, collaboration });
+    this.deliver({
+      type: 'set_product_axes',
+      session_id: current.id,
+      work_profile: workProfile,
+      collaboration,
+    });
+    if (collaboration === 'plan') {
+      this.notice('协作=计划（只读）。确认后切到 goal 开始执行');
+    }
+  }
+
+  // ── 项目记忆（用户权威操作：接受/遗忘后刷新列表）───────────────────
+
+  listMemory(): void {
+    const current = this.getState().current;
+    if (!current) return;
+    this.deliver({ type: 'list_memory', session_id: current.id, include_archived: true });
+  }
+
+  acceptMemory(id: string): void {
+    const current = this.getState().current;
+    if (!current) return;
+    this.deliver({ type: 'accept_memory', session_id: current.id, id });
+    this.listMemory();
+  }
+
+  forgetMemory(id: string): void {
+    const current = this.getState().current;
+    if (!current) return;
+    this.deliver({ type: 'forget_memory', session_id: current.id, id });
+    this.listMemory();
   }
 
   restoreCheckpoint(checkpointId: CheckpointId): void {
@@ -581,15 +692,26 @@ export class RuntimeBridge {
         this.setModel(hit);
         return;
       }
-      case '/mode': {
-        if (!arg) return;
-        const mode: AgentMode | null =
-          arg.toLowerCase() === 'plan' ? 'plan' : arg.toLowerCase() === 'direct' ? 'direct' : null;
-        if (!mode) {
-          this.dispatch({ type: 'notice', message: '用法：/mode direct|plan' });
+      case '/work-mode': {
+        if (!arg) return; // 无参数：由 Composer 打开工作档弹层
+        const work = arg.toLowerCase();
+        if (!(WORK_PROFILES as readonly string[]).includes(work)) {
+          this.dispatch({ type: 'notice', message: '用法：/work-mode economy|balanced|delivery' });
           return;
         }
-        this.setAgentMode(mode);
+        const cur = this.getState().current;
+        if (cur) this.setAxes(work, cur.collaboration);
+        return;
+      }
+      case '/collab': {
+        if (!arg) return; // 无参数：由 Composer 打开协作弹层
+        const collab = arg.toLowerCase();
+        if (!(COLLABORATIONS as readonly string[]).includes(collab)) {
+          this.dispatch({ type: 'notice', message: '用法：/collab chat|plan|goal' });
+          return;
+        }
+        const cur = this.getState().current;
+        if (cur) this.setAxes(cur.workProfile, collab);
         return;
       }
       case '/perm': {
@@ -644,7 +766,9 @@ export class RuntimeBridge {
       }
       case '/memory': {
         const sid = needSession();
-        if (sid) this.deliver({ type: 'list_memory', session_id: sid, include_archived: false });
+        if (!sid) return;
+        this.listMemory();
+        this.dispatch({ type: 'notice', message: '记忆已刷新，见右栏「记忆」' });
         return;
       }
       case '/cancel': {

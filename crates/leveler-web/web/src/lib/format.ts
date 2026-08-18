@@ -108,7 +108,34 @@ export function permissionMeta(profile: PermissionProfile): PermissionMeta {
   }
 }
 
-/** agent 执行模式的中文标签。 */
-export function agentModeLabel(mode: 'direct' | 'plan'): string {
-  return mode === 'plan' ? '计划模式' : '直接执行';
+/** 工作档（work_profile 轴）的展示标签。含义以 runtime 为准，这里只翻译。 */
+export function workProfileLabel(profile: string): string {
+  switch (profile) {
+    case 'economy':
+      return 'Economy';
+    case 'delivery':
+      return 'Delivery';
+    case 'balanced':
+    default:
+      return 'Balanced';
+  }
+}
+
+/** 协作档（collaboration 轴）的展示标签。 */
+export function collaborationLabel(collab: string): string {
+  switch (collab) {
+    case 'plan':
+      return 'Plan';
+    case 'goal':
+      return 'Goal';
+    case 'chat':
+    default:
+      return 'Chat';
+  }
+}
+
+/** runtime 决议后的 reasoning effort 展示（`medium` → `Medium`）；null = 模型无档位。 */
+export function reasoningLabel(effort: string | null): string | null {
+  if (!effort) return null;
+  return effort.charAt(0).toUpperCase() + effort.slice(1);
 }

@@ -671,6 +671,66 @@ button { font-family: inherit; }
 .changes-sum .n { color: var(--text-primary); }
 .changes-sum .add { color: var(--success); }
 .changes-sum .del { color: var(--danger); }
+/* 任务 tab 的改动摘要 = 跳转按钮：右栏不重复完整 diff，点击切中央 Changes */
+.changes-sum.as-link {
+  background: none; border: none; padding: 4px 0; cursor: pointer; width: 100%;
+  text-align: left;
+}
+.changes-sum.as-link:hover .n { color: var(--accent); }
+.changes-sum.as-link .goto { margin-left: auto; color: var(--text-muted); }
+
+/* 子 Agent 树（sub_agent_*）：Main 之下每个 child 一行，running→done 原地更新 */
+.agent-tree { font-size: 12.5px; }
+.agent-row {
+  display: flex; gap: 8px; align-items: flex-start; padding: 5px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.agent-row:last-child { border-bottom: none; }
+.agent-row .ag-glyph { flex: none; width: 14px; }
+.agent-row.run .ag-glyph { color: var(--accent); }
+.agent-row.done .ag-glyph { color: var(--success); }
+.agent-row.fail .ag-glyph { color: var(--danger); }
+.agent-row .ag-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.agent-row .ag-name { color: var(--text-primary); }
+.agent-row .ag-role {
+  margin-left: 6px; font-family: var(--mono); font-size: 10.5px; color: var(--text-muted);
+}
+.agent-row .ag-detail {
+  color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-row .ag-step {
+  font-family: var(--mono); font-size: 11px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-row .ag-tokens { flex: none; font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+
+/* 记忆 tab（memory_list）：pending 需要用户同意，active 可遗忘 */
+.mem-row {
+  display: flex; gap: 8px; align-items: center; padding: 5px 0;
+  font-size: 12.5px; border-bottom: 1px solid var(--border-subtle);
+}
+.mem-row:last-child { border-bottom: none; }
+.mem-row .mem-title {
+  flex: 1; min-width: 0; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mem-row.pending .mem-title { color: var(--text-primary); }
+.mem-row.archived .mem-title { color: var(--text-muted); }
+.mem-row .mem-ops { flex: none; display: flex; gap: 6px; }
+.mem-btn {
+  font-family: var(--mono); font-size: 11px; color: var(--text-secondary);
+  background: none; border: 1px solid var(--border-default); border-radius: 4px;
+  padding: 2px 8px; cursor: pointer;
+}
+.mem-btn:hover { color: var(--text-primary); border-color: var(--border-strong); }
+.mem-btn.ghost { border-color: transparent; color: var(--text-muted); }
+.mem-btn.ghost:hover { color: var(--danger); }
+
+/* 记忆 tab 上的待采纳提示点 */
+.insp-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--warning); margin-left: 5px; vertical-align: 1px;
+}
 
 /* 待确认 */
 .confirm-item {
@@ -1246,6 +1306,35 @@ button { font-family: inherit; }
   padding: 4px 14px; cursor: pointer;
 }
 .rs-btn:hover { color: var(--text-primary); border-color: var(--border-strong); }
+
+/* Turn Truth 终态语气：success/calm/warn/error/muted（7 终态 → 5 语气）。
+   incomplete/unverified 是 warn —— 永远不许渲染成绿色完成。 */
+.r-terminal.tone-success .rs-icon { color: var(--success); }
+.r-terminal.tone-success .rs-primary { color: var(--text-secondary); }
+.r-terminal.tone-calm .rs-icon { color: var(--success); }
+.r-terminal.tone-calm .rs-primary { color: var(--text-muted); }
+.r-terminal.tone-warn .rs-icon { color: var(--warning); }
+.r-terminal.tone-warn .rs-primary { color: var(--warning); }
+.r-terminal.tone-error .rs-icon { color: var(--danger); }
+.r-terminal.tone-error .rs-primary { color: var(--danger); }
+.r-terminal.tone-muted .rs-icon { color: var(--text-muted); }
+.r-terminal.tone-muted .rs-primary { color: var(--text-secondary); }
+.r-terminal .rs-toggle { margin-left: 22px; display: block; }
+
+/* 后台任务行（background_task_*）：当前 Agent 的执行活动，不是独立卡片 */
+.rs-bg {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--mono); font-size: 12px; color: var(--text-secondary);
+  margin: 4px 0 0 22px;
+}
+.rs-bg .rs-spin {
+  width: 10px; height: 10px; border-radius: 50%;
+  border: 2px solid var(--accent-soft); border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite; flex: none;
+}
+.rs-bg.ok { color: var(--text-muted); }
+.rs-bg.bad { color: var(--danger); }
+.rs-bg .rs-time { margin-left: auto; }
 
 /* ============ 回到底部悬浮按钮 ============ */
 .timeline { position: relative; }

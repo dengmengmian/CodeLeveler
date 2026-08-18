@@ -6,21 +6,28 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
-import { agentModeLabel, modelLabel, modelRefString, permissionMeta } from '../lib/format';
+import {
+  collaborationLabel,
+  modelLabel,
+  modelRefString,
+  permissionMeta,
+  reasoningLabel,
+  workProfileLabel,
+} from '../lib/format';
 import { uploadAttachment } from '../lib/api';
-import type { AgentMode } from '../state/store';
 import type { ModelRef, PermissionProfile } from '../types/protocol';
 
 /** 斜杠命令（cmd, 描述, 对应 ClientCommand 变体） */
 const SLASH: ReadonlyArray<readonly [string, string, string]> = [
   ['/model', '切换模型', 'SelectModel'],
-  ['/mode', '切换 agent 模式', 'SetAgentMode'],
+  ['/work-mode', '工作档：economy|balanced|delivery', 'SetProductAxes'],
+  ['/collab', '协作档：chat|plan|goal', 'SetProductAxes'],
   ['/perm', '切换权限档位', 'SetPermissionProfile'],
   ['/compact', '压缩上下文', 'CompactContext'],
   ['/clear', '开始新对话（当前这段保留在会话列表）', 'NewSessionFor'],
   ['/diff', '查看当前变更', 'RequestDiff'],
   ['/checkpoint', '回滚到检查点', 'RestoreCheckpoint'],
-  ['/memory', '查看 / 遗忘项目记忆', 'ListMemory / ForgetMemory'],
+  ['/memory', '查看 / 采纳 / 遗忘项目记忆（右栏「记忆」）', 'ListMemory / AcceptMemory / ForgetMemory'],
   ['/cancel', '取消当前回合', 'CancelCurrentTurn'],
   ['/btw', '侧问（不打断当前回合）', 'Btw'],
 ];
@@ -30,11 +37,12 @@ const EXEC_IMMEDIATELY = new Set(['/compact', '/clear', '/diff', '/cancel', '/me
 /** 选中后打开弹层的命令 → 弹层名 */
 const OPEN_POPUP: Record<string, Popup> = {
   '/model': 'model',
-  '/mode': 'mode',
+  '/work-mode': 'work',
+  '/collab': 'collab',
   '/perm': 'perm',
 };
 
-type Popup = 'perm' | 'mode' | 'model' | null;
+type Popup = 'perm' | 'work' | 'collab' | 'model' | null;
 
 const PERMISSIONS: ReadonlyArray<{
   profile: PermissionProfile;
@@ -48,9 +56,17 @@ const PERMISSIONS: ReadonlyArray<{
   { profile: 'full_access', label: '完全访问', desc: '全部自动执行，不询问', tag: '危险', color: 'var(--danger)' },
 ];
 
-const MODES: ReadonlyArray<readonly [AgentMode, string]> = [
-  ['direct', '直接执行，单 agent 循环'],
-  ['plan', '先出计划，确认后执行'],
+/** 产品轴选项（wire 值 → 描述）。含义以 runtime 为准，这里只解释。 */
+const WORK_OPTIONS: ReadonlyArray<readonly [string, string]> = [
+  ['economy', '省着用：更少的探索与验证轮次'],
+  ['balanced', '默认：探索、实现、验证均衡'],
+  ['delivery', '交付：更充分的验证与收口'],
+];
+
+const COLLAB_OPTIONS: ReadonlyArray<readonly [string, string]> = [
+  ['chat', '普通交互执行'],
+  ['plan', '只读出方案，确认后再执行'],
+  ['goal', '目标闭环：自动验证直至完成'],
 ];
 
 export function Composer() {
@@ -183,7 +199,9 @@ export function Composer() {
   };
 
   const perm = permissionMeta(current?.permission ?? 'assisted');
-  const mode: AgentMode = current?.agentMode ?? 'direct';
+  const workProfile = current?.workProfile ?? 'balanced';
+  const collaboration = current?.collaboration ?? 'chat';
+  const reasoning = reasoningLabel(current?.reasoningEffort ?? null);
   const models = current?.availableModels ?? [];
   const currentModelRef = current?.model ? modelRefString(current.model) : null;
   const attachments = state.pendingAttachments;
@@ -373,30 +391,63 @@ export function Composer() {
               <span className="perm-wrap">
                 <button
                   className="c-chip"
-                  title="执行模式"
+                  title="工作档（work_profile 轴）"
                   onClick={(e) => {
                     e.stopPropagation();
-                    setPopup(popup === 'mode' ? null : 'mode');
+                    setPopup(popup === 'work' ? null : 'work');
                   }}
                 >
-                  <span>{agentModeLabel(mode)}</span>
+                  <span>{workProfileLabel(workProfile)}</span>
                   <span className="caret">▴</span>
                 </button>
-                {popup === 'mode' && (
+                {popup === 'work' && (
                   <div className="pop">
-                    <div className="pop-head">执行模式</div>
-                    {MODES.map(([m, desc]) => (
+                    <div className="pop-head">工作档 · 回合空闲时可切</div>
+                    {WORK_OPTIONS.map(([w, desc]) => (
                       <button
-                        key={m}
-                        className={`pop-item${mode === m ? ' sel' : ''}`}
+                        key={w}
+                        className={`pop-item${workProfile === w ? ' sel' : ''}`}
                         onClick={() => {
-                          bridge.setAgentMode(m);
+                          bridge.setAxes(w, collaboration);
                           setPopup(null);
                         }}
                       >
-                        <span className="cmd">{agentModeLabel(m)}</span>
+                        <span className="cmd">{workProfileLabel(w)}</span>
                         <span className="desc">{desc}</span>
-                        <span className="cur">{mode === m ? '当前' : ''}</span>
+                        <span className="cur">{workProfile === w ? '当前' : ''}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </span>
+
+              <span className="perm-wrap">
+                <button
+                  className="c-chip"
+                  title="协作档（collaboration 轴）"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPopup(popup === 'collab' ? null : 'collab');
+                  }}
+                >
+                  <span>{collaborationLabel(collaboration)}</span>
+                  <span className="caret">▴</span>
+                </button>
+                {popup === 'collab' && (
+                  <div className="pop">
+                    <div className="pop-head">协作档 · goal = 目标闭环，plan = 只读方案</div>
+                    {COLLAB_OPTIONS.map(([c, desc]) => (
+                      <button
+                        key={c}
+                        className={`pop-item${collaboration === c ? ' sel' : ''}`}
+                        onClick={() => {
+                          bridge.setAxes(workProfile, c);
+                          setPopup(null);
+                        }}
+                      >
+                        <span className="cmd">{collaborationLabel(c)}</span>
+                        <span className="desc">{desc}</span>
+                        <span className="cur">{collaboration === c ? '当前' : ''}</span>
                       </button>
                     ))}
                   </div>
@@ -413,7 +464,11 @@ export function Composer() {
                     setPopup(popup === 'model' ? null : 'model');
                   }}
                 >
-                  <b style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{modelLabel(current?.model)}</b>{' '}
+                  <b style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
+                    {modelLabel(current?.model)}
+                    {/* runtime 决议后的 reasoning effort，只展示不发明（无档位则不显示） */}
+                    {reasoning ? ` · ${reasoning}` : ''}
+                  </b>{' '}
                   <span className="caret">▴</span>
                 </button>
                 {popup === 'model' && (

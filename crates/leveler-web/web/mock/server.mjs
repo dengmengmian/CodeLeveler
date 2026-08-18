@@ -87,6 +87,9 @@ function makeSnapshot(id, goal, overrides = {}) {
     diff: null,
     checkpoints: [],
     completion_report: null,
+    reasoning: { effective: 'medium' },
+    work_profile: 'balanced',
+    collaboration: 'chat',
     ...overrides,
   };
 }
@@ -378,9 +381,15 @@ async function handleDeliver(ws, frame) {
       emit({ type: 'session_updated', session });
       return;
     }
-    case 'set_agent_mode':
-      emit({ type: 'notification', level: 'info', message: `agent 模式已切换：orchestrate=${command.orchestrate}` });
+    case 'set_product_axes': {
+      // 真宿主：持久化到 session record 并回 session_updated（snapshot 带轴）。
+      if (!session) return;
+      session.work_profile = command.work_profile;
+      session.collaboration = command.collaboration;
+      touch(session);
+      emit({ type: 'session_updated', session });
       return;
+    }
     case 'request_diff': {
       if (!session) return;
       emit({ type: 'diff_updated', diff: session.diff ?? { files: [] } });
@@ -417,7 +426,16 @@ async function handleDeliver(ws, frame) {
       emit({ type: 'notification', level: 'info', message: `已回滚到检查点 ${command.checkpoint_id}` });
       return;
     case 'list_memory':
-      emit({ type: 'memory_list', memory_dir: '.leveler/memory', active: [], archived: [] });
+      emit({
+        type: 'memory_list',
+        memory_dir: '.leveler/memory',
+        active: [{ id: 'mem-1', title: '构建用 cargo nextest' }],
+        archived: [],
+        pending: [{ id: 'mem-p1', title: '项目使用 Rust workspace 布局' }],
+      });
+      return;
+    case 'accept_memory':
+      emit({ type: 'notification', level: 'info', message: `记忆已采纳：${command.id}` });
       return;
     case 'btw': {
       emit({ type: 'btw_started', question: command.question });
@@ -429,7 +447,6 @@ async function handleDeliver(ws, frame) {
     }
     case 'quit':
       return;
-    case 'set_product_axes':
     case 'confirm_plan_to_goal':
     case 'add_attachment':
     case 'add_clipboard_image':

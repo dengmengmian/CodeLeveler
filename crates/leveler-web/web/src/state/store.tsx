@@ -1,9 +1,12 @@
 // 应用状态：useReducer 单向数据流。
-// 视图模型对齐 mockup 的三栏结构；数据源全部来自协议契约
+// 视图模型对齐三栏结构；数据源全部来自协议契约
 // （UiSessionSnapshot 整量 + RuntimeEvent 增量）。
+// 语义规则与 TUI reducer（crates/leveler-tui/src/reducer/runtime_apply.rs）
+// 保持同构：同一事件在两个 UI 里表达同一产品事实。
 
 import { createContext, useContext, type Dispatch, type ReactNode } from 'react';
 import { useImmerReducer } from '../lib/useImmerReducer';
+import type { TurnOutcome } from '../lib/turn';
 import type {
   AttachmentRef,
   ModelRef,
@@ -17,6 +20,7 @@ import type {
   UiClarificationRequest,
   UiCompletionReport,
   UiDiff,
+  UiMemoryEntry,
   UiPlan,
   UiRole,
   UiSessionSnapshot,
@@ -63,13 +67,44 @@ export interface QueuedMessage {
   text: string;
 }
 
-export type AgentMode = 'direct' | 'plan';
-
-/** 上一回合终态：用于在对话流内显示「已完成 / 执行失败 / 已停止 + 用时」。 */
+/** 上一回合终态：7 个 runtime 终态逐一保真（Turn Truth），detail 永不丢。 */
 export interface LastTurn {
-  outcome: 'completed' | 'failed' | 'cancelled';
+  outcome: TurnOutcome;
   ms: number;
-  error: string | null;
+  detail: string | null;
+}
+
+/** 一个 spawn 出来的子 agent（多 agent 委派），running → done 原地更新。 */
+export interface SubAgentView {
+  id: string;
+  nickname: string;
+  role: string;
+  status: 'run' | 'done' | 'fail';
+  /** 运行中 = 任务描述；完成后 = 结果摘要（协议语义） */
+  detail: string;
+  /** 最近一步工具活动（sub_agent_activity），如 `cargo test ✓` */
+  recentStep: string | null;
+  active: boolean;
+  tokens: { input: number; output: number; cached: number };
+  seq: number;
+}
+
+/** 后台任务（run_command background=true）：当前 Agent 的执行活动。 */
+export interface BackgroundTaskView {
+  id: string;
+  program: string;
+  status: 'run' | 'done' | 'fail';
+  exitCode: number | null;
+  durationMs: number | null;
+  startedAt: number;
+}
+
+/** 项目记忆（memory_list）：active / pending（待用户采纳）/ archived。 */
+export interface MemoryView {
+  dir: string;
+  active: UiMemoryEntry[];
+  archived: UiMemoryEntry[];
+  pending: UiMemoryEntry[];
 }
 
 export interface SessionView {
@@ -81,6 +116,10 @@ export interface SessionView {
   messages: ChatMessage[];
   /** 当前回合的工具调用（下一回合开始时清空） */
   tools: ToolCallView[];
+  /** 当前回合的子 agent（下一回合开始时清空） */
+  agents: SubAgentView[];
+  /** 当前回合的后台任务（下一回合开始时清空） */
+  backgroundTasks: BackgroundTaskView[];
   pendingApprovals: UiApprovalRequest[];
   pendingClarifications: UiClarificationRequest[];
   plan: UiPlan | null;
@@ -88,24 +127,36 @@ export interface SessionView {
   diff: UiDiff | null;
   checkpoints: UiCheckpoint[];
   completionReport: UiCompletionReport | null;
+  memory: MemoryView | null;
   turnActive: boolean;
-  /** agent_activity 事件的最近一条标签（「正在分析项目结构」之类） */
+  /** agent_activity / command_progress / turn_progress 的统一 coarse activity */
   activity: string | null;
+  /** 模型推理流（reasoning_delta）；工具调用后被下一条 delta 替换（TUI 同款） */
+  reasoning: string;
+  reasoningSuperseded: boolean;
   /** 当前回合开始时间（epoch ms）；空闲时为 null，用于运行计时 */
   turnStartedAt: number | null;
-  /** 上一回合终态（完成/失败/取消）；新回合开始时清空 */
+  /** 上一回合终态（7 值保真）；新回合开始时清空 */
   lastTurn: LastTurn | null;
   model: ModelRef | null;
   availableModels: ModelRef[];
   permission: PermissionProfile;
-  /** DIRECT/PLAN 是客户端侧轴，映射到 set_agent_mode.orchestrate */
-  agentMode: AgentMode;
+  /** 产品轴（economy|balanced|delivery）；SoT 是 session record，snapshot 带回 */
+  workProfile: string;
+  /** 产品轴（chat|plan|goal）；goal 时 runtime 把普通提交路由成 goal turn */
+  collaboration: string;
+  /** runtime 决议后的 reasoning effort（snapshot.reasoning.effective），只展示不发明 */
+  reasoningEffort: string | null;
   tokens: { input: number; output: number };
+  /** 上下文占用（token_usage 的 input+output；无真实读数时用估算占位） */
+  contextTokens: number;
   /** 来自 SessionBootstrap；不知道时 CTX 表按 0% */
   contextWindow: number | null;
 }
 
 export type ConnectionStatus = 'connecting' | 'online';
+
+export type StageView = 'chat' | 'diff';
 
 export interface AppState {
   connection: ConnectionStatus;
@@ -115,6 +166,8 @@ export interface AppState {
   draft: boolean;
   /** 当前 runtime 的仓库路径（分组回退值 + hero 项目选择器） */
   repository: string;
+  /** 中央主区域视图（对话 / 改动）；Inspector 任务 tab 的改动摘要可切过来 */
+  stageView: StageView;
   queue: QueuedMessage[];
   notice: string | null;
   /** 已上传、待随下一条消息提交的附件 */
@@ -133,6 +186,7 @@ export const initialState: AppState = {
   current: null,
   draft: true,
   repository: '',
+  stageView: 'chat',
   queue: [],
   notice: null,
   pendingAttachments: [],
@@ -149,16 +203,24 @@ export type Action =
   | { type: 'snapshot'; session: UiSessionSnapshot; contextWindow?: number | null }
   | { type: 'select_session'; id: SessionId }
   | { type: 'new_draft'; project?: string | null }
+  | { type: 'stage_view'; view: StageView }
   | { type: 'user_message'; id: string; text: string; time: string }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
   | { type: 'assistant_delta'; id: string; delta: string }
   | { type: 'assistant_completed'; id: string }
+  | { type: 'reasoning_delta'; delta: string }
   | { type: 'btw_started'; question: string; time: string }
   | { type: 'btw_delta'; delta: string }
   | { type: 'btw_done' }
   | { type: 'tool_started'; id: ToolCallId; name: string; arguments: string; parallel: boolean }
   | { type: 'tool_completed'; id: ToolCallId; ok: boolean; preview: string; durationMs: number }
+  | { type: 'sub_agent_updated'; id: string; nickname: string; role: string; done: boolean; ok: boolean; detail: string }
+  | { type: 'sub_agent_progress'; id: string; active: boolean; input: number; output: number; cached: number }
+  | { type: 'sub_agent_activity'; id: string; step: string }
+  | { type: 'background_started'; taskId: string; program: string; args: string[] }
+  | { type: 'background_exited'; taskId: string; exitCode: number | null; durationMs: number; ok: boolean }
+  | { type: 'memory_list'; dir: string; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; pending: UiMemoryEntry[] }
   | { type: 'approval_requested'; request: UiApprovalRequest }
   | { type: 'approval_resolved'; requestId: string }
   | { type: 'clarification_requested'; request: UiClarificationRequest }
@@ -169,15 +231,16 @@ export type Action =
   | { type: 'checkpoint_added'; checkpoint: UiCheckpoint }
   | { type: 'completion'; report: UiCompletionReport }
   | { type: 'token_usage'; input: number; output: number }
+  | { type: 'context_estimate'; tokens: number }
   | { type: 'turn_active'; value: boolean }
-  | { type: 'turn_terminal'; outcome: 'completed' | 'failed' | 'cancelled'; error?: string }
+  | { type: 'turn_terminal'; outcome: TurnOutcome; detail?: string | null }
   | { type: 'seed_composer'; text: string | null }
   | { type: 'enqueue'; item: QueuedMessage }
   | { type: 'dequeue'; id: string }
   | { type: 'queue_move'; id: string; dir: -1 | 1 }
   | { type: 'set_permission'; mode: PermissionProfile }
   | { type: 'set_model'; model: ModelRef }
-  | { type: 'set_agent_mode'; mode: AgentMode }
+  | { type: 'set_axes'; workProfile: string; collaboration: string }
   | { type: 'agent_activity'; label: string }
   | { type: 'attachment_added'; attachment: AttachmentRef }
   | { type: 'attachment_removed'; id: string }
@@ -231,10 +294,12 @@ function viewFromSnapshot(
     id: snap.id,
     title: snap.goal || '未命名会话',
     repository: snap.repository,
-    branch: snap.branch,
+    branch: snap.branch ?? null,
     status: snap.status,
     messages,
     tools,
+    agents: sameSession ? prev.agents : [],
+    backgroundTasks: sameSession ? prev.backgroundTasks : [],
     pendingApprovals,
     pendingClarifications,
     plan: snap.plan ?? null,
@@ -242,17 +307,45 @@ function viewFromSnapshot(
     diff: snap.diff ?? null,
     checkpoints: snap.checkpoints ?? [],
     completionReport: snap.completion_report ?? null,
+    memory: sameSession ? prev.memory : null,
     turnActive,
     activity: sameSession ? prev.activity : null,
+    reasoning: sameSession ? prev.reasoning : '',
+    reasoningSuperseded: sameSession ? prev.reasoningSuperseded : false,
     turnStartedAt: sameSession ? prev.turnStartedAt : turnActive ? Date.now() : null,
     lastTurn: sameSession ? prev.lastTurn : null,
-    model: snap.model,
+    model: snap.model ?? null,
     availableModels: snap.available_models ?? [],
     permission: snap.mode,
-    agentMode: sameSession ? prev.agentMode : 'direct',
+    // 轴的 SoT 是 session record；老 runtime 不带字段时保留本地值 / 回退默认。
+    workProfile: snap.work_profile ?? (sameSession ? prev.workProfile : 'balanced'),
+    collaboration: snap.collaboration ?? (sameSession ? prev.collaboration : 'chat'),
+    // reasoning.effective 缺席 = 老 runtime（保留旧值）；present but null =
+    // 模型没有可控档位（就是 null，不发明）。
+    reasoningEffort:
+      snap.reasoning !== undefined && snap.reasoning !== null
+        ? (snap.reasoning.effective ?? null)
+        : sameSession
+          ? prev.reasoningEffort
+          : null,
     tokens: sameSession ? prev.tokens : { input: 0, output: 0 },
+    contextTokens: sameSession ? prev.contextTokens : 0,
     contextWindow: contextWindow ?? (sameSession ? prev.contextWindow : null),
   };
+}
+
+/** TUI mark_turn_busy 的对应物：事件到来说明回合在跑。 */
+function markBusy(current: SessionView): void {
+  if (!current.turnActive) {
+    current.turnActive = true;
+    current.turnStartedAt = Date.now();
+    current.lastTurn = null;
+  }
+}
+
+function resetReasoning(current: SessionView): void {
+  current.reasoning = '';
+  current.reasoningSuperseded = false;
 }
 
 // ── reducer ─────────────────────────────────────────────────────────
@@ -287,6 +380,9 @@ export function reducer(state: AppState, action: Action): void {
       state.current = null;
       state.draftProject = action.project ?? null;
       return;
+    case 'stage_view':
+      state.stageView = action.view;
+      return;
     case 'user_message': {
       if (!state.current) return;
       if (state.current.messages.some((m) => m.id === action.id)) return;
@@ -298,16 +394,21 @@ export function reducer(state: AppState, action: Action): void {
         time: action.time,
         seq: nextSeq(),
       });
-      // 新回合开始：清掉上一回合的工具轨与终态
+      // 新回合开始：清掉上一回合的执行轨（工具/子 agent/后台任务）与终态
       state.current.tools = [];
+      state.current.agents = [];
+      state.current.backgroundTasks = [];
       state.current.turnActive = true;
       state.current.turnStartedAt = Date.now();
       state.current.activity = null;
       state.current.lastTurn = null;
+      resetReasoning(state.current);
       return;
     }
     case 'assistant_started': {
       if (!state.current) return;
+      markBusy(state.current);
+      resetReasoning(state.current);
       if (state.current.messages.some((m) => m.id === action.id)) return;
       state.current.messages.push({
         id: action.id,
@@ -317,11 +418,11 @@ export function reducer(state: AppState, action: Action): void {
         time: action.time,
         seq: nextSeq(),
       });
-      state.current.turnActive = true;
       return;
     }
     case 'assistant_reset': {
       if (!state.current) return;
+      resetReasoning(state.current);
       if (action.id === null) {
         // 清掉最后一条仍在流式输出的消息
         for (let i = state.current.messages.length - 1; i >= 0; i -= 1) {
@@ -344,6 +445,15 @@ export function reducer(state: AppState, action: Action): void {
     case 'assistant_completed': {
       const msg = state.current?.messages.find((m) => m.id === action.id);
       if (msg) msg.streaming = false;
+      return;
+    }
+    case 'reasoning_delta': {
+      if (!state.current) return;
+      markBusy(state.current);
+      // 上一步的思考在它调用工具时就结束了；这条 delta 属于新的一步，
+      // 替换而不是续写（TUI 同款规则）。
+      if (state.current.reasoningSuperseded) resetReasoning(state.current);
+      state.current.reasoning += action.delta;
       return;
     }
     case 'btw_started': {
@@ -374,6 +484,9 @@ export function reducer(state: AppState, action: Action): void {
     }
     case 'tool_started': {
       if (!state.current) return;
+      markBusy(state.current);
+      // 对思考采取行动 = 思考结束；下一条 reasoning delta 会替换它。
+      state.current.reasoningSuperseded = true;
       if (state.current.tools.some((t) => t.id === action.id)) return;
       state.current.tools.push({
         id: action.id,
@@ -394,8 +507,86 @@ export function reducer(state: AppState, action: Action): void {
         tool.preview = action.preview || null;
         tool.durationMs = action.durationMs;
       }
+      // 工具结束后把它的 activity 标签留着会像挂死；退回思考态（TUI 同款）。
+      if (state.current) {
+        state.current.activity = null;
+        resetReasoning(state.current);
+      }
       return;
     }
+    case 'sub_agent_updated': {
+      if (!state.current) return;
+      markBusy(state.current);
+      const existing = state.current.agents.find((a) => a.id === action.id);
+      if (existing) {
+        existing.nickname = action.nickname;
+        existing.role = action.role;
+        existing.detail = action.detail;
+        if (action.done) {
+          existing.status = action.ok ? 'done' : 'fail';
+          existing.active = false;
+        }
+        return;
+      }
+      state.current.agents.push({
+        id: action.id,
+        nickname: action.nickname,
+        role: action.role,
+        status: action.done ? (action.ok ? 'done' : 'fail') : 'run',
+        detail: action.detail,
+        recentStep: null,
+        active: !action.done,
+        tokens: { input: 0, output: 0, cached: 0 },
+        seq: nextSeq(),
+      });
+      return;
+    }
+    case 'sub_agent_progress': {
+      const agent = state.current?.agents.find((a) => a.id === action.id);
+      if (agent) {
+        agent.active = action.active;
+        agent.tokens = { input: action.input, output: action.output, cached: action.cached };
+      }
+      return;
+    }
+    case 'sub_agent_activity': {
+      const agent = state.current?.agents.find((a) => a.id === action.id);
+      if (agent) agent.recentStep = action.step;
+      return;
+    }
+    case 'background_started': {
+      if (!state.current) return;
+      markBusy(state.current);
+      if (state.current.backgroundTasks.some((t) => t.id === action.taskId)) return;
+      state.current.backgroundTasks.push({
+        id: action.taskId,
+        program: [action.program, ...action.args].join(' '),
+        status: 'run',
+        exitCode: null,
+        durationMs: null,
+        startedAt: Date.now(),
+      });
+      return;
+    }
+    case 'background_exited': {
+      const task = state.current?.backgroundTasks.find((t) => t.id === action.taskId);
+      if (task) {
+        task.status = action.ok ? 'done' : 'fail';
+        task.exitCode = action.exitCode;
+        task.durationMs = action.durationMs;
+      }
+      return;
+    }
+    case 'memory_list':
+      if (state.current) {
+        state.current.memory = {
+          dir: action.dir,
+          active: action.active,
+          archived: action.archived,
+          pending: action.pending,
+        };
+      }
+      return;
     case 'approval_requested':
       if (state.current && !state.current.pendingApprovals.some((a) => a.id === action.request.id)) {
         state.current.pendingApprovals.push(action.request);
@@ -442,7 +633,17 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'token_usage':
       if (state.current) {
+        // 全零读数不覆盖已有数据（provider 缺 usage chunk 时，TUI 同款保护）。
+        if (action.input === 0 && action.output === 0) return;
         state.current.tokens = { input: action.input, output: action.output };
+        // input 是本轮完整 prompt，加 output 即回复后的窗口占用；取代不累加。
+        state.current.contextTokens = action.input + action.output;
+      }
+      return;
+    case 'context_estimate':
+      // 预运行估算只做占位：有真实 usage 后不许覆盖，避免表针抖动。
+      if (state.current && state.current.contextTokens === 0 && state.current.tokens.input === 0) {
+        state.current.contextTokens = action.tokens;
       }
       return;
     case 'turn_active':
@@ -464,11 +665,12 @@ export function reducer(state: AppState, action: Action): void {
         state.current.lastTurn = {
           outcome: action.outcome,
           ms,
-          error: action.error ?? null,
+          detail: action.detail ?? null,
         };
         state.current.turnActive = false;
         state.current.turnStartedAt = null;
         state.current.activity = null;
+        resetReasoning(state.current);
         for (const m of state.current.messages) m.streaming = false;
       }
       return;
@@ -495,11 +697,17 @@ export function reducer(state: AppState, action: Action): void {
     case 'set_model':
       if (state.current) state.current.model = action.model;
       return;
-    case 'set_agent_mode':
-      if (state.current) state.current.agentMode = action.mode;
+    case 'set_axes':
+      if (state.current) {
+        state.current.workProfile = action.workProfile;
+        state.current.collaboration = action.collaboration;
+      }
       return;
     case 'agent_activity':
-      if (state.current) state.current.activity = action.label;
+      if (state.current) {
+        markBusy(state.current);
+        state.current.activity = action.label;
+      }
       return;
     case 'attachment_added':
       if (!state.pendingAttachments.some((a) => a.id === action.attachment.id)) {
