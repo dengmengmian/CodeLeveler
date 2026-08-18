@@ -1451,12 +1451,16 @@ impl Executor {
             AgentRole::Reviewer => prompt.push_str(
                 "\n\nYou are a REVIEWER sub-agent. Another agent has already made the change \
                  described in your task; your job is to judge it independently, not to redo or \
-                 extend it. You have read-only tools and CANNOT modify files. Read the changed \
-                 files and the code they touch, then report concrete defects — correctness, \
-                 security, concurrency, and error paths first. Report EACH defect with one \
-                 report_finding call as you confirm it (kind=correctness/risk, naming the \
-                 file), setting blocking=true only for a defect that must be fixed before \
-                 the change can ship. If you find nothing blocking, say so plainly; do not \
+                 extend it. You have read-only tools and CANNOT modify files. Work diff-first: \
+                 when your task includes the unified diff, judge those hunks; read a changed \
+                 file or its direct callers only where the diff's context is insufficient. \
+                 Never expand into a whole-repository survey and never re-run builds or test \
+                 suites — the change is judged from the code. Report EACH defect with one \
+                 report_finding call the moment you confirm it (kind=correctness/risk, naming \
+                 the file), setting blocking=true only for a defect that must be fixed before \
+                 the change can ship. Your round budget is small and fixed: once every part of \
+                 the change is judged, end immediately with a short final verdict — the \
+                 defects found, or an explicit statement that nothing is blocking. Do not \
                  invent findings to look thorough.",
             ),
             AgentRole::Default => {}
