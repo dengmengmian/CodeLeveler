@@ -117,6 +117,42 @@ jobs:
       - name: Test
         run: flutter test
 
+  # Protocol contract closure for the WebUI: Rust is the source of truth
+  # (schemas/ is guarded by schema_export.rs in the Rust job); this job makes
+  # the OTHER half of the chain loud — schemas → generated TS. `check:protocol`
+  # fails when schemas/ changed but src/types/protocol.gen.ts was not
+  # regenerated, so a new ClientCommand/RuntimeEvent variant can never drift
+  # silently past the web client again.
+  web-ui:
+    name: leveler-web UI · contract · typecheck · test · build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/leveler-web/web
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/leveler-web/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Protocol contract (schemas → generated TS)
+        run: npm run check:protocol
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
   supply-chain:
     name: deny · audit
     runs-on: ubuntu-latest

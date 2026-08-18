@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "typecheck": "tsc --noEmit",
-    "mock": "node mock/server.mjs"
+    "build": "node scripts/gen-protocol.mjs --check && vite build",
+    "typecheck": "node scripts/gen-protocol.mjs --check && tsc --noEmit",
+    "mock": "node mock/server.mjs",
+    "gen:protocol": "node scripts/gen-protocol.mjs",
+    "check:protocol": "node scripts/gen-protocol.mjs --check",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^19.1.0",
@@ -21,6 +24,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
+    "vitest": "^3.2.7",
     "ws": "^8.18.2"
   }
 }
