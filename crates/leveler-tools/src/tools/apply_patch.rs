@@ -956,8 +956,17 @@ mod tests {
         let second = dir.join("src/second.rs");
         std::fs::write(&second, "second-original\n").unwrap();
 
-        let lock_path =
-            leveler_project::layout::target_lock_path(&context.execution.environment, &second);
+        // The lock must be taken on the SAME path the commit path derives:
+        // the workspace root is canonicalized (`/var/…` → `/private/var/…` on
+        // macOS), and `target_lock_path` hashes the raw string. Hashing the
+        // uncanonicalized `dir`-based path produced a different lock file, the
+        // tool never blocked, and this test raced its own external writes
+        // (~40% failures under load).
+        let second_resolved = context.execution.workspace.root().join("src/second.rs");
+        let lock_path = leveler_project::layout::target_lock_path(
+            &context.execution.environment,
+            &second_resolved,
+        );
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -1039,8 +1048,13 @@ mod tests {
         std::fs::write(&second, "second-original\n").unwrap();
         let before = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
 
-        let lock_path =
-            leveler_project::layout::target_lock_path(&context.execution.environment, &second);
+        // Same canonical-root derivation as the clobber test above: the lock
+        // is only a lock if it hashes the path the commit path hashes.
+        let second_resolved = context.execution.workspace.root().join("src/second.rs");
+        let lock_path = leveler_project::layout::target_lock_path(
+            &context.execution.environment,
+            &second_resolved,
+        );
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)
