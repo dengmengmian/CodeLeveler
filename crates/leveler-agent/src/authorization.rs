@@ -162,7 +162,16 @@ pub(crate) fn write_targets_inside_scopes(call: &ToolCall, scopes: &[String]) ->
     write_targets(call)
         .into_iter()
         .map(|p| norm_scope_path(&p))
-        .filter(|target| owned.iter().any(|a| scope_covers(a, target)))
+        .filter(|target| {
+            // This check DENIES matches, so an unresolvable spelling must
+            // fail CLOSED: a target using `..` segments or an absolute path
+            // cannot be proven outside the owned scopes by string comparison,
+            // so it is treated as inside (review: fence was fail-open for
+            // `foo/../b.txt`).
+            let unresolvable =
+                target.starts_with('/') || target.split('/').any(|segment| segment == "..");
+            unresolvable || owned.iter().any(|a| scope_covers(a, target))
+        })
         .collect()
 }
 

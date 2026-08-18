@@ -88,6 +88,11 @@ pub fn should_inject_delegation_hint(allow_delegation: bool, depth: u32) -> bool
     allow_delegation && depth == 0
 }
 
+/// First line of [`multi_agent_steer_hint`]; the drive loop dedups injection
+/// by this exact header, so the two must never drift apart again (review 必改③:
+/// a stale needle re-injected the hint into every resumed window).
+pub const MULTI_AGENT_HINT_HEADER: &str = "## Multi-agent coordination";
+
 /// One-shot user injection when [`should_inject_delegation_hint`] is true.
 /// V2: this is the canonical coordination policy — Main is both the coding
 /// agent and the coordinator of this workspace.
@@ -104,10 +109,11 @@ pub fn multi_agent_steer_hint() -> String {
      with the child's id, and the runtime tells you when each settles — do not \
      poll. Start independent delegations together in one assistant message and \
      CONTINUE USEFUL WORK while they run: another disjoint area, integration \
-     boundaries, test preparation. Never edit files a running child owns (the \
-     runtime refuses it) and do not redo child-owned work — inspect and \
-     integrate its result when it settles. Set run_in_background=false only \
-     when your next action depends on that child's result.\n\
+     boundaries, test preparation. Never write into files a running child owns \
+     — by editor tools (the runtime refuses those) or by shell commands — and \
+     do not redo child-owned work; inspect and integrate its result when it \
+     settles. Set run_in_background=false only when your next action depends \
+     on that child's result.\n\
      Keep work yourself when it is small, tightly coupled, needs your \
      in-flight context, or has no safe ownership boundary — KEEP is a \
      first-class outcome. Do not spawn for its own sake.\n\
@@ -776,7 +782,8 @@ mod tests {
     #[test]
     fn steer_hint_names_spawn_agent() {
         let h = multi_agent_steer_hint();
-        assert!(h.contains("## Multi-agent coordination"));
+        // The dedup needle must be the hint's actual first line (必改③).
+        assert!(h.starts_with(MULTI_AGENT_HINT_HEADER));
         assert!(h.contains("spawn_agent"));
         assert!(h.contains("direct tool loop"));
     }

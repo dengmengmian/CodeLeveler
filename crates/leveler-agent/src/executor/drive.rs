@@ -172,7 +172,9 @@ impl Executor {
         // evaluate bounded Worker work.
         if should_inject_delegation_hint(self.policy.allow_delegation, self.depth)
             && !messages.iter().any(|m| {
-                m.role == Role::User && m.text_content().contains("## Multi-agent delegation")
+                m.role == Role::User
+                    && m.text_content()
+                        .contains(crate::sub_agent::MULTI_AGENT_HINT_HEADER)
             })
         {
             messages.push(Message::text(Role::User, multi_agent_steer_hint()));
@@ -201,12 +203,18 @@ impl Executor {
         // truthfully which delegations were lost, release their scopes, and
         // clear the durable record.
         if self.depth == 0 && !progress.outstanding_children.is_empty() {
-            let note = lost_children_note(&progress.outstanding_children);
+            let note = Message::text(
+                Role::User,
+                lost_children_note(&progress.outstanding_children),
+            );
             progress.outstanding_children.clear();
             observer(AgentEvent::ProgressUpdated {
                 ledger: progress.clone(),
             });
-            messages.push(Message::text(Role::User, note));
+            // 必改④: durable like every other injected turn — the record was
+            // just cleared, so the note is the only remaining truth.
+            sink.append(std::slice::from_ref(&note)).await?;
+            messages.push(note);
         }
         // MA-WA1: one-shot keep-vs-delegate decision point. Eligible only for
         // top-level runs with delegation on; a prior window's offer and
@@ -395,10 +403,16 @@ impl Executor {
                         &result,
                     );
                     clear_outstanding_child(&mut progress, &id);
-                    messages.push(Message::text(
+                    let notice = Message::text(
                         Role::User,
                         settlement_notice(&nickname, &id, role, &scope, &content),
-                    ));
+                    );
+                    // 必改④: persist the notice NOW. The next ContextSnapshot is
+                    // a whole model round away, and outstanding_children was
+                    // just cleared — a crash in between would otherwise lose
+                    // the child's report text with no lost-note either.
+                    sink.append(std::slice::from_ref(&notice)).await?;
+                    messages.push(notice);
                     flush_epoch!($rounds);
                 }
             }};
@@ -1387,6 +1401,18 @@ impl Executor {
                             .iter()
                             .map(|c| format!("{} ({})", c.nickname, c.id))
                             .collect();
+                        // Review 必改②: this drain runs MID tool batch — pin the
+                        // parent's same-batch spend first, or the settlement
+                        // fold overwrites local counters with a lagging ledger
+                        // (the exact under-count pin_parent_batch_spend exists
+                        // to prevent on the foreground path).
+                        pin_parent_batch_spend(
+                            &mut progress,
+                            commands_run,
+                            model_tokens_spent,
+                            cost_spent_micros,
+                            &modified_files,
+                        );
                         drain_background_children!(round);
                         let feedback = format!(
                             "Cannot complete: delegated sub-agent(s) {} were still \
@@ -3055,6 +3081,10 @@ impl Executor {
             .continuation
             .round_limit()
             .expect("only bounded continuation exits the loop by round count");
+        // Review 必改①: this `break` tail is the COMMON bounded exit — drain
+        // running background children here like every `return` does, or the
+        // abort-on-drop backstop hard-kills them (spend and findings lost).
+        drain_background_children!(round);
         // Budget exhausted: never return an empty answer. Surface the last thing
         // the model said plus how far it got, so the caller/UI shows real state.
         let summary = {
