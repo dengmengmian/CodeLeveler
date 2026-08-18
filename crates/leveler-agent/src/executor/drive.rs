@@ -47,8 +47,9 @@ use crate::injected_tools::{
 };
 use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
-    AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, multi_agent_steer_hint,
-    scopes_overlap, task_suggests_delegation,
+    AgentRole, ChildProfile, DelegationDecisionPoint, DelegationRoundAction, MAX_SUB_AGENT_DEPTH,
+    agent_nickname, delegation_decision_request, multi_agent_steer_hint, scopes_overlap,
+    should_inject_delegation_hint,
 };
 
 struct CancelOnDrop(CancellationToken);
@@ -139,11 +140,10 @@ impl Executor {
         {
             messages.push(Message::text(Role::User, contract_injection));
         }
-        // Product steer: when delegation is on and the task looks multi-part /
-        // parallel, remind the model once that concurrent spawn_agent is OK.
-        if self.policy.allow_delegation
-            && self.depth == 0
-            && task_suggests_delegation(&original_task)
+        // Product steer: top-level runs see keep-vs-delegate once. Parallel
+        // keywords are not required — ordinary implementation goals must still
+        // evaluate bounded Worker work.
+        if should_inject_delegation_hint(self.policy.allow_delegation, self.depth)
             && !messages.iter().any(|m| {
                 m.role == Role::User && m.text_content().contains("## Multi-agent delegation")
             })
@@ -159,6 +159,18 @@ impl Executor {
         }
         // Sub-agents spawned so far this run (bounds total delegation).
         let mut agents_spawned = 0usize;
+        // MA-WA1: one-shot keep-vs-delegate decision point. Eligible only for
+        // top-level runs with delegation on; a prior window's offer and
+        // disposition facts (seeded via ProgressLedger) are never re-asked or
+        // re-recorded.
+        let mut delegation_decision = DelegationDecisionPoint::new(
+            self.policy.allow_delegation && self.depth == 0,
+            crate::sub_agent::DelegationPrior {
+                offered: progress.delegation_decision_offered,
+                kept: progress.delegation_kept_recorded,
+                delegated: progress.delegation_delegated_recorded,
+            },
+        );
         // Accumulated elevations from approved request_permissions this turn.
         let mut turn_grants = crate::injected_tools::TurnPermissionGrants::default();
         // Leveling: consecutive search calls with no intervening action. Reset
@@ -1745,6 +1757,14 @@ impl Executor {
                                 plan_state = next;
                                 structured_plan_started = true;
                                 metrics.plan_updated += 1;
+                                delegation_decision.note_plan_registered(
+                                    &plan_state
+                                        .steps
+                                        .iter()
+                                        .filter(|s| s.status != "completed")
+                                        .map(|s| s.step.clone())
+                                        .collect::<Vec<_>>(),
+                                );
                                 observer(AgentEvent::PlanUpdated {
                                     steps: plan_state.steps.clone(),
                                 });
@@ -1789,6 +1809,7 @@ impl Executor {
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.
                 if !is_error && call_mutated {
+                    delegation_decision.note_mutation();
                     if !newly_modified.is_empty() {
                         if self.registry.mutates_files(&call.name) {
                             non_observe_success_this_round =
@@ -1869,6 +1890,7 @@ impl Executor {
                         }
                     }
                     if !is_error && !job_files.is_empty() {
+                        delegation_decision.note_mutation();
                         verification_ran = false;
                         note_tool_side_effects(
                             &mut ledger,
@@ -2104,6 +2126,7 @@ impl Executor {
 
                     if role == AgentRole::Worker {
                         admitted_worker_scopes.push(files.clone());
+                        delegation_decision.note_worker_admitted(&files);
                     }
                     agents_spawned += 1;
                     let id = format!("agent-{agents_spawned}");
@@ -2340,6 +2363,48 @@ impl Executor {
             // flushed above) — exit now instead of starting another model round.
             if cancelled_mid_batch {
                 return Err(AgentError::Cancelled);
+            }
+
+            // MA-WA1: resolve this round's delegation-decision facts. Facts
+            // (`delegated` / `kept`) are durable events only; the offer is one
+            // neutral user message, at most once per goal epoch.
+            for action in delegation_decision.end_round() {
+                match action {
+                    DelegationRoundAction::RecordDelegated(scope) => {
+                        progress.delegation_delegated_recorded = true;
+                        observer(AgentEvent::DelegationStage {
+                            action: "delegated".to_string(),
+                            detail: scope,
+                        });
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
+                    }
+                    DelegationRoundAction::RecordKept => {
+                        progress.delegation_kept_recorded = true;
+                        observer(AgentEvent::DelegationStage {
+                            action: "kept".to_string(),
+                            detail: String::new(),
+                        });
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
+                    }
+                    DelegationRoundAction::Offer { trigger, steps } => {
+                        progress.delegation_decision_offered = true;
+                        observer(AgentEvent::DelegationStage {
+                            action: "offered".to_string(),
+                            detail: trigger.to_string(),
+                        });
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
+                        messages.push(Message::text(
+                            Role::User,
+                            delegation_decision_request(&steps),
+                        ));
+                    }
+                }
             }
 
             // Progress assess: closeout thrash + pure-observe no-progress streaks.

@@ -92,6 +92,19 @@ pub struct ProgressLedger {
     pub cumulative_modified_paths: Vec<String>,
     #[serde(default)]
     pub observe_hits: BTreeMap<String, (String, u32)>,
+    /// MA-WA1: the one-shot keep-vs-delegate decision point was already offered
+    /// this goal epoch. Persisted so continue/resume windows never re-ask
+    /// (no nag loop across windows).
+    #[serde(default)]
+    pub delegation_decision_offered: bool,
+    /// A `kept` disposition fact was already recorded this goal epoch, so
+    /// continue/resume/repair windows do not re-record it (one fact per epoch,
+    /// not one per window).
+    #[serde(default)]
+    pub delegation_kept_recorded: bool,
+    /// A `delegated` disposition fact was already recorded this goal epoch.
+    #[serde(default)]
+    pub delegation_delegated_recorded: bool,
 }
 
 impl ProgressLedger {

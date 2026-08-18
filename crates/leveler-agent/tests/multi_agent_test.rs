@@ -29,6 +29,9 @@ struct SleepyRuntime {
     /// call, so tests can time cancellation deterministically.
     on_stream: Option<Arc<dyn Fn(usize) + Send + Sync>>,
     stream_count: std::sync::atomic::AtomicUsize,
+    /// The message list of every request, in stream order, so tests can assert
+    /// what the model was actually shown on each round.
+    requests: Mutex<Vec<Vec<Message>>>,
 }
 
 impl SleepyRuntime {
@@ -39,6 +42,7 @@ impl SleepyRuntime {
             default_delay: delay,
             on_stream: None,
             stream_count: std::sync::atomic::AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
         }
     }
 
@@ -67,10 +71,11 @@ impl ModelRuntime for SleepyRuntime {
 
     async fn stream(
         &self,
-        _request: ModelRequest,
+        request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         use leveler_model::ModelEvent;
+        self.requests.lock().unwrap().push(request.messages.clone());
         let index = self
             .stream_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3826,5 +3831,324 @@ async fn child_observability_reconstructs_from_authoritative_events() {
     let ledger = last_ledger(&events);
     assert_eq!(ledger.findings.len(), 1);
     assert_eq!(ledger.findings[0].role, "explorer");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── MA-WA1: keep-vs-delegate decision point + disposition observability ──────
+
+fn delegation_stages(events: &[AgentEvent]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::DelegationStage { action, detail } => {
+                Some((action.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn patch_call(id: &str, file: &str, from: &str, to: &str) -> ContentPart {
+    tool_call_part(
+        id,
+        "apply_patch",
+        serde_json::json!({
+            "patch": format!("*** Begin Patch\n*** Update File: {file}\n-{from}\n+{to}\n*** End Patch")
+        }),
+    )
+}
+
+/// Accident regression (MA-WA1 root defect): once the model registers its own
+/// multi-step decomposition, the harness must raise the one-shot
+/// keep-vs-delegate decision point — and a mutation after the offer with no
+/// Worker records an observable KEEP. Before this repair the harness had no
+/// decision point and a KEEP run left zero trace.
+#[tokio::test]
+async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded() {
+    let dir = tmp("decision-plan", 41);
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "p1",
+                    "update_plan",
+                    serde_json::json!({
+                        "plan": [
+                            {"step": "edit the file", "status": "in_progress"},
+                            {"step": "verify", "status": "pending"}
+                        ]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("e2", "a.txt", "new", "newer")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        Duration::from_millis(1),
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "improve the file handling",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let stages = delegation_stages(&events);
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|(action, _)| action == "offered")
+            .count(),
+        1,
+        "exactly one decision point: {stages:?}"
+    );
+    assert!(
+        stages
+            .iter()
+            .any(|(action, detail)| action == "offered" && detail == "plan"),
+        "plan registration is the trigger: {stages:?}"
+    );
+    assert_eq!(
+        stages.iter().filter(|(action, _)| action == "kept").count(),
+        1,
+        "first mutation after the offer records KEEP exactly once: {stages:?}"
+    );
+
+    // The offer reaches the model exactly once, after the plan round.
+    let requests = runtime.requests.lock().unwrap();
+    let offer_count_in = |messages: &[Message]| {
+        messages
+            .iter()
+            .filter(|m| {
+                m.role == Role::User && m.text_content().contains("## Delegation disposition")
+            })
+            .count()
+    };
+    assert_eq!(
+        offer_count_in(&requests[0]),
+        0,
+        "no offer before the decomposition exists"
+    );
+    let last = requests.last().unwrap();
+    assert_eq!(
+        offer_count_in(last),
+        1,
+        "the offer is injected once and never repeated"
+    );
+    let offer_text = last
+        .iter()
+        .find(|m| m.role == Role::User && m.text_content().contains("## Delegation disposition"))
+        .unwrap()
+        .text_content();
+    assert!(
+        offer_text.contains("1. edit the file") && offer_text.contains("2. verify"),
+        "the plan-triggered offer enumerates the model's own open steps: {offer_text}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Fallback trigger: a run that never registers a structured plan still gets
+/// exactly one decision point — at its SECOND mutating round (a lone prep
+/// edit leaves room for a plan to land first) — and a later mutation records
+/// KEEP.
+#[tokio::test]
+async fn the_second_mutating_round_is_the_fallback_decision_point_without_a_plan() {
+    let dir = tmp("decision-mutation", 42);
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("e2", "a.txt", "new", "newer")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("e3", "a.txt", "newer", "newest")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        Duration::from_millis(1),
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "tweak the file",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let stages = delegation_stages(&events);
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|(action, _)| action == "offered")
+            .count(),
+        1,
+        "{stages:?}"
+    );
+    assert!(
+        stages
+            .iter()
+            .any(|(action, detail)| action == "offered" && detail == "mutation_fallback"),
+        "{stages:?}"
+    );
+    assert_eq!(
+        stages.iter().filter(|(action, _)| action == "kept").count(),
+        1,
+        "{stages:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A spontaneous Worker spawn IS the delegation decision: record `delegated`
+/// with its scope and never raise the offer afterwards (no nagging a model
+/// that already decided).
+#[tokio::test]
+async fn worker_admission_records_a_delegated_disposition_and_suppresses_the_offer() {
+    let dir = tmp("decision-delegate", 43);
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": "change old to new in a.txt",
+                        "role": "worker",
+                        "files": ["a.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Worker child: one edit, then reports.
+            assistant_with(
+                vec![patch_call("w1", "a.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("worker: edited a.txt"),
+            // Parent integrates and finishes.
+            assistant_text("integrated the worker result"),
+        ],
+        Duration::from_millis(1),
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "update the file",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let stages = delegation_stages(&events);
+    assert!(
+        stages
+            .iter()
+            .any(|(action, detail)| action == "delegated" && detail.contains("a.txt")),
+        "{stages:?}"
+    );
+    assert!(
+        stages.iter().all(|(action, _)| action != "offered"),
+        "a model that already delegated must not be offered: {stages:?}"
+    );
+    assert!(
+        stages.iter().all(|(action, _)| action != "kept"),
+        "{stages:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Kill-switch: with delegation off there is no decision point and no
+/// disposition noise at all.
+#[tokio::test]
+async fn no_decision_point_when_delegation_is_disabled() {
+    let dir = tmp("decision-off", 44);
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        Duration::from_millis(1),
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_delegation(false);
+    let mut events = Vec::new();
+    executor
+        .run(
+            "tweak the file",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        delegation_stages(&events).is_empty(),
+        "no delegation facts when delegation is off"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

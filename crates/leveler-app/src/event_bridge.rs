@@ -346,6 +346,13 @@ impl EventBridge {
                     label: format!("gate refused {kind}: {detail}"),
                 });
             }
+            EngineEvent::DelegationStage { action, detail } => {
+                // Durable delegation-disposition fact; surfaced as a light
+                // activity label so a KEEP/DELEGATE outcome is visible live.
+                let _ = self.events.send(RuntimeEvent::AgentActivity {
+                    label: format!("delegation {action}: {detail}"),
+                });
+            }
             EngineEvent::ReviewStage {
                 required,
                 action,

@@ -157,21 +157,20 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
         name: SPAWN_AGENT_TOOL.to_string(),
         description: "Run a focused sub-agent on a self-contained subtask and get \
             back its final result. It shares your model and workspace but starts a \
-            FRESH conversation, so put everything it needs in `task`. Emit SEVERAL \
-            spawn_agent calls in one turn to run them in parallel — do this when the \
-            user asks for parallel/multi-agent work, or the task has independent \
-            facets (e.g. architecture + stability + tools review, disjoint files). \
-            Do NOT use it for the whole task as one blob, or for trivial one-step \
-            work you can do directly. \
-            role='explorer' gives a read-only agent for investigation/Q&A; \
-            role='worker' writes code and MUST be given `files` it exclusively owns \
-            (assign disjoint files to parallel workers so they never edit the same \
-            file). \
-            agent='<name>' runs a reusable named persona (see the project's agent \
-            list, e.g. code-explorer / code-architect / code-reviewer); its \
-            instructions are prepended to your `task`, and it supplies the role \
-            unless you override it. Prefer a named agent over pasting the same \
-            persona into `task` every time."
+            FRESH conversation, so put everything it needs in `task`. \
+            Before substantial implementation, prefer delegation when a bounded \
+            subtask has a clear file/module scope, can be independently verified, \
+            needs little shared mutable context, and a Worker can produce a concrete \
+            implementation. role='worker' performs scoped writes in `files` and can \
+            run targeted verification; assign disjoint `files` if you emit several \
+            workers. Keep the work yourself when coordination would cost more than \
+            it saves, or the step is a single trivial edit. \
+            Emit several spawn_agent calls in one turn to run them concurrently \
+            when facets are independent. Do NOT spawn the whole task as one blob. \
+            role='explorer' is read-only investigation/Q&A. \
+            agent='<name>' runs a reusable named persona (project \
+            `.leveler/agents/<name>.md`, user-level, or built-in); its instructions \
+            are prepended to `task` and supply the role unless you override it."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -185,7 +184,7 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                 "files": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "For role='worker': the files this agent exclusively owns and may edit. Edits outside them are rejected."
+                    "description": "For role='worker': the paths this agent exclusively owns and may edit. Each entry is a relative file path or a directory (a directory grants its whole subtree, e.g. 'src/output/'). Edits outside them are rejected."
                 },
                 "agent": {
                     "type": "string",
@@ -432,6 +431,48 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_scope_advertises_directory_grants() {
+        // Ergonomics (MA-WA1): at decision time Main often knows the module,
+        // not every file. Directory scope has always been enforced (allowlist
+        // + overlap both use directory-prefix semantics) — the schema must say
+        // so, or the model believes it needs perfect file knowledge to spawn.
+        let def = spawn_agent_tool_definition();
+        let files_desc = def.input_schema["properties"]["files"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            files_desc.contains("directory"),
+            "files scope must advertise directory grants: {files_desc}"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_description_prefers_bounded_write_delegation() {
+        let def = spawn_agent_tool_definition();
+        let d = def.description.to_ascii_lowercase();
+        assert!(
+            d.contains("scoped") && (d.contains("write") || d.contains("edit")),
+            "Worker scoped write must be model-visible: {}",
+            def.description
+        );
+        assert!(
+            d.contains("independently verif") || d.contains("independent verif"),
+            "bounded independently-verifiable work must be named: {}",
+            def.description
+        );
+        assert!(
+            !d.contains("when the user asks for parallel/multi-agent work"),
+            "must not frame spawn as user-asked-parallel-only: {}",
+            def.description
+        );
+        assert!(
+            !d.contains("always spawn"),
+            "must not force spawn: {}",
+            def.description
+        );
+    }
 
     #[test]
     fn legacy_action_only_requests_network() {

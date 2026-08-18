@@ -295,6 +295,32 @@ impl TurnRunner<'_> {
                 if let Some(progress) = progress {
                     executor = executor.with_seeded_progress(progress);
                 }
+            } else if is_repair_turn
+                && progress.as_ref().is_some_and(|p| {
+                    p.delegation_decision_offered
+                        || p.delegation_kept_recorded
+                        || p.delegation_delegated_recorded
+                })
+            {
+                // A repair turn continues the SAME goal even though it runs as
+                // a fresh epoch (terminal progress is not inherited). The
+                // one-shot delegation decision point was already offered and
+                // must not be raised again, and its disposition facts must not
+                // be re-recorded (MA-WA1: one fact per epoch). Seed only those
+                // flags.
+                let prior = progress.as_ref().expect("guarded by is_some_and");
+                executor = executor.with_seeded_progress(leveler_agent::ProgressLedger {
+                    delegation_decision_offered: prior.delegation_decision_offered,
+                    delegation_kept_recorded: prior.delegation_kept_recorded,
+                    delegation_delegated_recorded: prior.delegation_delegated_recorded,
+                    ..Default::default()
+                });
+                if let Some(ledger) =
+                    last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
+                    && let Some(carried) = ledger.carry_forward_findings()
+                {
+                    executor = executor.with_seeded_ledger(carried);
+                }
             } else if let Some(ledger) =
                 last_persisted_ledger(self.stores.events.as_ref(), &self.session_id).await?
                 && let Some(carried) = ledger.carry_forward_findings()

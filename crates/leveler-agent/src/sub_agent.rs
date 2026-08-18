@@ -80,18 +80,252 @@ pub fn task_suggests_delegation(task: &str) -> bool {
     false
 }
 
-/// One-shot user injection when [`task_suggests_delegation`] is true.
+/// Whether the top-level executor should inject the keep-vs-delegate planning
+/// hint. Keyword heuristics (`task_suggests_delegation`) do **not** gate this:
+/// ordinary implementation goals must still see the policy. Children (`depth > 0`)
+/// never get it.
+pub fn should_inject_delegation_hint(allow_delegation: bool, depth: u32) -> bool {
+    allow_delegation && depth == 0
+}
+
+/// One-shot user injection when [`should_inject_delegation_hint`] is true.
 pub fn multi_agent_steer_hint() -> String {
     "## Multi-agent delegation\n\
-     This request looks multi-part or parallel. Prefer emitting several \
-     `spawn_agent` calls **in the same assistant turn** so they run concurrently \
-     (explorer for investigation, worker + disjoint `files` for edits). Put a \
-     complete self-contained `task` in each spawn — children do not see parent \
-     tool history. After children return, synthesize one answer yourself; do not \
-     re-run the same investigation. Do not spawn for trivial single-step work.\n\
+     Before substantial implementation, decide whether any bounded subtask \
+     should leave this trajectory. Prefer `spawn_agent` with role='worker' when \
+     the subtask has a clear file/module/symbol scope, can be independently \
+     verified, needs little shared mutable context, can produce a concrete \
+     implementation, and would reduce main-trajectory context or latency. A \
+     worker performs scoped writes inside `files` and can run targeted tests; \
+     put a complete self-contained `task` in the spawn — children do not see \
+     parent tool history. After a child returns, inspect and integrate; do not \
+     silently redo the same writes.\n\
+     Keep work on the main trajectory when delegation would introduce more \
+     coordination cost than value, or the step is a single trivial edit. If \
+     several subtasks are independent, emit several `spawn_agent` calls in one \
+     turn. Do not spawn for its own sake.\n\
      Long work stays in this direct tool loop: keep calling tools / spawn_agent \
      until the goal is proven; do not stop early with a plan-only summary."
         .to_string()
+}
+
+/// What the drive loop must do at a round boundary for the delegation
+/// decision point (MA-WA1). Ordering: facts (`RecordDelegated` / `RecordKept`)
+/// come before `Offer`, so the offer is never emitted after the decision it
+/// would ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DelegationRoundAction {
+    /// Inject the one-shot keep-vs-delegate request. `trigger` (`plan` |
+    /// `mutation_fallback`) labels the durable `offered` fact; `steps` carries
+    /// the model's own open plan steps (empty on the mutation fallback) so the
+    /// request is anchored to the registered decomposition, item by item.
+    Offer {
+        trigger: &'static str,
+        steps: Vec<String>,
+    },
+    /// First mutation after a visible offer with no Worker: durable `kept`.
+    RecordKept,
+    /// First Worker admitted: durable `delegated` with its file scope.
+    RecordDelegated(String),
+}
+
+/// Disposition facts already recorded in earlier windows of this goal epoch
+/// (seeded from `ProgressLedger`), so continue/resume/repair windows neither
+/// re-ask nor re-record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DelegationPrior {
+    pub offered: bool,
+    pub kept: bool,
+    pub delegated: bool,
+}
+
+/// One-shot keep-vs-delegate decision point (MA-WA1).
+///
+/// The prior architecture had no decision layer at all: the only delegation
+/// input was a round-1 hint, never re-anchored at the moment the model's own
+/// decomposition made the judgment possible. This struct guarantees exactly one
+/// neutral decision point per goal epoch — at plan registration (decomposition
+/// written down) or, for plan-less runs, at the second mutating round — and
+/// derives an observable disposition from behavior, never from self-report or
+/// hidden
+/// reasoning. It never blocks a call, never repeats, and treats KEEP as a
+/// first-class outcome.
+#[derive(Debug, Clone)]
+pub(crate) struct DelegationDecisionPoint {
+    /// depth == 0 ∧ allow_delegation. Children never see any of this.
+    eligible: bool,
+    /// The offer was injected (this window or a prior one, via ProgressLedger).
+    offered: bool,
+    /// The model has had a full round to read the offer; only mutations after
+    /// that count as a KEEP commitment.
+    offer_visible: bool,
+    kept_recorded: bool,
+    delegated_recorded: bool,
+    /// Rounds (not calls) in which at least one mutation succeeded. The
+    /// fallback offer waits for the SECOND such round: probe evidence (xsv ×2)
+    /// showed a lone prep edit (Cargo.toml) one round before `update_plan`
+    /// consuming the one-shot offer, so the plan-anchored per-step form never
+    /// fired on exactly the runs that needed it.
+    mutation_rounds_seen: u32,
+    // Round-local facts, cleared by `end_round`.
+    plan_open_steps: Vec<String>,
+    mutated_this_round: bool,
+    worker_scope_this_round: Option<String>,
+}
+
+impl DelegationDecisionPoint {
+    pub(crate) fn new(eligible: bool, prior: DelegationPrior) -> Self {
+        Self {
+            eligible,
+            offered: prior.offered,
+            offer_visible: prior.offered,
+            kept_recorded: prior.kept,
+            delegated_recorded: prior.delegated,
+            mutation_rounds_seen: 0,
+            plan_open_steps: Vec::new(),
+            mutated_this_round: false,
+            worker_scope_this_round: None,
+        }
+    }
+
+    /// A ModelExplicit plan was registered/replaced; `open_steps` are the step
+    /// texts still pending/in_progress, in plan order.
+    pub(crate) fn note_plan_registered(&mut self, open_steps: &[String]) {
+        if open_steps.len() > self.plan_open_steps.len() {
+            self.plan_open_steps = open_steps.to_vec();
+        }
+    }
+
+    /// A tool call successfully mutated the workspace this round.
+    pub(crate) fn note_mutation(&mut self) {
+        self.mutated_this_round = true;
+    }
+
+    /// A Worker child passed spawn admission this round.
+    pub(crate) fn note_worker_admitted(&mut self, files: &[String]) {
+        if self.worker_scope_this_round.is_none() {
+            self.worker_scope_this_round = Some(files.join(", "));
+        }
+    }
+
+    /// Resolve this round's facts into actions. At most one `Offer` per epoch;
+    /// `kept`/`delegated` each at most once.
+    pub(crate) fn end_round(&mut self) -> Vec<DelegationRoundAction> {
+        let mut actions = Vec::new();
+        if !self.eligible {
+            self.clear_round();
+            return actions;
+        }
+        if let Some(scope) = self.worker_scope_this_round.take()
+            && !self.delegated_recorded
+        {
+            self.delegated_recorded = true;
+            actions.push(DelegationRoundAction::RecordDelegated(scope));
+        }
+        if self.mutated_this_round
+            && self.offer_visible
+            && !self.kept_recorded
+            && !self.delegated_recorded
+        {
+            self.kept_recorded = true;
+            actions.push(DelegationRoundAction::RecordKept);
+        }
+        if self.mutated_this_round {
+            self.mutation_rounds_seen = self.mutation_rounds_seen.saturating_add(1);
+        }
+        if !self.offered && !self.delegated_recorded {
+            if self.plan_open_steps.len() >= 2 {
+                self.offered = true;
+                actions.push(DelegationRoundAction::Offer {
+                    trigger: "plan",
+                    steps: std::mem::take(&mut self.plan_open_steps),
+                });
+            } else if self.mutation_rounds_seen >= 2 {
+                // Plan-less fallback, deliberately one mutating round late:
+                // a prep edit followed by update_plan next round still gets
+                // the plan-anchored per-step form instead of this generic one.
+                self.offered = true;
+                actions.push(DelegationRoundAction::Offer {
+                    trigger: "mutation_fallback",
+                    steps: Vec::new(),
+                });
+            }
+        }
+        // Anything offered up to and including this round is readable next round.
+        self.offer_visible = self.offered;
+        self.clear_round();
+        actions
+    }
+
+    fn clear_round(&mut self) {
+        self.plan_open_steps.clear();
+        self.mutated_this_round = false;
+        self.worker_scope_this_round = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn offered(&self) -> bool {
+        self.offered
+    }
+}
+
+/// How many registered plan steps the decision request enumerates at most.
+const DECISION_REQUEST_MAX_STEPS: usize = 8;
+
+/// The one-shot decision-point message. Deliberately neutral: it names both
+/// outcomes as valid, directs nothing globally, and says it will not repeat.
+///
+/// When the trigger was plan registration, the request enumerates the model's
+/// OWN open steps and asks for a per-step disposition. Probe evidence (miller
+/// head/tail): a generic "any bounded piece?" invitation lets the model judge
+/// the whole plan by its most coupled steps and keep everything — including
+/// the separable mechanical tail (doc/golden updates) that then exhausts its
+/// round budget. Anchoring the choice to each registered item is decision
+/// scaffolding, not steering: the criteria stay symmetric and KEEP-everything
+/// stays a first-class outcome.
+pub(crate) fn delegation_decision_request(steps: &[String]) -> String {
+    let mut out = String::from("## Delegation disposition (one-time)\n");
+    if steps.is_empty() {
+        out.push_str(
+            "Your task decomposition is on record. Decide once, before continuing \
+             implementation: does any remaining piece form a bounded independent \
+             workstream — a clear file/module scope, independently verifiable, needing \
+             little of your in-flight context?\n\
+             - If yes: you may delegate it now via `spawn_agent` with role='worker', a \
+             complete self-contained `task`, and the exact `files` (or directories) it \
+             will own; inspect and integrate its result when it returns.\n\
+             - If no: keep all the work and continue exactly as you were. KEEP is a \
+             fully valid outcome.\n",
+        );
+    } else {
+        out.push_str(
+            "Your plan is on record. Decide once, for EACH open step below: KEEP \
+             (do it on this trajectory) or DELEGATE (`spawn_agent` role='worker' \
+             with a complete self-contained `task` and the exact `files` or \
+             directories that step owns).\n",
+        );
+        for (i, step) in steps.iter().take(DECISION_REQUEST_MAX_STEPS).enumerate() {
+            out.push_str(&format!("{}. {}\n", i + 1, step));
+        }
+        if steps.len() > DECISION_REQUEST_MAX_STEPS {
+            out.push_str(&format!(
+                "… and {} more step(s), same choice each.\n",
+                steps.len() - DECISION_REQUEST_MAX_STEPS
+            ));
+        }
+        out.push_str(
+            "A step that needs your in-flight context, shares edits with other \
+             steps, or is trivial: KEEP it. A step that is bounded, independently \
+             verifiable, and does not need what is in your head — for example a \
+             self-contained module, or a broad mechanical update of docs/goldens/\
+             fixtures — is a candidate for DELEGATE: the worker runs concurrently \
+             and returns a result you inspect and integrate.\n\
+             Answer with one short KEEP/DELEGATE line per step, then proceed \
+             accordingly. KEEP for every step is a valid outcome.\n",
+        );
+    }
+    out.push_str("This is the only time the harness raises this; you will not be asked again.");
+    out
 }
 
 /// A delegated unit must eventually return control to its parent even if a
@@ -356,7 +590,14 @@ impl ChildProfile {
 /// prefix of the other), after `./` normalization. Used to refuse same-batch
 /// workers whose exclusive scopes are not actually exclusive.
 pub(crate) fn scopes_overlap(a: &[String], b: &[String]) -> bool {
-    let norm = |p: &String| p.trim().trim_start_matches("./").to_string();
+    // Trailing slashes stripped for the same reason as the write allowlist:
+    // the schema's directory example is spelled `src/output/`.
+    let norm = |p: &String| {
+        p.trim()
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_string()
+    };
     let covers = |x: &str, y: &str| x == y || y.starts_with(&format!("{x}/"));
     a.iter().map(&norm).any(|pa| {
         b.iter()
@@ -437,6 +678,17 @@ mod profile_tests {
             &["src/auth.rs.bak".to_string()]
         ));
         assert!(!scopes_overlap(&a, &[]));
+        // The schema's directory example carries a trailing slash; overlap
+        // detection must see through it, or two same-batch workers could hold
+        // "src/output/" and "src/output/foo.rs" as disjoint scopes.
+        assert!(scopes_overlap(
+            &["src/output/".to_string()],
+            &["src/output/foo.rs".to_string()]
+        ));
+        assert!(scopes_overlap(
+            &["src/output".to_string()],
+            &["src/output/".to_string()]
+        ));
     }
 }
 
@@ -468,8 +720,290 @@ mod tests {
     }
 
     #[test]
+    fn steer_hint_is_keep_vs_delegate_not_always_spawn() {
+        let h = multi_agent_steer_hint();
+        let lower = h.to_ascii_lowercase();
+        assert!(lower.contains("bounded"));
+        assert!(lower.contains("independently verif") || lower.contains("independent verif"));
+        assert!(lower.contains("scoped") && (lower.contains("write") || lower.contains("edit")));
+        assert!(lower.contains("coordination") || lower.contains("keep work on the main"));
+        assert!(!lower.contains("always spawn"));
+        assert!(!lower.contains("must spawn"));
+    }
+
+    #[test]
+    fn keep_vs_delegate_hint_is_offered_on_ordinary_implementation_goals() {
+        assert!(should_inject_delegation_hint(true, 0));
+        assert!(!should_inject_delegation_hint(true, 1));
+        assert!(!should_inject_delegation_hint(false, 0));
+        // A real GitHub-issue goal without parallel/spawn words still gets the hint.
+        let goal = "Add `--export-toml FILE`. When that flag is passed, write \
+                    the timing summary as TOML. Existing export flags must keep working.";
+        assert!(
+            !task_suggests_delegation(goal),
+            "ordinary implementation goals must stay unsteered by the keyword heuristic"
+        );
+        assert!(should_inject_delegation_hint(true, 0));
+    }
+
+    #[test]
     fn nicknames_cycle() {
         assert_eq!(agent_nickname(1), "Euclid");
         assert_eq!(agent_nickname(AGENT_NICKNAMES.len() + 1), "Euclid #2");
+    }
+}
+
+#[cfg(test)]
+mod decision_point_tests {
+    use super::*;
+
+    fn steps(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_registration_triggers_one_offer_and_mutations_then_record_keep() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_plan_registered(&steps(&["edit head", "edit tail"]));
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::Offer {
+                trigger: "plan",
+                steps: steps(&["edit head", "edit tail"]),
+            }],
+            "decomposition on record → one offer carrying the model's own steps"
+        );
+        // Same round as the offer: the model has not read it yet, so a
+        // mutation that raced it in a later round is the KEEP commitment.
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "keep is recorded once, never nagged"
+        );
+    }
+
+    #[test]
+    fn the_mutation_fallback_fires_on_the_second_mutating_round() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "one mutating round leaves room for a plan to land first"
+        );
+        dp.note_mutation();
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::Offer {
+                trigger: "mutation_fallback",
+                steps: Vec::new(),
+            }]
+        );
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+    }
+
+    /// Iteration 3 (xsv probes ×2): a lone prep edit one round before
+    /// update_plan must NOT consume the one-shot offer — the plan-anchored
+    /// per-step form is the one that produces reviewable dispositions.
+    #[test]
+    fn a_prep_edit_then_a_plan_still_gets_the_per_step_form() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_mutation(); // Cargo.toml prep edit
+        assert!(dp.end_round().is_empty());
+        dp.note_plan_registered(&steps(&["frequency --json", "stats --json", "dedup"]));
+        let actions = dp.end_round();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [DelegationRoundAction::Offer { trigger: "plan", steps }] if steps.len() == 3
+            ),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_step_plan_waits_for_the_mutation_fallback() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_plan_registered(&steps(&["do it"]));
+        assert!(dp.end_round().is_empty(), "one step is not a decomposition");
+        dp.note_mutation();
+        dp.end_round();
+        dp.note_mutation();
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::Offer {
+                trigger: "mutation_fallback",
+                steps: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn worker_admission_records_delegated_and_suppresses_offer_and_keep() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_worker_admitted(&["src/a.rs".into(), "src/b.rs".into()]);
+        dp.note_mutation();
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordDelegated(
+                "src/a.rs, src/b.rs".into()
+            )],
+            "a model that already decided is not offered and not marked kept"
+        );
+        dp.note_worker_admitted(&["src/c.rs".into()]);
+        assert!(dp.end_round().is_empty(), "delegated is recorded once");
+    }
+
+    #[test]
+    fn delegation_after_keep_is_still_recorded_as_a_fact() {
+        let mut dp = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        dp.note_mutation();
+        dp.end_round();
+        dp.note_mutation();
+        dp.end_round(); // second mutating round → offer
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+        dp.note_worker_admitted(&["src/a.rs".into()]);
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordDelegated("src/a.rs".into())]
+        );
+    }
+
+    #[test]
+    fn children_and_disabled_delegation_are_fully_silent() {
+        for mut dp in [
+            DelegationDecisionPoint::new(false, DelegationPrior::default()),
+            DelegationDecisionPoint::new(
+                false,
+                DelegationPrior {
+                    offered: true,
+                    kept: false,
+                    delegated: false,
+                },
+            ),
+        ] {
+            dp.note_plan_registered(&steps(&["a", "b", "c"]));
+            dp.note_mutation();
+            dp.note_worker_admitted(&["a".into()]);
+            assert!(dp.end_round().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_prior_window_offer_is_never_re_asked() {
+        // Resume: ProgressLedger says the offer already happened. The next
+        // mutation records KEEP; no second offer this epoch.
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: false,
+                delegated: false,
+            },
+        );
+        assert!(dp.offered());
+        dp.note_plan_registered(&steps(&["a", "b", "c", "d"]));
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+    }
+
+    fn assert_request_is_neutral(text: &str) {
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.contains("## delegation disposition"));
+        assert!(lower.contains("spawn_agent") && lower.contains("worker"));
+        assert!(lower.contains("valid outcome"));
+        assert!(lower.contains("not be asked again"));
+        // Forbidden directive framings (gate §5): the decision point asks,
+        // it never steers.
+        for banned in [
+            "you should delegate",
+            "prefer worker",
+            "prefer delegation",
+            "delegate when possible",
+            "always",
+            "parallelize aggressively",
+            "for complex tasks",
+        ] {
+            assert!(
+                !lower.contains(banned),
+                "banned phrase `{banned}` in: {text}"
+            );
+        }
+    }
+
+    /// Review finding #2: disposition facts are one-per-epoch, not
+    /// one-per-window. A resumed/repair window seeded with a prior `kept` or
+    /// `delegated` must not re-record it — and must never record a
+    /// contradictory `kept` after a prior-window `delegated`.
+    #[test]
+    fn prior_window_disposition_facts_are_not_re_recorded() {
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: true,
+                delegated: false,
+            },
+        );
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "kept already recorded last window"
+        );
+        dp.note_worker_admitted(&["src/a.rs".into()]);
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordDelegated("src/a.rs".into())],
+            "a genuinely new delegated fact is still recordable after kept"
+        );
+
+        let mut dp = DelegationDecisionPoint::new(
+            true,
+            DelegationPrior {
+                offered: true,
+                kept: false,
+                delegated: true,
+            },
+        );
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "no contradictory kept after a prior-window delegated"
+        );
+        dp.note_worker_admitted(&["src/b.rs".into()]);
+        assert!(
+            dp.end_round().is_empty(),
+            "delegated recorded once per epoch"
+        );
+    }
+
+    #[test]
+    fn the_generic_request_is_neutral_names_both_outcomes_and_promises_no_repeat() {
+        assert_request_is_neutral(&delegation_decision_request(&[]));
+    }
+
+    /// Iteration 2 (miller probe evidence): the plan-triggered request must
+    /// enumerate the model's own open steps and ask per-step, with symmetric
+    /// KEEP/DELEGATE criteria — never a global directive.
+    #[test]
+    fn the_plan_request_enumerates_the_registered_steps_per_item() {
+        let items = steps(&["给 head.go 加 --filename", "更新 docs 与 goldens"]);
+        let text = delegation_decision_request(&items);
+        assert_request_is_neutral(&text);
+        assert!(text.contains("1. 给 head.go 加 --filename"), "{text}");
+        assert!(text.contains("2. 更新 docs 与 goldens"), "{text}");
+        assert!(text.contains("EACH open step"), "{text}");
+        assert!(
+            text.contains("KEEP for every step is a valid outcome"),
+            "{text}"
+        );
+        // Long plans stay bounded.
+        let many: Vec<String> = (0..12).map(|i| format!("step {i}")).collect();
+        let long = delegation_decision_request(&many);
+        assert!(long.contains("… and 4 more step(s)"), "{long}");
+        assert!(!long.contains("step 9"), "{long}");
     }
 }

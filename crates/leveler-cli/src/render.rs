@@ -162,6 +162,13 @@ fn render_event_text(event: AgentEvent) {
                 console::style(detail).dim()
             );
         }
+        AgentEvent::DelegationStage { action, detail } => {
+            println!(
+                "  {} delegation {action} {}",
+                console::style("⑂").cyan(),
+                console::style(detail).dim()
+            );
+        }
         AgentEvent::EvidenceLedgerUpdated { ledger } => {
             println!(
                 "  {} evidence ledger · mut={} verify={} intercepts={}",
@@ -339,6 +346,9 @@ fn render_event_jsonl(event: AgentEvent) {
         }),
         AgentEvent::GoalIntercepted { kind, detail } => serde_json::json!({
             "type": "goal_intercepted", "kind": kind, "detail": detail,
+        }),
+        AgentEvent::DelegationStage { action, detail } => serde_json::json!({
+            "type": "delegation_stage", "action": action, "detail": detail,
         }),
         AgentEvent::EvidenceLedgerUpdated { ledger } => serde_json::json!({
             "type": "evidence_ledger_updated",

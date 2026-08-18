@@ -99,8 +99,20 @@ pub(crate) fn write_targets_outside_allowlist(
     call: &ToolCall,
     allowlist: &[String],
 ) -> Vec<String> {
-    let norm = |p: &str| p.trim().trim_start_matches("./").to_string();
-    let allow: Vec<String> = allowlist.iter().map(|p| norm(p)).collect();
+    // Trailing slashes are stripped so a directory grant written either way
+    // (`src/output` / `src/output/`, the spawn_agent schema shows the latter)
+    // covers its subtree. A bare "/" normalizes to "" and matches nothing.
+    let norm = |p: &str| {
+        p.trim()
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let allow: Vec<String> = allowlist
+        .iter()
+        .map(|p| norm(p))
+        .filter(|p| !p.is_empty())
+        .collect();
     let targets: Vec<String> = match call.name.as_str() {
         "apply_patch" => {
             let patch = call
@@ -434,6 +446,29 @@ mod tests {
             name: name.to_string(),
             arguments,
         }
+    }
+
+    /// The spawn_agent schema's directory example uses a trailing slash
+    /// (`src/output/`). The allowlist must accept that spelling: without
+    /// trailing-slash normalization every write of a worker scoped per the
+    /// schema's own example is refused (fail-closed, but a dead worker).
+    #[test]
+    fn a_trailing_slash_directory_allowlist_entry_admits_the_subtree() {
+        let call = tool_call(
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/output/mod.rs\n-a\n+b\n*** End Patch"
+            }),
+        );
+        assert!(
+            write_targets_outside_allowlist(&call, &["src/output/".to_string()]).is_empty(),
+            "trailing-slash directory grant must cover its subtree"
+        );
+        assert_eq!(
+            write_targets_outside_allowlist(&call, &["src/other/".to_string()]),
+            vec!["src/output/mod.rs".to_string()],
+            "normalization must not turn a trailing slash into allow-everything"
+        );
     }
 
     #[test]
