@@ -55,6 +55,8 @@ fn snapshot_for(session_id: &str) -> UiSessionSnapshot {
         user_shells: Vec::new(),
         completion_report: None,
         reasoning: None,
+        work_profile: None,
+        collaboration: None,
     }
 }
 

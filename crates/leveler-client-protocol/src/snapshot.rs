@@ -70,6 +70,63 @@ mod tests {
     }
 
     #[test]
+    fn old_snapshot_json_without_axes_stays_compatible() {
+        let json = serde_json::json!({
+            "id": "s1",
+            "repository": "/repo",
+            "goal": "g",
+            "model": null,
+            "mode": "assisted",
+            "branch": null,
+            "status": "idle",
+            "messages": []
+        });
+        let snap: UiSessionSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snap.work_profile, None);
+        assert_eq!(snap.collaboration, None);
+    }
+
+    #[test]
+    fn snapshot_carries_product_axes_when_set() {
+        let mut snap = UiSessionSnapshot {
+            id: crate::SessionId::new("s1"),
+            repository: "/repo".into(),
+            goal: "g".into(),
+            model: None,
+            mode: crate::PermissionProfile::Assisted,
+            branch: None,
+            status: "idle".into(),
+            messages: Vec::new(),
+            pending_interactions: Vec::new(),
+            available_models: Vec::new(),
+            vision: false,
+            last_sequence: None,
+            active_tools: Vec::new(),
+            plan: None,
+            verification: None,
+            diff: None,
+            checkpoints: Vec::new(),
+            user_shells: Vec::new(),
+            completion_report: None,
+            reasoning: None,
+            work_profile: None,
+            collaboration: None,
+        };
+        // Unset axes stay off the wire (old-client compatibility).
+        let value = serde_json::to_value(&snap).unwrap();
+        assert!(value.get("work_profile").is_none(), "{value}");
+        assert!(value.get("collaboration").is_none(), "{value}");
+
+        snap.work_profile = Some("delivery".into());
+        snap.collaboration = Some("goal".into());
+        let value = serde_json::to_value(&snap).unwrap();
+        assert_eq!(value["work_profile"], "delivery");
+        assert_eq!(value["collaboration"], "goal");
+        let back: UiSessionSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(back, snap);
+    }
+
+    #[test]
     fn snapshot_omits_reasoning_when_unset() {
         let snap = UiSessionSnapshot {
             id: crate::SessionId::new("s1"),
@@ -92,6 +149,8 @@ mod tests {
             user_shells: Vec::new(),
             completion_report: None,
             reasoning: None,
+            work_profile: None,
+            collaboration: None,
         };
         let value = serde_json::to_value(&snap).unwrap();
         assert!(value.get("reasoning").is_none(), "{value}");
@@ -291,6 +350,17 @@ pub struct UiSessionSnapshot {
     /// the model has no controllable effort knob (do not invent one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<UiReasoningState>,
+    /// Product work-profile axis (`economy | balanced | delivery`). The source
+    /// of truth is the session record (`SetProductAxes`); carried here so a
+    /// reconnecting client shows the axis the runtime will actually use
+    /// instead of a stale local guess. Absent on old runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_profile: Option<String>,
+    /// Product collaboration axis (`chat | plan | goal`). Same contract as
+    /// `work_profile` — the runtime routes submits (goal) and restricts tools
+    /// (plan) from this value, so clients must not invent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration: Option<String>,
 }
 
 /// Additive reasoning projection. The client must display `effective` and

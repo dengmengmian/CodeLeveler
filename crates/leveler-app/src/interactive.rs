@@ -2220,6 +2220,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             user_shells: self.user_shells.snapshot(session_id),
             completion_report: live.completion_report,
             reasoning,
+            work_profile: Some(config.work_profile.clone()),
+            collaboration: Some(config.collaboration.clone()),
         })
     }
 }
@@ -2480,6 +2482,8 @@ async fn compact_conversation(
                 user_shells: Vec::new(),
                 completion_report: live.completion_report,
                 reasoning,
+                work_profile: Some(record.work_profile.clone()),
+                collaboration: Some(record.collaboration.clone()),
             },
         });
     }

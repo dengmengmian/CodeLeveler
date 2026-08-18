@@ -745,6 +745,15 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     if let Some(reasoning) = &session.reasoning {
         state.reasoning_effort = reasoning.effective.clone();
     }
+    // Product axes: the session record is the source of truth; adopt when the
+    // runtime sends them so a reconnect cannot show a stale local guess. Old
+    // runtimes omit the fields — keep the local value then.
+    if let Some(work_profile) = &session.work_profile {
+        state.work_profile = work_profile.clone();
+    }
+    if let Some(collaboration) = &session.collaboration {
+        state.collaboration = collaboration.clone();
+    }
 }
 
 fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {

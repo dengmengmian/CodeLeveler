@@ -1771,6 +1771,13 @@
             "$ref": "#/definitions/UiCheckpoint"
           }
         },
+        "collaboration": {
+          "description": "Product collaboration axis (`chat | plan | goal`). Same contract as `work_profile` — the runtime routes submits (goal) and restricts tools (plan) from this value, so clients must not invent it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "completion_report": {
           "default": null,
           "anyOf": [
@@ -1887,6 +1894,13 @@
           "description": "Whether the current model accepts image input (spec §42).",
           "default": false,
           "type": "boolean"
+        },
+        "work_profile": {
+          "description": "Product work-profile axis (`economy | balanced | delivery`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

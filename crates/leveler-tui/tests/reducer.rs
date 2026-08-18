@@ -83,6 +83,8 @@ fn snapshot() -> UiSessionSnapshot {
         user_shells: Vec::new(),
         completion_report: None,
         reasoning: None,
+        work_profile: None,
+        collaboration: None,
     }
 }
 
@@ -114,6 +116,32 @@ fn session_opened_sets_labels_without_welcome_card() {
         s.transcript.is_empty(),
         "no welcome card or other blocks may be injected on open"
     );
+}
+
+#[test]
+fn session_updated_adopts_product_axes_from_snapshot() {
+    let mut s = state();
+    // Boot defaults are balanced/chat; the runtime (session record) says
+    // otherwise — the snapshot value must win over the local guess.
+    let mut snap = snapshot();
+    snap.work_profile = Some("delivery".into());
+    snap.collaboration = Some("goal".into());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
+    );
+    assert_eq!(s.work_profile, "delivery");
+    assert_eq!(s.collaboration, "goal");
+
+    // An old runtime without the fields must NOT clobber the local state.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated {
+            session: snapshot(),
+        }),
+    );
+    assert_eq!(s.work_profile, "delivery");
+    assert_eq!(s.collaboration, "goal");
 }
 
 #[test]
