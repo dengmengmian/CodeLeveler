@@ -155,19 +155,20 @@ pub(crate) fn complete_step_tool_definition() -> ToolDefinition {
 pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: SPAWN_AGENT_TOOL.to_string(),
-        description: "Run a focused sub-agent on a self-contained subtask and get \
-            back its final result. It shares your model and workspace but starts a \
-            FRESH conversation, so put everything it needs in `task`. \
-            Before substantial implementation, prefer delegation when a bounded \
-            subtask has a clear file/module scope, can be independently verified, \
-            needs little shared mutable context, and a Worker can produce a concrete \
-            implementation. role='worker' performs scoped writes in `files` and can \
-            run targeted verification; assign disjoint `files` if you emit several \
-            workers. Keep the work yourself when coordination would cost more than \
-            it saves, or the step is a single trivial edit. \
-            Emit several spawn_agent calls in one turn to run them concurrently \
-            when facets are independent. Do NOT spawn the whole task as one blob. \
+        description: "Delegate a self-contained subtask to a focused sub-agent so it \
+            does not consume this conversation's context. The child shares your model \
+            and workspace but starts a FRESH conversation — put everything it needs \
+            in `task`. This tool runs the child IN THE BACKGROUND BY DEFAULT: the \
+            call returns immediately with the child's id, you continue working, and \
+            the runtime tells you when it settles (its truthful result, partial work \
+            included). Start independent delegations together in one assistant \
+            message; they run concurrently. \
+            role='worker' performs scoped writes inside `files` (its exclusive \
+            ownership — your own edits there are refused while it runs) and can run \
+            targeted verification; assign disjoint `files` to parallel workers. \
             role='explorer' is read-only investigation/Q&A. \
+            Keep the work yourself when it is small, tightly coupled, or needs your \
+            in-flight context. Do NOT spawn the whole task as one blob. \
             agent='<name>' runs a reusable named persona (project \
             `.leveler/agents/<name>.md`, user-level, or built-in); its instructions \
             are prepended to `task` and supply the role unless you override it."
@@ -189,11 +190,25 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                 "agent": {
                     "type": "string",
                     "description": "Name of a reusable agent persona to run (project `.leveler/agents/<name>.md`, user-level, or built-in). Its instructions are prepended to `task`."
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Defaults to true — the call returns immediately with the child's id and you continue useful work; the runtime tells you when it settles. Set false only when your next action depends on this child's result."
                 }
             },
             "required": ["task"]
         }),
     }
+}
+
+/// Runtime default resolution for `run_in_background`: an omitted parameter
+/// means background. The model relies on the advertised default; it does not
+/// have to reproduce it on every call.
+pub(crate) fn resolve_run_in_background(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("run_in_background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }
 
 /// The tool a CHILD calls to report one typed finding as it is confirmed.
@@ -448,30 +463,58 @@ mod tests {
         );
     }
 
+    /// V2 four-point background contract, tool-description + parameter points:
+    /// the advertised default is background, the call returns immediately with
+    /// the child's id, settlement is promised, and the foreground escape is
+    /// scoped to "next action depends on it". Runtime point is
+    /// `resolve_run_in_background`; prompt point is the steer hint (tested in
+    /// sub_agent.rs).
     #[test]
-    fn spawn_agent_description_prefers_bounded_write_delegation() {
+    fn spawn_agent_advertises_the_background_first_contract() {
         let def = spawn_agent_tool_definition();
         let d = def.description.to_ascii_lowercase();
+        assert!(d.contains("background by default"), "{}", def.description);
+        assert!(d.contains("returns immediately"), "{}", def.description);
+        assert!(d.contains("settle"), "{}", def.description);
         assert!(
             d.contains("scoped") && (d.contains("write") || d.contains("edit")),
-            "Worker scoped write must be model-visible: {}",
+            "Worker scoped write must stay model-visible: {}",
             def.description
         );
         assert!(
-            d.contains("independently verif") || d.contains("independent verif"),
-            "bounded independently-verifiable work must be named: {}",
+            d.contains("keep the work yourself when"),
+            "KEEP guidance must stay: {}",
             def.description
         );
         assert!(
             !d.contains("when the user asks for parallel/multi-agent work"),
-            "must not frame spawn as user-asked-parallel-only: {}",
+            "{}",
             def.description
         );
-        assert!(
-            !d.contains("always spawn"),
-            "must not force spawn: {}",
-            def.description
-        );
+        assert!(!d.contains("always spawn"), "{}", def.description);
+
+        let param = def.input_schema["properties"]["run_in_background"]["description"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(param.contains("defaults to true"), "{param}");
+        assert!(param.contains("next action depends"), "{param}");
+    }
+
+    #[test]
+    fn run_in_background_default_is_runtime_resolved_not_model_remembered() {
+        assert!(resolve_run_in_background(&serde_json::json!({"task": "x"})));
+        assert!(resolve_run_in_background(
+            &serde_json::json!({"task": "x", "run_in_background": true})
+        ));
+        assert!(!resolve_run_in_background(
+            &serde_json::json!({"task": "x", "run_in_background": false})
+        ));
+        // Malformed value degrades to the advertised default, never to a
+        // silent foreground surprise.
+        assert!(resolve_run_in_background(
+            &serde_json::json!({"task": "x", "run_in_background": "yes"})
+        ));
     }
 
     #[test]

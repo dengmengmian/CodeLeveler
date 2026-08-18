@@ -48,9 +48,36 @@ use crate::injected_tools::{
 use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
     AgentRole, ChildProfile, DelegationDecisionPoint, DelegationRoundAction, MAX_SUB_AGENT_DEPTH,
-    agent_nickname, delegation_decision_request, multi_agent_steer_hint, scopes_overlap,
-    should_inject_delegation_hint,
+    agent_nickname, delegation_decision_request, lost_children_note, multi_agent_steer_hint,
+    scopes_overlap, settlement_notice, should_inject_delegation_hint,
 };
+
+/// One still-running background delegation (V2). The join handle is owned by
+/// the drive loop — there is no second scheduler; settlement is read at round
+/// boundaries and at the explicit drain points.
+struct BackgroundChild {
+    id: String,
+    nickname: String,
+    role: AgentRole,
+    /// Worker exclusive scope (empty for read-only roles). Held for overlap
+    /// admission and the parent write fence until settlement.
+    scope: Vec<String>,
+    handle: tokio::task::JoinHandle<super::handlers::SubAgentRunResult>,
+}
+
+/// Abort-on-drop guard: if the drive future is dropped on an unexpected path,
+/// spawned children must not keep running as orphans. Every NORMAL exit drains
+/// (settles) children first, so this abort is strictly the crash path.
+#[derive(Default)]
+struct BackgroundChildren(Vec<BackgroundChild>);
+
+impl Drop for BackgroundChildren {
+    fn drop(&mut self) {
+        for child in &self.0 {
+            child.handle.abort();
+        }
+    }
+}
 
 struct CancelOnDrop(CancellationToken);
 
@@ -66,7 +93,7 @@ impl Executor {
         &self,
         mut messages: Vec<Message>,
         objective: ObjectiveAnchor,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
@@ -145,7 +172,9 @@ impl Executor {
         // evaluate bounded Worker work.
         if should_inject_delegation_hint(self.policy.allow_delegation, self.depth)
             && !messages.iter().any(|m| {
-                m.role == Role::User && m.text_content().contains("## Multi-agent delegation")
+                m.role == Role::User
+                    && m.text_content()
+                        .contains(crate::sub_agent::MULTI_AGENT_HINT_HEADER)
             })
         {
             messages.push(Message::text(Role::User, multi_agent_steer_hint()));
@@ -159,6 +188,34 @@ impl Executor {
         }
         // Sub-agents spawned so far this run (bounds total delegation).
         let mut agents_spawned = 0usize;
+        // V2 background delegation state: children the model started with
+        // run_in_background (the default). One run-level concurrency semaphore
+        // covers foreground batches AND background children; the progress
+        // channel outlives any single spawn batch and is drained at round
+        // boundaries.
+        let mut background_children = BackgroundChildren::default();
+        let run_agents_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            self.policy.max_concurrent_agents.max(1),
+        ));
+        let (bg_progress_tx, mut bg_progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        // In-process children did not survive a restart: tell the model
+        // truthfully which delegations were lost, release their scopes, and
+        // clear the durable record.
+        if self.depth == 0 && !progress.outstanding_children.is_empty() {
+            let note = Message::text(
+                Role::User,
+                lost_children_note(&progress.outstanding_children),
+            );
+            progress.outstanding_children.clear();
+            observer(AgentEvent::ProgressUpdated {
+                ledger: progress.clone(),
+            });
+            // 必改④: durable like every other injected turn — the record was
+            // just cleared, so the note is the only remaining truth.
+            sink.append(std::slice::from_ref(&note)).await?;
+            messages.push(note);
+        }
         // MA-WA1: one-shot keep-vs-delegate decision point. Eligible only for
         // top-level runs with delegation on; a prior window's offer and
         // disposition facts (seeded via ProgressLedger) are never re-asked or
@@ -307,6 +364,81 @@ impl Executor {
             }};
         }
 
+        // V2: non-blocking settlement of finished background children — the
+        // notice lands in `messages` before the next model round.
+        macro_rules! settle_finished_children {
+            ($rounds:expr) => {{
+                while let Ok(event) = bg_progress_rx.try_recv() {
+                    observer(event);
+                }
+                let mut settled = Vec::new();
+                let mut i = 0;
+                while i < background_children.0.len() {
+                    if background_children.0[i].handle.is_finished() {
+                        settled.push(background_children.0.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                for child in settled {
+                    let BackgroundChild {
+                        id,
+                        nickname,
+                        role,
+                        scope,
+                        handle,
+                    } = child;
+                    let result = join_settlement(handle.await);
+                    let (content, _ok) = fold_child_settlement(
+                        &mut progress,
+                        &mut commands_run,
+                        &mut model_tokens_spent,
+                        &mut cost_spent_micros,
+                        &mut modified_files,
+                        &mut ledger,
+                        observer,
+                        &id,
+                        &nickname,
+                        role,
+                        &result,
+                    );
+                    clear_outstanding_child(&mut progress, &id);
+                    let notice = Message::text(
+                        Role::User,
+                        settlement_notice(&nickname, &id, role, &scope, &content),
+                    );
+                    // 必改④: persist the notice NOW. The next ContextSnapshot is
+                    // a whole model round away, and outstanding_children was
+                    // just cleared — a crash in between would otherwise lose
+                    // the child's report text with no lost-note either.
+                    sink.append(std::slice::from_ref(&notice)).await?;
+                    messages.push(notice);
+                    flush_epoch!($rounds);
+                }
+            }};
+        }
+
+        // V2: full drain — await EVERY outstanding background child before the
+        // run returns, so no exit path orphans a running delegation or loses
+        // its result (findings adoption in the fold is durable even when the
+        // run is ending). Children hold child cancellation tokens and wall
+        // caps, so this terminates.
+        macro_rules! drain_background_children {
+            ($rounds:expr) => {{
+                while !background_children.0.is_empty() {
+                    settle_finished_children!($rounds);
+                    if background_children.0.is_empty() {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        Some(event) = bg_progress_rx.recv() => observer(event),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    }
+                }
+            }};
+        }
+
         let mut round = 0u32;
 
         // A progress watchdog giving up: mark the ledger terminal, publish it,
@@ -327,6 +459,7 @@ impl Executor {
                 };
                 observer(AgentEvent::Finished(final_text.clone()));
                 flush_epoch!(round);
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_result(
                     final_text,
                     round,
@@ -366,6 +499,11 @@ impl Executor {
                     messages.push(message);
                 }
             }
+            // Background settlements land before the model is asked anything —
+            // whichever path reached this round top (tool batch, quiet wait,
+            // nudge continue), the model never runs a round blind to a child
+            // that already finished.
+            settle_finished_children!(round);
             if let Some(max) = self.step_limits.max_model_tokens
                 && model_tokens_spent >= max
             {
@@ -375,6 +513,7 @@ impl Executor {
                 observer(AgentEvent::Finished(reason.clone()));
                 flush_epoch!(round);
 
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
@@ -398,6 +537,7 @@ impl Executor {
                 observer(AgentEvent::Finished(reason.clone()));
                 flush_epoch!(round);
 
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
@@ -420,6 +560,7 @@ impl Executor {
                 );
                 observer(AgentEvent::Finished(reason.clone()));
                 flush_epoch!(round);
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_result(
                     reason,
                     round,
@@ -444,6 +585,7 @@ impl Executor {
                 // Flush epoch spend before Cancelled so resume/event-log keep
                 // command/file/token totals (including any absorbed children).
                 flush_epoch!(round);
+                drain_background_children!(round);
                 return Err(AgentError::Cancelled);
             }
             if let Some(max) = self.step_limits.max_duration {
@@ -458,6 +600,7 @@ impl Executor {
                     observer(AgentEvent::Finished(reason.clone()));
                     flush_epoch!(round);
 
+                    drain_background_children!(round);
                     return Ok(AgentOutcome::drive_budget_exhausted(
                         reason,
                         round - 1,
@@ -736,6 +879,7 @@ impl Executor {
                 sink.append(&[assistant]).await?;
                 observer(AgentEvent::Finished(reason.clone()));
                 flush_epoch!(round);
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
@@ -745,6 +889,29 @@ impl Executor {
                     &progress,
                     &objective,
                 ));
+            }
+
+            if calls.is_empty() && !background_children.0.is_empty() {
+                // V2: a quiet round while background children run is WAITING,
+                // not a stall — hold for the next settlement instead of
+                // burning closeout nudges or classifying no-progress. The
+                // settlement itself is injected at the next round top.
+                sink.append(&[assistant]).await?;
+                while !background_children.0.is_empty()
+                    && !background_children
+                        .0
+                        .iter()
+                        .any(|child| child.handle.is_finished())
+                    && !cancellation.is_cancelled()
+                {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {}
+                        Some(event) = bg_progress_rx.recv() => observer(event),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                    }
+                }
+                continue;
             }
 
             if calls.is_empty() {
@@ -850,6 +1017,7 @@ impl Executor {
                 };
                 flush_epoch!(round);
 
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_result(
                     last_text,
                     round,
@@ -1220,6 +1388,58 @@ impl Executor {
                     // A resolution without an explicit status is not accepted as
                     // completion — feed the error back so the model resolves
                     // deliberately instead of by omission.
+                    // V2 completion gate: a goal cannot close while delegated
+                    // children are still running — their results have not been
+                    // received, let alone integrated. Drain them (they hold
+                    // wall caps), inject the settlements, and refuse this
+                    // resolution once so the model integrates first.
+                    if call.arguments.get("status").and_then(|v| v.as_str()) == Some("complete")
+                        && !background_children.0.is_empty()
+                    {
+                        let waiting: Vec<String> = background_children
+                            .0
+                            .iter()
+                            .map(|c| format!("{} ({})", c.nickname, c.id))
+                            .collect();
+                        // Review 必改②: this drain runs MID tool batch — pin the
+                        // parent's same-batch spend first, or the settlement
+                        // fold overwrites local counters with a lagging ledger
+                        // (the exact under-count pin_parent_batch_spend exists
+                        // to prevent on the foreground path).
+                        pin_parent_batch_spend(
+                            &mut progress,
+                            commands_run,
+                            model_tokens_spent,
+                            cost_spent_micros,
+                            &modified_files,
+                        );
+                        drain_background_children!(round);
+                        let feedback = format!(
+                            "Cannot complete: delegated sub-agent(s) {} were still \
+                             running. They have now settled — their notices are above. \
+                             Inspect and integrate their results (judge any findings), \
+                             re-verify, then call update_goal again.",
+                            waiting.join(", ")
+                        );
+                        observer(AgentEvent::GoalIntercepted {
+                            kind: "outstanding_children".to_string(),
+                            detail: waiting.join(", "),
+                        });
+                        observer(AgentEvent::ToolResult {
+                            id: call.id.as_str().to_string(),
+                            name: UPDATE_GOAL_TOOL.to_string(),
+                            is_error: true,
+                            preview: preview(&feedback),
+                        });
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: feedback,
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
                     let reason = match call.arguments.get("status").and_then(|v| v.as_str()) {
                         Some("complete") => StopReason::Completed,
                         Some("blocked") => StopReason::Blocked,
@@ -1547,6 +1767,49 @@ impl Executor {
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
+                // V2 parent write fence: a running background Worker owns its
+                // scope EXCLUSIVELY — including against the parent. An edit
+                // there would race the child the parent itself delegated to;
+                // integration waits for the settlement notice.
+                if self.registry.mutates_files(&call.name) && !background_children.0.is_empty() {
+                    let active_scopes: Vec<String> = background_children
+                        .0
+                        .iter()
+                        .filter(|child| child.role == AgentRole::Worker)
+                        .flat_map(|child| child.scope.iter().cloned())
+                        .collect();
+                    let inside =
+                        crate::authorization::write_targets_inside_scopes(&call, &active_scopes);
+                    if !inside.is_empty() {
+                        let owners: Vec<String> = background_children
+                            .0
+                            .iter()
+                            .filter(|child| {
+                                child.role == AgentRole::Worker
+                                    && inside.iter().any(|t| {
+                                        crate::sub_agent::scopes_overlap(
+                                            &child.scope,
+                                            std::slice::from_ref(t),
+                                        )
+                                    })
+                            })
+                            .map(|child| format!("{} ({})", child.nickname, child.id))
+                            .collect();
+                        let msg = format!(
+                            "Edit refused: {} belongs to the exclusive scope of \
+                             still-running sub-agent(s) {}. Wait for the settlement \
+                             notice and integrate its result instead of editing its \
+                             files while it works; continue on other work meanwhile.",
+                            inside.join(", "),
+                            owners.join(", ")
+                        );
+                        denied_calls_this_round += 1;
+                        policy_blocked_calls_this_round += 1;
+                        results[index] = Some(deny_call(observer, call, msg));
+                        continue;
+                    }
+                }
+
                 // Write allowlist (worker sub-agents, orchestrated nodes):
                 // reject an edit that reaches outside the allowed paths BEFORE
                 // it runs, feeding the reason back so the model stays in scope.
@@ -1957,9 +2220,6 @@ impl Executor {
             // slot; start/finish bubbles to the observer for the UI.
             if !spawn_jobs.is_empty() && !cancelled_mid_batch {
                 use futures::stream::{FuturesUnordered, StreamExt};
-                let sem = Arc::new(tokio::sync::Semaphore::new(
-                    self.policy.max_concurrent_agents.max(1),
-                ));
                 let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut futs = FuturesUnordered::new();
                 // Parent may have run shells/edits in this same tool batch
@@ -1977,6 +2237,7 @@ impl Executor {
                 // Pass 1: reject invalid spawns. Pass 2: split residual only
                 // across *accepted* children (rejected slots must not dilute
                 // the share — and must not let accepted children oversell).
+                #[allow(clippy::type_complexity)]
                 let mut accepted: Vec<(
                     usize,
                     leveler_core::ToolCallId,
@@ -1988,6 +2249,7 @@ impl Executor {
                     Option<leveler_model::ModelRef>,
                     Vec<String>,
                     u32,
+                    bool, // run in background (runtime-resolved default: true)
                 )> = Vec::new();
                 // Exclusive scopes of workers already admitted in THIS batch.
                 // "Exclusive" is only true if admission enforces it: two
@@ -1995,6 +2257,8 @@ impl Executor {
                 // to happen, so the second one is refused honestly.
                 let mut admitted_worker_scopes: Vec<Vec<String>> = Vec::new();
                 for (index, call) in spawn_jobs {
+                    let background =
+                        crate::injected_tools::resolve_run_in_background(&call.arguments);
                     let task = call
                         .arguments
                         .get("task")
@@ -2098,6 +2362,20 @@ impl Executor {
                              overlapping work into one worker or re-scope it.",
                             files.join(", ")
                         ))
+                    } else if role == AgentRole::Worker
+                        && background_children.0.iter().any(|child| {
+                            child.role == AgentRole::Worker && scopes_overlap(&child.scope, &files)
+                        })
+                    {
+                        // V2: exclusive means exclusive across the whole run —
+                        // a still-running background worker owns its scope
+                        // until it settles, not just within one batch.
+                        Some(format!(
+                            "Worker scope {} overlaps a background worker that is STILL \
+                             RUNNING. Wait for its settlement notice, or scope this \
+                             worker to disjoint files.",
+                            files.join(", ")
+                        ))
                     } else if agents_spawned >= self.policy.max_total_agents {
                         Some(format!(
                             "Sub-agent limit reached ({} max this run). Do the remaining work \
@@ -2153,6 +2431,7 @@ impl Executor {
                         model_override,
                         agent_tools,
                         agent_max_rounds,
+                        background,
                     ));
                 }
                 let share_n = accepted.len() as u32;
@@ -2169,11 +2448,11 @@ impl Executor {
                         model_override,
                         agent_tools,
                         agent_max_rounds,
+                        background,
                     ),
                 ) in accepted.into_iter().enumerate()
                 {
-                    let sem = sem.clone();
-                    let progress_ch = progress_tx.clone();
+                    let sem = run_agents_semaphore.clone();
                     let token = cancellation.child_token();
                     // Residual parent budgets split across concurrent spawns.
                     let residual = residual_step_limits(
@@ -2192,6 +2471,76 @@ impl Executor {
                         epoch_duration_at_start,
                         run_started,
                     };
+                    if background {
+                        // V2 background-first: spawn the owned child future and
+                        // return the tool result immediately. Settlement is
+                        // injected at a later round boundary; the child's
+                        // progress/activity events flow through the run-level
+                        // channel.
+                        let fut = self.sub_agent_run_future(
+                            id.clone(),
+                            role,
+                            files.clone(),
+                            model_override,
+                            agent_tools,
+                            agent_max_rounds,
+                            task,
+                            sem,
+                            bg_progress_tx.clone(),
+                            residual,
+                            token,
+                            parent_wall,
+                        );
+                        let handle = tokio::spawn(fut);
+                        progress.outstanding_children.push(format!(
+                            "{id}|{nickname}|{}|{}",
+                            role.label(),
+                            files.join(",")
+                        ));
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
+                        let scope_line = if files.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " It exclusively owns {} — your own edits there are \
+                                 refused until it settles.",
+                                files.join(", ")
+                            )
+                        };
+                        let content = format!(
+                            "[sub-agent {nickname} ({id}, role={})] started in the \
+                             background.{scope_line} You will be told when it settles — \
+                             continue useful work; do not poll.",
+                            role.label()
+                        );
+                        // The immediate acknowledgment is model-visible, so it
+                        // must be UI-visible too (P2 disclosure): pair the
+                        // spawn call with its result like any other tool.
+                        observer(AgentEvent::ToolResult {
+                            id: call_id.as_str().to_string(),
+                            name: SPAWN_AGENT_TOOL.to_string(),
+                            is_error: false,
+                            preview: preview(&content),
+                        });
+                        background_children.0.push(BackgroundChild {
+                            id,
+                            nickname,
+                            role,
+                            scope: files,
+                            handle,
+                        });
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id,
+                                content,
+                                is_error: false,
+                            },
+                        });
+                        continue;
+                    }
+                    let progress_ch = progress_tx.clone();
                     futs.push(async move {
                         let result = self
                             .run_one_sub_agent_on(
@@ -2219,89 +2568,19 @@ impl Executor {
                         biased;
                         Some(progress_ev) = progress_rx.recv() => observer(progress_ev),
                         Some((index, call_id, id, nickname, role, result)) = futs.next() => {
-                            // Roll sub-agent spend into the parent task epoch.
-                            // Parent same-batch spend was pinned before absorb.
-                            progress.absorb_child_spend(&result.progress);
-                            commands_run = progress.cumulative_commands;
-                            model_tokens_spent = progress.cumulative_model_tokens;
-                            cost_spent_micros = progress.cumulative_cost_usd_micros;
-                            for path in &result.modified_files {
-                                if !modified_files.iter().any(|p| p == path) {
-                                    modified_files.push(path.clone());
-                                }
-                            }
-                            // Adopt the child's typed findings into the parent
-                            // ledger at Acknowledged (receipt is not judgment)
-                            // and persist the snapshot. The parent-facing text
-                            // names the adopted ids so the model can judge
-                            // them with resolve_finding.
-                            let mut adopted: Vec<String> = result
-                                .findings
-                                .iter()
-                                .map(|f| ledger.adopt_finding(&id, role.label(), f))
-                                .collect();
-                            // A Worker that did not finish its scoped subtask
-                            // is original-goal debt: the parent must settle
-                            // it (finish the work and reject this finding,
-                            // or address it) before a verified closure.
-                            // Explorer incomplete is knowledge loss, not a
-                            // closure gate.
-                            if role == AgentRole::Worker && !result.result.status.completed() {
-                                let reason = if result.result.stop_reason.is_empty() {
-                                    result.result.status.label().to_string()
-                                } else {
-                                    result.result.stop_reason.clone()
-                                };
-                                adopted.push(ledger.record_parent_finding(
-                                    &id,
-                                    role.label(),
-                                    FindingKind::Observation,
-                                    format!(
-                                        "Worker {nickname} did not complete scoped work \
-                                         ({reason}). Finish it yourself, then reject this \
-                                         finding with a reason, or spawn the worker again."
-                                    ),
-                                    true,
-                                ));
-                            }
-                            if !adopted.is_empty() {
-                                observer(AgentEvent::EvidenceLedgerUpdated {
-                                    ledger: ledger.clone(),
-                                });
-                            }
-                            // N1: the status line leads, so the parent can tell
-                            // "finished, nothing to flag" from "stopped before it
-                            // found anything" — opposite instructions that a bare
-                            // report text cannot carry.
-                            let mut content = result.result.for_parent(&nickname);
-                            if !result.modified_files.is_empty() {
-                                content.push_str(&format!(
-                                    "\nFiles touched: {}",
-                                    result.modified_files.join(", ")
-                                ));
-                            }
-                            if !adopted.is_empty() {
-                                // Keep this line near the top so a truncated
-                                // SubAgentFinished preview still names the ids
-                                // (TUI finding-count is a projection of it).
-                                let adopted_line = format!(
-                                    "Structured findings adopted: {} — judge each \
-                                     with resolve_finding.",
-                                    adopted.join(", ")
-                                );
-                                if let Some(pos) = content.find('\n') {
-                                    content.insert_str(pos + 1, &format!("{adopted_line}\n"));
-                                } else {
-                                    content.push('\n');
-                                    content.push_str(&adopted_line);
-                                }
-                            }
-                            observer(AgentEvent::SubAgentFinished {
-                                id: id.clone(),
-                                nickname: nickname.clone(),
-                                ok: result.result.status.completed(),
-                                summary: preview(&content),
-                            });
+                            let (content, ok) = fold_child_settlement(
+                                &mut progress,
+                                &mut commands_run,
+                                &mut model_tokens_spent,
+                                &mut cost_spent_micros,
+                                &mut modified_files,
+                                &mut ledger,
+                                observer,
+                                &id,
+                                &nickname,
+                                role,
+                                &result,
+                            );
                             results[index] = Some(ContentPart::ToolResult {
                                 result: ToolResultContent {
                                     call_id,
@@ -2311,7 +2590,7 @@ impl Executor {
                                         &content,
                                         self.tool_context.policy.tool_output_budget,
                                     ),
-                                    is_error: !result.result.status.completed(),
+                                    is_error: !ok,
                                 },
                             });
                         }
@@ -2362,8 +2641,14 @@ impl Executor {
             // Batch was cancelled: the round is durable (results paired, spend
             // flushed above) — exit now instead of starting another model round.
             if cancelled_mid_batch {
+                drain_background_children!(round);
                 return Err(AgentError::Cancelled);
             }
+
+            // V2: forward background children's live progress and settle any
+            // that finished — the notice must be in context before the next
+            // model round ("you are told when one finishes"; no polling).
+            settle_finished_children!(round);
 
             // MA-WA1: resolve this round's delegation-decision facts. Facts
             // (`delegated` / `kept`) are durable events only; the offer is one
@@ -2631,6 +2916,7 @@ impl Executor {
                 observer(AgentEvent::Finished(final_text.clone()));
                 flush_epoch!(round);
 
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_result(
                     final_text,
                     round,
@@ -2648,6 +2934,7 @@ impl Executor {
                 observer(AgentEvent::Finished(reason.clone()));
                 flush_epoch!(round);
 
+                drain_background_children!(round);
                 return Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
                     round,
@@ -2794,6 +3081,10 @@ impl Executor {
             .continuation
             .round_limit()
             .expect("only bounded continuation exits the loop by round count");
+        // Review 必改①: this `break` tail is the COMMON bounded exit — drain
+        // running background children here like every `return` does, or the
+        // abort-on-drop backstop hard-kills them (spend and findings lost).
+        drain_background_children!(round);
         // Budget exhausted: never return an empty answer. Surface the last thing
         // the model said plus how far it got, so the caller/UI shows real state.
         let summary = {
@@ -2820,6 +3111,126 @@ impl Executor {
             &progress,
             &objective,
         ))
+    }
+}
+
+/// Roll one settled child into the parent epoch: spend absorb, modified-file
+/// merge, typed-finding adoption at Acknowledged (receipt is not judgment),
+/// Worker-incomplete goal debt, the parent-facing content, and the
+/// `SubAgentFinished` event. Shared verbatim by the foreground batch, the
+/// background settlement path, and the exit drains, so background execution
+/// cannot reduce truthfulness.
+#[allow(clippy::too_many_arguments)]
+fn fold_child_settlement(
+    progress: &mut leveler_lifecycle::ProgressLedger,
+    commands_run: &mut u32,
+    model_tokens_spent: &mut u64,
+    cost_spent_micros: &mut u64,
+    modified_files: &mut Vec<String>,
+    ledger: &mut EvidenceLedger,
+    observer: &mut (dyn FnMut(AgentEvent) + Send),
+    id: &str,
+    nickname: &str,
+    role: AgentRole,
+    result: &super::handlers::SubAgentRunResult,
+) -> (String, bool) {
+    // Roll sub-agent spend into the parent task epoch.
+    progress.absorb_child_spend(&result.progress);
+    *commands_run = progress.cumulative_commands;
+    *model_tokens_spent = progress.cumulative_model_tokens;
+    *cost_spent_micros = progress.cumulative_cost_usd_micros;
+    for path in &result.modified_files {
+        if !modified_files.iter().any(|p| p == path) {
+            modified_files.push(path.clone());
+        }
+    }
+    // Adopt the child's typed findings into the parent ledger at Acknowledged
+    // and persist the snapshot; the parent-facing text names the adopted ids
+    // so the model can judge them with resolve_finding.
+    let mut adopted: Vec<String> = result
+        .findings
+        .iter()
+        .map(|f| ledger.adopt_finding(id, role.label(), f))
+        .collect();
+    // A Worker that did not finish its scoped subtask is original-goal debt:
+    // the parent must settle it before a verified closure. Explorer
+    // incomplete is knowledge loss, not a closure gate.
+    if role == AgentRole::Worker && !result.result.status.completed() {
+        let reason = if result.result.stop_reason.is_empty() {
+            result.result.status.label().to_string()
+        } else {
+            result.result.stop_reason.clone()
+        };
+        adopted.push(ledger.record_parent_finding(
+            id,
+            role.label(),
+            FindingKind::Observation,
+            format!(
+                "Worker {nickname} did not complete scoped work ({reason}). Finish it \
+                 yourself, then reject this finding with a reason, or spawn the worker again."
+            ),
+            true,
+        ));
+    }
+    if !adopted.is_empty() {
+        observer(AgentEvent::EvidenceLedgerUpdated {
+            ledger: ledger.clone(),
+        });
+    }
+    // N1: the status line leads, so the parent can tell "finished, nothing to
+    // flag" from "stopped before it found anything".
+    let mut content = result.result.for_parent(nickname);
+    if !result.modified_files.is_empty() {
+        content.push_str(&format!(
+            "\nFiles touched: {}",
+            result.modified_files.join(", ")
+        ));
+    }
+    if !adopted.is_empty() {
+        let adopted_line = format!(
+            "Structured findings adopted: {} — judge each with resolve_finding.",
+            adopted.join(", ")
+        );
+        if let Some(pos) = content.find('\n') {
+            content.insert_str(pos + 1, &format!("{adopted_line}\n"));
+        } else {
+            content.push('\n');
+            content.push_str(&adopted_line);
+        }
+    }
+    observer(AgentEvent::SubAgentFinished {
+        id: id.to_string(),
+        nickname: nickname.to_string(),
+        ok: result.result.status.completed(),
+        summary: preview(&content),
+    });
+    (content, result.result.status.completed())
+}
+
+/// Remove `id` from the durable outstanding-children record.
+fn clear_outstanding_child(progress: &mut leveler_lifecycle::ProgressLedger, id: &str) {
+    progress
+        .outstanding_children
+        .retain(|entry| entry.split('|').next() != Some(id));
+}
+
+/// A joined background child. A panicked/aborted task is reported as an
+/// honest no-result failure, never silently dropped.
+fn join_settlement(
+    joined: Result<super::handlers::SubAgentRunResult, tokio::task::JoinError>,
+) -> super::handlers::SubAgentRunResult {
+    match joined {
+        Ok(result) => result,
+        Err(join_error) => super::handlers::SubAgentRunResult {
+            result: crate::sub_agent::ChildResult::new(
+                false,
+                "",
+                format!("its background task ended abnormally: {join_error}"),
+            ),
+            progress: leveler_lifecycle::ProgressLedger::default(),
+            modified_files: Vec::new(),
+            findings: Vec::new(),
+        },
     }
 }
 

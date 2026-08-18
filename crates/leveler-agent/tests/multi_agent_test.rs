@@ -123,7 +123,25 @@ impl ModelRuntime for SleepyRuntime {
     }
 }
 
-fn spawn_call(id: &str, args: serde_json::Value) -> ContentPart {
+fn spawn_call(id: &str, mut args: serde_json::Value) -> ContentPart {
+    // V2 made background the default; the legacy tests below exercise the
+    // synchronous (foreground) fold and say so explicitly. Background-path
+    // tests pass `run_in_background: true` (or use `spawn_call_default`).
+    if args.get("run_in_background").is_none() {
+        args["run_in_background"] = serde_json::Value::Bool(false);
+    }
+    ContentPart::ToolCall {
+        call: ToolCall {
+            id: ToolCallId::new(id),
+            name: "spawn_agent".to_string(),
+            arguments: args,
+        },
+    }
+}
+
+/// A spawn with NO `run_in_background` key: exercises the runtime default
+/// resolution (background).
+fn spawn_call_default(id: &str, args: serde_json::Value) -> ContentPart {
     ContentPart::ToolCall {
         call: ToolCall {
             id: ToolCallId::new(id),
@@ -4149,6 +4167,825 @@ async fn no_decision_point_when_delegation_is_disabled() {
     assert!(
         delegation_stages(&events).is_empty(),
         "no delegation facts when delegation is off"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── V2 background-first delegation contract ─────────────────────────────────
+
+/// Routes scripted responses by conversation identity instead of arrival
+/// order: with a background child racing the parent for model rounds, queue
+/// order is nondeterministic, but a child conversation always carries its own
+/// task marker in its transcript.
+struct RoutedRuntime {
+    parent: Mutex<VecDeque<ModelResponse>>,
+    child: Mutex<VecDeque<ModelResponse>>,
+    child_marker: &'static str,
+    /// Delay before each CHILD response (keeps the child "still running"
+    /// while parent rounds execute, deterministically).
+    child_delay: Duration,
+    /// Message lists of every PARENT request, in order.
+    parent_requests: Mutex<Vec<Vec<Message>>>,
+}
+
+impl RoutedRuntime {
+    fn new(
+        parent: Vec<ModelResponse>,
+        child: Vec<ModelResponse>,
+        child_marker: &'static str,
+        child_delay: Duration,
+    ) -> Self {
+        Self {
+            parent: Mutex::new(VecDeque::from(parent)),
+            child: Mutex::new(VecDeque::from(child)),
+            child_marker,
+            child_delay,
+            parent_requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelRuntime for RoutedRuntime {
+    async fn generate(
+        &self,
+        _request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        unimplemented!()
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        use leveler_model::ModelEvent;
+        let is_child = request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains(self.child_marker));
+        if is_child {
+            tokio::time::sleep(self.child_delay).await;
+        } else {
+            self.parent_requests
+                .lock()
+                .unwrap()
+                .push(request.messages.clone());
+        }
+        let queue = if is_child { &self.child } else { &self.parent };
+        let response = queue.lock().unwrap().pop_front().ok_or_else(|| {
+            ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                if is_child {
+                    "child queue exhausted"
+                } else {
+                    "parent queue exhausted"
+                },
+            )
+        })?;
+        let mut events: Vec<Result<ModelEvent, ModelError>> =
+            vec![Ok(ModelEvent::MessageStarted {
+                request_id: response.request_id.clone(),
+            })];
+        for part in &response.message.content {
+            match part {
+                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                    delta: text.clone(),
+                })),
+                ContentPart::ToolCall { call } => {
+                    events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
+                }
+                _ => {}
+            }
+        }
+        events.push(Ok(ModelEvent::MessageCompleted {
+            finish_reason: response.finish_reason,
+        }));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+        unimplemented!()
+    }
+}
+
+const CHILD_MARKER: &str = "CHILD-TASK-7f3a";
+
+/// V2 core: an omitted `run_in_background` resolves to background at the
+/// RUNTIME — the spawn returns immediately with the child's id, the parent
+/// keeps working, and the runtime injects an unconditional settlement notice
+/// carrying the child's truthful result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_spawn_runs_in_background_and_settles_into_a_later_round() {
+    let dir = tmp("bg-settle", 61);
+    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // r1: delegate (no run_in_background key → background default)
+            // AND read a parent file in the same round.
+            assistant_with(
+                vec![
+                    spawn_call_default(
+                        "s1",
+                        serde_json::json!({
+                            "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                            "role": "worker",
+                            "files": ["b.txt"]
+                        }),
+                    ),
+                    tool_call_part("r1", "read_file", serde_json::json!({"path": "a.txt"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            // r2: parent continues useful work while the child runs.
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "parent", "parent-more")],
+                FinishReason::ToolCalls,
+            ),
+            // r3: quiet — the harness must WAIT for the settlement, not stall.
+            assistant_text("waiting on my delegation"),
+            // r4: after the settlement notice, finish.
+            assistant_text("integrated the worker result"),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("scoped edit done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(150),
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "update both files",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_text, "integrated the worker result");
+    // The child's edit really happened (real scoped mutation).
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    // The spawn's tool result was immediate — it does NOT carry the child's
+    // report; the settlement notice does.
+    let spawn_result = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult { id, preview, .. } if id == "s1" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("spawn tool result");
+    assert!(
+        spawn_result.contains("started in the background"),
+        "{spawn_result}"
+    );
+    assert!(
+        spawn_result.contains("agent-1"),
+        "durable child id must be model-visible: {spawn_result}"
+    );
+    // Settlement notice reached the model: some later PARENT request carries
+    // it as an injected user message, with the child's truthful report.
+    let requests = runtime.parent_requests.lock().unwrap();
+    let saw_settlement = requests.iter().any(|messages| {
+        messages.iter().any(|m| {
+            m.role == Role::User
+                && m.text_content().contains("## Background sub-agent settled")
+                && m.text_content().contains("COMPLETED_WITH_FINDINGS")
+        })
+    });
+    assert!(saw_settlement, "settlement notice must be injected");
+    drop(requests);
+    // Truthful lifecycle events: started AND finished for the same child.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentStarted { id, .. } if id == "agent-1"))
+    );
+    assert!(events.iter().any(
+        |e| matches!(e, AgentEvent::SubAgentFinished { id, ok: true, .. } if id == "agent-1")
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// V2 safety: while a background Worker runs, its scope is exclusive against
+/// EVERYONE — a parent edit inside it is refused with an honest message, and a
+/// second worker overlapping it is refused at admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_workers_scope_fences_the_parent_and_new_workers() {
+    let dir = tmp("bg-fence", 62);
+    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: parent tries to edit the child's file AND to spawn an
+            // overlapping worker — both must be refused while it runs.
+            assistant_with(
+                vec![
+                    patch_call("e1", "b.txt", "old", "hijacked"),
+                    spawn_call(
+                        "s2",
+                        serde_json::json!({
+                            "task": "also edit b.txt",
+                            "role": "worker",
+                            "files": ["b.txt"]
+                        }),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            // r3: quiet → wait for settlement.
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(250),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "update b via delegation",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let refusal = |id: &str| {
+        events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult {
+                    id: rid,
+                    is_error: true,
+                    preview,
+                    ..
+                } if rid == id => Some(preview.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    let parent_edit = refusal("e1");
+    assert!(
+        parent_edit.contains("exclusive scope") && parent_edit.contains("still-running"),
+        "parent edit inside an active child scope must be refused: {parent_edit}"
+    );
+    let overlap_spawn = refusal("s2");
+    assert!(
+        overlap_spawn.contains("STILL RUNNING"),
+        "overlapping worker vs ACTIVE child must be refused: {overlap_spawn}"
+    );
+    // The child, not the parent, owns the final content of b.txt.
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// V2 completion gate: a goal cannot close while a delegated child is still
+/// running — the harness drains the children, injects their settlements, and
+/// refuses that resolution once so the model integrates first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_completion_is_refused_while_children_are_outstanding() {
+    let dir = tmp("bg-goalgate", 63);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: tries to close the goal while the child still runs.
+            assistant_with(
+                vec![tool_call_part(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({"status": "complete", "summary": "done"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r3: after the forced settlement + refusal, close for real.
+            assistant_with(
+                vec![tool_call_part(
+                    "g2",
+                    "update_goal",
+                    serde_json::json!({"status": "complete", "summary": "integrated"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(200),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    )
+    .with_goal_mode(true);
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "update b.txt via delegation",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // First completion refused with the outstanding-children intercept.
+    let refused = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                id,
+                is_error: true,
+                preview,
+                ..
+            } if id == "g1" => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("first update_goal(complete) must be refused");
+    assert!(refused.contains("Cannot complete"), "{refused}");
+    assert!(
+        events.iter().any(|e| matches!(e,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "outstanding_children")),
+        "the intercept must be durable"
+    );
+    // The child settled (drained) and its work is on disk.
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentFinished { ok: true, .. }))
+    );
+    // The second completion goes through.
+    assert!(matches!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::Completed
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// V2 resume truth: in-process children do not survive a restart. A run seeded
+/// with outstanding children must tell the model exactly which delegations
+/// were lost and clear the durable record — never let "you will be told when
+/// it settles" dangle forever.
+#[tokio::test]
+async fn a_resumed_run_reports_children_lost_at_restart() {
+    let dir = tmp("bg-lost", 64);
+    std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![assistant_text("nothing else to do")],
+        Duration::from_millis(1),
+    ));
+    let mut seeded = leveler_agent::ProgressLedger::default();
+    seeded
+        .outstanding_children
+        .push("agent-2|Newton|worker|src/lib.rs".to_string());
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .with_seeded_progress(seeded);
+    let mut events = Vec::new();
+    executor
+        .run(
+            "continue the task",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = runtime.requests.lock().unwrap();
+    let first = &requests[0];
+    let note = first
+        .iter()
+        .find(|m| {
+            m.role == Role::User && m.text_content().contains("## Delegations lost at restart")
+        })
+        .map(|m| m.text_content())
+        .expect("lost-children note must be injected before the first round");
+    assert!(
+        note.contains("Newton (agent-2, role=worker, scope: src/lib.rs)"),
+        "{note}"
+    );
+    drop(requests);
+    // The durable record is cleared so the note never repeats.
+    let cleared = events.iter().rev().find_map(|e| match e {
+        AgentEvent::ProgressUpdated { ledger } => Some(ledger.outstanding_children.is_empty()),
+        _ => None,
+    });
+    assert_eq!(cleared, Some(true));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// V2: user cancellation with a background child running must not orphan it —
+/// the child is cancelled through its child token, drained at the exit, and
+/// its (cancelled) settlement is still folded truthfully.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_drains_background_children_without_orphans() {
+    let dir = tmp("bg-cancel", 65);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let cancel = CancellationToken::new();
+
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: slow work"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("continuing"),
+            assistant_text("never reached"),
+        ],
+        vec![
+            // The child's model round is slow; the cancel lands before it.
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(600),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel_clone.cancel();
+    });
+    let started = Instant::now();
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "delegate slow work",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            cancel,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(leveler_agent::AgentError::Cancelled)),
+        "{outcome:?}"
+    );
+    // The drain settled the child (cancelled, truthfully) instead of
+    // orphaning it; the whole run ended promptly.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentFinished { ok: false, .. })),
+        "cancelled child must still settle truthfully"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "no hang on cancellation drain"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review 必改①: the bounded round-limit exit is the COMMON way a busy run
+/// ends — it must drain running background children like every other exit,
+/// not let the abort-on-drop backstop hard-kill them (spend lost, findings
+/// lost, mid-write kill).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_round_limit_exit_drains_running_children_instead_of_aborting() {
+    let dir = tmp("bg-roundlimit", 66);
+    std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Two more busy rounds exhaust max_rounds=3 while the slow child
+            // is still running.
+            assistant_with(
+                vec![tool_call_part(
+                    "r1",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "r2",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(300),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        3,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "delegate then keep busy",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::BudgetExhausted | leveler_agent::StopReason::TurnLimitReached
+    ));
+    // The child settled truthfully at the exit drain — it was NOT aborted.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentFinished { id, .. } if id == "agent-1")),
+        "round-limit exit must settle the running child, not abort it"
+    );
+    // Its work landed and its scope record is cleared.
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    let cleared = events.iter().rev().find_map(|e| match e {
+        AgentEvent::ProgressUpdated { ledger } => Some(ledger.outstanding_children.is_empty()),
+        _ => None,
+    });
+    assert_eq!(cleared, Some(true), "outstanding record must be cleared");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review 必改②: completing a goal in the SAME batch as parent commands while
+/// children are outstanding must not lose the batch's spend to the settlement
+/// fold's lagging-ledger overwrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_completion_gate_drain_keeps_same_batch_parent_spend() {
+    let dir = tmp("bg-pinspend", 67);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![
+                    spawn_call_default(
+                        "s1",
+                        serde_json::json!({
+                            "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                            "role": "worker",
+                            "files": ["b.txt"]
+                        }),
+                    ),
+                    tool_call_part("c1", "shell_command", serde_json::json!({"cmd": "true"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            // Same-batch parent command + completion attempt while the child
+            // still runs: the gate drains mid-batch.
+            assistant_with(
+                vec![
+                    tool_call_part("c2", "shell_command", serde_json::json!({"cmd": "true"})),
+                    tool_call_part(
+                        "g1",
+                        "update_goal",
+                        serde_json::json!({"status": "complete", "summary": "done"}),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "g2",
+                    "update_goal",
+                    serde_json::json!({"status": "complete", "summary": "integrated"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(250),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    )
+    .with_goal_mode(true);
+    let mut events = Vec::new();
+    executor
+        .run(
+            "update b.txt via delegation",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let final_commands = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_commands),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        final_commands >= 2,
+        "both parent shell commands must survive the mid-batch drain: {final_commands}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review 必改④: the settlement notice must be durable the moment it is
+/// injected — a crash before the next snapshot must not lose the child's
+/// report after outstanding_children was already cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settlement_notices_are_appended_to_the_transcript_sink() {
+    struct RecordingSink(Arc<Mutex<Vec<Message>>>);
+    #[async_trait]
+    impl leveler_agent::TranscriptSink for RecordingSink {
+        async fn append(&mut self, messages: &[Message]) -> Result<(), leveler_agent::AgentError> {
+            self.0.lock().unwrap().extend_from_slice(messages);
+            Ok(())
+        }
+    }
+    let dir = tmp("bg-sink", 68);
+    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(120),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let transcript = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = RecordingSink(transcript.clone());
+    executor
+        .run(
+            "update b via delegation",
+            &mut |_| {},
+            &mut sink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let recorded = transcript.lock().unwrap();
+    assert!(
+        recorded.iter().any(|m| {
+            m.role == Role::User && m.text_content().contains("## Background sub-agent settled")
+        }),
+        "the settlement notice must be persisted to the sink when injected"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

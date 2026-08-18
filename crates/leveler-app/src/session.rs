@@ -86,7 +86,7 @@ fn goal_from_content(content: &[ContentPart]) -> String {
 /// the eval collectors (`run_in_session_bounded`, `eval_signals`). Never add
 /// a UI path through here: the mapping is deliberately lossy (engine-only
 /// facts return `None`).
-fn forward_engine_event(event: EngineEvent, observer: &mut dyn FnMut(AgentEvent)) {
+fn forward_engine_event(event: EngineEvent, observer: &mut (dyn FnMut(AgentEvent) + Send)) {
     if let Some(agent_event) = engine_event_to_agent(event) {
         observer(agent_event);
     }
@@ -449,7 +449,7 @@ impl Application {
         goal: &str,
         approver: Arc<dyn Approver>,
         sandbox: bool,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         // Unattended defaults: AutoClarify + a wall-clock ceiling — nobody is
@@ -491,7 +491,7 @@ impl Application {
         sandbox: bool,
         // Mid-turn user input; `None` disables steering for this run.
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         self.run_in_session_with_policy(
@@ -522,7 +522,7 @@ impl Application {
         goal: &str,
         approver: Arc<dyn Approver>,
         sandbox: bool,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
         max_rounds: u32,
         // Eval runs are unattended, so this is `None` for every normal run.
@@ -559,7 +559,7 @@ impl Application {
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
         continuation: leveler_agent::ContinuationPolicy,
         limits: leveler_agent::StepLimits,
@@ -623,7 +623,7 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
-        observer: &mut dyn FnMut(EngineEvent),
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
@@ -713,7 +713,7 @@ impl Application {
         &self,
         session_id: &leveler_core::SessionId,
         approver: Arc<dyn Approver>,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;

@@ -55,7 +55,7 @@ pub(crate) fn note_tool_side_effects(
     tool: &str,
     record_paths: Vec<String>,
     plan_state: &PlanState,
-    observer: &mut dyn FnMut(AgentEvent),
+    observer: &mut (dyn FnMut(AgentEvent) + Send),
 ) {
     ledger.note_mutation_op();
     if !record_paths.is_empty() {
@@ -192,7 +192,7 @@ pub(crate) fn task_needs_structured_plan(task: &str) -> bool {
 /// seen, leaving it with no name or arguments to render — the row comes out
 /// blank. A refusal has to say what was refused.
 pub(crate) fn deny_call(
-    observer: &mut dyn FnMut(AgentEvent),
+    observer: &mut (dyn FnMut(AgentEvent) + Send),
     call: ToolCall,
     message: String,
 ) -> ContentPart {

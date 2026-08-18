@@ -105,6 +105,13 @@ pub struct ProgressLedger {
     /// A `delegated` disposition fact was already recorded this goal epoch.
     #[serde(default)]
     pub delegation_delegated_recorded: bool,
+    /// V2 background children still running when this snapshot was taken, as
+    /// `id|nickname|role|scope` records. In-process children do not survive a
+    /// restart: a resumed run reads this, tells the model truthfully which
+    /// delegations were lost (scope released, re-delegate if still needed),
+    /// and clears it. Normally drained to empty before a run returns.
+    #[serde(default)]
+    pub outstanding_children: Vec<String>,
 }
 
 impl ProgressLedger {

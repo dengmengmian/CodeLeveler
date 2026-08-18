@@ -1554,7 +1554,7 @@ impl Executor {
     pub async fn run(
         &self,
         goal: &str,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
@@ -1578,7 +1578,7 @@ impl Executor {
         &self,
         content: Vec<ContentPart>,
         objective: ObjectiveAnchor,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
@@ -1627,7 +1627,7 @@ impl Executor {
         &self,
         prior: Vec<Message>,
         content: Vec<ContentPart>,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
@@ -1665,7 +1665,7 @@ impl Executor {
     pub async fn resume(
         &self,
         prior: Vec<Message>,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {

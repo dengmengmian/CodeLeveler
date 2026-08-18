@@ -64,7 +64,7 @@ impl Executor {
     pub(crate) async fn stream_round_with_retry(
         &self,
         request: ModelRequest,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<StreamRoundResult, AgentError> {
         const MAX_ATTEMPTS: u32 = 5;
@@ -130,7 +130,7 @@ impl Executor {
     async fn stream_round(
         &self,
         request: ModelRequest,
-        observer: &mut dyn FnMut(AgentEvent),
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<StreamRoundResult, AgentError> {
         use futures::StreamExt;
