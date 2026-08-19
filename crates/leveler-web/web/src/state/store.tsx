@@ -188,6 +188,8 @@ export interface AppState {
   projects: ProjectInfo[];
   /** 新对话的目标项目（= 项目分组上的 ＋ 入口）；null = 当前仓库 */
   draftProject: string | null;
+  /** Selected Project identity: canonical repository path. */
+  selectedProject: string | null;
   /** 待注入到输入框的文本（空状态快捷操作 → Composer 消费后清空） */
   composerSeed: string | null;
   /** Diff 工作区当前聚焦的文件；null = 用列表第一项 */
@@ -216,6 +218,7 @@ export const initialState: AppState = {
   pendingAttachments: [],
   projects: [],
   draftProject: null,
+  selectedProject: null,
   composerSeed: null,
   diffFocus: null,
   railOpen: true,
@@ -233,6 +236,7 @@ export type Action =
   | { type: 'snapshot'; session: UiSessionSnapshot; contextWindow?: number | null }
   | { type: 'select_session'; id: SessionId }
   | { type: 'new_draft'; project?: string | null }
+  | { type: 'select_project'; path: string }
   | { type: 'stage_view'; view: StageView }
   | { type: 'set_rail_nav'; nav: RailNav }
   | { type: 'set_workspace_section'; section: WorkspaceSection }
@@ -372,6 +376,17 @@ function viewFromSnapshot(
   };
 }
 
+/** Drop every projection that belongs to the session currently on screen. */
+function leaveSessionView(state: AppState): void {
+  state.current = null;
+  state.diffFocus = null;
+  state.observation = null;
+  state.observationStatus = 'idle';
+  state.pendingObservationQuery = null;
+  state.pendingAttachments = [];
+  state.composerSeed = null;
+}
+
 /** TUI mark_turn_busy 的对应物：事件到来说明回合在跑。 */
 function markBusy(current: SessionView): void {
   if (!current.turnActive) {
@@ -406,26 +421,36 @@ export function reducer(state: AppState, action: Action): void {
       const view = viewFromSnapshot(action.session, state.current, action.contextWindow);
       state.current = view;
       state.draft = false;
-      if (view.repository) state.repository = view.repository;
+      if (view.repository) {
+        state.repository = view.repository;
+        state.selectedProject = view.repository;
+      }
       return;
     }
+    case 'select_project':
+      if (state.selectedProject === action.path && state.draftProject === action.path) {
+        return;
+      }
+      state.selectedProject = action.path;
+      state.draftProject = action.path;
+      if (state.current && state.current.repository !== action.path) {
+        state.draft = true;
+        leaveSessionView(state);
+      } else if (!state.current) {
+        state.draft = true;
+      }
+      return;
     case 'select_session':
       state.draft = false;
       if (state.current?.id !== action.id) {
-        state.current = null; // 等 snapshot
-        state.diffFocus = null;
-        state.observation = null;
-        state.observationStatus = 'idle';
-        state.pendingObservationQuery = null;
+        leaveSessionView(state); // 等 snapshot
       }
       return;
     case 'new_draft':
       state.draft = true;
-      state.current = null;
-      state.draftProject = action.project ?? null;
-      state.observation = null;
-      state.observationStatus = 'idle';
-      state.pendingObservationQuery = null;
+      state.draftProject = action.project ?? state.selectedProject;
+      if (state.draftProject) state.selectedProject = state.draftProject;
+      leaveSessionView(state);
       return;
     case 'stage_view':
       state.stageView = action.view;
@@ -809,9 +834,31 @@ export function reducer(state: AppState, action: Action): void {
     case 'attachments_cleared':
       state.pendingAttachments = [];
       return;
-    case 'projects':
+    case 'projects': {
       state.projects = action.projects;
+      if (action.projects.length === 0) {
+        if (!state.selectedProject) {
+          state.selectedProject =
+            state.current?.repository ||
+            state.draftProject ||
+            state.repository ||
+            null;
+        }
+        return;
+      }
+      const listed = action.projects.some((p) => p.path === state.selectedProject);
+      if (!state.selectedProject || !listed) {
+        const fromSession = action.projects.find((p) => p.path === state.current?.repository)?.path;
+        const next = fromSession ?? action.projects[0].path;
+        state.selectedProject = next;
+        state.draftProject = next;
+        if (state.current && state.current.repository !== next) {
+          state.draft = true;
+          leaveSessionView(state);
+        }
+      }
       return;
+    }
     case 'project_status': {
       const p = state.projects.find((p) => p.path === action.path);
       if (p) p.status = action.status;

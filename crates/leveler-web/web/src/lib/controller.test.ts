@@ -27,6 +27,7 @@ interface Harness {
   state: AppState;
   sent: ClientCommand[];
   apply: (ev: RuntimeEvent) => void;
+  wsSession: { id: string | null };
 }
 
 function harness(): Harness {
@@ -34,11 +35,20 @@ function harness(): Harness {
   const dispatch = (action: Action) => reducer(state, action);
   const bridge = new RuntimeBridge(dispatch, () => state);
   const sent: ClientCommand[] = [];
+  const wsSession = { id: 's1' as string | null };
   // 拦截 WS 出站帧：只关心命令语义，不建真连接。
-  (bridge as unknown as { ws: { send: (f: UpFrame) => boolean } }).ws = {
+  (bridge as unknown as {
+    ws: {
+      send: (f: UpFrame) => boolean;
+      setSession: (id: string | null) => void;
+    };
+  }).ws = {
     send: (frame: UpFrame) => {
       if (frame.type === 'deliver') sent.push(frame.command);
       return true;
+    },
+    setSession: (id: string | null) => {
+      wsSession.id = id;
     },
   };
   reducer(state, {
@@ -56,7 +66,7 @@ function harness(): Harness {
   });
   const apply = (ev: RuntimeEvent) =>
     (bridge as unknown as { applyEvent: (ev: RuntimeEvent) => void }).applyEvent(ev);
-  return { bridge, state, sent, apply };
+  return { bridge, state, sent, apply, wsSession };
 }
 
 describe('product axes commands', () => {
@@ -88,6 +98,101 @@ describe('product axes commands', () => {
     bridge.runSlash('/collab goal');
     expect(sent.map((c) => c.type)).toEqual(['set_product_axes', 'set_product_axes']);
     expect(sent[1]).toMatchObject({ work_profile: 'delivery', collaboration: 'goal' });
+  });
+});
+
+describe('new session', () => {
+  it('newDraft without an argument targets the selected project', () => {
+    const { bridge, state } = harness();
+    reducer(state, { type: 'select_project', path: '/A' });
+    bridge.newDraft();
+    expect(state.draft).toBe(true);
+    expect(state.draftProject).toBe('/A');
+    expect(state.selectedProject).toBe('/A');
+  });
+});
+
+describe('project switch isolation', () => {
+  it('leaving a project unsubscribes the previous session websocket', () => {
+    const { bridge, state, wsSession } = harness();
+    expect(state.current?.repository).toBe('/repo');
+    bridge.selectProject('/B');
+    expect(state.current).toBeNull();
+    expect(state.draft).toBe(true);
+    expect(wsSession.id).toBeNull();
+  });
+
+  it('keeps the websocket on the open session when re-selecting its project', () => {
+    const { bridge, state, wsSession } = harness();
+    bridge.selectProject('/repo');
+    expect(state.current?.id).toBe('s1');
+    expect(wsSession.id).toBe('s1');
+  });
+
+  it('newDraft unsubscribes so the draft is not still bound to the left session', () => {
+    const { bridge, wsSession } = harness();
+    bridge.newDraft('/A');
+    expect(wsSession.id).toBeNull();
+  });
+
+  it('drops late events from the left session after a project switch', () => {
+    const { bridge, state, apply } = harness();
+    bridge.selectProject('/B');
+    apply({ type: 'assistant_text_delta', message_id: 'm1', delta: 'leak from A' });
+    expect(state.current).toBeNull();
+    expect(state.observation).toBeNull();
+  });
+
+  it('does not adopt a late snapshot of the left session while drafting on another project', () => {
+    const { bridge, state } = harness();
+    bridge.selectProject('/B');
+    (
+      bridge as unknown as {
+        applySnapshot: (snap: {
+          id: string;
+          repository: string;
+          goal: string;
+          model: null;
+          mode: 'assisted';
+          branch: null;
+          status: string;
+          messages: Array<{ id: string; role: 'assistant'; text: string }>;
+        }) => void;
+      }
+    ).applySnapshot({
+      id: 's1',
+      repository: '/repo',
+      goal: 'g',
+      model: null,
+      mode: 'assisted',
+      branch: null,
+      status: 'running',
+      messages: [{ id: 'm', role: 'assistant', text: 'leaked' }],
+    });
+    expect(state.current).toBeNull();
+    expect(state.draft).toBe(true);
+  });
+
+  it('session mutations stay ClientCommand on the session id', () => {
+    const { bridge, sent } = harness();
+    bridge.renameSession('s1', 'new title');
+    bridge.archiveSession('s1');
+    bridge.forkSession('s1');
+    bridge.deleteSession('s1');
+    expect(sent.map((c) => c.type)).toEqual([
+      'rename_session',
+      'request_session_list',
+      'archive_session',
+      'request_session_list',
+      'fork_session',
+      'request_session_list',
+      'delete_session',
+      'request_session_list',
+    ]);
+    expect(sent[0]).toMatchObject({ type: 'rename_session', session_id: 's1', name: 'new title' });
+    expect(sent[2]).toMatchObject({ type: 'archive_session', session_id: 's1' });
+    expect(sent[4]).toMatchObject({ type: 'fork_session', session_id: 's1' });
+    expect(sent[6]).toMatchObject({ type: 'delete_session', session_id: 's1' });
   });
 });
 

@@ -121,7 +121,9 @@ function Shell() {
   }, [bridge, dispatch]);
 
   const current = state.current;
-  const project = repoShortName(current?.repository ?? state.repository);
+  const projectPath = current?.repository ?? state.selectedProject ?? state.repository;
+  const project =
+    state.projects.find((p) => p.path === projectPath)?.name ?? repoShortName(projectPath);
   const branch = current?.branch ?? null;
 
   return (

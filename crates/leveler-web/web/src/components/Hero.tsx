@@ -6,6 +6,7 @@ import { useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
 import { BrandMark } from './BrandMark';
 import { repoShortName, formatRelative } from '../lib/format';
+import { sessionsForProject } from '../lib/projectScope';
 
 /** 空状态快捷操作：点击把起手语注入输入框，用户补全后发送。 */
 const QUICK_ACTIONS: ReadonlyArray<{ label: string; hint: string; seed: string }> = [
@@ -30,10 +31,9 @@ export function Hero() {
     return () => document.removeEventListener('click', onDocClick);
   }, [open]);
 
-  // 当前选择：draftProject ?? 当前仓库
-  const selected = state.draftProject ?? state.repository;
+  const selected = state.selectedProject ?? state.draftProject ?? (state.repository || null);
   const projects = state.projects;
-  const recent = state.sessions.slice(0, 5);
+  const recent = sessionsForProject(state.sessions, selected).slice(0, 5);
 
   return (
     <div className="hero">
@@ -41,15 +41,15 @@ export function Hero() {
         <BrandMark />
       </div>
       <div className="h-word">CodeLeveler</div>
-      <div className="h-sub">选一个快捷操作，或在下方直接告诉 Agent 要做什么</div>
+      <div className="h-sub">你想让 CodeLeveler 做什么？</div>
       <div className="h-proj" ref={wrapRef}>
         <button className="h-proj-btn" onClick={() => setOpen((v) => !v)}>
           <span>⌂</span>
-          <span>{repoShortName(selected)}</span>
+          <span>{repoShortName(selected ?? '')}</span>
           <span className="caret">▼</span>
         </button>
         <div className="pop" hidden={!open}>
-          <div className="pop-head">选择项目 · 新对话将在此工作区创建</div>
+          <div className="pop-head">选择项目 · 新对话将在此项目创建</div>
           {projects.length === 0 && (
             <button
               className="pop-item sel"

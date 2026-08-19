@@ -380,7 +380,26 @@ export class RuntimeBridge {
   }
 
   newDraft(project?: string): void {
-    this.dispatch({ type: 'new_draft', project: project ?? null });
+    const state = this.getState();
+    const path = project ?? state.selectedProject ?? (state.repository || null);
+    this.dispatch({ type: 'new_draft', project: path });
+    this.leaveSessionSubscription();
+  }
+
+  selectProject(path: string): void {
+    const before = this.getState().current?.id ?? null;
+    this.dispatch({ type: 'select_project', path });
+    this.dispatch({ type: 'set_rail_nav', nav: 'sessions' });
+    if (before && this.getState().current?.id !== before) {
+      this.leaveSessionSubscription();
+    }
+  }
+
+  /** Stop receiving the previous session's subscribe_session stream. */
+  private leaveSessionSubscription(): void {
+    this.pendingSessionId = null;
+    this.awaitingNewSession = false;
+    this.ws.setSession(null);
   }
 
   // ── 多项目（聚合层）─────────────────────────────────────────────────
@@ -411,6 +430,7 @@ export class RuntimeBridge {
     try {
       await api.addProject(path);
       await this.refreshProjects();
+      this.dispatch({ type: 'select_project', path });
       this.requestSessionList();
       return true;
     } catch (err) {
@@ -460,6 +480,12 @@ export class RuntimeBridge {
     this.deliver({ type: 'archive_session', session_id: id });
     this.requestSessionList();
     this.notice('会话已归档');
+  }
+
+  deleteSession(id: SessionId): void {
+    this.deliver({ type: 'delete_session', session_id: id });
+    if (this.getState().current?.id === id) this.newDraft();
+    this.requestSessionList();
   }
 
   forkSession(id: SessionId): void {
@@ -515,7 +541,7 @@ export class RuntimeBridge {
           text,
           state.current?.model ?? null,
           state.current?.permission ?? 'assisted',
-          state.draftProject ?? undefined,
+          state.draftProject ?? state.selectedProject ?? undefined,
         );
         this.dispatch({
           type: 'snapshot',

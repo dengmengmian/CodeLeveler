@@ -2,7 +2,8 @@
 // memory / sub-agent / background task / 产品轴 / 终态保真。
 
 import { describe, expect, it } from 'vitest';
-import type { UiObservabilityLoaded, UiSessionSnapshot } from '../types/protocol';
+import type { ProjectInfo, UiObservabilityLoaded, UiSessionSnapshot } from '../types/protocol';
+import { sessionsForProject } from '../lib/projectScope';
 import { headerWaitingCue, inspectorMode } from '../lib/inspectorModel';
 import { initialState, reducer, type AppState } from './store';
 
@@ -87,6 +88,136 @@ describe('product axes', () => {
     expect(state.current?.reasoningEffort).toBe('max');
     const none = stateWithSession({ reasoning: { effective: null } });
     expect(none.current?.reasoningEffort).toBeNull();
+  });
+});
+
+function project(path: string, over: Partial<ProjectInfo> = {}): ProjectInfo {
+  return { path, name: path.split('/').pop() ?? path, status: 'online', sessions: 0, ...over };
+}
+
+describe('project → sessions', () => {
+  it('selecting a project filters the session list to that repository', () => {
+    const state = structuredClone(initialState);
+    reducer(state, {
+      type: 'projects',
+      projects: [project('/A', { name: 'Alpha' }), project('/B', { name: 'Beta' })],
+    });
+    reducer(state, {
+      type: 'session_list',
+      sessions: [
+        { id: 'a1', goal: 'fix A', status: 'idle', model: '', updated_at: 't', repository: '/A' },
+        { id: 'b1', goal: 'fix B', status: 'idle', model: '', updated_at: 't', repository: '/B' },
+      ],
+    });
+    reducer(state, { type: 'select_project', path: '/A' });
+    expect(state.selectedProject).toBe('/A');
+    expect(sessionsForProject(state.sessions, state.selectedProject).map((s) => s.id)).toEqual(['a1']);
+  });
+
+  it('new_draft targets the selected project', () => {
+    const state = structuredClone(initialState);
+    reducer(state, { type: 'select_project', path: '/A' });
+    reducer(state, { type: 'new_draft', project: '/A' });
+    expect(state.draft).toBe(true);
+    expect(state.draftProject).toBe('/A');
+    expect(state.selectedProject).toBe('/A');
+    expect(state.current).toBeNull();
+  });
+
+  it('switching project clears the other project session and observability ownership', () => {
+    const state = stateWithSession({ id: 'a1', repository: '/A' });
+    reducer(state, { type: 'observation_loading', queryId: 'q-a' });
+    reducer(state, {
+      type: 'observation_loaded',
+      queryId: 'q-a',
+      observation: observation({ session: { ...observation().session, session_id: 'a1' } }),
+    });
+    expect(state.observation).not.toBeNull();
+    reducer(state, { type: 'select_project', path: '/B' });
+    expect(state.selectedProject).toBe('/B');
+    expect(state.current).toBeNull();
+    expect(state.draft).toBe(true);
+    expect(state.draftProject).toBe('/B');
+    expect(state.observation).toBeNull();
+    expect(state.pendingObservationQuery).toBeNull();
+    expect(state.observationStatus).toBe('idle');
+  });
+
+  it('a late observability payload for the previous session is dropped', () => {
+    const state = stateWithSession({ id: 'a1', repository: '/A' });
+    reducer(state, { type: 'observation_loading', queryId: 'q-a' });
+    reducer(state, { type: 'select_project', path: '/B' });
+    reducer(state, {
+      type: 'observation_loaded',
+      queryId: 'q-a',
+      observation: observation({ session: { ...observation().session, session_id: 'a1' } }),
+    });
+    expect(state.observation).toBeNull();
+    expect(state.pendingObservationQuery).toBeNull();
+  });
+
+  it('opening a session snapshot aligns the selected project to its repository', () => {
+    const state = structuredClone(initialState);
+    reducer(state, { type: 'select_project', path: '/A' });
+    reducer(state, { type: 'snapshot', session: snapshot({ id: 'b1', repository: '/B' }) });
+    expect(state.selectedProject).toBe('/B');
+    expect(state.current?.id).toBe('b1');
+  });
+
+  it('records offline project status without inventing online', () => {
+    const state = structuredClone(initialState);
+    reducer(state, { type: 'projects', projects: [project('/A', { status: 'offline' })] });
+    expect(state.projects[0]?.status).toBe('offline');
+    reducer(state, { type: 'project_status', path: '/A', status: 'starting' });
+    expect(state.projects[0]?.status).toBe('starting');
+  });
+
+  it('clears pending attachments when leaving a project session', () => {
+    const state = stateWithSession({ id: 'a1', repository: '/A' });
+    reducer(state, {
+      type: 'attachment_added',
+      attachment: {
+        id: 'att1',
+        name: 'note.txt',
+        mime_type: 'text/plain',
+        kind: 'text_file',
+        sha256: 'x',
+        size_bytes: 1,
+      },
+    });
+    expect(state.pendingAttachments).toHaveLength(1);
+    reducer(state, { type: 'select_project', path: '/B' });
+    expect(state.pendingAttachments).toEqual([]);
+  });
+
+  it('keeps the open session when re-selecting its project', () => {
+    const state = stateWithSession({ id: 'a1', repository: '/A' });
+    reducer(state, { type: 'select_project', path: '/A' });
+    expect(state.current?.id).toBe('a1');
+    expect(state.draft).toBe(false);
+  });
+
+  it('falls back to another listed project when the selected one disappears', () => {
+    const state = stateWithSession({ id: 'b1', repository: '/B' });
+    reducer(state, {
+      type: 'projects',
+      projects: [project('/A'), project('/B')],
+    });
+    expect(state.selectedProject).toBe('/B');
+    reducer(state, { type: 'projects', projects: [project('/A')] });
+    expect(state.selectedProject).toBe('/A');
+    expect(state.current).toBeNull();
+    expect(state.draft).toBe(true);
+    expect(state.observation).toBeNull();
+  });
+
+  it('new_draft without a path uses the selected project', () => {
+    const state = structuredClone(initialState);
+    reducer(state, { type: 'select_project', path: '/A' });
+    reducer(state, { type: 'new_draft' });
+    expect(state.draftProject).toBe('/A');
+    expect(state.selectedProject).toBe('/A');
+    expect(state.draft).toBe(true);
   });
 });
 

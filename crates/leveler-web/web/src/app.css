@@ -314,6 +314,28 @@ button { font-family: inherit; }
   font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--text-tertiary);
 }
 .sessions { flex: 1; overflow-y: auto; padding: 4px 8px 12px; }
+.proj-switch { position: relative; padding: 10px 8px 0; }
+.proj-switch-btn {
+  background: none; border: none; cursor: pointer;
+  font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+  color: var(--text-tertiary); text-transform: uppercase;
+}
+.proj-switch-btn .caret { margin-left: 6px; font-size: 9px; }
+.proj-switch-pop { left: 8px; right: auto; min-width: 180px; }
+.p-item.on { color: var(--text-primary); }
+.proj-context {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 8px 2px;
+}
+.proj-context-name {
+  flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; gap: 6px;
+}
+.proj-offline {
+  font-family: var(--mono); font-size: 11px; color: var(--warning);
+}
+.proj-context:hover .p-add { opacity: 1; }
 .rail-empty {
   padding: 18px 12px; font-family: var(--mono); font-size: 12px;
   color: var(--text-tertiary); line-height: 1.8;
@@ -384,9 +406,13 @@ button { font-family: inherit; }
 }
 .sess-more:hover { background: var(--bg-hover); color: var(--text-primary); }
 .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
-.dot.run  { background: var(--accent); animation: pulse 1.6s infinite; }
+.dot.run, .dot.running { background: var(--accent); animation: pulse 1.6s infinite; }
 .dot.idle { background: var(--text-tertiary); }
-.dot.wait { background: var(--warning); }
+.dot.wait, .dot.waiting, .dot.blocked { background: var(--warning); }
+.dot.failed { background: var(--danger); }
+.dot.completed { background: var(--success); }
+.dot.interrupted, .dot.incomplete { background: var(--text-tertiary); }
+.sess-mark { flex: none; font-size: 11px; color: var(--success); width: 10px; text-align: center; }
 @keyframes pulse { 50% { opacity: .35; } }
 .rail-foot {
   border-top: 1px solid var(--border-subtle); padding: 10px 14px;

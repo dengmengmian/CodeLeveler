@@ -322,7 +322,9 @@ export function Composer() {
               placeholder={
                 turnActive
                   ? '回合运行中，可继续输入并加入队列…… ( / 唤起命令 )'
-                  : '告诉 Agent 要完成什么，或输入 / 查看命令'
+                  : state.draft
+                    ? '你想让 CodeLeveler 做什么？'
+                    : '告诉 Agent 要完成什么，或输入 / 查看命令'
               }
               onChange={(e) => {
                 setText(e.target.value);
