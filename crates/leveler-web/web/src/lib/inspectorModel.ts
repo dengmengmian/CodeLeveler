@@ -15,6 +15,15 @@ export function inspectorMode(s: SessionView | null): InspectorMode {
   return 'idle';
 }
 
+/** Header cue while the user must act. Click opens Inspector — never a second modal. */
+export function headerWaitingCue(
+  s: SessionView | null,
+): { glyph: '⚠'; label: '等待确认' | '需要回答' } | null {
+  if (inspectorMode(s) !== 'waiting' || !s) return null;
+  if (s.pendingApprovals.length > 0) return { glyph: '⚠', label: '等待确认' };
+  return { glyph: '⚠', label: '需要回答' };
+}
+
 export function inspectorTerminalTone(end: TurnEnd): TurnTone {
   return presentTurnEnd(end).tone;
 }

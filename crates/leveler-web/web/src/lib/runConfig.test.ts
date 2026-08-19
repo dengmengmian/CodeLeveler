@@ -1,17 +1,19 @@
 import { describe, expect, it } from 'vitest';
+import { reasoningLabel } from './format';
 import { runConfigSummary } from './runConfig';
 
 describe('runConfigSummary', () => {
-  it('projects the five product axes as one quiet line', () => {
+  it('projects snapshot.reasoning.effective max as Max, never a client-invented value', () => {
+    expect(reasoningLabel('max')).toBe('Max');
     expect(
       runConfigSummary({
-        modelLabel: 'deepseek-v4-flash',
-        reasoning: 'Max',
+        modelLabel: 'GLM-5.2',
+        reasoning: reasoningLabel('max'),
         workProfile: 'balanced',
         collaboration: 'goal',
         permission: 'assisted',
       }),
-    ).toBe('deepseek-v4-flash · Max · Balanced · Goal · 辅助模式');
+    ).toBe('GLM-5.2 · Max · Balanced · Goal · 辅助模式');
   });
 
   it('omits reasoning when the model has no effort', () => {

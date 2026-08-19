@@ -1000,6 +1000,10 @@ button { font-family: inherit; }
 }
 .run-readonly { padding: 4px 12px 8px; color: var(--text-secondary); font-size: 13px; }
 .sh-status.wait { color: var(--warning); }
+button.sh-status {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  font: inherit; color: inherit;
+}
 .sh-status.term.tone-success { color: var(--success); }
 .sh-status.term.tone-warn { color: var(--warning); }
 .sh-status.term.tone-error { color: var(--danger); }

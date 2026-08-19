@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionView } from '../state/store';
-import { inspectorMode, inspectorTerminalTone, currentPlanProgress } from './inspectorModel';
+import {
+  inspectorMode,
+  inspectorTerminalTone,
+  currentPlanProgress,
+  headerWaitingCue,
+} from './inspectorModel';
 import type { TurnOutcome } from './turn';
 
 function session(over: Partial<SessionView> = {}): SessionView {
@@ -79,6 +84,43 @@ describe('inspectorMode', () => {
   it('idle when empty', () => {
     expect(inspectorMode(session())).toBe('idle');
     expect(inspectorMode(null)).toBe('idle');
+  });
+});
+
+describe('headerWaitingCue', () => {
+  it('shows 等待确认 for a pending approval, not the running activity line', () => {
+    const cue = headerWaitingCue(
+      session({
+        turnActive: true,
+        activity: '正在运行 cargo test',
+        pendingApprovals: [
+          {
+            id: 'a1',
+            tool: 'run_command',
+            summary: 'run rm',
+            command: 'rm -rf build/',
+            risks: [],
+          },
+        ],
+      }),
+    );
+    expect(cue).toEqual({ glyph: '⚠', label: '等待确认' });
+    expect(cue?.label).not.toMatch(/cargo test|正在运行/);
+  });
+
+  it('shows 需要回答 for a pending clarification', () => {
+    expect(
+      headerWaitingCue(
+        session({
+          turnActive: true,
+          pendingClarifications: [{ id: 'c1', question: 'old API?', options: [] }],
+        }),
+      ),
+    ).toEqual({ glyph: '⚠', label: '需要回答' });
+  });
+
+  it('is absent while only running', () => {
+    expect(headerWaitingCue(session({ turnActive: true, activity: 'cargo test' }))).toBeNull();
   });
 });
 

@@ -1,22 +1,32 @@
 # Web Product UX Smoke
 
-**Date:** 2026-08-18  
-**Build:** `npm run typecheck` · `npm test` (54) · `npm run build` — pass  
+**Date:** 2026-08-19  
 **Harness:** `crates/leveler-web/web` mock (`MOCK_PORT=7331`) serving `dist/`
+
+These four statuses are independent. Automated tests and mock contract
+smoke are **not** a headed browser UX walkthrough.
+
+| Gate | Result |
+| --- | --- |
+| IMPLEMENTATION | READY |
+| AUTOMATED REGRESSION | PASS |
+| MOCK / CONTRACT SMOKE | PASS |
+| REAL HEADED BROWSER UX SMOKE | NOT RUN / ENVIRONMENT BLOCKED |
 
 ## Automated
 
 | Step | Result |
 | --- | --- |
-| GET `/` 200 + new bundle (`index-Bu7fOSBk.js`) | pass |
-| `node mock/smoke.mjs` full turn (tools → approval → plan → verify → diff → complete) | **SMOKE OK** |
+| GET `/` 200 + production bundle | pass (prior mock round; this closeout rebuilt `index-CCkC4Hio.js`) |
+| `node mock/smoke.mjs` full turn (tools → approval → plan → verify → diff → complete) | **SMOKE OK** (not re-run this closeout; contract unchanged) |
 
 The mock script drives the same approval / verification / diff events the new
 Inspector and Diff workspace consume. It does not click the DOM.
 
 ## Manual (this machine)
 
-`open_page` cannot attach to `127.0.0.1`. No headed browser was driven.
+`open_page` cannot attach to `127.0.0.1`. **REAL HEADED BROWSER UX SMOKE
+was not run** (environment blocked). This is not “Browser smoke PASS”.
 
 Walked the new surfaces against the mock contract and static build:
 

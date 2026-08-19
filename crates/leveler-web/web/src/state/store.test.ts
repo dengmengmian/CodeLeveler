@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { UiSessionSnapshot } from '../types/protocol';
+import { headerWaitingCue, inspectorMode } from '../lib/inspectorModel';
 import { initialState, reducer, type AppState } from './store';
 
 function snapshot(over: Partial<UiSessionSnapshot> = {}): UiSessionSnapshot {
@@ -46,8 +47,8 @@ describe('product axes', () => {
   });
 
   it('exposes the runtime-resolved reasoning effort, never inventing one', () => {
-    const state = stateWithSession({ reasoning: { effective: 'medium' } });
-    expect(state.current?.reasoningEffort).toBe('medium');
+    const state = stateWithSession({ reasoning: { effective: 'max' } });
+    expect(state.current?.reasoningEffort).toBe('max');
     const none = stateWithSession({ reasoning: { effective: null } });
     expect(none.current?.reasoningEffort).toBeNull();
   });
@@ -66,6 +67,42 @@ describe('chrome / diff focus', () => {
     expect(state.inspectorOpen).toBe(true);
     reducer(state, { type: 'toggle_inspector' });
     expect(state.inspectorOpen).toBe(false);
+  });
+
+  it('pending approval with a closed inspector still surfaces the waiting cue; opening Inspector is the action entry', () => {
+    const state = stateWithSession({
+      pending_interactions: [
+        {
+          type: 'approval',
+          request: {
+            id: 'a1',
+            tool: 'run_command',
+            summary: 'run rm',
+            command: 'rm -rf build/',
+            risks: [],
+          },
+        },
+      ],
+    });
+    reducer(state, { type: 'set_inspector', open: false });
+    expect(state.inspectorOpen).toBe(false);
+    expect(inspectorMode(state.current)).toBe('waiting');
+    expect(headerWaitingCue(state.current)).toEqual({ glyph: '⚠', label: '等待确认' });
+    reducer(state, { type: 'set_inspector', open: true });
+    expect(state.inspectorOpen).toBe(true);
+  });
+
+  it('pending clarification with a closed inspector surfaces 需要回答; opening Inspector is the action entry', () => {
+    const state = stateWithSession({
+      pending_interactions: [
+        { type: 'clarification', request: { id: 'c1', question: 'old API?', options: [] } },
+      ],
+    });
+    reducer(state, { type: 'set_inspector', open: false });
+    expect(state.inspectorOpen).toBe(false);
+    expect(headerWaitingCue(state.current)).toEqual({ glyph: '⚠', label: '需要回答' });
+    reducer(state, { type: 'set_inspector', open: true });
+    expect(state.inspectorOpen).toBe(true);
   });
 });
 

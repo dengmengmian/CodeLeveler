@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { RuntimeBridge } from './lib/controller';
 import { formatElapsed, repoShortName } from './lib/format';
-import { inspectorMode } from './lib/inspectorModel';
+import { headerWaitingCue, inspectorMode } from './lib/inspectorModel';
 import { presentTurnEnd } from './lib/turn';
 import { AppProvider, useAppDispatch, useAppState, type AppState } from './state/store';
 import { BridgeProvider, useBridge } from './state/bridge';
@@ -201,8 +201,10 @@ function Shell() {
 
 function RunStatus() {
   const current = useAppState().current;
+  const dispatch = useAppDispatch();
   const bridge = useBridge();
   const mode = inspectorMode(current);
+  const waiting = headerWaitingCue(current);
   const startedAt = current?.turnStartedAt ?? null;
   const [, forceTick] = useState(0);
 
@@ -212,12 +214,18 @@ function RunStatus() {
     return () => clearInterval(timer);
   }, [mode]);
 
-  if (mode === 'waiting') {
+  if (waiting) {
     return (
-      <span className="sh-status wait">
-        <i className="dot" />
-        等待确认
-      </span>
+      <button
+        type="button"
+        className="sh-status wait"
+        title="打开任务面板"
+        aria-label={`${waiting.label}，打开任务面板`}
+        onClick={() => dispatch({ type: 'set_inspector', open: true })}
+      >
+        <span aria-hidden="true">{waiting.glyph}</span>
+        {waiting.label}
+      </button>
     );
   }
 

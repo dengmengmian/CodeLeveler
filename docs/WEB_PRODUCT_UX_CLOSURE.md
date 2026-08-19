@@ -1,7 +1,7 @@
 # WEB PRODUCT UX CLOSURE FINAL REPORT
 
-**Date:** 2026-08-18  
-**Verdict:** **READY**
+**Date:** 2026-08-19  
+**Verdict:** **CLOSED**
 
 Product projection only. No Runtime / Harness / Long Goal / Multi-Agent
 runtime / protocol change.
@@ -70,7 +70,8 @@ Profile, Collaboration, Permission. Slash commands still work.
 
 Timeline = record (“在任务面板处理”).  
 Inspector = only full action buttons.  
-Waiting auto-opens Inspector.
+Waiting auto-opens Inspector. Header `⚠ 等待确认` / `⚠ 需要回答`
+re-opens the same drawer if the user closed it.
 
 ## 9. Responsive
 
@@ -87,17 +88,28 @@ inspector, ⌘B rail, ⌘I inspector. Existing y/s/a/n + Esc kept.
 
 ## 11. Tests
 
-`npm test` — 54 pass (was 35-ish + 19 new).  
-Coverage: inspector modes/tones/plan progress; diff next/prev/line
-numbers/collapse; run-config summary; store `focus_diff` / toggle
+`npm test` — 59 pass.  
+Coverage: inspector modes/tones/plan progress; header waiting cue
+(approval / clarification, closed drawer → open Inspector); diff
+next/prev/line numbers/collapse; run-config summary (`effective=max`
+→ Max, no client-invented effort); store `focus_diff` / toggle
 inspector.  
 `npm run typecheck` · `npm run build` pass.
 
 ## 12. Browser smoke
 
-See `docs/WEB_PRODUCT_UX_SMOKE.md`. Mock contract smoke **SMOKE OK**.
-Headed daemon click-through not executed (localhost browser tool
-unavailable).
+See `docs/WEB_PRODUCT_UX_SMOKE.md`. Statuses are independent:
+
+| Gate | Result |
+| --- | --- |
+| IMPLEMENTATION | READY |
+| AUTOMATED REGRESSION | PASS |
+| MOCK / CONTRACT SMOKE | PASS |
+| REAL HEADED BROWSER UX SMOKE | NOT RUN / ENVIRONMENT BLOCKED |
+
+Mock contract smoke is **SMOKE OK**. Headed daemon click-through was not
+executed (`open_page` cannot attach to `127.0.0.1`). Automated tests are
+not equivalent to a headed UX walkthrough.
 
 ## 13. Remaining debt
 
@@ -107,10 +119,27 @@ unavailable).
 - Headed daemon walkthrough still due on a real display.  
 - Inspector default-open on desktop can still feel busy on first load.
 
+## 14. Final closeout
+
+**Date:** 2026-08-19
+
+| Check | Result |
+| --- | --- |
+| Reasoning Truth | PASS — `snapshot.reasoning.effective` only; Run Configuration is read-only; no setter / fake command / client persist |
+| Responsive Waiting Action | FIXED — Header `⚠ 等待确认` / `⚠ 需要回答` opens the existing Inspector drawer; no second action modal |
+| Browser Smoke Truth | PASS — four statuses recorded honestly; headed smoke not claimed |
+
+```
+WEB PRODUCT UX CLOSURE: CLOSED
+```
+
+WebUI is frozen after this closeout. Further changes wait on real-use
+feedback.
+
 ## Verdict
 
 ```
-READY
+CLOSED
 ```
 
 The WebUI now projects the existing runtime as a coding-agent client:
