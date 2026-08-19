@@ -906,6 +906,9 @@ pub struct Executor {
     /// When `Some`, `apply_patch` may only touch these files (worker ownership).
     /// `None` = unrestricted.
     write_allowlist: Option<Vec<String>>,
+    /// Workspace-wide write-ownership truth, shared by the whole execution
+    /// tree (late-bound ownership: spawned children claim scopes here).
+    ownership: Arc<crate::ownership::OwnershipRegistry>,
     /// Role-specific policies resolved by the engine for delegated executors.
     /// Direct library users fall back to the parent's settings, with writes
     /// serialized, so the safety invariant does not depend on the app layer.
@@ -983,6 +986,7 @@ impl Executor {
             depth: 0,
             agent_role: AgentRole::Default,
             write_allowlist: None,
+            ownership: Arc::new(crate::ownership::OwnershipRegistry::new()),
             sub_agent_policies: None,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
@@ -1111,6 +1115,28 @@ impl Executor {
 
     /// Restrict edits (`apply_patch`/`replace`) to these paths (files or
     /// directory prefixes). Enforced BEFORE the tool runs; `None` = unrestricted.
+    /// The write authority actually in force for THIS executor right now.
+    /// `None` = unrestricted (the top-level agent / orchestrated hosts without
+    /// a static allowlist). For a spawned child the answer is the live
+    /// ownership registry: everything it has claimed (a legacy Worker's
+    /// `files` arrive there as a pre-claim), which is EMPTY before its first
+    /// grant — so every mutation is refused until it claims.
+    pub(crate) fn effective_write_allowlist(&self) -> Option<Vec<String>> {
+        if self.depth == 0 {
+            return self.write_allowlist.clone();
+        }
+        if crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only {
+            // Structurally read-only: no write tools exist; an empty list is
+            // a consistent answer for the command pipeline.
+            return Some(Vec::new());
+        }
+        let owner = match &self.agent_id {
+            Some(id) => id.clone(),
+            None => return self.write_allowlist.clone(),
+        };
+        Some(self.ownership.owned_by(&owner))
+    }
+
     pub fn with_write_allowlist(mut self, paths: Option<Vec<String>>) -> Self {
         self.write_allowlist = paths.filter(|p| !p.is_empty());
         self
@@ -1255,6 +1281,7 @@ impl Executor {
             depth: self.depth + 1,
             agent_role: role,
             write_allowlist,
+            ownership: self.ownership.clone(),
             sub_agent_policies: self.sub_agent_policies,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),

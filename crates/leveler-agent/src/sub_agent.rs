@@ -100,9 +100,10 @@ pub fn multi_agent_steer_hint() -> String {
     "## Multi-agent coordination\n\
      You are both the coding agent and the coordinator of this workspace. \
      Delegate focused, INDEPENDENT work to `spawn_agent` children so it does \
-     not consume this conversation's context: role='worker' with the exact \
-     `files` or directories it will exclusively own for a bounded \
-     implementation, role='explorer' for read-only investigation. Put a \
+     not consume this conversation's context. `task` is the only required \
+     argument: the child starts read-capable, inspects the code, and claims \
+     its own bounded write scope (claim_write_scope) — the runtime enforces \
+     exclusive ownership, so you do not pre-plan file ownership. Put a \
      complete self-contained `task` in each spawn — children do not see your \
      history.\n\
      Children run in the background by default: the call returns immediately \

@@ -39,10 +39,11 @@ use crate::authorization::{
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
-    COMPLETE_STEP_TOOL, PermissionRequestOutcome, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL,
-    RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL, apply_turn_grants,
-    ask_user_tool_definition, complete_step_tool_definition, is_user_input_tool,
-    parse_permission_request, permission_already_denied_message, report_finding_tool_definition,
+    CLAIM_WRITE_SCOPE_TOOL, COMPLETE_STEP_TOOL, PermissionRequestOutcome, REPORT_FINDING_TOOL,
+    REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL,
+    apply_turn_grants, ask_user_tool_definition, claim_write_scope_tool_definition,
+    complete_step_tool_definition, is_user_input_tool, parse_permission_request,
+    permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     resolve_finding_tool_definition, spawn_agent_tool_definition, update_goal_tool_definition,
 };
@@ -112,6 +113,11 @@ impl Executor {
         // can also hide spawn_agent entirely.
         if self.policy.allow_delegation && self.depth < MAX_SUB_AGENT_DEPTH {
             tools.push(spawn_agent_tool_definition());
+        }
+        // Late-bound ownership: a spawned child starts read-capable and
+        // claims its own bounded write scope. Read-only roles never claim.
+        if self.depth > 0 && !crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only {
+            tools.push(claim_write_scope_tool_definition());
         }
         // Children report typed findings; the parent judges adopted ones.
         // The parent also gets resolve_finding with delegation off when a
@@ -406,6 +412,9 @@ impl Executor {
                         &result,
                     );
                     clear_outstanding_child(&mut progress, &id);
+                    // Terminal release: the child's exclusive claims end with
+                    // it, whatever its terminal state (idempotent).
+                    self.ownership.release_all(&id);
                     let notice = Message::text(
                         Role::User,
                         settlement_notice(&nickname, &id, role, &scope, &content),
@@ -1646,6 +1655,62 @@ impl Executor {
                     continue;
                 }
 
+                // Late-bound ownership: a child claims exclusive write scope
+                // against the shared registry. Atomic; a denial is an honest
+                // coordination result (is_error=false) the child works around.
+                if call.name == CLAIM_WRITE_SCOPE_TOOL {
+                    let paths: Vec<String> = call
+                        .arguments
+                        .get("paths")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let (content, is_error) = if self.depth == 0 {
+                        (
+                            "You are the top-level agent: you already write directly \
+                             (outside children's claimed scopes). claim_write_scope is \
+                             for spawned children."
+                                .to_string(),
+                            true,
+                        )
+                    } else {
+                        let owner = self
+                            .agent_id
+                            .clone()
+                            .unwrap_or_else(|| format!("child-depth-{}", self.depth));
+                        match self.ownership.try_claim(&owner, &paths) {
+                            Ok(owned) => (
+                                format!(
+                                    "granted — you exclusively own: {}. Re-read a claimed \
+                                     file before your first write to it if time has passed \
+                                     since you read it.",
+                                    owned.join(", ")
+                                ),
+                                false,
+                            ),
+                            Err(rejection) => (rejection.for_model(), false),
+                        }
+                    };
+                    observer(AgentEvent::ToolResult {
+                        id: call.id.as_str().to_string(),
+                        name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+                        is_error,
+                        preview: preview(&content),
+                    });
+                    results[index] = Some(ContentPart::ToolResult {
+                        result: ToolResultContent {
+                            call_id: call.id,
+                            content,
+                            is_error,
+                        },
+                    });
+                    continue;
+                }
+
                 // request_permissions is answered by the user, not the registry.
                 if call.name == REQUEST_PERMISSIONS_TOOL {
                     let (_, _, requested) = parse_permission_request(&call.arguments);
@@ -1862,20 +1927,33 @@ impl Executor {
                     }
                 }
 
-                // Write allowlist (worker sub-agents, orchestrated nodes):
-                // reject an edit that reaches outside the allowed paths BEFORE
-                // it runs, feeding the reason back so the model stays in scope.
+                // Write authority (late-bound ownership): a child's effective
+                // allowlist is what it has CLAIMED (plus any legacy pre-claim);
+                // before its first grant that set is empty and every mutation
+                // is refused with the claim protocol named. The parent stays
+                // unrestricted (fenced above by others' claims); orchestrated
+                // nodes keep their static allowlist.
                 if self.registry.mutates_files(&call.name)
-                    && let Some(allow) = &self.write_allowlist
+                    && let Some(allow) = self.effective_write_allowlist()
                 {
-                    let outside = write_targets_outside_allowlist(&call, allow);
+                    let outside = write_targets_outside_allowlist(&call, &allow);
                     if !outside.is_empty() {
-                        let msg = format!(
-                            "Edit rejected: {} is outside your allowed paths ({}). Only edit \
-                             within them; ask for the others if you truly need them.",
-                            outside.join(", "),
-                            allow.join(", ")
-                        );
+                        let msg = if allow.is_empty() {
+                            format!(
+                                "Edit rejected: no write scope is currently owned. Read \
+                                 the relevant code, then use claim_write_scope(paths) \
+                                 before modifying files (denied: {}).",
+                                outside.join(", ")
+                            )
+                        } else {
+                            format!(
+                                "Edit rejected: {} is outside your claimed scope ({}). \
+                                 Claim it with claim_write_scope first, or stay within \
+                                 your scope.",
+                                outside.join(", "),
+                                allow.join(", ")
+                            )
+                        };
                         denied_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
@@ -1909,7 +1987,7 @@ impl Executor {
                     .max_modified_files
                     .map(|max| max.saturating_sub(epoch_paths.len()));
                 let ctx = ctx.with_command_write_constraints(
-                    self.write_allowlist.clone(),
+                    self.effective_write_allowlist(),
                     remaining_files,
                     epoch_paths,
                 );
@@ -1919,6 +1997,14 @@ impl Executor {
                 // requires the AdmittedCall it returns; `parallel` (computed
                 // above) decides deferral to the batch — every other admitted
                 // call runs here, in order.
+                // §19: while the parent executes a mutation, an overlapping
+                // child claim is denied retryably (guard dropped after the
+                // call resolves).
+                let _parent_mut_guard =
+                    (self.depth == 0 && self.registry.mutates_files(&call.name)).then(|| {
+                        self.ownership
+                            .parent_mutation_guard(crate::authorization::mutation_targets(&call))
+                    });
                 let (
                     content,
                     is_error,
@@ -2420,18 +2506,21 @@ impl Executor {
                             files.join(", ")
                         ))
                     } else if role == AgentRole::Worker
-                        && background_children.0.iter().any(|child| {
-                            child.role == AgentRole::Worker && scopes_overlap(&child.scope, &files)
-                        })
+                        && !self.ownership.conflicts_for(&files, "").is_empty()
                     {
-                        // V2: exclusive means exclusive across the whole run —
-                        // a still-running background worker owns its scope
-                        // until it settles, not just within one batch.
+                        // Legacy pre-scoped Worker: its files are an exclusive
+                        // claim in the SAME registry late-bound children use —
+                        // a conflict with any live claim is an honest denial.
+                        let hits = self.ownership.conflicts_for(&files, "");
                         Some(format!(
-                            "Worker scope {} overlaps a background worker that is STILL \
-                             RUNNING. Wait for its settlement notice, or scope this \
-                             worker to disjoint files.",
-                            files.join(", ")
+                            "Worker scope {} overlaps exclusive ownership held by {}. \
+                             Wait for its settlement notice, or scope this worker to \
+                             disjoint files.",
+                            files.join(", "),
+                            hits.iter()
+                                .map(|c| c.owner.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ))
                     } else if agents_spawned >= self.policy.max_total_agents {
                         Some(format!(
@@ -2466,6 +2555,32 @@ impl Executor {
                     agents_spawned += 1;
                     let id = new_delegated_agent_id();
                     let nickname = agent_nickname(agents_spawned);
+                    self.ownership
+                        .register_owner(&id, &format!("{nickname} ({id})"));
+                    if role == AgentRole::Worker && !files.is_empty() {
+                        // Atomic legacy pre-claim; admission above already
+                        // verified there is no live conflict, and this batch's
+                        // earlier spawns claim before later ones are admitted.
+                        if let Err(rejection) = self.ownership.try_claim(&id, &files) {
+                            let msg = rejection.for_model();
+                            self.ownership.release_all(&id);
+                            observer(AgentEvent::ToolResult {
+                                id: call.id.as_str().to_string(),
+                                name: SPAWN_AGENT_TOOL.to_string(),
+                                is_error: true,
+                                preview: preview(&msg),
+                            });
+                            results[index] = Some(ContentPart::ToolResult {
+                                result: ToolResultContent {
+                                    call_id: call.id,
+                                    content: msg,
+                                    is_error: true,
+                                },
+                            });
+                            agents_spawned -= 1;
+                            continue;
+                        }
+                    }
                     let started_task = if role == AgentRole::Worker && !files.is_empty() {
                         format!("{task}\n[scope: {}]", files.join(", "))
                     } else {
@@ -2625,6 +2740,7 @@ impl Executor {
                         biased;
                         Some(progress_ev) = progress_rx.recv() => observer(progress_ev),
                         Some((index, call_id, id, nickname, role, result)) = futs.next() => {
+                            self.ownership.release_all(&id);
                             let (content, ok) = fold_child_settlement(
                                 &mut progress,
                                 &mut commands_run,

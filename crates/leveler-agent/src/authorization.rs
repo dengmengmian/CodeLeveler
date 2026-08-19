@@ -111,6 +111,17 @@ pub(crate) fn write_targets_outside_allowlist(
         .collect()
 }
 
+/// The paths a direct write tool would touch, normalized — for callers that
+/// need the target set itself (ownership fences) rather than a containment
+/// verdict against a fixed list.
+pub(crate) fn mutation_targets(call: &ToolCall) -> Vec<String> {
+    write_targets(call)
+        .into_iter()
+        .map(|p| norm_scope_path(&p))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 /// The paths a direct write tool would touch, unnormalized.
 fn write_targets(call: &ToolCall) -> Vec<String> {
     match call.name.as_str() {

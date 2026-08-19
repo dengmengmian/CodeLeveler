@@ -17,6 +17,7 @@ mod executor;
 mod injected_tools;
 pub mod named_agent;
 mod nudges;
+pub mod ownership;
 mod prompt;
 mod sub_agent;
 
