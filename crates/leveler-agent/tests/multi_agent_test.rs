@@ -3972,7 +3972,9 @@ async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded()
         messages
             .iter()
             .filter(|m| {
-                m.role == Role::User && m.text_content().contains("## Delegation disposition")
+                m.role == Role::User
+                    && m.text_content()
+                        .contains("## Background delegation is available")
             })
             .count()
     };
@@ -3989,7 +3991,11 @@ async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded()
     );
     let offer_text = last
         .iter()
-        .find(|m| m.role == Role::User && m.text_content().contains("## Delegation disposition"))
+        .find(|m| {
+            m.role == Role::User
+                && m.text_content()
+                    .contains("## Background delegation is available")
+        })
         .unwrap()
         .text_content();
     assert!(
@@ -4225,9 +4231,11 @@ async fn plan_progress_after_keep_raises_one_reconsideration_with_parent_scope_f
         text.contains("a.txt"),
         "parent-edited paths ground the boundary: {text}"
     );
+    // Phase B: the surface states availability and expects no answer —
+    // not calling spawn_agent already IS keeping the work.
     assert!(
-        text.to_ascii_lowercase().contains("valid outcome"),
-        "KEEP stays first-class: {text}"
+        text.to_ascii_lowercase().contains("no reply is expected"),
+        "the reconsideration must not demand a disposition: {text}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

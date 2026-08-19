@@ -115,11 +115,10 @@ pub fn multi_agent_steer_hint() -> String {
      do not redo child-owned work; inspect and integrate its result when it \
      settles. Set run_in_background=false only when your next action depends \
      on that child's result.\n\
-     Keep work yourself when it is small, tightly coupled, needs your \
-     in-flight context, or has no safe ownership boundary — KEEP is a \
-     first-class outcome. Do not spawn for its own sake. A piece you kept \
-     because it was blocked by unfinished work can still be delegated later, \
-     once its blockers clear: freeze its contract (expected outputs, \
+     Work that is small, tightly coupled, or needs your in-flight context \
+     simply stays here — not calling `spawn_agent` is already that choice, so \
+     it needs no announcement. A piece blocked by unfinished work can go out \
+     later, once its blockers clear: freeze its contract (expected outputs, \
      interfaces, acceptance commands) in the task text and hand it off.\n\
      Long work stays in this direct tool loop: keep calling tools / spawn_agent \
      until the goal is proven; do not stop early with a plan-only summary."
@@ -457,53 +456,44 @@ const DECISION_REQUEST_MAX_STEPS: usize = 8;
 /// scaffolding, not steering: the criteria stay symmetric and KEEP-everything
 /// stays a first-class outcome.
 pub(crate) fn delegation_decision_request(steps: &[String]) -> String {
-    let mut out = String::from("## Delegation disposition (one-time)\n");
+    let mut out = String::from("## Background delegation is available\n");
     if steps.is_empty() {
         out.push_str(
-            "Your task decomposition is on record. Decide once, before continuing \
-             implementation: does any remaining piece form a bounded independent \
-             workstream — a clear file/module scope, independently verifiable, needing \
-             little of your in-flight context?\n\
-             - If yes: you may delegate it now via `spawn_agent` with role='worker', a \
-             complete self-contained `task`, and the exact `files` (or directories) it \
-             will own; inspect and integrate its result when it returns.\n\
-             - If no: keep all the work and continue exactly as you were. KEEP is a \
-             fully valid outcome.\n",
+            "Your task decomposition is on record. `spawn_agent` runs focused, \
+             independent work in the background while you keep going: give it a \
+             complete self-contained `task` (that is the only required argument) \
+             and it claims the write scope it needs itself; the runtime enforces \
+             exclusive ownership and tells you when it settles.\n\
+             Start independent delegations together in one message when useful, \
+             and continue productive work while they run.\n",
         );
     } else {
-        out.push_str(
-            "Your plan is on record. Decide once, for EACH open step below: KEEP \
-             (do it on this trajectory) or DELEGATE (`spawn_agent` role='worker' \
-             with a complete self-contained `task` and the exact `files` or \
-             directories that step owns).\n",
-        );
+        out.push_str("Your plan is on record; these steps are open:\n");
         for (i, step) in steps.iter().take(DECISION_REQUEST_MAX_STEPS).enumerate() {
             out.push_str(&format!("{}. {}\n", i + 1, step));
         }
         if steps.len() > DECISION_REQUEST_MAX_STEPS {
             out.push_str(&format!(
-                "… and {} more step(s), same choice each.\n",
+                "… and {} more step(s).\n",
                 steps.len() - DECISION_REQUEST_MAX_STEPS
             ));
         }
         out.push_str(
-            "A step that needs your in-flight context, shares edits with other \
-             steps, or is trivial: KEEP it. A step that is bounded, independently \
-             verifiable, and does not need what is in your head — for example a \
-             self-contained module, or a broad mechanical update of docs/goldens/\
-             fixtures — is a candidate for DELEGATE: the worker runs concurrently \
-             and returns a result you inspect and integrate.\n\
-             A step that BUNDLES a self-contained new file/module with small \
-             shared-file glue may be split in your disposition: DELEGATE the \
-             self-contained part with its exact files, KEEP the glue.\n\
-             Answer with one short KEEP/DELEGATE line per step, then proceed \
-             accordingly. KEEP for every step is a valid outcome.\n",
+            "`spawn_agent` runs focused, independent work in the background while \
+             you keep going: a complete self-contained `task` is the only required \
+             argument — the child claims the write scope it needs itself, the \
+             runtime enforces exclusive ownership, and you are told when it \
+             settles. Work that is bounded and does not need what is in your head \
+             — a self-contained module, a broad mechanical update of docs/goldens/\
+             fixtures — moves well; a piece bundling a self-contained module with \
+             small shared-file glue can go out as the module alone. Start \
+             independent delegations together in one message when useful, and \
+             continue productive work while they run.\n",
         );
     }
     out.push_str(
-        "The harness raises this once now. Only if your plan later materially \
-         changes — completed steps unblocking bounded remaining ones — will it \
-         raise one final reconsideration; otherwise you will not be asked again.",
+        "This is a capability note, not a request: no reply is expected — continue \
+         with your work.",
     );
     out
 }
@@ -548,15 +538,13 @@ pub(crate) fn delegation_reconsideration_request(
         }
     }
     out.push_str(
-        "Decide once more, for EACH remaining step: KEEP (do it here) or \
-         DELEGATE (`spawn_agent` role='worker', a complete self-contained \
-         `task`, and the exact `files` or directories it will own). A step \
-         that is now unblocked, bounded, independently verifiable, and does \
-         not need the files above is a candidate to DELEGATE — you can freeze \
-         its contract (expected outputs, interfaces, acceptance commands) in \
-         the task text. A step still coupled to your remaining work, or \
-         trivial: KEEP it. KEEP for every step remains a fully valid outcome.\n\
-         This is the final time the harness raises this; you will not be asked again.",
+        "Steps that are now unblocked, bounded, and independent of the files \
+         above are the ones that move well to a background `spawn_agent`: give \
+         it a complete self-contained `task` with the contract frozen in the \
+         text (expected outputs, interfaces, acceptance commands) — it claims \
+         its own write scope and settles back to you.\n\
+         This is a capability note, not a request: no reply is expected — \
+         continue with your work.",
     );
     out
 }
@@ -993,8 +981,12 @@ mod tests {
         assert!(lower.contains("background by default"));
         assert!(lower.contains("continue useful work"));
         assert!(lower.contains("run_in_background=false only"));
-        assert!(lower.contains("keep is a first-class outcome"));
-        assert!(lower.contains("do not spawn for its own sake"));
+        // Phase B: no KEEP sermon — not calling spawn_agent already IS keeping
+        // the work, so the hint states that as a fact instead of sanctioning a
+        // refusal the model can reach for.
+        assert!(!lower.contains("keep is a first-class outcome"));
+        assert!(lower.contains("simply stays here"));
+        // …and still no pressure in the other direction.
         assert!(!lower.contains("always spawn"));
         assert!(!lower.contains("must spawn"));
         assert!(!lower.contains("every task"));
@@ -1183,10 +1175,10 @@ mod decision_point_tests {
 
     fn assert_request_is_neutral(text: &str) {
         let lower = text.to_ascii_lowercase();
-        assert!(lower.contains("## delegation disposition"));
-        assert!(lower.contains("spawn_agent") && lower.contains("worker"));
-        assert!(lower.contains("valid outcome"));
-        assert!(lower.contains("not be asked again"));
+        // Phase B: an availability note, not a disposition questionnaire.
+        assert!(lower.contains("available") || lower.contains("capability note"));
+        assert!(lower.contains("spawn_agent"));
+        assert!(lower.contains("no reply is expected"));
         // Forbidden directive framings (gate §5): the decision point asks,
         // it never steers.
         for banned in [
@@ -1254,7 +1246,7 @@ mod decision_point_tests {
     }
 
     #[test]
-    fn the_generic_request_is_neutral_names_both_outcomes_and_promises_no_repeat() {
+    fn the_generic_request_states_availability_without_steering() {
         assert_request_is_neutral(&delegation_decision_request(&[]));
     }
 
@@ -1436,9 +1428,10 @@ mod decision_point_tests {
         assert!(text.contains("1. tests"), "{text}");
         assert!(text.contains("2. goldens"), "{text}");
         assert!(text.contains("src/cmd/dedup.rs"), "{text}");
-        assert!(lower.contains("keep") && lower.contains("delegate"));
-        assert!(lower.contains("valid outcome"));
-        assert!(lower.contains("not be asked again"));
+        // Phase B: the facts stay (open steps + the parent's edited-file
+        // boundary), the interrogation does not.
+        assert!(lower.contains("spawn_agent"), "{text}");
+        assert!(lower.contains("no reply is expected"), "{text}");
         for banned in [
             "you should delegate",
             "prefer worker",
@@ -1457,19 +1450,66 @@ mod decision_point_tests {
     /// self-contained new file with shared-file glue reads as coupled and
     /// kills the candidate).
     #[test]
-    fn the_plan_request_mentions_split_and_conditional_reask() {
+    fn the_plan_request_keeps_the_bundled_module_guidance_as_a_fact() {
+        // EA-1/EA-3 forensics: a step bundling a self-contained module with
+        // shared-file glue reads as coupled and kills the candidate. Phase B
+        // keeps that FACT while dropping the per-step interrogation.
         let text = delegation_decision_request(&steps(&["impl dedup + register", "tests"]));
         let lower = text.to_ascii_lowercase();
-        assert!(lower.contains("split"), "{text}");
         assert!(
-            lower.contains("materially changes"),
-            "one-shot promise must be conditional now: {text}"
+            lower.contains("bundling") || lower.contains("bundles"),
+            "{text}"
         );
+        assert!(lower.contains("no reply is expected"), "{text}");
+    }
+
+    /// Phase B (delegation ergonomics): the surface is an AVAILABILITY notice,
+    /// not a questionnaire. Prior evidence: natural adoption 0/9 across two
+    /// ownership APIs, with the offer AND the reoffer declined every time —
+    /// an explicit question invites an explicit refusal, and "KEEP is a fully
+    /// valid outcome" hands the model a sanctioned way to say no. dsh (same
+    /// model family, real adoption) never asks: the tool is simply there.
+    #[test]
+    fn the_decision_surface_states_availability_instead_of_demanding_an_answer() {
+        for text in [
+            delegation_decision_request(&[]),
+            delegation_decision_request(&steps(&["impl dedup + register", "tests"])),
+            delegation_reconsideration_request(
+                &steps(&["docs", "goldens"]),
+                &["src/a.rs".to_string()],
+            ),
+        ] {
+            let lower = text.to_ascii_lowercase();
+            // No ceremony: no demand for a KEEP/DELEGATE answer per step.
+            assert!(
+                !lower.contains("decide once") && !lower.contains("decide again"),
+                "no decision ceremony: {text}"
+            );
+            assert!(
+                !lower.contains("answer with"),
+                "the model must not owe an answer: {text}"
+            );
+            assert!(
+                !lower.contains("each open step") && !lower.contains("each remaining step"),
+                "no per-step interrogation: {text}"
+            );
+            // No sanctioned refusal to reach for.
+            assert!(
+                !lower.contains("keep is a") && !lower.contains("keep for every step"),
+                "no KEEP sermon (not calling spawn_agent already IS keeping): {text}"
+            );
+            // Still no forcing in the other direction.
+            for pushy in ["you must", "always delegate", "should delegate"] {
+                assert!(!lower.contains(pushy), "no forcing either: {text}");
+            }
+            // It still names the capability and stays factual.
+            assert!(lower.contains("spawn_agent"), "{text}");
+        }
     }
 
     /// Iteration 2 (miller probe evidence): the plan-triggered request must
-    /// enumerate the model's own open steps and ask per-step, with symmetric
-    /// KEEP/DELEGATE criteria — never a global directive.
+    /// enumerate the model's own open steps — that context is factual and
+    /// stays. (Phase B removed the per-step interrogation, not the facts.)
     #[test]
     fn the_plan_request_enumerates_the_registered_steps_per_item() {
         let items = steps(&["给 head.go 加 --filename", "更新 docs 与 goldens"]);
@@ -1477,11 +1517,7 @@ mod decision_point_tests {
         assert_request_is_neutral(&text);
         assert!(text.contains("1. 给 head.go 加 --filename"), "{text}");
         assert!(text.contains("2. 更新 docs 与 goldens"), "{text}");
-        assert!(text.contains("EACH open step"), "{text}");
-        assert!(
-            text.contains("KEEP for every step is a valid outcome"),
-            "{text}"
-        );
+        assert!(text.contains("these steps are open"), "{text}");
         // Long plans stay bounded.
         let many: Vec<String> = (0..12).map(|i| format!("step {i}")).collect();
         let long = delegation_decision_request(&many);
