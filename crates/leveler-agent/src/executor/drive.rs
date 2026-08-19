@@ -70,13 +70,24 @@ struct BackgroundChild {
 /// Abort-on-drop guard: if the drive future is dropped on an unexpected path,
 /// spawned children must not keep running as orphans. Every NORMAL exit drains
 /// (settles) children first, so this abort is strictly the crash path.
+///
+/// Review 必改②: an aborted child never reaches a settle fold, so its write
+/// ownership must be released HERE too — otherwise a mid-round `return Err`
+/// (model decode/length/content-filter/fatal-admission) leaves the registry
+/// holding a claim for a child that no longer exists.
 #[derive(Default)]
-struct BackgroundChildren(Vec<BackgroundChild>);
+struct BackgroundChildren {
+    children: Vec<BackgroundChild>,
+    ownership: Option<Arc<crate::ownership::OwnershipRegistry>>,
+}
 
 impl Drop for BackgroundChildren {
     fn drop(&mut self) {
-        for child in &self.0 {
+        for child in &self.children {
             child.handle.abort();
+            if let Some(ownership) = &self.ownership {
+                ownership.release_all(&child.id);
+            }
         }
     }
 }
@@ -200,7 +211,10 @@ impl Executor {
         // covers foreground batches AND background children; the progress
         // channel outlives any single spawn batch and is drained at round
         // boundaries.
-        let mut background_children = BackgroundChildren::default();
+        let mut background_children = BackgroundChildren {
+            children: Vec::new(),
+            ownership: Some(self.ownership.clone()),
+        };
         let run_agents_semaphore = Arc::new(tokio::sync::Semaphore::new(
             self.policy.max_concurrent_agents.max(1),
         ));
@@ -382,9 +396,9 @@ impl Executor {
                 }
                 let mut settled = Vec::new();
                 let mut i = 0;
-                while i < background_children.0.len() {
-                    if background_children.0[i].handle.is_finished() {
-                        settled.push(background_children.0.remove(i));
+                while i < background_children.children.len() {
+                    if background_children.children[i].handle.is_finished() {
+                        settled.push(background_children.children.remove(i));
                     } else {
                         i += 1;
                     }
@@ -437,9 +451,9 @@ impl Executor {
         // caps, so this terminates.
         macro_rules! drain_background_children {
             ($rounds:expr) => {{
-                while !background_children.0.is_empty() {
+                while !background_children.children.is_empty() {
                     settle_finished_children!($rounds);
-                    if background_children.0.is_empty() {
+                    if background_children.children.is_empty() {
                         break;
                     }
                     tokio::select! {
@@ -909,15 +923,15 @@ impl Executor {
                 ));
             }
 
-            if calls.is_empty() && !background_children.0.is_empty() {
+            if calls.is_empty() && !background_children.children.is_empty() {
                 // V2: a quiet round while background children run is WAITING,
                 // not a stall — hold for the next settlement instead of
                 // burning closeout nudges or classifying no-progress. The
                 // settlement itself is injected at the next round top.
                 sink.append(&[assistant]).await?;
-                while !background_children.0.is_empty()
+                while !background_children.children.is_empty()
                     && !background_children
-                        .0
+                        .children
                         .iter()
                         .any(|child| child.handle.is_finished())
                     && !cancellation.is_cancelled()
@@ -1433,10 +1447,10 @@ impl Executor {
                     // wall caps), inject the settlements, and refuse this
                     // resolution once so the model integrates first.
                     if call.arguments.get("status").and_then(|v| v.as_str()) == Some("complete")
-                        && !background_children.0.is_empty()
+                        && !background_children.children.is_empty()
                     {
                         let waiting: Vec<String> = background_children
-                            .0
+                            .children
                             .iter()
                             .map(|c| format!("{} ({})", c.nickname, c.id))
                             .collect();
@@ -1884,34 +1898,25 @@ impl Executor {
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
-                // V2 parent write fence: a running background Worker owns its
-                // scope EXCLUSIVELY — including against the parent. An edit
-                // there would race the child the parent itself delegated to;
-                // integration waits for the settlement notice.
-                if self.registry.mutates_files(&call.name) && !background_children.0.is_empty() {
-                    let active_scopes: Vec<String> = background_children
-                        .0
-                        .iter()
-                        .filter(|child| child.role == AgentRole::Worker)
-                        .flat_map(|child| child.scope.iter().cloned())
-                        .collect();
-                    let inside =
-                        crate::authorization::write_targets_inside_scopes(&call, &active_scopes);
-                    if !inside.is_empty() {
-                        let owners: Vec<String> = background_children
-                            .0
-                            .iter()
-                            .filter(|child| {
-                                child.role == AgentRole::Worker
-                                    && inside.iter().any(|t| {
-                                        crate::sub_agent::scopes_overlap(
-                                            &child.scope,
-                                            std::slice::from_ref(t),
-                                        )
-                                    })
-                            })
-                            .map(|child| format!("{} ({})", child.nickname, child.id))
-                            .collect();
+                // Write-ownership fence: a live claim is EXCLUSIVE against
+                // everyone, the parent included. The registry is the one
+                // authority, so this covers a late-bound child's own
+                // claim_write_scope grant as well as a legacy Worker's
+                // pre-claim — an edit there would race the child this agent
+                // delegated to; integration waits for the settlement notice.
+                if self.registry.mutates_files(&call.name) {
+                    let owner_key = match (&self.agent_id, self.depth) {
+                        (Some(id), _) => id.clone(),
+                        (None, 0) => "parent".to_string(),
+                        (None, depth) => format!("child-depth-{depth}"),
+                    };
+                    let targets = crate::authorization::mutation_targets(&call);
+                    let hits = self.ownership.conflicts_for(&targets, &owner_key);
+                    if !hits.is_empty() {
+                        let inside: Vec<String> = hits.iter().map(|c| c.path.clone()).collect();
+                        let mut owners: Vec<String> =
+                            hits.iter().map(|c| c.owner.clone()).collect();
+                        owners.dedup();
                         let msg = format!(
                             "Edit refused: {} belongs to the exclusive scope of \
                              still-running sub-agent(s) {}. Wait for the settlement \
@@ -2696,7 +2701,7 @@ impl Executor {
                             is_error: false,
                             preview: preview(&content),
                         });
-                        background_children.0.push(BackgroundChild {
+                        background_children.children.push(BackgroundChild {
                             id,
                             nickname,
                             role,

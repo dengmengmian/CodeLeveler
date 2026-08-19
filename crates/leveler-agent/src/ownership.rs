@@ -194,16 +194,21 @@ impl OwnershipRegistry {
 
     /// Paths in `targets` owned by someone OTHER than `exclude_owner`
     /// (the parent write fence asks with `exclude_owner="parent"`).
+    ///
+    /// This DENIES on a match, so a target that cannot be proven
+    /// in-workspace by string comparison (absolute, or containing `..`) fails
+    /// CLOSED: it conflicts with every live claim rather than escaping one.
     pub fn conflicts_for(&self, targets: &[String], exclude_owner: &str) -> Vec<ClaimConflict> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         for raw in targets {
             let t = normalize(raw);
+            let unresolvable = crate::authorization::target_is_unresolvable(&t);
             for (owner, owned) in &state.claims {
                 if owner == exclude_owner {
                     continue;
                 }
-                if owned.iter().any(|o| covers(o, &t)) {
+                if unresolvable || owned.iter().any(|o| covers(o, &t)) {
                     let label = state
                         .labels
                         .get(owner)
@@ -336,6 +341,28 @@ mod tests {
         reg.release_all("a");
         assert!(reg.owned_by("a").is_empty());
         assert!(reg.try_claim("b", &v(&["src/x.rs"])).is_ok());
+    }
+
+    #[test]
+    fn an_unresolvable_target_fails_closed_against_every_live_claim() {
+        // The fence denies on a match, so `foo/../b.txt` or an absolute path
+        // must not be provable-outside by string comparison (regression of
+        // the old fence's fail-open hole, carried over with the rewrite).
+        let reg = OwnershipRegistry::new();
+        reg.register_owner("child-1", "Euclid (child-1)");
+        reg.try_claim("child-1", &v(&["src/owned.rs"])).unwrap();
+        for sneaky in ["foo/../b.txt", "/etc/passwd", "../escape.rs"] {
+            assert!(
+                !reg.conflicts_for(&v(&[sneaky]), "parent").is_empty(),
+                "{sneaky} must fail closed while any claim is live"
+            );
+        }
+        // With no live claim there is nothing to conflict with.
+        reg.release_all("child-1");
+        assert!(
+            reg.conflicts_for(&v(&["foo/../b.txt"]), "parent")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -5543,6 +5543,8 @@ struct DualChildRuntime {
     marker2: &'static str,
     delay1: Duration,
     delay2: Duration,
+    /// Delay before each PARENT response (lets children win a race on purpose).
+    parent_delay: Duration,
 }
 
 #[async_trait]
@@ -5572,7 +5574,7 @@ impl ModelRuntime for DualChildRuntime {
         } else if text.contains(self.marker1) {
             (&self.child1, self.delay1)
         } else {
-            (&self.parent, Duration::ZERO)
+            (&self.parent, self.parent_delay)
         };
         tokio::time::sleep(delay).await;
         let response =
@@ -5603,6 +5605,103 @@ impl ModelRuntime for DualChildRuntime {
     async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
         unimplemented!()
     }
+}
+
+/// Review 必改: a LATE-BOUND child claim must fence the PARENT too. The old
+/// fence only knew legacy `role="worker"` children's pre-declared `.scope`,
+/// so a Default child's registry claim left the parent free to edit the very
+/// files it had exclusively granted — while the tool description promised the
+/// opposite.
+///
+/// Deterministic shape: the child claims and then BLOCKS (its second round is
+/// slow), so the claim is provably live when the parent's edit is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_bound_child_claim_fences_the_parent() {
+    let dir = tmp("lbo-parentfence", 85);
+    std::fs::write(dir.join("b.txt"), "child-owns\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(DualChildRuntime {
+        parent: Mutex::new(VecDeque::from(vec![
+            // r1: normal background spawn — NO role, NO files (late-bound).
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({"task": "HOLDER-CHILD: own and edit b.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: parent tries to edit the file the child claimed. The parent's
+            // own round takes a model call (marker2 delay = 400ms) so the
+            // child's fast claim (5ms) is already in the registry.
+            assistant_with(
+                vec![patch_call("e1", "b.txt", "child-owns", "parent-stole")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ])),
+        child1: Mutex::new(VecDeque::from(vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Hold the claim: this round is slow, so the child is still alive
+            // (and still owning b.txt) while the parent attempts its edit.
+            assistant_text("holding my scope"),
+        ])),
+        child2: Mutex::new(VecDeque::new()),
+        marker1: "HOLDER-CHILD",
+        marker2: "NEVER-USED-MARKER",
+        delay1: Duration::from_millis(5),
+        delay2: Duration::ZERO,
+        parent_delay: Duration::from_millis(400),
+    });
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "parent and child contend",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let refusal = events.iter().find_map(|e| match e {
+        AgentEvent::ToolResult {
+            id,
+            is_error: true,
+            preview,
+            ..
+        } if id == "e1" => Some(preview.clone()),
+        _ => None,
+    });
+    assert!(
+        refusal.is_some(),
+        "the parent's edit inside a live child claim must be refused"
+    );
+    let refusal = refusal.unwrap();
+    assert!(
+        refusal.contains("exclusive scope"),
+        "the refusal must name the ownership reason: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "child-owns\n",
+        "the parent must not have written into the claimed scope"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A denied claim is a coordination result, not a child failure: the child
@@ -5664,6 +5763,7 @@ async fn a_denied_claim_does_not_kill_the_child() {
         marker2: "CLAIMER-CHILD",
         delay1: Duration::from_millis(1200),
         delay2: Duration::from_millis(30),
+        parent_delay: Duration::ZERO,
     });
     let executor = Executor::new(
         runtime,
