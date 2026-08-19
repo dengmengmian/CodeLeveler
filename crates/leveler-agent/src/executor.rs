@@ -1706,6 +1706,110 @@ impl Executor {
 }
 
 #[cfg(test)]
+mod ownership_authority_tests {
+    use super::*;
+
+    struct NullRuntime;
+
+    #[async_trait]
+    impl leveler_model::ModelRuntime for NullRuntime {
+        async fn generate(
+            &self,
+            _request: leveler_model::ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_model::ModelResponse, leveler_model::ModelError> {
+            unreachable!("write-authority resolution never queries the model")
+        }
+        async fn stream(
+            &self,
+            _request: leveler_model::ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_model::ModelEventStream, leveler_model::ModelError> {
+            unreachable!("write-authority resolution never queries the model")
+        }
+        async fn profile(
+            &self,
+            _model: &leveler_model::ModelRef,
+        ) -> Result<leveler_model::ModelProfile, leveler_model::ModelError> {
+            unreachable!("write-authority resolution never queries the model")
+        }
+    }
+
+    fn executor() -> Executor {
+        let dir = std::env::temp_dir().join(format!("leveler-lbo-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Executor::new(
+            Arc::new(NullRuntime),
+            Arc::new(leveler_tools::default_registry()),
+            ToolContext::new(
+                leveler_execution::Workspace::new(&dir).unwrap(),
+                leveler_execution::PermissionProfile::Assisted,
+            ),
+            leveler_model::ModelRef::new("mock", "m"),
+            4,
+        )
+    }
+
+    /// The write-authority fallback is the dangerous edge: `effective_write_
+    /// allowlist` returns the STATIC list when `agent_id` is None, and a
+    /// static None means UNRESTRICTED. Every child construction path stamps an
+    /// id (`sub_agent_run_future` → `with_agent_id`), so a child can never
+    /// reach that branch — this pins both halves.
+    #[test]
+    fn a_child_without_a_claim_has_an_empty_write_authority() {
+        let parent = executor();
+        // Parent (depth 0): unrestricted unless a host pinned an allowlist.
+        assert_eq!(parent.effective_write_allowlist(), None);
+
+        // A child WITH an id (the only shape the runtime builds) starts empty.
+        let child = parent
+            .child_for_role_on(AgentRole::Default, Vec::new(), None)
+            .with_agent_id("child-1");
+        assert_eq!(
+            child.effective_write_allowlist(),
+            Some(Vec::new()),
+            "an unclaimed child must hold NO write authority"
+        );
+
+        // After a claim in the SHARED registry, the authority is exactly it.
+        child
+            .ownership
+            .try_claim("child-1", &["src/a.rs".to_string()])
+            .unwrap();
+        assert_eq!(
+            child.effective_write_allowlist(),
+            Some(vec!["src/a.rs".to_string()])
+        );
+        // …and the parent sees the same truth (one registry, shared).
+        assert_eq!(
+            parent.ownership.owned_by("child-1"),
+            vec!["src/a.rs".to_string()]
+        );
+    }
+
+    /// A read-only role holds no authority regardless of registry state.
+    #[test]
+    fn a_read_only_child_never_gains_write_authority() {
+        let parent = executor();
+        for role in [AgentRole::Explorer, AgentRole::Reviewer] {
+            let child = parent
+                .child_for_role_on(role, Vec::new(), None)
+                .with_agent_id("ro-1");
+            child
+                .ownership
+                .try_claim("ro-1", &["src/a.rs".to_string()])
+                .unwrap();
+            assert_eq!(
+                child.effective_write_allowlist(),
+                Some(Vec::new()),
+                "{role:?} must stay write-less"
+            );
+            child.ownership.release_all("ro-1");
+        }
+    }
+}
+
+#[cfg(test)]
 mod recall_tests {
     use super::{RECALL_CHAR_BUDGET, RECALL_FLOOR, RECALL_K, render_recall_block};
     use leveler_memory::{MemoryEntry, MemoryStore};

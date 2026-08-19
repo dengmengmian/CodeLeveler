@@ -766,6 +766,25 @@ fn normalize_args(program: &str, mut args: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Late-bound ownership depends on this: a child that has claimed NOTHING
+    /// yet gets `Some(vec![])`, and an empty allowlist must deny every command
+    /// write (the violation path restores the snapshot), never read as "no
+    /// constraint". `None` alone means unconstrained.
+    #[test]
+    fn an_empty_command_allowlist_allows_no_path() {
+        let allow: Vec<String> = Vec::new();
+        for modified in ["src/main.rs", "a.txt", "nested/deep/file.rs"] {
+            assert!(
+                !allow.iter().any(|a| path_allows(a, modified)),
+                "{modified} must fall outside an empty allowlist"
+            );
+        }
+        // And a non-empty one still covers its own subtree.
+        let allow = vec!["src/output".to_string()];
+        assert!(path_allows(&allow[0], "src/output/json.rs"));
+        assert!(!path_allows(&allow[0], "src/input.rs"));
+    }
+
     // ── R004 F3: workspace read boundary for shell/argv (T4) ────────────────
 
     #[cfg(not(windows))]
