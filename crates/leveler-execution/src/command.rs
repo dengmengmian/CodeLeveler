@@ -366,6 +366,24 @@ fn macos_sandbox_command(
             "(deny file-read* (subpath (param \"READ_DENIED_{i}\")) (literal (param \"READ_DENIED_{i}\")))\n"
         ));
     }
+    // A confined command must be able to READ every root it may WRITE. A
+    // harness seal can overlap them — an eval launched with LEVELER_HOME
+    // under its (sealed) cwd puts the Leveler tool cache Go/npm/pip are
+    // redirected into inside a read-denied subtree, and the toolchain dies on
+    // stat ("could not create module cache: … operation not permitted",
+    // FA-2/ORC-B1 environment failure). Re-allow AFTER the denials so the
+    // last-match rule restores exactly the writable roots: the workspace, the
+    // per-command scratch, and the Leveler-owned caches. Answer keys never
+    // live in a writable root (cases/fixtures sit beside them in the sealed
+    // tree; projects_dir/config are sealed explicitly), so the seal holds.
+    // Guarded so the profile stays byte-identical when nothing is sealed.
+    if !read_denied_roots.is_empty() {
+        for i in 0..write_roots.len() {
+            policy.push_str(&format!(
+                "(allow file-read* (subpath (param \"WRITABLE_ROOT_{i}\")))\n"
+            ));
+        }
+    }
     policy.push_str("(allow file-write*");
     for i in 0..write_roots.len() {
         policy.push_str(&format!(" (subpath (param \"WRITABLE_ROOT_{i}\"))"));
@@ -2932,6 +2950,128 @@ mod tests {
             args.iter()
                 .any(|a| a == "-DREAD_DENIED_0=/Users/someone/project/evals"),
             "denied root passed as a -D param, never interpolated: {args:?}"
+        );
+    }
+
+    /// Eval Go-sandbox repair: a harness seal may overlap the roots the
+    /// sandbox itself made writable (the eval cwd containing LEVELER_HOME —
+    /// so the Leveler tool cache Go is redirected into). A confined command
+    /// must be able to READ every root it may WRITE, so the profile must
+    /// re-allow reads on the writable roots AFTER the denial block (SBPL:
+    /// last matching rule wins). Answer keys never live in a writable root.
+    #[test]
+    fn read_denials_do_not_swallow_the_sandboxes_own_writable_roots() {
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("ws");
+        let sealed = base.path().join("gate");
+        let cache = sealed.join("home/cache/tools/x/go/mod");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (_, args) = sandbox_command_with_read_denials(
+            "go",
+            &["build".into()],
+            true,
+            Some(&workspace),
+            &[],
+            Some(scratch.path()),
+            std::slice::from_ref(&cache),
+            std::slice::from_ref(&sealed.to_path_buf()),
+        );
+        let policy = &args[1];
+        let deny_at = policy
+            .find("(deny file-read* (subpath (param \"READ_DENIED_0\"))")
+            .expect("seal emitted");
+        let reallow_at = policy
+            .find("(allow file-read* (subpath (param \"WRITABLE_ROOT_")
+            .expect("writable roots must be re-allowed for reads when a seal is declared");
+        assert!(
+            reallow_at > deny_at,
+            "the re-allow only wins if it comes after the deny in SBPL: {policy}"
+        );
+    }
+
+    /// The kernel-level proof of the same repair: with a seal covering the
+    /// directory that CONTAINS the redirected Go caches (the FA-2/ORC-B1
+    /// environment shape), a confined `go build` must still work. Runs real
+    /// `sandbox-exec` + real `go`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_sealed_harness_root_does_not_break_the_confined_go_toolchain() {
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: go is not installed");
+            return;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let base_path = base.path().canonicalize().unwrap();
+        // The sealed "gate" dir contains the leveler-home-shaped cache tree,
+        // exactly like an eval launched with LEVELER_HOME under its cwd.
+        let sealed = base_path.join("gate");
+        let go_cache = sealed.join("home/cache/tools/k/go/build");
+        let go_mod = sealed.join("home/cache/tools/k/go/mod");
+        std::fs::create_dir_all(&go_cache).unwrap();
+        std::fs::create_dir_all(&go_mod).unwrap();
+        let workspace = base_path.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("go.mod"), "module sealed-smoke\n\ngo 1.22\n").unwrap();
+        std::fs::write(workspace.join("main.go"), "package main\nfunc main() {}\n").unwrap();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let tmp = scratch.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cache_roots = vec![go_cache.clone(), go_mod.clone()];
+        let (program, args) = sandbox_command_with_read_denials(
+            "go",
+            &["build".into(), "./...".into()],
+            true,
+            Some(&workspace),
+            &[],
+            Some(scratch.path()),
+            &cache_roots,
+            std::slice::from_ref(&sealed),
+        );
+        let output = std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&workspace)
+            .env("GOCACHE", &go_cache)
+            .env("GOMODCACHE", &go_mod)
+            .env("GOPATH", scratch.path().join("gopath"))
+            .env("TMPDIR", &tmp)
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .output()
+            .expect("spawn sandbox-exec go");
+        assert!(
+            output.status.success(),
+            "confined go build must survive a seal overlapping its caches:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // And the seal still holds for non-writable content beside the caches.
+        let key = sealed.join("case.yaml");
+        std::fs::write(&key, "answer").unwrap();
+        let (program, args) = sandbox_command_with_read_denials(
+            "cat",
+            &[key.display().to_string()],
+            true,
+            Some(&workspace),
+            &[],
+            Some(scratch.path()),
+            &cache_roots,
+            std::slice::from_ref(&sealed),
+        );
+        let output = std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&workspace)
+            .output()
+            .expect("spawn sandbox-exec cat");
+        assert!(
+            !output.status.success(),
+            "the answer-key seal must still hold outside the writable roots: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 
