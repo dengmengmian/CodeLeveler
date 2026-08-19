@@ -1230,6 +1230,25 @@
           ]
         }
       }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session.",
+      "type": "object",
+      "required": [
+        "observation",
+        "type"
+      ],
+      "properties": {
+        "observation": {
+          "$ref": "#/definitions/UiObservabilityLoaded"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "observability_loaded"
+          ]
+        }
+      }
     }
   ],
   "definitions": {
@@ -1349,6 +1368,23 @@
         "error"
       ]
     },
+    "ObservationClass": {
+      "description": "Presentation class for a meaningful durable event. Unknown tools map to [`Self::Tool`].",
+      "type": "string",
+      "enum": [
+        "model",
+        "read",
+        "search",
+        "edit",
+        "shell",
+        "tool",
+        "verify",
+        "agent",
+        "recovery",
+        "system",
+        "terminal"
+      ]
+    },
     "PermissionProfile": {
       "type": "string",
       "enum": [
@@ -1392,6 +1428,34 @@
           "$ref": "#/definitions/ToolCallId"
         },
         "name": {
+          "type": "string"
+        }
+      }
+    },
+    "UiAgentObservation": {
+      "description": "Durable sub-agent / reviewer observation.",
+      "type": "object",
+      "required": [
+        "id",
+        "nickname",
+        "role",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
           "type": "string"
         }
       }
@@ -1592,6 +1656,28 @@
         }
       }
     },
+    "UiEventRelation": {
+      "description": "Identity-based relation (never inferred from wall-clock proximity).",
+      "type": "object",
+      "required": [
+        "kind",
+        "label",
+        "sequence"
+      ],
+      "properties": {
+        "kind": {
+          "description": "pair_start | pair_end | same_turn | same_agent",
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
     "UiMemoryEntry": {
       "description": "Compact durable-memory row for TUI list surfaces.",
       "type": "object",
@@ -1625,6 +1711,144 @@
         },
         "text": {
           "type": "string"
+        }
+      }
+    },
+    "UiObservabilityLoaded": {
+      "description": "Bounded event window + related observation slices. Current and historical sessions use this same payload.",
+      "type": "object",
+      "required": [
+        "agents",
+        "recovery",
+        "requests",
+        "session",
+        "tools",
+        "window",
+        "window_from",
+        "window_to"
+      ],
+      "properties": {
+        "agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiAgentObservation"
+          }
+        },
+        "recovery": {
+          "$ref": "#/definitions/UiRecoveryObservation"
+        },
+        "relations": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiEventRelation"
+          }
+        },
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiRequestObservation"
+          }
+        },
+        "session": {
+          "$ref": "#/definitions/UiSessionObservation"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiToolAggregate"
+          }
+        },
+        "window": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiObservationRow"
+          }
+        },
+        "window_from": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "window_to": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "UiObservationField": {
+      "description": "One inspect key/value. Avoids tuple arrays in the JSON schema.",
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "UiObservationRow": {
+      "description": "One bounded, safe trace row.",
+      "type": "object",
+      "required": [
+        "class",
+        "created_at",
+        "event_type",
+        "sequence",
+        "status",
+        "title"
+      ],
+      "properties": {
+        "class": {
+          "$ref": "#/definitions/ObservationClass"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "event_type": {
+          "description": "Durable event type tag (`tool_call_finished`, …).",
+          "type": "string"
+        },
+        "fields": {
+          "description": "Safe inspect fields only (no raw args, no prompt, no secrets).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiObservationField"
+          }
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "description": "running | ok | fail | info",
+          "type": "string"
+        },
+        "target": {
+          "default": "",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -1719,6 +1943,101 @@
         }
       }
     },
+    "UiRecoveryObservation": {
+      "description": "Recovery facts that are already durable and safe to show.",
+      "type": "object",
+      "required": [
+        "interrupted_turns",
+        "repair_attempts",
+        "review_stages",
+        "workspace_snapshots"
+      ],
+      "properties": {
+        "interrupted_turns": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "repair_attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "review_stages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workspace_snapshots": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiRequestObservation": {
+      "description": "One durable model-request row (no prompt/body).",
+      "type": "object",
+      "required": [
+        "created_at",
+        "id",
+        "input_tokens",
+        "model",
+        "output_tokens",
+        "provider",
+        "retry_count"
+      ],
+      "properties": {
+        "created_at": {
+          "type": "string"
+        },
+        "error_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finish_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": "string"
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "provider": {
+          "type": "string"
+        },
+        "retry_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "UiRole": {
       "description": "Who authored a message.",
       "type": "string",
@@ -1728,6 +2047,139 @@
         "system",
         "tool"
       ]
+    },
+    "UiSessionObservation": {
+      "description": "Session-level observation header + aggregates from durable stores.",
+      "type": "object",
+      "required": [
+        "collaboration",
+        "compact_count",
+        "created_at",
+        "goal",
+        "input_tokens",
+        "model",
+        "output_tokens",
+        "repair_started",
+        "repository",
+        "request_count",
+        "request_failures",
+        "request_retries",
+        "session_id",
+        "status",
+        "subagent_started",
+        "tool_finished",
+        "tool_started",
+        "updated_at",
+        "verification_runs",
+        "work_profile"
+      ],
+      "properties": {
+        "avg_latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "collaboration": {
+          "type": "string"
+        },
+        "compact_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "last_latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "last_sequence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "model": {
+          "type": "string"
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "repair_started": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "repository": {
+          "type": "string"
+        },
+        "request_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "request_failures": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "request_retries": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "status": {
+          "type": "string"
+        },
+        "subagent_started": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tool_finished": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tool_started": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "verification_runs": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "work_profile": {
+          "type": "string"
+        }
+      }
     },
     "UiSessionSnapshot": {
       "description": "Everything a client needs to render a session's header and transcript.",
@@ -1936,6 +2388,65 @@
         },
         "updated_at": {
           "type": "string"
+        }
+      }
+    },
+    "UiToolAggregate": {
+      "description": "Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration.",
+      "type": "object",
+      "required": [
+        "calls",
+        "class",
+        "failed",
+        "name"
+      ],
+      "properties": {
+        "avg_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "class": {
+          "$ref": "#/definitions/ObservationClass"
+        },
+        "failed": {
+          "description": "Finished with `is_error = true`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "name": {
+          "type": "string"
+        },
+        "succeeded": {
+          "description": "Finished with `is_error = false`.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "total_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unfinished": {
+          "description": "`tool_call_started` with no matching `tool_call_finished`.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
         }
       }
     },

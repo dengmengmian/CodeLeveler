@@ -52,6 +52,12 @@ pub trait MessageStore: Send + Sync {
 pub trait ModelRequestStore: Send + Sync {
     /// Record one upstream model call.
     async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError>;
+
+    /// Durable request diagnostics for one session, oldest first.
+    async fn load_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError>;
 }
 
 /// The production SQLite adapters.
@@ -92,6 +98,15 @@ impl ModelRequestStore for Database {
     async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError> {
         crate::ModelRequestRepository::new(self)
             .insert(record)
+            .await
+    }
+
+    async fn load_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError> {
+        crate::ModelRequestRepository::new(self)
+            .load_for_session(session_id)
             .await
     }
 }
@@ -212,6 +227,20 @@ impl ModelRequestStore for MemoryModelRequestStore {
     async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError> {
         self.rows.lock().unwrap().push(record.clone());
         Ok(())
+    }
+
+    async fn load_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.session_id == *session_id)
+            .cloned()
+            .collect())
     }
 }
 

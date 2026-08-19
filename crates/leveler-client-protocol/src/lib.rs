@@ -42,6 +42,7 @@ mod command;
 mod command_envelope;
 mod event;
 mod media;
+mod observability;
 mod origin;
 mod progress;
 mod snapshot;
@@ -59,6 +60,12 @@ pub use event::{
     UiMemoryEntry, parse_runtime_event,
 };
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
+pub use observability::{
+    OBSERVABILITY_REQUESTS_MAX, OBSERVABILITY_WINDOW_MAX, ObservationClass, UiAgentObservation,
+    UiEventRelation, UiObservabilityLoaded, UiObservationField, UiObservationRow,
+    UiRecoveryObservation, UiRequestObservation, UiSessionObservation, UiToolAggregate,
+    classify_tool,
+};
 pub use origin::ClientOrigin;
 pub use progress::{
     CheckState, PlanStepStatus, UiCheck, UiCompletionReport, UiDiff, UiDiffFile, UiPlan,

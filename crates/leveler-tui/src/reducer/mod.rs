@@ -30,8 +30,25 @@ const QUIT_CONFIRM_MESSAGE: &str = "再按一次 Ctrl+C 退出";
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     match action {
         Action::Runtime(event) => {
+            let refresh = state.active_screen == Screen::Trace
+                && crate::observability::should_refresh_trace(&event);
             apply_runtime(state, event);
-            Vec::new()
+            if refresh {
+                let session_id = state
+                    .trace
+                    .loaded
+                    .as_ref()
+                    .map(|l| l.session.session_id.clone())
+                    .unwrap_or_else(|| state.session_id.clone());
+                vec![Effect::Send(ClientCommand::QueryObservability {
+                    session_id,
+                    center_seq: None,
+                    before: 0,
+                    after: 80,
+                })]
+            } else {
+                Vec::new()
+            }
         }
         Action::Resize(cols, rows) => {
             state.size = (cols, rows);

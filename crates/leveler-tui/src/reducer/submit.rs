@@ -9,7 +9,7 @@ use super::overlay_keys::{
     open_model_picker, open_theme_picker, open_unsupported_media, open_work_mode_picker,
 };
 use super::runtime_apply::start_turn;
-use super::screen_nav::{open_diff_screen, open_sessions_screen, toggle_screen};
+use super::screen_nav::{open_diff_screen, open_sessions_screen, open_trace, toggle_screen};
 
 /// Composer text changed: re-enable the slash popup and reset its highlight.
 pub(super) fn touch_slash_filter(state: &mut AppState) {
@@ -272,6 +272,10 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "goal" => run_goal(state, command),
         "btw" => run_btw(state, command),
         "tools" => toggle_screen(state, Screen::Tools),
+        "trace" => {
+            let id = command.split_whitespace().nth(1).map(str::to_string);
+            open_trace(state, id)
+        }
         // /plan = collaboration Plan mode (read-only planning).
         "plan" => apply_collab(state, "plan"),
         "work-mode" => set_work_mode(state, command),

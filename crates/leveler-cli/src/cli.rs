@@ -159,6 +159,22 @@ pub enum Command {
     #[command(subcommand)]
     Sessions(SessionsCommand),
 
+    /// Inspect durable runtime observation (EventLog + model requests).
+    Trace {
+        /// Session id (defaults to the most recently updated session).
+        session: Option<String>,
+        /// Center the event window on this sequence.
+        #[arg(long)]
+        seq: Option<i64>,
+        #[arg(long, default_value_t = 20)]
+        before: u32,
+        #[arg(long, default_value_t = 80)]
+        after: u32,
+        /// Machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run an agent task: the model uses tools to investigate and edit the repo.
     Run {
         /// The natural-language task. Omit only with `--resume`.

@@ -151,6 +151,11 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                         })];
                     }
                 }
+                KeyCode::Char('t') => {
+                    if let Some(s) = state.sessions.get(state.sessions_selected) {
+                        return open_trace(state, Some(s.id.as_str().to_string()));
+                    }
+                }
                 _ => {}
             }
         }
@@ -159,6 +164,66 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 close_screen(state);
             } else {
                 scroll_screen_key(state, &key, true);
+            }
+        }
+        Screen::Trace => {
+            use crate::observability::TraceTab;
+            match key.code {
+                KeyCode::Esc if state.trace.inspect => state.trace.inspect = false,
+                KeyCode::Esc => close_screen(state),
+                KeyCode::Left | KeyCode::BackTab => {
+                    state.trace.tab = state.trace.tab.prev();
+                    state.screen_scroll = 0;
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    state.trace.tab = state.trace.tab.next();
+                    state.screen_scroll = 0;
+                }
+                KeyCode::Char(c) if TraceTab::from_digit(c).is_some() => {
+                    state.trace.tab = TraceTab::from_digit(c).unwrap();
+                    state.screen_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => state.trace.move_sel(-1),
+                KeyCode::Down | KeyCode::Char('j') => state.trace.move_sel(1),
+                KeyCode::Enter => {
+                    state.trace.inspect = !state.trace.inspect;
+                    if let Some(row) = state.trace.selected_row() {
+                        let seq = row.sequence;
+                        let sid = state
+                            .trace
+                            .loaded
+                            .as_ref()
+                            .map(|l| l.session.session_id.clone())
+                            .unwrap_or_else(|| state.session_id.clone());
+                        return vec![Effect::Send(ClientCommand::QueryObservability {
+                            session_id: sid,
+                            center_seq: Some(seq),
+                            before: 20,
+                            after: 20,
+                        })];
+                    }
+                }
+                KeyCode::Char('f') => {
+                    state.trace.filter = state.trace.filter.next();
+                    state.trace.clamp();
+                }
+                KeyCode::Char('r') => {
+                    let sid = state
+                        .trace
+                        .loaded
+                        .as_ref()
+                        .map(|l| l.session.session_id.clone())
+                        .unwrap_or_else(|| state.session_id.clone());
+                    return vec![Effect::Send(ClientCommand::QueryObservability {
+                        session_id: sid,
+                        center_seq: None,
+                        before: 0,
+                        after: 80,
+                    })];
+                }
+                _ => {
+                    scroll_screen_key(state, &key, true);
+                }
             }
         }
         Screen::Conversation => {}
@@ -193,6 +258,23 @@ pub(super) fn open_diff_screen(state: &mut AppState) -> Vec<Effect> {
     state.diff_selected = 0;
     vec![Effect::Send(ClientCommand::RequestDiff {
         session_id: state.session_id.clone(),
+    })]
+}
+
+/// Open the observatory for `session_id` (current session when `None`).
+pub(super) fn open_trace(state: &mut AppState, session_id: Option<String>) -> Vec<Effect> {
+    let session_id = session_id
+        .map(leveler_client_protocol::SessionId::new)
+        .unwrap_or_else(|| state.session_id.clone());
+    state.active_screen = Screen::Trace;
+    state.screen_scroll = 0;
+    state.trace.inspect = false;
+    state.trace.selected = 0;
+    vec![Effect::Send(ClientCommand::QueryObservability {
+        session_id,
+        center_seq: None,
+        before: 0,
+        after: 80,
     })]
 }
 

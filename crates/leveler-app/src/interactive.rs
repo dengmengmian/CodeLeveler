@@ -1942,6 +1942,37 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::QueryObservability {
+                session_id,
+                center_seq,
+                before,
+                after,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                match crate::observability::query_observability(
+                    &db,
+                    &session_id,
+                    center_seq,
+                    before,
+                    after,
+                )
+                .await
+                {
+                    Ok(observation) => {
+                        let _ = self
+                            .events_for(&session_id)
+                            .send(RuntimeEvent::ObservabilityLoaded { observation });
+                    }
+                    Err(error) => {
+                        self.notify_error(&session_id, format!("observability: {error}"));
+                    }
+                }
+                Ok(())
+            }
             ClientCommand::Quit => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);

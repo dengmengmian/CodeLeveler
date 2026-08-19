@@ -265,6 +265,11 @@ pub enum RuntimeEvent {
         no_progress_streak: u32,
         closeout_deny_rounds: u32,
     },
+    /// Result of [`crate::ClientCommand::QueryObservability`]. Read-only
+    /// projection of durable facts for the current or a historical session.
+    ObservabilityLoaded {
+        observation: crate::UiObservabilityLoaded,
+    },
 }
 
 /// Deserialize a runtime event, treating **unknown** `type` tags as

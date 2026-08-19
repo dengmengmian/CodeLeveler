@@ -131,6 +131,68 @@ impl<'a> EventRepository<'a> {
         Ok(rows)
     }
 
+    /// Inclusive sequence window `[from_seq, to_seq]`.
+    pub async fn load_window(
+        &self,
+        session_id: &SessionId,
+        from_seq: i64,
+        to_seq: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        let rows = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND sequence >= ?2 AND sequence <= ?3 ORDER BY sequence",
+        )
+        .bind(session_id.as_str())
+        .bind(from_seq)
+        .bind(to_seq)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Per-type counts for a session.
+    pub async fn count_by_type(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT type, COUNT(*) FROM events WHERE session_id = ?1 GROUP BY type ORDER BY MIN(sequence)",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Events whose `type` is in `types`, in sequence order.
+    ///
+    /// Observatory session-wide aggregates use this so a query loads only the
+    /// relevant lifecycle rows (e.g. `tool_call_started` / `tool_call_finished`)
+    /// instead of the full session log. Not a TUI dump.
+    pub async fn load_by_types(
+        &self,
+        session_id: &SessionId,
+        types: &[&str],
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let types_json = serde_json::to_string(types)
+            .map_err(|e| StorageError::InvalidData(format!("load_by_types type list: {e}")))?;
+        let rows = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND type IN (SELECT value FROM json_each(?2)) \
+             ORDER BY sequence",
+        )
+        .bind(session_id.as_str())
+        .bind(&types_json)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
+    }
+
     /// The newest event of `event_type`, optionally scoped to one turn — an
     /// indexed single-row lookup so "latest plan/ledger/snapshot" seeding never
     /// scans the whole session log.
@@ -167,6 +229,82 @@ mod tests {
         SessionRepository::new(&db).create(&record).await.unwrap();
         let id = SessionId::new(record.id);
         (db, id)
+    }
+
+    #[tokio::test]
+    async fn load_window_is_inclusive_and_bounded() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        for i in 0..5 {
+            repo.append(
+                &session,
+                None,
+                "task_started",
+                &format!(r#"{{"i":{i}}}"#),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        }
+        let window = repo.load_window(&session, 2, 4).await.unwrap();
+        let seqs: Vec<i64> = window.iter().map(|r| r.sequence).collect();
+        assert_eq!(seqs, vec![2, 3, 4]);
+        let counts = repo.count_by_type(&session).await.unwrap();
+        assert_eq!(counts, vec![("task_started".into(), 5)]);
+    }
+
+    #[tokio::test]
+    async fn load_by_types_returns_only_requested_types_in_sequence() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        for i in 0..3 {
+            repo.append(
+                &session,
+                None,
+                "assistant_message",
+                &format!(r#"{{"i":{i}}}"#),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+            repo.append(
+                &session,
+                None,
+                "tool_call_started",
+                &format!(r#"{{"i":{i}}}"#),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+            repo.append(
+                &session,
+                None,
+                "tool_call_finished",
+                &format!(r#"{{"i":{i}}}"#),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        }
+        let rows = repo
+            .load_by_types(&session, &["tool_call_started", "tool_call_finished"])
+            .await
+            .unwrap();
+        let tags: Vec<&str> = rows.iter().map(|r| r.event_type.as_str()).collect();
+        assert_eq!(
+            tags,
+            [
+                "tool_call_started",
+                "tool_call_finished",
+                "tool_call_started",
+                "tool_call_finished",
+                "tool_call_started",
+                "tool_call_finished",
+            ]
+        );
+        let seqs: Vec<i64> = rows.iter().map(|r| r.sequence).collect();
+        assert_eq!(seqs, vec![2, 3, 5, 6, 8, 9]);
+        assert!(repo.load_by_types(&session, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

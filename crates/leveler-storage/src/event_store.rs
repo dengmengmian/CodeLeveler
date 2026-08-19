@@ -65,6 +65,74 @@ pub trait EventStore: Send + Sync {
         turn_id: Option<&TurnId>,
     ) -> Result<Option<EventRecord>, StorageError>;
 
+    /// Inclusive sequence window `[from_seq, to_seq]`, ordered by sequence.
+    /// Callers must bound the range; this is not a full-session dump.
+    ///
+    /// Default filters [`Self::load`] for test doubles. Production stores
+    /// override with a range query.
+    async fn load_window(
+        &self,
+        session_id: &SessionId,
+        from_seq: i64,
+        to_seq: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        let mut rows = self.load(session_id).await?;
+        rows.retain(|e| e.sequence >= from_seq && e.sequence <= to_seq);
+        Ok(rows)
+    }
+
+    /// Highest sequence for the session, if any events exist.
+    async fn latest_sequence(&self, session_id: &SessionId) -> Result<Option<i64>, StorageError> {
+        Ok(self
+            .load(session_id)
+            .await?
+            .into_iter()
+            .map(|e| e.sequence)
+            .max())
+    }
+
+    /// Per-type counts for overview (canonical log, no payload scan).
+    async fn count_by_type(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let rows = self.load(session_id).await?;
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for e in rows {
+            let entry = counts.entry(e.event_type.clone()).or_insert_with(|| {
+                order.push(e.event_type.clone());
+                0
+            });
+            *entry += 1;
+        }
+        Ok(order
+            .into_iter()
+            .map(|t| {
+                let n = counts[&t];
+                (t, n)
+            })
+            .collect())
+    }
+
+    /// Events whose `type` is in `types`, in sequence order.
+    ///
+    /// Used by observatory session-wide aggregates so callers do not load the
+    /// full session log. Default filters [`Self::load`]; production stores
+    /// override with an indexed type query.
+    async fn load_by_types(
+        &self,
+        session_id: &SessionId,
+        types: &[&str],
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = self.load(session_id).await?;
+        rows.retain(|e| types.iter().any(|t| e.event_type == *t));
+        Ok(rows)
+    }
+
     /// Fenced append: like `append`, but atomically guarded on `token` being
     /// the session's task's CURRENT ownership. The check and the insert are
     /// one atomic persistence step (single guarded statement in SQLite) — a
@@ -120,6 +188,38 @@ impl EventStore for Database {
     ) -> Result<Option<EventRecord>, StorageError> {
         EventRepository::new(self)
             .load_last_by_type(session_id, event_type, turn_id)
+            .await
+    }
+
+    async fn load_window(
+        &self,
+        session_id: &SessionId,
+        from_seq: i64,
+        to_seq: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        EventRepository::new(self)
+            .load_window(session_id, from_seq, to_seq)
+            .await
+    }
+
+    async fn latest_sequence(&self, session_id: &SessionId) -> Result<Option<i64>, StorageError> {
+        EventRepository::new(self).latest_sequence(session_id).await
+    }
+
+    async fn count_by_type(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        EventRepository::new(self).count_by_type(session_id).await
+    }
+
+    async fn load_by_types(
+        &self,
+        session_id: &SessionId,
+        types: &[&str],
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        EventRepository::new(self)
+            .load_by_types(session_id, types)
             .await
     }
 
@@ -335,6 +435,83 @@ impl EventStore for MemoryEventStore {
             })
             .max_by_key(|e| e.sequence)
             .cloned())
+    }
+
+    async fn load_window(
+        &self,
+        session_id: &SessionId,
+        from_seq: i64,
+        to_seq: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        let events = self.events.lock().unwrap();
+        let mut rows: Vec<EventRecord> = events
+            .iter()
+            .filter(|e| {
+                e.session_id == session_id.as_str()
+                    && e.sequence >= from_seq
+                    && e.sequence <= to_seq
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|e| e.sequence);
+        Ok(rows)
+    }
+
+    async fn latest_sequence(&self, session_id: &SessionId) -> Result<Option<i64>, StorageError> {
+        Ok(self
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.session_id == session_id.as_str())
+            .map(|e| e.sequence)
+            .max())
+    }
+
+    async fn count_by_type(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let events = self.events.lock().unwrap();
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for e in events
+            .iter()
+            .filter(|e| e.session_id == session_id.as_str())
+        {
+            let entry = counts.entry(e.event_type.clone()).or_insert_with(|| {
+                order.push(e.event_type.clone());
+                0
+            });
+            *entry += 1;
+        }
+        Ok(order
+            .into_iter()
+            .map(|t| {
+                let n = counts[&t];
+                (t, n)
+            })
+            .collect())
+    }
+
+    async fn load_by_types(
+        &self,
+        session_id: &SessionId,
+        types: &[&str],
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let events = self.events.lock().unwrap();
+        let mut rows: Vec<EventRecord> = events
+            .iter()
+            .filter(|e| {
+                e.session_id == session_id.as_str() && types.iter().any(|t| e.event_type == *t)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|e| e.sequence);
+        Ok(rows)
     }
 }
 

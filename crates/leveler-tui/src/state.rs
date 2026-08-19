@@ -104,6 +104,7 @@ pub struct AppState {
     /// The active full-screen view (Conversation by default).
     pub active_screen: Screen,
     pub tools_screen: ToolsScreenState,
+    pub trace: crate::observability::TraceView,
 
     /// Latest plan / verification / diff from the current run, if any.
     pub plan: Option<UiPlan>,
@@ -282,6 +283,7 @@ impl AppState {
             size: (80, 24),
             active_screen: Screen::default(),
             tools_screen: ToolsScreenState::default(),
+            trace: crate::observability::TraceView::default(),
             plan: None,
             project_rule_sources: Vec::new(),
             verification: None,

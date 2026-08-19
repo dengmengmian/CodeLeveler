@@ -1,9 +1,10 @@
 // 中栏时间线：文档式对话流 —— 用户消息（左侧细强调线引用块）+ Agent 正文（无卡片），
-// 不显示身份名称/头像；工具调用不平铺，全部归入底部的轻量运行摘要（AgentRunBlock）。
+// 不显示身份名称/头像；工具调用不平铺，运行摘要插在本轮问题之后、回答之前（对齐 TUI）。
 // 滚动：在底部时跟随流式输出；用户上滚后立即停止跟随，悬浮提示累计新活动条数，
 // 点击回到底部并恢复跟随；回合完成时不强制拉回，只更新提示。
 
 import { useEffect, useRef, useState } from 'react';
+import { splitAroundCurrentTurn } from '../lib/timelineLayout';
 import { useAppState, type ChatMessage } from '../state/store';
 import { AgentRunBlock } from './AgentRunBlock';
 import { ApprovalCard } from './ApprovalCard';
@@ -36,6 +37,12 @@ function AssistantTurn({ m }: { m: ChatMessage }) {
       </div>
     </div>
   );
+}
+
+function renderTurn(m: ChatMessage) {
+  if (m.btw !== undefined) return <BtwTurn key={m.id} m={m} />;
+  if (m.role === 'user') return <UserTurn key={m.id} m={m} />;
+  return <AssistantTurn key={m.id} m={m} />;
 }
 
 // 旁问侧答：独立卡片，回显问题 + 答案，标注不打断主回合。
@@ -141,20 +148,14 @@ export function Timeline() {
       ? '↓ Agent 已完成 · 查看结果'
       : '↓ 回到底部';
 
+  const { beforeRun, afterRun } = splitAroundCurrentTurn(current.messages);
+
   return (
     <div className="timeline" ref={scrollRef} onScroll={onScroll}>
       <div className="tl-inner">
-        {current.messages.map((m) =>
-          m.btw !== undefined ? (
-            <BtwTurn key={m.id} m={m} />
-          ) : m.role === 'user' ? (
-            <UserTurn key={m.id} m={m} />
-          ) : (
-            <AssistantTurn key={m.id} m={m} />
-          ),
-        )}
-
+        {beforeRun.map(renderTurn)}
         <AgentRunBlock />
+        {afterRun.map(renderTurn)}
 
         {current.pendingApprovals.map((a) => (
           <ApprovalCard key={a.id} request={a} variant="record" />

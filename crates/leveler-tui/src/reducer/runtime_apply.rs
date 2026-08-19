@@ -514,6 +514,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 message: format!("bg {task_id}: {program} started"),
             });
         }
+        RuntimeEvent::ObservabilityLoaded { observation } => {
+            state.trace.loaded = Some(observation);
+            state.trace.clamp();
+        }
         RuntimeEvent::BackgroundTaskExited {
             task_id,
             exit_code,

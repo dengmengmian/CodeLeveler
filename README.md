@@ -185,6 +185,7 @@ discard.
 | --- | --- |
 | Work interactively (TUI) | `leveler` |
 | Browser UI (same runtime) | `leveler web` |
+| Inspect a run (live or later) | TUI `/trace`, or `leveler trace [session]` |
 | Run one task | `leveler run "add validation to the order endpoint"` |
 | Resume previous work | `leveler resume <session-id>` |
 | Long task until done | TUI `/goal …`, or `leveler run "…" --collaboration goal` |

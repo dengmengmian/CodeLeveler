@@ -174,6 +174,20 @@ pub enum ClientCommand {
         session_id: SessionId,
         question: String,
     },
+    /// Read-only observatory query. Does not mutate runtime, tools, or
+    /// verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].
+    QueryObservability {
+        session_id: SessionId,
+        /// Sequence to center the event window on. `None` = latest durable seq.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        center_seq: Option<i64>,
+        /// Events strictly before the center (capped by the runtime).
+        #[serde(default)]
+        before: u32,
+        /// Events at/after the center (capped by the runtime).
+        #[serde(default)]
+        after: u32,
+    },
     /// The runtime owner is shutting down; all work should stop. Disconnecting
     /// an individual UI client must not issue this command.
     Quit,
@@ -211,7 +225,8 @@ impl ClientCommand {
             | ClientCommand::RestoreCheckpoint { session_id, .. }
             | ClientCommand::RunUserShell { session_id, .. }
             | ClientCommand::CancelUserShell { session_id, .. }
-            | ClientCommand::Btw { session_id, .. } => Some(session_id),
+            | ClientCommand::Btw { session_id, .. }
+            | ClientCommand::QueryObservability { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
                 requester_session_id,
             }
@@ -412,6 +427,19 @@ mod tests {
                 mode: PermissionProfile::FullAccess,
             },
             "set_permission_profile",
+        );
+    }
+
+    #[test]
+    fn query_observability_roundtrips() {
+        roundtrip(
+            ClientCommand::QueryObservability {
+                session_id: SessionId::new("s1"),
+                center_seq: Some(42),
+                before: 10,
+                after: 20,
+            },
+            "query_observability",
         );
     }
 

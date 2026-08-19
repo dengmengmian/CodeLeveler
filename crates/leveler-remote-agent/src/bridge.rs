@@ -583,6 +583,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::Btw { .. } => "btw",
         ClientCommand::RunUserShell { .. } => "run_user_shell",
         ClientCommand::CancelUserShell { .. } => "cancel_user_shell",
+        ClientCommand::QueryObservability { .. } => "query_observability",
         ClientCommand::Quit => "quit",
     }
 }

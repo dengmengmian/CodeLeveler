@@ -23,6 +23,7 @@ pub mod external_editor;
 pub mod i18n;
 mod layout;
 pub mod markdown;
+mod observability;
 pub mod overlay;
 mod plan_cell;
 mod presentation;

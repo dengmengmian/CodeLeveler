@@ -25,6 +25,7 @@ mod remote_invite;
 mod render;
 mod run_cmds;
 mod sessions_cmd;
+mod trace_cmd;
 mod trust_cmds;
 mod upgrade_cmd;
 
@@ -266,6 +267,13 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             ModelSubcommand::Probe { model } => cmd_model_probe(layout, &model).await,
         },
         Command::Sessions(sc) => cmd_sessions(layout, sc).await,
+        Command::Trace {
+            session,
+            seq,
+            before,
+            after,
+            json,
+        } => crate::trace_cmd::cmd_trace(layout, session, seq, before, after, json).await,
         Command::Run {
             task,
             resume,

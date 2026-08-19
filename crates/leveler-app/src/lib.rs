@@ -14,6 +14,7 @@ pub mod global_config;
 mod interactive;
 mod live_view;
 pub mod mcp_config;
+pub mod observability;
 mod parallel;
 mod prompt_bridge;
 mod runtime_identity;

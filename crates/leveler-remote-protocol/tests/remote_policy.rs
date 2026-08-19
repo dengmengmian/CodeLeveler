@@ -294,6 +294,16 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             },
             false,
         ),
+        (
+            "query_observability",
+            ClientCommand::QueryObservability {
+                session_id: session(),
+                center_seq: None,
+                before: 0,
+                after: 80,
+            },
+            false,
+        ),
         ("quit", ClientCommand::Quit, false),
     ]
 }
