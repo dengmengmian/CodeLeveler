@@ -5144,11 +5144,171 @@ async fn settlement_notices_are_appended_to_the_transcript_sink() {
         .await
         .unwrap();
     let recorded = transcript.lock().unwrap();
-    assert!(
-        recorded.iter().any(|m| {
+    let notices = recorded
+        .iter()
+        .filter(|m| {
             m.role == Role::User && m.text_content().contains("## Background sub-agent settled")
-        }),
-        "the settlement notice must be persisted to the sink when injected"
+        })
+        .count();
+    assert_eq!(
+        notices, 1,
+        "the settlement notice must be persisted to the sink when injected — exactly once \
+         (a duplicate would double-inject the child's report on resume)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Settlement × continuation seam (FA-2 / ORC-B1): a child that settles at the
+/// exit drain — the parent's window closed before it could act on the notice —
+/// must be recorded as UNCONSUMED settlement debt on the progress ledger, so
+/// the continuation layer above can tell a stranded result from a consumed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settlement_at_the_exit_drain_is_recorded_as_unconsumed_debt() {
+    let dir = tmp("bg-debt-strand", 69);
+    std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // r1: delegate; the slow child outlives the 3-round window.
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2/r3: busy observe-only rounds exhaust the window while the
+            // child still runs — it settles at the exit drain, unconsumed.
+            assistant_with(
+                vec![tool_call_part(
+                    "r1",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "r2",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(300),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        3,
+    );
+    let outcome = executor
+        .run(
+            "delegate then run out of window",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // The child's work is real and settled (drained, not aborted) …
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    // … and the ledger names it as debt the parent never got to act on.
+    assert_eq!(
+        outcome.progress.unconsumed_child_settlements, 1,
+        "a settlement the parent had no round to act on must read as unconsumed debt"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The debt resets once the parent ACTS after the settlement notice became
+/// model-visible — a consumed settlement must not read as debt (and must not
+/// buy a spurious continuation window upstream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settlement_the_parent_acts_on_is_consumed() {
+    let dir = tmp("bg-debt-consume", 70);
+    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // r1: delegate.
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: quiet — the harness waits for the settlement notice.
+            assistant_text("waiting on my delegation"),
+            // r3: informed by the notice, the parent integrates (non-observe
+            // success) — this consumes the settlement.
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "parent", "parent-integrated")],
+                FinishReason::ToolCalls,
+            ),
+            // r4: finish.
+            assistant_text("integrated the worker result"),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("scoped edit done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(150),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let outcome = executor
+        .run(
+            "delegate, then integrate the result",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "parent-integrated\n"
+    );
+    assert_eq!(
+        outcome.progress.unconsumed_child_settlements, 0,
+        "a settlement the parent acted on must not read as debt"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

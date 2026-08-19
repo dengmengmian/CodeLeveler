@@ -67,8 +67,22 @@ pub struct DefaultSupervisorPolicy {
 
 impl SupervisorPolicy for DefaultSupervisorPolicy {
     fn after_turn(&self, ended: &TurnEnded<'_>) -> Continuation {
-        // A pinned round budget means the caller owns pacing; never add turns.
-        if ended.round_budget.round_limit().is_some() {
+        // A pinned round budget means the caller owns pacing; never add turns —
+        // with ONE narrow exception (settlement × continuation seam, FA-2 /
+        // ORC-B1): a local window ceiling reached with a settled child result
+        // the parent never acted on is NOT goal exhaustion. While the pinned
+        // TOTAL budget still has rounds left, open one bounded integration
+        // window; the engine clamps that window to the remaining budget, so
+        // the total is consumed, never topped up.
+        if let Some(total) = ended.round_budget.round_limit() {
+            if ended.stop_reason == StopReason::TurnLimitReached
+                && ended.progress.unconsumed_child_settlements > 0
+                && ended.progress.cumulative_rounds < total
+                && !ended.progress.human_boundary_seen()
+                && ended.windows_without_progress < MAX_NO_PROGRESS_WINDOWS
+            {
+                return Continuation::DriveGoalAgain;
+            }
             return Continuation::Stop;
         }
         if ended.stop_reason == StopReason::Stalled
@@ -318,11 +332,110 @@ mod tests {
 
     #[test]
     fn a_pinned_budget_ceiling_never_opens_a_window() {
-        // An eval's fixed round budget owns pacing: no multi-window continuation.
+        // An eval's fixed round budget owns pacing: no multi-window continuation
+        // — when there is no orchestration debt (the common case).
         let progress = active();
         let policy = DefaultSupervisorPolicy::default();
         let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
         e.round_budget = ContinuationPolicy::bounded(5);
         assert_eq!(policy.after_turn(&e), Continuation::Stop);
+    }
+
+    // ── settlement × continuation seam (FA-2 / ORC-B1 accident) ────────────
+
+    /// A ledger shaped like the accident: the local window closed with a
+    /// settled-but-unconsumed child result and epoch rounds under the total.
+    fn debted(cumulative_rounds: u32, debt: u32) -> ProgressLedger {
+        ProgressLedger {
+            cumulative_rounds,
+            unconsumed_child_settlements: debt,
+            ..active()
+        }
+    }
+
+    #[test]
+    fn a_pinned_budget_with_unconsumed_settlement_debt_opens_an_integration_window() {
+        // THE accident regression (FA-2, ORC-B1): parent hit the 100-round
+        // local window ceiling, a child result settled unconsumed, and 180
+        // rounds of the pinned 280 total remain — the goal must get a bounded
+        // integration window, not terminalize with the result stranded.
+        let progress = debted(100, 1);
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(280);
+        assert_eq!(
+            policy.after_turn(&e),
+            Continuation::DriveGoalAgain,
+            "a settled-unconsumed child result with global budget remaining must \
+             open a bounded integration window"
+        );
+    }
+
+    #[test]
+    fn settlement_debt_cannot_manufacture_budget_past_the_pinned_total() {
+        // Negative B: global budget exhausted — debt buys nothing.
+        let progress = debted(280, 1);
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(280);
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+    }
+
+    #[test]
+    fn a_consumed_settlement_does_not_reopen_a_window() {
+        // Negative C at the policy layer: once the parent acted on the notice
+        // (debt reset to 0), a later ceiling is the ordinary pinned Stop.
+        let progress = debted(100, 0);
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(280);
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+    }
+
+    #[test]
+    fn settlement_debt_respects_the_human_boundary() {
+        let mut progress = debted(100, 1);
+        progress.record_human_denial(false, true);
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(280);
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+    }
+
+    #[test]
+    fn settlement_debt_respects_the_no_progress_window_cap() {
+        // A debt window that keeps moving nothing converges like any other.
+        let progress = debted(100, 1);
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(280);
+        e.windows_without_progress = MAX_NO_PROGRESS_WINDOWS;
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+    }
+
+    #[test]
+    fn settlement_debt_never_reopens_a_terminal_or_non_ceiling_stop() {
+        // Terminal monotonicity (negative G): only the local-window ceiling
+        // qualifies; a completed, stalled, or budget-exhausted pinned run
+        // stays terminal no matter what debt reads.
+        let progress = debted(100, 1);
+        let policy = DefaultSupervisorPolicy::default();
+        for reason in [
+            StopReason::Completed,
+            StopReason::Answered,
+            StopReason::Blocked,
+            StopReason::CloseoutForced,
+            StopReason::Stalled,
+            StopReason::BudgetExhausted,
+            StopReason::Incomplete,
+        ] {
+            let mut e = ended(reason, &progress, &[], None);
+            e.round_budget = ContinuationPolicy::bounded(280);
+            assert_eq!(
+                policy.after_turn(&e),
+                Continuation::Stop,
+                "{reason:?} must not be reopened by settlement debt"
+            );
+        }
     }
 }

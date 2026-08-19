@@ -109,6 +109,15 @@ pub struct ProgressLedger {
     /// goal epoch (MA-WA1 repair), so later windows never raise it again.
     #[serde(default)]
     pub delegation_reconsidered: bool,
+    /// Settled background-child results whose settlement notice the parent has
+    /// not acted on yet (no successful non-observe call in a round at-or-after
+    /// the notice becoming model-visible). Nonzero at a window boundary is
+    /// material orchestration debt: the continuation layer may open a bounded
+    /// follow-up window while the goal's total round budget still permits it,
+    /// instead of terminalizing with a settled child result stranded
+    /// (settlement × continuation seam — FA-2 / ORC-B1).
+    #[serde(default)]
+    pub unconsumed_child_settlements: u32,
     /// V2 background children still running when this snapshot was taken, as
     /// `id|nickname|role|scope` records. In-process children do not survive a
     /// restart: a resumed run reads this, tells the model truthfully which

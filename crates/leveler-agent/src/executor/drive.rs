@@ -2696,6 +2696,15 @@ impl Executor {
                 return Err(AgentError::Cancelled);
             }
 
+            // A successful non-observe action this round ran with every prior
+            // settlement notice already model-visible — the parent has acted
+            // on them, so the settlement debt is consumed. Reset BEFORE this
+            // boundary's settle below: a result landing right now has not been
+            // seen by any model round yet and must still read as debt.
+            if non_observe_success_this_round > 0 {
+                progress.unconsumed_child_settlements = 0;
+            }
+
             // V2: forward background children's live progress and settle any
             // that finished — the notice must be in context before the next
             // model round ("you are told when one finishes"; no polling).
@@ -3222,6 +3231,12 @@ fn fold_child_settlement(
 ) -> (String, bool) {
     // Roll sub-agent spend into the parent task epoch.
     progress.absorb_child_spend(&result.progress);
+    // Settlement × continuation seam: every settled result starts as debt the
+    // parent has not acted on. The round loop resets the counter when a round
+    // with the notice model-visible performs a successful non-observe action,
+    // so a nonzero value at a window boundary means a stranded result the
+    // continuation layer must give the parent a bounded window to integrate.
+    progress.unconsumed_child_settlements = progress.unconsumed_child_settlements.saturating_add(1);
     *commands_run = progress.cumulative_commands;
     *model_tokens_spent = progress.cumulative_model_tokens;
     *cost_spent_micros = progress.cumulative_cost_usd_micros;
