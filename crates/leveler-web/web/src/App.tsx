@@ -9,14 +9,17 @@ import { presentTurnEnd } from './lib/turn';
 import { AppProvider, useAppDispatch, useAppState, type AppState } from './state/store';
 import { BridgeProvider, useBridge } from './state/bridge';
 import { MoreMenu } from './components/Appearance';
+import { AppRail } from './components/AppRail';
 import { Composer } from './components/Composer';
 import { DiffView } from './components/DiffView';
+import { ExecutionView } from './components/ExecutionView';
 import { FileViewerProvider } from './components/FileViewer';
 import { Hero } from './components/Hero';
 import { Inspector } from './components/Inspector';
 import { LevelMeter } from './components/LevelMeter';
-import { Rail } from './components/Rail';
+import { Sidebar } from './components/Rail';
 import { Timeline } from './components/Timeline';
+import type { StageView } from './state/store';
 import type { ApprovalDecision } from './types/protocol';
 
 const APPROVAL_KEYS: Record<string, ApprovalDecision> = {
@@ -38,7 +41,7 @@ function Shell() {
   stateRef.current = state;
   const [bridge] = useState(() => new RuntimeBridge(dispatch, () => stateRef.current));
   const view = state.stageView;
-  const setView = (v: 'chat' | 'diff') => dispatch({ type: 'stage_view', view: v });
+  const setView = (v: StageView) => dispatch({ type: 'stage_view', view: v });
 
   useEffect(() => {
     if (window.matchMedia('(max-width: 1279px)').matches) {
@@ -117,7 +120,6 @@ function Shell() {
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [bridge, dispatch]);
 
-  const title = state.current?.title ?? '新对话';
   const current = state.current;
   const project = repoShortName(current?.repository ?? state.repository);
   const branch = current?.branch ?? null;
@@ -126,9 +128,10 @@ function Shell() {
     <BridgeProvider value={bridge}>
       <FileViewerProvider>
         <div
-          className={`deck${state.railOpen ? '' : ' rail-off'}${state.inspectorOpen ? '' : ' insp-off'}`}
+          className={`deck${state.railOpen ? '' : ' sidebar-off'}${state.inspectorOpen ? '' : ' insp-off'}`}
         >
-          <Rail />
+          <AppRail />
+          <Sidebar />
           <main className="stage">
             <header className="stage-head">
               <button
@@ -143,26 +146,9 @@ function Shell() {
               <span className="sh-identity">
                 <span className="sh-proj">{project}</span>
                 {branch && <span className="sh-branch">{branch}</span>}
-                <span className="sh-title">{title}</span>
               </span>
-              <span className="view-tabs">
-                <button
-                  type="button"
-                  className={`view-tab${view === 'chat' ? ' on' : ''}`}
-                  onClick={() => setView('chat')}
-                >
-                  对话
-                </button>
-                <button
-                  type="button"
-                  className={`view-tab${view === 'diff' ? ' on' : ''}`}
-                  onClick={() => setView('diff')}
-                >
-                  改动
-                </button>
-              </span>
-              <RunStatus />
               <span className="sh-right">
+                <RunStatus />
                 <LevelMeter />
                 <MoreMenu />
                 <button
@@ -176,7 +162,38 @@ function Shell() {
                 </button>
               </span>
             </header>
-            {view === 'diff' && !state.draft ? (
+            <div className="ws-tabs" role="tablist" aria-label="Workspace">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'chat'}
+                className={`ws-tab${view === 'chat' ? ' on' : ''}`}
+                onClick={() => setView('chat')}
+              >
+                Conversation
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'diff'}
+                className={`ws-tab${view === 'diff' ? ' on' : ''}`}
+                onClick={() => setView('diff')}
+              >
+                Changes
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'execution'}
+                className={`ws-tab${view === 'execution' ? ' on' : ''}`}
+                onClick={() => setView('execution')}
+              >
+                Execution
+              </button>
+            </div>
+            {view === 'execution' ? (
+              <ExecutionView />
+            ) : view === 'diff' && !state.draft ? (
               <DiffView />
             ) : state.draft ? (
               <Hero />

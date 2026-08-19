@@ -5,8 +5,10 @@
 import { useEffect, useState } from 'react';
 import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
 import { useBridge } from '../state/bridge';
-import { formatElapsed, formatTokens } from '../lib/format';
+import { completionTruth, trustLabel } from '../lib/completionTruth';
+import { formatElapsed } from '../lib/format';
 import { currentPlanProgress, inspectorMode } from '../lib/inspectorModel';
+import { projectObservability } from '../lib/observabilityView';
 import { presentTurnEnd } from '../lib/turn';
 import type { CheckState, UiApprovalRequest, UiClarificationRequest } from '../types/protocol';
 
@@ -251,6 +253,8 @@ function TaskTab({ current }: { current: SessionView | null }) {
         {current.pendingClarifications.map((c) => (
           <ClarificationActions key={c.id} request={c} />
         ))}
+        <ResultSection current={current} />
+        <RuntimeSection />
         <ChangesJump current={current} />
       </>
     );
@@ -284,12 +288,10 @@ function TaskTab({ current }: { current: SessionView | null }) {
             </div>
           </>
         )}
+        <ResultSection current={current} />
+        <RuntimeSection />
         <div className="insp-sec">Changes</div>
         <ChangesJump current={current} />
-        <details className="insp-more">
-          <summary>更多</summary>
-          <MetaFooter current={current} />
-        </details>
       </>
     );
   }
@@ -323,14 +325,10 @@ function TaskTab({ current }: { current: SessionView | null }) {
             </div>
           </>
         )}
+        <ResultSection current={current} />
+        <RuntimeSection />
         <div className="insp-sec">Changes</div>
         <ChangesJump current={current} />
-        {p.detail && (
-          <>
-            <div className="insp-sec">Outcome</div>
-            <div className="t-detail">{p.detail}</div>
-          </>
-        )}
       </>
     );
   }
@@ -344,31 +342,76 @@ function TaskTab({ current }: { current: SessionView | null }) {
           空闲
         </div>
       </div>
+      <ResultSection current={current} />
+      <RuntimeSection />
       <ChangesJump current={current} />
     </>
   );
 }
 
-function MetaFooter({ current }: { current: SessionView }) {
-  const toolAgg = new Map<string, number>();
-  for (const t of current.tools) {
-    toolAgg.set(t.name, (toolAgg.get(t.name) ?? 0) + 1);
-  }
+function ResultSection({ current }: { current: SessionView }) {
+  const truth = completionTruth(current);
+  if (!truth || truth.kind === 'idle') return null;
   return (
-    <div className="tool-agg">
-      {[...toolAgg.entries()].map(([name, cnt]) => (
-        <div className="row" key={name}>
-          <span>{name}</span>
-          <span className="cnt">× {cnt}</span>
+    <>
+      <div className="insp-sec">Result</div>
+      <dl className="kv runtime-kv">
+        <dt>Status</dt>
+        <dd>
+          {truth.glyph} {truth.title}
+        </dd>
+        <dt>Trust</dt>
+        <dd>{trustLabel(truth.trust)}</dd>
+        <dt>Artifacts</dt>
+        <dd>
+          {truth.artifacts.files} files
+          {truth.artifacts.files > 0
+            ? `  +${truth.artifacts.added} −${truth.artifacts.removed}`
+            : ''}
+        </dd>
+      </dl>
+      {truth.facts.map((f) => (
+        <div className="t-detail" key={f}>
+          {f}
         </div>
       ))}
-      <div className="row" style={{ marginTop: 6 }}>
-        <span>tokens</span>
-        <span className="cnt">
-          {formatTokens(current.tokens.input)} / {formatTokens(current.tokens.output)}
-        </span>
-      </div>
-    </div>
+      {truth.recoveryHint && <div className="t-detail">{truth.recoveryHint}</div>}
+    </>
+  );
+}
+
+/** Session-wide runtime facts from QueryObservability — never SessionView.tools. */
+function RuntimeSection() {
+  const { observation, observationStatus } = useAppState();
+  if (observationStatus === 'loading' && !observation) {
+    return (
+      <>
+        <div className="insp-sec">Runtime</div>
+        <div className="insp-empty">查询中…</div>
+      </>
+    );
+  }
+  if (!observation) return null;
+  const { summary } = projectObservability(observation);
+  return (
+    <>
+      <div className="insp-sec">Runtime</div>
+      <dl className="kv runtime-kv">
+        <dt>Model</dt>
+        <dd>{summary.model || '—'}</dd>
+        <dt>Duration</dt>
+        <dd>{summary.durationMs != null ? formatElapsed(Math.round(summary.durationMs / 1000)) : '—'}</dd>
+        <dt>Requests</dt>
+        <dd>{summary.requestCount}</dd>
+        <dt>Tools</dt>
+        <dd>
+          {summary.toolStarted}
+          {summary.toolFinished !== summary.toolStarted ? ` · finished ${summary.toolFinished}` : ''}
+        </dd>
+        <dt>Verification</dt>
+        <dd>{summary.verificationRuns > 0 ? `×${summary.verificationRuns}` : '—'}</dd>
+      </dl>
+    </>
   );
 }
 

@@ -59,7 +59,71 @@ describe('chrome / diff focus', () => {
     const state = stateWithSession();
     reducer(state, { type: 'focus_diff', path: 'src/auth.rs' });
     expect(state.stageView).toBe('diff');
+    expect(state.railNav).toBe('changes');
     expect(state.diffFocus).toBe('src/auth.rs');
+  });
+
+  it('rail activity only switches the execution workspace slot', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'set_rail_nav', nav: 'activity' });
+    expect(state.railNav).toBe('activity');
+    expect(state.stageView).toBe('execution');
+  });
+
+  it('sessions rail does not steal the workspace surface', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'stage_view', view: 'diff' });
+    reducer(state, { type: 'set_rail_nav', nav: 'sessions' });
+    expect(state.railNav).toBe('sessions');
+    expect(state.stageView).toBe('diff');
+  });
+
+  it('execution workspace tab is a placeholder stage, not a protocol query', () => {
+    const state = structuredClone(initialState);
+    reducer(state, { type: 'stage_view', view: 'execution' });
+    expect(state.stageView).toBe('execution');
+    expect(state.railNav).toBe('activity');
+  });
+
+  it('stores QueryObservability payload off SessionView.tools', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: {
+        agents: [],
+        recovery: { interrupted_turns: 0, repair_attempts: 0, workspace_snapshots: 0, review_stages: [] },
+        requests: [],
+        tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
+        window: [],
+        window_from: 1,
+        window_to: 2,
+        session: {
+          session_id: 's1',
+          goal: 'fix auth',
+          repository: '/repo',
+          created_at: 't',
+          updated_at: 't',
+          status: 'completed',
+          model: 'deepseek/v4',
+          work_profile: 'balanced',
+          collaboration: 'chat',
+          request_count: 3,
+          input_tokens: 10,
+          output_tokens: 2,
+          request_failures: 0,
+          request_retries: 0,
+          tool_started: 21,
+          tool_finished: 21,
+          verification_runs: 1,
+          compact_count: 0,
+          subagent_started: 0,
+          repair_started: 0,
+        },
+      },
+    });
+    expect(state.observation?.session.tool_started).toBe(21);
+    expect(state.observation?.tools[0]?.calls).toBe(40);
+    expect(state.current?.tools).toEqual([]);
   });
 
   it('toggle_inspector flips the drawer', () => {

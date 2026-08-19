@@ -4,6 +4,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useAppDispatch, useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
+import { completionTruth, trustLabel } from '../lib/completionTruth';
+import { groupChangeFiles } from '../lib/changeFiles';
 import {
   nextPath,
   numberPatch,
@@ -11,6 +13,7 @@ import {
   shouldCollapsePatch,
   type PatchLine,
 } from '../lib/diffWorkspace';
+import type { UiDiffFile } from '../types/protocol';
 
 export function DiffView() {
   const current = useAppState().current;
@@ -27,6 +30,8 @@ export function DiffView() {
   const paths = files.map((f) => f.path);
   const selected = (focus && paths.includes(focus) ? focus : null) ?? paths[0] ?? null;
   const file = files.find((f) => f.path === selected) ?? null;
+  const grouped = groupChangeFiles(files);
+  const truth = completionTruth(current);
   const totalAdd = files.reduce((n, f) => n + f.added, 0);
   const totalDel = files.reduce((n, f) => n + f.removed, 0);
 
@@ -48,6 +53,12 @@ export function DiffView() {
           <span className="add">+{totalAdd}</span>
           <span className="del">−{totalDel}</span>
         </span>
+        {truth && (
+          <span className={`ch-truth tone-${truth.tone}`}>
+            {truth.glyph} {truth.title}
+            <span className="ch-trust">{trustLabel(truth.trust)}</span>
+          </span>
+        )}
         <span className="dv-nav">
           <button
             type="button"
@@ -75,20 +86,9 @@ export function DiffView() {
       ) : (
         <div className="dv-split">
           <nav className="dv-files" aria-label="Changed files">
-            {files.map((f) => (
-              <button
-                key={f.path}
-                type="button"
-                className={`dv-file-item${f.path === selected ? ' on' : ''}`}
-                onClick={() => select(f.path)}
-              >
-                <span className="p">{f.path}</span>
-                <span className="nums">
-                  <span className="add">+{f.added}</span>
-                  <span className="del">−{f.removed}</span>
-                </span>
-              </button>
-            ))}
+            <FileGroup title="Modified" files={grouped.modified} selected={selected} onSelect={select} />
+            <FileGroup title="Added" files={grouped.added} selected={selected} onSelect={select} />
+            <FileGroup title="Deleted" files={grouped.deleted} selected={selected} onSelect={select} />
           </nav>
           <section className="dv-pane">
             {file && (
@@ -108,7 +108,69 @@ export function DiffView() {
           </section>
         </div>
       )}
+      {truth && <ChangesFooter truth={truth} />}
     </div>
+  );
+}
+
+function FileGroup({
+  title,
+  files,
+  selected,
+  onSelect,
+}: {
+  title: string;
+  files: UiDiffFile[];
+  selected: string | null;
+  onSelect: (path: string) => void;
+}) {
+  if (files.length === 0) return null;
+  return (
+    <div className="dv-group">
+      <div className="dv-group-h">
+        {title} · {files.length}
+      </div>
+      {files.map((f) => (
+        <button
+          key={f.path}
+          type="button"
+          className={`dv-file-item${f.path === selected ? ' on' : ''}`}
+          onClick={() => onSelect(f.path)}
+        >
+          <span className="p">{f.path}</span>
+          <span className="nums">
+            <span className="add">+{f.added}</span>
+            <span className="del">−{f.removed}</span>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ChangesFooter({ truth }: { truth: NonNullable<ReturnType<typeof completionTruth>> }) {
+  const dispatch = useAppDispatch();
+  const bridge = useBridge();
+  return (
+    <footer className="ch-foot">
+      <div className="ch-facts">
+        {truth.facts.map((f) => (
+          <span key={f}>{f}</span>
+        ))}
+      </div>
+      <div className="ch-acts">
+        {truth.pending !== 'none' && (
+          <button type="button" className="dv-refresh" onClick={() => dispatch({ type: 'set_inspector', open: true })}>
+            在任务面板处理
+          </button>
+        )}
+        {truth.recoveryHint && (
+          <button type="button" className="dv-refresh" onClick={() => bridge.rerunLast()}>
+            {truth.recoveryHint}
+          </button>
+        )}
+      </div>
+    </footer>
   );
 }
 

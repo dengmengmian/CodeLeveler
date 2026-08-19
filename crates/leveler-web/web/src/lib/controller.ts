@@ -6,6 +6,7 @@ import type { Dispatch } from 'react';
 import * as api from './api';
 import { formatClock, modelRefString } from './format';
 import { getToken } from './token';
+import { shouldRefreshObservability } from './observabilityView';
 import { commandProgressLabel, turnEndFromEvent, turnProgressLabel } from './turn';
 import { deliverFrame, WsClient } from './ws';
 import type { Action, AppState } from '../state/store';
@@ -84,8 +85,21 @@ export class RuntimeBridge {
     }
   }
 
+  queryObservability(sessionId?: SessionId): void {
+    const id = sessionId ?? this.getState().current?.id;
+    if (!id) return;
+    this.dispatch({ type: 'observation_loading' });
+    this.deliver({
+      type: 'query_observability',
+      session_id: id,
+      before: 0,
+      after: 80,
+    });
+  }
+
   private applySnapshot(snap: UiSessionSnapshot, contextWindow?: number | null): void {
     const { current, draft } = this.getState();
+    const previousId = current?.id;
     // 广播流里可能夹带别会话的 session_opened/updated：只接收当前会话的整量；
     // 例外一是 selectSession 后等待目标会话 snapshot 的窗口期；
     // 例外二是 `/clear`：宿主刚建的新会话 id 与当前不同，正是要切过去的那个。
@@ -103,6 +117,9 @@ export class RuntimeBridge {
     }
     this.pendingSessionId = null;
     this.dispatch({ type: 'snapshot', session: snap, contextWindow });
+    if (previousId !== snap.id || this.getState().observation === null) {
+      this.queryObservability(snap.id);
+    }
     // 整量落地后若回合空闲，补发排队消息
     this.flushQueue();
   }
@@ -306,10 +323,17 @@ export class RuntimeBridge {
           message: `上下文预算已扩张 ${ev.from_tokens} → ${ev.to_tokens} tokens`,
         });
         break;
+      case 'observability_loaded':
+        this.dispatch({ type: 'observation_loaded', observation: ev.observation });
+        break;
       default:
         // user_shell_*（web 无 !command 入口，本期不渲染）/ project_rules_loaded /
         // 未知（更新的 runtime 新增的）事件：忽略不崩。
         break;
+    }
+
+    if (ev.type !== 'observability_loaded' && shouldRefreshObservability(ev)) {
+      this.queryObservability(current.id);
     }
 
     const end = turnEndFromEvent(ev);

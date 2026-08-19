@@ -23,6 +23,7 @@ import type {
   UiMemoryEntry,
   UiPlan,
   UiRole,
+  UiObservabilityLoaded,
   UiSessionSnapshot,
   UiSessionSummary,
   UiVerification,
@@ -156,7 +157,14 @@ export interface SessionView {
 
 export type ConnectionStatus = 'connecting' | 'online';
 
-export type StageView = 'chat' | 'diff';
+/** Central workspace surface. `execution` is a Phase 1 slot only (no observatory). */
+export type StageView = 'chat' | 'diff' | 'execution';
+
+/** 48px application rail. Lists live in the context sidebar. */
+export type RailNav = 'sessions' | 'workspace' | 'search' | 'changes' | 'activity' | 'settings';
+
+/** Sections inside the Workspace sidebar. Symbols/Environment have no extra API. */
+export type WorkspaceSection = 'files' | 'symbols' | 'repository' | 'environment';
 
 export interface AppState {
   connection: ConnectionStatus;
@@ -166,8 +174,12 @@ export interface AppState {
   draft: boolean;
   /** 当前 runtime 的仓库路径（分组回退值 + hero 项目选择器） */
   repository: string;
-  /** 中央主区域视图（对话 / 改动）；Inspector 任务 tab 的改动摘要可切过来 */
+  /** 中央主区域视图（对话 / 改动 / Execution 占位） */
   stageView: StageView;
+  /** First-level icon rail. */
+  railNav: RailNav;
+  /** Workspace sidebar subsection. */
+  workspaceSection: WorkspaceSection;
   queue: QueuedMessage[];
   notice: string | null;
   /** 已上传、待随下一条消息提交的附件 */
@@ -180,8 +192,12 @@ export interface AppState {
   composerSeed: string | null;
   /** Diff 工作区当前聚焦的文件；null = 用列表第一项 */
   diffFocus: string | null;
+  /** Context sidebar open. The 48px icon rail stays visible. */
   railOpen: boolean;
   inspectorOpen: boolean;
+  /** Durable observatory payload (QueryObservability). Not live SessionView.tools. */
+  observation: UiObservabilityLoaded | null;
+  observationStatus: 'idle' | 'loading' | 'ready' | 'error';
 }
 
 export const initialState: AppState = {
@@ -191,6 +207,8 @@ export const initialState: AppState = {
   draft: true,
   repository: '',
   stageView: 'chat',
+  railNav: 'sessions',
+  workspaceSection: 'files',
   queue: [],
   notice: null,
   pendingAttachments: [],
@@ -200,6 +218,8 @@ export const initialState: AppState = {
   diffFocus: null,
   railOpen: true,
   inspectorOpen: true,
+  observation: null,
+  observationStatus: 'idle',
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -211,10 +231,14 @@ export type Action =
   | { type: 'select_session'; id: SessionId }
   | { type: 'new_draft'; project?: string | null }
   | { type: 'stage_view'; view: StageView }
+  | { type: 'set_rail_nav'; nav: RailNav }
+  | { type: 'set_workspace_section'; section: WorkspaceSection }
   | { type: 'focus_diff'; path: string | null }
   | { type: 'toggle_rail' }
   | { type: 'toggle_inspector' }
   | { type: 'set_inspector'; open: boolean }
+  | { type: 'observation_loading' }
+  | { type: 'observation_loaded'; observation: UiObservabilityLoaded }
   | { type: 'user_message'; id: string; text: string; time: string }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
@@ -387,18 +411,33 @@ export function reducer(state: AppState, action: Action): void {
       if (state.current?.id !== action.id) {
         state.current = null; // 等 snapshot
         state.diffFocus = null;
+        state.observation = null;
+        state.observationStatus = 'idle';
       }
       return;
     case 'new_draft':
       state.draft = true;
       state.current = null;
       state.draftProject = action.project ?? null;
+      state.observation = null;
+      state.observationStatus = 'idle';
       return;
     case 'stage_view':
       state.stageView = action.view;
+      if (action.view === 'diff') state.railNav = 'changes';
+      if (action.view === 'execution') state.railNav = 'activity';
+      return;
+    case 'set_rail_nav':
+      state.railNav = action.nav;
+      if (action.nav === 'changes') state.stageView = 'diff';
+      if (action.nav === 'activity') state.stageView = 'execution';
+      return;
+    case 'set_workspace_section':
+      state.workspaceSection = action.section;
       return;
     case 'focus_diff':
       state.stageView = 'diff';
+      state.railNav = 'changes';
       state.diffFocus = action.path;
       return;
     case 'toggle_rail':
@@ -409,6 +448,16 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'set_inspector':
       state.inspectorOpen = action.open;
+      return;
+    case 'observation_loading':
+      state.observationStatus = 'loading';
+      return;
+    case 'observation_loaded':
+      if (state.current && action.observation.session.session_id !== state.current.id) {
+        return;
+      }
+      state.observation = action.observation;
+      state.observationStatus = 'ready';
       return;
     case 'user_message': {
       if (!state.current) return;

@@ -1,16 +1,16 @@
-// 左栏：项目工作台导航。顶部品牌 + 新对话入口；面板切换：
-// 会话（按仓库分组的会话列表）/ 文件（仓库文件树，前缀过滤）/
-// 搜索（内容搜索）/ Git（工作区改动）。数据走 REST，按当前会话定位仓库；
-// 底部 daemon 连接状态。
+// Context sidebar: lists for the current Application Rail item.
+// Sessions / Files / Search / Git 数据走 REST。不接 Observability。
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useAppState } from '../state/store';
+import { useAppDispatch, useAppState, type WorkspaceSection } from '../state/store';
 import { useBridge } from '../state/bridge';
-import { BrandMark } from './BrandMark';
+import { AppearancePanel } from './Appearance';
 import { ProjectPicker } from './ProjectPicker';
 import { useOpenFile } from './FileViewer';
 import { gitStatus, listFiles, searchFiles, type GitStatus, type SearchMatch } from '../lib/api';
-import { formatRelative, repoShortName, statusDot } from '../lib/format';
+import { formatDuration, formatRelative, repoShortName, statusDot } from '../lib/format';
+import { projectObservability } from '../lib/observabilityView';
+import { groupByDay } from '../lib/sessionDay';
 import type { UiSessionSummary } from '../types/protocol';
 
 interface ProjectGroup {
@@ -18,65 +18,109 @@ interface ProjectGroup {
   sessions: UiSessionSummary[];
 }
 
-type Panel = 'sessions' | 'files' | 'search' | 'git';
-
-const WORKSPACE: ReadonlyArray<readonly [Exclude<Panel, 'sessions'>, string]> = [
-  ['files', 'Files'],
-  ['search', 'Search'],
-  ['git', 'Git'],
+const WORKSPACE_SECTIONS: ReadonlyArray<{ id: WorkspaceSection; label: string }> = [
+  { id: 'files', label: 'Files' },
+  { id: 'symbols', label: 'Symbols' },
+  { id: 'repository', label: 'Repository' },
+  { id: 'environment', label: 'Environment' },
 ];
 
-export function Rail() {
+export function Sidebar() {
   const state = useAppState();
-  const bridge = useBridge();
-  const [panel, setPanel] = useState<Panel>('sessions');
+  const dispatch = useAppDispatch();
 
   return (
-    <aside className={`rail${state.railOpen ? '' : ' is-hidden'}`} aria-label="项目与会话">
-      <div className="brand" title={`CodeLeveler web · v${__APP_VERSION__}`}>
-        <BrandMark />
-        <div className="name">CodeLeveler</div>
-      </div>
-
-      <button type="button" className="rail-new" onClick={() => bridge.newDraft()}>
-        ＋ 新对话
-      </button>
-
-      {panel === 'sessions' && <SessionsPanel />}
-      {panel === 'files' && <FilesPanel />}
-      {panel === 'search' && <SearchPanel />}
-      {panel === 'git' && <GitPanel />}
-
-      <div className="rail-workspace">
-        <div className="rail-ws-label">Workspace</div>
-        <div className="rail-ws-row">
-          <button
-            type="button"
-            className={`rail-tab${panel === 'sessions' ? ' on' : ''}`}
-            onClick={() => setPanel('sessions')}
-          >
-            Sessions
-          </button>
-          {WORKSPACE.map(([key, label]) => (
-            <button
-              key={key}
-              type="button"
-              className={`rail-tab${panel === key ? ' on' : ''}`}
-              onClick={() => setPanel(key)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="rail-foot">
-        <span className={`led${state.connection === 'online' ? '' : ' off'}`} />
-        <span>
-          Daemon · {state.connection === 'online' ? '已连接' : '重连中'}
-        </span>
-      </div>
+    <aside className={`sidebar${state.railOpen ? '' : ' is-hidden'}`} aria-label="Context">
+      {state.railNav === 'sessions' && <SessionsPanel />}
+      {state.railNav === 'workspace' && (
+        <>
+          <div className="sidebar-head">Workspace</div>
+          <div className="ws-sec">
+            {WORKSPACE_SECTIONS.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                className={`ws-sec-btn${state.workspaceSection === s.id ? ' on' : ''}`}
+                onClick={() => dispatch({ type: 'set_workspace_section', section: s.id })}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+          {state.workspaceSection === 'files' && <FilesPanel />}
+          {state.workspaceSection === 'symbols' && (
+            <div className="rail-empty">符号索引本阶段不新增 API。</div>
+          )}
+          {state.workspaceSection === 'repository' && <GitPanel />}
+          {state.workspaceSection === 'environment' && (
+            <div className="rail-panel">
+              <div className="rp-bar">
+                <span className={`led${state.connection === 'online' ? '' : ' off'}`} />
+                <span className="rp-branch">
+                  Daemon · {state.connection === 'online' ? '已连接' : '重连中'}
+                </span>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+      {state.railNav === 'search' && (
+        <>
+          <div className="sidebar-head">Search</div>
+          <SearchPanel />
+        </>
+      )}
+      {state.railNav === 'changes' && (
+        <>
+          <div className="sidebar-head">Changes</div>
+          <GitPanel />
+        </>
+      )}
+      {state.railNav === 'activity' && (
+        <>
+          <div className="sidebar-head">Activity</div>
+          <ActivityPanel />
+        </>
+      )}
+      {state.railNav === 'settings' && (
+        <>
+          <div className="sidebar-head">Settings</div>
+          <AppearancePanel />
+        </>
+      )}
     </aside>
+  );
+}
+
+function ActivityPanel() {
+  const { observation, observationStatus } = useAppState();
+  if (observationStatus === 'loading' && !observation) {
+    return <div className="rail-empty">查询 Runtime…</div>;
+  }
+  if (!observation) {
+    return <div className="rail-empty">尚无 durable Activity。打开 Execution 或等待查询完成。</div>;
+  }
+  const { summary, tools } = projectObservability(observation);
+  return (
+    <div className="rail-panel">
+      <dl className="kv runtime-kv">
+        <dt>Tools</dt>
+        <dd>{summary.toolStarted}</dd>
+        <dt>Requests</dt>
+        <dd>{summary.requestCount}</dd>
+        <dt>Verify</dt>
+        <dd>{summary.verificationRuns}</dd>
+      </dl>
+      {tools.map((t) => (
+        <div className="row tool-agg-row" key={t.name}>
+          <span>{t.name}</span>
+          <span className="cnt">
+            {t.calls}
+            {t.avg_ms != null ? ` · ${formatDuration(t.avg_ms)}` : ''}
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -164,8 +208,11 @@ function SessionsPanel() {
   return (
     <div className="sessions">
       {picking && <ProjectPicker onClose={() => setPicking(false)} />}
+      <button type="button" className="rail-new" onClick={() => bridge.newDraft()}>
+        ＋ New Task
+      </button>
       <div className="rail-head">
-        <span>项目</span>
+        <span>Sessions</span>
         <button className="p-open" title="打开项目（浏览并选择一个仓库目录）" onClick={() => setPicking(true)}>
           ＋ 打开项目
         </button>
@@ -174,7 +221,7 @@ function SessionsPanel() {
         <div className="rail-empty">
           还没有会话。
           <br />
-          点击「＋ 新对话」或在下方输入开始。
+          点击「＋ New Task」或在下方输入开始。
         </div>
       )}
       {groups.map((g) => {
@@ -240,42 +287,46 @@ function SessionsPanel() {
                   {status === 'offline' ? 'daemon 离线 —— 点 ⟳ 重启后加载会话' : '暂无会话'}
                 </div>
               )}
-              {(expandedSessions.has(g.repository)
-                ? g.sessions
-                : g.sessions.slice(0, SESSION_PREVIEW_COUNT)
-              ).map((s) => {
-                const dot = statusDot(s.status);
-                return (
-                  // 单行紧凑式：标题 + 右侧相对时间;状态点只在「运行中/等待
-                  // 输入」时出现,完成态不再各占一行刷 COMPLETED 噪声。
-                  <button
-                    key={s.id}
-                    className={`sess${state.current?.id === s.id ? ' active' : ''}`}
-                    onClick={() => bridge.selectSession(s.id)}
-                    title={`${dot.label} · ${formatRelative(s.updated_at)}`}
-                  >
-                    {dot.cls !== 'idle' && <i className={`dot ${dot.cls}`} />}
-                    {renamingSession === s.id ? (
-                      <RenameInput
-                        initial={s.goal}
-                        onSubmit={(value) => {
-                          setRenamingSession(null);
-                          bridge.renameSession(s.id, value);
-                        }}
-                        onCancel={() => setRenamingSession(null)}
-                      />
-                    ) : (
-                      <span className="t">{s.goal || '未命名会话'}</span>
-                    )}
-                    <span className="ago">{formatRelative(s.updated_at)}</span>
-                    <SessionMenu
-                      id={s.id}
-                      title={s.goal}
-                      onRename={() => setRenamingSession(s.id)}
-                    />
-                  </button>
-                );
-              })}
+              {groupByDay(
+                expandedSessions.has(g.repository)
+                  ? g.sessions
+                  : g.sessions.slice(0, SESSION_PREVIEW_COUNT),
+              ).map((day) => (
+                <div key={day.bucket} className="sess-day">
+                  <div className="sess-day-label">{day.label}</div>
+                  {day.items.map((s) => {
+                    const dot = statusDot(s.status);
+                    return (
+                      <button
+                        key={s.id}
+                        className={`sess${state.current?.id === s.id ? ' active' : ''}`}
+                        onClick={() => bridge.selectSession(s.id)}
+                        title={`${dot.label} · ${formatRelative(s.updated_at)}`}
+                      >
+                        {dot.cls !== 'idle' && <i className={`dot ${dot.cls}`} />}
+                        {renamingSession === s.id ? (
+                          <RenameInput
+                            initial={s.goal}
+                            onSubmit={(value) => {
+                              setRenamingSession(null);
+                              bridge.renameSession(s.id, value);
+                            }}
+                            onCancel={() => setRenamingSession(null)}
+                          />
+                        ) : (
+                          <span className="t">{s.goal || '未命名会话'}</span>
+                        )}
+                        <span className="ago">{formatRelative(s.updated_at)}</span>
+                        <SessionMenu
+                          id={s.id}
+                          title={s.goal}
+                          onRename={() => setRenamingSession(s.id)}
+                        />
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
               {g.sessions.length > SESSION_PREVIEW_COUNT &&
                 (expandedSessions.has(g.repository) ? (
                   <button className="sess-more" onClick={() => toggleSessionList(g.repository)}>

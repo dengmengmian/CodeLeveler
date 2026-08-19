@@ -105,6 +105,55 @@ describe('memory commands', () => {
   });
 });
 
+describe('query observability', () => {
+  it('sends query_observability and stores ObservabilityLoaded off live tools', () => {
+    const { bridge, sent, apply, state } = harness();
+    bridge.queryObservability('s1');
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'query_observability',
+      session_id: 's1',
+      before: 0,
+      after: 80,
+    });
+    apply({
+      type: 'observability_loaded',
+      observation: {
+        agents: [],
+        recovery: { interrupted_turns: 0, repair_attempts: 0, workspace_snapshots: 0, review_stages: [] },
+        requests: [],
+        tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
+        window: [],
+        window_from: 1,
+        window_to: 2,
+        session: {
+          session_id: 's1',
+          goal: 'fix auth',
+          repository: '/repo',
+          created_at: 't',
+          updated_at: 't',
+          status: 'completed',
+          model: 'deepseek/v4',
+          work_profile: 'balanced',
+          collaboration: 'chat',
+          request_count: 3,
+          input_tokens: 10,
+          output_tokens: 2,
+          request_failures: 0,
+          request_retries: 0,
+          tool_started: 21,
+          tool_finished: 21,
+          verification_runs: 1,
+          compact_count: 0,
+          subagent_started: 0,
+          repair_started: 0,
+        },
+      },
+    });
+    expect(state.observation?.session.tool_started).toBe(21);
+    expect(state.current?.tools).toEqual([]);
+  });
+});
+
 describe('event closure', () => {
   it('memory_list reaches state (was silently dropped)', () => {
     const { apply, state } = harness();

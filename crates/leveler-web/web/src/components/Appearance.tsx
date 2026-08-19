@@ -159,9 +159,48 @@ export function SettingsButton() {
   );
 }
 
-function SettingsModal({ onClose }: { onClose: () => void }) {
+/** Theme cards for the Settings sidebar (no extra API). */
+export function AppearancePanel() {
   const choice = useThemeChoice();
+  return (
+    <div className="set-body">
+      <div className="set-sec">外观</div>
+      <div className="set-hint">主题立即生效并保存到本机，刷新后保持。</div>
+      <div className="theme-cards">
+        {THEME_OPTIONS.map((t) => {
+          const sw = swatchFor(t.choice);
+          const active = choice === t.choice;
+          return (
+            <button
+              key={t.choice}
+              className={`theme-card${active ? ' active' : ''}`}
+              onClick={() => setThemeChoice(t.choice)}
+            >
+              <span
+                className="tc-preview"
+                style={{ background: sw.app, borderColor: sw.surface }}
+              >
+                <i className="tc-side" style={{ background: sw.surface }} />
+                <i className="tc-bar" style={{ background: sw.accent }} />
+                <i className="tc-line" style={{ background: sw.text, opacity: 0.5 }} />
+                <i className="tc-line short" style={{ background: sw.text, opacity: 0.3 }} />
+              </span>
+              <span className="tc-meta">
+                <span className="tc-name">
+                  {t.label}
+                  {active && <span className="tc-cur">当前</span>}
+                </span>
+                <span className="tc-desc">{t.desc}</span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
+function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
@@ -179,40 +218,7 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
             ✕
           </button>
         </div>
-        <div className="set-body">
-          <div className="set-sec">外观</div>
-          <div className="set-hint">主题立即生效并保存到本机，刷新后保持。</div>
-          <div className="theme-cards">
-            {THEME_OPTIONS.map((t) => {
-              const sw = swatchFor(t.choice);
-              const active = choice === t.choice;
-              return (
-                <button
-                  key={t.choice}
-                  className={`theme-card${active ? ' active' : ''}`}
-                  onClick={() => setThemeChoice(t.choice)}
-                >
-                  <span
-                    className="tc-preview"
-                    style={{ background: sw.app, borderColor: sw.surface }}
-                  >
-                    <i className="tc-side" style={{ background: sw.surface }} />
-                    <i className="tc-bar" style={{ background: sw.accent }} />
-                    <i className="tc-line" style={{ background: sw.text, opacity: 0.5 }} />
-                    <i className="tc-line short" style={{ background: sw.text, opacity: 0.3 }} />
-                  </span>
-                  <span className="tc-meta">
-                    <span className="tc-name">
-                      {t.label}
-                      {active && <span className="tc-cur">当前</span>}
-                    </span>
-                    <span className="tc-desc">{t.desc}</span>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
+        <AppearancePanel />
       </div>
     </div>
   );

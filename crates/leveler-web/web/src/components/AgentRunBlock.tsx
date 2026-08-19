@@ -8,6 +8,7 @@
 import { useEffect, useState } from 'react';
 import { useAppState, type BackgroundTaskView } from '../state/store';
 import { useBridge } from '../state/bridge';
+import { completionTruth } from '../lib/completionTruth';
 import { deriveRunState, type AgentRunState } from '../lib/runstate';
 import { formatSeconds, statsLine, summarizeTools } from '../lib/toolstats';
 import { ToolCallRow } from './ToolCallRow';
@@ -81,6 +82,7 @@ export function AgentRunBlock() {
     const tone = run.tone ?? 'muted';
     const retry =
       run.outcome === 'failed' || run.outcome === 'cancelled' || run.outcome === 'truncated';
+    const truth = completionTruth(current);
     return (
       <div className={`run-summary r-terminal tone-${tone}`}>
         <div className="rs-head">
@@ -88,6 +90,13 @@ export function AgentRunBlock() {
           <span className="rs-primary">{run.primary}</span>
         </div>
         {run.detail && <div className="rs-detail">原因：{run.detail}</div>}
+        {truth && (
+          <div className="rs-facts">
+            {truth.facts.map((f) => (
+              <div key={f}>{f}</div>
+            ))}
+          </div>
+        )}
         {tools.length > 0 && <div className="rs-sub">{statsLine(stats)}</div>}
         {backgroundTasks.map((t) => (
           <BackgroundTaskRow key={t.id} task={t} />
