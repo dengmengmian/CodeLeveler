@@ -2,9 +2,45 @@
 // memory / sub-agent / background task / 产品轴 / 终态保真。
 
 import { describe, expect, it } from 'vitest';
-import type { UiSessionSnapshot } from '../types/protocol';
+import type { UiObservabilityLoaded, UiSessionSnapshot } from '../types/protocol';
 import { headerWaitingCue, inspectorMode } from '../lib/inspectorModel';
 import { initialState, reducer, type AppState } from './store';
+
+function observation(over: Partial<UiObservabilityLoaded> = {}): UiObservabilityLoaded {
+  return {
+    agents: [],
+    recovery: { interrupted_turns: 0, repair_attempts: 0, workspace_snapshots: 0, review_stages: [] },
+    requests: [],
+    tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
+    window: [],
+    window_from: 1,
+    window_to: 2,
+    session: {
+      session_id: 's1',
+      goal: 'fix auth',
+      repository: '/repo',
+      created_at: 't',
+      updated_at: 't',
+      status: 'completed',
+      model: 'deepseek/v4',
+      work_profile: 'balanced',
+      collaboration: 'chat',
+      request_count: 3,
+      input_tokens: 10,
+      output_tokens: 2,
+      request_failures: 0,
+      request_retries: 0,
+      tool_started: 21,
+      tool_finished: 21,
+      verification_runs: 1,
+      compact_count: 0,
+      subagent_started: 0,
+      repair_started: 0,
+      last_sequence: 12,
+    },
+    ...over,
+  };
+}
 
 function snapshot(over: Partial<UiSessionSnapshot> = {}): UiSessionSnapshot {
   return {
@@ -87,43 +123,67 @@ describe('chrome / diff focus', () => {
 
   it('stores QueryObservability payload off SessionView.tools', () => {
     const state = stateWithSession();
-    reducer(state, {
-      type: 'observation_loaded',
-      observation: {
-        agents: [],
-        recovery: { interrupted_turns: 0, repair_attempts: 0, workspace_snapshots: 0, review_stages: [] },
-        requests: [],
-        tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
-        window: [],
-        window_from: 1,
-        window_to: 2,
-        session: {
-          session_id: 's1',
-          goal: 'fix auth',
-          repository: '/repo',
-          created_at: 't',
-          updated_at: 't',
-          status: 'completed',
-          model: 'deepseek/v4',
-          work_profile: 'balanced',
-          collaboration: 'chat',
-          request_count: 3,
-          input_tokens: 10,
-          output_tokens: 2,
-          request_failures: 0,
-          request_retries: 0,
-          tool_started: 21,
-          tool_finished: 21,
-          verification_runs: 1,
-          compact_count: 0,
-          subagent_started: 0,
-          repair_started: 0,
-        },
-      },
-    });
+    reducer(state, { type: 'observation_loaded', observation: observation() });
     expect(state.observation?.session.tool_started).toBe(21);
     expect(state.observation?.tools[0]?.calls).toBe(40);
     expect(state.current?.tools).toEqual([]);
+  });
+
+  it('drops a stale observability payload whose last_sequence is older', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: observation({
+        tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
+        session: { ...observation().session, last_sequence: 50 },
+      }),
+    });
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: observation({
+        tools: [{ name: 'read_file', class: 'read', calls: 1, succeeded: 1, failed: 0, unfinished: 0 }],
+        session: { ...observation().session, last_sequence: 12 },
+      }),
+    });
+    expect(state.observation?.session.last_sequence).toBe(50);
+    expect(state.observation?.tools[0]?.calls).toBe(40);
+    expect(state.observationStatus).toBe('ready');
+  });
+
+  it('accepts an equal or newer last_sequence for the same session', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: observation({ session: { ...observation().session, last_sequence: 12 } }),
+    });
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: observation({
+        tools: [{ name: 'grep', class: 'search', calls: 2, succeeded: 2, failed: 0, unfinished: 0 }],
+        session: { ...observation().session, last_sequence: 12 },
+      }),
+    });
+    expect(state.observation?.tools[0]?.name).toBe('grep');
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: observation({
+        tools: [{ name: 'read_file', class: 'read', calls: 9, succeeded: 9, failed: 0, unfinished: 0 }],
+        session: { ...observation().session, last_sequence: 40 },
+      }),
+    });
+    expect(state.observation?.session.last_sequence).toBe(40);
+    expect(state.observation?.tools[0]?.calls).toBe(9);
+  });
+
+  it('still ignores observability for a different session', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: observation({
+        session: { ...observation().session, session_id: 'other', last_sequence: 99 },
+      }),
+    });
+    expect(state.observation).toBeNull();
   });
 
   it('toggle_inspector flips the drawer', () => {
@@ -251,6 +311,34 @@ describe('sub-agents', () => {
     reducer(state, { type: 'sub_agent_updated', id: 'ag1', nickname: 'W', role: 'worker', done: true, ok: true, detail: 'x' });
     reducer(state, { type: 'user_message', id: 'm9', text: 'next', time: '10:00:00' });
     expect(state.current?.agents).toHaveLength(0);
+  });
+
+  it('live SessionView.agents is not the session-wide agent history', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'observation_loaded',
+      observation: observation({
+        agents: [
+          { id: 'agent-1', nickname: 'Explorer', role: 'explorer', status: 'ok', summary: 'done' },
+          { id: 'agent-2', nickname: 'Worker', role: 'worker', status: 'ok', summary: 'done' },
+        ],
+        session: { ...observation().session, subagent_started: 2, last_sequence: 40 },
+      }),
+    });
+    reducer(state, {
+      type: 'sub_agent_updated',
+      id: 'agent-3',
+      nickname: 'Worker',
+      role: 'worker',
+      done: false,
+      ok: false,
+      detail: 'Add tests',
+    });
+    expect(state.current?.agents).toHaveLength(1);
+    expect(state.observation?.agents).toHaveLength(2);
+    reducer(state, { type: 'user_message', id: 'm9', text: 'next', time: '10:00:00' });
+    expect(state.current?.agents).toHaveLength(0);
+    expect(state.observation?.agents).toHaveLength(2);
   });
 });
 

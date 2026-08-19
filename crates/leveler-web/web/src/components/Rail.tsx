@@ -100,7 +100,7 @@ function ActivityPanel() {
   if (!observation) {
     return <div className="rail-empty">尚无 durable Activity。打开 Execution 或等待查询完成。</div>;
   }
-  const { summary, tools } = projectObservability(observation);
+  const { summary, tools, agents } = projectObservability(observation);
   return (
     <div className="rail-panel">
       <dl className="kv runtime-kv">
@@ -110,7 +110,22 @@ function ActivityPanel() {
         <dd>{summary.requestCount}</dd>
         <dt>Verify</dt>
         <dd>{summary.verificationRuns}</dd>
+        <dt>Agents</dt>
+        <dd>{summary.delegatedAgents}</dd>
       </dl>
+      {agents.length > 0 && (
+        <>
+          <div className="ag-kicker">Delegated</div>
+          {agents.map((a) => (
+            <div className="row tool-agg-row" key={a.id}>
+              <span>{a.nickname || a.id}</span>
+              <span className="cnt">
+                {a.status === 'running' ? 'Running' : a.status === 'completed' ? 'Finished' : 'Failed'}
+              </span>
+            </div>
+          ))}
+        </>
+      )}
       {tools.map((t) => (
         <div className="row tool-agg-row" key={t.name}>
           <span>{t.name}</span>

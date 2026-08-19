@@ -107,7 +107,13 @@ pub async fn query_observability(
         .await
         .map_err(AppError::from)?;
     let tools = aggregate_tools(&decode_records(&tool_rows)?);
-    let agents = collect_agents(&decoded);
+    // Session-wide: sub-agent start/finish only. Same class of bug Tools had
+    // when `collect_agents` read the event window.
+    let agent_rows = db
+        .load_by_types(session_id, &["sub_agent_started", "sub_agent_finished"])
+        .await
+        .map_err(AppError::from)?;
+    let agents = collect_agents(&decode_records(&agent_rows)?);
     let review_stages = collect_review_stages(&decoded);
     let relations = if let Some(seq) = center_seq {
         relations_for(&decoded, seq)
@@ -1034,6 +1040,147 @@ mod tests {
         assert_eq!(read.unfinished, 1);
         assert_eq!(read.total_ms, None);
         assert_eq!(read.avg_ms, None);
+    }
+
+    fn agent_start(id: &str, nickname: &str, role: &str, task: &str) -> EngineEvent {
+        EngineEvent::SubAgentStarted {
+            id: id.into(),
+            nickname: nickname.into(),
+            role: role.into(),
+            task: task.into(),
+        }
+    }
+
+    fn agent_end(id: &str, nickname: &str, ok: bool, summary: &str) -> EngineEvent {
+        EngineEvent::SubAgentFinished {
+            id: id.into(),
+            nickname: nickname.into(),
+            ok,
+            summary: summary.into(),
+        }
+    }
+
+    fn by_agent<'a>(agents: &'a [UiAgentObservation], id: &str) -> &'a UiAgentObservation {
+        agents
+            .iter()
+            .find(|a| a.id == id)
+            .unwrap_or_else(|| panic!("missing agent {id} in {agents:?}"))
+    }
+
+    #[tokio::test]
+    async fn agent_list_is_session_wide_not_window() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "wide agents", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        persist(
+            &db,
+            &sid,
+            agent_start(
+                "agent-1",
+                "Explorer",
+                "explorer",
+                "Inspect authentication flow",
+            ),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_end("agent-1", "Explorer", true, "auth flow mapped"),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_start("agent-2", "Worker", "worker", "Add tests"),
+        )
+        .await;
+
+        for i in 0..40 {
+            persist(&db, &sid, tool_start(&format!("r{i}"), "read_file")).await;
+            persist(&db, &sid, tool_end(&format!("r{i}"), "read_file", false)).await;
+        }
+
+        persist(
+            &db,
+            &sid,
+            agent_end("agent-2", "Worker", false, "tests still failing"),
+        )
+        .await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert!(
+            loaded.window.len() <= 20,
+            "trace window must stay bounded: {}",
+            loaded.window.len()
+        );
+        let window_agent_rows = loaded
+            .window
+            .iter()
+            .filter(|r| r.class == ObservationClass::Agent)
+            .count();
+        assert!(
+            window_agent_rows < 4,
+            "window must not contain every agent lifecycle row: {window_agent_rows}"
+        );
+
+        assert_eq!(
+            loaded.agents.len(),
+            2,
+            "agents must be session-wide: {:?}",
+            loaded.agents
+        );
+        let explorer = by_agent(&loaded.agents, "agent-1");
+        assert_eq!(explorer.nickname, "Explorer");
+        assert_eq!(explorer.role, "explorer");
+        assert_eq!(explorer.status, "ok");
+        assert_eq!(explorer.summary, "auth flow mapped");
+
+        let worker = by_agent(&loaded.agents, "agent-2");
+        assert_eq!(worker.nickname, "Worker");
+        assert_eq!(worker.role, "worker");
+        assert_eq!(worker.status, "fail");
+        assert_eq!(worker.summary, "tests still failing");
+    }
+
+    #[tokio::test]
+    async fn running_agent_outside_window_still_listed() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "open agent", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        persist(
+            &db,
+            &sid,
+            agent_start(
+                "agent-1",
+                "Explorer",
+                "explorer",
+                "Inspect authentication flow",
+            ),
+        )
+        .await;
+        for _ in 0..30 {
+            persist(&db, &sid, EngineEvent::VerificationStarted).await;
+        }
+
+        let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
+        assert!(
+            loaded
+                .window
+                .iter()
+                .all(|r| r.class != ObservationClass::Agent),
+            "started agent must sit outside the event window: {:?}",
+            loaded.window
+        );
+        assert_eq!(loaded.agents.len(), 1);
+        let explorer = by_agent(&loaded.agents, "agent-1");
+        assert_eq!(explorer.role, "explorer");
+        assert_eq!(explorer.status, "running");
+        assert_eq!(explorer.summary, "Inspect authentication flow");
     }
 
     #[tokio::test]

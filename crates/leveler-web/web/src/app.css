@@ -828,11 +828,14 @@ button { font-family: inherit; }
 .agent-row.done .ag-glyph { color: var(--success); }
 .agent-row.fail .ag-glyph { color: var(--danger); }
 .agent-row .ag-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.agent-row .ag-name { color: var(--text-primary); }
-.agent-row .ag-role {
+.agent-row .ag-name,
+.ag-star-row .ag-name { color: var(--text-primary); }
+.agent-row .ag-role,
+.ag-star-row .ag-role {
   margin-left: 6px; font-family: var(--mono); font-size: 10.5px; color: var(--text-muted);
 }
-.agent-row .ag-detail {
+.agent-row .ag-detail,
+.ag-star-row .ag-detail {
   color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .agent-row .ag-step {
@@ -840,6 +843,23 @@ button { font-family: inherit; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .agent-row .ag-tokens { flex: none; font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+.ag-kicker {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .08em; color: var(--text-muted);
+  text-transform: uppercase; margin: 8px 0 4px;
+}
+.ag-star { font-size: 12.5px; }
+.ag-star-main { color: var(--text-primary); padding: 4px 0; }
+.ag-star-row {
+  display: flex; gap: 8px; align-items: flex-start; padding: 3px 0;
+}
+.ag-star-row .ag-branch {
+  flex: none; width: 14px; font-family: var(--mono); color: var(--text-muted);
+}
+.ag-star-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ag-star-row .ag-status { font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+.ag-star-row.running .ag-status { color: var(--accent); }
+.ag-star-row.completed .ag-status { color: var(--success); }
+.ag-star-row.failed .ag-status { color: var(--danger); }
 
 /* 记忆 tab（memory_list）：pending 需要用户同意，active 可遗忘 */
 .mem-row {

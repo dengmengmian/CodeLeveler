@@ -456,6 +456,15 @@ export function reducer(state: AppState, action: Action): void {
       if (state.current && action.observation.session.session_id !== state.current.id) {
         return;
       }
+      // Same-session QueryObservability can overlap across clients (TUI /trace
+      // + Web, or two tabs). Drop a strictly older last_sequence so a slow
+      // query cannot overwrite a newer one. Equal is a refresh. Session switch
+      // already cleared `observation`.
+      if (state.observation) {
+        const incoming = action.observation.session.last_sequence ?? -1;
+        const current = state.observation.session.last_sequence ?? -1;
+        if (incoming < current) return;
+      }
       state.observation = action.observation;
       state.observationStatus = 'ready';
       return;

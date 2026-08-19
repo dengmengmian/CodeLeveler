@@ -100,4 +100,72 @@ describe('completionTruth', () => {
     expect(t?.recoveryHint).toBe('可重试上一轮');
     expect(t?.title).toBe('执行失败');
   });
+
+  it('report-only files_changed does not invent +0 −0', () => {
+    const t = completionTruth(
+      session({
+        lastTurn: { outcome: 'completed', detail: null, ms: 1000 },
+        completionReport: {
+          files_changed: 5,
+          added: 0,
+          removed: 0,
+          checks_passed: 0,
+          checks_total: 0,
+          success: true,
+        },
+        diff: null,
+      }),
+    );
+    expect(t?.changesApplied).toBe(true);
+    expect(t?.artifacts.source).toBe('report');
+    expect(t?.artifacts.files).toBe(5);
+    expect(t?.artifacts.added).toBeNull();
+    expect(t?.artifacts.removed).toBeNull();
+    expect(t?.facts.join(' ')).toContain('5 files changed');
+    expect(t?.facts.join(' ')).not.toMatch(/\+0/);
+    expect(t?.facts.join(' ')).not.toMatch(/−0/);
+  });
+
+  it('a loaded empty diff is exact zero and does not fall back to the report', () => {
+    const t = completionTruth(
+      session({
+        lastTurn: { outcome: 'completed', detail: null, ms: 1000 },
+        completionReport: {
+          files_changed: 5,
+          added: 0,
+          removed: 0,
+          checks_passed: 0,
+          checks_total: 0,
+          success: true,
+        },
+        diff: { files: [] },
+      }),
+    );
+    expect(t?.changesApplied).toBe(false);
+    expect(t?.artifacts.source).toBe('none');
+    expect(t?.facts).toContain('未改仓库');
+    expect(t?.facts.join(' ')).not.toContain('5 files changed');
+  });
+
+  it('exact diff totals win when a real diff is present', () => {
+    const t = completionTruth(
+      session({
+        lastTurn: { outcome: 'completed', detail: null, ms: 1000 },
+        completionReport: {
+          files_changed: 9,
+          added: 10,
+          removed: 4,
+          checks_passed: 1,
+          checks_total: 1,
+          success: true,
+        },
+        diff: { files: [{ path: 'a.rs', added: 2, removed: 1 }] },
+      }),
+    );
+    expect(t?.artifacts.source).toBe('diff');
+    expect(t?.artifacts.files).toBe(1);
+    expect(t?.artifacts.added).toBe(2);
+    expect(t?.artifacts.removed).toBe(1);
+    expect(t?.facts.some((f) => f.includes('1 files') && f.includes('+2') && f.includes('−1'))).toBe(true);
+  });
 });

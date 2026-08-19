@@ -77,7 +77,9 @@ export function ExecutionView() {
                   </span>
                   <span className="exec-time">{step.time}</span>
                   <span className="exec-kind">{step.kind}</span>
-                  <span className="exec-title">{step.title}</span>
+                  <span className="exec-title">
+                    {step.agentLabel ? `${step.agentLabel} · ${step.title}` : step.title}
+                  </span>
                   {jump ? (
                     <button
                       type="button"

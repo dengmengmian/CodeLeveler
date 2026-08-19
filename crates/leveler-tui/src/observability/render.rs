@@ -297,7 +297,7 @@ fn agents(
     let theme = &state.theme;
     if loaded.agents.is_empty() {
         lines.push(Line::from(Span::styled(
-            "此窗口没有 durable SubAgent 起止事件。",
+            "此会话没有 durable SubAgent 起止事件。",
             Style::default().fg(theme.text.muted),
         )));
         return;

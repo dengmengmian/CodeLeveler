@@ -1,11 +1,13 @@
 // Frontend projection of QueryObservability DTOs.
 // Components must not read SessionView.tools for session totals,
+// must not use SessionView.agents as session-wide history,
 // and must not interpret raw RuntimeEvent shapes here.
 
 import { formatClock } from './format';
 import type {
   ObservationClass,
   RuntimeEvent,
+  UiAgentObservation,
   UiObservabilityLoaded,
   UiObservationRow,
   UiToolAggregate,
@@ -25,6 +27,22 @@ export interface ExecStep {
   eventType: string;
   turnId: string | null;
   class: ObservationClass;
+  /** Nickname, or the raw agent id if lifecycle is missing. Null for Main. */
+  agentLabel: string | null;
+}
+
+export type AgentDelegationStatus = 'running' | 'completed' | 'failed';
+
+/** In-session delegated worker. Not a child Session. */
+export interface AgentDelegationView {
+  id: string;
+  nickname: string;
+  role: string;
+  status: AgentDelegationStatus;
+  /** Present while running — protocol stores the task in `summary` until finish. */
+  task: string | null;
+  /** Present after finish. The start-task is overwritten and is not recovered. */
+  summary: string | null;
 }
 
 export interface ExecTurnGroup {
@@ -45,12 +63,15 @@ export interface RuntimeSummary {
   inputTokens: number;
   outputTokens: number;
   lastSequence: number | null;
+  /** Length of session-wide `UiAgentObservation[]`, not SessionView.agents. */
+  delegatedAgents: number;
 }
 
 export interface ObservabilityView {
   summary: RuntimeSummary;
   groups: ExecTurnGroup[];
   tools: UiToolAggregate[];
+  agents: AgentDelegationView[];
 }
 
 const KIND: Record<ObservationClass, ExecKind> = {
@@ -85,7 +106,17 @@ function sessionDurationMs(createdAt: string, updatedAt: string): number | null 
   return b - a;
 }
 
-export function projectRow(row: UiObservationRow): ExecStep {
+function field(row: UiObservationRow, key: string): string | null {
+  const hit = row.fields?.find((f) => f.key === key);
+  return hit?.value ?? null;
+}
+
+export function projectRow(row: UiObservationRow, agents: readonly AgentDelegationView[] = []): ExecStep {
+  const agentId = field(row, 'Agent');
+  let agentLabel: string | null = null;
+  if (agentId && agentId !== 'main') {
+    agentLabel = agents.find((a) => a.id === agentId)?.nickname ?? agentId;
+  }
   return {
     sequence: row.sequence,
     time: clock(row.created_at),
@@ -97,7 +128,26 @@ export function projectRow(row: UiObservationRow): ExecStep {
     eventType: row.event_type,
     turnId: row.turn_id ?? null,
     class: row.class,
+    agentLabel,
   };
+}
+
+function nonempty(s: string | undefined): string | null {
+  const t = (s ?? '').trim();
+  return t.length > 0 ? t : null;
+}
+
+export function projectAgentDelegation(agents: readonly UiAgentObservation[]): AgentDelegationView[] {
+  return agents.map((a) => {
+    const text = nonempty(a.summary);
+    if (a.status === 'ok') {
+      return { id: a.id, nickname: a.nickname, role: a.role, status: 'completed', task: null, summary: text };
+    }
+    if (a.status === 'fail') {
+      return { id: a.id, nickname: a.nickname, role: a.role, status: 'failed', task: null, summary: text };
+    }
+    return { id: a.id, nickname: a.nickname, role: a.role, status: 'running', task: text, summary: null };
+  });
 }
 
 export function groupByTurn(steps: readonly ExecStep[]): ExecTurnGroup[] {
@@ -121,7 +171,8 @@ export function groupByTurn(steps: readonly ExecStep[]): ExecTurnGroup[] {
 
 export function projectObservability(loaded: UiObservabilityLoaded): ObservabilityView {
   const s = loaded.session;
-  const steps = loaded.window.map(projectRow);
+  const agents = projectAgentDelegation(loaded.agents);
+  const steps = loaded.window.map((row) => projectRow(row, agents));
   return {
     summary: {
       model: s.model,
@@ -135,9 +186,11 @@ export function projectObservability(loaded: UiObservabilityLoaded): Observabili
       inputTokens: s.input_tokens,
       outputTokens: s.output_tokens,
       lastSequence: s.last_sequence ?? null,
+      delegatedAgents: agents.length,
     },
     groups: groupByTurn(steps),
     tools: loaded.tools,
+    agents,
   };
 }
 

@@ -93,7 +93,7 @@ pub(crate) async fn cmd_trace(
         }
     }
     if !loaded.agents.is_empty() {
-        println!("\n{}", Line::heading("Agents"));
+        println!("\n{}", Line::heading("Agents (session-wide)"));
         for a in &loaded.agents {
             println!("  {}  {}  {}  {}", a.nickname, a.role, a.status, a.summary);
         }

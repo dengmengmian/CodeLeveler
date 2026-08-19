@@ -5,10 +5,14 @@
 import { useEffect, useState } from 'react';
 import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
 import { useBridge } from '../state/bridge';
-import { completionTruth, trustLabel } from '../lib/completionTruth';
+import { completionTruth, trustLabel, type ArtifactFacts } from '../lib/completionTruth';
 import { formatElapsed } from '../lib/format';
 import { currentPlanProgress, inspectorMode } from '../lib/inspectorModel';
-import { projectObservability } from '../lib/observabilityView';
+import {
+  projectObservability,
+  type AgentDelegationStatus,
+  type AgentDelegationView,
+} from '../lib/observabilityView';
 import { presentTurnEnd } from '../lib/turn';
 import type { CheckState, UiApprovalRequest, UiClarificationRequest } from '../types/protocol';
 
@@ -232,7 +236,6 @@ function TaskTab({ current }: { current: SessionView | null }) {
     ? Math.max(0, Math.floor((Date.now() - current.turnStartedAt) / 1000))
     : 0;
   const plan = currentPlanProgress(current?.plan);
-  const agents = current?.agents ?? [];
   const [, tick] = useState(0);
   useEffect(() => {
     if (mode !== 'running') return;
@@ -254,6 +257,7 @@ function TaskTab({ current }: { current: SessionView | null }) {
           <ClarificationActions key={c.id} request={c} />
         ))}
         <ResultSection current={current} />
+        <AgentsSection live={current.agents} />
         <RuntimeSection />
         <ChangesJump current={current} />
       </>
@@ -278,17 +282,8 @@ function TaskTab({ current }: { current: SessionView | null }) {
             </div>
           </>
         )}
-        {agents.length > 0 && (
-          <>
-            <div className="insp-sec">Agents</div>
-            <div className="agent-tree">
-              {agents.map((a) => (
-                <AgentRow key={a.id} agent={a} />
-              ))}
-            </div>
-          </>
-        )}
         <ResultSection current={current} />
+        <AgentsSection live={current.agents} />
         <RuntimeSection />
         <div className="insp-sec">Changes</div>
         <ChangesJump current={current} />
@@ -326,6 +321,7 @@ function TaskTab({ current }: { current: SessionView | null }) {
           </>
         )}
         <ResultSection current={current} />
+        <AgentsSection live={current.agents} />
         <RuntimeSection />
         <div className="insp-sec">Changes</div>
         <ChangesJump current={current} />
@@ -343,6 +339,7 @@ function TaskTab({ current }: { current: SessionView | null }) {
         </div>
       </div>
       <ResultSection current={current} />
+      <AgentsSection live={current.agents} />
       <RuntimeSection />
       <ChangesJump current={current} />
     </>
@@ -363,12 +360,7 @@ function ResultSection({ current }: { current: SessionView }) {
         <dt>Trust</dt>
         <dd>{trustLabel(truth.trust)}</dd>
         <dt>Artifacts</dt>
-        <dd>
-          {truth.artifacts.files} files
-          {truth.artifacts.files > 0
-            ? `  +${truth.artifacts.added} −${truth.artifacts.removed}`
-            : ''}
-        </dd>
+        <dd>{artifactLine(truth.artifacts)}</dd>
       </dl>
       {truth.facts.map((f) => (
         <div className="t-detail" key={f}>
@@ -376,6 +368,73 @@ function ResultSection({ current }: { current: SessionView }) {
         </div>
       ))}
       {truth.recoveryHint && <div className="t-detail">{truth.recoveryHint}</div>}
+    </>
+  );
+}
+
+function artifactLine(a: ArtifactFacts): string {
+  if (a.source === 'report') return `${a.files} files changed`;
+  if (a.source === 'diff') return `${a.files} files  +${a.added} −${a.removed}`;
+  return `${a.files} files`;
+}
+
+function delegationStatus(status: AgentDelegationStatus): string {
+  if (status === 'running') return '● Running';
+  if (status === 'completed') return '✓ Finished';
+  return '✗ Failed';
+}
+
+function DelegationStar({ agents }: { agents: readonly AgentDelegationView[] }) {
+  return (
+    <div className="ag-star" aria-label="本会话委派">
+      <div className="ag-star-main">Main</div>
+      {agents.map((a, i) => {
+        const last = i === agents.length - 1;
+        return (
+          <div key={a.id} className={`ag-star-row ${a.status}`}>
+            <span className="ag-branch" aria-hidden="true">
+              {last ? '└' : '├'}
+            </span>
+            <span className="ag-star-body">
+              <span className="ag-name">
+                {a.nickname}
+                {a.role ? <span className="ag-role">{a.role}</span> : null}
+              </span>
+              <span className="ag-status">{delegationStatus(a.status)}</span>
+              {(a.task || a.summary) && <span className="ag-detail">{a.task ?? a.summary}</span>}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Live HUD is SessionView.agents; history is QueryObservability.agents. */
+function AgentsSection({ live }: { live: readonly SubAgentView[] }) {
+  const { observation } = useAppState();
+  const running = live.filter((a) => a.status === 'run');
+  const delegated = observation ? projectObservability(observation).agents : [];
+  if (running.length === 0 && delegated.length === 0) return null;
+  return (
+    <>
+      <div className="insp-sec">AGENTS</div>
+      {running.length > 0 && (
+        <>
+          <div className="ag-kicker">Running</div>
+          <div className="agent-tree">
+            {running.map((a) => (
+              <AgentRow key={a.id} agent={a} />
+            ))}
+          </div>
+        </>
+      )}
+      {delegated.length > 0 && (
+        <>
+          <div className="ag-kicker">Delegated</div>
+          <DelegationStar agents={delegated} />
+        </>
+      )}
     </>
   );
 }

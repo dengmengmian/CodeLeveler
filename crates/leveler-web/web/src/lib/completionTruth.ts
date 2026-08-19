@@ -1,5 +1,6 @@
 // Session Truth: one projection for Conversation, Changes, and Inspector.
-// Does not invent protocol fields. Sources: lastTurn, verification, diff, waiters.
+// Does not invent protocol fields. Sources: lastTurn, verification, diff,
+// completionReport. Diff totals and report file counts stay distinct.
 
 import type { SessionView } from '../state/store';
 import { artifactTotals } from './changeFiles';
@@ -8,6 +9,16 @@ import { presentTurnEnd, type TurnTone } from './turn';
 export type CompletionKind = 'idle' | 'running' | 'waiting' | 'success' | 'warning' | 'failure';
 export type TrustState = 'verified' | 'unverified' | 'failed' | 'pending' | 'n/a';
 export type VerifyState = 'passed' | 'failed' | 'incomplete' | 'running' | 'none';
+
+export type ArtifactSource = 'diff' | 'report' | 'none';
+
+export interface ArtifactFacts {
+  files: number;
+  /** Exact diff totals only. Null when the count came from completionReport. */
+  added: number | null;
+  removed: number | null;
+  source: ArtifactSource;
+}
 
 export interface CompletionTruth {
   kind: CompletionKind;
@@ -18,17 +29,33 @@ export interface CompletionTruth {
   trust: TrustState;
   verify: VerifyState;
   changesApplied: boolean;
-  artifacts: { files: number; added: number; removed: number };
+  artifacts: ArtifactFacts;
   pending: 'approval' | 'clarification' | 'none';
   recoveryHint: string | null;
   facts: string[];
 }
 
+export function sessionArtifacts(s: SessionView): ArtifactFacts {
+  if (s.diff) {
+    const files = s.diff.files;
+    if (files.length > 0) {
+      const totals = artifactTotals(files);
+      return { files: totals.files, added: totals.added, removed: totals.removed, source: 'diff' };
+    }
+    return { files: 0, added: null, removed: null, source: 'none' };
+  }
+  const reported = s.completionReport?.files_changed ?? 0;
+  if (reported > 0) {
+    return { files: reported, added: null, removed: null, source: 'report' };
+  }
+  return { files: 0, added: null, removed: null, source: 'none' };
+}
+
 export function completionTruth(s: SessionView | null): CompletionTruth | null {
   if (!s) return null;
 
-  const artifacts = artifactTotals(s.diff?.files ?? []);
-  const changesApplied = artifacts.files > 0 || (s.completionReport?.files_changed ?? 0) > 0;
+  const artifacts = sessionArtifacts(s);
+  const changesApplied = artifacts.source !== 'none';
   const verify = verifyState(s);
 
   if (s.pendingApprovals.length > 0) {
@@ -44,7 +71,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'approval',
       recoveryHint: null,
-      facts: ['需要你确认后才能继续', factChanges(changesApplied, artifacts), factVerify(verify)],
+      facts: ['需要你确认后才能继续', factChanges(artifacts), factVerify(verify)],
     };
   }
   if (s.pendingClarifications.length > 0) {
@@ -60,7 +87,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'clarification',
       recoveryHint: null,
-      facts: ['需要补充信息', factChanges(changesApplied, artifacts), factVerify(verify)],
+      facts: ['需要补充信息', factChanges(artifacts), factVerify(verify)],
     };
   }
   if (s.turnActive) {
@@ -76,7 +103,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'none',
       recoveryHint: null,
-      facts: [factChanges(changesApplied, artifacts), factVerify(verify)],
+      facts: [factChanges(artifacts), factVerify(verify)],
     };
   }
   if (!s.lastTurn) {
@@ -92,7 +119,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'none',
       recoveryHint: null,
-      facts: [factChanges(changesApplied, artifacts), factVerify(verify)],
+      facts: [factChanges(artifacts), factVerify(verify)],
     };
   }
 
@@ -116,7 +143,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
     pending: 'none',
     recoveryHint: recovery,
     facts: [
-      factChanges(changesApplied, artifacts),
+      factChanges(artifacts),
       factVerify(verify),
       pendingNone(kind),
     ].filter(Boolean) as string[],
@@ -158,8 +185,9 @@ function trustFrom(s: SessionView, kind: CompletionKind, verify: VerifyState): T
   return 'unverified';
 }
 
-function factChanges(applied: boolean, a: { files: number; added: number; removed: number }): string {
-  if (!applied) return '未改仓库';
+function factChanges(a: ArtifactFacts): string {
+  if (a.source === 'none') return '未改仓库';
+  if (a.source === 'report') return `${a.files} files changed`;
   return `${a.files} files  +${a.added} −${a.removed}`;
 }
 

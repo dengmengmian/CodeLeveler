@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { UiObservabilityLoaded, UiObservationRow } from '../types/protocol';
 import {
   groupByTurn,
+  projectAgentDelegation,
   projectObservability,
   projectRow,
   shouldRefreshObservability,
@@ -112,5 +113,99 @@ describe('observability projection', () => {
       true,
     );
     expect(shouldRefreshObservability({ type: 'observability_loaded', observation: loaded() })).toBe(false);
+  });
+
+  it('projects running / completed / failed agents from protocol status only', () => {
+    const views = projectAgentDelegation([
+      { id: 'agent-1', nickname: 'Explorer', role: 'explorer', status: 'running', summary: 'Inspect authentication flow' },
+      { id: 'agent-2', nickname: 'Worker', role: 'worker', status: 'ok', summary: 'tests added' },
+      { id: 'agent-3', nickname: 'Worker', role: 'worker', status: 'fail', summary: 'compile error' },
+    ]);
+    expect(views).toEqual([
+      {
+        id: 'agent-1',
+        nickname: 'Explorer',
+        role: 'explorer',
+        status: 'running',
+        task: 'Inspect authentication flow',
+        summary: null,
+      },
+      {
+        id: 'agent-2',
+        nickname: 'Worker',
+        role: 'worker',
+        status: 'completed',
+        task: null,
+        summary: 'tests added',
+      },
+      {
+        id: 'agent-3',
+        nickname: 'Worker',
+        role: 'worker',
+        status: 'failed',
+        task: null,
+        summary: 'compile error',
+      },
+    ]);
+  });
+
+  it('does not invent a finished agent task that the protocol already overwrote', () => {
+    const [view] = projectAgentDelegation([
+      { id: 'agent-1', nickname: 'Explorer', role: 'explorer', status: 'ok', summary: 'auth flow mapped' },
+    ]);
+    expect(view?.task).toBeNull();
+    expect(view?.summary).toBe('auth flow mapped');
+  });
+
+  it('session-wide agent count comes from QueryObservability.agents, not a live list', () => {
+    const view = projectObservability(
+      loaded({
+        agents: [
+          { id: 'agent-1', nickname: 'Explorer', role: 'explorer', status: 'ok', summary: 'done' },
+          { id: 'agent-2', nickname: 'Worker', role: 'worker', status: 'running', summary: 'Add tests' },
+        ],
+        session: { ...loaded().session, subagent_started: 2 },
+      }),
+    );
+    expect(view.agents).toHaveLength(2);
+    expect(view.summary.delegatedAgents).toBe(2);
+  });
+
+  it('tool attribution uses Agent field; Main is unlabeled', () => {
+    const view = projectObservability(
+      loaded({
+        agents: [{ id: 'agent-1', nickname: 'Explorer', role: 'explorer', status: 'ok', summary: 'done' }],
+        window: [
+          row({
+            sequence: 4,
+            class: 'read',
+            title: 'read_file',
+            target: 'src/auth.rs',
+            turn_id: 't1',
+            fields: [
+              { key: 'Call', value: 'c1' },
+              { key: 'Agent', value: 'agent-1' },
+            ],
+          }),
+          row({
+            sequence: 5,
+            class: 'shell',
+            title: 'run_command',
+            turn_id: 't1',
+            fields: [{ key: 'Agent', value: 'main' }],
+          }),
+          row({
+            sequence: 6,
+            class: 'search',
+            title: 'grep',
+            turn_id: 't1',
+            fields: [{ key: 'Agent', value: 'agent-9' }],
+          }),
+        ],
+      }),
+    );
+    expect(view.groups[0]?.steps[0]?.agentLabel).toBe('Explorer');
+    expect(view.groups[0]?.steps[1]?.agentLabel).toBeNull();
+    expect(view.groups[0]?.steps[2]?.agentLabel).toBe('agent-9');
   });
 });
