@@ -50,7 +50,7 @@ use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
     AgentRole, ChildProfile, DelegationDecisionPoint, DelegationRoundAction, MAX_SUB_AGENT_DEPTH,
     agent_nickname, delegation_decision_request, lost_children_note, multi_agent_steer_hint,
-    scopes_overlap, settlement_notice, should_inject_delegation_hint,
+    new_delegated_agent_id, scopes_overlap, settlement_notice, should_inject_delegation_hint,
 };
 
 /// One still-running background delegation (V2). The join handle is owned by
@@ -2464,7 +2464,7 @@ impl Executor {
                         delegation_decision.note_worker_admitted(&files);
                     }
                     agents_spawned += 1;
-                    let id = format!("agent-{agents_spawned}");
+                    let id = new_delegated_agent_id();
                     let nickname = agent_nickname(agents_spawned);
                     let started_task = if role == AgentRole::Worker && !files.is_empty() {
                         format!("{task}\n[scope: {}]", files.join(", "))

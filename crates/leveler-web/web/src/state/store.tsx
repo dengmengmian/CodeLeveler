@@ -198,6 +198,8 @@ export interface AppState {
   /** Durable observatory payload (QueryObservability). Not live SessionView.tools. */
   observation: UiObservabilityLoaded | null;
   observationStatus: 'idle' | 'loading' | 'ready' | 'error';
+  /** QueryObservability.query_id this view currently owns. */
+  pendingObservationQuery: string | null;
 }
 
 export const initialState: AppState = {
@@ -220,6 +222,7 @@ export const initialState: AppState = {
   inspectorOpen: true,
   observation: null,
   observationStatus: 'idle',
+  pendingObservationQuery: null,
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -237,8 +240,8 @@ export type Action =
   | { type: 'toggle_rail' }
   | { type: 'toggle_inspector' }
   | { type: 'set_inspector'; open: boolean }
-  | { type: 'observation_loading' }
-  | { type: 'observation_loaded'; observation: UiObservabilityLoaded }
+  | { type: 'observation_loading'; queryId: string }
+  | { type: 'observation_loaded'; observation: UiObservabilityLoaded; queryId: string }
   | { type: 'user_message'; id: string; text: string; time: string }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
@@ -413,6 +416,7 @@ export function reducer(state: AppState, action: Action): void {
         state.diffFocus = null;
         state.observation = null;
         state.observationStatus = 'idle';
+        state.pendingObservationQuery = null;
       }
       return;
     case 'new_draft':
@@ -421,6 +425,7 @@ export function reducer(state: AppState, action: Action): void {
       state.draftProject = action.project ?? null;
       state.observation = null;
       state.observationStatus = 'idle';
+      state.pendingObservationQuery = null;
       return;
     case 'stage_view':
       state.stageView = action.view;
@@ -451,19 +456,14 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'observation_loading':
       state.observationStatus = 'loading';
+      state.pendingObservationQuery = action.queryId;
       return;
     case 'observation_loaded':
       if (state.current && action.observation.session.session_id !== state.current.id) {
         return;
       }
-      // Same-session QueryObservability can overlap across clients (TUI /trace
-      // + Web, or two tabs). Drop a strictly older last_sequence so a slow
-      // query cannot overwrite a newer one. Equal is a refresh. Session switch
-      // already cleared `observation`.
-      if (state.observation) {
-        const incoming = action.observation.session.last_sequence ?? -1;
-        const current = state.observation.session.last_sequence ?? -1;
-        if (incoming < current) return;
+      if (state.pendingObservationQuery !== action.queryId) {
+        return;
       }
       state.observation = action.observation;
       state.observationStatus = 'ready';

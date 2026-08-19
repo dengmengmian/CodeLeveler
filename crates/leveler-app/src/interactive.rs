@@ -1944,6 +1944,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             }
             ClientCommand::QueryObservability {
                 session_id,
+                query_id,
                 center_seq,
                 before,
                 after,
@@ -1963,9 +1964,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 .await
                 {
                     Ok(observation) => {
-                        let _ = self
-                            .events_for(&session_id)
-                            .send(RuntimeEvent::ObservabilityLoaded { observation });
+                        let _ =
+                            self.events_for(&session_id)
+                                .send(RuntimeEvent::ObservabilityLoaded {
+                                    query_id,
+                                    observation,
+                                });
                     }
                     Err(error) => {
                         self.notify_error(&session_id, format!("observability: {error}"));

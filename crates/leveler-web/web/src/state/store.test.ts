@@ -121,64 +121,115 @@ describe('chrome / diff focus', () => {
     expect(state.railNav).toBe('activity');
   });
 
+  function acceptObservation(state: AppState, obs: UiObservabilityLoaded, queryId: string): void {
+    reducer(state, { type: 'observation_loading', queryId });
+    reducer(state, { type: 'observation_loaded', observation: obs, queryId });
+  }
+
   it('stores QueryObservability payload off SessionView.tools', () => {
     const state = stateWithSession();
-    reducer(state, { type: 'observation_loaded', observation: observation() });
+    acceptObservation(state, observation(), 'q1');
     expect(state.observation?.session.tool_started).toBe(21);
     expect(state.observation?.tools[0]?.calls).toBe(40);
     expect(state.current?.tools).toEqual([]);
   });
 
-  it('drops a stale observability payload whose last_sequence is older', () => {
+  it('drops an older query after a newer one has been accepted', () => {
     const state = stateWithSession();
+    acceptObservation(
+      state,
+      observation({ session: { ...observation().session, last_sequence: 70 } }),
+      'q-b',
+    );
     reducer(state, {
       type: 'observation_loaded',
+      queryId: 'q-a',
       observation: observation({
-        tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
+        tools: [{ name: 'read_file', class: 'read', calls: 1, succeeded: 1, failed: 0, unfinished: 0 }],
         session: { ...observation().session, last_sequence: 50 },
       }),
     });
-    reducer(state, {
-      type: 'observation_loaded',
-      observation: observation({
-        tools: [{ name: 'read_file', class: 'read', calls: 1, succeeded: 1, failed: 0, unfinished: 0 }],
-        session: { ...observation().session, last_sequence: 12 },
-      }),
-    });
-    expect(state.observation?.session.last_sequence).toBe(50);
-    expect(state.observation?.tools[0]?.calls).toBe(40);
+    expect(state.observation?.session.last_sequence).toBe(70);
     expect(state.observationStatus).toBe('ready');
   });
 
-  it('accepts an equal or newer last_sequence for the same session', () => {
+  it('does not let a same-sequence historical query overwrite the owned tail', () => {
     const state = stateWithSession();
+    acceptObservation(
+      state,
+      observation({
+        window_from: 21,
+        window_to: 100,
+        session: { ...observation().session, last_sequence: 100 },
+      }),
+      'web-tail',
+    );
     reducer(state, {
       type: 'observation_loaded',
-      observation: observation({ session: { ...observation().session, last_sequence: 12 } }),
-    });
-    reducer(state, {
-      type: 'observation_loaded',
+      queryId: 'tui-inspect-40',
       observation: observation({
+        window_from: 20,
+        window_to: 60,
+        session: { ...observation().session, last_sequence: 100 },
+      }),
+    });
+    expect(state.observation?.window_from).toBe(21);
+    expect(state.observation?.window_to).toBe(100);
+  });
+
+  it('accepts a refresh of the currently owned query at the same last_sequence', () => {
+    const state = stateWithSession();
+    acceptObservation(
+      state,
+      observation({
+        tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
+        session: { ...observation().session, last_sequence: 100 },
+      }),
+      'q-a',
+    );
+    acceptObservation(
+      state,
+      observation({
         tools: [{ name: 'grep', class: 'search', calls: 2, succeeded: 2, failed: 0, unfinished: 0 }],
-        session: { ...observation().session, last_sequence: 12 },
+        session: { ...observation().session, last_sequence: 100 },
       }),
-    });
+      'q-b',
+    );
     expect(state.observation?.tools[0]?.name).toBe('grep');
+  });
+
+  it('drops a late response from a superseded Web query at the same last_sequence', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'observation_loading', queryId: 'q-a' });
+    reducer(state, { type: 'observation_loading', queryId: 'q-b' });
     reducer(state, {
       type: 'observation_loaded',
+      queryId: 'q-b',
       observation: observation({
-        tools: [{ name: 'read_file', class: 'read', calls: 9, succeeded: 9, failed: 0, unfinished: 0 }],
-        session: { ...observation().session, last_sequence: 40 },
+        window_from: 21,
+        window_to: 100,
+        session: { ...observation().session, last_sequence: 100 },
       }),
     });
-    expect(state.observation?.session.last_sequence).toBe(40);
-    expect(state.observation?.tools[0]?.calls).toBe(9);
+    reducer(state, {
+      type: 'observation_loaded',
+      queryId: 'q-a',
+      observation: observation({
+        window_from: 1,
+        window_to: 80,
+        session: { ...observation().session, last_sequence: 100 },
+      }),
+    });
+    expect(state.observation?.window_from).toBe(21);
+    expect(state.observation?.window_to).toBe(100);
   });
 
   it('still ignores observability for a different session', () => {
     const state = stateWithSession();
+    reducer(state, { type: 'observation_loading', queryId: 'q1' });
     reducer(state, {
       type: 'observation_loaded',
+      queryId: 'q1',
       observation: observation({
         session: { ...observation().session, session_id: 'other', last_sequence: 99 },
       }),
@@ -315,8 +366,10 @@ describe('sub-agents', () => {
 
   it('live SessionView.agents is not the session-wide agent history', () => {
     const state = stateWithSession();
+    reducer(state, { type: 'observation_loading', queryId: 'q-hist' });
     reducer(state, {
       type: 'observation_loaded',
+      queryId: 'q-hist',
       observation: observation({
         agents: [
           { id: 'agent-1', nickname: 'Explorer', role: 'explorer', status: 'ok', summary: 'done' },

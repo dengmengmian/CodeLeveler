@@ -1184,6 +1184,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_spawn_of_each_turn_is_a_distinct_session_agent() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "cross-turn agents", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        let turn_a = leveler_core::AgentId::generate().into_inner();
+        let turn_b = leveler_core::AgentId::generate().into_inner();
+        assert_ne!(turn_a, turn_b);
+
+        persist(
+            &db,
+            &sid,
+            agent_start(
+                &turn_a,
+                "Explorer",
+                "explorer",
+                "Inspect authentication flow",
+            ),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_end(&turn_a, "Explorer", true, "auth flow mapped"),
+        )
+        .await;
+        persist(
+            &db,
+            &sid,
+            agent_start(&turn_b, "Worker", "worker", "Add tests"),
+        )
+        .await;
+        persist(&db, &sid, agent_end(&turn_b, "Worker", true, "tests added")).await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        assert_eq!(loaded.agents.len(), 2, "{:?}", loaded.agents);
+        let explorer = by_agent(&loaded.agents, &turn_a);
+        let worker = by_agent(&loaded.agents, &turn_b);
+        assert_eq!(explorer.nickname, "Explorer");
+        assert_eq!(explorer.role, "explorer");
+        assert_eq!(explorer.status, "ok");
+        assert_eq!(explorer.summary, "auth flow mapped");
+        assert_eq!(worker.nickname, "Worker");
+        assert_eq!(worker.role, "worker");
+        assert_eq!(worker.status, "ok");
+        assert_eq!(worker.summary, "tests added");
+    }
+
+    fn tool_start_by(id: &str, name: &str, agent: &str) -> EngineEvent {
+        EngineEvent::ToolCallStarted {
+            call_id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            parallel: false,
+            risk: None,
+            agent_id: Some(agent.into()),
+        }
+    }
+
+    fn tool_end_by(id: &str, name: &str, agent: &str) -> EngineEvent {
+        EngineEvent::ToolCallFinished {
+            call_id: id.into(),
+            name: name.into(),
+            is_error: false,
+            preview: String::new(),
+            agent_id: Some(agent.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn relations_do_not_cross_distinct_delegated_agents() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "rel", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+
+        let explorer = leveler_core::AgentId::generate().into_inner();
+        let worker = leveler_core::AgentId::generate().into_inner();
+        persist(
+            &db,
+            &sid,
+            agent_start(&explorer, "Explorer", "explorer", "inspect"),
+        )
+        .await;
+        persist(&db, &sid, tool_start_by("e1", "read_file", &explorer)).await;
+        persist(&db, &sid, tool_end_by("e1", "read_file", &explorer)).await;
+        persist(&db, &sid, agent_end(&explorer, "Explorer", true, "mapped")).await;
+        persist(&db, &sid, tool_start("m1", "run_command")).await;
+        persist(&db, &sid, tool_end("m1", "run_command", false)).await;
+        persist(&db, &sid, agent_start(&worker, "Worker", "worker", "tests")).await;
+        persist(&db, &sid, tool_start_by("w1", "run_command", &worker)).await;
+        persist(&db, &sid, tool_end_by("w1", "run_command", &worker)).await;
+        persist(&db, &sid, agent_end(&worker, "Worker", true, "ok")).await;
+
+        let focused = query_observability(&db, &sid, Some(1), 20, 20)
+            .await
+            .unwrap();
+        assert!(
+            focused
+                .relations
+                .iter()
+                .any(|r| r.kind == "same_agent" && r.label == "same sub-agent"),
+            "{:?}",
+            focused.relations
+        );
+        assert!(
+            focused
+                .relations
+                .iter()
+                .any(|r| r.kind == "same_agent" && r.label == "tool by this agent"),
+            "{:?}",
+            focused.relations
+        );
+        let related: std::collections::HashSet<i64> =
+            focused.relations.iter().map(|r| r.sequence).collect();
+        // Worker start is sequence 7 (1 start, 2-3 tools, 4 finish, 5-6 main tools).
+        assert!(
+            !related.contains(&7),
+            "worker start must not relate to explorer: {:?}",
+            focused.relations
+        );
+        assert!(
+            !related.contains(&8) && !related.contains(&9),
+            "worker tools must not relate to explorer: {:?}",
+            focused.relations
+        );
+        assert!(
+            !related.contains(&5) && !related.contains(&6),
+            "main tools must not relate to explorer: {:?}",
+            focused.relations
+        );
+    }
+
+    #[tokio::test]
     async fn session_wide_tool_aggregates_survive_file_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obs.sqlite");

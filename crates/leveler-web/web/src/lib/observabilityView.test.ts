@@ -112,7 +112,9 @@ describe('observability projection', () => {
     expect(shouldRefreshObservability({ type: 'tool_call_completed', id: 'c', ok: true, preview: '', duration_ms: 1 })).toBe(
       true,
     );
-    expect(shouldRefreshObservability({ type: 'observability_loaded', observation: loaded() })).toBe(false);
+    expect(
+      shouldRefreshObservability({ type: 'observability_loaded', query_id: 'q1', observation: loaded() }),
+    ).toBe(false);
   });
 
   it('projects running / completed / failed agents from protocol status only', () => {
@@ -169,6 +171,33 @@ describe('observability projection', () => {
     );
     expect(view.agents).toHaveLength(2);
     expect(view.summary.delegatedAgents).toBe(2);
+  });
+
+  it('maps a unique durable agent id to nickname without labeling Main', () => {
+    const id = '3f1c0a9e-2b44-4d3a-9c11-7e2b0c8a1d55';
+    const view = projectObservability(
+      loaded({
+        agents: [{ id, nickname: 'Explorer', role: 'explorer', status: 'ok', summary: 'done' }],
+        window: [
+          row({
+            sequence: 4,
+            class: 'read',
+            title: 'read_file',
+            turn_id: 't1',
+            fields: [{ key: 'Agent', value: id }],
+          }),
+          row({
+            sequence: 5,
+            class: 'shell',
+            title: 'run_command',
+            turn_id: 't1',
+            fields: [{ key: 'Agent', value: 'main' }],
+          }),
+        ],
+      }),
+    );
+    expect(view.groups[0]?.steps[0]?.agentLabel).toBe('Explorer');
+    expect(view.groups[0]?.steps[1]?.agentLabel).toBeNull();
   });
 
   it('tool attribution uses Agent field; Main is unlabeled', () => {

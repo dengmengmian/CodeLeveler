@@ -88,10 +88,12 @@ export class RuntimeBridge {
   queryObservability(sessionId?: SessionId): void {
     const id = sessionId ?? this.getState().current?.id;
     if (!id) return;
-    this.dispatch({ type: 'observation_loading' });
+    const queryId = crypto.randomUUID();
+    this.dispatch({ type: 'observation_loading', queryId });
     this.deliver({
       type: 'query_observability',
       session_id: id,
+      query_id: queryId,
       before: 0,
       after: 80,
     });
@@ -324,7 +326,11 @@ export class RuntimeBridge {
         });
         break;
       case 'observability_loaded':
-        this.dispatch({ type: 'observation_loaded', observation: ev.observation });
+        this.dispatch({
+          type: 'observation_loaded',
+          observation: ev.observation,
+          queryId: ev.query_id,
+        });
         break;
       default:
         // user_shell_*（web 无 !command 入口，本期不渲染）/ project_rules_loaded /

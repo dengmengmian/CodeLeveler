@@ -2,9 +2,9 @@
 
 **Date:** 2026-08-19  
 **Baseline:** `1010f0fd44c68b92aa05cbdd5f1b1bd5d9292dee`  
+**Closeout:** `41b72086` + this correctness patch  
 **Scope:** Session-wide Agent projection + honest in-session Delegation view.
-No Child Session, no Replay, no new EventLog, no new Query type, no protocol
-change.
+No Child Session, no Replay, no new EventLog, no new Query type.
 
 ---
 
@@ -14,7 +14,8 @@ Current Runtime Agent model (unchanged):
 
 ```
 Parent Session  (one SessionId, one EventLog)
-    spawn_agent  →  id = "agent-N"
+    spawn_agent  →  id = AgentId::generate()   (UUID; session-unique)
+                    nickname = Euclid / Newton / …  (per-run ordinal label)
                     SubAgentStarted { id, nickname, role, task }   durable
                     child tools carry agent_id = that id
                     SubAgentFinished { id, nickname, ok, summary } durable
@@ -211,3 +212,79 @@ Also still true, and not papered over:
 
 Phase 4A stops here. Child Session belongs on a later Structured SubAgent
 Capability path, not a WebUI mock.
+
+---
+
+# Phase 4A Correctness Closeout
+
+## Issue A — Agent ID was run-local
+
+**Root cause:** `drive()` owned `agents_spawned` and minted `agent-{n}` at
+spawn. The next user turn re-enters `drive()`, so the first child of turn 2
+reused `agent-1`. Session-wide `collect_agents` keys on `id`, so later turns
+overwrote earlier Explorer/Worker history.
+
+**Fix:** `new_delegated_agent_id()` = `AgentId::generate()` (typed UUID in
+`leveler-core`, same family as `SessionId` / `ToolCallId`). Nickname stays
+`agent_nickname(seq)` for this run. `AgentId` is a **delegation identity**,
+not a child `SessionId`.
+
+The same string is used for:
+
+```
+SubAgentStarted.id
+SubAgentProgress.id
+SubAgentActivity.id
+SubAgentFinished.id
+BackgroundChild.id
+ToolCallStarted/Finished.agent_id
+UiAgentObservation.id
+relations_for()
+```
+
+**Tests:** `delegated_agent_ids_are_unique_and_not_run_ordinals`,
+`first_spawn_of_each_turn_is_a_distinct_session_agent`,
+`relations_do_not_cross_distinct_delegated_agents`, spawn-path
+start/progress/finish identity in `multi_agent_test`.
+
+## Issue B — last_sequence was a session version, not a query id
+
+**Root cause:** `ObservabilityLoaded` is a session broadcast. Web tail
+(`center=None`, window `21..100`) and TUI inspect (`center=40`, window
+`20..60`) share `last_sequence=100`. The monotonic seq guard accepted the
+historical payload as a same-version refresh.
+
+**Fix:** `QueryObservability.query_id: CommandId` (reuses the existing
+command-id type; not a new id family). Runtime echoes it on
+`ObservabilityLoaded.query_id`. Web stores `pendingObservationQuery` and
+ignores any other `query_id`. TUI `/trace` does the same via
+`TraceView.pending_query_id`. Session switch clears the pending token.
+
+`last_sequence` comparison was **removed** so two guards cannot disagree.
+Equal-sequence refresh is allowed when the client owns the new `query_id`.
+
+Protocol minor `1.5 → 1.6` (additive field). Schemas + `protocol.gen.ts`
+regenerated.
+
+**Tests:** Web store cases 1–5 (older query, same-seq historical, owned
+refresh, superseded Web query, other session). TUI
+`tui_trace_ignores_observability_loaded_for_a_foreign_query` and
+`tui_trace_drops_a_stale_owned_query_after_refresh`.
+
+## Boundaries (unchanged)
+
+```
+Child Session implemented? NO
+Child SessionId? NO
+parent_id? NO
+Per-child EventLog? NO
+Child Resume? NO
+Debugger Replay? NO
+Durable SubAgentProgress? NO
+Durable SubAgentActivity? NO
+```
+
+Live `SessionView.agents` is still the current-turn HUD. Durable agents are
+still session-wide QueryObservability. Execution attribution is still
+`fields.Agent`. Main stays unlabeled. CompletionTruth was not changed in
+this closeout.

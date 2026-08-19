@@ -79,6 +79,12 @@ string_id!(
     ToolCallId
 );
 string_id!(
+ /// Identifies one in-session delegated worker (`spawn_agent` child).
+ /// Distinct from [`SessionId`]: this is a delegation identity, not a
+ /// child session, and it is not a parent/child session tree key.
+    AgentId
+);
+string_id!(
  /// Identifies a stored artifact (large tool output, diff, report, ...).
     ArtifactId
 );
@@ -151,6 +157,9 @@ mod tests {
         let a = RequestId::generate();
         let b = RequestId::generate();
         assert_ne!(a, b);
+        let c = AgentId::generate();
+        let d = AgentId::generate();
+        assert_ne!(c, d);
     }
 
     #[test]

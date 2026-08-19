@@ -749,6 +749,7 @@
       "description": "Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].",
       "type": "object",
       "required": [
+        "query_id",
         "session_id",
         "type"
       ],
@@ -774,6 +775,14 @@
             "null"
           ],
           "format": "int64"
+        },
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`]. Distinct from envelope `command_id` (delivery idempotency): this names the query so a client can ignore another client's (or its own stale) observatory response. Not a session identity.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            }
+          ]
         },
         "session_id": {
           "$ref": "#/definitions/SessionId"
@@ -887,6 +896,10 @@
     },
     "ClarificationId": {
       "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "CommandId": {
+      "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
       "type": "string"
     },
     "ModelRef": {

@@ -6,9 +6,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use leveler_client_protocol::{
-    ClientCommand, MessageId, ObservationClass, PermissionProfile, PlanStepStatus, RuntimeEvent,
-    SessionId, ToolCallId, UiDiff, UiDiffFile, UiObservabilityLoaded, UiPlan, UiPlanStep,
-    UiRecoveryObservation, UiSessionObservation, UiSessionSnapshot, UiToolAggregate,
+    ClientCommand, CommandId, MessageId, ObservationClass, PermissionProfile, PlanStepStatus,
+    RuntimeEvent, SessionId, ToolCallId, UiDiff, UiDiffFile, UiObservabilityLoaded, UiPlan,
+    UiPlanStep, UiRecoveryObservation, UiSessionObservation, UiSessionSnapshot, UiToolAggregate,
 };
 use leveler_tui::action::{Action, Effect};
 use leveler_tui::reducer::reduce;
@@ -431,15 +431,18 @@ fn tui_trace_queries_durable_observatory_and_esc_returns() {
     typed(&mut s, "/trace");
     let effects = enter(&mut s);
     assert_eq!(s.active_screen, Screen::Trace);
+    let query_id = effects.iter().find_map(|e| match e {
+        Effect::Send(ClientCommand::QueryObservability { query_id, .. }) => Some(query_id.clone()),
+        _ => None,
+    });
     assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::Send(ClientCommand::QueryObservability { .. }))),
+        query_id.is_some(),
         " /trace must query the runtime, not SQLite: {effects:?}"
     );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: query_id.unwrap(),
             observation: UiObservabilityLoaded {
                 session: UiSessionObservation {
                     session_id: SessionId::new("e2e"),
@@ -506,4 +509,114 @@ fn tui_trace_queries_durable_observatory_and_esc_returns() {
     );
     reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+fn trace_observation(window_from: i64, window_to: i64) -> UiObservabilityLoaded {
+    UiObservabilityLoaded {
+        session: UiSessionObservation {
+            session_id: SessionId::new("e2e"),
+            goal: "e2e".into(),
+            repository: "/repo".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            status: "completed".into(),
+            model: "glm-5.2".into(),
+            work_profile: "balanced".into(),
+            collaboration: "goal".into(),
+            last_sequence: Some(100),
+            request_count: 3,
+            input_tokens: 1000,
+            output_tokens: 40,
+            avg_latency_ms: Some(2000),
+            last_latency_ms: Some(1800),
+            request_failures: 0,
+            request_retries: 0,
+            tool_started: 5,
+            tool_finished: 5,
+            verification_runs: 1,
+            compact_count: 0,
+            subagent_started: 0,
+            repair_started: 0,
+        },
+        window: Vec::new(),
+        window_from,
+        window_to,
+        requests: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+        recovery: UiRecoveryObservation {
+            interrupted_turns: 0,
+            repair_attempts: 0,
+            workspace_snapshots: 0,
+            review_stages: Vec::new(),
+        },
+        relations: Vec::new(),
+    }
+}
+
+#[test]
+fn tui_trace_ignores_observability_loaded_for_a_foreign_query() {
+    let mut s = opened();
+    typed(&mut s, "/trace");
+    let effects = enter(&mut s);
+    let owned = effects.iter().find_map(|e| match e {
+        Effect::Send(ClientCommand::QueryObservability { query_id, .. }) => Some(query_id.clone()),
+        _ => None,
+    });
+    let owned = owned.expect("trace query");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: CommandId::new("foreign-historical"),
+            observation: trace_observation(20, 60),
+        }),
+    );
+    assert!(
+        s.trace.loaded.is_none(),
+        "foreign query must not populate /trace"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: owned,
+            observation: trace_observation(21, 100),
+        }),
+    );
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_from), Some(21));
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_to), Some(100));
+}
+
+#[test]
+fn tui_trace_drops_a_stale_owned_query_after_refresh() {
+    let mut s = opened();
+    typed(&mut s, "/trace");
+    let first = enter(&mut s);
+    let query_a = first.iter().find_map(|e| match e {
+        Effect::Send(ClientCommand::QueryObservability { query_id, .. }) => Some(query_id.clone()),
+        _ => None,
+    });
+    let query_a = query_a.expect("first query");
+    let second = reduce(&mut s, key(KeyCode::Char('r')));
+    let query_b = second.iter().find_map(|e| match e {
+        Effect::Send(ClientCommand::QueryObservability { query_id, .. }) => Some(query_id.clone()),
+        _ => None,
+    });
+    let query_b = query_b.expect("refresh query");
+    assert_ne!(query_a, query_b);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: query_b.clone(),
+            observation: trace_observation(21, 100),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: query_a,
+            observation: trace_observation(20, 60),
+        }),
+    );
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_from), Some(21));
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_to), Some(100));
 }

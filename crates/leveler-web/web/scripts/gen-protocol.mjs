@@ -51,6 +51,9 @@ function refName(ref) {
 /** schema 节点 → TS 类型表达式。 */
 function tsType(node, ctx) {
   if (node.$ref) return refName(node.$ref);
+  if (node.allOf && node.allOf.length === 1) {
+    return tsType({ ...node.allOf[0], description: node.description }, ctx);
+  }
   if (node.anyOf) {
     return node.anyOf.map((n) => tsType(n, ctx)).join(' | ');
   }

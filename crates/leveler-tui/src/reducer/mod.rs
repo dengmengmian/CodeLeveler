@@ -40,12 +40,13 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                     .as_ref()
                     .map(|l| l.session.session_id.clone())
                     .unwrap_or_else(|| state.session_id.clone());
-                vec![Effect::Send(ClientCommand::QueryObservability {
+                vec![Effect::Send(crate::observability::issue_query(
+                    &mut state.trace,
                     session_id,
-                    center_seq: None,
-                    before: 0,
-                    after: 80,
-                })]
+                    None,
+                    0,
+                    80,
+                ))]
             } else {
                 Vec::new()
             }

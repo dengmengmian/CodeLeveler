@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::{ApprovalId, ClarificationId, ToolCallId};
+use leveler_core::{ApprovalId, ClarificationId, CommandId, ToolCallId};
 
 use super::approval::{UiApprovalRequest, UiClarificationRequest};
 use super::media::AttachmentRef;
@@ -267,7 +267,10 @@ pub enum RuntimeEvent {
     },
     /// Result of [`crate::ClientCommand::QueryObservability`]. Read-only
     /// projection of durable facts for the current or a historical session.
+    /// `query_id` echoes the command's correlation token so a client consumes
+    /// only the query it currently owns.
     ObservabilityLoaded {
+        query_id: CommandId,
         observation: crate::UiObservabilityLoaded,
     },
 }

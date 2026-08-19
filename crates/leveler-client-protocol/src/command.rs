@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::{ApprovalId, CheckpointId, ClarificationId, SessionId};
+use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, SessionId};
 use leveler_model::ModelRef;
 
 use super::media::AttachmentRef;
@@ -178,6 +178,11 @@ pub enum ClientCommand {
     /// verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].
     QueryObservability {
         session_id: SessionId,
+        /// Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`].
+        /// Distinct from envelope `command_id` (delivery idempotency): this
+        /// names the query so a client can ignore another client's (or its
+        /// own stale) observatory response. Not a session identity.
+        query_id: CommandId,
         /// Sequence to center the event window on. `None` = latest durable seq.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         center_seq: Option<i64>,
@@ -435,6 +440,7 @@ mod tests {
         roundtrip(
             ClientCommand::QueryObservability {
                 session_id: SessionId::new("s1"),
+                query_id: CommandId::new("q1"),
                 center_seq: Some(42),
                 before: 10,
                 after: 20,

@@ -579,6 +579,13 @@ pub(crate) const AGENT_NICKNAMES: &[&str] = &[
     "Fermi", "Gauss", "Noether",
 ];
 
+/// Durable identity for one `spawn_agent` child. Unique across turns of the
+/// same session. Not a [`leveler_core::SessionId`] and not a run-local
+/// `agent-N` ordinal.
+pub(crate) fn new_delegated_agent_id() -> String {
+    leveler_core::AgentId::generate().into_inner()
+}
+
 /// The nickname for the `seq`-th sub-agent (1-based).
 pub(crate) fn agent_nickname(seq: usize) -> String {
     let i = seq.saturating_sub(1);
@@ -927,6 +934,26 @@ mod profile_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn looks_like_run_ordinal(id: &str) -> bool {
+        id.strip_prefix("agent-")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    #[test]
+    fn delegated_agent_ids_are_unique_and_not_run_ordinals() {
+        let a = new_delegated_agent_id();
+        let b = new_delegated_agent_id();
+        assert_ne!(a, b);
+        assert!(!looks_like_run_ordinal(&a), "{a}");
+        assert!(!looks_like_run_ordinal(&b), "{b}");
+    }
+
+    #[test]
+    fn nickname_stays_a_display_label_not_an_id() {
+        assert_eq!(agent_nickname(1), "Euclid");
+        assert_eq!(agent_nickname(2), "Newton");
+    }
 
     #[test]
     fn suggests_delegation_for_parallel_and_chinese_markers() {

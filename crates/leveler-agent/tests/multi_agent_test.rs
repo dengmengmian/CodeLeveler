@@ -18,6 +18,16 @@ use leveler_model::{
 };
 use leveler_tools::{ToolContext, default_registry};
 
+fn first_started_id(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SubAgentStarted { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("SubAgentStarted")
+}
+
 /// Replays scripted responses in order; each `stream` sleeps either the next
 /// staged delay or the default delay, so concurrent sub-agents can overlap.
 struct SleepyRuntime {
@@ -324,6 +334,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
         .await
         .unwrap();
 
+    let child = first_started_id(&events);
     assert!(
         events.iter().any(|event| {
             matches!(event, AgentEvent::SubAgentProgress {
@@ -332,7 +343,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
             input_tokens: 1_900,
             output_tokens: 110,
             cached_input_tokens: 900,
-        } if id == "agent-1")
+        } if id == &child)
         }),
         "per-agent progress must bubble while it is executing: {events:?}"
     );
@@ -4520,8 +4531,9 @@ async fn a_default_spawn_runs_in_background_and_settles_into_a_later_round() {
         spawn_result.contains("started in the background"),
         "{spawn_result}"
     );
+    let child = first_started_id(&events);
     assert!(
-        spawn_result.contains("agent-1"),
+        spawn_result.contains(&child),
         "durable child id must be model-visible: {spawn_result}"
     );
     // Settlement notice reached the model: some later PARENT request carries
@@ -4540,11 +4552,13 @@ async fn a_default_spawn_runs_in_background_and_settles_into_a_later_round() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::SubAgentStarted { id, .. } if id == "agent-1"))
+            .any(|e| matches!(e, AgentEvent::SubAgentStarted { id, .. } if id == &child))
     );
-    assert!(events.iter().any(
-        |e| matches!(e, AgentEvent::SubAgentFinished { id, ok: true, .. } if id == "agent-1")
-    ));
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::SubAgentFinished { id, ok: true, .. } if id == &child)
+        )
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -4973,10 +4987,11 @@ async fn the_round_limit_exit_drains_running_children_instead_of_aborting() {
         leveler_agent::StopReason::BudgetExhausted | leveler_agent::StopReason::TurnLimitReached
     ));
     // The child settled truthfully at the exit drain — it was NOT aborted.
+    let child = first_started_id(&events);
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::SubAgentFinished { id, .. } if id == "agent-1")),
+            .any(|e| matches!(e, AgentEvent::SubAgentFinished { id, .. } if id == &child)),
         "round-limit exit must settle the running child, not abort it"
     );
     // Its work landed and its scope record is cleared.

@@ -36,6 +36,9 @@ export type CheckState = 'running' | 'passed' | 'failed' | 'skipped';
 /** Identifies a pending clarification (ask-user) request. */
 export type ClarificationId = string;
 
+/** Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice. */
+export type CommandId = string;
+
 /** Identifies a single assistant/user message in the transcript. A protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message. */
 export type MessageId = string;
 
@@ -429,7 +432,7 @@ export type ClientCommand =
   | { type: 'cancel_user_shell'; execution_id: UserShellId; session_id: SessionId }
   | { type: 'btw'; question: string; session_id: SessionId }
   /** Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`]. */
-  | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; session_id: SessionId }
+  | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id: CommandId; session_id: SessionId }
   /** The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command. */
   | { type: 'quit' };
 
@@ -539,5 +542,5 @@ export type RuntimeEvent =
   | { type: 'btw_failed'; error: string }
   /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
   | { type: 'turn_progress'; closeout_deny_rounds: number; closing: boolean; no_progress_streak: number; phase: string }
-  /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. */
-  | { type: 'observability_loaded'; observation: UiObservabilityLoaded };
+  /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. `query_id` echoes the command's correlation token so a client consumes only the query it currently owns. */
+  | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id: CommandId };

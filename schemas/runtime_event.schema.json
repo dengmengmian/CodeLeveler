@@ -1232,15 +1232,19 @@
       }
     },
     {
-      "description": "Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session.",
+      "description": "Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. `query_id` echoes the command's correlation token so a client consumes only the query it currently owns.",
       "type": "object",
       "required": [
         "observation",
+        "query_id",
         "type"
       ],
       "properties": {
         "observation": {
           "$ref": "#/definitions/UiObservabilityLoaded"
+        },
+        "query_id": {
+          "$ref": "#/definitions/CommandId"
         },
         "type": {
           "type": "string",
@@ -1337,6 +1341,10 @@
     },
     "ClarificationId": {
       "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "CommandId": {
+      "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
       "type": "string"
     },
     "MessageId": {

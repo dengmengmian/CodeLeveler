@@ -109,14 +109,18 @@ describe('query observability', () => {
   it('sends query_observability and stores ObservabilityLoaded off live tools', () => {
     const { bridge, sent, apply, state } = harness();
     bridge.queryObservability('s1');
-    expect(sent[sent.length - 1]).toEqual({
+    const sentQuery = sent[sent.length - 1];
+    expect(sentQuery).toMatchObject({
       type: 'query_observability',
       session_id: 's1',
       before: 0,
       after: 80,
     });
+    expect(sentQuery.type === 'query_observability' && sentQuery.query_id).toBeTruthy();
+    const queryId = sentQuery.type === 'query_observability' ? sentQuery.query_id : '';
     apply({
       type: 'observability_loaded',
+      query_id: queryId,
       observation: {
         agents: [],
         recovery: { interrupted_turns: 0, repair_attempts: 0, workspace_snapshots: 0, review_stages: [] },

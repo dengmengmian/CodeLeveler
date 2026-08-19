@@ -1,6 +1,8 @@
 //! Presentation state for `/trace`. The payload is a protocol query result.
 
-use leveler_client_protocol::{ObservationClass, UiObservabilityLoaded, UiObservationRow};
+use leveler_client_protocol::{
+    CommandId, ObservationClass, UiObservabilityLoaded, UiObservationRow,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TraceTab {
@@ -118,6 +120,9 @@ impl TraceFilter {
 #[derive(Debug, Clone, Default)]
 pub struct TraceView {
     pub loaded: Option<UiObservabilityLoaded>,
+    /// Query this `/trace` view currently owns. Foreign / stale
+    /// `ObservabilityLoaded` events are ignored.
+    pub pending_query_id: Option<CommandId>,
     pub tab: TraceTab,
     pub filter: TraceFilter,
     pub selected: usize,

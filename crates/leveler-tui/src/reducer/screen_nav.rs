@@ -195,12 +195,13 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                             .as_ref()
                             .map(|l| l.session.session_id.clone())
                             .unwrap_or_else(|| state.session_id.clone());
-                        return vec![Effect::Send(ClientCommand::QueryObservability {
-                            session_id: sid,
-                            center_seq: Some(seq),
-                            before: 20,
-                            after: 20,
-                        })];
+                        return vec![Effect::Send(crate::observability::issue_query(
+                            &mut state.trace,
+                            sid,
+                            Some(seq),
+                            20,
+                            20,
+                        ))];
                     }
                 }
                 KeyCode::Char('f') => {
@@ -214,12 +215,13 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                         .as_ref()
                         .map(|l| l.session.session_id.clone())
                         .unwrap_or_else(|| state.session_id.clone());
-                    return vec![Effect::Send(ClientCommand::QueryObservability {
-                        session_id: sid,
-                        center_seq: None,
-                        before: 0,
-                        after: 80,
-                    })];
+                    return vec![Effect::Send(crate::observability::issue_query(
+                        &mut state.trace,
+                        sid,
+                        None,
+                        0,
+                        80,
+                    ))];
                 }
                 _ => {
                     scroll_screen_key(state, &key, true);
@@ -270,12 +272,13 @@ pub(super) fn open_trace(state: &mut AppState, session_id: Option<String>) -> Ve
     state.screen_scroll = 0;
     state.trace.inspect = false;
     state.trace.selected = 0;
-    vec![Effect::Send(ClientCommand::QueryObservability {
+    vec![Effect::Send(crate::observability::issue_query(
+        &mut state.trace,
         session_id,
-        center_seq: None,
-        before: 0,
-        after: 80,
-    })]
+        None,
+        0,
+        80,
+    ))]
 }
 
 /// Open the Sessions screen and refresh the list (spec §52).
