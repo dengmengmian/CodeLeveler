@@ -5312,3 +5312,89 @@ async fn a_settlement_the_parent_acts_on_is_consumed() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Review 必改A: a FOREGROUND spawn folds mid-batch, so its report is not
+/// model-visible until the NEXT round — a successful sibling tool call in the
+/// same batch must not consume that debt. Only settlements the model already
+/// saw when the round's actions ran are consumable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreground_settlement_is_not_consumed_by_same_round_siblings() {
+    let dir = tmp("bg-debt-foreground", 71);
+    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // r1: foreground spawn AND a sibling patch in the SAME batch. The
+            // child's report lands as this round's tool result — the model has
+            // not seen it yet; the sibling patch is a non-observe success that
+            // must NOT consume the just-folded settlement.
+            assistant_with(
+                vec![
+                    spawn_call(
+                        "s1",
+                        serde_json::json!({
+                            "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                            "role": "worker",
+                            "files": ["b.txt"],
+                            "run_in_background": false
+                        }),
+                    ),
+                    patch_call("e1", "a.txt", "parent", "parent-edited"),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            // r2/r3: observe-only rounds run out the window — the parent never
+            // acts WITH the report in context.
+            assistant_with(
+                vec![tool_call_part(
+                    "r1",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "r2",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(20),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        3,
+    );
+    let outcome = executor
+        .run(
+            "delegate in the foreground, then run out of window",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    assert_eq!(
+        outcome.progress.unconsumed_child_settlements, 1,
+        "a settlement the model has not seen must survive same-round consumption"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

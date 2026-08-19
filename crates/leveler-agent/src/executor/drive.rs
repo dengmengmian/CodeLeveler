@@ -507,6 +507,12 @@ impl Executor {
             // nudge continue), the model never runs a round blind to a child
             // that already finished.
             settle_finished_children!(round);
+            // Everything in the debt counter NOW is model-visible this round
+            // (the notices are already in `messages`). Debt added later in the
+            // round — a foreground spawn folding mid-batch, a child settling
+            // at the round's end — is invisible until the next model call and
+            // must survive this round's consumption reset.
+            let visible_settlement_debt = progress.unconsumed_child_settlements;
             if let Some(max) = self.step_limits.max_model_tokens
                 && model_tokens_spent >= max
             {
@@ -2696,13 +2702,15 @@ impl Executor {
                 return Err(AgentError::Cancelled);
             }
 
-            // A successful non-observe action this round ran with every prior
-            // settlement notice already model-visible — the parent has acted
-            // on them, so the settlement debt is consumed. Reset BEFORE this
-            // boundary's settle below: a result landing right now has not been
-            // seen by any model round yet and must still read as debt.
+            // A successful non-observe action this round ran with the round's
+            // MODEL-VISIBLE settlement notices in context — the parent has
+            // acted on those, so exactly that portion of the debt is consumed.
+            // Debt added during this round (foreground folds, this boundary's
+            // settle below) was never seen by a model call and survives.
             if non_observe_success_this_round > 0 {
-                progress.unconsumed_child_settlements = 0;
+                progress.unconsumed_child_settlements = progress
+                    .unconsumed_child_settlements
+                    .saturating_sub(visible_settlement_debt);
             }
 
             // V2: forward background children's live progress and settle any

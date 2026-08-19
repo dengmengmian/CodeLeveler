@@ -2428,7 +2428,10 @@ mod continue_cap_tests {
             spent, TOTAL,
             "with debt standing the goal consumes the full remaining budget"
         );
-        assert_eq!(windows_opened, 2, "280 total / 100 local = two follow-up windows");
+        assert_eq!(
+            windows_opened, 2,
+            "280 total / 100 local = two follow-up windows"
+        );
     }
 
     #[test]

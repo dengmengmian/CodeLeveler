@@ -79,6 +79,10 @@ impl SupervisorPolicy for DefaultSupervisorPolicy {
                 && ended.progress.unconsumed_child_settlements > 0
                 && ended.progress.cumulative_rounds < total
                 && !ended.progress.human_boundary_seen()
+                // A Closing/Terminal ledger would not seed into the next
+                // window (fresh-epoch accounting) — the integration window
+                // only opens where the clamp's epoch spend survives.
+                && !ended.progress.is_terminal_for_inheritance()
                 && ended.windows_without_progress < MAX_NO_PROGRESS_WINDOWS
             {
                 return Continuation::DriveGoalAgain;
@@ -410,6 +414,19 @@ mod tests {
         let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
         e.round_budget = ContinuationPolicy::bounded(280);
         e.windows_without_progress = MAX_NO_PROGRESS_WINDOWS;
+        assert_eq!(policy.after_turn(&e), Continuation::Stop);
+    }
+
+    #[test]
+    fn settlement_debt_does_not_open_a_window_for_closing_progress() {
+        // Review 建议B: a ledger already Closing/Terminal would NOT seed into
+        // the next window (fresh-epoch accounting) — the exception must not
+        // fire there, or the clamp would restart from zero rounds.
+        let mut progress = debted(100, 1);
+        progress.enter_closing();
+        let policy = DefaultSupervisorPolicy::default();
+        let mut e = ended(StopReason::TurnLimitReached, &progress, &[], None);
+        e.round_budget = ContinuationPolicy::bounded(280);
         assert_eq!(policy.after_turn(&e), Continuation::Stop);
     }
 
