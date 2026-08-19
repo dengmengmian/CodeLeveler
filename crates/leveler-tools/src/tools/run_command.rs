@@ -780,9 +780,9 @@ mod tests {
             );
         }
         // And a non-empty one still covers its own subtree.
-        let allow = vec!["src/output".to_string()];
-        assert!(path_allows(&allow[0], "src/output/json.rs"));
-        assert!(!path_allows(&allow[0], "src/input.rs"));
+        let allowed = "src/output";
+        assert!(path_allows(allowed, "src/output/json.rs"));
+        assert!(!path_allows(allowed, "src/input.rs"));
     }
 
     // ── R004 F3: workspace read boundary for shell/argv (T4) ────────────────
