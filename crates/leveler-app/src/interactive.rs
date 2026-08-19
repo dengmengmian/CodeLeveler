@@ -1964,6 +1964,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 .await
                 {
                     Ok(observation) => {
+                        // Echo the caller's token. `None` is a 1.5 query:
+                        // still serve the read model; 1.6 clients will not
+                        // treat the response as owned.
                         let _ =
                             self.events_for(&session_id)
                                 .send(RuntimeEvent::ObservabilityLoaded {

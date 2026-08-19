@@ -21,7 +21,7 @@ pub fn issue_query(
     trace.pending_query_id = Some(query_id.clone());
     ClientCommand::QueryObservability {
         session_id,
-        query_id,
+        query_id: Some(query_id),
         center_seq,
         before,
         after,

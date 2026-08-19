@@ -288,3 +288,39 @@ Live `SessionView.agents` is still the current-turn HUD. Durable agents are
 still session-wide QueryObservability. Execution attribution is still
 `fields.Agent`. Main stays unlabeled. CompletionTruth was not changed in
 this closeout.
+
+---
+
+# Protocol Compatibility Closeout
+
+### Before
+
+```
+Protocol 1.6 added required query_id
+→ violated same-major minor compatibility
+```
+
+`is_compatible_with()` only checks `major`. A 1.5 JSON body without
+`query_id` failed to decode on 1.6, even though the envelope said
+compatible.
+
+### After
+
+```
+query_id is Option<CommandId>
+#[serde(default, skip_serializing_if = "Option::is_none")]
+```
+
+1.5 bodies decode as `None`. 1.6 clients still send `Some(id)` and only
+apply `ObservabilityLoaded` when `pending == Some(id)`. A `None` response
+is ignored — not a `last_sequence` fallback.
+
+```
+Decode compatibility
+!=
+feature capability
+```
+
+A 1.6 Web talking to a 1.5 runtime can exchange frames. The observatory
+read model does not update until the peer echoes a matching `query_id`.
+Agent identity (`AgentId::generate()`) is unchanged.

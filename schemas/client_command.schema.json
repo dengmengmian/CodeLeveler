@@ -749,7 +749,6 @@
       "description": "Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].",
       "type": "object",
       "required": [
-        "query_id",
         "session_id",
         "type"
       ],
@@ -777,10 +776,13 @@
           "format": "int64"
         },
         "query_id": {
-          "description": "Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`]. Distinct from envelope `command_id` (delivery idempotency): this names the query so a client can ignore another client's (or its own stale) observatory response. Not a session identity.",
-          "allOf": [
+          "description": "Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`]. Distinct from envelope `command_id` (delivery idempotency): this names the query so a client can ignore another client's (or its own stale) observatory response. Absent on protocol 1.5 peers. Not a session identity.",
+          "anyOf": [
             {
               "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
             }
           ]
         },

@@ -1232,11 +1232,10 @@
       }
     },
     {
-      "description": "Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. `query_id` echoes the command's correlation token so a client consumes only the query it currently owns.",
+      "description": "Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a 1.6 client must not treat that as ownership.",
       "type": "object",
       "required": [
         "observation",
-        "query_id",
         "type"
       ],
       "properties": {
@@ -1244,7 +1243,14 @@
           "$ref": "#/definitions/UiObservabilityLoaded"
         },
         "query_id": {
-          "$ref": "#/definitions/CommandId"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "type": {
           "type": "string",

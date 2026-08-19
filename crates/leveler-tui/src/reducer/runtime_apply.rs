@@ -518,8 +518,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             observation,
             query_id,
         } => {
-            if state.trace.pending_query_id.as_ref() != Some(&query_id) {
-                return;
+            // Only a correlated 1.6 response for the query this view owns.
+            // `query_id: None` is a legacy 1.5 payload — decode-safe, not owned.
+            match (&state.trace.pending_query_id, &query_id) {
+                (Some(pending), Some(incoming)) if pending == incoming => {}
+                _ => return,
             }
             state.trace.loaded = Some(observation);
             state.trace.clamp();

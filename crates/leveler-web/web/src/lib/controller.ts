@@ -329,7 +329,7 @@ export class RuntimeBridge {
         this.dispatch({
           type: 'observation_loaded',
           observation: ev.observation,
-          queryId: ev.query_id,
+          queryId: ev.query_id ?? null,
         });
         break;
       default:

@@ -181,8 +181,10 @@ pub enum ClientCommand {
         /// Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`].
         /// Distinct from envelope `command_id` (delivery idempotency): this
         /// names the query so a client can ignore another client's (or its
-        /// own stale) observatory response. Not a session identity.
-        query_id: CommandId,
+        /// own stale) observatory response. Absent on protocol 1.5 peers.
+        /// Not a session identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
         /// Sequence to center the event window on. `None` = latest durable seq.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         center_seq: Option<i64>,
@@ -440,12 +442,52 @@ mod tests {
         roundtrip(
             ClientCommand::QueryObservability {
                 session_id: SessionId::new("s1"),
-                query_id: CommandId::new("q1"),
+                query_id: Some(CommandId::new("q1")),
                 center_seq: Some(42),
                 before: 10,
                 after: 20,
             },
             "query_observability",
+        );
+    }
+
+    #[test]
+    fn query_observability_decodes_protocol_1_5_without_query_id() {
+        let cmd: ClientCommand = serde_json::from_str(
+            r#"{"type":"query_observability","session_id":"s1","before":0,"after":80}"#,
+        )
+        .expect("1.5 query_observability must decode on 1.6");
+        match cmd {
+            ClientCommand::QueryObservability {
+                session_id,
+                query_id,
+                center_seq,
+                before,
+                after,
+            } => {
+                assert_eq!(session_id.as_str(), "s1");
+                assert_eq!(query_id, None);
+                assert_eq!(center_seq, None);
+                assert_eq!(before, 0);
+                assert_eq!(after, 80);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_observability_omits_absent_query_id_on_the_wire() {
+        let json = serde_json::to_string(&ClientCommand::QueryObservability {
+            session_id: SessionId::new("s1"),
+            query_id: None,
+            center_seq: None,
+            before: 0,
+            after: 80,
+        })
+        .unwrap();
+        assert!(
+            !json.contains("query_id"),
+            "legacy-shaped query must not emit query_id: {json}"
         );
     }
 

@@ -241,7 +241,7 @@ export type Action =
   | { type: 'toggle_inspector' }
   | { type: 'set_inspector'; open: boolean }
   | { type: 'observation_loading'; queryId: string }
-  | { type: 'observation_loaded'; observation: UiObservabilityLoaded; queryId: string }
+  | { type: 'observation_loaded'; observation: UiObservabilityLoaded; queryId: string | null }
   | { type: 'user_message'; id: string; text: string; time: string }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
@@ -462,7 +462,11 @@ export function reducer(state: AppState, action: Action): void {
       if (state.current && action.observation.session.session_id !== state.current.id) {
         return;
       }
-      if (state.pendingObservationQuery !== action.queryId) {
+      if (
+        state.pendingObservationQuery == null ||
+        action.queryId == null ||
+        state.pendingObservationQuery !== action.queryId
+      ) {
         return;
       }
       state.observation = action.observation;

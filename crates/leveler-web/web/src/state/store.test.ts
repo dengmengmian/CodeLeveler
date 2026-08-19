@@ -224,6 +224,21 @@ describe('chrome / diff focus', () => {
     expect(state.observation?.window_to).toBe(100);
   });
 
+  it('ignores a legacy observability payload with no query_id', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'observation_loading', queryId: 'q1' });
+    reducer(state, {
+      type: 'observation_loaded',
+      queryId: null,
+      observation: observation({
+        window_from: 20,
+        window_to: 60,
+        session: { ...observation().session, last_sequence: 100 },
+      }),
+    });
+    expect(state.observation).toBeNull();
+  });
+
   it('still ignores observability for a different session', () => {
     const state = stateWithSession();
     reducer(state, { type: 'observation_loading', queryId: 'q1' });
