@@ -5615,6 +5615,127 @@ impl ModelRuntime for DualChildRuntime {
     }
 }
 
+/// PB_B_ORCH_1 root cause (event rowids 874-877): an UNCLAIMED child ran
+/// `shell_command: rmdir <dir>` and it returned exit 0 — the directory was
+/// really removed. The command path enforces write scope by diffing a git
+/// snapshot AFTER the fact, and git does not track empty directories, so the
+/// mutation was invisible to the check and no violation fired. An unclaimed
+/// child holds NO write authority at all: a command that can mutate must be
+/// refused BEFORE it runs, not audited afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_mutate_through_a_shell_command() {
+    let dir = tmp("lbo-shellwrite", 87);
+    std::fs::create_dir_all(dir.join("victim")).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: tidy up")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            // No claim; a shell mutation that git cannot see afterwards.
+            assistant_with(
+                vec![tool_call_part(
+                    "sh1",
+                    "shell_command",
+                    serde_json::json!({"cmd": "rmdir victim"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run("tidy", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        dir.join("victim").is_dir(),
+        "an unclaimed child must not mutate the workspace through a shell command"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// PB_B_ORCH_1 forensics: the first production run that actually delegated
+/// showed the child creating NEW files (`*** Add File:`) with zero claims —
+/// 11 successful writes. The unit-level fence handles Add File correctly, so
+/// this pins the whole runtime path for the create shape, not just Update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_create_new_files_either() {
+    let dir = tmp("lbo-addfile", 86);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // BACKGROUND spawn — the production shape (PB_B_ORCH_1).
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: scaffold new case files")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            // Create a brand-new file with NO claim: must be refused.
+            assistant_with(
+                vec![tool_call_part(
+                    "w1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: cases/0001/input.csv\nname\nvalue\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run("scaffold", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        !dir.join("cases/0001/input.csv").exists(),
+        "an unclaimed child must not be able to CREATE files either"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Review 必改: a LATE-BOUND child claim must fence the PARENT too. The old
 /// fence only knew legacy `role="worker"` children's pre-declared `.scope`,
 /// so a Default child's registry claim left the parent free to edit the very

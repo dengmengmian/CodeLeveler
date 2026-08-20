@@ -306,6 +306,25 @@ pub(crate) async fn execute_program(
             return Ok(output);
         }
     }
+    // Zero write authority = refuse BEFORE the process runs. The
+    // allowlist below is otherwise enforced by diffing a git snapshot after
+    // the fact, and that audit is blind to mutations git cannot see — an
+    // unclaimed child removed an empty directory with `rmdir` and the check
+    // found nothing to roll back (PB_B_ORCH_1). A holder of no scope has
+    // nothing to audit against, so the only correct answer is up front.
+    if context
+        .policy
+        .command_write_allowlist
+        .as_deref()
+        .is_some_and(|allow| allow.is_empty())
+        && !context.policy.read_only
+    {
+        return Ok(ToolOutput::error(
+            "Refused: no write scope is currently owned, so this command may not run \
+             (it could modify the workspace). Read the relevant code, then use \
+             claim_write_scope(paths) to take the bounded scope you need.\n",
+        ));
+    }
     let mut request = ProcessRequest::new(program.to_string(), args, cwd);
     let timeout = resolve_timeout(timeout_seconds);
     request.timeout = timeout;
@@ -1370,6 +1389,46 @@ mod snapshot_tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some(),
             "tool metadata must identify the snapshot for turn/tool-call persistence"
+        );
+    }
+
+    /// PB_B_ORCH_1 root cause. A child that has claimed NOTHING gets an EMPTY
+    /// write allowlist — it holds no write authority at all. Enforcing that by
+    /// diffing a git snapshot AFTER the command is not enough: git does not
+    /// track empty directories, so `rmdir` mutated the workspace invisibly and
+    /// no violation fired (production evidence: an unclaimed child removed
+    /// test/cases/verb-fieldlen/0003 with exit 0). With zero claimed paths a
+    /// mutation-capable command must be refused BEFORE it runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_zero_scope_command_is_refused_before_it_can_mutate() {
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("victim")).unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "hi\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        // An unclaimed child: constrained, with an EMPTY allowlist.
+        let context =
+            ctx(dir.path()).with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "rmdir victim"]}),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            dir.path().join("victim").is_dir(),
+            "a zero-scope child must not be able to remove a directory: {}",
+            out.content
+        );
+        assert!(
+            out.content.to_lowercase().contains("scope")
+                || out.content.to_lowercase().contains("refused"),
+            "the refusal must name the missing write scope: {}",
+            out.content
         );
     }
 
