@@ -1931,6 +1931,46 @@ impl Executor {
                     }
                 }
 
+                // TEMPORARY FORENSIC PROBE (M7): capture the authority state
+                // immediately before the direct-write decision. Structured
+                // facts only — no reasoning content. Removed once the M7
+                // contradiction is explained.
+                if self.registry.mutates_files(&call.name) {
+                    let owned = self
+                        .agent_id
+                        .as_ref()
+                        .map(|id| self.ownership.owned_by(id))
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        target: "leveler::authority_probe",
+                        depth = self.depth,
+                        agent_id = ?self.agent_id,
+                        agent_role = ?self.agent_role,
+                        tool = %call.name,
+                        call_id = %call.id.as_str(),
+                        static_write_allowlist = ?self.write_allowlist,
+                        ownership_owned = ?owned,
+                        effective = ?self.effective_write_allowlist(),
+                        registry_ptr = %format!("{:p}", Arc::as_ptr(&self.ownership)),
+                        targets = ?crate::authorization::mutation_targets(&call),
+                        "direct-write authority probe"
+                    );
+                    if std::env::var_os("LEVELER_AUTHORITY_PROBE").is_some() {
+                        eprintln!(
+                            "AUTHORITY_PROBE depth={} agent_id={:?} role={:?} tool={} static={:?} owned={:?} effective={:?} registry={:p} targets={:?}",
+                            self.depth,
+                            self.agent_id,
+                            self.agent_role,
+                            call.name,
+                            self.write_allowlist,
+                            owned,
+                            self.effective_write_allowlist(),
+                            Arc::as_ptr(&self.ownership),
+                            crate::authorization::mutation_targets(&call),
+                        );
+                    }
+                }
+
                 // Write authority (late-bound ownership): a child's effective
                 // allowlist is what it has CLAIMED (plus any legacy pre-claim);
                 // before its first grant that set is empty and EVERY mutating
