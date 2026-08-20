@@ -1146,6 +1146,39 @@ impl Executor {
         self
     }
 
+    /// `Some(msg)` when this mutating call is not allowed under live write
+    /// authority. An empty claimed set is zero authority: refuse even if the
+    /// patch parser cannot name the target files.
+    pub(crate) fn refuse_unscoped_mutation(
+        &self,
+        call: &leveler_model::ToolCall,
+    ) -> Option<String> {
+        if !self.registry.mutates_files(&call.name) {
+            return None;
+        }
+        match self.effective_write_allowlist() {
+            Some(allow) if allow.is_empty() => Some(
+                "Edit rejected: no write scope is currently owned. Read the relevant \
+                 code, then use claim_write_scope(paths) before modifying files."
+                    .to_string(),
+            ),
+            Some(allow) => {
+                let outside = crate::authorization::write_targets_outside_allowlist(call, &allow);
+                if outside.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "Edit rejected: {} is outside your claimed scope ({}). \
+                         Claim it with claim_write_scope first, or stay within your scope.",
+                        outside.join(", "),
+                        allow.join(", ")
+                    ))
+                }
+            }
+            None => None,
+        }
+    }
+
     /// Enable goal mode: require an explicit `update_goal(complete|blocked)` to
     /// end the run (see [`Executor::goal_mode`]).
     /// Supply mid-turn user input for this run.
@@ -1819,6 +1852,26 @@ mod ownership_authority_tests {
             );
             child.ownership.release_all("ro-1");
         }
+    }
+
+    #[test]
+    fn empty_authority_refuses_a_mutating_call_even_without_parseable_targets() {
+        use leveler_core::ToolCallId;
+        use leveler_model::ToolCall;
+        let child = executor()
+            .child_for_role_on(AgentRole::Default, Vec::new(), None)
+            .with_agent_id("child-1");
+        let call = ToolCall {
+            id: ToolCallId::new("c1"),
+            name: "apply_patch".into(),
+            // Not a string — drive used to skip the fence when it could not
+            // name target files. Empty authority must still refuse.
+            arguments: serde_json::json!({ "patch": ["not", "a", "string"] }),
+        };
+        let msg = child
+            .refuse_unscoped_mutation(&call)
+            .expect("empty authority must refuse");
+        assert!(msg.contains("no write scope"), "{msg}");
     }
 }
 

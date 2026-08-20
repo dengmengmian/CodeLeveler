@@ -164,6 +164,12 @@ impl ToolRegistry {
                 risk: tool.risk(),
             });
         }
+        if tool.mutates_files() && context.policy.has_zero_write_authority() {
+            return Ok(ToolOutput::error(
+                "Edit rejected: no write scope is currently owned. Read the relevant \
+                 code, then use claim_write_scope(paths) before modifying files.",
+            ));
+        }
         if !context.policy.mode.permits(tool.risk()) {
             return Err(ToolError::NotPermitted {
                 tool: name.to_string(),

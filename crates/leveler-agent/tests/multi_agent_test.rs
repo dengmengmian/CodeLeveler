@@ -5615,6 +5615,86 @@ impl ModelRuntime for DualChildRuntime {
     }
 }
 
+/// M7 production shape: an unclaimed background Default child first tried
+/// `Add File` on a path the PARENT had already created (which failed only
+/// with "cannot add existing file" — a functional error, not an ownership
+/// denial), then succeeded with `Update File`. Both calls must be refused for
+/// want of a claim; the earlier tests only covered Add-on-absent and
+/// Update-in-a-workspace-the-parent-had-not-touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_update_a_file_the_parent_created() {
+    let dir = tmp("lbo-m7shape", 88);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // Parent creates the file FIRST (as in M7), then delegates.
+            assistant_with(
+                vec![tool_call_part(
+                    "p1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: probe.txt\nparent\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({"task": format!("{CHILD_MARKER}: rewrite probe.txt")}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            // Child, no claim: Add (fails functionally) then Update.
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: probe.txt\nchild\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("c2", "probe.txt", "parent", "child")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    executor
+        .run(
+            "rewrite",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("probe.txt")).unwrap(),
+        "parent\n",
+        "an unclaimed child must not update a file the parent created"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// PB_B_ORCH_1 root cause (event rowids 874-877): an UNCLAIMED child ran
 /// `shell_command: rmdir <dir>` and it returned exit 0 — the directory was
 /// really removed. The command path enforces write scope by diffing a git
@@ -5737,6 +5817,72 @@ async fn an_unclaimed_child_cannot_create_new_files_either() {
     assert!(
         !dir.join("cases/0001/input.csv").exists(),
         "an unclaimed child must not be able to CREATE files either"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// PB2_B_ORCH_1: the child landed an Update File on
+/// `docs/src/reference-verbs.md.in` with zero claims. Empty-allowlist refusal
+/// must not depend on parsing patch targets — mutating tools are refused
+/// outright until claim_write_scope succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_update_an_existing_file_either() {
+    let dir = tmp("lbo-updatefile", 88);
+    std::fs::create_dir_all(dir.join("docs/src")).unwrap();
+    std::fs::write(
+        dir.join("docs/src/reference-verbs.md.in"),
+        "GENMD-RUN-COMMAND\nmlr bootstrap --help\nGENMD-EOF\n",
+    )
+    .unwrap();
+    let original = std::fs::read_to_string(dir.join("docs/src/reference-verbs.md.in")).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: update verb docs")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "w1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Update File: docs/src/reference-verbs.md.in\n@@\n GENMD-RUN-COMMAND\n mlr bootstrap --help\n GENMD-EOF\n+\n+## basename\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run("docs", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    let now = std::fs::read_to_string(dir.join("docs/src/reference-verbs.md.in")).unwrap();
+    assert_eq!(
+        now, original,
+        "an unclaimed child must not Update File either"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

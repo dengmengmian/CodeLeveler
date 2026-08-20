@@ -35,7 +35,6 @@ use super::{
 use crate::authorization::{
     collect_scoped_paths_from_call, counts_as_verification_evidence, extract_command,
     is_observe_result_tool, is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
-    write_targets_outside_allowlist,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
@@ -1934,35 +1933,15 @@ impl Executor {
 
                 // Write authority (late-bound ownership): a child's effective
                 // allowlist is what it has CLAIMED (plus any legacy pre-claim);
-                // before its first grant that set is empty and every mutation
-                // is refused with the claim protocol named. The parent stays
-                // unrestricted (fenced above by others' claims); orchestrated
-                // nodes keep their static allowlist.
-                if self.registry.mutates_files(&call.name)
-                    && let Some(allow) = self.effective_write_allowlist()
-                {
-                    let outside = write_targets_outside_allowlist(&call, &allow);
-                    if !outside.is_empty() {
-                        let msg = if allow.is_empty() {
-                            format!(
-                                "Edit rejected: no write scope is currently owned. Read \
-                                 the relevant code, then use claim_write_scope(paths) \
-                                 before modifying files (denied: {}).",
-                                outside.join(", ")
-                            )
-                        } else {
-                            format!(
-                                "Edit rejected: {} is outside your claimed scope ({}). \
-                                 Claim it with claim_write_scope first, or stay within \
-                                 your scope.",
-                                outside.join(", "),
-                                allow.join(", ")
-                            )
-                        };
-                        denied_calls_this_round += 1;
-                        results[index] = Some(deny_call(observer, call, msg));
-                        continue;
-                    }
+                // before its first grant that set is empty and EVERY mutating
+                // tool is refused — do not wait to parse patch paths
+                // (PB2_B_ORCH_1: Update File landed because an empty-target
+                // miss skipped this fence). The parent stays unrestricted
+                // (fenced above by others' claims).
+                if let Some(msg) = self.refuse_unscoped_mutation(&call) {
+                    denied_calls_this_round += 1;
+                    results[index] = Some(deny_call(observer, call, msg));
+                    continue;
                 }
 
                 // Read-only, side-effect-free tools are deferred to the

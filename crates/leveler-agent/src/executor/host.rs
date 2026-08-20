@@ -158,6 +158,9 @@ impl Executor {
         {
             return Err(AdmitError::Fatal(error));
         }
+        if let Some(reason) = self.refuse_unscoped_mutation(&call) {
+            return Err(AdmitError::Refused { call, reason });
+        }
         let mut pending_always: Option<PendingStandingGrant> = None;
         if let Err(reason) = self
             .authorize_with_cancellation(&call, session_approved, &mut pending_always, cancellation)
