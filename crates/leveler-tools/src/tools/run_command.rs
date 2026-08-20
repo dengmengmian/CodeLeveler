@@ -178,6 +178,10 @@ async fn execute_background(
     };
     // Allowlist-constrained workers need a recoverable snapshot to restore on
     // wait. Without git we cannot enforce the constraint.
+    // A background process outlives the round that started it, so a scope
+    // claimed later cannot bound it: a child with no write authority may not
+    // detach one at all. Foreground commands instead run with a read-only
+    // workspace (see `execute_program`).
     if let Some(output) = refuse_zero_write_authority(&context) {
         return Ok(output);
     }
@@ -309,12 +313,16 @@ pub(crate) async fn execute_program(
             return Ok(output);
         }
     }
-    if let Some(output) = refuse_zero_write_authority(&context) {
-        return Ok(output);
-    }
     let mut request = ProcessRequest::new(program.to_string(), args, cwd);
     let timeout = resolve_timeout(timeout_seconds);
     request.timeout = timeout;
+    // Pre-claim child: run the process, but make the workspace read-only at
+    // the OS boundary. Observation is exactly what a child must do before it
+    // can know which scope to claim, while every workspace mutation — rmdir,
+    // redirection, sed -i, a Python script — fails in the kernel. Enforcing
+    // the EFFECT beats guessing which commands are read-only, and it closes
+    // the PB_B hole that post-hoc git diffing could not see.
+    request.read_only_workspace = context.policy.has_zero_write_authority();
     request.deny_network = context.policy.network_denied();
     request.deny_env = context.policy.deny_env.as_ref().clone();
     // OS confinement when not full-access / turn-unrestricted:
@@ -326,9 +334,22 @@ pub(crate) async fn execute_program(
         let extra = context.execution.workspace.readonly_roots().to_vec();
         request.write_root = Some(write_root.clone());
         request.extra_read_roots = extra.clone();
-        request.filesystem_intent = Some(leveler_execution::FilesystemIntent::WorkspaceWrite {
-            write_root,
-            extra_read_roots: extra,
+        // A pre-claim child declares a READ-ONLY intent, so the Windows
+        // backend gate fails closed when it cannot enforce one (§18) instead
+        // of quietly spawning a writable process.
+        request.filesystem_intent = Some(if request.read_only_workspace {
+            leveler_execution::FilesystemIntent::ReadOnly {
+                read_roots: {
+                    let mut roots = vec![write_root.clone()];
+                    roots.extend(extra.iter().cloned());
+                    roots
+                },
+            }
+        } else {
+            leveler_execution::FilesystemIntent::WorkspaceWrite {
+                write_root,
+                extra_read_roots: extra,
+            }
         });
     } else {
         request.filesystem_intent = Some(leveler_execution::FilesystemIntent::Unrestricted);
@@ -1391,6 +1412,93 @@ mod snapshot_tests {
         );
     }
 
+    /// A pre-claim child must still be able to OBSERVE: exploring the code is
+    /// exactly what it has to do before it can know which scope to claim.
+    /// Blanket-refusing every command made that impossible (P3 evidence: a
+    /// `head … && grep …` pipeline was refused). The boundary belongs at the
+    /// filesystem — the process runs with the workspace read-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_zero_scope_child_can_still_observe_the_workspace() {
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("keep.txt"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        let context =
+            ctx(dir.path()).with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", "ls && cat keep.txt"]}),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("original"),
+            "a pre-claim child must be able to read the workspace: {}",
+            out.content
+        );
+    }
+
+    /// RO5/RO7: a scripting language cannot escape the boundary (the effect is
+    /// enforced, not the program name), and once a scope IS claimed the very
+    /// same write succeeds inside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_read_only_boundary_holds_for_scripts_and_lifts_after_a_claim() {
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("allowed")).unwrap();
+        std::fs::write(dir.path().join("allowed/x.txt"), "before\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        // Zero scope: a shell script write is denied by the kernel.
+        let zero =
+            ctx(dir.path()).with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let _ = RunCommandTool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "printf tampered > allowed/x.txt"]
+                }),
+                zero,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("allowed/x.txt")).unwrap(),
+            "before\n",
+            "a zero-scope script must not rewrite a workspace file"
+        );
+
+        // With the scope claimed, the same write goes through.
+        let claimed = ctx(dir.path()).with_command_write_constraints(
+            Some(vec!["allowed".to_string()]),
+            None,
+            Vec::new(),
+        );
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "printf after > allowed/x.txt"]
+                }),
+                claimed,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("allowed/x.txt")).unwrap(),
+            "after",
+            "a claimed scope must allow the write: {}",
+            out.content
+        );
+    }
+
     /// PB_B_ORCH_1 root cause. A child that has claimed NOTHING gets an EMPTY
     /// write allowlist — it holds no write authority at all. Enforcing that by
     /// diffing a git snapshot AFTER the command is not enough: git does not
@@ -1423,10 +1531,12 @@ mod snapshot_tests {
             "a zero-scope child must not be able to remove a directory: {}",
             out.content
         );
+        // The denial now comes from the OS (the workspace is read-only for a
+        // zero-scope child), not from a tool-layer refusal string: the effect
+        // is enforced, whatever program attempts it.
         assert!(
-            out.content.to_lowercase().contains("scope")
-                || out.content.to_lowercase().contains("refused"),
-            "the refusal must name the missing write scope: {}",
+            out.content.contains("not permitted") || out.content.contains("denied"),
+            "the mutation must fail at the filesystem boundary: {}",
             out.content
         );
     }
