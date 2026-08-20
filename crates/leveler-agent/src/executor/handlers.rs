@@ -448,6 +448,14 @@ async fn run_prepared_sub_agent(
                 is_error: *is_error,
             });
         }
+        // An ownership transition decides what this child may mutate, and
+        // child activity is transient — forward it verbatim so it lands on
+        // the parent's DURABLE delegation channel. Without this an offline
+        // audit cannot distinguish an authorized write from a bypass (the M7
+        // measurement failure).
+        AgentEvent::DelegationStage { action, .. } if action.starts_with("ownership_") => {
+            let _ = activity_tx.send(event.clone());
+        }
         _ => {}
     };
     let mut sink = SubAgentProgressSink::new(id, progress);

@@ -5615,6 +5615,117 @@ impl ModelRuntime for DualChildRuntime {
     }
 }
 
+/// M7 measurement failure, turned into a regression: a granted claim must be
+/// reconstructable from the durable event stream ALONE. Previously
+/// claim_write_scope was answered inside the drive loop and emitted only a
+/// ToolResult — no ToolCall event — so an audit keyed on tool starts could
+/// not see that a child had been authorized, and a perfectly legal write read
+/// as a security bypass for an entire investigation round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_claim_is_reconstructable_from_durable_events() {
+    let dir = tmp("lbo-claimprov", 89);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": format!("{CHILD_MARKER}: change old to new")}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "update b",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // The audit an offline reader performs. A child's tool events reach the
+    // parent stream as SubAgentActivity, so the claim must be visible there
+    // with BOTH phases — a result-only claim is exactly the blind spot that
+    // made M7 read as a bypass.
+    let started = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::SubAgentActivity { tool, phase, .. }
+                if tool == "claim_write_scope" && phase == "tool_started"
+        )
+    });
+    assert!(
+        started,
+        "a claim must announce itself in the child activity stream, not only settle: {events:#?}"
+    );
+    let finished = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentActivity {
+            tool,
+            phase,
+            preview,
+            is_error,
+            ..
+        } if tool == "claim_write_scope" && phase != "tool_started" => {
+            Some((preview.clone(), *is_error))
+        }
+        _ => None,
+    });
+    let (preview, is_error) = finished.expect("claim outcome must be observable");
+    assert!(!is_error, "the grant must not read as an error: {preview}");
+    assert!(
+        preview.contains("granted") || preview.contains("own"),
+        "the observable outcome must record the decision: {preview}"
+    );
+    // …and the DURABLE half: child activity is transient, so the ownership
+    // transition itself must land on the persisted delegation channel or an
+    // offline audit still cannot tell an authorized write from a bypass.
+    let durable = events.iter().find_map(|e| match e {
+        AgentEvent::DelegationStage { action, detail } if action.starts_with("ownership_") => {
+            Some((action.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (action, detail) = durable.expect("the ownership transition must be durable");
+    assert_eq!(action, "ownership_granted");
+    assert!(
+        detail.contains("b.txt"),
+        "the durable record must name the owned path: {detail}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// M7 production shape: an unclaimed background Default child first tried
 /// `Add File` on a path the PARENT had already created (which failed only
 /// with "cannot add existing file" — a functional error, not an ownership

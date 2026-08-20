@@ -1672,6 +1672,18 @@ impl Executor {
                 // against the shared registry. Atomic; a denial is an honest
                 // coordination result (is_error=false) the child works around.
                 if call.name == CLAIM_WRITE_SCOPE_TOOL {
+                    // Durable lifecycle FIRST: an ownership transition that
+                    // decides what a child may mutate has to be
+                    // reconstructable from the event log like any other tool
+                    // call. Emitting only a result made a granted claim
+                    // invisible to an audit keyed on tool starts, and a legal
+                    // write read as a pre-claim bypass (M7 measurement error).
+                    observer(AgentEvent::ToolCall {
+                        id: call.id.as_str().to_string(),
+                        name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+                        arguments: compact_json(&call.arguments),
+                        parallel: false,
+                    });
                     let paths: Vec<String> = call
                         .arguments
                         .get("paths")
@@ -1682,6 +1694,8 @@ impl Executor {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let mut granted = false;
+                    let mut decision_detail = String::new();
                     let (content, is_error) = if self.depth == 0 {
                         (
                             "You are the top-level agent: you already write directly \
@@ -1696,16 +1710,32 @@ impl Executor {
                             .clone()
                             .unwrap_or_else(|| format!("child-depth-{}", self.depth));
                         match self.ownership.try_claim(&owner, &paths) {
-                            Ok(owned) => (
-                                format!(
-                                    "granted — you exclusively own: {}. Re-read a claimed \
-                                     file before your first write to it if time has passed \
-                                     since you read it.",
-                                    owned.join(", ")
-                                ),
-                                false,
-                            ),
-                            Err(rejection) => (rejection.for_model(), false),
+                            Ok(owned) => {
+                                granted = true;
+                                decision_detail = owned.join(", ");
+                                (
+                                    format!(
+                                        "granted — you exclusively own: {}. Re-read a claimed \
+                                         file before your first write to it if time has passed \
+                                         since you read it.",
+                                        owned.join(", ")
+                                    ),
+                                    false,
+                                )
+                            }
+                            Err(rejection) => {
+                                decision_detail = match &rejection {
+                                    crate::ownership::ClaimRejection::Conflicts(conflicts) => {
+                                        conflicts
+                                            .iter()
+                                            .map(|c| format!("{} owned by {}", c.path, c.owner))
+                                            .collect::<Vec<_>>()
+                                            .join("; ")
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                (rejection.for_model(), false)
+                            }
                         }
                     };
                     observer(AgentEvent::ToolResult {
@@ -1714,6 +1744,27 @@ impl Executor {
                         is_error,
                         preview: preview(&content),
                     });
+                    // Durable ownership provenance: a child's tool events
+                    // reach the parent as TRANSIENT activity, so without this
+                    // an offline audit cannot tell an authorized write from a
+                    // bypass — the M7 measurement failure. DelegationStage is
+                    // the existing durable domain channel for orchestration
+                    // decisions; reuse it rather than inventing a second
+                    // lifecycle.
+                    if self.depth > 0 {
+                        let owner = self
+                            .agent_id
+                            .clone()
+                            .unwrap_or_else(|| format!("child-depth-{}", self.depth));
+                        observer(AgentEvent::DelegationStage {
+                            action: if granted {
+                                "ownership_granted".to_string()
+                            } else {
+                                "ownership_denied".to_string()
+                            },
+                            detail: format!("{owner}: {}", decision_detail),
+                        });
+                    }
                     results[index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
                             call_id: call.id,
