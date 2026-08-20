@@ -355,9 +355,14 @@ pub(crate) async fn execute_program(
         request.filesystem_intent = Some(leveler_execution::FilesystemIntent::Unrestricted);
     }
 
-    // Pre-command workspace snapshot (git only). Read-only overlays skip it.
+    // Pre-command workspace snapshot (git only). Read-only overlays skip it,
+    // and so does a caller with no write authority at all: its workspace is
+    // mounted read-only for this command, so it CANNOT have changed anything.
+    // Anything the diff would report then belongs to a concurrent sibling, and
+    // rolling back to this snapshot would destroy that sibling's authorized
+    // work — a `ls` reverting another agent's committed file.
     let root = context.execution.workspace.root().to_path_buf();
-    let snapshot = if context.policy.read_only {
+    let snapshot = if context.policy.read_only || context.policy.has_zero_write_authority() {
         None
     } else {
         match WorkspaceSnapshot::capture(&root).await {
@@ -375,8 +380,14 @@ pub(crate) async fn execute_program(
         }
     };
 
-    let constrained = context.policy.command_write_allowlist.is_some()
-        || context.policy.command_modified_files_remaining.is_some();
+    // A caller with no write authority has nothing to roll back: its workspace
+    // is read-only for this command, so the snapshot is deliberately absent
+    // (see above) rather than unavailable. Demanding one here would refuse
+    // pre-claim exploration outright — the capability the read-only workspace
+    // exists to preserve.
+    let constrained = (context.policy.command_write_allowlist.is_some()
+        || context.policy.command_modified_files_remaining.is_some())
+        && !context.policy.has_zero_write_authority();
     if constrained && snapshot.is_none() && !context.policy.read_only {
         return Ok(ToolOutput::error(
             "Refused: command mutation constraints require a recoverable git workspace snapshot.\n",
@@ -418,6 +429,18 @@ pub(crate) async fn execute_program(
 
     let mut mutation_error = None;
     if let Some(id) = &snapshot {
+        // The diff covers the WHOLE workspace, so in a shared tree it also
+        // reports what a concurrent sibling wrote inside its own exclusive
+        // scope. This command cannot have written those — the ownership fence
+        // and the write allowlist refuse them — and charging them here rolls
+        // the sibling's authorized work back along with everything else.
+        command_modified.retain(|path| {
+            !context
+                .policy
+                .command_foreign_paths
+                .iter()
+                .any(|owned| path_allows(owned, path))
+        });
         let outside: Vec<&str> = context
             .policy
             .command_write_allowlist

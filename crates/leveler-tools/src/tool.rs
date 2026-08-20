@@ -98,6 +98,15 @@ pub struct ToolPolicy {
     pub command_modified_files_remaining: Option<usize>,
     /// Files already counted against the run budget before this command.
     pub command_previously_modified: Arc<Vec<String>>,
+    /// Paths exclusively owned by ANOTHER agent while this call runs.
+    ///
+    /// A command's workspace changes are attributed by diffing the whole
+    /// workspace around it, which in a shared tree with concurrent children
+    /// also catches a sibling's writes. This call cannot have made those — the
+    /// ownership fence and the write allowlist both refuse them — so they are
+    /// excluded from attribution. Without it, a sibling's authorized write is
+    /// charged here as a violation and rolled back with the rest.
+    pub command_foreign_paths: Arc<Vec<String>>,
     /// Per-model byte budget for a single tool result (the central cap applied
     /// after every tool call). Defaults to [`crate::registry::MAX_TOOL_OUTPUT`];
     /// weaker models with small reliable contexts may configure less.
@@ -228,6 +237,7 @@ impl ToolContext {
                 command_write_allowlist: None,
                 command_modified_files_remaining: None,
                 command_previously_modified: Arc::new(Vec::new()),
+                command_foreign_paths: Arc::new(Vec::new()),
                 tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
             },
             services: ToolServices {
@@ -323,6 +333,12 @@ impl ToolContext {
         self.policy.command_write_allowlist = allowlist.map(Arc::new);
         self.policy.command_modified_files_remaining = modified_files_remaining;
         self.policy.command_previously_modified = Arc::new(previously_modified);
+        self
+    }
+
+    /// Paths another agent exclusively owns for the duration of this call.
+    pub fn with_foreign_owned_paths(mut self, paths: Vec<String>) -> Self {
+        self.policy.command_foreign_paths = Arc::new(paths);
         self
     }
 

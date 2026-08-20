@@ -1754,35 +1754,45 @@ impl Executor {
                     // grant emitted only through the activity channel waits for
                     // the parent's next drain and can land after the write,
                     // which is exactly how a legal write reads as a bypass.
-                    // Riding the barrier queue is what orders the two; the
-                    // observer copy below stays for live UI only.
+                    // Riding the barrier queue is what orders the two.
+                    //
+                    // Exactly ONE durable record per transition. The observer
+                    // copy is forwarded to the parent and persisted from there,
+                    // so emitting it as well as recording on the barrier writes
+                    // the same grant twice and an offline audit reads two grants
+                    // for one claim. The barrier is the primary path; the
+                    // observer is the fallback when there is no durable host
+                    // (standalone library use).
                     if self.depth > 0 {
-                        let owner = self
-                            .agent_id
-                            .clone()
-                            .unwrap_or_else(|| format!("child-depth-{}", self.depth));
                         let action = if granted {
                             "ownership_granted".to_string()
                         } else {
                             "ownership_denied".to_string()
                         };
-                        if let (Some(barrier), Some(agent_id)) =
-                            (&self.event_barrier, &self.agent_id)
-                        {
-                            barrier.record_child_tool_event(ChildToolEvent::Ownership {
-                                agent_id: agent_id.clone(),
-                                action: action.clone(),
-                                detail: decision_detail.clone(),
-                            });
-                            // The registry has already changed, so a flush
-                            // failure aborts the run rather than continuing
-                            // with owned paths no durable record accounts for.
-                            barrier.flush().await?;
+                        match (&self.event_barrier, &self.agent_id) {
+                            (Some(barrier), Some(agent_id)) => {
+                                barrier.record_child_tool_event(ChildToolEvent::Ownership {
+                                    agent_id: agent_id.clone(),
+                                    action,
+                                    detail: decision_detail.clone(),
+                                });
+                                // The registry has already changed, so a flush
+                                // failure aborts the run rather than continuing
+                                // with owned paths no durable record accounts
+                                // for.
+                                barrier.flush().await?;
+                            }
+                            _ => {
+                                let owner = self
+                                    .agent_id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("child-depth-{}", self.depth));
+                                observer(AgentEvent::DelegationStage {
+                                    action,
+                                    detail: format!("{owner}: {decision_detail}"),
+                                });
+                            }
                         }
-                        observer(AgentEvent::DelegationStage {
-                            action,
-                            detail: format!("{owner}: {decision_detail}"),
-                        });
                     }
                     results[index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
@@ -2074,6 +2084,18 @@ impl Executor {
                     remaining_files,
                     epoch_paths,
                 );
+                // What a concurrent sibling owns right now. A command's changes
+                // are attributed by diffing the whole workspace, which in a
+                // shared tree also sees the sibling's writes; this call cannot
+                // have made them, so they must not be charged here and rolled
+                // back with it.
+                let owner_key = match (&self.agent_id, self.depth) {
+                    (Some(id), _) => id.clone(),
+                    (None, 0) => "parent".to_string(),
+                    (None, depth) => format!("child-depth-{depth}"),
+                };
+                let ctx =
+                    ctx.with_foreign_owned_paths(self.ownership.paths_owned_by_others(&owner_key));
 
                 // Admission: the ToolHost pipeline (side-effect barrier →
                 // hooks → rules → policy → approval → barrier). Execution

@@ -2624,6 +2624,7 @@ mod child_side_effects_are_recoverable {
         ));
 
         let workspace = Workspace::new(&dir).unwrap();
+        let mut observed = Vec::new();
         Executor::new(
             runtime,
             Arc::new(default_registry()),
@@ -2634,7 +2635,7 @@ mod child_side_effects_are_recoverable {
         .with_event_barrier(barrier.clone())
         .run(
             "update b",
-            &mut |_| {},
+            &mut |e| observed.push(e),
             &mut NoopSink,
             CancellationToken::new(),
         )
@@ -2660,6 +2661,26 @@ mod child_side_effects_are_recoverable {
             grant < write,
             "the write was durable before its grant — an offline audit ordered by \
              rowid still reads this as a pre-claim bypass: grant@{grant} write@{write}"
+        );
+        // Exactly ONE durable record per transition. The observer copy is
+        // forwarded to the parent and persisted from there, so recording on
+        // the barrier AND emitting it writes the same grant twice and an
+        // offline audit reads two grants for one claim.
+        let grants = events
+            .iter()
+            .filter(|e| matches!(e, ChildToolEvent::Ownership { .. }))
+            .count();
+        assert_eq!(
+            grants, 1,
+            "one claim produced {grants} records: {events:#?}"
+        );
+        assert!(
+            !observed.iter().any(|e| matches!(
+                e,
+                AgentEvent::DelegationStage { action, .. } if action.starts_with("ownership_")
+            )),
+            "with a durable barrier the transition must not ALSO travel the \
+             observer path, or the parent persists a second copy: {observed:#?}"
         );
         // The claim must NOT appear as a tool-call lifecycle: it is a virtual
         // tool the drive loop answers inline and never registers, so a

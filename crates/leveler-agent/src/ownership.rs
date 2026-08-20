@@ -287,6 +287,30 @@ impl OwnershipRegistry {
         out
     }
 
+    /// Every path currently spoken for by someone OTHER than `owner_key` —
+    /// other agents' claims plus a parent mutation in flight.
+    ///
+    /// A command run by `owner_key` cannot have written any of these: the
+    /// ownership fence and the write allowlist both refuse it. So when
+    /// attributing a command's workspace changes they must be excluded, or a
+    /// sibling's concurrent write inside its OWN scope is charged to this
+    /// command and rolled back with it.
+    pub fn paths_owned_by_others(&self, owner_key: &str) -> Vec<String> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<String> = state
+            .claims
+            .iter()
+            .filter(|(owner, _)| owner.as_str() != owner_key)
+            .flat_map(|(_, paths)| paths.iter().cloned())
+            .collect();
+        if owner_key != "parent" {
+            out.extend(state.parent_active.iter().cloned());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Check ownership and commit to mutating in ONE locked operation, for a
     /// non-child writer (`owner_key` "parent" at depth 0).
     ///
@@ -628,5 +652,39 @@ mod tests {
         }
         // Guard dropped with the call: the path is claimable again.
         assert!(reg.try_claim("child-1", &targets).is_ok());
+    }
+
+    /// A command's workspace diff is global, so it also reports what a
+    /// concurrent sibling wrote inside its OWN scope. Attribution must be able
+    /// to subtract those, or the sibling's authorized work is charged as this
+    /// command's violation and rolled back with it — a zero-authority child's
+    /// `ls` reverting another child's committed file (F_OV).
+    #[test]
+    fn foreign_paths_name_what_a_sibling_owns_but_never_the_asker_own_scope() {
+        let reg = OwnershipRegistry::new(true);
+        reg.try_claim("child-1", &v(&["pkg/transformers"])).unwrap();
+        reg.try_claim("child-2", &v(&["docs/guide.md"])).unwrap();
+
+        let for_two = reg.paths_owned_by_others("child-2");
+        assert_eq!(for_two, v(&["pkg/transformers"]));
+        let for_one = reg.paths_owned_by_others("child-1");
+        assert_eq!(for_one, v(&["docs/guide.md"]));
+
+        // An unclaimed child sees BOTH scopes as foreign — it owns nothing, so
+        // nothing the diff reports can be its own doing.
+        let for_none = reg.paths_owned_by_others("child-3");
+        assert_eq!(for_none, v(&["docs/guide.md", "pkg/transformers"]));
+    }
+
+    /// A parent mutation in flight is foreign to a child for the same reason,
+    /// even though it is not a claim.
+    #[test]
+    fn a_parent_mutation_in_flight_is_foreign_to_a_child_but_not_to_the_parent() {
+        let reg = OwnershipRegistry::new(true);
+        let _guard = reg
+            .try_mutation_guard("parent", &v(&["src/main.rs"]))
+            .unwrap();
+        assert_eq!(reg.paths_owned_by_others("child-1"), v(&["src/main.rs"]));
+        assert!(reg.paths_owned_by_others("parent").is_empty());
     }
 }
