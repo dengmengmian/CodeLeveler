@@ -2428,6 +2428,7 @@ mod child_side_effects_are_recoverable {
             self.order.lock().unwrap().push(match event {
                 ChildToolEvent::Started { .. } => "started",
                 ChildToolEvent::Finished { .. } => "finished",
+                ChildToolEvent::Ownership { .. } => "ownership",
             });
             self.events.lock().unwrap().push(event);
         }
@@ -2641,19 +2642,36 @@ mod child_side_effects_are_recoverable {
         .unwrap();
 
         let events = barrier.events.lock().unwrap().clone();
-        let position = |wanted: &str| {
-            events
-                .iter()
-                .position(|e| matches!(e, ChildToolEvent::Started { name, .. } if name == wanted))
-        };
-        let claim = position("claim_write_scope").unwrap_or_else(|| {
-            panic!("the grant never reached the durable queue the child's writes use: {events:#?}")
-        });
-        let write = position("apply_patch").expect("the child's write must be recorded");
+        let grant = events
+            .iter()
+            .position(|e| matches!(e, ChildToolEvent::Ownership { action, .. } if action == "ownership_granted"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the grant never reached the durable queue the child's writes use: {events:#?}"
+                )
+            });
+        let write = events
+            .iter()
+            .position(
+                |e| matches!(e, ChildToolEvent::Started { name, .. } if name == "apply_patch"),
+            )
+            .expect("the child's write must be recorded");
         assert!(
-            claim < write,
+            grant < write,
             "the write was durable before its grant — an offline audit ordered by \
-             rowid still reads this as a pre-claim bypass: claim@{claim} write@{write}"
+             rowid still reads this as a pre-claim bypass: grant@{grant} write@{write}"
+        );
+        // The claim must NOT appear as a tool-call lifecycle: it is a virtual
+        // tool the drive loop answers inline and never registers, so a
+        // ToolCallStarted for it reads as a dangling call to crash recovery
+        // and blocks resume on an operation with no external side effect.
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ChildToolEvent::Started { name, .. } | ChildToolEvent::Finished { name, .. }
+                    if name == "claim_write_scope"
+            )),
+            "the claim must not be recorded as a registered tool's lifecycle: {events:#?}"
         );
     }
 }

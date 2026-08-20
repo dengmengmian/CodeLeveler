@@ -212,7 +212,13 @@ impl OwnershipRegistry {
             {
                 conflicts.push(ClaimConflict {
                     path: p.clone(),
-                    owner: "parent (mutation in flight — retry shortly)".to_string(),
+                    // Not "retry shortly": the parent holds this from the
+                    // ownership check until its call resolves, which spans an
+                    // approval prompt and so can be an unbounded human wait.
+                    // Promising a short retry burns the child's rounds.
+                    owner: "parent (mutation in flight — claim something else, \
+                            or retry after it settles)"
+                        .to_string(),
                 });
             }
         }

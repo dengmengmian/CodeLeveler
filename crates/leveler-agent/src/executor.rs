@@ -635,6 +635,24 @@ pub enum ChildToolEvent {
         is_error: bool,
         preview: String,
     },
+    /// A write-ownership transition (`claim_write_scope` granted or denied).
+    ///
+    /// Rides this queue, not the activity channel, because the grant must be
+    /// durable BEFORE any event whose authorization depends on it — a child's
+    /// writes flush here immediately, so a grant recorded anywhere else can
+    /// land after the write it authorized and read as a bypass.
+    ///
+    /// Deliberately NOT a `Started`/`Finished` pair: `claim_write_scope` is a
+    /// virtual tool the drive loop answers inline and never registers, so a
+    /// `ToolCallStarted` for it would look like a dangling call to crash
+    /// recovery and demand human reconciliation for an operation with no
+    /// external side effect — the registry it mutates is in memory and dies
+    /// with the process.
+    Ownership {
+        agent_id: String,
+        action: String,
+        detail: String,
+    },
 }
 
 /// A sink that persists the transcript as the loop advances, enabling resume.

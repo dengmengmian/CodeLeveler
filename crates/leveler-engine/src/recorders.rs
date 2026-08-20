@@ -169,6 +169,14 @@ impl leveler_agent::EventBarrier for PumpBarrier {
                 preview,
                 agent_id: Some(agent_id),
             },
+            leveler_agent::ChildToolEvent::Ownership {
+                agent_id,
+                action,
+                detail,
+            } => EngineEvent::DelegationStage {
+                action,
+                detail: format!("{agent_id}: {detail}"),
+            },
         });
     }
 }

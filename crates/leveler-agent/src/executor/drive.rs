@@ -1684,24 +1684,6 @@ impl Executor {
                         arguments: compact_json(&call.arguments),
                         parallel: false,
                     });
-                    // A child's tool calls are recorded on the barrier queue
-                    // and flushed on the child's own task, while this branch
-                    // never reaches `admit`. Announcing the claim on the SAME
-                    // queue is what orders the grant ahead of the write it
-                    // authorizes — presence alone is not enough, because the
-                    // audit that misread M7 reads the log in rowid order.
-                    // Announce-then-flush BEFORE touching the registry, for
-                    // the same reason `admit` does: a crash must never leave
-                    // ownership state that the log cannot explain.
-                    if let (Some(barrier), Some(agent_id)) = (&self.event_barrier, &self.agent_id) {
-                        barrier.record_child_tool_event(ChildToolEvent::Started {
-                            agent_id: agent_id.clone(),
-                            call_id: call.id.as_str().to_string(),
-                            name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
-                            arguments: compact_json(&call.arguments),
-                        });
-                        barrier.flush().await?;
-                    }
                     let paths: Vec<String> = call
                         .arguments
                         .get("paths")
@@ -1762,39 +1744,44 @@ impl Executor {
                         is_error,
                         preview: preview(&content),
                     });
-                    // The decision itself, durable before the model can act on
-                    // it. The registry has already changed, so a flush failure
-                    // here aborts the run rather than continuing with owned
-                    // paths that no durable record accounts for.
-                    if let (Some(barrier), Some(agent_id)) = (&self.event_barrier, &self.agent_id) {
-                        barrier.record_child_tool_event(ChildToolEvent::Finished {
-                            agent_id: agent_id.clone(),
-                            call_id: call.id.as_str().to_string(),
-                            name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
-                            is_error,
-                            preview: preview(&content),
-                        });
-                        barrier.flush().await?;
-                    }
-                    // Durable ownership provenance: a child's tool events
-                    // reach the parent as TRANSIENT activity, so without this
-                    // an offline audit cannot tell an authorized write from a
-                    // bypass — the M7 measurement failure. DelegationStage is
-                    // the existing durable domain channel for orchestration
-                    // decisions; reuse it rather than inventing a second
-                    // lifecycle.
+                    // Durable ownership provenance. A child's tool events reach
+                    // the parent as TRANSIENT activity, so without a durable
+                    // record an offline audit cannot tell an authorized write
+                    // from a bypass — the M7 measurement failure.
+                    //
+                    // It must also be durable BEFORE the write it authorizes:
+                    // a child's tool calls flush on the child's own task, so a
+                    // grant emitted only through the activity channel waits for
+                    // the parent's next drain and can land after the write,
+                    // which is exactly how a legal write reads as a bypass.
+                    // Riding the barrier queue is what orders the two; the
+                    // observer copy below stays for live UI only.
                     if self.depth > 0 {
                         let owner = self
                             .agent_id
                             .clone()
                             .unwrap_or_else(|| format!("child-depth-{}", self.depth));
+                        let action = if granted {
+                            "ownership_granted".to_string()
+                        } else {
+                            "ownership_denied".to_string()
+                        };
+                        if let (Some(barrier), Some(agent_id)) =
+                            (&self.event_barrier, &self.agent_id)
+                        {
+                            barrier.record_child_tool_event(ChildToolEvent::Ownership {
+                                agent_id: agent_id.clone(),
+                                action: action.clone(),
+                                detail: decision_detail.clone(),
+                            });
+                            // The registry has already changed, so a flush
+                            // failure aborts the run rather than continuing
+                            // with owned paths no durable record accounts for.
+                            barrier.flush().await?;
+                        }
                         observer(AgentEvent::DelegationStage {
-                            action: if granted {
-                                "ownership_granted".to_string()
-                            } else {
-                                "ownership_denied".to_string()
-                            },
-                            detail: format!("{owner}: {}", decision_detail),
+                            action,
+                            detail: format!("{owner}: {decision_detail}"),
                         });
                     }
                     results[index] = Some(ContentPart::ToolResult {
