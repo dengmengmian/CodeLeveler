@@ -2041,6 +2041,15 @@ impl Executor {
                 // (PB2_B_ORCH_1: Update File landed because an empty-target
                 // miss skipped this fence). The parent stays unrestricted
                 // (fenced above by others' claims).
+                // An MCP tool's effect lands in a separate, unsandboxed
+                // process and cannot be bounded by a claimed scope, so a
+                // delegated agent may not reach one at all.
+                if let Some(msg) = self.refuse_unboundable_delegated_tool(&call) {
+                    denied_calls_this_round += 1;
+                    policy_blocked_calls_this_round += 1;
+                    results[index] = Some(deny_call(observer, call, msg));
+                    continue;
+                }
                 if let Some(msg) = self.refuse_unscoped_mutation(&call) {
                     denied_calls_this_round += 1;
                     results[index] = Some(deny_call(observer, call, msg));

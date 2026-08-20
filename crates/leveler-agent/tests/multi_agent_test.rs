@@ -6422,3 +6422,228 @@ async fn a_foreground_settlement_is_not_consumed_by_same_round_siblings() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── MCP mutation boundary ───────────────────────────────────────────────────
+//
+// An MCP tool is a JSON-RPC proxy to a SEPARATE process that CodeLeveler
+// launches with no sandbox, no workspace path preflight and no checkpoint
+// (`mcp.rs` uses tokio::process::Command directly, not CommandRunner), and
+// `McpTool::execute` discards its ToolContext outright. So its effect cannot
+// be bounded to a claimed scope even AFTER a claim — routing it through
+// ownership admission would only pretend the claim constrains it.
+//
+// It also declares no `mutates_files()`, inheriting `false`, which is what all
+// three ownership fences key on. A delegated child could therefore mutate the
+// workspace through MCP with no ownership check firing anywhere.
+//
+// Beta semantics: a delegated child may not invoke MCP at all. The top-level
+// agent keeps it, approval-gated, with the human in the loop.
+mod mcp_ownership_boundary {
+    use super::*;
+
+    /// Stands in for an MCP tool: the `mcp__` prefix a real server's tools get
+    /// (`McpClient::parse_tools`), inheriting `mutates_files() == false` just
+    /// as `McpTool` does, and a side effect on the workspace to make a bypass
+    /// observable rather than theoretical.
+    struct FakeMcpTool {
+        touched: Arc<std::path::PathBuf>,
+    }
+
+    #[async_trait]
+    impl leveler_tools::Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            "mcp__probe__write"
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn risk(&self) -> leveler_execution::RiskLevel {
+            leveler_execution::RiskLevel::Network
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: ToolContext,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_tools::ToolOutput, leveler_tools::ToolError> {
+            std::fs::write(self.touched.as_ref(), "written by mcp\n").unwrap();
+            Ok(leveler_tools::ToolOutput::ok("done"))
+        }
+    }
+
+    fn registry_with_fake_mcp(touched: std::path::PathBuf) -> Arc<leveler_tools::ToolRegistry> {
+        let mut registry = default_registry();
+        registry.register(Arc::new(FakeMcpTool {
+            touched: Arc::new(touched),
+        }));
+        Arc::new(registry)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unclaimed_child_cannot_mutate_the_workspace_through_mcp() {
+        let dir = tmp("mcp-child-bypass", 93);
+        let touched = dir.join("mcp_written.txt");
+        let workspace = Workspace::new(&dir).unwrap();
+        let runtime = Arc::new(RoutedRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": format!("{CHILD_MARKER}: use the probe")}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "mcp__probe__write",
+                        serde_json::json!({}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child done"),
+            ],
+            CHILD_MARKER,
+            Duration::from_millis(10),
+        ));
+        Executor::new(
+            runtime,
+            registry_with_fake_mcp(touched.clone()),
+            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .run(
+            "delegate",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !touched.exists(),
+            "a child with no claimed scope mutated the workspace through an MCP \
+             tool — the ownership fences key on mutates_files(), which MCP never \
+             declares, and the effect lands outside the sandbox and checkpoint"
+        );
+    }
+
+    /// A claim must NOT unlock MCP. The scope bounds what the ownership model
+    /// can enforce inside CodeLeveler; it says nothing about a separate
+    /// process that never sees the ToolContext. Treating a claim as
+    /// sufficient would be exactly the false safety claim this boundary
+    /// exists to avoid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claimed_child_still_cannot_reach_mcp() {
+        let dir = tmp("mcp-claimed-child", 95);
+        std::fs::write(dir.join("owned.txt"), "old\n").unwrap();
+        let touched = dir.join("mcp_written.txt");
+        let workspace = Workspace::new(&dir).unwrap();
+        let runtime = Arc::new(RoutedRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": format!("{CHILD_MARKER}: claim then probe")}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "claim_write_scope",
+                        serde_json::json!({"paths": ["owned.txt"]}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_with(
+                    vec![tool_call_part(
+                        "c2",
+                        "mcp__probe__write",
+                        serde_json::json!({}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child done"),
+            ],
+            CHILD_MARKER,
+            Duration::from_millis(10),
+        ));
+        Executor::new(
+            runtime,
+            registry_with_fake_mcp(touched.clone()),
+            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .run(
+            "delegate",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !touched.exists(),
+            "holding a claimed scope must not unlock a tool whose effect lands \
+             outside that scope entirely"
+        );
+    }
+
+    /// The boundary must not be a blanket ban: the top-level agent is the
+    /// human's own agent, MCP is approval-gated there, and taking it away
+    /// would break every configured MCP server for ordinary use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_top_level_agent_still_reaches_mcp() {
+        let dir = tmp("mcp-parent-allowed", 94);
+        let touched = dir.join("mcp_written.txt");
+        let workspace = Workspace::new(&dir).unwrap();
+        let runtime = Arc::new(SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "p1",
+                        "mcp__probe__write",
+                        serde_json::json!({}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            Duration::from_millis(0),
+        ));
+        Executor::new(
+            runtime,
+            registry_with_fake_mcp(touched.clone()),
+            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .run(
+            "use the probe",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            touched.exists(),
+            "the top-level agent must keep MCP; the boundary is about delegated children"
+        );
+    }
+}

@@ -1151,6 +1151,34 @@ impl Executor {
         self
     }
 
+    /// `Some(msg)` when a DELEGATED agent asks for a tool whose workspace
+    /// effect the ownership model cannot bound.
+    ///
+    /// An MCP tool is a JSON-RPC proxy to a separate process that CodeLeveler
+    /// launches with no sandbox, no workspace path preflight and no
+    /// checkpoint, and `McpTool::execute` discards its `ToolContext`. So a
+    /// claimed scope does not constrain it — admitting it through the
+    /// ownership fence would assert a safety property that does not hold.
+    /// It also declares no `mutates_files()`, which is the predicate all
+    /// three fences key on, so today it passes every one of them untouched.
+    ///
+    /// Depth 0 is the user's own agent and keeps MCP, gated by approval.
+    pub(crate) fn refuse_unboundable_delegated_tool(
+        &self,
+        call: &leveler_model::ToolCall,
+    ) -> Option<String> {
+        let delegated = self.depth > 0 || self.agent_id.is_some();
+        (delegated && call.name.starts_with("mcp__")).then(|| {
+            format!(
+                "{} is unavailable to a delegated agent: an MCP server runs outside \
+                 the workspace sandbox and outside any claimed write scope, so its \
+                 effect cannot be bounded to yours. Report what you need in your \
+                 result and let the main agent run it.",
+                call.name
+            )
+        })
+    }
+
     /// `Some(msg)` when this mutating call is not allowed under live write
     /// authority. An empty claimed set is zero authority: refuse even if the
     /// patch parser cannot name the target files.
@@ -1240,7 +1268,10 @@ impl Executor {
         let registry = if profile.read_only {
             Arc::new(self.registry.read_only_subset())
         } else {
-            self.registry.clone()
+            // A writer child keeps the full toolset EXCEPT MCP proxies, whose
+            // effect lands in a separate unsandboxed process that no claimed
+            // scope can bound (see `refuse_unboundable_delegated_tool`).
+            Arc::new(self.registry.without_mcp_tools())
         };
         let write_allowlist = (!profile.read_only && !files.is_empty()).then_some(files);
         let child_policy = self.sub_agent_policies.map_or(

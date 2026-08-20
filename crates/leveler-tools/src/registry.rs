@@ -117,6 +117,22 @@ impl ToolRegistry {
         subset
     }
 
+    /// Every tool except MCP proxies. A delegated agent gets this: an MCP
+    /// server runs in its own unsandboxed process, outside any claimed write
+    /// scope, so its effect cannot be bounded to a child's. Filtering the
+    /// registry keeps the tool from being advertised at all — admission
+    /// refuses it too, but offering a tool that can only ever be refused just
+    /// burns the child's rounds.
+    pub fn without_mcp_tools(&self) -> ToolRegistry {
+        let mut subset = ToolRegistry::new();
+        for tool in self.tools.values() {
+            if !tool.name().starts_with("mcp__") {
+                subset.register(tool.clone());
+            }
+        }
+        subset
+    }
+
     pub fn read_only_subset(&self) -> ToolRegistry {
         use leveler_execution::RiskLevel;
         const READ_ONLY_TOOLS: &[&str] = OBSERVE_CLASS_TOOLS;
