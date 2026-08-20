@@ -1,7 +1,10 @@
 // Contextual Inspector: waiting > running > terminal > idle.
 // Sections appear only when they have content. Checkpoints / Memory live under More.
 
+import { ArrowUp, CircleHelp, ShieldAlert } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
+import { choiceOrdinal, splitChoiceOption } from '../lib/choiceLabel';
+import { CTRL_ICON } from '../lib/icons';
 import { completionTruth, trustLabel, type ArtifactFacts } from '../lib/completionTruth';
 import { formatElapsed } from '../lib/format';
 import { currentPlanProgress, inspectorMode, inspectorVisibleSections } from '../lib/inspectorModel';
@@ -255,20 +258,25 @@ function ChangesJump({ current }: { current: SessionView }) {
 function ApprovalActions({ request }: { request: UiApprovalRequest }) {
   const bridge = useBridge();
   return (
-    <div className="action-block" role="region" aria-label="需要确认">
-      <div className="action-kicker">需要确认</div>
-      <div className="action-body">
-        <div>{request.summary}</div>
-        {request.command && <pre className="action-cmd">{request.command}</pre>}
+    <div className="action-block approval" role="region" aria-label="需要你的授权">
+      <div className="action-head">
+        <ShieldAlert {...CTRL_ICON} aria-hidden="true" />
+        需要你的授权
       </div>
+      <div className="action-body">{request.summary}</div>
+      {request.command && <pre className="action-cmd">{request.command}</pre>}
       <div className="action-ops">
-        <button className="abtn primary" onClick={() => bridge.decideApproval(request.id, 'approve_once')}>
+        <button
+          type="button"
+          className="abtn primary"
+          onClick={() => bridge.decideApproval(request.id, 'approve_once')}
+        >
           允许一次
         </button>
-        <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_session')}>
+        <button type="button" className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_session')}>
           本会话允许
         </button>
-        <button className="abtn danger" onClick={() => bridge.decideApproval(request.id, 'deny')}>
+        <button type="button" className="abtn danger" onClick={() => bridge.decideApproval(request.id, 'deny')}>
           拒绝
         </button>
       </div>
@@ -279,31 +287,54 @@ function ApprovalActions({ request }: { request: UiApprovalRequest }) {
 function ClarificationActions({ request }: { request: UiClarificationRequest }) {
   const bridge = useBridge();
   const [answer, setAnswer] = useState('');
+  const submit = () => {
+    const v = answer.trim();
+    if (!v) return;
+    bridge.answerClarification(request.id, v);
+  };
   return (
-    <div className="action-block" role="region" aria-label="需要澄清">
-      <div className="action-kicker">需要澄清</div>
+    <div className="action-block clarification" role="region" aria-label="需要你补充信息">
+      <div className="action-head">
+        <CircleHelp {...CTRL_ICON} aria-hidden="true" />
+        需要你补充信息
+      </div>
       <div className="action-body">{request.question}</div>
       {request.options.length > 0 && (
-        <div className="c-options">
-          {request.options.map((opt) => (
-            <button key={opt} className="abtn" onClick={() => bridge.answerClarification(request.id, opt)}>
-              {opt}
-            </button>
-          ))}
+        <div className="choice-rows">
+          {request.options.map((opt, i) => {
+            const split = splitChoiceOption(opt);
+            const ordinal = split.ordinal ?? choiceOrdinal(i);
+            return (
+              <button
+                key={`${opt}-${i}`}
+                type="button"
+                className="choice-row"
+                onClick={() => bridge.answerClarification(request.id, opt)}
+              >
+                <span className="choice-ord">{ordinal}</span>
+                <span className="choice-body">{split.body}</span>
+              </button>
+            );
+          })}
         </div>
       )}
-      <div className="c-input-row">
-        <input
+      <div className="mini-composer-label">或者直接说明</div>
+      <div className="mini-composer">
+        <textarea
           value={answer}
-          aria-label="回答"
-          placeholder="输入回答"
+          aria-label="补充说明"
+          placeholder="输入你的说明…"
+          rows={1}
           onChange={(e) => setAnswer(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') bridge.answerClarification(request.id, answer);
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              submit();
+            }
           }}
         />
-        <button className="abtn primary" onClick={() => bridge.answerClarification(request.id, answer)}>
-          回答
+        <button type="button" className="mini-send" title="提交" aria-label="提交" onClick={submit}>
+          <ArrowUp size={16} strokeWidth={2} aria-hidden="true" />
         </button>
       </div>
     </div>
@@ -413,8 +444,14 @@ function RuntimeSection() {
 
 function MoreSection({ current }: { current: SessionView }) {
   const pending = current.memory?.pending.length ?? 0;
+  const moreOpen = useAppState().inspectorMore;
+  const dispatch = useAppDispatch();
   return (
-    <details className="insp-more">
+    <details
+      className="insp-more"
+      open={moreOpen}
+      onToggle={(e) => dispatch({ type: 'set_inspector_more', open: e.currentTarget.open })}
+    >
       <summary>
         More
         {pending > 0 && <i className="insp-dot" title="有待采纳的记忆" />}

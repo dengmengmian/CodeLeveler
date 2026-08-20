@@ -5,6 +5,7 @@
 // 保持同构：同一事件在两个 UI 里表达同一产品事实。
 
 import { createContext, useContext, type Dispatch, type ReactNode } from 'react';
+import { isCompactionSummaryText, isTurnUser } from '../lib/presentationKind';
 import { useImmerReducer } from '../lib/useImmerReducer';
 import type { TurnOutcome } from '../lib/turn';
 import type {
@@ -48,6 +49,8 @@ export interface ChatMessage {
   seq: number;
   /** 旁问（/btw）侧答：存被问的问题，非空即渲染为独立侧答卡片 */
   btw?: string;
+  /** Product presentation; compaction is stamped by the runtime prefix. */
+  kind?: 'compaction_summary';
 }
 
 export interface ToolCallView {
@@ -207,6 +210,8 @@ export interface AppState {
   /** Single sidebar open. */
   railOpen: boolean;
   inspectorOpen: boolean;
+  /** Open the Inspector More disclosure (Checkpoints / Memory). */
+  inspectorMore: boolean;
   /** Durable observatory payload (QueryObservability). Not live SessionView.tools. */
   observation: UiObservabilityLoaded | null;
   observationStatus: 'idle' | 'loading' | 'ready' | 'error';
@@ -233,6 +238,7 @@ export const initialState: AppState = {
   diffFocus: null,
   railOpen: true,
   inspectorOpen: true,
+  inspectorMore: false,
   observation: null,
   observationStatus: 'idle',
   pendingObservationQuery: null,
@@ -256,6 +262,7 @@ export type Action =
   | { type: 'toggle_rail' }
   | { type: 'toggle_inspector' }
   | { type: 'set_inspector'; open: boolean }
+  | { type: 'set_inspector_more'; open: boolean }
   | { type: 'observation_loading'; queryId: string }
   | { type: 'observation_loaded'; observation: UiObservabilityLoaded; queryId: string | null }
   | { type: 'user_message'; id: string; text: string; time: string }
@@ -325,6 +332,8 @@ function viewFromSnapshot(
     streaming: false,
     time: null,
     seq: nextSeq(),
+    kind:
+      m.role === 'user' && isCompactionSummaryText(m.text) ? 'compaction_summary' : undefined,
   }));
   const tools: ToolCallView[] = (snap.active_tools ?? []).map((t) => ({
     id: t.id,
@@ -436,7 +445,7 @@ function snapshotTurnTrace(current: SessionView): void {
   let userSeq: number | null = null;
   for (let i = current.messages.length - 1; i >= 0; i -= 1) {
     const m = current.messages[i];
-    if (m.role === 'user' && m.btw === undefined) {
+    if (isTurnUser(m)) {
       userSeq = m.seq;
       break;
     }
@@ -534,6 +543,10 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'set_inspector':
       state.inspectorOpen = action.open;
+      return;
+    case 'set_inspector_more':
+      state.inspectorMore = action.open;
+      if (action.open) state.inspectorOpen = true;
       return;
     case 'observation_loading':
       state.observationStatus = 'loading';

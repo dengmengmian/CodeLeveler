@@ -21,36 +21,26 @@ import {
 } from '../lib/format';
 import { CTRL_ICON } from '../lib/icons';
 import { runConfigCompact } from '../lib/runConfig';
+import {
+  filterSlashCommands,
+  groupSlashCommands,
+  slashTarget,
+  type SlashPopup,
+} from '../lib/slashCommands';
 import { useBridge } from '../state/bridge';
 import { useAppState } from '../state/store';
 import type { ModelRef, PermissionProfile } from '../types/protocol';
 
-/** 斜杠命令（cmd, 描述, 对应 ClientCommand 变体） */
-const SLASH: ReadonlyArray<readonly [string, string, string]> = [
-  ['/model', '切换模型', 'SelectModel'],
-  ['/work-mode', '工作档：economy|balanced|delivery', 'SetProductAxes'],
-  ['/collab', '协作档：chat|plan|goal', 'SetProductAxes'],
-  ['/perm', '切换权限档位', 'SetPermissionProfile'],
-  ['/compact', '压缩上下文', 'CompactContext'],
-  ['/clear', '开始新对话（当前这段保留在会话列表）', 'NewSessionFor'],
-  ['/diff', '查看当前变更', 'RequestDiff'],
-  ['/checkpoint', '回滚到检查点', 'RestoreCheckpoint'],
-  ['/memory', '查看 / 采纳 / 遗忘项目记忆（Inspector → More）', 'ListMemory / AcceptMemory / ForgetMemory'],
-  ['/cancel', '取消当前回合', 'CancelCurrentTurn'],
-  ['/btw', '侧问（不打断当前回合）', 'Btw'],
-];
+type Popup = SlashPopup | 'run' | null;
+type ActiveCommand = 'btw' | null;
 
-/** 选中后立即执行的命令（无参数） */
-const EXEC_IMMEDIATELY = new Set(['/compact', '/clear', '/diff', '/cancel', '/memory']);
-/** 选中后打开弹层的命令 → 弹层名 */
-const OPEN_POPUP: Record<string, Popup> = {
-  '/model': 'model',
-  '/work-mode': 'work',
-  '/collab': 'collab',
-  '/perm': 'perm',
+type PickerItem = {
+  key: string;
+  label: string;
+  desc: string;
+  current?: boolean;
+  run: () => void;
 };
-
-type Popup = 'perm' | 'work' | 'collab' | 'model' | 'run' | null;
 
 const PERMISSIONS: ReadonlyArray<{
   profile: PermissionProfile;
@@ -83,6 +73,8 @@ export function Composer() {
   const [text, setText] = useState('');
   const [popup, setPopup] = useState<Popup>(null);
   const [slashIndex, setSlashIndex] = useState(0);
+  const [pickerIndex, setPickerIndex] = useState(0);
+  const [activeCommand, setActiveCommand] = useState<ActiveCommand>(null);
   const [uploading, setUploading] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -90,12 +82,18 @@ export function Composer() {
   const current = state.current;
   const turnActive = current?.turnActive ?? false;
   const queue = state.queue.filter((q) => q.sessionId === current?.id);
+  const workProfile = current?.workProfile ?? 'balanced';
+  const collaboration = current?.collaboration ?? 'chat';
+  const reasoning = reasoningLabel(current?.reasoningEffort ?? null);
+  const models = current?.availableModels ?? [];
+  const currentModelRef = current?.model ? modelRefString(current.model) : null;
+  const attachments = state.pendingAttachments;
 
-  // 斜杠面板命中项
-  const slashOpen = text.startsWith('/');
+  const slashOpen = !activeCommand && text.startsWith('/');
   const query = slashOpen ? text.slice(1).toLowerCase() : '';
-  const hits = slashOpen ? SLASH.filter((c) => c[0].slice(1).startsWith(query)) : [];
-  const showSlash = slashOpen && hits.length > 0 && !text.includes(' ');
+  const hits = slashOpen && !text.includes(' ') ? filterSlashCommands(query) : [];
+  const showSlash = hits.length > 0;
+  const slashGroups = query.trim() ? [{ label: '', items: hits }] : groupSlashCommands(hits);
 
   // 点击组件外关闭弹层
   useEffect(() => {
@@ -105,6 +103,10 @@ export function Composer() {
     };
     document.addEventListener('click', onDocClick);
     return () => document.removeEventListener('click', onDocClick);
+  }, [popup]);
+
+  useEffect(() => {
+    setPickerIndex(0);
   }, [popup]);
 
   // 通知条 6s 自动消失
@@ -143,27 +145,119 @@ export function Composer() {
       taRef.current?.focus();
       return;
     }
-    void bridge.sendUserMessage(value);
+    if (activeCommand === 'btw') {
+      bridge.sendBtw(value);
+      setActiveCommand(null);
+    } else {
+      void bridge.sendUserMessage(value);
+    }
     setText('');
     requestAnimationFrame(autosize);
-  }, [bridge, text, autosize]);
+  }, [bridge, text, autosize, activeCommand]);
 
   const pickSlash = useCallback(
     (cmd: string) => {
-      if (EXEC_IMMEDIATELY.has(cmd)) {
-        setText('');
-        bridge.runSlash(cmd);
-      } else if (cmd in OPEN_POPUP) {
-        setText('');
-        setPopup(OPEN_POPUP[cmd]);
-      } else {
-        setText(`${cmd} `);
+      const target = slashTarget(cmd);
+      setText('');
+      setSlashIndex(0);
+      if (!target) {
+        taRef.current?.focus();
+        return;
+      }
+      if (target.kind === 'action') {
+        bridge.runSlash(target.command);
+      } else if (target.kind === 'selector' || target.kind === 'entity-picker') {
+        setPopup(target.popup);
+      } else if (target.kind === 'navigation') {
+        if (target.dest === 'diff') bridge.openChanges();
+        if (target.dest === 'memory') bridge.openMemory();
+      } else if (target.kind === 'input-mode') {
+        setActiveCommand('btw');
       }
       taRef.current?.focus();
       requestAnimationFrame(autosize);
     },
     [bridge, autosize],
   );
+
+  const pickerItems: PickerItem[] = (() => {
+    if (popup === 'model') {
+      return models.map((m) => {
+        const ref = modelRefString(m);
+        return {
+          key: ref,
+          label: m.model,
+          desc: m.provider,
+          current: ref === currentModelRef,
+          run: () => {
+            bridge.setModel(m);
+            setPopup(null);
+          },
+        };
+      });
+    }
+    if (popup === 'work') {
+      return WORK_OPTIONS.map(([w, desc]) => ({
+        key: w,
+        label: workProfileLabel(w),
+        desc,
+        current: workProfile === w,
+        run: () => {
+          bridge.setAxes(w, collaboration);
+          setPopup(null);
+        },
+      }));
+    }
+    if (popup === 'collab') {
+      return COLLAB_OPTIONS.map(([c, desc]) => ({
+        key: c,
+        label: collaborationLabel(c),
+        desc,
+        current: collaboration === c,
+        run: () => {
+          bridge.setAxes(workProfile, c);
+          setPopup(null);
+        },
+      }));
+    }
+    if (popup === 'perm') {
+      return PERMISSIONS.map((p) => ({
+        key: p.profile,
+        label: p.label,
+        desc: p.desc,
+        current: current?.permission === p.profile,
+        run: () => {
+          bridge.setPermission(p.profile);
+          setPopup(null);
+        },
+      }));
+    }
+    if (popup === 'checkpoint') {
+      return (current?.checkpoints ?? []).map((c) => ({
+        key: c.id,
+        label: c.label || `#${c.ordinal}`,
+        desc: `#${c.ordinal}`,
+        run: () => {
+          bridge.restoreCheckpoint(c.id);
+          setPopup(null);
+        },
+      }));
+    }
+    return [];
+  })();
+
+  const pickerTitle =
+    popup === 'model'
+      ? 'Model'
+      : popup === 'work'
+        ? 'Work Profile'
+        : popup === 'collab'
+          ? 'Collaboration'
+          : popup === 'perm'
+            ? 'Permission'
+            : popup === 'checkpoint'
+              ? 'Restore checkpoint'
+              : null;
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Escape') {
@@ -174,6 +268,11 @@ export function Composer() {
       }
       if (popup) {
         setPopup(null);
+        e.preventDefault();
+        return;
+      }
+      if (activeCommand) {
+        setActiveCommand(null);
         e.preventDefault();
         return;
       }
@@ -196,7 +295,24 @@ export function Composer() {
       }
       if (e.key === 'Tab' || e.key === 'Enter') {
         e.preventDefault();
-        pickSlash(hits[Math.min(slashIndex, hits.length - 1)][0]);
+        pickSlash(hits[Math.min(slashIndex, hits.length - 1)].command);
+        return;
+      }
+    }
+    if (popup && popup !== 'run' && pickerItems.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setPickerIndex((i) => Math.min(i + 1, pickerItems.length - 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setPickerIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === 'Tab' || e.key === 'Enter') {
+        e.preventDefault();
+        pickerItems[Math.min(pickerIndex, pickerItems.length - 1)]?.run();
         return;
       }
     }
@@ -205,13 +321,6 @@ export function Composer() {
       send();
     }
   };
-
-  const workProfile = current?.workProfile ?? 'balanced';
-  const collaboration = current?.collaboration ?? 'chat';
-  const reasoning = reasoningLabel(current?.reasoningEffort ?? null);
-  const models = current?.availableModels ?? [];
-  const currentModelRef = current?.model ? modelRefString(current.model) : null;
-  const attachments = state.pendingAttachments;
 
   const pickFiles = () => {
     if (!current) {
@@ -308,39 +417,72 @@ export function Composer() {
 
         <div className="box-outer">
           {showSlash && (
-            <div className="slash-pop">
-              <div className="pop-head">命令 · 输入继续过滤，↑↓ 选择，Tab 补全</div>
-              <div>
-                {hits.map((c, idx) => (
-                  <button
-                    key={c[0]}
-                    className={`pop-item${idx === Math.min(slashIndex, hits.length - 1) ? ' sel' : ''}`}
-                    onMouseEnter={() => setSlashIndex(idx)}
-                    onClick={() => pickSlash(c[0])}
-                  >
-                    <span className="cmd">{c[0]}</span>
-                    <span className="desc">{c[1]}</span>
-                    <span className="cur">{c[2]}</span>
-                  </button>
-                ))}
-              </div>
+            <div className="slash-pop" role="listbox" aria-label="命令">
+              {slashGroups.map((g) => (
+                <div key={g.label || 'hits'} className="slash-group">
+                  {g.label ? <div className="slash-group-h">{g.label}</div> : null}
+                  {g.items.map((c) => {
+                    const idx = hits.indexOf(c);
+                    return (
+                      <button
+                        key={c.command}
+                        type="button"
+                        role="option"
+                        aria-selected={idx === Math.min(slashIndex, hits.length - 1)}
+                        className={`slash-item${idx === Math.min(slashIndex, hits.length - 1) ? ' sel' : ''}`}
+                        onMouseEnter={() => setSlashIndex(idx)}
+                        onClick={() => pickSlash(c.command)}
+                      >
+                        <span className="slash-cmd">{c.command}</span>
+                        <span className="slash-desc">{c.description}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
             </div>
           )}
 
           <div className="box">
+            {activeCommand === 'btw' && (
+              <div className="cmd-row">
+                <span className="cmd-chip">
+                  /btw
+                  <button
+                    type="button"
+                    className="cmd-chip-x"
+                    title="退出侧问"
+                    aria-label="退出侧问"
+                    onClick={() => setActiveCommand(null)}
+                  >
+                    <X {...CTRL_ICON} aria-hidden="true" />
+                  </button>
+                </span>
+              </div>
+            )}
             <textarea
               ref={taRef}
               rows={2}
               value={text}
               placeholder={
-                turnActive
-                  ? '回合运行中，可继续输入并加入队列…… ( / 唤起命令 )'
-                  : state.draft
-                    ? '你想让 CodeLeveler 做什么？'
-                    : '告诉 Agent 要完成什么，或输入 / 查看命令'
+                activeCommand === 'btw'
+                  ? '侧问 · 不打断当前回合'
+                  : turnActive
+                    ? '回合运行中，可继续输入并加入队列…… ( / 唤起命令 )'
+                    : state.draft
+                      ? '你想让 CodeLeveler 做什么？'
+                      : '告诉 Agent 要完成什么，或输入 / 查看命令'
               }
               onChange={(e) => {
-                setText(e.target.value);
+                const v = e.target.value;
+                if (!activeCommand && (v === '/btw ' || v.startsWith('/btw '))) {
+                  setActiveCommand('btw');
+                  setText(v.slice('/btw '.length));
+                  setSlashIndex(0);
+                  requestAnimationFrame(autosize);
+                  return;
+                }
+                setText(v);
                 setSlashIndex(0);
                 autosize();
               }}
@@ -450,6 +592,30 @@ export function Composer() {
                     ))}
                   </div>
                 )}
+                {pickerTitle && (
+                  <div className="pop pop-right run-pop" role="listbox" aria-label={pickerTitle}>
+                    <div className="pop-head">{pickerTitle}</div>
+                    {pickerItems.length === 0 && (
+                      <div className="insp-empty">
+                        {popup === 'checkpoint' ? '暂无检查点' : popup === 'model' ? '暂无可用模型' : '暂无选项'}
+                      </div>
+                    )}
+                    {pickerItems.map((it, i) => (
+                      <button
+                        key={it.key}
+                        type="button"
+                        role="option"
+                        aria-selected={i === Math.min(pickerIndex, pickerItems.length - 1)}
+                        className={`pop-item${it.current || i === Math.min(pickerIndex, pickerItems.length - 1) ? ' sel' : ''}`}
+                        onMouseEnter={() => setPickerIndex(i)}
+                        onClick={it.run}
+                      >
+                        <span className="cmd">{it.label}</span>
+                        <span className="desc">{it.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </span>
 
               <button
@@ -466,7 +632,7 @@ export function Composer() {
         </div>
         <div className="hint">
           <kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · <kbd>/</kbd> 命令 · 回合进行中发送将
-          <b>排队</b> · <kbd>Esc</kbd> 取消当前回合
+          <b>排队</b> · <kbd>Esc</kbd> 关闭面板 / 退出命令 / 取消回合
         </div>
       </div>
     </div>

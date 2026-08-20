@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { ProjectInfo, UiObservabilityLoaded, UiSessionSnapshot } from '../types/protocol';
+import { COMPACTION_SUMMARY_PREFIX } from '../lib/presentationKind';
 import { sessionsForProject } from '../lib/projectScope';
 import { headerWaitingCue, inspectorMode } from '../lib/inspectorModel';
 import { initialState, reducer, type AppState } from './store';
@@ -647,5 +648,18 @@ describe('reasoning stream', () => {
     reducer(state, { type: 'tool_started', id: 't1', name: 'read_file', arguments: '{}', parallel: false });
     reducer(state, { type: 'reasoning_delta', delta: '新想法' });
     expect(state.current?.reasoning).toBe('新想法');
+  });
+});
+
+describe('compaction presentation', () => {
+  it('stamps compaction_summary from the runtime prefix on snapshot reload', () => {
+    const state = stateWithSession({
+      messages: [
+        { id: 'c1', role: 'user', text: `${COMPACTION_SUMMARY_PREFIX}：\n## 简报\n- a` },
+        { id: 'u1', role: 'user', text: '继续' },
+      ],
+    });
+    expect(state.current?.messages[0]?.kind).toBe('compaction_summary');
+    expect(state.current?.messages[1]?.kind).toBeUndefined();
   });
 });

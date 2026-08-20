@@ -69,6 +69,13 @@ function localizeDetail(detail: string): string {
   return d;
 }
 
+/** Conversation Turn Footer primary line: Turn Truth + duration, no wall-clock. */
+export function turnFooterPrimary(end: TurnEnd, ms: number): string {
+  const p = presentTurnEnd(end);
+  const sec = Math.round(ms / 1000);
+  return sec > 0 ? `${p.label} · ${sec}s` : p.label;
+}
+
 export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
   const token = end.detail?.trim() ?? null;
   switch (end.outcome) {

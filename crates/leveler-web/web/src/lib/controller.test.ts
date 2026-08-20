@@ -7,9 +7,13 @@ import type { Action, AppState } from '../state/store';
 import { initialState, reducer } from '../state/store';
 import type { ClientCommand, RuntimeEvent, UpFrame } from '../types/protocol';
 import { RuntimeBridge } from './controller';
+import { loadLastSession, saveLastSession } from './lastSession';
+
+const localStore = new Map<string, string>();
 
 // getToken 需要 window/sessionStorage；node 环境下补最小桩。
 beforeEach(() => {
+  localStore.clear();
   const g = globalThis as Record<string, unknown>;
   g.window = {
     location: { href: 'http://localhost/', protocol: 'http:', host: 'localhost' },
@@ -19,6 +23,15 @@ beforeEach(() => {
     getItem: () => '',
     setItem: () => {},
     removeItem: () => {},
+  };
+  g.localStorage = {
+    getItem: (key: string) => localStore.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      localStore.set(key, value);
+    },
+    removeItem: (key: string) => {
+      localStore.delete(key);
+    },
   };
 });
 
@@ -101,6 +114,49 @@ describe('product axes commands', () => {
   });
 });
 
+function emptyHarness(): Harness {
+  const state: AppState = structuredClone(initialState);
+  const dispatch = (action: Action) => reducer(state, action);
+  const bridge = new RuntimeBridge(dispatch, () => state);
+  const sent: ClientCommand[] = [];
+  const wsSession = { id: null as string | null };
+  (bridge as unknown as {
+    ws: {
+      send: (f: UpFrame) => boolean;
+      setSession: (id: string | null) => void;
+    };
+  }).ws = {
+    send: (frame: UpFrame) => {
+      if (frame.type === 'deliver') sent.push(frame.command);
+      return true;
+    },
+    setSession: (id: string | null) => {
+      wsSession.id = id;
+    },
+  };
+  const apply = (ev: RuntimeEvent) =>
+    (bridge as unknown as { applyEvent: (ev: RuntimeEvent) => void }).applyEvent(ev);
+  return { bridge, state, sent, apply, wsSession };
+}
+
+function summary(id: string, repository = '/repo'): {
+  id: string;
+  goal: string;
+  model: string;
+  status: string;
+  updated_at: string;
+  repository: string;
+} {
+  return {
+    id,
+    goal: id,
+    model: 'm',
+    status: 'idle',
+    updated_at: '2026-08-20T00:00:00Z',
+    repository,
+  };
+}
+
 describe('new session', () => {
   it('newDraft without an argument targets the selected project', () => {
     const { bridge, state } = harness();
@@ -109,6 +165,49 @@ describe('new session', () => {
     expect(state.draft).toBe(true);
     expect(state.draftProject).toBe('/A');
     expect(state.selectedProject).toBe('/A');
+  });
+
+  it('newDraft forgets the last conversation so refresh stays on new task', () => {
+    const { bridge } = harness();
+    saveLastSession('s1');
+    bridge.newDraft('/A');
+    expect(loadLastSession()).toBeNull();
+  });
+});
+
+describe('reopen last conversation on refresh', () => {
+  it('selectSession remembers the conversation', () => {
+    const { bridge } = emptyHarness();
+    bridge.selectSession('sess-keep');
+    expect(loadLastSession()).toBe('sess-keep');
+  });
+
+  it('session_list reopens the last conversation instead of staying on the hero', () => {
+    saveLastSession('sess-keep');
+    const { state, sent, apply, wsSession } = emptyHarness();
+    expect(state.draft).toBe(true);
+    apply({
+      type: 'session_list',
+      sessions: [summary('other'), summary('sess-keep')],
+    });
+    expect(state.draft).toBe(false);
+    expect(wsSession.id).toBe('sess-keep');
+    expect(sent.some((c) => c.type === 'open_session' && c.session_id === 'sess-keep')).toBe(true);
+  });
+
+  it('does not invent a conversation when nothing was open', () => {
+    const { state, sent, apply } = emptyHarness();
+    apply({ type: 'session_list', sessions: [summary('sess-keep')] });
+    expect(state.draft).toBe(true);
+    expect(sent.some((c) => c.type === 'open_session')).toBe(false);
+  });
+
+  it('stays on new task when the last conversation is gone', () => {
+    saveLastSession('deleted');
+    const { state, apply } = emptyHarness();
+    apply({ type: 'session_list', sessions: [summary('other')] });
+    expect(state.draft).toBe(true);
+    expect(state.current).toBeNull();
   });
 });
 
@@ -207,6 +306,31 @@ describe('memory commands', () => {
       'forget_memory',
       'list_memory',
     ]);
+  });
+});
+
+describe('interaction commands', () => {
+  it('sendBtw delivers the typed btw command, not a slash string', () => {
+    const { bridge, sent } = harness();
+    bridge.sendBtw('这是什么');
+    expect(sent).toEqual([{ type: 'btw', session_id: 's1', question: '这是什么' }]);
+  });
+
+  it('openChanges requests a fresh diff then stages Changes', () => {
+    const { bridge, sent, state } = harness();
+    bridge.openChanges();
+    expect(sent[0]).toMatchObject({ type: 'request_diff', session_id: 's1' });
+    expect(state.stageView).toBe('diff');
+  });
+
+  it('openMemory lists memory and opens Inspector More', () => {
+    const { bridge, sent, state } = harness();
+    reducer(state, { type: 'set_inspector', open: false });
+    expect(state.inspectorOpen).toBe(false);
+    bridge.openMemory();
+    expect(sent[0]).toMatchObject({ type: 'list_memory', session_id: 's1', include_archived: true });
+    expect(state.inspectorOpen).toBe(true);
+    expect(state.inspectorMore).toBe(true);
   });
 });
 

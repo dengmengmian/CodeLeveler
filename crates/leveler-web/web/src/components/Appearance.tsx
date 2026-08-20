@@ -19,9 +19,9 @@ function useThemeChoice(): ThemeChoice {
 
 /** 预览卡片的代表色（展示各主题外观，与 app.css 的调色板对应）。 */
 const SWATCH: Record<'graphite' | 'midnight' | 'paper', { app: string; surface: string; accent: string; text: string }> = {
-  graphite: { app: '#11161d', surface: '#19222d', accent: '#9ddd48', text: '#e8edf4' },
-  midnight: { app: '#0f1520', surface: '#192434', accent: '#8fda45', text: '#edf3fb' },
-  paper: { app: '#f4f6f8', surface: '#ffffff', accent: '#6fae1f', text: '#1b2530' },
+  graphite: { app: '#121416', surface: '#1c1f23', accent: '#9ddd48', text: '#eceff2' },
+  midnight: { app: '#0d121c', surface: '#172033', accent: '#8fda45', text: '#edf3fb' },
+  paper: { app: '#ffffff', surface: '#f7f7f5', accent: '#5b8f1f', text: '#202326' },
 };
 
 function swatchFor(choice: ThemeChoice) {

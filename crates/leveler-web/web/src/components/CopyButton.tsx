@@ -39,8 +39,10 @@ export function CopyButton({
 
   return (
     <button
+      type="button"
       className={`copy-btn${copied ? ' copied' : ''}${className ? ` ${className}` : ''}`}
       title={title}
+      aria-label={title}
       onClick={onClick}
     >
       {copied ? <span className="copy-done">已复制</span> : <CopyIcon />}
@@ -70,8 +72,10 @@ export function CopyButtonLazy({
 
   return (
     <button
+      type="button"
       className={`copy-btn${copied ? ' copied' : ''}${className ? ` ${className}` : ''}`}
       title={title}
+      aria-label={title}
       onClick={onClick}
     >
       {copied ? <span className="copy-done">已复制</span> : <CopyIcon />}

@@ -16,7 +16,8 @@ import { useBridge } from '../state/bridge';
 import { completionTruth } from '../lib/completionTruth';
 import { deriveRunState, type AgentRunState } from '../lib/runstate';
 import { formatSeconds, statsLine, summarizeTools } from '../lib/toolstats';
-import { presentTurnEnd } from '../lib/turn';
+import { presentTurnEnd, turnFooterPrimary } from '../lib/turn';
+import { CopyButton } from './CopyButton';
 import { ReasoningDisclosure } from './ReasoningDisclosure';
 import { ToolCallRow } from './ToolCallRow';
 
@@ -72,11 +73,15 @@ export function AgentRunBlock({
   tools: toolsProp,
   backgroundTasks: bgProp,
   lastTurn: lastTurnProp,
+  copyText = null,
+  live: liveFooter = false,
 }: {
   variant?: 'live' | 'process' | 'footer';
   tools?: ToolCallView[];
   backgroundTasks?: BackgroundTaskView[];
   lastTurn?: LastTurn | null;
+  copyText?: string | null;
+  live?: boolean;
 } = {}) {
   const current = useAppState().current;
   const bridge = useBridge();
@@ -92,7 +97,7 @@ export function AgentRunBlock({
     if (tools.length === 0 && backgroundTasks.length === 0) return null;
     const stats = summarizeTools(tools);
     return (
-      <div className="run-summary r-terminal tone-muted">
+      <div className="run-summary r-process tone-muted">
         {tools.length > 0 && <div className="rs-sub">{statsLine(stats)}</div>}
         {backgroundTasks.map((t) => (
           <BackgroundTaskRow key={t.id} task={t} />
@@ -117,17 +122,25 @@ export function AgentRunBlock({
     const lastTurn = lastTurnProp ?? current?.lastTurn ?? null;
     if (!lastTurn) return null;
     const p = presentTurnEnd(lastTurn);
-    const sec = Math.round(lastTurn.ms / 1000);
-    const primary = sec > 0 && p.tone === 'success' ? `${p.label} · 用时 ${sec}s` : p.label;
+    const primary = turnFooterPrimary(lastTurn, lastTurn.ms);
     const retry =
-      lastTurn.outcome === 'failed' || lastTurn.outcome === 'cancelled' || lastTurn.outcome === 'truncated';
+      liveFooter &&
+      (lastTurn.outcome === 'failed' || lastTurn.outcome === 'cancelled' || lastTurn.outcome === 'truncated');
     const truth = current ? completionTruth(current) : null;
-    const showFacts = Boolean(lastTurnProp === undefined && truth && truth.facts.length > 0);
+    const showFacts = Boolean(liveFooter && truth && truth.facts.length > 0);
     return (
-      <div className={`run-summary r-terminal tone-${p.tone}`}>
+      <div className={`run-summary r-footer tone-${p.tone}`}>
         <div className="rs-head">
           <span className="rs-icon">{p.glyph}</span>
           <span className="rs-primary">{primary}</span>
+          <span className="turn-actions">
+            {retry && (
+              <button type="button" className="rs-btn" onClick={() => bridge.rerunLast()}>
+                {lastTurn.outcome === 'failed' ? '重试' : '重新运行'}
+              </button>
+            )}
+            {copyText ? <CopyButton text={copyText} className="copy-btn-compact" /> : null}
+          </span>
         </div>
         {p.detail && <div className="rs-detail">原因：{p.detail}</div>}
         {showFacts && truth && (
@@ -135,13 +148,6 @@ export function AgentRunBlock({
             {truth.facts.map((f) => (
               <div key={f}>{f}</div>
             ))}
-          </div>
-        )}
-        {retry && (
-          <div className="rs-actions">
-            <button className="rs-btn" onClick={() => bridge.rerunLast()}>
-              {lastTurn.outcome === 'failed' ? '重试' : '重新运行'}
-            </button>
           </div>
         )}
       </div>
@@ -159,7 +165,7 @@ export function AgentRunBlock({
   const recentDone = tools.filter((t) => t.status !== 'run').slice(-RECENT_DONE);
 
   return (
-    <div className={`run-summary r-${run.state}`}>
+    <div className={`run-summary r-live r-${run.state}`}>
       <div className="rs-head">
         <span className="rs-icon">{spinning ? <span className="rs-spin" /> : '⏸'}</span>
         <span className="rs-primary">{run.primary}</span>

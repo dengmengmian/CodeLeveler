@@ -5,6 +5,7 @@
 import type { Dispatch } from 'react';
 import * as api from './api';
 import { formatClock, modelRefString } from './format';
+import { loadLastSession, saveLastSession } from './lastSession';
 import { getToken } from './token';
 import { shouldRefreshObservability } from './observabilityView';
 import { commandProgressLabel, turnEndFromEvent, turnProgressLabel } from './turn';
@@ -119,6 +120,7 @@ export class RuntimeBridge {
     }
     this.pendingSessionId = null;
     this.dispatch({ type: 'snapshot', session: snap, contextWindow });
+    saveLastSession(snap.id);
     if (previousId !== snap.id || this.getState().observation === null) {
       this.queryObservability(snap.id);
     }
@@ -138,6 +140,7 @@ export class RuntimeBridge {
     switch (ev.type) {
       case 'session_list':
         this.dispatch({ type: 'session_list', sessions: ev.sessions });
+        this.maybeRestoreLastSession();
         return;
       case 'session_opened':
         this.applySnapshot(ev.session);
@@ -384,6 +387,7 @@ export class RuntimeBridge {
     this.pendingSessionId = id;
     this.dispatch({ type: 'select_session', id });
     this.ws.setSession(id);
+    saveLastSession(id);
     // 让 runtime 把该会话 transcript 载入视图（网关也会主动推 snapshot，双保险）
     this.deliver({ type: 'open_session', session_id: id });
   }
@@ -392,7 +396,18 @@ export class RuntimeBridge {
     const state = this.getState();
     const path = project ?? state.selectedProject ?? (state.repository || null);
     this.dispatch({ type: 'new_draft', project: path });
+    saveLastSession(null);
     this.leaveSessionSubscription();
+  }
+
+  /** Refresh should reopen the conversation that was on screen, not the hero. */
+  private maybeRestoreLastSession(): void {
+    const state = this.getState();
+    if (!state.draft || state.current || this.pendingSessionId) return;
+    const last = loadLastSession();
+    if (!last) return;
+    if (!state.sessions.some((s) => s.id === last)) return;
+    this.selectSession(last);
   }
 
   selectProject(path: string): void {
@@ -713,6 +728,24 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return;
     this.deliver({ type: 'request_diff', session_id: current.id });
+  }
+
+  sendBtw(question: string): void {
+    const q = question.trim();
+    if (!q) return;
+    const current = this.getState().current;
+    if (!current) return;
+    this.deliver({ type: 'btw', session_id: current.id, question: q });
+  }
+
+  openChanges(): void {
+    this.requestDiff();
+    this.dispatch({ type: 'stage_view', view: 'diff' });
+  }
+
+  openMemory(): void {
+    this.listMemory();
+    this.dispatch({ type: 'set_inspector_more', open: true });
   }
 
   /** 仅从待发列表移除附件（服务端已注册的无法撤回） */

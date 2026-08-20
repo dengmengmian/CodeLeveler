@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatMessage } from '../state/store';
-import { groupConversationTurns, layoutTimeline, splitAroundCurrentTurn } from './timelineLayout';
+import {
+  assistantResultText,
+  groupConversationTurns,
+  layoutTimeline,
+  splitAroundCurrentTurn,
+} from './timelineLayout';
 
 function msg(
   role: ChatMessage['role'],
@@ -37,6 +42,16 @@ describe('splitAroundCurrentTurn', () => {
     expect(beforeRun.map((m) => m.text)).toEqual(['q']);
     expect(afterRun.map((m) => m.text)).toEqual(['side', 'answer']);
   });
+
+  it('does not treat a compaction summary as a user prompt', () => {
+    const { beforeRun, afterRun } = splitAroundCurrentTurn([
+      msg('user', '摘要', { seq: 1, kind: 'compaction_summary' }),
+      msg('user', '继续', { seq: 2 }),
+      msg('assistant', '好', { seq: 3 }),
+    ]);
+    expect(beforeRun.map((m) => m.text)).toEqual(['摘要', '继续']);
+    expect(afterRun.map((m) => m.text)).toEqual(['好']);
+  });
 });
 
 describe('layoutTimeline', () => {
@@ -48,12 +63,13 @@ describe('layoutTimeline', () => {
         msg('user', 'q2', { seq: 3 }),
         msg('assistant', 'a2', { seq: 4 }),
       ],
-      { turnActive: false, hasLastTurn: true, frozenProcessSeqs: [1, 3] },
+      { turnActive: false, hasLastTurn: true, frozenProcessSeqs: [1, 3], footerSeqs: [1, 3] },
     );
     expect(slots.map((s) => (s.kind === 'message' ? s.message.text : `${s.kind}:${s.userSeq}`))).toEqual([
       'q1',
       'process:1',
       'a1',
+      'footer:1',
       'q2',
       'process:3',
       'a2',
@@ -109,7 +125,7 @@ describe('groupConversationTurns', () => {
         msg('user', 'q2', { seq: 3 }),
         msg('assistant', 'a2', { seq: 4 }),
       ],
-      { turnActive: false, hasLastTurn: true, frozenProcessSeqs: [1, 3] },
+      { turnActive: false, hasLastTurn: true, frozenProcessSeqs: [1, 3], footerSeqs: [1, 3] },
     );
     const turns = groupConversationTurns(slots);
     expect(turns).toHaveLength(2);
@@ -119,6 +135,7 @@ describe('groupConversationTurns', () => {
       'q1',
       'process',
       'a1',
+      'footer',
     ]);
     expect(turns[1].items.map((s) => (s.kind === 'message' ? s.message.text : s.kind))).toEqual([
       'q2',
@@ -135,5 +152,42 @@ describe('groupConversationTurns', () => {
     );
     const [turn] = groupConversationTurns(slots);
     expect(turn.items.map((s) => s.kind)).toEqual(['message', 'process', 'message']);
+  });
+});
+
+describe('assistantResultText', () => {
+  it('returns the last assistant result in the turn for Copy', () => {
+    const slots = layoutTimeline(
+      [msg('user', 'q', { seq: 1 }), msg('assistant', 'hello', { seq: 2 })],
+      { turnActive: false, hasLastTurn: true, frozenProcessSeqs: [], footerSeqs: [1] },
+    );
+    const [turn] = groupConversationTurns(slots);
+    expect(assistantResultText(turn.items)).toBe('hello');
+    expect(turn.items.map((s) => s.kind)).toEqual(['message', 'process', 'message', 'footer']);
+  });
+
+  it('does not offer Copy for streaming or empty assistant text', () => {
+    expect(
+      assistantResultText([
+        { kind: 'message', message: msg('user', 'q', { seq: 1 }) },
+        { kind: 'message', message: msg('assistant', 'partial', { seq: 2, streaming: true }) },
+      ]),
+    ).toBeNull();
+    expect(
+      assistantResultText([
+        { kind: 'message', message: msg('user', 'q', { seq: 1 }) },
+        { kind: 'footer', userSeq: 1, live: true },
+      ]),
+    ).toBeNull();
+  });
+
+  it('ignores btw side-answers when choosing copy text', () => {
+    expect(
+      assistantResultText([
+        { kind: 'message', message: msg('user', 'q', { seq: 1 }) },
+        { kind: 'message', message: msg('assistant', 'side', { seq: 2, btw: '顺便' }) },
+        { kind: 'message', message: msg('assistant', 'main', { seq: 3 }) },
+      ]),
+    ).toBe('main');
   });
 });

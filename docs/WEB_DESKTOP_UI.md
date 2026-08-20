@@ -61,12 +61,41 @@ TURN
 ├── Agent Execution
 │   ├── Thinking
 │   └── Tool activity
-└── Assistant Result
+├── Assistant Result
+└── Turn Footer
 ```
 
 `.conv-turn` is the only spacing owner: 12px inside a turn, 32px between
 turns. User prompts use `--user-accent`, not the brand green. Assistant
 results stay document-style (no avatar, no card).
+
+### Conversation Message Presentation
+
+| Kind | Rendering |
+| --- | --- |
+| Normal user | plain text (never Markdown) |
+| Assistant | `MessageBody` / shared `.md-body` |
+| BTW | side-question card + `.md-body`. Live only: `ChatMessage.btw` from `btw_*` events. Not in the transcript, so reload cannot restore it. |
+| Compaction summary | collapsed context disclosure + `.md-body`. Runtime stamps `COMPACTION_SUMMARY_PREFIX` (`对话摘要（已压缩历史）`) on the replacement user message — the same constant the TUI uses. Not a user prompt. |
+
+Do not copy Markdown CSS per container. `.message-assistant`, `.btw-card`,
+and `.compaction-summary` own chrome; `.md-body` owns typography.
+
+### Turn Footer Contract
+
+Wall-clock timestamps are not shown in the primary Conversation UI
+(`title` on the user prompt still holds the time).
+
+Turn Footer owns:
+
+- Turn Truth
+- duration
+- terminal actions (retry / re-run)
+- copy of the **assistant result only**
+
+Live / process disclosure keeps a left rail. The footer does not.
+Copy is omitted when there is no assistant result. Footer appears only
+after terminal Turn Truth exists (not while streaming).
 
 Thinking is current-turn presentation of `SessionView.reasoning` /
 `reasoning_delta`. Empty → hidden. Default collapsed. Body capped at 24
@@ -92,12 +121,36 @@ with `Open Execution`. Changes is a summary with `View changes →`.
 
 Waiting auto-opens the Inspector. The header waiting cue also opens it.
 
+### Action Required Contract
+
+Approval is permission / risk (warning). Clarification is a missing-information
+request (informational). They do not share the same chrome.
+
+Clarification options are choice rows (`A` / `B` / `C` in a fixed column),
+not boxed form buttons. Freeform input is a mini composer (Enter submits).
+Approval keeps the existing decide-approval decisions; Deny is a text
+action, not a third identical box.
+
 ## Composer
 
 One input. Attachment, compact Run Configuration (model · work profile),
 send. Enter sends, Shift+Enter newline, `/` slash commands, queue while
 the turn is running. Focus uses a neutral border plus a low-alpha ring —
 not a solid brand-green box. There is no fake `@` context control.
+
+TUI may express commands as CLI strings. Web maps the same runtime
+semantics to GUI interaction:
+
+| Kind | Commands | Web interaction |
+| --- | --- | --- |
+| Action | `/compact` `/clear` `/cancel` | existing ClientCommand |
+| Selector | `/model` `/work-mode` `/collab` `/perm` | dedicated picker |
+| Entity picker | `/checkpoint` | checkpoint list, typed id |
+| Input mode | `/btw` | `/btw` chip + argument (not `/btw ` in the textarea) |
+| Navigation | `/diff` `/memory` | Changes tab / Inspector More |
+
+The slash palette shows `/command` + a Chinese description. Internal
+ClientCommand names (`SelectModel`, `SetProductAxes`, …) stay in code.
 
 ## Icon system
 
@@ -109,5 +162,9 @@ Turn-truth glyphs (`✓ ✗ ◇ ●`) stay as semantic status, not nav.
 - UI 13–14px sans, conversation 15px, metadata 11–12px, code 13px mono
 - Spacing scale 4 / 8 / 12 / 16 / 20 / 24 / 32 / 40
 - Radius 6 / 8 / 12
+- Paper: workspace white, sidebar/inspector soft gray, warm-neutral text
+- Graphite: charcoal dark. Midnight: blue-black. Not two navies.
 - Brand green: brand mark, primary send, selected indicator, running
 - Success color is not the brand accent
+- User prompt is a neutral task marker, not a blue chat bubble
+- Composer focus is a neutral ring, not a brand-green glow

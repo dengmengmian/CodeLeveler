@@ -5,9 +5,15 @@
 // 点击回到底部并恢复跟随；回合完成时不强制拉回，只更新提示。
 
 import { useEffect, useRef, useState } from 'react';
-import { groupConversationTurns, layoutTimeline, type TimelineSlot } from '../lib/timelineLayout';
+import {
+  assistantResultText,
+  groupConversationTurns,
+  layoutTimeline,
+  type TimelineSlot,
+} from '../lib/timelineLayout';
 import { useAppState, type ChatMessage, type LastTurn, type TurnTrace } from '../state/store';
 import { AgentRunBlock } from './AgentRunBlock';
+import { CompactionSummary } from './CompactionSummary';
 import { ApprovalCard } from './ApprovalCard';
 import { ClarificationCard } from './ClarificationCard';
 import { CopyButton } from './CopyButton';
@@ -18,7 +24,6 @@ function UserTurn({ m }: { m: ChatMessage }) {
     <div className="turn turn-user">
       <div className="message-user" title={m.time ?? undefined}>
         {m.text}
-        {m.time && <time className="msg-time">{m.time}</time>}
       </div>
     </div>
   );
@@ -29,18 +34,13 @@ function AssistantTurn({ m }: { m: ChatMessage }) {
     <div className="turn turn-assistant">
       <div className="message-assistant">
         <MessageBody text={m.text} streaming={m.streaming} />
-        {!m.streaming && m.text && (
-          <div className="msg-foot">
-            <CopyButton text={m.text} />
-            {m.time && <time className="msg-time">{m.time}</time>}
-          </div>
-        )}
       </div>
     </div>
   );
 }
 
 function renderTurn(m: ChatMessage) {
+  if (m.kind === 'compaction_summary') return <CompactionSummary key={m.id} text={m.text} />;
   if (m.btw !== undefined) return <BtwTurn key={m.id} m={m} />;
   if (m.role === 'user') return <UserTurn key={m.id} m={m} />;
   return <AssistantTurn key={m.id} m={m} />;
@@ -52,10 +52,19 @@ function renderSlot(
   turnActive: boolean,
   lastTurn: LastTurn | null,
   traces: Map<number, TurnTrace>,
+  copyText: string | null,
 ) {
   if (slot.kind === 'message') return renderTurn(slot.message);
   if (slot.kind === 'footer') {
-    return <AgentRunBlock key={`footer-${slot.userSeq}`} variant="footer" lastTurn={slot.live ? lastTurn : traces.get(slot.userSeq)?.lastTurn} />;
+    return (
+      <AgentRunBlock
+        key={`footer-${slot.userSeq}`}
+        variant="footer"
+        lastTurn={slot.live ? lastTurn : traces.get(slot.userSeq)?.lastTurn}
+        copyText={copyText}
+        live={slot.live}
+      />
+    );
   }
   if (slot.live && turnActive) {
     return <AgentRunBlock key={`live-${slot.userSeq}`} variant="live" />;
@@ -81,16 +90,11 @@ function BtwTurn({ m }: { m: ChatMessage }) {
           <span className="btw-badge">旁问</span>
           <span className="btw-q">{m.btw}</span>
           <span className="btw-note">不打断当前回合</span>
+          {!m.streaming && m.text && <CopyButton text={m.text} className="copy-btn-compact" />}
         </div>
         <div className="btw-body">
           <MessageBody text={m.text} streaming={m.streaming} />
         </div>
-        {!m.streaming && m.text && (
-          <div className="msg-foot">
-            <CopyButton text={m.text} />
-            {m.time && <time className="msg-time">{m.time}</time>}
-          </div>
-        )}
       </div>
     </div>
   );
@@ -181,17 +185,23 @@ export function Timeline() {
     turnActive: current.turnActive,
     hasLastTurn: Boolean(current.lastTurn) && current.pendingApprovals.length === 0 && current.pendingClarifications.length === 0,
     frozenProcessSeqs: traces.filter((t) => t.tools.length > 0 || t.backgroundTasks.length > 0).map((t) => t.userSeq),
+    footerSeqs: traces.filter((t) => t.lastTurn).map((t) => t.userSeq),
   });
   const traceBySeq = new Map(traces.map((t) => [t.userSeq, t]));
 
   return (
     <div className="timeline" ref={scrollRef} onScroll={onScroll}>
       <div className="tl-inner">
-        {groupConversationTurns(slots).map((turn) => (
+        {groupConversationTurns(slots).map((turn) => {
+          const copyText = assistantResultText(turn.items);
+          return (
           <div className="conv-turn" key={`turn-${turn.userSeq}`} data-turn={turn.userSeq}>
-            {turn.items.map((slot, i) => renderSlot(slot, i, current.turnActive, current.lastTurn, traceBySeq))}
+            {turn.items.map((slot, i) =>
+              renderSlot(slot, i, current.turnActive, current.lastTurn, traceBySeq, copyText),
+            )}
           </div>
-        ))}
+          );
+        })}
 
         {current.pendingApprovals.map((a) => (
           <ApprovalCard key={a.id} request={a} variant="record" />

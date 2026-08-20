@@ -14,9 +14,9 @@ export const THEME_OPTIONS: ReadonlyArray<{
   desc: string;
 }> = [
   { choice: 'system', label: '跟随系统', desc: '深色用 Graphite，浅色用 Paper' },
-  { choice: 'graphite', label: 'Graphite', desc: '深灰蓝石墨 · 默认暗色' },
-  { choice: 'midnight', label: 'Midnight', desc: '深蓝暗色 · 层级更分明' },
-  { choice: 'paper', label: 'Paper', desc: '完整浅色主题' },
+  { choice: 'graphite', label: 'Graphite', desc: '中性炭黑 · 默认暗色' },
+  { choice: 'midnight', label: 'Midnight', desc: '蓝黑暗色 · 夜间专注' },
+  { choice: 'paper', label: 'Paper', desc: '浅色中性 · 内容优先' },
 ];
 
 export function storedChoice(): ThemeChoice {

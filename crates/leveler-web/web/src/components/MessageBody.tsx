@@ -91,7 +91,7 @@ const components: Components = {
 
 export function MessageBody({ text, streaming }: { text: string; streaming: boolean }) {
   return (
-    <div className="body">
+    <div className="body md-body">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
         {text}
       </ReactMarkdown>
