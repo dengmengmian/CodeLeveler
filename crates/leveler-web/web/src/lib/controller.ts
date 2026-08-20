@@ -102,7 +102,7 @@ export class RuntimeBridge {
   private applySnapshot(snap: UiSessionSnapshot, contextWindow?: number | null): void {
     const { current, draft } = this.getState();
     const previousId = current?.id;
-    // 广播流里可能夹带别会话的 session_opened/updated：只接收当前会话的整量；
+    // 广播流里可能夹带别会话的 session_opened：只接收当前会话的整量；
     // 例外一是 selectSession 后等待目标会话 snapshot 的窗口期；
     // 例外二是 `/clear`：宿主刚建的新会话 id 与当前不同，正是要切过去的那个。
     if (current && current.id !== snap.id) {
@@ -126,6 +126,13 @@ export class RuntimeBridge {
     this.flushQueue();
   }
 
+  /** SessionUpdated = TUI apply_meta. Same-session header only; never a full resync. */
+  private applySessionMeta(snap: UiSessionSnapshot): void {
+    const { current } = this.getState();
+    if (!current || current.id !== snap.id) return;
+    this.dispatch({ type: 'session_meta', session: snap });
+  }
+
   private applyEvent(ev: RuntimeEvent): void {
     const state = this.getState();
     switch (ev.type) {
@@ -133,8 +140,10 @@ export class RuntimeBridge {
         this.dispatch({ type: 'session_list', sessions: ev.sessions });
         return;
       case 'session_opened':
-      case 'session_updated':
         this.applySnapshot(ev.session);
+        return;
+      case 'session_updated':
+        this.applySessionMeta(ev.session);
         return;
       case 'runtime_ready':
         this.requestSessionList();

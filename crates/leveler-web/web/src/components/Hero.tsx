@@ -10,10 +10,10 @@ import { sessionsForProject } from '../lib/projectScope';
 
 /** 空状态快捷操作：点击把起手语注入输入框，用户补全后发送。 */
 const QUICK_ACTIONS: ReadonlyArray<{ label: string; hint: string; seed: string }> = [
-  { label: '分析当前项目', hint: '架构与主要风险', seed: '分析当前项目的架构与主要风险，并给出改进建议。' },
+  { label: '解释这个仓库', hint: '它是做什么的', seed: '解释这个仓库是做什么的，以及主要模块怎么组织。' },
   { label: '修复一个问题', hint: '定位并修复', seed: '我遇到一个问题需要修复：' },
-  { label: '实现新功能', hint: '从需求到实现', seed: '我想实现一个新功能：' },
-  { label: '检查代码改动', hint: '评审当前 diff', seed: '检查当前的代码改动并做一次评审。' },
+  { label: '补测试', hint: '为当前改动补测试', seed: '为当前改动补上有意义的测试。' },
+  { label: '评审改动', hint: 'Review changes', seed: '检查当前的代码改动并做一次评审。' },
 ];
 
 export function Hero() {

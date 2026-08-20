@@ -222,22 +222,23 @@ describe('project → sessions', () => {
 });
 
 describe('chrome / diff focus', () => {
-  it('focus_diff opens the changes workspace on that file', () => {
+  it('focus_diff opens the changes workspace on that file without stealing sidebar nav', () => {
     const state = stateWithSession();
     reducer(state, { type: 'focus_diff', path: 'src/auth.rs' });
     expect(state.stageView).toBe('diff');
-    expect(state.railNav).toBe('changes');
+    expect(state.railNav).toBe('sessions');
     expect(state.diffFocus).toBe('src/auth.rs');
   });
 
-  it('rail activity only switches the execution workspace slot', () => {
+  it('files sidebar destination does not steal the workspace surface', () => {
     const state = stateWithSession();
-    reducer(state, { type: 'set_rail_nav', nav: 'activity' });
-    expect(state.railNav).toBe('activity');
-    expect(state.stageView).toBe('execution');
+    reducer(state, { type: 'stage_view', view: 'diff' });
+    reducer(state, { type: 'set_rail_nav', nav: 'files' });
+    expect(state.railNav).toBe('files');
+    expect(state.stageView).toBe('diff');
   });
 
-  it('sessions rail does not steal the workspace surface', () => {
+  it('sessions sidebar does not steal the workspace surface', () => {
     const state = stateWithSession();
     reducer(state, { type: 'stage_view', view: 'diff' });
     reducer(state, { type: 'set_rail_nav', nav: 'sessions' });
@@ -245,11 +246,11 @@ describe('chrome / diff focus', () => {
     expect(state.stageView).toBe('diff');
   });
 
-  it('execution workspace tab is a placeholder stage, not a protocol query', () => {
+  it('execution workspace tab is independent of sidebar destination', () => {
     const state = structuredClone(initialState);
     reducer(state, { type: 'stage_view', view: 'execution' });
     expect(state.stageView).toBe('execution');
-    expect(state.railNav).toBe('activity');
+    expect(state.railNav).toBe('sessions');
   });
 
   function acceptObservation(state: AppState, obs: UiObservabilityLoaded, queryId: string): void {
@@ -440,6 +441,78 @@ describe('turn terminal truth', () => {
     const state = stateWithSession();
     reducer(state, { type: 'turn_terminal', outcome: 'incomplete', detail: 'budget_exhausted' });
     expect(state.current?.lastTurn?.outcome).toBe('incomplete');
+  });
+
+  it('session_meta does not wipe completed tools, agents, or lastTurn (TUI apply_meta)', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'user_message', id: 'u1', text: 'q', time: '10:00:00' });
+    reducer(state, {
+      type: 'tool_started',
+      id: 't1',
+      name: 'read_file',
+      arguments: '{"path":"README.md"}',
+      parallel: false,
+    });
+    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 12 });
+    reducer(state, { type: 'sub_agent_updated', id: 'ag1', nickname: 'W', role: 'worker', done: true, ok: true, detail: 'x' });
+    reducer(state, { type: 'turn_terminal', outcome: 'answered', detail: null });
+    const toolsBefore = state.current?.tools.length;
+    reducer(
+      state,
+      {
+        type: 'session_meta',
+        session: snapshot({
+          status: 'idle',
+          active_tools: [],
+          work_profile: 'delivery',
+          collaboration: 'goal',
+          mode: 'full_access',
+        }),
+      },
+    );
+    expect(state.current?.tools).toHaveLength(toolsBefore ?? 0);
+    expect(state.current?.tools[0]?.status).toBe('done');
+    expect(state.current?.agents).toHaveLength(1);
+    expect(state.current?.lastTurn?.outcome).toBe('answered');
+    expect(state.current?.workProfile).toBe('delivery');
+    expect(state.current?.collaboration).toBe('goal');
+    expect(state.current?.permission).toBe('full_access');
+  });
+
+  it('a full snapshot still replaces tools from active_tools', () => {
+    const state = stateWithSession();
+    reducer(state, {
+      type: 'tool_started',
+      id: 't1',
+      name: 'read_file',
+      arguments: '{}',
+      parallel: false,
+    });
+    reducer(state, { type: 'snapshot', session: snapshot({ status: 'idle', active_tools: [] }) });
+    expect(state.current?.tools).toHaveLength(0);
+  });
+
+  it('keeps the previous turn tools after a new user message', () => {
+    const state = stateWithSession();
+    reducer(state, { type: 'user_message', id: 'u1', text: '这是什么玩意儿', time: '10:00:00' });
+    const userSeq = state.current?.messages.at(-1)?.seq;
+    reducer(state, {
+      type: 'tool_started',
+      id: 't1',
+      name: 'read_file',
+      arguments: '{"path":"README.md"}',
+      parallel: false,
+    });
+    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 12 });
+    reducer(state, { type: 'turn_terminal', outcome: 'answered', detail: null });
+    expect(state.current?.traces).toHaveLength(1);
+    expect(state.current?.traces[0]?.userSeq).toBe(userSeq);
+    expect(state.current?.traces[0]?.tools).toHaveLength(1);
+    expect(state.current?.traces[0]?.tools[0]?.name).toBe('read_file');
+    reducer(state, { type: 'user_message', id: 'u2', text: '你好', time: '10:01:00' });
+    expect(state.current?.tools).toHaveLength(0);
+    expect(state.current?.lastTurn).toBeNull();
+    expect(state.current?.traces[0]?.tools).toHaveLength(1);
   });
 });
 

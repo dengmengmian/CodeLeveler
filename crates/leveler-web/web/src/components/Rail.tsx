@@ -1,213 +1,206 @@
-// Context sidebar: lists for the current Application Rail item.
-// Sessions / Files / Search / Git 数据走 REST。不接 Observability。
+// Single sidebar: Brand, New Task, Conversations / Files / Search,
+// Workspaces (projects → sessions), Settings. Changes and Execution
+// live in the workspace tabs, not here.
 
+import {
+  ChevronDown,
+  ChevronRight,
+  Files,
+  MessageSquare,
+  Plus,
+  RefreshCw,
+  Search,
+  Settings,
+  SquarePen,
+  type LucideIcon,
+} from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useAppDispatch, useAppState, type WorkspaceSection } from '../state/store';
-import { useBridge } from '../state/bridge';
-import { AppearancePanel } from './Appearance';
-import { ProjectPicker } from './ProjectPicker';
-import { useOpenFile } from './FileViewer';
 import { gitStatus, listFiles, searchFiles, type GitStatus, type SearchMatch } from '../lib/api';
-import { formatDuration, formatRelative, repoShortName } from '../lib/format';
-import { projectObservability } from '../lib/observabilityView';
+import { formatRelative, repoShortName } from '../lib/format';
+import { CTRL_ICON, NAV_ICON } from '../lib/icons';
 import { sessionStatusCue, sessionsForProject } from '../lib/projectScope';
+import { SIDEBAR_NAV } from '../lib/railNav';
 import { groupByDay } from '../lib/sessionDay';
+import { useBridge } from '../state/bridge';
+import { useAppDispatch, useAppState, type RailNav } from '../state/store';
+import { AppearancePanel } from './Appearance';
+import { BrandMark } from './BrandMark';
+import { useOpenFile } from './FileViewer';
+import { ProjectPicker } from './ProjectPicker';
 
-const WORKSPACE_SECTIONS: ReadonlyArray<{ id: WorkspaceSection; label: string }> = [
-  { id: 'files', label: 'Files' },
-  { id: 'symbols', label: 'Symbols' },
-  { id: 'repository', label: 'Repository' },
-  { id: 'environment', label: 'Environment' },
-];
+const NAV_ICONS: Record<Exclude<RailNav, 'settings'>, LucideIcon> = {
+  sessions: MessageSquare,
+  files: Files,
+  search: Search,
+};
 
 export function Sidebar() {
   const state = useAppState();
   const dispatch = useAppDispatch();
+  const bridge = useBridge();
+  const [picking, setPicking] = useState(false);
+
+  const newTask = () => {
+    const path = state.selectedProject ?? (state.repository || null);
+    if (!path) {
+      setPicking(true);
+      return;
+    }
+    bridge.newDraft(path);
+    dispatch({ type: 'set_rail_nav', nav: 'sessions' });
+  };
 
   return (
-    <aside className={`sidebar${state.railOpen ? '' : ' is-hidden'}`} aria-label="Context">
-      {state.railNav === 'sessions' && <SessionsPanel />}
-      {state.railNav === 'workspace' && (
-        <>
-          <div className="sidebar-head">Workspace</div>
-          <div className="ws-sec">
-            {WORKSPACE_SECTIONS.map((s) => (
-              <button
-                key={s.id}
-                type="button"
-                className={`ws-sec-btn${state.workspaceSection === s.id ? ' on' : ''}`}
-                onClick={() => dispatch({ type: 'set_workspace_section', section: s.id })}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
-          {state.workspaceSection === 'files' && <FilesPanel />}
-          {state.workspaceSection === 'symbols' && (
-            <div className="rail-empty">符号索引本阶段不新增 API。</div>
-          )}
-          {state.workspaceSection === 'repository' && <GitPanel />}
-          {state.workspaceSection === 'environment' && (
-            <div className="rail-panel">
-              <div className="rp-bar">
-                <span className={`led${state.connection === 'online' ? '' : ' off'}`} />
-                <span className="rp-branch">
-                  Daemon · {state.connection === 'online' ? '已连接' : '重连中'}
-                </span>
-              </div>
-            </div>
-          )}
-        </>
-      )}
-      {state.railNav === 'search' && (
-        <>
-          <div className="sidebar-head">Search</div>
-          <SearchPanel />
-        </>
-      )}
-      {state.railNav === 'changes' && (
-        <>
-          <div className="sidebar-head">Changes</div>
-          <GitPanel />
-        </>
-      )}
-      {state.railNav === 'activity' && (
-        <>
-          <div className="sidebar-head">Activity</div>
-          <ActivityPanel />
-        </>
-      )}
-      {state.railNav === 'settings' && (
-        <>
-          <div className="sidebar-head">Settings</div>
-          <AppearancePanel />
-        </>
-      )}
+    <aside className={`sidebar${state.railOpen ? '' : ' is-hidden'}`} aria-label="Sidebar">
+      {picking && <ProjectPicker onClose={() => setPicking(false)} />}
+      <div className="sb-brand" title={`CodeLeveler web · v${__APP_VERSION__}`}>
+        <BrandMark />
+        <span className="sb-word">CodeLeveler</span>
+      </div>
+      <button type="button" className="sb-new" onClick={newTask}>
+        <SquarePen {...NAV_ICON} aria-hidden="true" />
+        New Task
+      </button>
+      <nav className="sb-nav" aria-label="Primary">
+        {SIDEBAR_NAV.map((item) => {
+          const Icon = NAV_ICONS[item.id];
+          const on = state.railNav === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              className={`sb-nav-btn${on ? ' on' : ''}`}
+              aria-current={on ? 'page' : undefined}
+              onClick={() => dispatch({ type: 'set_rail_nav', nav: item.id })}
+            >
+              <Icon {...NAV_ICON} aria-hidden="true" />
+              {item.label}
+            </button>
+          );
+        })}
+      </nav>
+      <div className="sb-body">
+        {state.railNav === 'sessions' && <WorkspacesPanel onOpenProject={() => setPicking(true)} />}
+        {state.railNav === 'files' && (
+          <>
+            <FilesPanel />
+            <GitPanel />
+          </>
+        )}
+        {state.railNav === 'search' && <SearchPanel />}
+        {state.railNav === 'settings' && <AppearancePanel />}
+      </div>
+      <button
+        type="button"
+        className={`sb-settings${state.railNav === 'settings' ? ' on' : ''}`}
+        aria-current={state.railNav === 'settings' ? 'page' : undefined}
+        onClick={() => dispatch({ type: 'set_rail_nav', nav: 'settings' })}
+      >
+        <Settings {...NAV_ICON} aria-hidden="true" />
+        Settings
+      </button>
     </aside>
   );
 }
 
-function ActivityPanel() {
-  const { observation, observationStatus } = useAppState();
-  if (observationStatus === 'loading' && !observation) {
-    return <div className="rail-empty">查询 Runtime…</div>;
-  }
-  if (!observation) {
-    return <div className="rail-empty">尚无 durable Activity。打开 Execution 或等待查询完成。</div>;
-  }
-  const { summary, tools, agents } = projectObservability(observation);
-  return (
-    <div className="rail-panel">
-      <dl className="kv runtime-kv">
-        <dt>Tools</dt>
-        <dd>{summary.toolStarted}</dd>
-        <dt>Requests</dt>
-        <dd>{summary.requestCount}</dd>
-        <dt>Verify</dt>
-        <dd>{summary.verificationRuns}</dd>
-        <dt>Agents</dt>
-        <dd>{summary.delegatedAgents}</dd>
-      </dl>
-      {agents.length > 0 && (
-        <>
-          <div className="ag-kicker">Delegated</div>
-          {agents.map((a) => (
-            <div className="row tool-agg-row" key={a.id}>
-              <span>{a.nickname || a.id}</span>
-              <span className="cnt">
-                {a.status === 'running' ? 'Running' : a.status === 'completed' ? 'Finished' : 'Failed'}
-              </span>
-            </div>
-          ))}
-        </>
-      )}
-      {tools.map((t) => (
-        <div className="row tool-agg-row" key={t.name}>
-          <span>{t.name}</span>
-          <span className="cnt">
-            {t.calls}
-            {t.avg_ms != null ? ` · ${formatDuration(t.avg_ms)}` : ''}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ── 会话面板：当前选中 Project 的 Sessions ─────────────────────────
-
-function SessionsPanel() {
+function WorkspacesPanel({ onOpenProject }: { onOpenProject: () => void }) {
   const state = useAppState();
-  const bridge = useBridge();
-  const [picking, setPicking] = useState(false);
-  const [renaming, setRenaming] = useState(false);
-  const [renamingSession, setRenamingSession] = useState<string | null>(null);
-
-  const projectPath = state.selectedProject ?? (state.repository || null);
-  const proj = state.projects.find((p) => p.path === projectPath) ?? null;
-  const name = proj?.name ?? (projectPath ? repoShortName(projectPath) : '');
-  const status = proj?.status ?? null;
-  const sessions = useMemo(() => {
-    const rows = sessionsForProject(state.sessions, projectPath);
-    return [...rows].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-  }, [state.sessions, projectPath]);
-
-  const submitRename = (raw: string) => {
-    setRenaming(false);
-    if (!projectPath) return;
-    const value = raw.trim();
-    if (value === name) return;
-    void bridge.renameProject(projectPath, value);
-  };
+  const currentPath = state.selectedProject ?? (state.repository || null);
+  const groups = useMemo(() => {
+    if (state.projects.length > 0) return state.projects;
+    if (!currentPath) return [];
+    return [{ path: currentPath, name: repoShortName(currentPath), status: 'online' as const }];
+  }, [state.projects, currentPath]);
 
   return (
     <div className="sessions">
-      {picking && <ProjectPicker onClose={() => setPicking(false)} />}
-      <ProjectSwitcher onOpenProject={() => setPicking(true)} />
-      {!projectPath && (
+      <div className="sb-kicker">WORKSPACES</div>
+      {groups.length === 0 && (
         <div className="rail-empty">
           Open a project
-          <button type="button" className="rail-new" onClick={() => setPicking(true)}>
+          <button type="button" className="rail-new" onClick={onOpenProject}>
             打开项目
           </button>
         </div>
       )}
-      {projectPath && (
-        <>
-          <div className="proj-context">
-            {renaming ? (
-              <RenameInput initial={name} onSubmit={submitRename} onCancel={() => setRenaming(false)} />
-            ) : (
-              <div className="proj-context-name">
-                {status && <i className={`pdot ${status}`} />}
-                {name}
-              </div>
-            )}
-            {status === 'offline' && <div className="proj-offline">Offline</div>}
-            <ProjectMenu
-              repo={projectPath}
-              name={name}
-              canManage={!!proj}
-              isPrimary={state.projects[0]?.path === projectPath}
-              onRename={() => setRenaming(true)}
-            />
-          </div>
-          {status === 'offline' ? (
-            <button
-              type="button"
-              className="rail-new"
-              onClick={() => void bridge.restartProject(projectPath)}
-            >
+      {groups.map((p) => (
+        <WorkspaceGroup key={p.path} path={p.path} name={p.name} status={p.status} />
+      ))}
+      {groups.length > 0 && (
+        <button type="button" className="sb-open-proj" onClick={onOpenProject}>
+          <Plus {...CTRL_ICON} aria-hidden="true" />
+          打开项目…
+        </button>
+      )}
+    </div>
+  );
+}
+
+function WorkspaceGroup({
+  path,
+  name,
+  status,
+}: {
+  path: string;
+  name: string;
+  status: string;
+}) {
+  const state = useAppState();
+  const selected = (state.selectedProject ?? state.repository) === path;
+  const [open, setOpen] = useState(selected);
+  const [renaming, setRenaming] = useState(false);
+  const [renamingSession, setRenamingSession] = useState<string | null>(null);
+  const bridge = useBridge();
+  const proj = state.projects.find((p) => p.path === path) ?? null;
+  const sessions = useMemo(() => {
+    const rows = sessionsForProject(state.sessions, path);
+    return [...rows].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }, [state.sessions, path]);
+
+  const submitRename = (raw: string) => {
+    setRenaming(false);
+    const value = raw.trim();
+    if (value === name) return;
+    void bridge.renameProject(path, value);
+  };
+
+  return (
+    <div className={`proj${open ? '' : ' closed'}`}>
+      <div className="proj-head-row">
+        <button
+          type="button"
+          className="proj-head"
+          title={path}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? (
+            <ChevronDown {...CTRL_ICON} aria-hidden="true" />
+          ) : (
+            <ChevronRight {...CTRL_ICON} aria-hidden="true" />
+          )}
+          {renaming ? (
+            <RenameInput initial={name} onSubmit={submitRename} onCancel={() => setRenaming(false)} />
+          ) : (
+            <span className="pname">{name}</span>
+          )}
+          {status === 'offline' && <span className="proj-offline">Offline</span>}
+        </button>
+        <ProjectMenu
+          repo={path}
+          name={name}
+          canManage={!!proj}
+          isPrimary={state.projects[0]?.path === path}
+          onRename={() => setRenaming(true)}
+        />
+      </div>
+      {open && (
+        <div className="proj-sessions">
+          {status === 'offline' && (
+            <button type="button" className="rail-new" onClick={() => void bridge.restartProject(path)}>
               Restart
             </button>
-          ) : (
-            <button type="button" className="rail-new" onClick={() => bridge.newDraft(projectPath)}>
-              ＋ New Session
-            </button>
           )}
-          {sessions.length === 0 && status !== 'offline' && (
-            <div className="rail-empty">No sessions yet</div>
-          )}
+          {sessions.length === 0 && status !== 'offline' && <div className="rail-empty">No sessions yet</div>}
           {groupByDay(sessions).map((day) => (
             <div key={day.bucket} className="sess-day">
               <div className="sess-day-label">{day.label}</div>
@@ -227,17 +220,14 @@ function SessionsPanel() {
                 return (
                   <button
                     key={s.id}
+                    type="button"
                     className={`sess${state.current?.id === s.id ? ' active' : ''}`}
                     onClick={() => bridge.selectSession(s.id)}
-                    title={cue.label ? `${cue.label} · ${formatRelative(s.updated_at)}` : formatRelative(s.updated_at)}
+                    title={
+                      cue.label ? `${cue.label} · ${formatRelative(s.updated_at)}` : formatRelative(s.updated_at)
+                    }
                   >
-                    {cue.kind === 'completed' ? (
-                      <span className="sess-mark" aria-hidden="true">
-                        ✓
-                      </span>
-                    ) : cue.kind !== 'idle' ? (
-                      <i className={`dot ${cue.kind}`} />
-                    ) : null}
+                    {showStatus ? <i className={`dot ${cue.kind}`} /> : null}
                     {renamingSession === s.id ? (
                       <RenameInput
                         initial={s.goal}
@@ -254,82 +244,17 @@ function SessionsPanel() {
                       {showStatus ? `${cue.label} · ` : ''}
                       {formatRelative(s.updated_at)}
                     </span>
-                    <SessionMenu
-                      id={s.id}
-                      title={s.goal}
-                      onRename={() => setRenamingSession(s.id)}
-                    />
+                    <SessionMenu id={s.id} title={s.goal} onRename={() => setRenamingSession(s.id)} />
                   </button>
                 );
               })}
             </div>
           ))}
-        </>
-      )}
-    </div>
-  );
-}
-
-function ProjectSwitcher({ onOpenProject }: { onOpenProject: () => void }) {
-  const state = useAppState();
-  const bridge = useBridge();
-  const [open, setOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const currentPath = state.selectedProject ?? (state.repository || null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('click', onDoc);
-    return () => document.removeEventListener('click', onDoc);
-  }, [open]);
-
-  if (state.projects.length === 0 && !currentPath) return null;
-
-  return (
-    <div className="proj-switch" ref={wrapRef}>
-      <button type="button" className="proj-switch-btn" onClick={() => setOpen((v) => !v)}>
-        Projects
-        <span className="caret">▼</span>
-      </button>
-      {open && (
-        <div className="p-pop proj-switch-pop">
-          {state.projects.map((p) => (
-            <span
-              key={p.path}
-              className={`p-item${p.path === currentPath ? ' on' : ''}`}
-              role="button"
-              onClick={() => {
-                bridge.selectProject(p.path);
-                setOpen(false);
-              }}
-            >
-              <i className={`pdot ${p.status}`} />
-              {p.name}
-              {p.status === 'offline' ? ' · Offline' : ''}
-            </span>
-          ))}
-          <span
-            className="p-item"
-            role="button"
-            onClick={() => {
-              setOpen(false);
-              onOpenProject();
-            }}
-          >
-            打开项目…
-          </span>
         </div>
       )}
     </div>
   );
 }
-
-// ── 项目「⋯」菜单：复制路径 / 重命名 / 移除工作区 ──────────────────────
-// 仿 ThemeMenu 模式：open 状态 + 外部点击 / Escape 关闭。proj-head 本身是
-// <button>，内部沿用 .p-add 的 span[role=button] 惯例避免嵌套按钮。
 
 function ProjectMenu({
   repo,
@@ -340,9 +265,7 @@ function ProjectMenu({
 }: {
   repo: string;
   name: string;
-  /** 是否在项目列表里（聚合模式）；否则只提供复制路径 */
   canManage: boolean;
-  /** primary 项目不可移除 */
   isPrimary: boolean;
   onRename: () => void;
 }) {
@@ -429,9 +352,6 @@ function ProjectMenu({
     </span>
   );
 }
-
-// ── 会话「⋯」菜单：复制 Session ID / 重命名 / 分叉 / 导出 / 归档 ────────
-// 复用 ProjectMenu 的 open + 外部点击/Escape 关闭模式与 .p-* 样式。
 
 function SessionMenu({
   id,
@@ -540,7 +460,6 @@ function SessionMenu({
   );
 }
 
-/** inline 重命名输入框：Enter / 失焦提交，Escape 取消。 */
 function RenameInput({
   initial,
   onSubmit,
@@ -550,7 +469,6 @@ function RenameInput({
   onSubmit: (value: string) => void;
   onCancel: () => void;
 }) {
-  // Escape 取消后 input 卸载，失焦回调不得再提交
   const cancelled = useRef(false);
   return (
     <input
@@ -574,8 +492,6 @@ function RenameInput({
   );
 }
 
-// ── 共用：面板数据加载 ───────────────────────────────────────────────
-
 function useSessionId(): string | null {
   return useAppState().current?.id ?? null;
 }
@@ -583,8 +499,6 @@ function useSessionId(): string | null {
 function NoSession() {
   return <div className="rail-empty">进入会话后可用 —— 面板数据按当前会话定位仓库。</div>;
 }
-
-// ── 文件面板 ────────────────────────────────────────────────────────
 
 function FilesPanel() {
   const sessionId = useSessionId();
@@ -637,9 +551,6 @@ function FilesPanel() {
   );
 }
 
-// ── 文件树 ──────────────────────────────────────────────────────────
-// 平铺路径拼成目录树；目录可折叠。过滤时全部展开只显示命中路径的分支。
-
 interface TreeNode {
   name: string;
   path: string;
@@ -664,9 +575,7 @@ function buildTree(paths: string[]): TreeNode[] {
     });
   }
   const sort = (nodes: TreeNode[]) => {
-    nodes.sort((a, b) =>
-      a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name),
-    );
+    nodes.sort((a, b) => (a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name)));
     for (const n of nodes) if (n.dir) sort(n.children);
   };
   sort(root.children);
@@ -682,7 +591,6 @@ function FileTree({
   filtering: boolean;
   onOpen: (path: string) => void;
 }) {
-  // 默认全部折叠（大仓库友好）；用户展开的目录记在集合里。过滤时忽略折叠状态。
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const tree = useMemo(() => buildTree(paths.slice(0, 4000)), [paths]);
 
@@ -697,16 +605,11 @@ function FileTree({
   const rows: ReactNode[] = [];
   const walk = (nodes: TreeNode[], depth: number) => {
     for (const node of nodes) {
-      const pad = { paddingLeft: `${6 + depth * 12}px` };
+      const pad = { paddingLeft: `${8 + depth * 12}px` };
       if (node.dir) {
         const open = filtering || expanded.has(node.path);
         rows.push(
-          <button
-            className="ft-dir"
-            key={`d:${node.path}`}
-            style={pad}
-            onClick={() => toggle(node.path)}
-          >
+          <button className="ft-dir" key={`d:${node.path}`} style={pad} onClick={() => toggle(node.path)}>
             <span className="ft-caret">{open ? '▾' : '▸'}</span>
             <span className="ft-name">{node.name}</span>
           </button>,
@@ -732,8 +635,6 @@ function FileTree({
   return <div className="ft">{rows}</div>;
 }
 
-// ── 搜索面板 ────────────────────────────────────────────────────────
-
 function SearchPanel() {
   const sessionId = useSessionId();
   const openFile = useOpenFile();
@@ -742,7 +643,6 @@ function SearchPanel() {
   const [matchesTruncated, setMatchesTruncated] = useState(false);
   const [searching, setSearching] = useState(false);
 
-  // 输入防抖 300ms
   useEffect(() => {
     if (!sessionId || !query.trim()) {
       setMatches(null);
@@ -782,11 +682,7 @@ function SearchPanel() {
       {matchesTruncated && <div className="rail-empty">已达到搜索预算，仅显示部分结果。</div>}
       <div className="rp-list">
         {(matches ?? []).map((m, i) => (
-          <button
-            className="rp-match"
-            key={`${m.path}:${m.line}:${i}`}
-            onClick={() => openFile(m.path, m.line)}
-          >
+          <button className="rp-match" key={`${m.path}:${m.line}:${i}`} onClick={() => openFile(m.path, m.line)}>
             <span className="rp-loc">
               {m.path}:{m.line}
             </span>
@@ -797,8 +693,6 @@ function SearchPanel() {
     </div>
   );
 }
-
-// ── Git 面板 ────────────────────────────────────────────────────────
 
 const GIT_TAG: Record<string, { tag: string; cls: string }> = {
   modified: { tag: 'M', cls: 'mod' },
@@ -825,20 +719,18 @@ function GitPanel() {
     refresh();
   }, [refresh]);
 
-  if (!sessionId) return <NoSession />;
+  if (!sessionId) return null;
 
   return (
-    <div className="rail-panel">
+    <div className="rail-panel git-foot">
       <div className="rp-bar">
         <span className="rp-branch">{status?.branch ?? '…'}</span>
-        <button className="rp-refresh" onClick={refresh} title="刷新">
-          ⟳
+        <button type="button" className="rp-refresh" onClick={refresh} title="刷新">
+          <RefreshCw {...CTRL_ICON} aria-hidden="true" />
         </button>
       </div>
       {status === null && <div className="rail-empty">加载中…</div>}
-      {status !== null && status.files.length === 0 && (
-        <div className="rail-empty">工作区干净。</div>
-      )}
+      {status !== null && status.files.length === 0 && <div className="rail-empty">工作区干净。</div>}
       <div className="rp-list">
         {(status?.files ?? []).map((f) => {
           const t = GIT_TAG[f.status] ?? GIT_TAG.modified;

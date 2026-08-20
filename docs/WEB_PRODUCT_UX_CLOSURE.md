@@ -1,3 +1,8 @@
+> **Historical / superseded.** The current desktop shell IA is
+> [`WEB_DESKTOP_UI.md`](WEB_DESKTOP_UI.md) (Single Sidebar, no AppRail,
+> contextual Inspector). This document describes the previous rail +
+> four-tab Inspector freeze.
+
 # WEB PRODUCT UX CLOSURE FINAL REPORT
 
 **Date:** 2026-08-19  

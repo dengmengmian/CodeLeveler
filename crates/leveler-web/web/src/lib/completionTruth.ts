@@ -1,6 +1,8 @@
 // Session Truth: one projection for Conversation, Changes, and Inspector.
 // Does not invent protocol fields. Sources: lastTurn, verification, diff,
 // completionReport. Diff totals and report file counts stay distinct.
+// facts only list things that happened or that the user must act on;
+// absences (no diff / no verify / nothing pending) stay silent.
 
 import type { SessionView } from '../state/store';
 import { artifactTotals } from './changeFiles';
@@ -71,7 +73,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'approval',
       recoveryHint: null,
-      facts: ['需要你确认后才能继续', factChanges(artifacts), factVerify(verify)],
+      facts: presentFacts({ artifacts, verify, pending: '需要你确认后才能继续' }),
     };
   }
   if (s.pendingClarifications.length > 0) {
@@ -87,7 +89,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'clarification',
       recoveryHint: null,
-      facts: ['需要补充信息', factChanges(artifacts), factVerify(verify)],
+      facts: presentFacts({ artifacts, verify, pending: '需要补充信息' }),
     };
   }
   if (s.turnActive) {
@@ -103,7 +105,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'none',
       recoveryHint: null,
-      facts: [factChanges(artifacts), factVerify(verify)],
+      facts: presentFacts({ artifacts, verify }),
     };
   }
   if (!s.lastTurn) {
@@ -119,7 +121,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       artifacts,
       pending: 'none',
       recoveryHint: null,
-      facts: [factChanges(artifacts), factVerify(verify)],
+      facts: presentFacts({ artifacts, verify }),
     };
   }
 
@@ -142,11 +144,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
     artifacts,
     pending: 'none',
     recoveryHint: recovery,
-    facts: [
-      factChanges(artifacts),
-      factVerify(verify),
-      pendingNone(kind),
-    ].filter(Boolean) as string[],
+    facts: presentFacts({ artifacts, verify }),
   };
 }
 
@@ -185,13 +183,25 @@ function trustFrom(s: SessionView, kind: CompletionKind, verify: VerifyState): T
   return 'unverified';
 }
 
+/** Only things that happened or that the user must act on. Absences stay silent. */
+function presentFacts(opts: {
+  artifacts: ArtifactFacts;
+  verify: VerifyState;
+  pending?: string;
+}): string[] {
+  const facts: string[] = [];
+  if (opts.pending) facts.push(opts.pending);
+  if (opts.artifacts.source !== 'none') facts.push(factChanges(opts.artifacts));
+  if (opts.verify !== 'none') facts.push(factVerify(opts.verify));
+  return facts;
+}
+
 function factChanges(a: ArtifactFacts): string {
-  if (a.source === 'none') return '未改仓库';
   if (a.source === 'report') return `${a.files} files changed`;
   return `${a.files} files  +${a.added} −${a.removed}`;
 }
 
-function factVerify(v: VerifyState): string {
+function factVerify(v: Exclude<VerifyState, 'none'>): string {
   switch (v) {
     case 'passed':
       return '验证通过';
@@ -201,14 +211,7 @@ function factVerify(v: VerifyState): string {
       return '验证未完成';
     case 'running':
       return '验证进行中';
-    case 'none':
-      return '无自动验证';
   }
-}
-
-function pendingNone(kind: CompletionKind): string | null {
-  if (kind === 'success') return '无需等待操作';
-  return null;
 }
 
 export function trustLabel(t: TrustState): string {

@@ -28,6 +28,37 @@ export function inspectorTerminalTone(end: TurnEnd): TurnTone {
   return presentTurnEnd(end).tone;
 }
 
+export type InspectorSection =
+  | 'action'
+  | 'task'
+  | 'result'
+  | 'plan'
+  | 'verification'
+  | 'changes'
+  | 'agents'
+  | 'runtime'
+  | 'more';
+
+/** Contextual Inspector: only sections with content. `more` is always last. */
+export function inspectorVisibleSections(
+  s: SessionView | null,
+  extras: { observation?: boolean; delegatedAgents?: boolean } = {},
+): InspectorSection[] {
+  if (!s) return [];
+  const mode = inspectorMode(s);
+  const sections: InspectorSection[] = [];
+  if (mode === 'waiting') sections.push('action');
+  if (mode === 'running' || mode === 'idle') sections.push('task');
+  if (mode === 'terminal') sections.push('result');
+  if (currentPlanProgress(s.plan)) sections.push('plan');
+  if (s.verification && s.verification.checks.length > 0) sections.push('verification');
+  if ((s.diff?.files.length ?? 0) > 0) sections.push('changes');
+  if (s.agents.length > 0 || extras.delegatedAgents) sections.push('agents');
+  if (extras.observation) sections.push('runtime');
+  sections.push('more');
+  return sections;
+}
+
 export function currentPlanProgress(
   plan: UiPlan | null | undefined,
 ): { current: number; total: number; description: string } | null {

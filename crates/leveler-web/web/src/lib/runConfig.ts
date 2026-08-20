@@ -19,3 +19,11 @@ export function runConfigSummary(input: {
   ].filter((p): p is string => Boolean(p));
   return parts.join(' · ');
 }
+
+/** Compact composer control: model · work profile. Full axes live in the popup. */
+export function runConfigCompact(input: {
+  modelLabel: string;
+  workProfile: string;
+}): string {
+  return [input.modelLabel, workProfileLabel(input.workProfile)].filter(Boolean).join(' · ');
+}

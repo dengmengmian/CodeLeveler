@@ -1,15 +1,9 @@
-// 应用外壳：三栏布局 + RuntimeBridge 生命周期 + 全局快捷键。
-// 顶栏：任务身份 | 运行状态 | 上下文 · 更多。
+// 应用外壳：Single Sidebar + Workspace + Contextual Inspector。
+// 顶栏：项目 / 分支 | 运行状态 | 上下文 · 更多 · Inspector。
 
+import { PanelLeftClose, PanelLeftOpen, PanelRight } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { RuntimeBridge } from './lib/controller';
-import { formatElapsed, repoShortName } from './lib/format';
-import { headerWaitingCue, inspectorMode } from './lib/inspectorModel';
-import { presentTurnEnd } from './lib/turn';
-import { AppProvider, useAppDispatch, useAppState, type AppState } from './state/store';
-import { BridgeProvider, useBridge } from './state/bridge';
 import { MoreMenu } from './components/Appearance';
-import { AppRail } from './components/AppRail';
 import { Composer } from './components/Composer';
 import { DiffView } from './components/DiffView';
 import { ExecutionView } from './components/ExecutionView';
@@ -19,7 +13,13 @@ import { Inspector } from './components/Inspector';
 import { LevelMeter } from './components/LevelMeter';
 import { Sidebar } from './components/Rail';
 import { Timeline } from './components/Timeline';
-import type { StageView } from './state/store';
+import { RuntimeBridge } from './lib/controller';
+import { formatElapsed, repoShortName } from './lib/format';
+import { CTRL_ICON } from './lib/icons';
+import { headerWaitingCue, inspectorMode } from './lib/inspectorModel';
+import { presentTurnEnd } from './lib/turn';
+import { BridgeProvider, useBridge } from './state/bridge';
+import { AppProvider, useAppDispatch, useAppState, type AppState, type StageView } from './state/store';
 import type { ApprovalDecision } from './types/protocol';
 
 const APPROVAL_KEYS: Record<string, ApprovalDecision> = {
@@ -44,10 +44,10 @@ function Shell() {
   const setView = (v: StageView) => dispatch({ type: 'stage_view', view: v });
 
   useEffect(() => {
-    if (window.matchMedia('(max-width: 1279px)').matches) {
+    if (window.matchMedia('(max-width: 1439px)').matches) {
       dispatch({ type: 'set_inspector', open: false });
     }
-    if (window.matchMedia('(max-width: 899px)').matches && stateRef.current.railOpen) {
+    if (window.matchMedia('(max-width: 1099px)').matches && stateRef.current.railOpen) {
       dispatch({ type: 'toggle_rail' });
     }
   }, [dispatch]);
@@ -132,7 +132,6 @@ function Shell() {
         <div
           className={`deck${state.railOpen ? '' : ' sidebar-off'}${state.inspectorOpen ? '' : ' insp-off'}`}
         >
-          <AppRail />
           <Sidebar />
           <main className="stage">
             <header className="stage-head">
@@ -143,7 +142,11 @@ function Shell() {
                 aria-label="切换侧栏"
                 onClick={() => dispatch({ type: 'toggle_rail' })}
               >
-                ☰
+                {state.railOpen ? (
+                  <PanelLeftClose {...CTRL_ICON} aria-hidden="true" />
+                ) : (
+                  <PanelLeftOpen {...CTRL_ICON} aria-hidden="true" />
+                )}
               </button>
               <span className="sh-identity">
                 <span className="sh-proj">{project}</span>
@@ -160,7 +163,7 @@ function Shell() {
                   aria-label="切换任务面板"
                   onClick={() => dispatch({ type: 'toggle_inspector' })}
                 >
-                  ▤
+                  <PanelRight {...CTRL_ICON} aria-hidden="true" />
                 </button>
               </span>
             </header>

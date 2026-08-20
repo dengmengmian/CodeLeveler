@@ -75,6 +75,14 @@ export interface LastTurn {
   detail: string | null;
 }
 
+/** Frozen per-turn execution process. Live `tools` still clear on the next user message. */
+export interface TurnTrace {
+  userSeq: number;
+  tools: ToolCallView[];
+  backgroundTasks: BackgroundTaskView[];
+  lastTurn: LastTurn;
+}
+
 /** 一个 spawn 出来的子 agent（多 agent 委派），running → done 原地更新。 */
 export interface SubAgentView {
   id: string;
@@ -117,6 +125,8 @@ export interface SessionView {
   messages: ChatMessage[];
   /** 当前回合的工具调用（下一回合开始时清空） */
   tools: ToolCallView[];
+  /** Completed turns' tool process, keyed by that turn's user message seq. */
+  traces: TurnTrace[];
   /** 当前回合的子 agent（下一回合开始时清空） */
   agents: SubAgentView[];
   /** 当前回合的后台任务（下一回合开始时清空） */
@@ -160,8 +170,8 @@ export type ConnectionStatus = 'connecting' | 'online';
 /** Central workspace surface. `execution` is a Phase 1 slot only (no observatory). */
 export type StageView = 'chat' | 'diff' | 'execution';
 
-/** 48px application rail. Lists live in the context sidebar. */
-export type RailNav = 'sessions' | 'workspace' | 'search' | 'changes' | 'activity' | 'settings';
+/** Sidebar destination. Workspace tabs (Conversation / Changes / Execution) are independent. */
+export type RailNav = 'sessions' | 'files' | 'search' | 'settings';
 
 /** Sections inside the Workspace sidebar. Symbols/Environment have no extra API. */
 export type WorkspaceSection = 'files' | 'symbols' | 'repository' | 'environment';
@@ -176,7 +186,7 @@ export interface AppState {
   repository: string;
   /** 中央主区域视图（对话 / 改动 / Execution 占位） */
   stageView: StageView;
-  /** First-level icon rail. */
+  /** Single-sidebar destination. Independent of workspace tabs. */
   railNav: RailNav;
   /** Workspace sidebar subsection. */
   workspaceSection: WorkspaceSection;
@@ -194,7 +204,7 @@ export interface AppState {
   composerSeed: string | null;
   /** Diff 工作区当前聚焦的文件；null = 用列表第一项 */
   diffFocus: string | null;
-  /** Context sidebar open. The 48px icon rail stays visible. */
+  /** Single sidebar open. */
   railOpen: boolean;
   inspectorOpen: boolean;
   /** Durable observatory payload (QueryObservability). Not live SessionView.tools. */
@@ -234,6 +244,8 @@ export type Action =
   | { type: 'connection'; status: ConnectionStatus }
   | { type: 'session_list'; sessions: UiSessionSummary[] }
   | { type: 'snapshot'; session: UiSessionSnapshot; contextWindow?: number | null }
+  /** SessionUpdated: TUI apply_meta. Metadata only; never rebuilds the turn presentation. */
+  | { type: 'session_meta'; session: UiSessionSnapshot }
   | { type: 'select_session'; id: SessionId }
   | { type: 'new_draft'; project?: string | null }
   | { type: 'select_project'; path: string }
@@ -304,8 +316,8 @@ function viewFromSnapshot(
     if (pi.type === 'approval') pendingApprovals.push(pi.request);
     else pendingClarifications.push(pi.request);
   }
-  // On a snapshot the interleave order between history messages and in-flight
-  // tools is not recoverable, so keep messages first, then the active tools.
+  // Full replace (SessionOpened / WS snapshot). SessionUpdated must NOT use this:
+  // active_tools is only in-flight, and rebuilding here wipes the current turn.
   const messages: ChatMessage[] = snap.messages.map((m) => ({
     id: m.id,
     role: m.role,
@@ -340,6 +352,7 @@ function viewFromSnapshot(
     status: snap.status,
     messages,
     tools,
+    traces: sameSession ? (prev.traces ?? []) : [],
     agents: sameSession ? prev.agents : [],
     backgroundTasks: sameSession ? prev.backgroundTasks : [],
     pendingApprovals,
@@ -396,9 +409,48 @@ function markBusy(current: SessionView): void {
   }
 }
 
+/** TUI `apply_meta`: header fields only. Does not touch transcript, tools, agents, lastTurn. */
+function applySessionMeta(current: SessionView, snap: UiSessionSnapshot): void {
+  current.repository = snap.repository;
+  current.branch = snap.branch ?? null;
+  current.model = snap.model ?? null;
+  current.availableModels = snap.available_models ?? [];
+  current.permission = snap.mode;
+  if (snap.status) current.status = snap.status;
+  if (snap.goal) current.title = snap.goal || current.title;
+  if (snap.work_profile) current.workProfile = snap.work_profile;
+  if (snap.collaboration) current.collaboration = snap.collaboration;
+  if (snap.reasoning !== undefined && snap.reasoning !== null) {
+    current.reasoningEffort = snap.reasoning.effective ?? null;
+  }
+}
+
 function resetReasoning(current: SessionView): void {
   current.reasoning = '';
   current.reasoningSuperseded = false;
+}
+
+function snapshotTurnTrace(current: SessionView): void {
+  if (!current.lastTurn) return;
+  if (!current.traces) current.traces = [];
+  let userSeq: number | null = null;
+  for (let i = current.messages.length - 1; i >= 0; i -= 1) {
+    const m = current.messages[i];
+    if (m.role === 'user' && m.btw === undefined) {
+      userSeq = m.seq;
+      break;
+    }
+  }
+  if (userSeq === null) return;
+  const trace: TurnTrace = {
+    userSeq,
+    tools: current.tools.slice(),
+    backgroundTasks: current.backgroundTasks.slice(),
+    lastTurn: current.lastTurn,
+  };
+  const idx = current.traces.findIndex((t) => t.userSeq === userSeq);
+  if (idx >= 0) current.traces[idx] = trace;
+  else current.traces.push(trace);
 }
 
 // ── reducer ─────────────────────────────────────────────────────────
@@ -424,6 +476,15 @@ export function reducer(state: AppState, action: Action): void {
       if (view.repository) {
         state.repository = view.repository;
         state.selectedProject = view.repository;
+      }
+      return;
+    }
+    case 'session_meta': {
+      if (!state.current || state.current.id !== action.session.id) return;
+      applySessionMeta(state.current, action.session);
+      if (state.current.repository) {
+        state.repository = state.current.repository;
+        state.selectedProject = state.current.repository;
       }
       return;
     }
@@ -454,20 +515,15 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'stage_view':
       state.stageView = action.view;
-      if (action.view === 'diff') state.railNav = 'changes';
-      if (action.view === 'execution') state.railNav = 'activity';
       return;
     case 'set_rail_nav':
       state.railNav = action.nav;
-      if (action.nav === 'changes') state.stageView = 'diff';
-      if (action.nav === 'activity') state.stageView = 'execution';
       return;
     case 'set_workspace_section':
       state.workspaceSection = action.section;
       return;
     case 'focus_diff':
       state.stageView = 'diff';
-      state.railNav = 'changes';
       state.diffFocus = action.path;
       return;
     case 'toggle_rail':
@@ -786,6 +842,7 @@ export function reducer(state: AppState, action: Action): void {
         state.current.activity = null;
         resetReasoning(state.current);
         for (const m of state.current.messages) m.streaming = false;
+        snapshotTurnTrace(state.current);
       }
       return;
     case 'seed_composer':

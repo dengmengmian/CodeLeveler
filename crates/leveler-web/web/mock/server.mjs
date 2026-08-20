@@ -203,6 +203,17 @@ async function runDemoTurn(sessionId) {
     return true;
   };
 
+  emit({ type: 'agent_activity', label: '正在分析项目' });
+  for (const chunk of [
+    '先看 workspace 里 transport 怎么接 Lagged。\n',
+    '对照 TUI 的订阅循环，再决定 web 网关怎么重同步。\n',
+    '工具调用前把当前思路收成几条。\n',
+  ]) {
+    if (runner.cancelled) return void (await cancelled());
+    emit({ type: 'reasoning_delta', delta: chunk });
+    await sleep(80);
+  }
+
   // 1) 第一段助手消息（流式）
   const m1 = `m-${uuid()}`;
   s.active_tools = [];

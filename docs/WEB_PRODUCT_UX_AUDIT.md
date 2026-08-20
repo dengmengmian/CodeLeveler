@@ -1,3 +1,5 @@
+> **Historical / superseded.** See [`WEB_DESKTOP_UI.md`](WEB_DESKTOP_UI.md).
+
 # Web Product UX Audit
 
 **Date:** 2026-08-18  

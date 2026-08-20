@@ -11,6 +11,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     status: 'idle',
     messages: [],
     tools: [],
+    traces: [],
     agents: [],
     backgroundTasks: [],
     pendingApprovals: [],
@@ -143,8 +144,31 @@ describe('completionTruth', () => {
     );
     expect(t?.changesApplied).toBe(false);
     expect(t?.artifacts.source).toBe('none');
-    expect(t?.facts).toContain('未改仓库');
     expect(t?.facts.join(' ')).not.toContain('5 files changed');
+    expect(t?.facts).not.toContain('未改仓库');
+  });
+
+  it('answered Q&A does not present absences as conclusions', () => {
+    const t = completionTruth(
+      session({
+        lastTurn: { outcome: 'answered', detail: null, ms: 18000 },
+        diff: { files: [] },
+      }),
+    );
+    expect(t?.kind).toBe('success');
+    expect(t?.title).toBe('已回答');
+    expect(t?.facts).toEqual([]);
+    expect(t?.facts.join(' ')).not.toMatch(/未改仓库|无自动验证|无需等待操作/);
+  });
+
+  it('waiting only states the pending action, not absences', () => {
+    const t = completionTruth(
+      session({
+        lastTurn: { outcome: 'completed', detail: null, ms: 1000 },
+        pendingApprovals: [{ id: 'a', tool: 'run_command', summary: 'rm', command: 'rm', risks: [] }],
+      }),
+    );
+    expect(t?.facts).toEqual(['需要你确认后才能继续']);
   });
 
   it('exact diff totals win when a real diff is present', () => {

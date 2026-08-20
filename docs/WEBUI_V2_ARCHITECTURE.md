@@ -1,3 +1,8 @@
+> **Partially superseded.** Desktop shell IA (Single Sidebar, workspace
+> tabs, contextual Inspector) is now
+> [`WEB_DESKTOP_UI.md`](WEB_DESKTOP_UI.md). Runtime / observatory
+> constraints in this document still apply.
+
 # CodeLeveler WebUI v2 Architecture
 
 **Document Version:** v2.0  

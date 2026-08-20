@@ -1,29 +1,19 @@
-// 右栏任务面板：任务 / 验证 / 检查点 / 记忆。
-// 「任务」按状态换优先级：等待操作 > 运行中 > 终态 > 空闲。
-// 不在这里铺完整工具列表或完整 Diff。
+// Contextual Inspector: waiting > running > terminal > idle.
+// Sections appear only when they have content. Checkpoints / Memory live under More.
 
-import { useEffect, useState } from 'react';
-import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
-import { useBridge } from '../state/bridge';
+import { useEffect, useState, type ReactNode } from 'react';
 import { completionTruth, trustLabel, type ArtifactFacts } from '../lib/completionTruth';
 import { formatElapsed } from '../lib/format';
-import { currentPlanProgress, inspectorMode } from '../lib/inspectorModel';
+import { currentPlanProgress, inspectorMode, inspectorVisibleSections } from '../lib/inspectorModel';
 import {
   projectObservability,
   type AgentDelegationStatus,
   type AgentDelegationView,
 } from '../lib/observabilityView';
 import { presentTurnEnd } from '../lib/turn';
+import { useBridge } from '../state/bridge';
+import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
 import type { CheckState, UiApprovalRequest, UiClarificationRequest } from '../types/protocol';
-
-type Tab = 'task' | 'verify' | 'ckpt' | 'memory';
-
-const TABS: ReadonlyArray<readonly [Tab, string]> = [
-  ['task', '任务'],
-  ['verify', '验证'],
-  ['ckpt', '检查点'],
-  ['memory', '记忆'],
-];
 
 const CHECK_GLYPH: Record<CheckState, string> = {
   passed: '✓',
@@ -33,103 +23,192 @@ const CHECK_GLYPH: Record<CheckState, string> = {
 };
 
 export function Inspector() {
-  const [tab, setTab] = useState<Tab>('task');
   const state = useAppState();
   const current = state.current;
-  const bridge = useBridge();
-  const mode = inspectorMode(current);
-
-  useEffect(() => {
-    if (mode === 'waiting') setTab('task');
-  }, [mode]);
+  const observation = state.observation;
+  const delegated = observation ? projectObservability(observation).agents.length > 0 : false;
+  const sections = inspectorVisibleSections(current, {
+    observation: Boolean(observation),
+    delegatedAgents: delegated,
+  });
 
   return (
     <aside className={`inspector${state.inspectorOpen ? '' : ' is-hidden'}`} aria-label="任务面板">
-      <div className="insp-tabs" role="tablist">
-        {TABS.map(([key, label]) => (
-          <button
-            key={key}
-            role="tab"
-            aria-selected={tab === key}
-            className={`insp-tab${tab === key ? ' on' : ''}`}
-            onClick={() => setTab(key)}
-          >
-            {label}
-            {key === 'memory' && (current?.memory?.pending.length ?? 0) > 0 && (
-              <i className="insp-dot" title="有待采纳的记忆" />
-            )}
-          </button>
-        ))}
-      </div>
       <div className="insp-body">
-        {tab === 'task' && <TaskTab current={current} />}
-
-        {tab === 'verify' && (
-          <>
-            {current?.verification && current.verification.checks.length > 0 ? (
-              <>
-                <div className="checks">
-                  {current.verification.checks.map((c) => {
-                    const cls =
-                      c.status === 'passed' ? 'ok' : c.status === 'failed' ? 'bad' : 'wait';
-                    return (
-                      <div className={`check ${cls}`} key={c.name}>
-                        <span className="st">{CHECK_GLYPH[c.status]}</span>
-                        <span>{c.name}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-                {current.verification.checks
-                  .filter((c) => c.evidence)
-                  .map((c) => (
-                    <div className="diff-patch" key={`${c.name}-ev`}>
-                      {c.evidence}
-                    </div>
-                  ))}
-                <dl className="kv" style={{ marginTop: 10 }}>
-                  <dt>结果</dt>
-                  <dd className={current.verification.passed ? 'good' : ''}>
-                    {current.verification.passed === null
-                      ? '进行中'
-                      : current.verification.passed
-                        ? '通过'
-                        : '未通过'}
-                  </dd>
-                </dl>
-              </>
-            ) : (
-              <div className="insp-empty">暂无验证结果 —— 任务执行验证步骤后展示。</div>
-            )}
-          </>
-        )}
-
-        {tab === 'ckpt' && (
-          <>
-            {current && current.checkpoints.length > 0 ? (
-              current.checkpoints.map((c) => (
-                <div className="ckpt" key={c.id}>
-                  <span className="label">
-                    #{c.ordinal} {c.label}
-                  </span>
-                  <button
-                    className="restore"
-                    title={`回滚到检查点 ${c.id}`}
-                    onClick={() => bridge.restoreCheckpoint(c.id)}
-                  >
-                    回滚
-                  </button>
-                </div>
-              ))
-            ) : (
-              <div className="insp-empty">暂无检查点。</div>
-            )}
-          </>
-        )}
-
-        {tab === 'memory' && <MemoryTab current={current} />}
+        {!current && <div className="insp-empty">先进入一个会话。</div>}
+        {current &&
+          sections.map((id) => {
+            switch (id) {
+              case 'action':
+                return <ActionSection key="action" current={current} />;
+              case 'task':
+                return <TaskSection key="task" current={current} />;
+              case 'result':
+                return <ResultCard key="result" current={current} />;
+              case 'plan':
+                return <PlanSection key="plan" current={current} />;
+              case 'verification':
+                return <VerificationSection key="verification" current={current} />;
+              case 'changes':
+                return (
+                  <InspectorBlock key="changes" title="CHANGES">
+                    <ChangesJump current={current} />
+                  </InspectorBlock>
+                );
+              case 'agents':
+                return <AgentsSection key="agents" live={current.agents} />;
+              case 'runtime':
+                return <RuntimeSection key="runtime" />;
+              case 'more':
+                return <MoreSection key="more" current={current} />;
+              default:
+                return null;
+            }
+          })}
       </div>
     </aside>
+  );
+}
+
+function InspectorBlock({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="insp-block">
+      <h2 className="insp-sec">{title}</h2>
+      {children}
+    </section>
+  );
+}
+
+function ActionSection({ current }: { current: SessionView }) {
+  return (
+    <section className="insp-block" aria-label="需要操作">
+      <h2 className="insp-sec">ACTION REQUIRED</h2>
+      {current.pendingApprovals.map((a) => (
+        <ApprovalActions key={a.id} request={a} />
+      ))}
+      {current.pendingClarifications.map((c) => (
+        <ClarificationActions key={c.id} request={c} />
+      ))}
+    </section>
+  );
+}
+
+function TaskSection({ current }: { current: SessionView }) {
+  const mode = inspectorMode(current);
+  const elapsed = current.turnStartedAt
+    ? Math.max(0, Math.floor((Date.now() - current.turnStartedAt) / 1000))
+    : 0;
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (mode !== 'running') return;
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [mode]);
+
+  return (
+    <InspectorBlock title="TASK">
+      <div className="task-card">
+        {mode === 'running' ? (
+          <>
+            <div className="t-status run">
+              <i className="dot" />
+              {current.activity ?? '正在运行'}
+            </div>
+            <div className="t-elapsed">{formatElapsed(elapsed)}</div>
+          </>
+        ) : (
+          <>
+            <div className="t-goal">{current.title || '新任务'}</div>
+            <div className="t-status idle">
+              <i className="dot" />
+              空闲
+            </div>
+          </>
+        )}
+      </div>
+    </InspectorBlock>
+  );
+}
+
+function ResultCard({ current }: { current: SessionView }) {
+  if (!current.lastTurn) return null;
+  const p = presentTurnEnd(current.lastTurn);
+  const sec = Math.round(current.lastTurn.ms / 1000);
+  const truth = completionTruth(current);
+  return (
+    <InspectorBlock title="RESULT">
+      <div className={`task-card tone-${p.tone}`}>
+        <div className={`t-status term ${p.tone}`}>
+          <span aria-hidden="true">{p.glyph}</span>
+          {p.label}
+        </div>
+        {sec > 0 && <div className="t-elapsed">{formatElapsed(sec)}</div>}
+        {p.detail && <div className="t-detail">{p.detail}</div>}
+      </div>
+      {truth && truth.kind !== 'idle' && (
+        <dl className="kv runtime-kv">
+          <dt>Trust</dt>
+          <dd>{trustLabel(truth.trust)}</dd>
+          <dt>Artifacts</dt>
+          <dd>{artifactLine(truth.artifacts)}</dd>
+        </dl>
+      )}
+      {truth?.facts.map((f) => (
+        <div className="t-detail" key={f}>
+          {f}
+        </div>
+      ))}
+      {truth?.recoveryHint && <div className="t-detail">{truth.recoveryHint}</div>}
+    </InspectorBlock>
+  );
+}
+
+function PlanSection({ current }: { current: SessionView }) {
+  const plan = currentPlanProgress(current.plan);
+  if (!plan) return null;
+  return (
+    <InspectorBlock title="PLAN">
+      <div className="plan-now">
+        {plan.current} / {plan.total} {plan.description}
+      </div>
+    </InspectorBlock>
+  );
+}
+
+function VerificationSection({ current }: { current: SessionView }) {
+  const verification = current.verification;
+  if (!verification || verification.checks.length === 0) return null;
+  return (
+    <InspectorBlock title="VERIFICATION">
+      <div className="checks">
+        {verification.checks.map((c) => {
+          const cls = c.status === 'passed' ? 'ok' : c.status === 'failed' ? 'bad' : 'wait';
+          return (
+            <div className={`check ${cls}`} key={c.name}>
+              <span className="st">{CHECK_GLYPH[c.status]}</span>
+              <span>{c.name}</span>
+            </div>
+          );
+        })}
+      </div>
+      {verification.checks
+        .filter((c) => c.evidence)
+        .map((c) => (
+          <div className="diff-patch" key={`${c.name}-ev`}>
+            {c.evidence}
+          </div>
+        ))}
+      <dl className="kv" style={{ marginTop: 8 }}>
+        <dt>结果</dt>
+        <dd className={verification.passed ? 'good' : ''}>
+          {verification.passed === null
+            ? '进行中'
+            : verification.passed
+              ? '通过'
+              : '未通过'}
+        </dd>
+      </dl>
+    </InspectorBlock>
   );
 }
 
@@ -160,6 +239,7 @@ function ChangesJump({ current }: { current: SessionView }) {
   if (files.length === 0) return null;
   return (
     <button
+      type="button"
       className="changes-sum as-link"
       title="在中央区域查看完整 diff"
       onClick={() => dispatch({ type: 'stage_view', view: 'diff' })}
@@ -167,7 +247,7 @@ function ChangesJump({ current }: { current: SessionView }) {
       <span className="n">{files.length} files</span>
       <span className="add">+{totalAdd}</span>
       <span className="del">−{totalDel}</span>
-      <span className="goto">→</span>
+      <span className="goto">View changes →</span>
     </button>
   );
 }
@@ -176,7 +256,7 @@ function ApprovalActions({ request }: { request: UiApprovalRequest }) {
   const bridge = useBridge();
   return (
     <div className="action-block" role="region" aria-label="需要确认">
-      <div className="action-kicker">⚠ 需要确认</div>
+      <div className="action-kicker">需要确认</div>
       <div className="action-body">
         <div>{request.summary}</div>
         {request.command && <pre className="action-cmd">{request.command}</pre>}
@@ -230,148 +310,6 @@ function ClarificationActions({ request }: { request: UiClarificationRequest }) 
   );
 }
 
-function TaskTab({ current }: { current: SessionView | null }) {
-  const mode = inspectorMode(current);
-  const elapsed = current?.turnStartedAt
-    ? Math.max(0, Math.floor((Date.now() - current.turnStartedAt) / 1000))
-    : 0;
-  const plan = currentPlanProgress(current?.plan);
-  const [, tick] = useState(0);
-  useEffect(() => {
-    if (mode !== 'running') return;
-    const t = setInterval(() => tick((n) => n + 1), 1000);
-    return () => clearInterval(t);
-  }, [mode]);
-
-  if (!current) {
-    return <div className="insp-empty">先进入一个会话。</div>;
-  }
-
-  if (mode === 'waiting') {
-    return (
-      <>
-        {current.pendingApprovals.map((a) => (
-          <ApprovalActions key={a.id} request={a} />
-        ))}
-        {current.pendingClarifications.map((c) => (
-          <ClarificationActions key={c.id} request={c} />
-        ))}
-        <ResultSection current={current} />
-        <AgentsSection live={current.agents} />
-        <RuntimeSection />
-        <ChangesJump current={current} />
-      </>
-    );
-  }
-
-  if (mode === 'running') {
-    return (
-      <>
-        <div className="task-card">
-          <div className={`t-status run`}>
-            <i className="dot" />
-            {current.activity ?? '正在运行'}
-          </div>
-          <div className="t-elapsed">{formatElapsed(elapsed)}</div>
-        </div>
-        {plan && (
-          <>
-            <div className="insp-sec">当前步骤</div>
-            <div className="plan-now">
-              {plan.current} / {plan.total} {plan.description}
-            </div>
-          </>
-        )}
-        <ResultSection current={current} />
-        <AgentsSection live={current.agents} />
-        <RuntimeSection />
-        <div className="insp-sec">Changes</div>
-        <ChangesJump current={current} />
-      </>
-    );
-  }
-
-  if (mode === 'terminal' && current.lastTurn) {
-    const p = presentTurnEnd(current.lastTurn);
-    const sec = Math.round(current.lastTurn.ms / 1000);
-    return (
-      <>
-        <div className={`task-card tone-${p.tone}`}>
-          <div className={`t-status term ${p.tone}`}>
-            <span aria-hidden="true">{p.glyph}</span>
-            {p.label}
-          </div>
-          {sec > 0 && <div className="t-elapsed">{formatElapsed(sec)}</div>}
-          {p.detail && <div className="t-detail">{p.detail}</div>}
-        </div>
-        {current.verification && current.verification.checks.length > 0 && (
-          <>
-            <div className="insp-sec">Verification</div>
-            <div className="checks">
-              {current.verification.checks.map((c) => {
-                const cls = c.status === 'passed' ? 'ok' : c.status === 'failed' ? 'bad' : 'wait';
-                return (
-                  <div className={`check ${cls}`} key={c.name}>
-                    <span className="st">{CHECK_GLYPH[c.status]}</span>
-                    <span>{c.name}</span>
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
-        <ResultSection current={current} />
-        <AgentsSection live={current.agents} />
-        <RuntimeSection />
-        <div className="insp-sec">Changes</div>
-        <ChangesJump current={current} />
-      </>
-    );
-  }
-
-  return (
-    <>
-      <div className="task-card">
-        <div className="t-goal">{current.title || '新任务'}</div>
-        <div className="t-status idle">
-          <i className="dot" />
-          空闲
-        </div>
-      </div>
-      <ResultSection current={current} />
-      <AgentsSection live={current.agents} />
-      <RuntimeSection />
-      <ChangesJump current={current} />
-    </>
-  );
-}
-
-function ResultSection({ current }: { current: SessionView }) {
-  const truth = completionTruth(current);
-  if (!truth || truth.kind === 'idle') return null;
-  return (
-    <>
-      <div className="insp-sec">Result</div>
-      <dl className="kv runtime-kv">
-        <dt>Status</dt>
-        <dd>
-          {truth.glyph} {truth.title}
-        </dd>
-        <dt>Trust</dt>
-        <dd>{trustLabel(truth.trust)}</dd>
-        <dt>Artifacts</dt>
-        <dd>{artifactLine(truth.artifacts)}</dd>
-      </dl>
-      {truth.facts.map((f) => (
-        <div className="t-detail" key={f}>
-          {f}
-        </div>
-      ))}
-      {truth.recoveryHint && <div className="t-detail">{truth.recoveryHint}</div>}
-    </>
-  );
-}
-
 function artifactLine(a: ArtifactFacts): string {
   if (a.source === 'report') return `${a.files} files changed`;
   if (a.source === 'diff') return `${a.files} files  +${a.added} −${a.removed}`;
@@ -410,15 +348,13 @@ function DelegationStar({ agents }: { agents: readonly AgentDelegationView[] }) 
   );
 }
 
-/** Live HUD is SessionView.agents; history is QueryObservability.agents. */
 function AgentsSection({ live }: { live: readonly SubAgentView[] }) {
   const { observation } = useAppState();
   const running = live.filter((a) => a.status === 'run');
   const delegated = observation ? projectObservability(observation).agents : [];
   if (running.length === 0 && delegated.length === 0) return null;
   return (
-    <>
-      <div className="insp-sec">AGENTS</div>
+    <InspectorBlock title="AGENTS">
       {running.length > 0 && (
         <>
           <div className="ag-kicker">Running</div>
@@ -435,31 +371,25 @@ function AgentsSection({ live }: { live: readonly SubAgentView[] }) {
           <DelegationStar agents={delegated} />
         </>
       )}
-    </>
+    </InspectorBlock>
   );
 }
 
-/** Session-wide runtime facts from QueryObservability — never SessionView.tools. */
 function RuntimeSection() {
   const { observation, observationStatus } = useAppState();
+  const dispatch = useAppDispatch();
   if (observationStatus === 'loading' && !observation) {
     return (
-      <>
-        <div className="insp-sec">Runtime</div>
+      <InspectorBlock title="RUNTIME">
         <div className="insp-empty">查询中…</div>
-      </>
+      </InspectorBlock>
     );
   }
   if (!observation) return null;
   const { summary } = projectObservability(observation);
   return (
-    <>
-      <div className="insp-sec">Runtime</div>
+    <InspectorBlock title="RUNTIME">
       <dl className="kv runtime-kv">
-        <dt>Model</dt>
-        <dd>{summary.model || '—'}</dd>
-        <dt>Duration</dt>
-        <dd>{summary.durationMs != null ? formatElapsed(Math.round(summary.durationMs / 1000)) : '—'}</dd>
         <dt>Requests</dt>
         <dd>{summary.requestCount}</dd>
         <dt>Tools</dt>
@@ -467,23 +397,65 @@ function RuntimeSection() {
           {summary.toolStarted}
           {summary.toolFinished !== summary.toolStarted ? ` · finished ${summary.toolFinished}` : ''}
         </dd>
-        <dt>Verification</dt>
-        <dd>{summary.verificationRuns > 0 ? `×${summary.verificationRuns}` : '—'}</dd>
+        <dt>Agents</dt>
+        <dd>{summary.delegatedAgents}</dd>
       </dl>
-    </>
+      <button
+        type="button"
+        className="insp-jump"
+        onClick={() => dispatch({ type: 'stage_view', view: 'execution' })}
+      >
+        Open Execution
+      </button>
+    </InspectorBlock>
   );
 }
 
-function MemoryTab({ current }: { current: SessionView | null }) {
+function MoreSection({ current }: { current: SessionView }) {
+  const pending = current.memory?.pending.length ?? 0;
+  return (
+    <details className="insp-more">
+      <summary>
+        More
+        {pending > 0 && <i className="insp-dot" title="有待采纳的记忆" />}
+      </summary>
+      <div className="insp-sec">Checkpoints</div>
+      {current.checkpoints.length > 0 ? (
+        current.checkpoints.map((c) => (
+          <CheckpointRow key={c.id} id={c.id} ordinal={c.ordinal} label={c.label} />
+        ))
+      ) : (
+        <div className="insp-empty">暂无检查点。</div>
+      )}
+      <div className="insp-sec">Memory</div>
+      <MemoryTab current={current} />
+    </details>
+  );
+}
+
+function CheckpointRow({ id, ordinal, label }: { id: string; ordinal: number; label: string }) {
   const bridge = useBridge();
-  const memory = current?.memory ?? null;
-  const sessionId = current?.id ?? null;
+  return (
+    <div className="ckpt">
+      <span className="label">
+        #{ordinal} {label}
+      </span>
+      <button className="restore" title={`回滚到检查点 ${id}`} onClick={() => bridge.restoreCheckpoint(id)}>
+        回滚
+      </button>
+    </div>
+  );
+}
+
+function MemoryTab({ current }: { current: SessionView }) {
+  const bridge = useBridge();
+  const memory = current.memory ?? null;
+  const sessionId = current.id;
 
   useEffect(() => {
     if (sessionId) bridge.listMemory();
   }, [sessionId, bridge]);
 
-  if (!current) return <div className="insp-empty">先进入一个会话。</div>;
   if (!memory) return <div className="insp-empty">读取项目记忆中…</div>;
 
   return (

@@ -3,9 +3,15 @@
 // 中间「权限 · 模式」合并入口，右侧模型 + 发送；停止由顶部全局状态栏负责。
 // 交互：Enter 发送、Shift+Enter 换行、/ 唤起命令、回合进行中发送排队。
 
+import {
+  ArrowDown,
+  ArrowUp,
+  Image as ImageIcon,
+  Paperclip,
+  X,
+} from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useAppState } from '../state/store';
-import { useBridge } from '../state/bridge';
+import { uploadAttachment } from '../lib/api';
 import {
   collaborationLabel,
   modelLabel,
@@ -13,8 +19,10 @@ import {
   reasoningLabel,
   workProfileLabel,
 } from '../lib/format';
-import { runConfigSummary } from '../lib/runConfig';
-import { uploadAttachment } from '../lib/api';
+import { CTRL_ICON } from '../lib/icons';
+import { runConfigCompact } from '../lib/runConfig';
+import { useBridge } from '../state/bridge';
+import { useAppState } from '../state/store';
 import type { ModelRef, PermissionProfile } from '../types/protocol';
 
 /** 斜杠命令（cmd, 描述, 对应 ClientCommand 变体） */
@@ -27,7 +35,7 @@ const SLASH: ReadonlyArray<readonly [string, string, string]> = [
   ['/clear', '开始新对话（当前这段保留在会话列表）', 'NewSessionFor'],
   ['/diff', '查看当前变更', 'RequestDiff'],
   ['/checkpoint', '回滚到检查点', 'RestoreCheckpoint'],
-  ['/memory', '查看 / 采纳 / 遗忘项目记忆（右栏「记忆」）', 'ListMemory / AcceptMemory / ForgetMemory'],
+  ['/memory', '查看 / 采纳 / 遗忘项目记忆（Inspector → More）', 'ListMemory / AcceptMemory / ForgetMemory'],
   ['/cancel', '取消当前回合', 'CancelCurrentTurn'],
   ['/btw', '侧问（不打断当前回合）', 'Btw'],
 ];
@@ -236,7 +244,7 @@ export function Composer() {
           <div className="notice">
             <span>{state.notice}</span>
             <button className="n-x" onClick={() => bridge.dismissNotice()} title="关闭">
-              ✕
+              <X {...CTRL_ICON} aria-hidden="true" />
             </button>
           </div>
         )}
@@ -256,7 +264,7 @@ export function Composer() {
                       disabled={i === 0}
                       onClick={() => bridge.moveQueued(q.id, -1)}
                     >
-                      ↑
+                      <ArrowUp {...CTRL_ICON} aria-hidden="true" />
                     </button>
                     <button
                       className="q-op"
@@ -264,12 +272,12 @@ export function Composer() {
                       disabled={i === queue.length - 1}
                       onClick={() => bridge.moveQueued(q.id, 1)}
                     >
-                      ↓
+                      <ArrowDown {...CTRL_ICON} aria-hidden="true" />
                     </button>
                   </span>
                 )}
                 <button className="q-x" onClick={() => bridge.cancelQueued(q.id)} title="取消排队">
-                  ✕
+                  <X {...CTRL_ICON} aria-hidden="true" />
                 </button>
               </div>
             ))}
@@ -280,13 +288,18 @@ export function Composer() {
           <div className="attach-row">
             {attachments.map((a) => (
               <span className="attach-chip" key={a.id} title={`${a.name} · ${a.mime_type}`}>
-                {a.kind === 'image' ? '🖼' : '📎'} {a.name}
+                {a.kind === 'image' ? (
+                  <ImageIcon {...CTRL_ICON} aria-hidden="true" />
+                ) : (
+                  <Paperclip {...CTRL_ICON} aria-hidden="true" />
+                )}{' '}
+                {a.name}
                 <button
                   className="attach-x"
                   title="从待发列表移除"
                   onClick={() => bridge.removeAttachment(a.id)}
                 >
-                  ✕
+                  <X {...CTRL_ICON} aria-hidden="true" />
                 </button>
               </span>
             ))}
@@ -342,12 +355,15 @@ export function Composer() {
                 onChange={(e) => void onFilesChosen(e)}
               />
               <button
-                className="c-chip"
-                title={current ? '上传附件（随下一条消息发送）' : '先进入会话再添加附件'}
+                type="button"
+                className="c-icon-btn"
+                title={current ? '附件' : '先进入会话再添加附件'}
+                aria-label="附件"
                 disabled={uploading}
                 onClick={pickFiles}
               >
-                {uploading ? '上传中…' : '＋ 附件'}
+                <Paperclip {...CTRL_ICON} aria-hidden="true" />
+                <span>{uploading ? '上传中…' : '附件'}</span>
               </button>
               <span className="spacer" />
 
@@ -363,14 +379,10 @@ export function Composer() {
                     setPopup(popup === 'run' ? null : 'run');
                   }}
                 >
-                  {runConfigSummary({
+                  {runConfigCompact({
                     modelLabel: modelLabel(current?.model),
-                    reasoning,
                     workProfile,
-                    collaboration,
-                    permission: current?.permission ?? 'assisted',
                   })}
-                  <span className="caret">▴</span>
                 </button>
                 {popup === 'run' && (
                   <div className="pop pop-right run-pop" role="dialog" aria-label="Run Configuration">
@@ -440,13 +452,14 @@ export function Composer() {
                 )}
               </span>
 
-              {turnActive && (
-                <span className="c-run-hint" title="停止由顶部状态栏负责 (Esc)">
-                  ● 运行中
-                </span>
-              )}
-              <button className="send" onClick={send}>
-                {turnActive ? '加入队列 ⏎' : '发送 ⏎'}
+              <button
+                type="button"
+                className="send-btn"
+                title={turnActive ? '加入队列' : '发送'}
+                aria-label={turnActive ? '加入队列' : '发送'}
+                onClick={send}
+              >
+                <ArrowUp size={18} strokeWidth={2} aria-hidden="true" />
               </button>
             </div>
           </div>

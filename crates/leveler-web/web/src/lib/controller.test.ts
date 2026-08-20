@@ -210,6 +210,67 @@ describe('memory commands', () => {
   });
 });
 
+describe('session_updated vs session_opened', () => {
+  it('session_updated merges metadata and does not replace completed tools', () => {
+    const { apply, state } = harness();
+    reducer(state, {
+      type: 'tool_started',
+      id: 't1',
+      name: 'read_file',
+      arguments: '{"path":"README.md"}',
+      parallel: false,
+    });
+    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 8 });
+    apply({
+      type: 'session_updated',
+      session: {
+        id: 's1',
+        repository: '/repo',
+        goal: 'g',
+        model: null,
+        mode: 'full_access',
+        branch: 'main',
+        status: 'idle',
+        messages: [],
+        active_tools: [],
+        work_profile: 'delivery',
+        collaboration: 'goal',
+      },
+    });
+    expect(state.current?.tools).toHaveLength(1);
+    expect(state.current?.tools[0]?.status).toBe('done');
+    expect(state.current?.permission).toBe('full_access');
+    expect(state.current?.workProfile).toBe('delivery');
+    expect(state.current?.collaboration).toBe('goal');
+  });
+
+  it('session_opened still replaces the session view from the snapshot', () => {
+    const { apply, state } = harness();
+    reducer(state, {
+      type: 'tool_started',
+      id: 't1',
+      name: 'read_file',
+      arguments: '{}',
+      parallel: false,
+    });
+    apply({
+      type: 'session_opened',
+      session: {
+        id: 's1',
+        repository: '/repo',
+        goal: 'g',
+        model: null,
+        mode: 'assisted',
+        branch: null,
+        status: 'idle',
+        messages: [],
+        active_tools: [],
+      },
+    });
+    expect(state.current?.tools).toHaveLength(0);
+  });
+});
+
 describe('query observability', () => {
   it('sends query_observability and stores ObservabilityLoaded off live tools', () => {
     const { bridge, sent, apply, state } = harness();

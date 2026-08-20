@@ -1,3 +1,7 @@
+> **Historical / superseded.** The implemented desktop shell is
+> [`WEB_DESKTOP_UI.md`](WEB_DESKTOP_UI.md). This analysis predates the
+> AppRail removal and contextual Inspector.
+
 # Current WebUI Analysis (vs WebUI v2)
 
 **Date:** 2026-08-19  

@@ -1,7 +1,9 @@
 // 改动审阅工作区：左侧 changed files，右侧单文件 unified diff。
 // 数据来自 snapshot.diff + diff_updated；打开时 request_diff。
 
+import { RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+import { CTRL_ICON } from '../lib/icons';
 import { useAppDispatch, useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
 import { completionTruth, trustLabel } from '../lib/completionTruth';
@@ -77,6 +79,7 @@ export function DiffView() {
             Next
           </button>
           <button type="button" className="dv-refresh" onClick={() => bridge.requestDiff()}>
+            <RefreshCw {...CTRL_ICON} aria-hidden="true" />
             Refresh
           </button>
         </span>

@@ -2,6 +2,8 @@
 // 主题状态来自 lib/theme.ts（外部存储），组件通过 useSyncExternalStore 订阅，
 // 切换立即生效并持久化。
 
+import { MoreHorizontal, Settings } from 'lucide-react';
+import { CTRL_ICON } from '../lib/icons';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
   THEME_OPTIONS,
@@ -60,7 +62,7 @@ export function MoreMenu() {
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        ⋯
+        <MoreHorizontal {...CTRL_ICON} aria-hidden="true" />
       </button>
       {open && (
         <div className="th-pop" role="menu">
@@ -152,7 +154,7 @@ export function SettingsButton() {
   return (
     <>
       <button className="set-gear" title="设置" onClick={() => setOpen(true)}>
-        ⚙
+        <Settings size={16} strokeWidth={1.75} aria-hidden="true" />
       </button>
       {open && <SettingsModal onClose={() => setOpen(false)} />}
     </>

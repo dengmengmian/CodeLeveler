@@ -3,6 +3,7 @@ import type { SessionView } from '../state/store';
 import {
   inspectorMode,
   inspectorTerminalTone,
+  inspectorVisibleSections,
   currentPlanProgress,
   headerWaitingCue,
 } from './inspectorModel';
@@ -17,6 +18,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     status: 'idle',
     messages: [],
     tools: [],
+    traces: [],
     agents: [],
     backgroundTasks: [],
     pendingApprovals: [],
@@ -153,5 +155,62 @@ describe('currentPlanProgress', () => {
 
   it('returns null without a plan', () => {
     expect(currentPlanProgress(null)).toBeNull();
+  });
+});
+
+describe('inspectorVisibleSections', () => {
+  it('waiting puts Action Required first', () => {
+    const sections = inspectorVisibleSections(
+      session({
+        turnActive: true,
+        pendingApprovals: [
+          {
+            id: 'a1',
+            tool: 'run_command',
+            summary: 'run rm',
+            command: 'rm -rf build/',
+            risks: [],
+          },
+        ],
+      }),
+    );
+    expect(sections[0]).toBe('action');
+    expect(sections).toContain('more');
+  });
+
+  it('running shows current activity, not action', () => {
+    const sections = inspectorVisibleSections(session({ turnActive: true, activity: '正在分析' }));
+    expect(sections).toContain('task');
+    expect(sections).not.toContain('action');
+    expect(sections).not.toContain('verification');
+    expect(sections).not.toContain('changes');
+  });
+
+  it('terminal uses Turn Truth result, not a fake success tab', () => {
+    const sections = inspectorVisibleSections(
+      session({ lastTurn: { outcome: 'unverified', detail: 'no verification', ms: 13000 } }),
+    );
+    expect(sections[0]).toBe('result');
+    expect(sections).not.toContain('verification');
+  });
+
+  it('hides verification and changes when they have no content', () => {
+    const sections = inspectorVisibleSections(session({ turnActive: true }));
+    expect(sections).not.toContain('verification');
+    expect(sections).not.toContain('changes');
+  });
+
+  it('shows verification only when checks exist — not a permanent tab', () => {
+    const sections = inspectorVisibleSections(
+      session({
+        lastTurn: { outcome: 'completed', detail: null, ms: 4000 },
+        verification: {
+          passed: true,
+          checks: [{ name: 'cargo test', status: 'passed', evidence: null }],
+        },
+      }),
+    );
+    expect(sections).toContain('verification');
+    expect(sections.filter((s) => s === 'verification')).toHaveLength(1);
   });
 });
