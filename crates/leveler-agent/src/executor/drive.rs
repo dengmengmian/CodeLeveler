@@ -29,8 +29,8 @@ use super::dispatch::{
 };
 use super::host::AdmitError;
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor, ModelRequestRecord, StopReason,
-    TranscriptSink,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, ChildToolEvent, Executor,
+    ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
     collect_scoped_paths_from_call, counts_as_verification_evidence, extract_command,
@@ -1684,6 +1684,24 @@ impl Executor {
                         arguments: compact_json(&call.arguments),
                         parallel: false,
                     });
+                    // A child's tool calls are recorded on the barrier queue
+                    // and flushed on the child's own task, while this branch
+                    // never reaches `admit`. Announcing the claim on the SAME
+                    // queue is what orders the grant ahead of the write it
+                    // authorizes — presence alone is not enough, because the
+                    // audit that misread M7 reads the log in rowid order.
+                    // Announce-then-flush BEFORE touching the registry, for
+                    // the same reason `admit` does: a crash must never leave
+                    // ownership state that the log cannot explain.
+                    if let (Some(barrier), Some(agent_id)) = (&self.event_barrier, &self.agent_id) {
+                        barrier.record_child_tool_event(ChildToolEvent::Started {
+                            agent_id: agent_id.clone(),
+                            call_id: call.id.as_str().to_string(),
+                            name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+                            arguments: compact_json(&call.arguments),
+                        });
+                        barrier.flush().await?;
+                    }
                     let paths: Vec<String> = call
                         .arguments
                         .get("paths")
@@ -1744,6 +1762,20 @@ impl Executor {
                         is_error,
                         preview: preview(&content),
                     });
+                    // The decision itself, durable before the model can act on
+                    // it. The registry has already changed, so a flush failure
+                    // here aborts the run rather than continuing with owned
+                    // paths that no durable record accounts for.
+                    if let (Some(barrier), Some(agent_id)) = (&self.event_barrier, &self.agent_id) {
+                        barrier.record_child_tool_event(ChildToolEvent::Finished {
+                            agent_id: agent_id.clone(),
+                            call_id: call.id.as_str().to_string(),
+                            name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+                            is_error,
+                            preview: preview(&content),
+                        });
+                        barrier.flush().await?;
+                    }
                     // Durable ownership provenance: a child's tool events
                     // reach the parent as TRANSIENT activity, so without this
                     // an offline audit cannot tell an authorized write from a
@@ -1979,46 +2011,6 @@ impl Executor {
                         policy_blocked_calls_this_round += 1;
                         results[index] = Some(deny_call(observer, call, msg));
                         continue;
-                    }
-                }
-
-                // TEMPORARY FORENSIC PROBE (M7): capture the authority state
-                // immediately before the direct-write decision. Structured
-                // facts only — no reasoning content. Removed once the M7
-                // contradiction is explained.
-                if self.registry.mutates_files(&call.name) {
-                    let owned = self
-                        .agent_id
-                        .as_ref()
-                        .map(|id| self.ownership.owned_by(id))
-                        .unwrap_or_default();
-                    tracing::warn!(
-                        target: "leveler::authority_probe",
-                        depth = self.depth,
-                        agent_id = ?self.agent_id,
-                        agent_role = ?self.agent_role,
-                        tool = %call.name,
-                        call_id = %call.id.as_str(),
-                        static_write_allowlist = ?self.write_allowlist,
-                        ownership_owned = ?owned,
-                        effective = ?self.effective_write_allowlist(),
-                        registry_ptr = %format!("{:p}", Arc::as_ptr(&self.ownership)),
-                        targets = ?crate::authorization::mutation_targets(&call),
-                        "direct-write authority probe"
-                    );
-                    if std::env::var_os("LEVELER_AUTHORITY_PROBE").is_some() {
-                        eprintln!(
-                            "AUTHORITY_PROBE depth={} agent_id={:?} role={:?} tool={} static={:?} owned={:?} effective={:?} registry={:p} targets={:?}",
-                            self.depth,
-                            self.agent_id,
-                            self.agent_role,
-                            call.name,
-                            self.write_allowlist,
-                            owned,
-                            self.effective_write_allowlist(),
-                            Arc::as_ptr(&self.ownership),
-                            crate::authorization::mutation_targets(&call),
-                        );
                     }
                 }
 

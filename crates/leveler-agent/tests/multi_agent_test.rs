@@ -2577,6 +2577,85 @@ mod child_side_effects_are_recoverable {
             "the child's call was recorded but never flushed before dispatch: {order:?}"
         );
     }
+
+    /// The M7 audit is ordered by rowid, so PRESENCE of the grant is not
+    /// enough — it must be durable BEFORE the write it authorizes. A child's
+    /// tool calls flush immediately on its own task, while a grant emitted
+    /// only as `DelegationStage` waits for the parent to drain the activity
+    /// channel at a round boundary. Two durability paths with no ordering
+    /// between them means an offline reader can still see an authorized write
+    /// land ahead of its authorization and call it a bypass — which is the
+    /// entire failure this provenance work exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_durable_before_the_write_it_authorizes() {
+        let dir = tmp("lbo-grant-order", 91);
+        std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+
+        let barrier = Arc::new(RecordingBarrier::default());
+        let runtime = Arc::new(RoutedRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": format!("{CHILD_MARKER}: change old to new")}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "claim_write_scope",
+                        serde_json::json!({"paths": ["b.txt"]}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_with(
+                    vec![patch_call("w1", "b.txt", "old", "new")],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child done"),
+            ],
+            CHILD_MARKER,
+            Duration::from_millis(10),
+        ));
+
+        let workspace = Workspace::new(&dir).unwrap();
+        Executor::new(
+            runtime,
+            Arc::new(default_registry()),
+            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_event_barrier(barrier.clone())
+        .run(
+            "update b",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let events = barrier.events.lock().unwrap().clone();
+        let position = |wanted: &str| {
+            events
+                .iter()
+                .position(|e| matches!(e, ChildToolEvent::Started { name, .. } if name == wanted))
+        };
+        let claim = position("claim_write_scope").unwrap_or_else(|| {
+            panic!("the grant never reached the durable queue the child's writes use: {events:#?}")
+        });
+        let write = position("apply_patch").expect("the child's write must be recorded");
+        assert!(
+            claim < write,
+            "the write was durable before its grant — an offline audit ordered by \
+             rowid still reads this as a pre-claim bypass: claim@{claim} write@{write}"
+        );
+    }
 }
 
 // ── Gate 5 / N1: a child's terminal result must be legible to the parent ────

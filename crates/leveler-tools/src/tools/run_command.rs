@@ -516,8 +516,11 @@ pub(crate) async fn execute_program(
     Ok(out)
 }
 
-/// Empty claimed scope: refuse BEFORE spawn. Native read tools remain; this
-/// command family is WorkspaceWrite and git cannot audit empty-dir removals.
+/// Empty claimed scope: refuse a BACKGROUND command before spawn. Only the
+/// detached path — it outlives the round, so a scope claimed later cannot bound
+/// it, and git cannot audit empty-dir removals after the fact. Foreground
+/// commands are NOT refused: they run under a read-only workspace
+/// (`read_only_workspace`), so exploration still works before a claim.
 fn refuse_zero_write_authority(context: &ToolContext) -> Option<ToolOutput> {
     context.policy.has_zero_write_authority().then(|| {
         ToolOutput::error(
