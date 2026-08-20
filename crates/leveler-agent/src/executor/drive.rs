@@ -1986,6 +1986,16 @@ impl Executor {
                 // claim_write_scope grant as well as a legacy Worker's
                 // pre-claim — an edit there would race the child this agent
                 // delegated to; integration waits for the settlement notice.
+                //
+                // A writer at depth 0 checks and commits in ONE locked
+                // registry operation and holds the guard for the rest of the
+                // call. Asking `conflicts_for` here and taking the guard later
+                // left a window in which a background child — a separate task,
+                // genuinely parallel on the multi-thread runtime — claimed the
+                // same path: its claim saw an empty `parent_active` and was
+                // granted, and the later guard marked without re-checking, so
+                // both wrote one file.
+                let mut _mutation_guard = None;
                 if self.registry.mutates_files(&call.name) {
                     let owner_key = match (&self.agent_id, self.depth) {
                         (Some(id), _) => id.clone(),
@@ -1993,7 +2003,17 @@ impl Executor {
                         (None, depth) => format!("child-depth-{depth}"),
                     };
                     let targets = crate::authorization::mutation_targets(&call);
-                    let hits = self.ownership.conflicts_for(&targets, &owner_key);
+                    let hits = if self.depth == 0 {
+                        match self.ownership.try_mutation_guard(&owner_key, &targets) {
+                            Ok(guard) => {
+                                _mutation_guard = Some(guard);
+                                Vec::new()
+                            }
+                            Err(conflicts) => conflicts,
+                        }
+                    } else {
+                        self.ownership.conflicts_for(&targets, &owner_key)
+                    };
                     if !hits.is_empty() {
                         let inside: Vec<String> = hits.iter().map(|c| c.path.clone()).collect();
                         let mut owners: Vec<String> =
@@ -2065,13 +2085,10 @@ impl Executor {
                 // above) decides deferral to the batch — every other admitted
                 // call runs here, in order.
                 // §19: while the parent executes a mutation, an overlapping
-                // child claim is denied retryably (guard dropped after the
-                // call resolves).
-                let _parent_mut_guard =
-                    (self.depth == 0 && self.registry.mutates_files(&call.name)).then(|| {
-                        self.ownership
-                            .parent_mutation_guard(crate::authorization::mutation_targets(&call))
-                    });
+                // child claim is denied retryably. The guard was acquired
+                // atomically with the ownership check above and lives until
+                // this call resolves — taking it here instead would reopen the
+                // window it exists to close.
                 let (
                     content,
                     is_error,

@@ -246,6 +246,17 @@ impl OwnershipRegistry {
     /// CLOSED: it conflicts with every live claim rather than escaping one.
     pub fn conflicts_for(&self, targets: &[String], exclude_owner: &str) -> Vec<ClaimConflict> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::conflicts_locked(&state, targets, exclude_owner, self.case_insensitive)
+    }
+
+    /// The conflict scan itself, so the check and the parent's mutation guard
+    /// can share one lock acquisition (see [`Self::try_mutation_guard`]).
+    fn conflicts_locked(
+        state: &RegistryState,
+        targets: &[String],
+        exclude_owner: &str,
+        case_insensitive: bool,
+    ) -> Vec<ClaimConflict> {
         let mut out = Vec::new();
         for raw in targets {
             let t = normalize(raw);
@@ -254,7 +265,7 @@ impl OwnershipRegistry {
                 if owner == exclude_owner {
                     continue;
                 }
-                if unresolvable || owned.iter().any(|o| covers(o, &t, self.case_insensitive)) {
+                if unresolvable || owned.iter().any(|o| covers(o, &t, case_insensitive)) {
                     let label = state
                         .labels
                         .get(owner)
@@ -270,18 +281,41 @@ impl OwnershipRegistry {
         out
     }
 
-    /// Mark paths as under active parent mutation for the duration of the
-    /// returned guard (claim requests overlapping them are denied retryably).
-    pub fn parent_mutation_guard(&self, paths: Vec<String>) -> ParentMutationGuard<'_> {
-        let normalized: Vec<String> = paths.iter().map(|p| normalize(p)).collect();
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.parent_active.extend(normalized.iter().cloned());
+    /// Check ownership and commit to mutating in ONE locked operation, for a
+    /// non-child writer (`owner_key` "parent" at depth 0).
+    ///
+    /// Doing this as two calls — ask `conflicts_for`, then take the guard —
+    /// leaves a window in which a background child, running on another worker
+    /// thread, claims the same path: its claim sees an empty `parent_active`
+    /// and is granted, the guard marks without re-checking, and both writers
+    /// proceed into one file. Concurrency here is real parallelism, not a
+    /// yield point, so "there is no await between the two calls" does not
+    /// close it. Callers must not re-implement the two-step form.
+    pub fn try_mutation_guard(
+        &self,
+        owner_key: &str,
+        targets: &[String],
+    ) -> Result<ParentMutationGuard<'_>, Vec<ClaimConflict>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let conflicts = Self::conflicts_locked(&state, targets, owner_key, self.case_insensitive);
+        if !conflicts.is_empty() {
+            return Err(conflicts);
         }
-        ParentMutationGuard {
+        let normalized: Vec<String> = targets.iter().map(|p| normalize(p)).collect();
+        state.parent_active.extend(normalized.iter().cloned());
+        drop(state);
+        Ok(ParentMutationGuard {
             registry: self,
             paths: normalized,
-        }
+        })
+    }
+}
+
+impl std::fmt::Debug for ParentMutationGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParentMutationGuard")
+            .field("paths", &self.paths)
+            .finish()
     }
 }
 
@@ -429,7 +463,9 @@ mod tests {
     fn an_active_parent_mutation_denies_the_claim_retryably() {
         let reg = OwnershipRegistry::new(true);
         {
-            let _guard = reg.parent_mutation_guard(v(&["src/main.rs"]));
+            let _guard = reg
+                .try_mutation_guard("parent", &v(&["src/main.rs"]))
+                .unwrap();
             let err = reg.try_claim("a", &v(&["src/main.rs"])).unwrap_err();
             assert!(matches!(err, ClaimRejection::Conflicts(_)));
         }
@@ -532,5 +568,59 @@ mod tests {
                 .is_empty(),
             "the parent fence must also see the case-variant as owned"
         );
+    }
+
+    /// The race the parent fence had: "is it free?" and "I am mutating it"
+    /// were two locked operations, and a background child runs on another
+    /// worker thread, so the gap between them is real parallel time rather
+    /// than a yield point. A claim landing in that gap was granted (it saw an
+    /// empty `parent_active`) and the parent then took its guard without
+    /// re-checking, so both wrote the same file.
+    ///
+    /// Deterministic by construction: the interleaving is performed in the
+    /// exact order the drive loop performs it, so this proves the API
+    /// contract rather than hoping a stress loop hits the window.
+    #[test]
+    fn a_claim_landing_after_the_parent_check_still_blocks_the_parent() {
+        let reg = OwnershipRegistry::new(true);
+        reg.register_owner("child-1", "Euclid (child-1)");
+        let targets = v(&["src/main.rs"]);
+
+        // Parent admission, step 1: nobody owns it yet.
+        assert!(reg.conflicts_for(&targets, "parent").is_empty());
+
+        // The window: a background child claims the same path.
+        reg.try_claim("child-1", &targets).unwrap();
+
+        // Parent admission, step 2. Committing to the mutation must re-check
+        // under the same lock, or the parent writes a child-owned file.
+        let denied = reg
+            .try_mutation_guard("parent", &targets)
+            .expect_err("the parent must not acquire a mutation guard on a claimed path");
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].owner, "Euclid (child-1)");
+    }
+
+    /// The guard must still be acquirable — and still block overlapping
+    /// claims — when the path really is free, or the fix would deadlock all
+    /// parent writes.
+    #[test]
+    fn an_uncontended_parent_mutation_still_takes_the_guard_and_fences_claims() {
+        let reg = OwnershipRegistry::new(true);
+        let targets = v(&["src/main.rs"]);
+        {
+            let _guard = reg
+                .try_mutation_guard("parent", &targets)
+                .expect("an unowned path must be guardable");
+            assert!(
+                matches!(
+                    reg.try_claim("child-1", &targets),
+                    Err(ClaimRejection::Conflicts(_))
+                ),
+                "a claim overlapping an in-flight parent mutation is denied retryably"
+            );
+        }
+        // Guard dropped with the call: the path is claimable again.
+        assert!(reg.try_claim("child-1", &targets).is_ok());
     }
 }
