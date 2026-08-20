@@ -79,9 +79,10 @@ struct RegistryState {
 
 /// Shared, workspace-wide write-ownership truth. One instance per top-level
 /// execution, `Arc`-shared into every child.
-#[derive(Default)]
 pub struct OwnershipRegistry {
     state: Mutex<RegistryState>,
+    /// The workspace volume's real case semantics, fixed at construction.
+    case_insensitive: bool,
 }
 
 /// `./`-stripped, trailing-slash-stripped form used for all containment math
@@ -94,15 +95,52 @@ fn normalize(path: &str) -> String {
         .to_string()
 }
 
-fn covers(owner: &str, target: &str) -> bool {
+/// Containment key. Ownership is exclusivity over a FILE, not over a spelling:
+/// on a volume that folds case, `src/Parser.rs` and `src/parser.rs` are the
+/// same bytes, so treating them as distinct hands two children "exclusive"
+/// ownership of one file and every fence downstream passes both writes.
+///
+/// The answer comes from the workspace's ACTUAL volume
+/// (`Workspace::path_case_insensitive`), never from the platform: macOS
+/// supports case-sensitive volumes and a Linux root can sit on a
+/// case-insensitive mount, so a `cfg!` guess is wrong on real configurations
+/// in both directions.
+fn fold(path: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
+fn covers(owner: &str, target: &str, case_insensitive: bool) -> bool {
+    let (owner, target) = (
+        fold(owner, case_insensitive),
+        fold(target, case_insensitive),
+    );
     owner == target
         || target.starts_with(&format!("{owner}/"))
         || owner.starts_with(&format!("{target}/"))
 }
 
+/// Conservative default: fold case. A derived `Default` would answer "this
+/// volume is case-sensitive", which is the direction that GRANTS two owners the
+/// same file — never let that be the fallback.
+impl Default for OwnershipRegistry {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
 impl OwnershipRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    /// For a workspace whose volume folds case (`Foo.rs` == `foo.rs`). Callers
+    /// pass `Workspace::path_case_insensitive()`; `true` is the conservative
+    /// answer when the volume cannot be probed.
+    pub fn new(case_insensitive: bool) -> Self {
+        Self {
+            state: Mutex::new(RegistryState::default()),
+            case_insensitive,
+        }
     }
 
     /// Record a display label for an owner (used in denial messages).
@@ -139,7 +177,11 @@ impl OwnershipRegistry {
         let already: Vec<String> = state.claims.get(owner_id).cloned().unwrap_or_default();
         let new_paths: Vec<String> = requested
             .into_iter()
-            .filter(|p| !already.iter().any(|own| covers(own, p)))
+            .filter(|p| {
+                !already
+                    .iter()
+                    .any(|own| covers(own, p, self.case_insensitive))
+            })
             .collect();
         if new_paths.is_empty() {
             // Everything requested is already owned — idempotent success.
@@ -151,7 +193,7 @@ impl OwnershipRegistry {
                 if other == owner_id {
                     continue;
                 }
-                if owned.iter().any(|o| covers(o, p)) {
+                if owned.iter().any(|o| covers(o, p, self.case_insensitive)) {
                     let owner = state
                         .labels
                         .get(other)
@@ -163,7 +205,11 @@ impl OwnershipRegistry {
                     });
                 }
             }
-            if state.parent_active.iter().any(|a| covers(a, p)) {
+            if state
+                .parent_active
+                .iter()
+                .any(|a| covers(a, p, self.case_insensitive))
+            {
                 conflicts.push(ClaimConflict {
                     path: p.clone(),
                     owner: "parent (mutation in flight — retry shortly)".to_string(),
@@ -208,7 +254,7 @@ impl OwnershipRegistry {
                 if owner == exclude_owner {
                     continue;
                 }
-                if unresolvable || owned.iter().any(|o| covers(o, &t)) {
+                if unresolvable || owned.iter().any(|o| covers(o, &t, self.case_insensitive)) {
                     let label = state
                         .labels
                         .get(owner)
@@ -270,7 +316,7 @@ mod tests {
 
     #[test]
     fn claim_is_atomic_all_or_nothing() {
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         reg.try_claim("a", &v(&["src/parser/"])).unwrap();
         // b requests two paths, one conflicting: NOTHING is acquired.
         let err = reg
@@ -285,7 +331,7 @@ mod tests {
 
     #[test]
     fn incremental_claim_keeps_prior_paths_and_evaluates_only_new_ones() {
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         reg.try_claim("a", &v(&["src/parser.rs", "tests/parser.rs"]))
             .unwrap();
         let owned = reg.try_claim("a", &v(&["src/types.rs"])).unwrap();
@@ -297,7 +343,7 @@ mod tests {
 
     #[test]
     fn root_and_unsafe_boundaries_are_hard_denied() {
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         for bad in ["", ".", "./", "/", "/etc/passwd", "../outside", "a/../../b"] {
             let err = reg.try_claim("a", &v(&[bad])).unwrap_err();
             assert!(
@@ -317,7 +363,7 @@ mod tests {
 
     #[test]
     fn overlap_is_denied_by_containment_in_both_directions() {
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         reg.register_owner("a", "Euclid (a)");
         reg.try_claim("a", &v(&["src/parser/"])).unwrap();
         // File inside owned dir.
@@ -335,7 +381,7 @@ mod tests {
 
     #[test]
     fn release_is_idempotent_and_frees_the_scope() {
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         reg.try_claim("a", &v(&["src/x.rs"])).unwrap();
         reg.release_all("a");
         reg.release_all("a");
@@ -348,7 +394,7 @@ mod tests {
         // The fence denies on a match, so `foo/../b.txt` or an absolute path
         // must not be provable-outside by string comparison (regression of
         // the old fence's fail-open hole, carried over with the rewrite).
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         reg.register_owner("child-1", "Euclid (child-1)");
         reg.try_claim("child-1", &v(&["src/owned.rs"])).unwrap();
         for sneaky in ["foo/../b.txt", "/etc/passwd", "../escape.rs"] {
@@ -367,7 +413,7 @@ mod tests {
 
     #[test]
     fn parent_fence_reports_conflicts_for_owned_targets() {
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         reg.register_owner("child-1", "Newton (child-1)");
         reg.try_claim("child-1", &v(&["src/output/"])).unwrap();
         let hits = reg.conflicts_for(&v(&["src/output/json.rs"]), "parent");
@@ -381,7 +427,7 @@ mod tests {
 
     #[test]
     fn an_active_parent_mutation_denies_the_claim_retryably() {
-        let reg = OwnershipRegistry::new();
+        let reg = OwnershipRegistry::new(true);
         {
             let _guard = reg.parent_mutation_guard(v(&["src/main.rs"]));
             let err = reg.try_claim("a", &v(&["src/main.rs"])).unwrap_err();
@@ -389,5 +435,102 @@ mod tests {
         }
         // Guard dropped: claim now succeeds.
         assert!(reg.try_claim("a", &v(&["src/main.rs"])).is_ok());
+    }
+
+    // ── CI1-CI5: exclusivity follows the FILE, not the spelling ──────────
+    //
+    // The semantics come from the workspace volume, so both directions are
+    // asserted against an explicitly-constructed registry rather than against
+    // whatever filesystem the test host happens to run on.
+
+    /// CI1: an identical spelling conflicts on either volume.
+    #[test]
+    fn an_identical_path_conflicts_under_both_case_semantics() {
+        for case_insensitive in [true, false] {
+            let reg = OwnershipRegistry::new(case_insensitive);
+            reg.try_claim("a", &v(&["src/parser.rs"])).unwrap();
+            assert!(
+                matches!(
+                    reg.try_claim("b", &v(&["src/parser.rs"])),
+                    Err(ClaimRejection::Conflicts(_))
+                ),
+                "case_insensitive={case_insensitive}"
+            );
+        }
+    }
+
+    /// CI3: on a case-sensitive volume the two spellings are genuinely two
+    /// files, so denying the second claim is a false denial that costs real
+    /// work. This is the half a platform-hardcoded fold gets wrong — a
+    /// case-sensitive volume on macOS is a supported configuration.
+    #[test]
+    fn a_case_alias_is_a_distinct_file_on_a_case_sensitive_volume() {
+        let reg = OwnershipRegistry::new(false);
+        reg.try_claim("a", &v(&["src/Parser.rs"])).unwrap();
+        // a's scope must not reach the other file — checked before anyone
+        // else claims it, so the query answers about a's scope alone.
+        assert!(
+            reg.conflicts_for(&v(&["src/parser.rs"]), "parent")
+                .is_empty(),
+            "a's scope must not fence a genuinely different file"
+        );
+        let owned = reg
+            .try_claim("b", &v(&["src/parser.rs"]))
+            .expect("distinct physical files must both be claimable");
+        assert_eq!(owned, v(&["src/parser.rs"]));
+    }
+
+    /// CI4: subtree coverage uses the same identity, so a case-aliased
+    /// DIRECTORY claim cannot slip a child under someone else's tree.
+    #[test]
+    fn subtree_coverage_uses_the_same_path_identity() {
+        let folding = OwnershipRegistry::new(true);
+        folding.try_claim("a", &v(&["src/Output/"])).unwrap();
+        assert!(matches!(
+            folding.try_claim("b", &v(&["src/output/json.rs"])),
+            Err(ClaimRejection::Conflicts(_))
+        ));
+        let sensitive = OwnershipRegistry::new(false);
+        sensitive.try_claim("a", &v(&["src/Output/"])).unwrap();
+        assert!(
+            sensitive
+                .try_claim("b", &v(&["src/output/json.rs"]))
+                .is_ok()
+        );
+    }
+
+    /// CI5: folding must not soften the boundary checks — they run before any
+    /// containment math and reject under either semantics.
+    #[test]
+    fn case_folding_never_permits_escape_or_root_claims() {
+        for case_insensitive in [true, false] {
+            let reg = OwnershipRegistry::new(case_insensitive);
+            for bad in ["..", "../Secret", "/etc/Passwd", ".", "./", ""] {
+                assert!(
+                    reg.try_claim("a", &v(&[bad])).is_err(),
+                    "{bad:?} was claimable with case_insensitive={case_insensitive}"
+                );
+            }
+        }
+    }
+
+    /// CI2: on a case-folding volume `src/Parser.rs` and `src/parser.rs` are
+    /// the same bytes on disk, so granting both hands two children "exclusive"
+    /// ownership of one file and every downstream fence — the parent guard
+    /// included — waves both writes through.
+    #[test]
+    fn a_case_variant_spelling_cannot_claim_an_already_owned_file() {
+        let reg = OwnershipRegistry::new(true);
+        reg.register_owner("a", "Euclid (a)");
+        reg.try_claim("a", &v(&["src/Parser.rs"])).unwrap();
+        let err = reg
+            .try_claim("b", &v(&["src/parser.rs"]))
+            .expect_err("a case-variant of an owned path must not be granted too");
+        assert!(matches!(err, ClaimRejection::Conflicts(_)), "{err:?}");
+        assert!(
+            !reg.conflicts_for(&v(&["src/parser.rs"]), "parent")
+                .is_empty(),
+            "the parent fence must also see the case-variant as owned"
+        );
     }
 }

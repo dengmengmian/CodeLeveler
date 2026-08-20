@@ -963,6 +963,11 @@ impl Executor {
         model: ModelRef,
         max_rounds: u32,
     ) -> Self {
+        // Ownership exclusivity must follow the workspace volume's real path
+        // identity, not a platform guess: a case-folding volume makes
+        // `src/Parser.rs` and `src/parser.rs` one file, and treating them as
+        // two hands both children "exclusive" ownership of the same bytes.
+        let case_insensitive = tool_context.execution.workspace.path_case_insensitive();
         Self {
             base_instructions: None,
             commit_co_author: true,
@@ -986,7 +991,7 @@ impl Executor {
             depth: 0,
             agent_role: AgentRole::Default,
             write_allowlist: None,
-            ownership: Arc::new(crate::ownership::OwnershipRegistry::new()),
+            ownership: Arc::new(crate::ownership::OwnershipRegistry::new(case_insensitive)),
             sub_agent_policies: None,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
