@@ -7216,7 +7216,7 @@ async fn a_run_that_only_observes_is_told_it_has_made_no_material_progress() {
     let advisory_seen = requests.iter().any(|r| {
         r.messages
             .iter()
-            .any(|m| m.text_content().contains("no file has been modified"))
+            .any(|m| m.text_content().contains("no edit has been applied"))
     });
     assert!(
         advisory_seen,
@@ -7283,10 +7283,87 @@ async fn a_run_that_edits_never_sees_the_engagement_advisory() {
     let advisory_seen = runtime.recorded_requests().iter().any(|r| {
         r.messages
             .iter()
-            .any(|m| m.text_content().contains("no file has been modified"))
+            .any(|m| m.text_content().contains("no edit has been applied"))
     });
     assert!(
         !advisory_seen,
         "a run that landed a real edit must never be told it made no progress"
+    );
+}
+
+/// Byproduct files must not silence the engagement advisory.
+///
+/// `CTL_LONG_B_ORCH_3` (same-day control, `ec39621a`) ran 139 tool calls across
+/// 99 rounds, registered no plan, applied no edit, and produced nothing — yet
+/// its ledger reports `cumulative_modified_files: 2`, both of them shell
+/// byproducts: `docs/src/reference-verbs.md.bak` and `.tmp`. Workspace diffing
+/// cannot tell an intended edit from a sed-in-place leftover.
+///
+/// The first version of this advisory latched material progress on that ledger
+/// count, so the very run that proves the spiral still exists would have been
+/// silenced by its own `.bak` file. The latch must key on a deliberate edit —
+/// a successful call to a tool the registry declares `mutates_files` — not on
+/// the workspace having changed. Filename heuristics are exactly what the
+/// original observe classifier got wrong, so none are used.
+#[tokio::test]
+async fn a_shell_byproduct_does_not_count_as_material_progress() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-engagement-byproduct-{}",
+        std::process::id() as u64 * 47 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..60 {
+        std::fs::write(
+            dir.join(format!("h{i}.rs")),
+            format!("pub fn h{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let workspace = Workspace::new(&dir).unwrap();
+    // FullAccess so the byproduct-producing command runs without an approval.
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+
+    // Round 1 leaves a .bak behind — exactly the CTL_LONG_B_ORCH_3 shape.
+    let mut script: Vec<ModelResponse> = vec![assistant_tool_call(
+        "bak",
+        "shell_command",
+        serde_json::json!({ "cmd": "cp h0.rs h0.rs.bak" }),
+    )];
+    script.extend((0..50).map(|i| {
+        assistant_tool_call(
+            &format!("r{i}"),
+            "read_file",
+            serde_json::json!({ "path": format!("h{i}.rs") }),
+        )
+    }));
+    script.push(assistant_text("done"));
+
+    let runtime = Arc::new(MockRuntime::new(script));
+    Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        60,
+    )
+    .run(
+        "add six new verbs to this tool",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let advisory_seen = runtime.recorded_requests().iter().any(|r| {
+        r.messages
+            .iter()
+            .any(|m| m.text_content().contains("no edit has been applied"))
+    });
+    assert!(
+        advisory_seen,
+        "a run whose only workspace change is a shell byproduct has produced \
+         nothing and must still be told so"
     );
 }

@@ -715,7 +715,7 @@ impl Executor {
                     Role::User,
                     format!(
                         "Progress check: {engagement_tool_rounds} rounds into this task, \
-                         no file has been modified and no plan is registered. Exploration \
+                         no edit has been applied and no plan is registered. Exploration \
                          remains available and nothing is being refused. If you already \
                          know enough to start, make the first concrete change now. If the \
                          task cannot be done in this repository, say so plainly and stop \
@@ -1148,6 +1148,10 @@ impl Executor {
             // Tools seen this round for pure-observe streak detection.
             let mut observe_only_tools_this_round = 0u32;
             let mut non_observe_success_this_round = 0u32;
+            // A tool the REGISTRY declares file-mutating succeeded this round.
+            // The engagement latch reads this rather than the workspace diff, so
+            // a shell byproduct (`.bak`, `.tmp`) is not mistaken for an edit.
+            let mut edit_applied_this_round = false;
             // Calls a guard refused before they ran (loop guard, plan gate,
             // budgets, allowlist, permission). A round consisting solely of
             // refusals is no progress — it must not reset the AC3 streak.
@@ -2358,6 +2362,9 @@ impl Executor {
                 }
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.
+                if !is_error && self.registry.mutates_files(&call.name) {
+                    edit_applied_this_round = true;
+                }
                 if !is_error && call_mutated {
                     delegation_decision.note_mutation();
                     if !newly_modified.is_empty() {
@@ -3261,22 +3268,26 @@ impl Executor {
                 plan_explore_rounds_used = plan_explore_rounds_used.saturating_add(1);
             }
 
-            // Engagement guard bookkeeping. Material progress is a LATCH read
-            // from durable facts — a registered plan, a modified file — never
-            // from a tool's name or its exit status. That is the distinction
-            // the original observe classifier got wrong.
+            // Engagement guard bookkeeping. Material progress is a LATCH over
+            // deliberate acts: a registered plan, or a successful call to a tool
+            // the REGISTRY declares file-mutating. Never a tool's name, never
+            // its exit status, and never the workspace merely having changed.
             //
-            // A passing verification is deliberately NOT a latch input: running
-            // the repository's existing test suite proves nothing about what
-            // THIS run produced, and accepting it would hand the model a
+            // Not the workspace diff: CTL_LONG_B_ORCH_3 ran 139 tool calls over
+            // 99 rounds, registered no plan, applied no edit, and produced
+            // nothing — yet its ledger reports cumulative_modified_files: 2,
+            // both shell byproducts (`reference-verbs.md.bak` and `.tmp`).
+            // Latching on that count would have silenced the advisory on the
+            // very run that proves the spiral. Filename heuristics are not the
+            // answer either — `mutates_files` is a product-declared property.
+            //
+            // Not a passing verification: running the repository's existing
+            // suite proves nothing about what THIS run produced, and would be a
             // one-command way to silence the advisory for the rest of the turn.
             if !call_snapshot.is_empty() {
                 engagement_tool_rounds = engagement_tool_rounds.saturating_add(1);
             }
-            if structured_plan_started
-                || !modified_files.is_empty()
-                || progress.cumulative_modified_files > 0
-            {
+            if structured_plan_started || edit_applied_this_round {
                 engagement_material_progress = true;
             }
 
