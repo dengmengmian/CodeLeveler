@@ -5726,7 +5726,12 @@ async fn an_unclaimed_child_cannot_create_new_files_either() {
         8,
     );
     executor
-        .run("scaffold", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .run(
+            "scaffold",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert!(

@@ -178,6 +178,9 @@ async fn execute_background(
     };
     // Allowlist-constrained workers need a recoverable snapshot to restore on
     // wait. Without git we cannot enforce the constraint.
+    if let Some(output) = refuse_zero_write_authority(&context) {
+        return Ok(output);
+    }
     if context.policy.command_write_allowlist.is_some()
         && mutation_baseline.is_none()
         && !context.policy.read_only
@@ -306,24 +309,8 @@ pub(crate) async fn execute_program(
             return Ok(output);
         }
     }
-    // Zero write authority = refuse BEFORE the process runs. The
-    // allowlist below is otherwise enforced by diffing a git snapshot after
-    // the fact, and that audit is blind to mutations git cannot see — an
-    // unclaimed child removed an empty directory with `rmdir` and the check
-    // found nothing to roll back (PB_B_ORCH_1). A holder of no scope has
-    // nothing to audit against, so the only correct answer is up front.
-    if context
-        .policy
-        .command_write_allowlist
-        .as_deref()
-        .is_some_and(|allow| allow.is_empty())
-        && !context.policy.read_only
-    {
-        return Ok(ToolOutput::error(
-            "Refused: no write scope is currently owned, so this command may not run \
-             (it could modify the workspace). Read the relevant code, then use \
-             claim_write_scope(paths) to take the bounded scope you need.\n",
-        ));
+    if let Some(output) = refuse_zero_write_authority(&context) {
+        return Ok(output);
     }
     let mut request = ProcessRequest::new(program.to_string(), args, cwd);
     let timeout = resolve_timeout(timeout_seconds);
@@ -506,6 +493,18 @@ pub(crate) async fn execute_program(
         }),
     };
     Ok(out)
+}
+
+/// Empty claimed scope: refuse BEFORE spawn. Native read tools remain; this
+/// command family is WorkspaceWrite and git cannot audit empty-dir removals.
+fn refuse_zero_write_authority(context: &ToolContext) -> Option<ToolOutput> {
+    context.policy.has_zero_write_authority().then(|| {
+        ToolOutput::error(
+            "Refused: no write scope is currently owned, so this command may not run \
+             (it could modify the workspace). Read the relevant code, then use \
+             claim_write_scope(paths) to take the bounded scope you need.\n",
+        )
+    })
 }
 
 fn path_allows(allowed: &str, modified: &str) -> bool {

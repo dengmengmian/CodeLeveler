@@ -254,6 +254,28 @@ impl Tool for ApplyPatchTool {
             Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
 
+        // Write-site ownership: the drive-loop fence is the first line, but
+        // PB_B_ORCH_1 showed a child apply_patch reaching this body with
+        // zero claims. Empty allowlist = no path is permitted.
+        for change in &changes {
+            let path = match change {
+                FileChange::Add { path, .. }
+                | FileChange::Delete { path }
+                | FileChange::Update { path, .. } => path.as_str(),
+            };
+            if let Some(denied) = context.policy.write_path_denied(path) {
+                return Ok(ToolOutput::error(denied));
+            }
+            if let FileChange::Update {
+                move_to: Some(dest),
+                ..
+            } = change
+                && let Some(denied) = context.policy.write_path_denied(dest)
+            {
+                return Ok(ToolOutput::error(denied));
+            }
+        }
+
         // Plan phase — resolve and compute all operations in memory.
         let mut ops = Vec::new();
         let mut summary = Vec::new();
@@ -503,6 +525,38 @@ mod tests {
     fn description_forbids_re_reading_the_file_to_verify_the_edit() {
         assert!(DESCRIPTION.contains("do NOT re-read the file"));
         assert!(DESCRIPTION.contains("fails the whole call"));
+    }
+
+    /// PB_B_ORCH_1: a child with zero claimed paths reached apply_patch and
+    /// created files. The tool itself must refuse, not only the drive loop.
+    #[tokio::test]
+    async fn empty_write_allowlist_refuses_the_patch_before_any_write() {
+        let (context, dir) = ctx();
+        let context = context.with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let patch = "*** Begin Patch\n*** Add File: src/new.rs\n+fn n() {}\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_error,
+            "zero-scope add must be refused: {}",
+            out.content
+        );
+        assert!(
+            !dir.join("src/new.rs").exists(),
+            "the file must not have been created"
+        );
+        assert!(
+            out.content.contains("no write scope") || out.content.contains("claim_write_scope"),
+            "refusal must name the claim protocol: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn ctx() -> (ToolContext, PathBuf) {

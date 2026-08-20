@@ -126,6 +126,43 @@ impl ToolPolicy {
     pub fn grant_unrestricted_fs(&mut self) {
         self.turn_unrestricted_fs = true;
     }
+
+    /// Whether `path` (workspace-relative) is outside the live write allowlist.
+    /// `None` allowlist = unrestricted. An empty allowlist is zero authority:
+    /// every path is denied (late-bound child before `claim_write_scope`).
+    pub fn write_path_denied(&self, path: &str) -> Option<String> {
+        let allow = self.command_write_allowlist.as_deref()?;
+        let path = path.trim().trim_start_matches("./").trim_end_matches('/');
+        if allow.iter().any(|a| {
+            let a = a.trim_end_matches('/');
+            !a.is_empty() && (path == a || path.starts_with(&format!("{a}/")))
+        }) {
+            return None;
+        }
+        Some(if allow.is_empty() {
+            format!(
+                "Edit rejected: no write scope is currently owned. Read the relevant \
+                 code, then use claim_write_scope(paths) before modifying files \
+                 (denied: {path})."
+            )
+        } else {
+            format!(
+                "Edit rejected: {path} is outside your claimed scope ({}). Claim it \
+                 with claim_write_scope first, or stay within your scope.",
+                allow.join(", ")
+            )
+        })
+    }
+
+    /// Zero claimed paths and not a structurally read-only overlay: a command
+    /// that can mutate the workspace must not run (git-after-the-fact cannot
+    /// see empty-directory removals).
+    pub fn has_zero_write_authority(&self) -> bool {
+        self.command_write_allowlist
+            .as_deref()
+            .is_some_and(|allow| allow.is_empty())
+            && !self.read_only
+    }
 }
 
 /// Optional long-lived capabilities specific tools use. A future

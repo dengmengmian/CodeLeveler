@@ -1122,19 +1122,23 @@ impl Executor {
     /// `files` arrive there as a pre-claim), which is EMPTY before its first
     /// grant — so every mutation is refused until it claims.
     pub(crate) fn effective_write_allowlist(&self) -> Option<Vec<String>> {
-        if self.depth == 0 {
-            return self.write_allowlist.clone();
-        }
         if crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only {
             // Structurally read-only: no write tools exist; an empty list is
             // a consistent answer for the command pipeline.
             return Some(Vec::new());
         }
-        let owner = match &self.agent_id {
-            Some(id) => id.clone(),
-            None => return self.write_allowlist.clone(),
-        };
-        Some(self.ownership.owned_by(&owner))
+        // Any executor stamped with a delegated identity is governed by the
+        // registry, even if depth were wrongly left at 0. The parent has no
+        // agent_id and stays unrestricted except for others' claims.
+        if let Some(id) = &self.agent_id {
+            return Some(self.ownership.owned_by(id));
+        }
+        if self.depth > 0 {
+            // Fail closed: a child factory that forgot `with_agent_id` must
+            // not become a full-workspace writer.
+            return Some(Vec::new());
+        }
+        self.write_allowlist.clone()
     }
 
     pub fn with_write_allowlist(mut self, paths: Option<Vec<String>>) -> Self {
@@ -1760,6 +1764,15 @@ mod ownership_authority_tests {
         let parent = executor();
         // Parent (depth 0): unrestricted unless a host pinned an allowlist.
         assert_eq!(parent.effective_write_allowlist(), None);
+
+        // Identity, not depth, is the authority gate: a delegated id at
+        // depth 0 (should not happen) still holds no write authority.
+        let mis_depth = executor().with_agent_id("orphan-depth0");
+        assert_eq!(
+            mis_depth.effective_write_allowlist(),
+            Some(Vec::new()),
+            "agent_id without a claim is never unrestricted"
+        );
 
         // A child WITH an id (the only shape the runtime builds) starts empty.
         let child = parent
