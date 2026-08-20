@@ -97,6 +97,65 @@ pub fn classify(input: &RoundInput) -> RoundVerdict {
     }
 }
 
+/// Tool-using rounds with no material progress before the engagement advisory
+/// is due.
+///
+/// Calibrated on 28 recorded long-task runs. The eight never-engaged ones ran to
+/// the turn ceiling (75-101 rounds) without ever registering a plan or modifying
+/// a file; all twenty healthy/KEEP runs reached their first material progress by
+/// round 74, median 28. 45 therefore reaches every spiral with most of the
+/// budget still unspent, and the four healthy runs it also reaches pay one
+/// factual sentence. The threshold is corpus-calibrated, not derived — it is
+/// deliberately advisory-only so a false positive costs a message, never a run.
+pub const ENGAGEMENT_ADVISORY_AFTER_ROUNDS: u32 = 45;
+
+/// At most this many advisories per drive; the second lands at twice the
+/// threshold, mirroring the policy-blocked track's escalate-then-stop shape.
+pub const ENGAGEMENT_ADVISORY_MAX: u32 = 2;
+
+/// Everything [`engagement_advisory_due`] needs. Pure data.
+#[derive(Debug, Clone, Copy)]
+pub struct EngagementInput {
+    /// Rounds so far in which at least one tool ran.
+    pub tool_rounds: u32,
+    /// The run has registered a plan or modified a file at any point. Material
+    /// progress is a latch, not a per-round fact: a run that has ever engaged is
+    /// never told it has not. A passing verification is deliberately excluded —
+    /// running the repository's existing suite says nothing about what this run
+    /// produced, and would be a one-command way to silence the advisory.
+    pub any_material_progress: bool,
+    /// Advisories already injected this drive.
+    pub advisories_sent: u32,
+    /// Background children are still running. An orchestrating parent
+    /// legitimately lands no edits of its own while they work, so the advisory
+    /// is suspended rather than firing on successful delegation.
+    pub children_outstanding: bool,
+}
+
+/// Should the engagement advisory be injected at this round boundary?
+///
+/// NEVER_ENGAGED_EXPLORATION_SPIRAL: eight recorded qualified runs spent the
+/// whole turn budget on successful, novel observation and produced zero
+/// material progress. Neither streak above can see that. [`classify`] grades a
+/// round containing any successful non-observe call as `Progress`, and
+/// [`made_progress`] accepts a command that merely exited 0 — both correct for
+/// what they measure, and both load-bearing (dropping the command term
+/// force-stops healthy runs around round 5). What was missing is upstream of
+/// both: across 100 rounds nothing ever told the model it had written nothing.
+///
+/// This is an advisory gate, NOT a kill switch. It removes no tool, forces no
+/// `ToolChoice`, refuses no call, and never terminates a turn.
+pub fn engagement_advisory_due(input: &EngagementInput) -> bool {
+    if input.any_material_progress
+        || input.children_outstanding
+        || input.advisories_sent >= ENGAGEMENT_ADVISORY_MAX
+    {
+        return false;
+    }
+    input.tool_rounds
+        >= ENGAGEMENT_ADVISORY_AFTER_ROUNDS.saturating_mul(input.advisories_sent.saturating_add(1))
+}
+
 /// Whether a round where commands ran counts as forward motion for the
 /// stagnation streak. Any one real signal clears it; a round with no command at
 /// all is neutral and never reaches this (goal/plan/edit work is not penalized).
@@ -228,6 +287,107 @@ mod tests {
     #[test]
     fn a_round_with_no_calls_at_all_is_progress() {
         assert_eq!(classify(&input()), RoundVerdict::Progress);
+    }
+
+    fn engagement(tool_rounds: u32) -> EngagementInput {
+        EngagementInput {
+            tool_rounds,
+            any_material_progress: false,
+            advisories_sent: 0,
+            children_outstanding: false,
+        }
+    }
+
+    /// E1/E2/E3: rounds of observation — reads, greps, `cat`/`ls`/`sed`
+    /// pipelines, whatever the spelling — never amount to material progress, so
+    /// the advisory eventually comes due. The predicate deliberately does not
+    /// look at command names at all: that is what made the original classifier
+    /// miss every non-`git` observation.
+    #[test]
+    fn observation_alone_eventually_makes_the_advisory_due() {
+        assert!(!engagement_advisory_due(&engagement(
+            ENGAGEMENT_ADVISORY_AFTER_ROUNDS - 1
+        )));
+        assert!(engagement_advisory_due(&engagement(
+            ENGAGEMENT_ADVISORY_AFTER_ROUNDS
+        )));
+    }
+
+    /// E4/E5: any material progress — a landed mutation, a registered plan, a
+    /// passing verification — silences the advisory permanently. A run that is
+    /// working is never told it is not.
+    #[test]
+    fn material_progress_silences_the_advisory_for_good() {
+        let working = EngagementInput {
+            any_material_progress: true,
+            ..engagement(ENGAGEMENT_ADVISORY_AFTER_ROUNDS * 10)
+        };
+        assert!(!engagement_advisory_due(&working));
+    }
+
+    /// E6: exploration that is still on its way to a mutation must not be cut
+    /// short. Below the threshold nothing happens, and even at the threshold the
+    /// only consequence is a message — no tool is removed and no turn ends.
+    #[test]
+    fn exploration_below_the_threshold_is_untouched() {
+        for round in 0..ENGAGEMENT_ADVISORY_AFTER_ROUNDS {
+            assert!(
+                !engagement_advisory_due(&engagement(round)),
+                "round {round} must be left alone"
+            );
+        }
+    }
+
+    /// A parent whose background children are working has legitimately landed
+    /// nothing itself. Firing here would penalize exactly the delegation the
+    /// product is trying to make dependable.
+    #[test]
+    fn an_orchestrating_parent_is_not_advised_while_children_run() {
+        let orchestrating = EngagementInput {
+            children_outstanding: true,
+            ..engagement(ENGAGEMENT_ADVISORY_AFTER_ROUNDS * 3)
+        };
+        assert!(!engagement_advisory_due(&orchestrating));
+    }
+
+    /// Bounded escalation, never a nag: the second advisory waits for twice the
+    /// threshold and there is no third.
+    #[test]
+    fn the_advisory_is_bounded_and_escalates_once() {
+        let after_first = EngagementInput {
+            advisories_sent: 1,
+            ..engagement(ENGAGEMENT_ADVISORY_AFTER_ROUNDS)
+        };
+        assert!(
+            !engagement_advisory_due(&after_first),
+            "the second must wait for twice the threshold, not repeat immediately"
+        );
+        let due_again = EngagementInput {
+            advisories_sent: 1,
+            ..engagement(ENGAGEMENT_ADVISORY_AFTER_ROUNDS * 2)
+        };
+        assert!(engagement_advisory_due(&due_again));
+        let exhausted = EngagementInput {
+            advisories_sent: ENGAGEMENT_ADVISORY_MAX,
+            ..engagement(ENGAGEMENT_ADVISORY_AFTER_ROUNDS * 100)
+        };
+        assert!(
+            !engagement_advisory_due(&exhausted),
+            "there is no third advisory however long the run goes"
+        );
+    }
+
+    /// E7: an unknown, successful, non-mutating tool (a custom shell wrapper, an
+    /// MCP tool) must not read as material progress. The predicate takes the
+    /// progress FACT, so a future tool cannot buy progress by exiting 0 — the
+    /// exact way the original classifier was fooled.
+    #[test]
+    fn an_unclassified_successful_tool_does_not_count_as_progress() {
+        // The caller passes `any_material_progress` from durable facts (plan
+        // registered / file modified / verification passed). Nothing about the
+        // tool's name or exit status can set it, so 200 successful rounds of an
+        // unknown tool still come due.
+        assert!(engagement_advisory_due(&engagement(200)));
     }
 
     #[test]

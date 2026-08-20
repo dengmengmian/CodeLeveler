@@ -167,6 +167,12 @@ impl Executor {
         const PLAN_SOFT_NUDGE_AFTER_ROUNDS: u32 = 2;
         let mut plan_explore_rounds_used = 0u32;
         let mut plan_soft_nudge_sent = false;
+        // Engagement guard (NEVER_ENGAGED_EXPLORATION_SPIRAL). Drive-local like
+        // the plan nudge above: these are advisory counters, not durable
+        // lifecycle facts, so they stay out of the ProgressLedger schema.
+        let mut engagement_tool_rounds = 0u32;
+        let mut engagement_advisories_sent = 0u32;
+        let mut engagement_material_progress = false;
         let mut plan_state = self.seeded_plan.clone();
         let mut structured_plan_started = !plan_state.is_empty();
         // Short tasks: no host-seeded one-step plan shell. Plan UI appears only when
@@ -683,6 +689,42 @@ impl Executor {
                 sink.append(std::slice::from_ref(&nudge)).await?;
                 messages.push(nudge);
                 plan_soft_nudge_sent = true;
+            }
+
+            // Engagement guard: a top-level run that has registered no plan and
+            // modified no file after this many tool-using rounds is told that
+            // fact. Eight recorded qualified runs spent a whole 100-round budget
+            // on successful, novel observation with cumulative_modified_files: 0
+            // and were never informed — neither progress streak can see it,
+            // because a successful non-observe call reads as Progress and a
+            // command that exits 0 clears the stagnation streak.
+            //
+            // Advisory ONLY: no tool is removed, no ToolChoice is forced, no
+            // call is refused, no turn is terminated, and delegation is not
+            // steered. Exploration stays legal at any round (R007 F1).
+            if self.depth == 0
+                && self.policy.progress_guards
+                && round_verdict::engagement_advisory_due(&round_verdict::EngagementInput {
+                    tool_rounds: engagement_tool_rounds,
+                    any_material_progress: engagement_material_progress,
+                    advisories_sent: engagement_advisories_sent,
+                    children_outstanding: !progress.outstanding_children.is_empty(),
+                })
+            {
+                let note = Message::text(
+                    Role::User,
+                    format!(
+                        "Progress check: {engagement_tool_rounds} rounds into this task, \
+                         no file has been modified and no plan is registered. Exploration \
+                         remains available and nothing is being refused. If you already \
+                         know enough to start, make the first concrete change now. If the \
+                         task cannot be done in this repository, say so plainly and stop \
+                         instead of continuing to look."
+                    ),
+                );
+                sink.append(std::slice::from_ref(&note)).await?;
+                messages.push(note);
+                engagement_advisories_sent = engagement_advisories_sent.saturating_add(1);
             }
 
             let mut request = ModelRequest::new(self.model.clone(), messages.clone());
@@ -3217,6 +3259,25 @@ impl Executor {
             // fire later. Never caps navigation; not a hard budget.
             if structured_plan_required && !structured_plan_started {
                 plan_explore_rounds_used = plan_explore_rounds_used.saturating_add(1);
+            }
+
+            // Engagement guard bookkeeping. Material progress is a LATCH read
+            // from durable facts — a registered plan, a modified file — never
+            // from a tool's name or its exit status. That is the distinction
+            // the original observe classifier got wrong.
+            //
+            // A passing verification is deliberately NOT a latch input: running
+            // the repository's existing test suite proves nothing about what
+            // THIS run produced, and accepting it would hand the model a
+            // one-command way to silence the advisory for the rest of the turn.
+            if !call_snapshot.is_empty() {
+                engagement_tool_rounds = engagement_tool_rounds.saturating_add(1);
+            }
+            if structured_plan_started
+                || !modified_files.is_empty()
+                || progress.cumulative_modified_files > 0
+            {
+                engagement_material_progress = true;
             }
 
             // Goal mode: an explicit update_goal this round ends the run now that
