@@ -4,7 +4,7 @@ import unittest
 
 from _path import LIB  # noqa: F401
 
-from schema import make_batch, make_run, validate_batch, validate_run
+from schema import compact_record, make_batch, make_run, validate_batch, validate_run
 
 
 class SchemaTests(unittest.TestCase):
@@ -62,6 +62,36 @@ class SchemaTests(unittest.TestCase):
         )
         batch = make_batch(batch_id="b1", runs=[run])
         self.assertEqual(validate_batch(batch), [])
+
+    def test_compact_record_has_required_contract_keys(self):
+        run = make_run(
+            run_id="r1",
+            started_at=None,
+            git_sha=None,
+            binary=None,
+            leveler_home=None,
+            session_db=None,
+            task_id="a01",
+            suite="adoption",
+            max_rounds=16,
+            expected_disposition="spawn",
+            arm_name="control",
+            arm_factor="baseline",
+            arm_value="product_default",
+            model_ref="m",
+            timeline={"valid": True, "engaged": True, "spawn": False, "disposition": "kept"},
+        )
+        rec = compact_record(run)
+        self.assertEqual(rec["run_id"], "r1")
+        self.assertEqual(rec["task"], "a01")
+        self.assertEqual(rec["model"], "m")
+        self.assertIn("spawn", rec["delegation"])
+        self.assertIn("worker_count", rec["delegation"])
+        self.assertIn("decision_round", rec["delegation"])
+        self.assertIn("turns", rec["execution"])
+        self.assertIn("edits", rec["execution"])
+        self.assertIn("verifier", rec["execution"])
+        self.assertIn("violations", rec["safety"])
 
 
 if __name__ == "__main__":

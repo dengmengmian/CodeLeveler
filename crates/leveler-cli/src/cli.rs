@@ -499,10 +499,25 @@ fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 #[derive(Debug, Subcommand)]
 pub enum EvalCommand {
     /// Run all cases with one model and report metrics.
+    ///
+    /// Capability path: `--cases evals/smoke` (default).
+    /// Framework path: `--suite adoption --experiment m3-baseline`.
     Run {
         /// Model reference.
         #[arg(long)]
         model: Option<String>,
+        /// Provider prefix for framework runs (`provider/model` when model has no `/`).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Eval framework suite (`adoption` | `capability` | `safety`).
+        #[arg(long)]
+        suite: Option<String>,
+        /// Experiment id under `eval/configs/<suite>/` (requires `--suite`).
+        #[arg(long)]
+        experiment: Option<String>,
+        /// Report directory for framework runs (`eval/reports/<suite>/<experiment>`).
+        #[arg(long)]
+        output: Option<PathBuf>,
         /// Directory of eval case YAML files (`evals/smoke`, `evals/hard`, …).
         #[arg(long, default_value = "evals/smoke")]
         cases: PathBuf,
@@ -516,8 +531,8 @@ pub enum EvalCommand {
         /// verify→repair rescues a run the model would have gotten wrong.
         #[arg(long)]
         no_verify_gate: bool,
-        /// Repeat every case to expose run-to-run variance.
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        /// Repeat every case to expose run-to-run variance (`--runs` is the same flag).
+        #[arg(long, visible_alias = "runs", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         repetitions: u32,
         /// Write a durable JSON baseline (report + meta) to this path.
         #[arg(long, value_name = "PATH")]
@@ -925,7 +940,12 @@ mod tests {
                 no_verify_gate,
                 repetitions,
                 json_out,
+                suite,
+                experiment,
+                ..
             })) => {
+                assert!(suite.is_none());
+                assert!(experiment.is_none());
                 assert!(!no_verify_gate, "the ablation is opt-in");
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
                 assert_eq!(cases, PathBuf::from("evals/smoke"));
@@ -968,6 +988,49 @@ mod tests {
                 assert_eq!(json_out.as_deref(), Some(std::path::Path::new("out.json")));
             }
             other => panic!("expected Eval Compare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_run_parses_suite_experiment_runs_and_output() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "run",
+            "--suite",
+            "adoption",
+            "--experiment",
+            "m3-baseline",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-v4-flash",
+            "--runs",
+            "3",
+            "--output",
+            "eval/reports/adoption/m3-baseline",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::Run {
+                suite,
+                experiment,
+                provider,
+                model,
+                repetitions,
+                output,
+                ..
+            })) => {
+                assert_eq!(suite.as_deref(), Some("adoption"));
+                assert_eq!(experiment.as_deref(), Some("m3-baseline"));
+                assert_eq!(provider.as_deref(), Some("deepseek"));
+                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(repetitions, 3);
+                assert_eq!(
+                    output.as_deref(),
+                    Some(std::path::Path::new("eval/reports/adoption/m3-baseline"))
+                );
+            }
+            other => panic!("expected Eval Run suite mode, got {other:?}"),
         }
     }
 

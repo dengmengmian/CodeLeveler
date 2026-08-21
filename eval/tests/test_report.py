@@ -94,6 +94,66 @@ class ReportTests(unittest.TestCase):
         self.assertIn("KEEP is a first-class outcome", md)
         self.assertIn("Task shape correlation", md)
 
+    def test_experiment_report_has_required_headings(self):
+        from report import experiment_report
+
+        runs = [
+            make_run(
+                run_id="p-1",
+                started_at=None,
+                git_sha=None,
+                binary=None,
+                leveler_home=None,
+                session_db=None,
+                task_id="a01-independent-modules",
+                suite="adoption",
+                max_rounds=16,
+                expected_disposition="spawn",
+                shape="parallel",
+                arm_name="control",
+                arm_factor="task_shape",
+                arm_value="parallel",
+                model_ref="m",
+                timeline={
+                    "valid": True,
+                    "engaged": True,
+                    "spawn": True,
+                    "offered": True,
+                    "offer_round": 4,
+                    "delegated_round": 8,
+                    "disposition": "delegated",
+                    "parent_edit_count": 2,
+                    "rounds": 10,
+                    "spawn_metric": {"natural_spawn_count": 1},
+                },
+            )
+        ]
+        md = experiment_report(
+            {"batch_id": "demo", "model": "m", "runs": runs},
+            experiment={
+                "suite": "adoption",
+                "experiment": "m3-baseline",
+                "model": "m",
+                "provider": "p",
+                "binary": "leveler",
+                "runs": 1,
+                "timeout_seconds": 1200,
+                "population": "model_initiated_only",
+                "exclude": ["safety_probe"],
+                "changes_runtime": False,
+            },
+        )
+        for heading in (
+            "## Experiment",
+            "## Dataset",
+            "## Spawn statistics",
+            "## Confidence interval",
+            "## Verifier results",
+            "## Findings",
+        ):
+            self.assertIn(heading, md)
+        self.assertIn("Wilson 90%", md)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,6 +53,42 @@ def rate(k: int, n: int) -> float | None:
     return k / n
 
 
+def mean(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    return sum(xs) / len(xs)
+
+
+def median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    ordered = sorted(xs)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def variance(xs: list[float]) -> float | None:
+    """Sample variance (n-1). None when n < 2 so we never invent 0."""
+    if len(xs) < 2:
+        return None
+    m = mean(xs)
+    assert m is not None
+    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+
+
+def describe(xs: list[float]) -> dict[str, float | int | None]:
+    return {
+        "n": len(xs),
+        "mean": mean(xs),
+        "median": median(xs),
+        "variance": variance(xs),
+        "min": min(xs) if xs else None,
+        "max": max(xs) if xs else None,
+    }
+
+
 def summarize_runs(runs: list[dict[str, Any]], *, spawn_likely_only: bool = False) -> dict[str, Any]:
     selected = []
     for run in runs:

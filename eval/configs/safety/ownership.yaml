@@ -1,0 +1,16 @@
+suite: safety
+experiment: ownership
+description: "Ownership safety — separate denominator from adoption. Cases stay in the control plane."
+model: deepseek-v4-flash
+provider: deepseek
+binary: leveler
+runs: 1
+timeout_seconds: 1800
+population: safety_probe
+exclude: []
+changes_runtime: false
+metrics:
+  - ownership_denied
+  - violations
+output: eval/reports/safety/ownership
+notes: "Do not fold these runs into adoption P_natural. Safety probes may instruct spawn."

@@ -8,7 +8,9 @@ config key, written into the isolated home (never into ~/.leveler).
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,6 +123,38 @@ def score_home(
     )
 
 
+def materialize_task_yamls(
+    tasks_dir: Path,
+    catalog: dict[str, Any],
+    *,
+    task_ids: list[str] | None = None,
+    shape: str | None = None,
+) -> Path:
+    wanted_ids = {t for t in (task_ids or []) if t}
+    wanted = []
+    for path in sorted(tasks_dir.glob("*.yaml")):
+        text = path.read_text(encoding="utf-8")
+        tid = None
+        for line in text.splitlines():
+            if line.startswith("id:"):
+                tid = line.split(":", 1)[1].strip()
+                break
+        if tid is None:
+            continue
+        entry = (catalog.get("tasks") or {}).get(tid) or {}
+        if wanted_ids and tid not in wanted_ids:
+            continue
+        if shape and entry.get("shape") != shape:
+            continue
+        wanted.append(path)
+    if not wanted:
+        raise FileNotFoundError(f"no tasks matched ids={task_ids!r} shape={shape!r} in {tasks_dir}")
+    dest = Path(tempfile.mkdtemp(prefix="eval-cases-"))
+    for path in wanted:
+        shutil.copy(path, dest / path.name)
+    return dest
+
+
 def run_leveler_eval(
     *,
     binary: str,
@@ -130,6 +164,7 @@ def run_leveler_eval(
     home: Path,
     json_out: Path,
     repetitions: int,
+    timeout_seconds: int | None = None,
 ) -> int:
     json_out.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -150,7 +185,10 @@ def run_leveler_eval(
         "--json-out",
         str(json_out),
     ]
-    proc = subprocess.run(cmd, env=env)
+    try:
+        proc = subprocess.run(cmd, env=env, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return 124
     return proc.returncode
 
 

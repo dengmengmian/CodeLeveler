@@ -29,7 +29,11 @@ eval/reports/*.json
 eval/reports/*.jsonl
 eval/reports/*.md
 eval/reports/*.csv
+eval/reports/adoption/
+eval/reports/capability/
+eval/reports/safety/
 !eval/reports/README.md
+!eval/reports/EXAMPLE.md
 !eval/runs/README.md
 eval/micro/adoption/reports/*.json
 eval/micro/adoption/reports/*.csv

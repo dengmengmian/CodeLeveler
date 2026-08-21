@@ -24,12 +24,29 @@ pub(crate) async fn cmd_eval(
     match command {
         EvalCommand::Run {
             model,
+            provider,
+            suite,
+            experiment,
+            output,
             cases,
             direct,
             no_verify_gate,
             repetitions,
             json_out,
         } => {
+            if let Some(suite) = suite {
+                let experiment = experiment
+                    .ok_or_else(|| anyhow::anyhow!("--experiment is required with --suite"))?;
+                return run_framework(
+                    &layout,
+                    suite,
+                    experiment,
+                    model,
+                    provider,
+                    repetitions,
+                    output,
+                );
+            }
             let app = Application::assemble(layout)?;
             let model_ref = resolve_model(&app, model)?;
             let cases_dir = cases.clone();
@@ -306,6 +323,51 @@ pub(crate) async fn cmd_eval(
         EvalCommand::Trend { history, out } => run_trend(&history, out),
         EvalCommand::AdoptionMicro(cmd) => run_adoption_micro(&layout, cmd),
     }
+}
+
+/// Observer-only framework entry: `eval/runner/run.py`.
+fn run_framework(
+    layout: &Layout,
+    suite: String,
+    experiment: String,
+    model: Option<String>,
+    provider: Option<String>,
+    runs: u32,
+    output: Option<std::path::PathBuf>,
+) -> anyhow::Result<std::process::ExitCode> {
+    let script = layout.repo_root.join("eval/runner/run.py");
+    if !script.is_file() {
+        anyhow::bail!(
+            "eval runner not found at {} (run from the CodeLeveler repo)",
+            script.display()
+        );
+    }
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script)
+        .arg("--suite")
+        .arg(suite)
+        .arg("--experiment")
+        .arg(experiment)
+        .arg("--runs")
+        .arg(runs.to_string());
+    if let Some(model) = model {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(provider) = provider {
+        cmd.arg("--provider").arg(provider);
+    }
+    if let Some(output) = output {
+        cmd.arg("--output").arg(output);
+    }
+    cmd.current_dir(&layout.repo_root);
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn python3 eval runner: {e}"))?;
+    Ok(if status.success() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    })
 }
 
 /// Observer-only: shells to `eval/micro/adoption/runner/run.py`. No product

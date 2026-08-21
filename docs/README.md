@@ -13,6 +13,7 @@
 | [../README.md](../README.md) | Everyone | English entry |
 | [../README.zh-CN.md](../README.zh-CN.md) | Everyone (中文) | Chinese entry |
 | [evaluations/README.md](evaluations/README.md) | Contributors | Eval framework: capability `evals/` vs observer `eval/` |
+| [eval-methodology.md](eval-methodology.md) | Contributors | Adoption vs safety denominators; what counts as a spawn |
 
 ## Config layers (quick)
 
