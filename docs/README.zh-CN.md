@@ -12,6 +12,7 @@
 | [../configs/example.yaml](../configs/example.yaml) | 用户 | 全局 + 包配置完整 schema |
 | [../README.zh-CN.md](../README.zh-CN.md) | 所有人 | 中文入口 |
 | [../README.md](../README.md) | 所有人 | 英文入口 |
+| [evaluations/README.zh-CN.md](evaluations/README.zh-CN.md) | 贡献者 | 评测框架：能力 `evals/` vs 观察层 `eval/` |
 
 ## 配置分几层
 

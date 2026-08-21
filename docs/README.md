@@ -12,6 +12,7 @@
 | [../configs/example.yaml](../configs/example.yaml) | Users | Global + bundle provider/model schema |
 | [../README.md](../README.md) | Everyone | English entry |
 | [../README.zh-CN.md](../README.zh-CN.md) | Everyone (中文) | Chinese entry |
+| [evaluations/README.md](evaluations/README.md) | Contributors | Eval framework: capability `evals/` vs observer `eval/` |
 
 ## Config layers (quick)
 

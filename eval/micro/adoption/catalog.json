@@ -1,0 +1,88 @@
+{
+  "suite": "adoption",
+  "gate": "E004",
+  "experiment": "task_shape",
+  "purpose": "Metrics-only labels. Never rendered into the model prompt. KEEP is a first-class outcome.",
+  "shapes": {
+    "parallel": "Two or more independent workstreams. Spawn is the interesting outcome, KEEP is still valid.",
+    "boundary": "Partially independent. Either disposition can be rational.",
+    "single": "One tightly-scoped change. Spawn is over-delegation (P_over)."
+  },
+  "tasks": {
+    "a01-independent-modules": {
+      "shape": "parallel",
+      "expected_disposition": "spawn",
+      "why": "Two new modules with no shared types."
+    },
+    "a05-three-cli-commands": {
+      "shape": "parallel",
+      "expected_disposition": "spawn",
+      "why": "Three disjoint command files."
+    },
+    "a09-two-cli-tools": {
+      "shape": "parallel",
+      "expected_disposition": "spawn",
+      "why": "upper and lower each live in their own file and do not share helpers."
+    },
+    "a10-sort-and-search": {
+      "shape": "parallel",
+      "expected_disposition": "spawn",
+      "why": "sort_stable and find_first are independent algorithms."
+    },
+    "a12-parse-and-count": {
+      "shape": "parallel",
+      "expected_disposition": "spawn",
+      "why": "line parser and line counter share no types."
+    },
+    "a04-parser-and-goldens": {
+      "shape": "boundary",
+      "expected_disposition": "either",
+      "why": "Parser first; goldens are independent once the contract exists."
+    },
+    "a06-typed-pipeline": {
+      "shape": "boundary",
+      "expected_disposition": "either",
+      "why": "Stage two consumes stage one's Token type. Sequential, but two files."
+    },
+    "a07-format-and-readme": {
+      "shape": "boundary",
+      "expected_disposition": "either",
+      "why": "Implementation plus README examples. Docs can wait until the signature exists."
+    },
+    "a08-new-module-plus-glue": {
+      "shape": "boundary",
+      "expected_disposition": "either",
+      "why": "New file is independent; lib.rs registration is glue."
+    },
+    "a13-helper-and-callers": {
+      "shape": "boundary",
+      "expected_disposition": "either",
+      "why": "Extract a helper then wire two call sites. Helper is bounded; callers share it."
+    },
+    "a02-shared-record-exporters": {
+      "shape": "single",
+      "expected_disposition": "keep",
+      "why": "Two exporters must share one null policy. Spawn would split a coupled contract."
+    },
+    "a03-single-file-keep": {
+      "shape": "single",
+      "expected_disposition": "keep",
+      "why": "One function in one file."
+    },
+    "a14-off-by-one": {
+      "shape": "single",
+      "expected_disposition": "keep",
+      "why": "One index error in one function."
+    },
+    "a15-clamp": {
+      "shape": "single",
+      "expected_disposition": "keep",
+      "why": "One clamp in one file."
+    },
+    "a16-match-arm": {
+      "shape": "single",
+      "expected_disposition": "keep",
+      "why": "One missing match arm in one file."
+    }
+  }
+}

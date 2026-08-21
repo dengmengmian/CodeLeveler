@@ -1,0 +1,12 @@
+control_root: ${CONTROL_ROOT}
+
+ownership:
+  case_rel: ownership-final/cases
+  notes: Production matrix O1–O11. Do not fold into adoption denominators.
+
+sandbox:
+  in_repo_docs: docs/C2_3C_S_EVAL_SANDBOX_INTEGRITY.md
+  in_repo_cases: evals/navigation
+
+permission:
+  in_repo_cases: evals/scenarios/permission

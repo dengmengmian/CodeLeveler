@@ -1,0 +1,32 @@
+id: a16-match-arm
+name: "One missing match arm"
+max_rounds: 12
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    #[derive(Clone, Copy)]
+    pub enum Kind { A, B, C }
+    pub fn label(k: Kind) -> &'static str {
+        match k {
+            Kind::A => "a",
+            Kind::B => "b",
+        }
+    }
+  tests/spec.rs: |
+    use evalcase::{label, Kind};
+    #[test]
+    fn c() {
+        assert_eq!(label(Kind::C), "c");
+    }
+task: |
+  Make label cover Kind::C with "c". Keep the change in src/lib.rs. Do not
+  edit tests.
+expect:
+  program: "true"
+  args: []

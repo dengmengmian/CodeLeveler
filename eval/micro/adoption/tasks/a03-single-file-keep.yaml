@@ -1,0 +1,27 @@
+id: a03-single-file-keep
+name: "One wrapping add in one file"
+max_rounds: 12
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn wrapping_add(a: u8, b: u8) -> u8 {
+        a + b
+    }
+  tests/spec.rs: |
+    use evalcase::wrapping_add;
+    #[test]
+    fn wraps() {
+        assert_eq!(wrapping_add(200, 100), 44);
+    }
+task: |
+  Make wrapping_add wrap on overflow instead of panicking in debug. Keep the
+  change in src/lib.rs. Do not edit tests.
+expect:
+  program: "true"
+  args: []

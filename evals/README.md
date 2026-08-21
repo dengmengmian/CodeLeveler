@@ -4,6 +4,10 @@ CodeLeveler's evaluation harness runs self-contained repository tasks in
 disposable worktrees and checks the result with an independent `expect` command.
 Each YAML case defines the task, starting files, and acceptance command.
 
+Delegation adoption, offer timing, and EventLog scoring live in the separate
+observer tree [`eval/`](../eval/README.md). That tree does not change product
+runtime. Keep using this directory for capability cases.
+
 ## Suites
 
 - `smoke/` — small, fast checks for local development and pull requests.

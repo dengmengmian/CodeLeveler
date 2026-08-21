@@ -1,0 +1,41 @@
+id: a09-two-cli-tools
+name: "Two independent string tools"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [[bin]]
+    name = "evalcase"
+    path = "src/main.rs"
+  src/main.rs: |
+    mod cmd_upper;
+    mod cmd_lower;
+    fn main() {
+        let mut args = std::env::args().skip(1);
+        let cmd = args.next().unwrap_or_default();
+        let rest: Vec<String> = args.collect();
+        let out = match cmd.as_str() {
+            "upper" => cmd_upper::run(&rest),
+            "lower" => cmd_lower::run(&rest),
+            _ => "unknown".into(),
+        };
+        print!("{out}");
+    }
+  src/cmd_upper.rs: |
+    pub fn run(args: &[String]) -> String {
+        todo!("join args with space, ASCII uppercase")
+    }
+  src/cmd_lower.rs: |
+    pub fn run(args: &[String]) -> String {
+        todo!("join args with space, ASCII lowercase")
+    }
+task: |
+  Finish two command modules. upper joins its arguments with spaces and
+  converts ASCII letters to uppercase. lower does the same with lowercase.
+  Each command lives in its own file and does not need the other.
+expect:
+  program: "true"
+  args: []

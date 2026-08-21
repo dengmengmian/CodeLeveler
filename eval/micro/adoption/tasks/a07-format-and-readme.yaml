@@ -1,0 +1,33 @@
+id: a07-format-and-readme
+name: "Formatter plus independent README examples"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn indent_block(text: &str, n: usize) -> String {
+        todo!("prefix every line with n spaces; preserve internal blank lines")
+    }
+  README.md: |
+    # evalcase
+
+    Examples go here once indent_block exists.
+  tests/spec.rs: |
+    use evalcase::indent_block;
+    #[test]
+    fn indents_each_line() {
+        assert_eq!(indent_block("a\nb", 2), "  a\n  b");
+    }
+task: |
+  Implement indent_block in src/lib.rs so tests/spec.rs pass. Then add three
+  short usage examples to README.md that a human can copy. The README does
+  not need to compile and does not share code with the library. Do not edit
+  tests/spec.rs.
+expect:
+  program: "true"
+  args: []

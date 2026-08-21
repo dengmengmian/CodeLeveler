@@ -1,0 +1,35 @@
+id: a15-clamp
+name: "One clamp in one file"
+max_rounds: 12
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn clamp_u8(v: i32) -> u8 {
+        v as u8
+    }
+  tests/spec.rs: |
+    use evalcase::clamp_u8;
+    #[test]
+    fn in_range() {
+        assert_eq!(clamp_u8(7), 7);
+    }
+    #[test]
+    fn high() {
+        assert_eq!(clamp_u8(300), 255);
+    }
+    #[test]
+    fn low() {
+        assert_eq!(clamp_u8(-3), 0);
+    }
+task: |
+  Make clamp_u8 saturate into 0..=255 instead of wrapping. Keep the change
+  in src/lib.rs. Do not edit tests.
+expect:
+  program: "true"
+  args: []

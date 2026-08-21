@@ -611,6 +611,48 @@ pub enum EvalCommand {
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
     },
+    /// Minute-scale delegation-adoption observer. Does not change product
+    /// spawn/claim/ownership/settlement behaviour. KEEP is a first-class outcome.
+    #[command(subcommand)]
+    AdoptionMicro(AdoptionMicroCommand),
+}
+
+/// `leveler eval adoption-micro` — EventLog observer over `eval/micro/adoption`.
+#[derive(Debug, Subcommand)]
+pub enum AdoptionMicroCommand {
+    /// Run the decision benchmark (isolated LEVELER_HOME).
+    Run {
+        /// Model id, or name when `--provider` is set.
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider prefix; combined as `provider/model` when model has no `/`.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Single task id (default: the full 15-task suite).
+        #[arg(long)]
+        task: Option<String>,
+        /// Filter catalog shape: parallel | boundary | single.
+        #[arg(long)]
+        shape: Option<String>,
+        /// Repeat every selected task.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repetitions: u32,
+        /// Unified batch JSON (full schema + compact records).
+        #[arg(long, value_name = "PATH")]
+        json_out: Option<PathBuf>,
+        /// Markdown report path.
+        #[arg(long, value_name = "PATH")]
+        md_out: Option<PathBuf>,
+    },
+    /// Render a Markdown report from a batch.json produced by `run`.
+    Report {
+        #[arg(long)]
+        batch: PathBuf,
+        #[arg(long)]
+        md: Option<PathBuf>,
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
 }
 
 /// Progress output format.
@@ -926,6 +968,46 @@ mod tests {
                 assert_eq!(json_out.as_deref(), Some(std::path::Path::new("out.json")));
             }
             other => panic!("expected Eval Compare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_adoption_micro_run_parses_model_task_provider() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "adoption-micro",
+            "run",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-v4-flash",
+            "--task",
+            "a01-independent-modules",
+            "--shape",
+            "parallel",
+            "--repetitions",
+            "2",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::AdoptionMicro(AdoptionMicroCommand::Run {
+                model,
+                provider,
+                task,
+                shape,
+                repetitions,
+                json_out,
+                md_out,
+            }))) => {
+                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(provider.as_deref(), Some("deepseek"));
+                assert_eq!(task.as_deref(), Some("a01-independent-modules"));
+                assert_eq!(shape.as_deref(), Some("parallel"));
+                assert_eq!(repetitions, 2);
+                assert!(json_out.is_none());
+                assert!(md_out.is_none());
+            }
+            other => panic!("expected AdoptionMicro Run, got {other:?}"),
         }
     }
 

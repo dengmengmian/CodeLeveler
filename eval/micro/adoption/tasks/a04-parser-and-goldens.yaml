@@ -1,0 +1,34 @@
+id: a04-parser-and-goldens
+name: "Parser plus independent golden files"
+max_rounds: 18
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn parse_kv(line: &str) -> Option<(String, String)> {
+        todo!("key=value, first '=' splits, trim both sides")
+    }
+  tests/goldens/ok1.txt: "a=b"
+  tests/goldens/ok2.txt: " host = local "
+  tests/spec.rs: |
+    use evalcase::parse_kv;
+    #[test]
+    fn splits_on_first_eq() {
+        assert_eq!(parse_kv("a=b=c"), Some(("a".into(), "b=c".into())));
+    }
+    #[test]
+    fn trims() {
+        assert_eq!(parse_kv(" k = v "), Some(("k".into(), "v".into())));
+    }
+task: |
+  Implement parse_kv in src/lib.rs so tests/spec.rs pass. Also add four more
+  example lines under tests/goldens/ (one pair per file) that a later reader
+  can check by eye: two valid, two that must not parse. Do not edit tests/spec.rs.
+expect:
+  program: "true"
+  args: []
