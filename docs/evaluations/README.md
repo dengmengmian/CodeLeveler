@@ -9,4 +9,7 @@ Two trees, one rule: **eval observes the product; it does not special-case it.**
 
 Gate map and the adoption micro protocol: [`E004-multi-agent-adoption.md`](E004-multi-agent-adoption.md).
 
+MA-WA1 closing record — what was tested, what was eliminated, and what that
+means for Beta: [`MA-WA1-FINAL.md`](MA-WA1-FINAL.md).
+
 Chinese: [`README.zh-CN.md`](README.zh-CN.md).
