@@ -170,6 +170,14 @@ impl ExecutorFactory {
         .with_progress_guards(resolved.repeated_read_guard)
         .with_sub_agent_policies(child_policies)
         .with_delegation(self.allow_delegation)
+        // H-C experiment: read from the ablation seam, never a production
+        // field. Absent (the default everywhere) keeps `PlanRegistration`.
+        .with_delegation_timing(
+            self.overrides
+                .as_ref()
+                .and_then(|o| o.delegation_timing)
+                .unwrap_or_default(),
+        )
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
 

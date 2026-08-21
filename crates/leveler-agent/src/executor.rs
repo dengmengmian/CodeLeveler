@@ -853,6 +853,10 @@ pub struct TurnPolicy {
     // ── Delegation ──────────────────────────────────────────────────────────
     /// When false, `spawn_agent` is not advertised (delegation kill-switch).
     pub allow_delegation: bool,
+    /// H-C experiment: WHEN the keep-vs-delegate surface is raised. Default is
+    /// `PlanRegistration`, the shipped behaviour; the other arm exists solely
+    /// so the timing hypothesis can be tested causally.
+    pub delegation_timing: crate::sub_agent::DelegationTiming,
     /// Max sub-agents running at once (within a spawn batch).
     pub max_concurrent_agents: usize,
     /// Max sub-agents spawned across the whole top-level run.
@@ -878,6 +882,7 @@ impl Default for TurnPolicy {
             delivery_gate: false,
             progress_guards: true,
             allow_delegation: true,
+            delegation_timing: crate::sub_agent::DelegationTiming::default(),
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
         }
@@ -1361,6 +1366,9 @@ impl Executor {
                 max_total_agents: self.policy.max_total_agents,
                 // Children never advertise spawn_agent (depth already blocks it).
                 allow_delegation: false,
+                // Irrelevant for a child (no offer is ever raised), carried so
+                // the field stays a single source of truth.
+                delegation_timing: self.policy.delegation_timing,
                 // A sub-agent finishes when it goes quiet; only the top-level
                 // run uses explicit goal resolution.
                 goal_mode: false,
@@ -1412,6 +1420,13 @@ impl Executor {
     /// Product kill-switch: when false, `spawn_agent` is not in the tool list.
     pub fn with_delegation(mut self, allow: bool) -> Self {
         self.policy.allow_delegation = allow;
+        self
+    }
+
+    /// H-C experiment: when the keep-vs-delegate surface is raised. Leaving
+    /// this unset keeps the shipped `PlanRegistration` behaviour.
+    pub fn with_delegation_timing(mut self, timing: crate::sub_agent::DelegationTiming) -> Self {
+        self.policy.delegation_timing = timing;
         self
     }
 

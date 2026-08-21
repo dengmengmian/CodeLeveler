@@ -94,6 +94,8 @@ pub struct LoadedConfig {
     pub mcp_servers: Vec<leveler_tools::mcp::McpServerConfig>,
     /// Global multi-agent kill-switch default (project config can override).
     pub agents_delegation: bool,
+    /// Multi-agent experiment: delegation offer timing (default shipped).
+    pub agents_offer_timing: leveler_project::OfferTiming,
 }
 
 impl Default for LoadedConfig {
@@ -106,6 +108,7 @@ impl Default for LoadedConfig {
             vcs_co_author: true,
             mcp_servers: Vec::new(),
             agents_delegation: true,
+            agents_offer_timing: leveler_project::OfferTiming::default(),
         }
     }
 }
@@ -197,6 +200,7 @@ impl Application {
             vcs_co_author: global.vcs_co_author,
             mcp_servers: global.mcp_servers,
             agents_delegation: global.agents_delegation,
+            agents_offer_timing: global.agents_offer_timing,
         })
     }
 
@@ -344,6 +348,36 @@ impl Application {
     /// Override the resolved execution policy for every execution path — the
     /// `leveler eval ablate` seam. Use on a freshly assembled Application so
     /// control and ablated runs differ in exactly the flipped knob.
+    /// The ablation seam, plus the H-C delegation-timing knob resolved from
+    /// config (project wins over global; both default to the shipped
+    /// `PlanRegistration`, in which case nothing is set and the seam stays
+    /// exactly as the caller left it).
+    fn execution_overrides_with_delegation_timing(
+        &self,
+    ) -> Option<leveler_engine::ExecutionOverrides> {
+        let configured = match (
+            self.project_config().agents.offer_timing,
+            self.config.agents_offer_timing,
+        ) {
+            (leveler_project::OfferTiming::AfterFirstEdit, _)
+            | (_, leveler_project::OfferTiming::AfterFirstEdit) => {
+                Some(leveler_agent::DelegationTiming::AfterFirstEdit)
+            }
+            _ => None,
+        };
+        match (self.execution_overrides.clone(), configured) {
+            (base, None) => base,
+            (Some(mut base), timing) => {
+                base.delegation_timing = timing;
+                Some(base)
+            }
+            (None, timing) => Some(leveler_engine::ExecutionOverrides {
+                delegation_timing: timing,
+                ..Default::default()
+            }),
+        }
+    }
+
     pub fn with_execution_overrides(
         mut self,
         overrides: leveler_engine::ExecutionOverrides,
@@ -503,7 +537,7 @@ impl Application {
                 tool_context,
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
-                overrides: self.execution_overrides.clone(),
+                overrides: self.execution_overrides_with_delegation_timing(),
                 work_profile,
                 memory_index,
                 permission_rules,

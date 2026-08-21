@@ -201,6 +201,20 @@ pub(crate) enum DelegationRoundAction {
     RecordDelegated(String),
 }
 
+/// WHEN the keep-vs-delegate decision surface is raised (H-C experiment).
+///
+/// EXPERIMENT KNOB. `PlanRegistration` is the shipped product behaviour and the
+/// default; `AfterFirstEdit` exists so the timing hypothesis can be tested
+/// causally without touching wording, schemas, ownership or settlement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DelegationTiming {
+    /// Offer as soon as the model registers a decomposition (today's product).
+    #[default]
+    PlanRegistration,
+    /// Hold the offer until a file-mutating tool has actually applied an edit.
+    AfterFirstEdit,
+}
+
 /// Disposition facts already recorded in earlier windows of this goal epoch
 /// (seeded from `ProgressLedger`), so continue/resume/repair windows neither
 /// re-ask nor re-record.
@@ -272,6 +286,19 @@ pub(crate) struct DelegationDecisionPoint {
     round_plan: Option<(Vec<String>, u32)>,
     mutated_this_round: bool,
     worker_scope_this_round: Option<String>,
+    /// H-C experiment: when the decision surface is raised.
+    timing: DelegationTiming,
+    /// A file-mutating tool applied an edit this round (registry-declared, not
+    /// a workspace diff — a shell byproduct is not an edit).
+    edit_applied_this_round: bool,
+    /// Latch: a real edit has landed at some point in this window.
+    edit_seen: bool,
+    /// Latest registered decomposition, retained across rounds. Only read by
+    /// `AfterFirstEdit`: when that arm finally raises the held offer, it must
+    /// carry the SAME per-step form the control arm would have shown, or the
+    /// experiment would be varying the offer's content as well as its timing.
+    latest_plan_steps: Vec<String>,
+    latest_plan_completed: u32,
 }
 
 fn steps_fingerprint(steps: &[String]) -> u64 {
@@ -302,7 +329,31 @@ impl DelegationDecisionPoint {
             round_plan: None,
             mutated_this_round: false,
             worker_scope_this_round: None,
+            timing: DelegationTiming::default(),
+            edit_applied_this_round: false,
+            edit_seen: false,
+            latest_plan_steps: Vec::new(),
+            latest_plan_completed: 0,
         }
+    }
+
+    /// Same, with an explicit offer timing (experiment configuration).
+    pub(crate) fn with_timing(
+        eligible: bool,
+        prior: DelegationPrior,
+        timing: DelegationTiming,
+    ) -> Self {
+        Self {
+            timing,
+            ..Self::new(eligible, prior)
+        }
+    }
+
+    /// A tool the registry declares file-mutating applied an edit successfully.
+    /// Distinct from `note_mutation`, which is the broad workspace-diff signal
+    /// and also fires on byproducts such as a sed `.bak`.
+    pub(crate) fn note_edit_applied(&mut self) {
+        self.edit_applied_this_round = true;
     }
 
     /// A ModelExplicit plan was registered/replaced; `open_steps` are the step
@@ -312,6 +363,8 @@ impl DelegationDecisionPoint {
         if open_steps.len() > self.plan_open_steps.len() {
             self.plan_open_steps = open_steps.to_vec();
         }
+        self.latest_plan_steps = open_steps.to_vec();
+        self.latest_plan_completed = completed;
         self.round_plan = Some((open_steps.to_vec(), completed));
     }
 
@@ -356,17 +409,40 @@ impl DelegationDecisionPoint {
         if self.mutated_this_round {
             self.mutation_rounds_seen = self.mutation_rounds_seen.saturating_add(1);
         }
-        if !self.offered && !self.delegated_recorded {
-            if self.plan_open_steps.len() >= 2 {
+        if self.edit_applied_this_round {
+            self.edit_seen = true;
+        }
+        // H-C experiment gate. `PlanRegistration` (default, shipped product)
+        // never withholds anything. `AfterFirstEdit` holds the INITIAL offer —
+        // and only the initial offer — until a file-mutating tool has actually
+        // applied an edit, so the same decision surface lands after the model
+        // has started writing instead of before. Nothing else moves: same
+        // wording, same trigger labels, same per-step form, same one-shot
+        // latches, same KEEP semantics, same reconsideration rules.
+        let timing_allows_initial_offer =
+            matches!(self.timing, DelegationTiming::PlanRegistration) || self.edit_seen;
+        if !self.offered && !self.delegated_recorded && timing_allows_initial_offer {
+            // The control arm offers from THIS round's plan. The treatment arm
+            // may be raising an offer for a plan registered several rounds ago,
+            // so it falls back to the retained decomposition — same content,
+            // later.
+            let mut steps = std::mem::take(&mut self.plan_open_steps);
+            if steps.is_empty() && matches!(self.timing, DelegationTiming::AfterFirstEdit) {
+                steps = self.latest_plan_steps.clone();
+            }
+            if steps.len() >= 2 {
                 self.offered = true;
                 self.offered_in_window = true;
                 self.offer_had_steps = true;
-                let steps = std::mem::take(&mut self.plan_open_steps);
                 // Material-change baseline: what the offer actually enumerated,
                 // plus the plan's completed count as of this round.
                 self.baseline_fingerprint = Some(steps_fingerprint(&steps));
-                self.baseline_completed =
-                    Some(self.round_plan.as_ref().map(|(_, c)| *c).unwrap_or(0));
+                self.baseline_completed = Some(
+                    self.round_plan
+                        .as_ref()
+                        .map(|(_, c)| *c)
+                        .unwrap_or(self.latest_plan_completed),
+                );
                 actions.push(DelegationRoundAction::Offer {
                     trigger: "plan",
                     steps,
@@ -429,6 +505,7 @@ impl DelegationDecisionPoint {
     }
 
     fn clear_round(&mut self) {
+        self.edit_applied_this_round = false;
         self.plan_open_steps.clear();
         self.round_plan = None;
         self.mutated_this_round = false;
@@ -1020,6 +1097,160 @@ mod decision_point_tests {
 
     fn steps(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---------------------------------------------------------------
+    // Delegation timing experiment (H-C). EXPERIMENT-ONLY: the default is
+    // `PlanRegistration`, so production behaviour is byte-identical.
+    // ---------------------------------------------------------------
+
+    fn timed(mode: DelegationTiming) -> DelegationDecisionPoint {
+        DelegationDecisionPoint::with_timing(true, DelegationPrior::default(), mode)
+    }
+
+    /// Arm A control: unchanged. A registered plan offers immediately, before
+    /// any edit exists.
+    #[test]
+    fn arm_a_plan_registration_offers_before_any_edit() {
+        let mut dp = timed(DelegationTiming::PlanRegistration);
+        dp.note_plan_registered(&steps(&["core", "tests", "docs"]), 0);
+        assert!(
+            matches!(
+                dp.end_round().as_slice(),
+                [DelegationRoundAction::Offer {
+                    trigger: "plan",
+                    ..
+                }]
+            ),
+            "control must keep offering at plan registration"
+        );
+    }
+
+    /// Arm B: the same plan raises NOTHING until a real edit lands, and then
+    /// the offer carries the model's own open steps — same wording, same
+    /// trigger label, only later.
+    #[test]
+    fn arm_b_holds_the_offer_until_the_first_edit() {
+        let mut dp = timed(DelegationTiming::AfterFirstEdit);
+        dp.note_plan_registered(&steps(&["core", "tests", "docs"]), 0);
+        assert!(
+            dp.end_round().is_empty(),
+            "treatment must not offer at plan registration"
+        );
+        // Rounds of work that are NOT edits: reads, greps, builds, read-only
+        // shell. `note_mutation` is the broad workspace-diff signal and must
+        // not open the gate on its own — a `.bak` left by sed is not an edit.
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "a workspace byproduct is not an edit"
+        );
+        dp.note_mutation();
+        assert!(dp.end_round().is_empty(), "still not an edit");
+        // A real edit applied by a file-mutating tool opens it.
+        dp.note_edit_applied();
+        let actions = dp.end_round();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [DelegationRoundAction::Offer { trigger: "plan", steps }] if steps.len() == 3
+            ),
+            "the first real edit must raise the plan-anchored offer: {actions:?}"
+        );
+    }
+
+    /// Arm B must still offer exactly once, and a later plan change must not
+    /// re-raise the initial offer.
+    #[test]
+    fn arm_b_offers_exactly_once() {
+        let mut dp = timed(DelegationTiming::AfterFirstEdit);
+        dp.note_plan_registered(&steps(&["a", "b", "c"]), 0);
+        dp.end_round();
+        dp.note_edit_applied();
+        assert_eq!(dp.end_round().len(), 1, "first edit offers");
+        dp.note_edit_applied();
+        dp.note_plan_registered(&steps(&["a", "b", "c"]), 0);
+        assert!(
+            dp.end_round().iter().all(|a| !matches!(
+                a,
+                DelegationRoundAction::Offer {
+                    trigger: "plan",
+                    ..
+                }
+            )),
+            "no duplicate initial offer"
+        );
+    }
+
+    /// Arm B on a plan-less run: the fallback still exists, but it too waits
+    /// for a real edit rather than for two workspace-diff mutations.
+    #[test]
+    fn arm_b_plan_less_run_falls_back_to_the_first_edit() {
+        let mut dp = timed(DelegationTiming::AfterFirstEdit);
+        dp.note_mutation();
+        dp.end_round();
+        dp.note_mutation();
+        assert!(
+            dp.end_round().is_empty(),
+            "the two-mutation fallback must not fire before a real edit"
+        );
+        dp.note_edit_applied();
+        assert!(
+            matches!(
+                dp.end_round().as_slice(),
+                [DelegationRoundAction::Offer {
+                    trigger: "mutation_fallback",
+                    ..
+                }]
+            ),
+            "a plan-less run offers on its first real edit"
+        );
+    }
+
+    /// A delegation that happened before the gate opened still suppresses the
+    /// offer: the model already acted, so there is nothing to ask.
+    #[test]
+    fn arm_b_never_offers_after_a_delegated_fact() {
+        let mut dp = timed(DelegationTiming::AfterFirstEdit);
+        dp.note_worker_admitted(&["src/a.rs".to_string()]);
+        assert_eq!(
+            dp.end_round(),
+            vec![DelegationRoundAction::RecordDelegated(
+                "src/a.rs".to_string()
+            )]
+        );
+        dp.note_plan_registered(&steps(&["a", "b"]), 0);
+        dp.note_edit_applied();
+        assert!(dp.end_round().is_empty(), "a spawned run is never offered");
+    }
+
+    /// Timing changes WHEN the decision surface appears, never whether the
+    /// model must answer: KEEP stays a first-class recorded outcome in Arm B.
+    #[test]
+    fn arm_b_still_records_keep_from_behaviour() {
+        let mut dp = timed(DelegationTiming::AfterFirstEdit);
+        dp.note_plan_registered(&steps(&["a", "b"]), 0);
+        dp.end_round();
+        dp.note_edit_applied();
+        assert_eq!(dp.end_round().len(), 1, "offer on first edit");
+        dp.note_edit_applied();
+        dp.note_mutation();
+        assert_eq!(dp.end_round(), vec![DelegationRoundAction::RecordKept]);
+    }
+
+    /// The default must be the control arm: an ordinary construction is
+    /// byte-identical to today's product.
+    #[test]
+    fn the_default_timing_is_the_current_product_behaviour() {
+        let mut a = DelegationDecisionPoint::new(true, DelegationPrior::default());
+        let mut b = timed(DelegationTiming::PlanRegistration);
+        a.note_plan_registered(&steps(&["x", "y"]), 0);
+        b.note_plan_registered(&steps(&["x", "y"]), 0);
+        assert_eq!(a.end_round(), b.end_round());
+        assert_eq!(
+            DelegationTiming::default(),
+            DelegationTiming::PlanRegistration
+        );
     }
 
     #[test]

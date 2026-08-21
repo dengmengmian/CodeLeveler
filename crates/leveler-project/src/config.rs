@@ -57,12 +57,32 @@ pub struct AgentsConfig {
     /// When false, `spawn_agent` is not advertised. Default true when omitted.
     #[serde(default = "default_true")]
     pub delegation: bool,
+    /// EXPERIMENT KNOB (H-C). When the keep-vs-delegate surface is raised:
+    /// `plan_registration` (default, shipped behaviour) or `after_first_edit`.
+    /// Exists so delegation timing can be tested causally; it changes no
+    /// wording, schema, ownership or settlement rule.
+    #[serde(default)]
+    pub offer_timing: OfferTiming,
 }
 
 impl Default for AgentsConfig {
     fn default() -> Self {
-        Self { delegation: true }
+        Self {
+            delegation: true,
+            offer_timing: OfferTiming::default(),
+        }
     }
+}
+
+/// Serialized form of the delegation offer timing (see `AgentsConfig`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfferTiming {
+    /// Offer as soon as the model registers a decomposition (product default).
+    #[default]
+    PlanRegistration,
+    /// Hold the offer until a file-mutating tool has applied an edit.
+    AfterFirstEdit,
 }
 
 fn default_true() -> bool {

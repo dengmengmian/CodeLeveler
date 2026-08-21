@@ -247,7 +247,7 @@ impl Executor {
         // top-level runs with delegation on; a prior window's offer and
         // disposition facts (seeded via ProgressLedger) are never re-asked or
         // re-recorded.
-        let mut delegation_decision = DelegationDecisionPoint::new(
+        let mut delegation_decision = DelegationDecisionPoint::with_timing(
             self.policy.allow_delegation && self.depth == 0,
             crate::sub_agent::DelegationPrior {
                 offered: progress.delegation_decision_offered,
@@ -255,6 +255,7 @@ impl Executor {
                 delegated: progress.delegation_delegated_recorded,
                 reconsidered: progress.delegation_reconsidered,
             },
+            self.policy.delegation_timing,
         );
         // Accumulated elevations from approved request_permissions this turn.
         let mut turn_grants = crate::injected_tools::TurnPermissionGrants::default();
@@ -2364,6 +2365,9 @@ impl Executor {
                 // only apply_patch/replace by name). Paths are this call only.
                 if !is_error && self.registry.mutates_files(&call.name) {
                     edit_applied_this_round = true;
+                    // Same signal the timing experiment gates on: a deliberate
+                    // edit, not a workspace diff.
+                    delegation_decision.note_edit_applied();
                 }
                 if !is_error && call_mutated {
                     delegation_decision.note_mutation();
