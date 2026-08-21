@@ -9,7 +9,9 @@ library;
 import 'package:flutter/material.dart';
 
 import '../domain/app_controller.dart';
+import '../domain/task_status.dart';
 import 'common.dart';
+import 'status_chip.dart';
 
 class SessionsScreen extends StatelessWidget {
   const SessionsScreen({super.key, required this.controller, required this.projectName});
@@ -48,7 +50,7 @@ class SessionsScreen extends StatelessWidget {
           : FloatingActionButton.extended(
               onPressed: () => _newSession(context),
               icon: const Icon(Icons.add),
-              label: const Text('新会话'),
+              label: const Text('新任务'),
             ),
       body: Column(
         children: [
@@ -63,13 +65,13 @@ class SessionsScreen extends StatelessWidget {
                         Icon(
                           controller.sessionsLoading
                               ? Icons.hourglass_empty
-                              : Icons.chat_bubble_outline,
+                              : Icons.task_alt_outlined,
                           size: 40,
                           color: Theme.of(context).colorScheme.outline,
                         ),
                         const SizedBox(height: 14),
                         Text(
-                          controller.sessionsLoading ? '正在读取会话…' : '这个项目还没有会话',
+                          controller.sessionsLoading ? '正在读取任务…' : '这个项目还没有任务',
                           style: Theme.of(context).textTheme.titleSmall,
                         ),
                         if (!controller.sessionsLoading && !controller.isObserveOnly) ...[
@@ -90,7 +92,6 @@ class SessionsScreen extends StatelessWidget {
                     itemBuilder: (context, index) {
                       final session = controller.sessions[index];
                       final theme = Theme.of(context);
-                      final running = session.status == 'running';
                       return ListTile(
                         title: Text(
                           session.goal.isEmpty ? '(无目标)' : session.goal,
@@ -102,22 +103,15 @@ class SessionsScreen extends StatelessWidget {
                           padding: const EdgeInsets.only(top: 4),
                           child: Row(
                             children: [
-                              if (running) ...[
-                                SizedBox(
-                                  width: 10,
-                                  height: 10,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 1.6,
-                                    color: theme.colorScheme.primary,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                              ],
+                              StatusChip(status: session.taskStatus, compact: true),
+                              const SizedBox(width: 8),
                               Flexible(
                                 child: Text(
-                                  running ? '运行中' : _when(session.updatedAt),
+                                  session.taskStatus == TaskStatus.running
+                                      ? '运行中'
+                                      : _when(session.updatedAt),
                                   style: theme.textTheme.bodySmall?.copyWith(
-                                    color: running
+                                    color: session.taskStatus == TaskStatus.running
                                         ? theme.colorScheme.primary
                                         : theme.colorScheme.onSurfaceVariant,
                                   ),
@@ -177,7 +171,7 @@ class _GoalDialogState extends State<_GoalDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('新建会话'),
+      title: const Text('新建任务'),
       content: TextField(
         controller: _goal,
         autofocus: true,

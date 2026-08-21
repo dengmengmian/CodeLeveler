@@ -169,7 +169,7 @@ Future<void> sendMessage(WidgetTester tester, String text) async {
 
 /// Start a session from the phone and wait for its stream.
 Future<void> startSession(WidgetTester tester, AppController controller, String goal) async {
-  await tapByText(tester, '新会话');
+  await tapByText(tester, '新任务');
   await tester.enterText(find.byType(TextField).last, goal);
   FocusManager.instance.primaryFocus?.unfocus();
   await settleUi(tester);

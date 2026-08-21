@@ -106,11 +106,250 @@ void main() {
     test('a kind we know but do not render is not counted as unknown', () {
       final state = SessionState('s1');
       state.applyEvent({'type': 'token_usage', 'input_tokens': 1, 'output_tokens': 2});
-      state.applyEvent({'type': 'reasoning_delta', 'delta': '想一想'});
+      state.applyEvent({'type': 'turn_progress'});
 
       expect(state.unknownEvents, isEmpty,
           reason: '"chose not to show" and "never heard of" are different states');
       expect(state.transcript, isEmpty);
+      expect(state.timeline, isEmpty);
+    });
+
+    test('decision-changing runtime events are not silently dropped', () {
+      // Token counts may stay quiet. Sub-agents, thinking, verification,
+      // completion, and attachments may not: those are why a phone exists.
+      const payloads = <Map<String, dynamic>>[
+        {
+          'type': 'user_message_added',
+          'message': {'id': 'u1', 'role': 'user', 'text': 'hi'},
+        },
+        {
+          'type': 'assistant_message_started',
+          'message_id': 'm1',
+        },
+        {
+          'type': 'tool_call_started',
+          'id': 't1',
+          'name': 'read_file',
+          'arguments': '{"path":"lib/a.rs"}',
+        },
+        {
+          'type': 'plan_updated',
+          'plan': {
+            'steps': [
+              {'description': 'one', 'status': 'done'},
+              {'description': 'two', 'status': 'pending'},
+            ],
+          },
+        },
+        {
+          'type': 'attachment_added',
+          'attachment': {
+            'id': 'a1',
+            'kind': 'text_file',
+            'name': 'out.md',
+            'mime_type': 'text/markdown',
+            'size_bytes': 12,
+            'sha256': 'aa',
+          },
+        },
+        {
+          'type': 'approval_requested',
+          'request': {'id': 'r1', 'tool': 'run_command', 'summary': 'rm'},
+        },
+        {'type': 'turn_completed'},
+        {
+          'type': 'reasoning_delta',
+          'delta': '先看测试',
+        },
+        {
+          'type': 'sub_agent_updated',
+          'id': 'c1',
+          'nickname': 'explorer',
+          'role': 'explorer',
+          'done': false,
+          'ok': false,
+          'detail': '查 Trait',
+        },
+        {
+          'type': 'verification_updated',
+          'verification': {
+            'checks': [
+              {'name': 'cargo test', 'status': 'passed'},
+            ],
+            'passed': true,
+          },
+        },
+        {
+          'type': 'session_completed',
+          'report': {
+            'files_changed': 2,
+            'added': 10,
+            'removed': 1,
+            'checks_passed': 1,
+            'checks_total': 1,
+            'success': true,
+          },
+        },
+        {
+          'type': 'diff_updated',
+          'diff': {
+            'files': [
+              {'path': 'a.rs', 'added': 3, 'removed': 1},
+            ],
+          },
+        },
+      ];
+
+      for (final event in payloads) {
+        final state = SessionState('s1');
+        state.applyEvent(event);
+        final type = event['type'] as String;
+        expect(state.unknownEvents, isEmpty, reason: '$type counted as unknown');
+        expect(
+          state.timeline.isNotEmpty || state.approvals.isNotEmpty,
+          isTrue,
+          reason: '$type was dropped',
+        );
+      }
+    });
+
+    test('sub-agent progress updates the same row instead of flooding the timeline', () {
+      final state = SessionState('s1');
+      state.applyEvent({
+        'type': 'sub_agent_updated',
+        'id': 'c1',
+        'nickname': 'worker',
+        'role': 'worker',
+        'done': false,
+        'ok': false,
+        'detail': '改协议',
+      });
+      state.applyEvent({
+        'type': 'sub_agent_progress',
+        'id': 'c1',
+        'active': true,
+        'input_tokens': 10,
+        'output_tokens': 2,
+        'cached_input_tokens': 0,
+      });
+      state.applyEvent({
+        'type': 'sub_agent_activity',
+        'id': 'c1',
+        'phase': 'tool_started',
+        'tool': 'read_file',
+        'preview': 'lib.rs',
+        'is_error': false,
+      });
+      state.applyEvent({
+        'type': 'sub_agent_updated',
+        'id': 'c1',
+        'nickname': 'worker',
+        'role': 'worker',
+        'done': true,
+        'ok': true,
+        'detail': '改完了',
+      });
+
+      expect(state.timeline.where((item) => item.kind == TimelineKind.subAgent), hasLength(1));
+      expect(state.timeline.single.ok, isTrue);
+      expect(state.timeline.single.detail, contains('改完了'));
+    });
+
+    test('reasoning_delta accumulates on one thinking row, not the transcript', () {
+      final state = SessionState('s1');
+      state.applyEvent({'type': 'reasoning_delta', 'delta': '先'});
+      state.applyEvent({'type': 'reasoning_delta', 'delta': '看测试'});
+
+      expect(state.transcript, isEmpty);
+      expect(state.timeline.single.kind, TimelineKind.thinking);
+      expect(state.timeline.single.detail, '先看测试');
+    });
+
+    test('a local steer is recorded as a user line and not doubled if the host echoes it', () {
+      final state = SessionState('s1')..status = 'running';
+      state.noteLocalUser('保持 API 兼容，不改库');
+      state.applyEvent({
+        'type': 'user_message_added',
+        'message': {'id': 'u9', 'role': 'user', 'text': '保持 API 兼容，不改库'},
+      });
+
+      expect(state.timeline.where((item) => item.kind == TimelineKind.user), hasLength(1));
+    });
+
+    test('tool arguments prefer a path over raw JSON', () {
+      final state = SessionState('s1');
+      state.applyEvent({
+        'type': 'tool_call_started',
+        'id': 't1',
+        'name': 'read_file',
+        'arguments': '{"path":"lib/a.rs"}',
+      });
+      expect(state.timeline.first.detail, 'lib/a.rs');
+    });
+
+    test('plan progress counts done steps', () {
+      final state = SessionState('s1');
+      state.applyEvent({
+        'type': 'plan_updated',
+        'plan': {
+          'steps': [
+            {'description': '查 Trait', 'status': 'done'},
+            {'description': '改协议', 'status': 'running'},
+            {'description': '跑测试', 'status': 'pending'},
+          ],
+        },
+      });
+      expect(state.planSteps, 3);
+      expect(state.planDone, 1);
+      expect(state.timeline.single.detail, contains('查 Trait'));
+    });
+
+    test('tool calls land on the timeline, not only in the activity spinner', () {
+      final state = SessionState('s1');
+      state.applyEvent({
+        'type': 'tool_call_started',
+        'id': 't1',
+        'name': 'read_file',
+        'arguments': '{"path":"lib/a.rs"}',
+      });
+      state.applyEvent({
+        'type': 'tool_call_completed',
+        'id': 't1',
+        'ok': true,
+        'preview': 'fn a() {}',
+      });
+
+      expect(state.timeline.map((item) => item.kind), [
+        TimelineKind.tool,
+        TimelineKind.toolResult,
+      ]);
+      expect(state.timeline.first.title, '读取文件');
+      expect(state.transcript, isEmpty);
+    });
+
+    test('plan_updated is a timeline row rather than an unknown event', () {
+      final state = SessionState('s1');
+      state.applyEvent({
+        'type': 'plan_updated',
+        'plan': {
+          'steps': [
+            {'title': 'one'},
+            {'title': 'two'},
+          ],
+        },
+      });
+
+      expect(state.unknownEvents, isEmpty);
+      expect(state.timeline.single.kind, TimelineKind.plan);
+      expect(state.sawPlan, isTrue);
+    });
+
+    test('a finished turn inserts a status row', () {
+      final state = SessionState('s1');
+      state.applyEvent({'type': 'turn_completed'});
+      expect(state.timeline.single.kind, TimelineKind.status);
+      expect(state.timeline.single.title, '回合完成');
+      expect(state.status, 'idle');
     });
 
     test('a delta for a message we never saw start is kept but marked suspect', () {

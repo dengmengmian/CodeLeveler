@@ -52,6 +52,30 @@ class Commands {
         'attachments': attachments,
       };
 
+  /// Inject text at the top of the next round of a turn that is already
+  /// running. The host ignores this when nothing is running and the caller
+  /// should [submitMessage] in that case — see [forComposer].
+  static Map<String, dynamic> steerCurrentTurn({
+    required String sessionId,
+    required String content,
+  }) =>
+      {
+        'type': 'steer_current_turn',
+        'session_id': sessionId,
+        'content': content,
+      };
+
+  /// What the composer should send: a steer while a turn is live, otherwise a
+  /// new message. Idle behaviour is unchanged.
+  static Map<String, dynamic> forComposer({
+    required String sessionId,
+    required String content,
+    required bool turnRunning,
+  }) =>
+      turnRunning
+          ? steerCurrentTurn(sessionId: sessionId, content: content)
+          : submitMessage(sessionId: sessionId, content: content);
+
   static Map<String, dynamic> cancelCurrentTurn(String sessionId) =>
       {'type': 'cancel_current_turn', 'session_id': sessionId};
 

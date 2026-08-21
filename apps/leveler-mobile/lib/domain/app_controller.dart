@@ -21,7 +21,9 @@ import '../protocol/commands.dart';
 import '../protocol/envelope.dart';
 import '../protocol/pairing.dart';
 import '../protocol/wire.dart';
+import 'artifact.dart';
 import 'session_state.dart';
+import 'task_status.dart';
 
 /// One session in a project, as the list shows it.
 class SessionSummary {
@@ -36,6 +38,8 @@ class SessionSummary {
   final String goal;
   final String status;
   final String updatedAt;
+
+  TaskStatus get taskStatus => deriveTaskStatus(status: status);
 
   static SessionSummary fromJson(Map<String, dynamic> json) => SessionSummary(
         id: json['id'] as String? ?? '',
@@ -94,9 +98,37 @@ class AppController extends ChangeNotifier {
   String? currentProjectId;
   SessionState? session;
 
+  /// Running / waiting tasks across projects we have already opened.
+  List<(ProjectSummary, SessionSummary)> get runningTasks {
+    final out = <(ProjectSummary, SessionSummary)>[];
+    for (final project in projects) {
+      for (final session in sessionsByProject[project.id] ?? const <SessionSummary>[]) {
+        if (session.taskStatus == TaskStatus.running ||
+            session.taskStatus == TaskStatus.planning ||
+            session.taskStatus == TaskStatus.waitingApproval ||
+            session.taskStatus == TaskStatus.waitingInput) {
+          out.add((project, session));
+        }
+      }
+    }
+    return out;
+  }
+
+  List<(ProjectSummary, SessionSummary)> get waitingTasks => runningTasks
+      .where(
+        (row) =>
+            row.$2.taskStatus == TaskStatus.waitingApproval ||
+            row.$2.taskStatus == TaskStatus.waitingInput,
+      )
+      .toList();
+
   /// Sessions in the project currently open, newest activity first.
   List<SessionSummary> sessions = [];
   bool sessionsLoading = false;
+
+  /// Last session list seen per project, so Home can show running tasks
+  /// without a new protocol.
+  final Map<String, List<SessionSummary>> sessionsByProject = {};
 
   /// Commands sent but not yet acknowledged, oldest first.
   ///
@@ -308,6 +340,7 @@ class AppController extends ChangeNotifier {
 
   /// The host's open projects.
   Future<void> loadProjects() async {
+    if (!isPaired) return;
     connection = LinkState.connecting;
     lastError = null;
     notifyListeners();
@@ -486,6 +519,10 @@ class AppController extends ChangeNotifier {
                   .map((raw) => SessionSummary.fromJson(raw as Map<String, dynamic>))
                   .toList(growable: false);
               sessionsLoading = false;
+              final projectId = currentProjectId;
+              if (projectId != null) {
+                sessionsByProject[projectId] = sessions;
+              }
             }
             session?.applyEvent(runtimeEvent);
           case SnapshotMessage(session: final snapshot):
@@ -539,10 +576,56 @@ class AppController extends ChangeNotifier {
     await _send(SnapshotRequest(current.sessionId));
   }
 
+  /// Load a registered attachment by sha256 over the signed RPC.
+  ///
+  /// Does not open workspace paths. Missing host support surfaces as an error,
+  /// not an empty success.
+  Future<List<int>> fetchAttachment(Artifact artifact) async {
+    final sha = artifact.sha256.trim();
+    if (sha.isEmpty) {
+      throw StateError('这个产物没有内容地址，无法下载。');
+    }
+    if (pairing == null || _relay == null) {
+      throw StateError('还没有连接到开发机。');
+    }
+    final collected = <int>[];
+    var index = 0;
+    var total = 1;
+    while (index < total) {
+      final body = await _rpc(
+        'fetch_attachment',
+        projectId: currentProjectId,
+        body: {'sha256': sha, 'chunk_index': index},
+      );
+      total = (body['chunk_total'] as num?)?.toInt() ?? 1;
+      if (total < 1) total = 1;
+      final chunk = body['data_base64'] as String? ?? '';
+      if (chunk.isNotEmpty) {
+        collected.addAll(base64Decode(chunk));
+      }
+      index += 1;
+      if (index > 64) {
+        throw StateError('产物分片过多，已停止。');
+      }
+    }
+    return collected;
+  }
+
   Future<void> submit(String text) async {
     final current = session;
     if (current == null || text.trim().isEmpty) return;
-    await _deliver(Commands.submitMessage(sessionId: current.sessionId, content: text));
+    if (isObserveOnly) {
+      lastError = '这台设备是只读配对，不能发送指令。';
+      notifyListeners();
+      return;
+    }
+    final running = current.status == 'running';
+    if (running) current.noteLocalUser(text);
+    await _deliver(Commands.forComposer(
+      sessionId: current.sessionId,
+      content: text,
+      turnRunning: running,
+    ));
   }
 
   Future<void> cancelTurn() async {

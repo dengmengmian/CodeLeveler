@@ -82,15 +82,15 @@ ThemeData levelerTheme(Brightness brightness) {
       fillColor: scheme.surfaceContainerLowest,
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(22),
+        borderRadius: BorderRadius.circular(12),
         borderSide: BorderSide(color: scheme.outlineVariant),
       ),
       enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(22),
+        borderRadius: BorderRadius.circular(12),
         borderSide: BorderSide(color: scheme.outlineVariant),
       ),
       focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(22),
+        borderRadius: BorderRadius.circular(12),
         borderSide: BorderSide(color: scheme.primary, width: 1.5),
       ),
     ),

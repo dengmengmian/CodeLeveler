@@ -1,4 +1,4 @@
-/// The conversation, and the approvals that interrupt it.
+/// The agent timeline, and the approvals that interrupt it.
 ///
 /// Two things this screen deliberately does not offer:
 ///
@@ -12,12 +12,16 @@
 library;
 
 import 'package:flutter/material.dart';
-import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../domain/app_controller.dart';
+import '../domain/artifact.dart';
 import '../domain/session_state.dart';
+import 'artifact_preview.dart';
 import 'common.dart';
 import '../protocol/commands.dart';
+import 'task_detail_screen.dart';
+import 'task_header.dart';
+import 'timeline.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key, required this.controller});
@@ -84,22 +88,10 @@ class _ChatScreenState extends State<ChatScreen> {
               icon: const Icon(Icons.arrow_back),
               onPressed: () => controller.closeSession(),
             ),
-            title: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  session.goal.isEmpty ? '会话' : session.goal,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                if (session.status == 'running')
-                  Text(
-                    '运行中…',
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                  ),
-              ],
+            title: Text(
+              session.goal.isEmpty ? '任务' : session.goal,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
             actions: [
               if (session.status == 'running')
@@ -114,6 +106,14 @@ class _ChatScreenState extends State<ChatScreen> {
           body: Column(
             children: [
               StatusBanner(controller: controller),
+              TaskHeader(
+                session: session,
+                onOpen: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => TaskDetailScreen(controller: controller),
+                  ),
+                ),
+              ),
               if (session.needsResync)
                 const Material(
                   child: Padding(
@@ -126,48 +126,31 @@ class _ChatScreenState extends State<ChatScreen> {
                 // per-bubble SelectableText claims the vertical drag for
                 // selecting, so the list would not scroll under a mouse at all.
                 child: SelectionArea(
-                  child: session.transcript.isEmpty
+                  child: session.timeline.isEmpty
                       ? _EmptySession(goal: session.goal)
-                      // Reversed, which is what makes a short conversation sit
-                      // against the composer instead of floating at the top of
-                      // an empty screen. It also puts "the newest message" at
-                      // offset zero, so following the tail is a scroll to 0.
+                      // Reversed, so a short timeline sits against the composer
+                      // and "the newest row" is offset zero.
                       : ListView.builder(
                           controller: _scroll,
                           reverse: true,
-                          padding: const EdgeInsets.all(12),
-                          itemCount: session.transcript.length,
-                          itemBuilder: (context, index) => _Bubble(
-                            entry: session.transcript[session.transcript.length - 1 - index],
-                          ),
+                          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                          itemCount: session.timeline.length,
+                          itemBuilder: (context, index) {
+                            final item = session.timeline[session.timeline.length - 1 - index];
+                            final artifact = item.kind == TimelineKind.attachment
+                                ? _artifactById(session, item.id)
+                                : null;
+                            return TimelineRow(
+                              item: item,
+                              artifact: artifact,
+                              onOpenArtifact: artifact == null
+                                  ? null
+                                  : () => _openArtifact(context, artifact, controller),
+                            );
+                          },
                         ),
                 ),
               ),
-              if (session.activity != null)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 2, 20, 6),
-                  child: Row(
-                    children: [
-                      SizedBox(
-                        width: 12,
-                        height: 12,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          session.activity!,
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: Theme.of(context).colorScheme.onSurfaceVariant,
-                              ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
               if (clarification != null)
                 _ClarificationCard(
                   clarification: clarification,
@@ -210,15 +193,15 @@ class _EmptySession extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.chat_bubble_outline, size: 36, color: theme.colorScheme.outline),
+            Icon(Icons.task_alt_outlined, size: 36, color: theme.colorScheme.outline),
             const SizedBox(height: 16),
             Text(
-              goal.isEmpty ? '还没有开始' : '会话已经建好了',
+              goal.isEmpty ? '还没有开始' : '任务已经建立',
               style: theme.textTheme.titleSmall,
             ),
             const SizedBox(height: 6),
             Text(
-              '在下面说点什么，电脑就会开始做。',
+              '电脑会开始执行。你可以在下方追加要求。',
               textAlign: TextAlign.center,
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
@@ -231,86 +214,22 @@ class _EmptySession extends StatelessWidget {
   }
 }
 
-class _Bubble extends StatelessWidget {
-  const _Bubble({required this.entry});
-  final TranscriptEntry entry;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    if (entry.role == 'notice') return _Notice(text: entry.text);
-    final mine = entry.role == 'user';
-    return Align(
-      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 5),
-        padding: EdgeInsets.symmetric(horizontal: 15, vertical: mine ? 11 : 9),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.82),
-        decoration: BoxDecoration(
-          color: mine
-              ? theme.colorScheme.primaryContainer
-              : theme.colorScheme.surfaceContainerHighest,
-          // A squared-off corner on the speaker's side, which is what makes a
-          // bubble look anchored to whoever said it rather than floating.
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(mine ? 16 : 4),
-            bottomRight: Radius.circular(mine ? 4 : 16),
-          ),
-        ),
-        // The assistant answers in Markdown — headings, bold, fenced code — and
-        // showing the source of that is showing the wrong thing. What the user
-        // types is not Markdown, so it stays literal.
-        child: mine
-            ? Text(entry.text)
-            : MarkdownBody(
-                data: entry.text,
-                selectable: false,
-                styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
-                  p: theme.textTheme.bodyMedium,
-                  code: theme.textTheme.bodySmall?.copyWith(
-                    fontFamily: 'monospace',
-                    backgroundColor: theme.colorScheme.surface,
-                  ),
-                  codeblockDecoration: BoxDecoration(
-                    color: theme.colorScheme.surface,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                ),
-              ),
-      ),
-    );
+Artifact? _artifactById(SessionState session, String id) {
+  for (final artifact in session.artifacts) {
+    if (artifact.id == id) return artifact;
   }
+  return null;
 }
 
-/// Something the host said that is not part of the conversation — a warning, a
-/// failure, a note. Centred and quiet, so it reads as an aside rather than as
-/// the assistant speaking.
-class _Notice extends StatelessWidget {
-  const _Notice({required this.text});
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(Icons.info_outline, size: 15, color: theme.colorScheme.outline),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              text,
-              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.outline),
-            ),
-          ),
-        ],
+void _openArtifact(BuildContext context, Artifact artifact, AppController controller) {
+  Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (_) => ArtifactPreviewPage(
+        artifact: artifact,
+        onFetch: () => controller.fetchAttachment(artifact),
       ),
-    );
-  }
+    ),
+  );
 }
 
 class _ApprovalCard extends StatelessWidget {
@@ -500,7 +419,12 @@ class _Composer extends StatelessWidget {
               maxLines: 5,
               textInputAction: TextInputAction.send,
               onSubmitted: (_) => onSend(),
-              decoration: const InputDecoration(hintText: '说点什么…', isDense: true),
+              decoration: InputDecoration(
+                hintText: controller.session?.status == 'running'
+                    ? '干预当前回合（立刻生效）'
+                    : '追加要求…',
+                isDense: true,
+              ),
             ),
           ),
           const SizedBox(width: 10),
