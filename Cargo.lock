@@ -2014,6 +2014,7 @@ name = "leveler-local-transport"
 version = "0.1.4"
 dependencies = [
  "async-trait",
+ "base64",
  "fs2",
  "leveler-client-protocol",
  "leveler-model",

@@ -41,6 +41,10 @@ pub enum MediaError {
     TooManyPixels(u64),
     #[error("decode error: {0}")]
     Decode(String),
+    #[error("attachment not found")]
+    NotFound,
+    #[error("invalid attachment id")]
+    InvalidId,
 }
 
 /// A supported input image type.
@@ -212,9 +216,83 @@ impl MediaStore {
     /// Load a stored image as `(mime_type, base64)` for a provider request.
     /// Base64 is produced here, at the request boundary, and never logged.
     pub fn load_base64(&self, sha256: &str) -> Result<(String, String), MediaError> {
-        let path = self.root.join(format!("{sha256}.png"));
-        let bytes = fs::read(&path).map_err(|e| MediaError::Io(e.to_string()))?;
-        Ok(("image/png".to_string(), BASE64.encode(bytes)))
+        let (mime, bytes) = self.load_bytes(sha256)?;
+        Ok((mime, BASE64.encode(bytes)))
+    }
+
+    /// Store non-image bytes under their content hash. Images still go through
+    /// [`Self::import_bytes`] so they stay decoded, bounded, and EXIF-stripped.
+    ///
+    /// The phone fetches by this same hash; this is not a second filesystem.
+    pub fn put_blob(&self, bytes: &[u8], mime_type: &str) -> Result<(String, u64), MediaError> {
+        let len = bytes.len() as u64;
+        if len > MAX_IMAGE_BYTES {
+            return Err(MediaError::TooLarge(len));
+        }
+        let sha256 = hex(&Sha256::digest(bytes));
+        fs::create_dir_all(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+        let path = self.root.join(&sha256);
+        if !path.exists() {
+            fs::write(&path, bytes).map_err(|e| MediaError::Io(e.to_string()))?;
+            let mime = sanitize_mime(mime_type);
+            fs::write(self.root.join(format!("{sha256}.mime")), mime)
+                .map_err(|e| MediaError::Io(e.to_string()))?;
+        }
+        Ok((sha256, len))
+    }
+
+    /// Decode immutable base64 and [`Self::put_blob`].
+    pub fn put_base64(&self, encoded: &str, mime_type: &str) -> Result<(String, u64), MediaError> {
+        const MAX_ENCODED_BYTES: usize = (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+        if encoded.len() > MAX_ENCODED_BYTES {
+            return Err(MediaError::TooLarge(MAX_IMAGE_BYTES + 1));
+        }
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|error| MediaError::Decode(format!("invalid base64 attachment: {error}")))?;
+        self.put_blob(&bytes, mime_type)
+    }
+
+    /// Load processed bytes by content hash. `sha256` must be 64 lowercase hex
+    /// characters — anything else is refused before it touches the filesystem.
+    pub fn load_bytes(&self, sha256: &str) -> Result<(String, Vec<u8>), MediaError> {
+        if !is_sha256_hex(sha256) {
+            return Err(MediaError::InvalidId);
+        }
+        let png = self.root.join(format!("{sha256}.png"));
+        if png.is_file() {
+            let bytes = fs::read(&png).map_err(|e| MediaError::Io(e.to_string()))?;
+            return Ok(("image/png".to_string(), bytes));
+        }
+        let blob = self.root.join(sha256);
+        if blob.is_file() {
+            let mime = fs::read_to_string(self.root.join(format!("{sha256}.mime")))
+                .ok()
+                .map(|value| sanitize_mime(value.trim()))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let bytes = fs::read(&blob).map_err(|e| MediaError::Io(e.to_string()))?;
+            return Ok((mime, bytes));
+        }
+        Err(MediaError::NotFound)
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn sanitize_mime(mime: &str) -> String {
+    let trimmed = mime.trim();
+    if trimmed.len() <= 80
+        && trimmed
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'+' | b'-'))
+        && trimmed.contains('/')
+    {
+        trimmed.to_ascii_lowercase()
+    } else {
+        "application/octet-stream".to_string()
     }
 }
 
@@ -361,5 +439,37 @@ mod tests {
         assert_eq!(stored.mime_type, "image/png");
         assert_eq!(stored.width, 1);
         assert_eq!(stored.height, 1);
+    }
+
+    #[test]
+    fn put_blob_roundtrips_markdown_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let body = b"# review\n\npass\n";
+        let (sha, size) = store.put_blob(body, "text/markdown").unwrap();
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(sha.len(), 64);
+        let (mime, loaded) = store.load_bytes(&sha).unwrap();
+        assert_eq!(mime, "text/markdown");
+        assert_eq!(loaded, body);
+    }
+
+    #[test]
+    fn load_bytes_refuses_path_traversal_before_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let err = store.load_bytes("../passwd").unwrap_err();
+        assert!(matches!(err, MediaError::InvalidId));
+        let err = store.load_bytes("abc").unwrap_err();
+        assert!(matches!(err, MediaError::InvalidId));
+    }
+
+    #[test]
+    fn missing_hash_is_not_found_not_an_io_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let sha = "ab".repeat(32);
+        let err = store.load_bytes(&sha).unwrap_err();
+        assert!(matches!(err, MediaError::NotFound));
     }
 }

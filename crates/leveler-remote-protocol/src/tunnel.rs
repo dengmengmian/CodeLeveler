@@ -148,6 +148,8 @@ pub enum RpcMethod {
     CreateSession,
     Snapshot,
     UploadAttachment,
+    /// Load a registered attachment by sha256. Observe pairings may call this.
+    FetchAttachment,
 }
 
 /// The payload inside an `rpc_request` envelope.

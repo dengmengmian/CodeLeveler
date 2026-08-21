@@ -108,6 +108,15 @@ pub struct SessionBootstrap {
     pub context_window: u32,
 }
 
+/// Bytes of one registered attachment, loaded from the runtime media store.
+///
+/// Remote clients never see a filesystem path. The content hash is the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentBytes {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Runtime operations needed in addition to the stable interactive client
 /// contract when a daemon owns session creation.
 #[async_trait]
@@ -153,6 +162,19 @@ pub trait LocalRuntimeService: InteractiveRuntimeClient {
     async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
         Err(ClientError::Runtime(
             "runtime identity is not available on this service".to_string(),
+        ))
+    }
+
+    /// Load a registered attachment by its content hash.
+    ///
+    /// Default: unsupported. Production runtimes override. Callers must not
+    /// invent a second store or open workspace paths.
+    async fn fetch_attachment(
+        &self,
+        _sha256: &str,
+    ) -> Result<AttachmentBytes, ClientError> {
+        Err(ClientError::Runtime(
+            "fetch_attachment is not supported by this runtime".to_string(),
         ))
     }
 }
@@ -220,6 +242,10 @@ enum WireRequest {
     /// before this variant fails the request, which clients treat as
     /// "identity unknown", never as a fatal error.
     RuntimeInfo,
+    /// Load a registered attachment by sha256. A read: safe to retry.
+    FetchAttachment {
+        sha256: String,
+    },
     Subscribe {
         session_id: Option<SessionId>,
         /// Absent from clients built before remote control existed; `default`
@@ -245,6 +271,7 @@ impl WireRequest {
             | WireRequest::Snapshot { .. }
             | WireRequest::LocalWaiters
             | WireRequest::RuntimeInfo
+            | WireRequest::FetchAttachment { .. }
             // Idempotent per-session policy assertion — replaying it after a
             // transport failure converges to the same state.
             | WireRequest::AttachSessionPolicy { .. }
@@ -266,6 +293,10 @@ enum WireResponse {
     Event(RuntimeEvent),
     LocalWaiters(usize),
     RuntimeInfo(leveler_client_protocol::RuntimeInfo),
+    Attachment {
+        mime_type: String,
+        data_base64: String,
+    },
     Error(WireError),
 }
 
@@ -533,6 +564,20 @@ mod unix {
                 send_result(
                     &mut stream,
                     runtime.runtime_info().await.map(WireResponse::RuntimeInfo),
+                )
+                .await
+            }
+            WireRequest::FetchAttachment { sha256 } => {
+                send_result(
+                    &mut stream,
+                    runtime.fetch_attachment(&sha256).await.map(|blob| {
+                        use base64::Engine as _;
+                        WireResponse::Attachment {
+                            mime_type: blob.mime_type,
+                            data_base64: base64::engine::general_purpose::STANDARD
+                                .encode(&blob.bytes),
+                        }
+                    }),
                 )
                 .await
             }
@@ -964,6 +1009,32 @@ mod unix {
                 .map_err(transport_client_error)?
             {
                 WireResponse::RuntimeInfo(info) => Ok(info),
+                WireResponse::Error(error) => Err(error.into_client_error()),
+                response => Err(unexpected_response(response)),
+            }
+        }
+
+        async fn fetch_attachment(
+            &self,
+            sha256: &str,
+        ) -> Result<AttachmentBytes, ClientError> {
+            match self
+                .request(WireRequest::FetchAttachment {
+                    sha256: sha256.to_string(),
+                })
+                .await
+                .map_err(transport_client_error)?
+            {
+                WireResponse::Attachment {
+                    mime_type,
+                    data_base64,
+                } => {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data_base64.as_bytes())
+                        .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                    Ok(AttachmentBytes { mime_type, bytes })
+                }
                 WireResponse::Error(error) => Err(error.into_client_error()),
                 response => Err(unexpected_response(response)),
             }
