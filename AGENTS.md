@@ -13,6 +13,7 @@ file is not.
 | `docs/ARCHITECTURE.md` | Crate layout and how a turn flows through the system (`docs/ARCHITECTURE.zh-CN.md` is the Chinese version) |
 | `docs/STABILITY.md` | Draft compatibility tiers, with recommended answers awaiting maintainer sign-off — read before touching CLI flags or config schema |
 | `evals/README.md` | Required before adding evaluation cases |
+| `docs/MOBILE_FREEZE.md` | Mobile client is frozen at tag `mobile-beta-mvp` — no Push / fleet / voice / rewrite until real Beta users |
 
 `CONTRIBUTING.md` already states the three rules most often gotten wrong:
 library crates expose typed errors, `anyhow` stays at application boundaries

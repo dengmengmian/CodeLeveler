@@ -6,6 +6,15 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Mobile Beta MVP (`apps/leveler-mobile`, tag `mobile-beta-mvp`): workspace
+  Home, agent timeline, `steer_current_turn` while a turn is running,
+  artifact cards/preview, and signed `fetch_attachment` (sha256 → media
+  store, no public URL). Task Detail is a projection of the open session.
+  **Further Mobile feature work is frozen** until real Beta users have used
+  this loop; see `docs/MOBILE_FREEZE.md`. Security and pairing fixes remain
+  in scope.
+
 ### Fixed
 - After a user denies a permission request, the harness no longer auto-nudges
   or `DriveGoalAgain` past that boundary. The agent can still adapt with
