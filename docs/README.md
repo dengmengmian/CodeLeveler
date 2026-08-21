@@ -14,6 +14,8 @@
 | [../README.zh-CN.md](../README.zh-CN.md) | Everyone (中文) | Chinese entry |
 | [evaluations/README.md](evaluations/README.md) | Contributors | Eval framework: capability `evals/` vs observer `eval/` |
 | [eval-methodology.md](eval-methodology.md) | Contributors | Adoption vs safety denominators; what counts as a spawn |
+| [MOBILE_UI_UX_CLOSURE.md](MOBILE_UI_UX_CLOSURE.md) | Contributors | Mobile UI/UX closure: workspace, not chat (v1.0) |
+| [MOBILE_UI_UX_CLOSURE.zh-CN.md](MOBILE_UI_UX_CLOSURE.zh-CN.md) | Contributors (中文) | 同上 |
 
 ## Config layers (quick)
 

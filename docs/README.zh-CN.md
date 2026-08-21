@@ -13,6 +13,7 @@
 | [../README.zh-CN.md](../README.zh-CN.md) | 所有人 | 中文入口 |
 | [../README.md](../README.md) | 所有人 | 英文入口 |
 | [evaluations/README.zh-CN.md](evaluations/README.zh-CN.md) | 贡献者 | 评测框架：能力 `evals/` vs 观察层 `eval/` |
+| [MOBILE_UI_UX_CLOSURE.zh-CN.md](MOBILE_UI_UX_CLOSURE.zh-CN.md) | 贡献者 | Mobile UI/UX 收口：工作台，不是聊天 App |
 
 ## 配置分几层
 
