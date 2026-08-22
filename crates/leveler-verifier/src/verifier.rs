@@ -938,6 +938,14 @@ mod toolchain_provenance_tests {
             eprintln!("skipping: cargo is not on PATH");
             return;
         }
+        // A cargo that cannot start (no writable rustup home on this host, as
+        // on the Windows runner) never gets far enough to read the
+        // requirement. That is a fact about the machine, and asserting the
+        // attribution against it would be asserting nothing.
+        if !check.evidence.contains("99.0") && check.evidence.contains("home directory") {
+            eprintln!("skipping: cargo cannot start here: {}", check.evidence);
+            return;
+        }
         assert_eq!(
             check.status,
             CheckStatus::EnvironmentUnavailable,
@@ -981,6 +989,13 @@ mod toolchain_provenance_tests {
         let check = &report.checks[0];
         if check.status == CheckStatus::ToolMissing {
             eprintln!("skipping: go is not on PATH");
+            return;
+        }
+        // Same as the cargo case: if the toolchain probe could not read a
+        // version on this host, the requirement was never compared and there
+        // is no attribution to assert.
+        if !check.evidence.contains("go.mod") && check.evidence.contains("Usage:") {
+            eprintln!("skipping: go could not report a version here");
             return;
         }
         assert_eq!(

@@ -95,6 +95,11 @@ pub fn classify(kind: CheckKind, output: &str) -> ClassifiedFailure {
         || lower.contains("out of memory")
         || lower.contains("cannot allocate memory")
         || lower.contains("killed: 9")
+        // a toolchain that cannot even start: rustup/cargo refusing because its
+        // home is not creatable is a fact about the machine, never about the
+        // tree being verified (seen on a Windows runner whose profile
+        // directory the sandbox could not create).
+        || lower.contains("could not create home directory")
         // tooling the environment does not provide
         || lower.contains("executable not found")
         || lower.contains("externally-managed-environment")
@@ -203,6 +208,23 @@ mod tests {
     /// limits of the machine, not defects in the agent's (correct) fix. The
     /// run was nonetheless recorded `failed`. A correct deliverable must not
     /// be blamed on the environment it happened to run in.
+    #[test]
+    fn a_toolchain_that_cannot_create_its_home_is_environment_not_code() {
+        let out = "error: could not create home directory: \
+                   'C:\\Users\\runneradmin\\.rustup'";
+        let classified = classify(CheckKind::Build, out);
+        assert_eq!(
+            classified.kind,
+            FailureKind::EnvironmentFailure,
+            "a compiler that cannot start says nothing about the code: {}",
+            classified.summary
+        );
+        assert_eq!(
+            classified.suggested_recovery,
+            RecoveryStrategy::StopAndReport
+        );
+    }
+
     #[test]
     fn resource_and_missing_global_tooling_are_environment_failures() {
         let cases = [

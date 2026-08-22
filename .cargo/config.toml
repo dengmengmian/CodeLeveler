@@ -19,3 +19,15 @@ c-perm = "check -p leveler-execution -p leveler-agent -p leveler-cli -p leveler-
 # Definition of done (slow — run once before push)
 dod-test = "test --workspace"
 dod-clippy = "clippy --workspace --all-targets --all-features -- -D warnings"
+
+# Windows gives the main thread a 1 MB stack where Unix gives 8 MB, and that
+# difference is not academic: `leveler completions bash` overflowed it in CI
+# (`thread 'main' has overflowed its stack`) generating the script from clap's
+# command tree. Reserve the Unix figure so a recursive walk over the CLI
+# definition behaves the same on every platform. Applies to the binaries this
+# workspace builds, including the release artifacts.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

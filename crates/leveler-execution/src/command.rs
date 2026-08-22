@@ -291,6 +291,10 @@ pub(crate) fn sandbox_command_read_only(
 /// Test-facing entry: the production callers all go through
 /// [`sandbox_command_read_only`], which carries the pre-claim switch.
 #[cfg(test)]
+// Every caller is a test, and on Windows every one of those tests is gated out:
+// read denials are a seatbelt rule with no Windows equivalent (confinement
+// there is AppContainer, not an argv wrapper).
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn sandbox_command_with_read_denials(
     program: &str,
     args: &[String],
@@ -1029,14 +1033,18 @@ impl CommandRunner {
 /// Windows: Unrestricted → Job Object only; restricted intents → AppContainer FS.
 #[cfg(windows)]
 /// `chunks` is the live-output sender that `run_observed` (the user shell's
-/// `!command` view) passes down. The Job Object path reads its pipes exactly
-/// like Unix does, so it streams. The AppContainer path does not: `rappct`
-/// hands back synchronous readers, and giving it a live view means restructuring
-/// that launcher rather than threading one argument. So on Windows a confined
-/// command (`ReadOnly` / `WorkspaceWrite`, i.e. anything below full access)
-/// delivers its output when it finishes instead of as it arrives. The sender is
-/// dropped here deliberately, and dropping it closes the channel — the consumer
-/// sees "no live view", never a stall waiting for chunks that will not come.
+/// `!command` view) passes down.
+///
+/// The Job Object path reads its pipes exactly like Unix does, so it streams.
+/// The AppContainer path cannot: `rappct` hands back synchronous readers, and
+/// giving it a live view means restructuring that launcher rather than threading
+/// one argument. It therefore emits the whole output **once, at the end**.
+///
+/// Emitting it matters more than it looks. A consumer of this channel — the
+/// `!command` view — builds what the user reads from chunks alone, so a
+/// confined command that sent none would print nothing at all, not merely
+/// "nothing yet". The difference between a late view and no view is the
+/// difference between a slow feature and a broken one.
 async fn run_windows_dispatch(
     request: ProcessRequest,
     intent: crate::windows_sandbox::FilesystemIntent,
@@ -1052,8 +1060,7 @@ async fn run_windows_dispatch(
             run_with_windows_job(request, program, args, cancellation, &environment, chunks).await
         }
         FilesystemIntent::ReadOnly { .. } | FilesystemIntent::WorkspaceWrite { .. } => {
-            drop(chunks);
-            crate::windows_appcontainer::run_appcontainer(
+            let result = crate::windows_appcontainer::run_appcontainer(
                 request,
                 intent,
                 program,
@@ -1061,7 +1068,21 @@ async fn run_windows_dispatch(
                 cancellation,
                 environment,
             )
-            .await
+            .await;
+            if let (Some(tx), Ok(output)) = (chunks.as_ref(), result.as_ref()) {
+                for (stream, text) in [
+                    (OutputStream::Stdout, &output.stdout),
+                    (OutputStream::Stderr, &output.stderr),
+                ] {
+                    if !text.is_empty() {
+                        let _ = tx.send(OutputChunk {
+                            stream,
+                            text: text.clone(),
+                        });
+                    }
+                }
+            }
+            result
         }
     }
 }
@@ -3297,6 +3318,10 @@ mod tests {
 
     /// Without declared denials the profile is byte-for-byte what it was:
     /// production reads stay unrestricted, and this change is inert there.
+    /// Unix only: it reads the wrapper's policy argument, and on a platform
+    /// that confines through AppContainer rather than an argv wrapper there is
+    /// no such argument to read.
+    #[cfg(unix)]
     #[test]
     fn no_declared_denials_leaves_the_read_policy_untouched() {
         let root = std::path::Path::new("/tmp");
@@ -3326,6 +3351,12 @@ mod tests {
 
     /// The denial list comes from the environment so only a harness that opts
     /// in gets it; an unset or empty variable means "no denials".
+    ///
+    /// Unix-shaped by construction: colon-separated, POSIX-absolute, exactly
+    /// like `PATH`. On Windows `:` is the drive separator and `/a/b` is not an
+    /// absolute path, so the format itself does not apply — and neither does
+    /// the seal, which no non-macOS backend enforces.
+    #[cfg(unix)]
     #[test]
     fn declared_read_denials_are_parsed_from_the_environment_value() {
         assert!(parse_read_denials(None).is_empty());

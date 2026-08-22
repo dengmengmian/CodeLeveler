@@ -521,12 +521,15 @@ impl Approver for ApproveOnceHuman {
 /// durable before the command runs.
 #[tokio::test]
 async fn approval_resolution_is_durable_before_dispatch() {
+    // Deleting a directory tree, spelled the way the host spells it. The
+    // barrier under test is platform-neutral; `rm -rf` is not.
+    let remove_tree = if cfg!(windows) {
+        serde_json::json!({"program": "cmd", "args": ["/C", "rmdir", "/s", "/q", "scratch"]})
+    } else {
+        serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]})
+    };
     let h = harness(vec![
-        tool_call(
-            "c1",
-            "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
-        ),
+        tool_call("c1", "run_command", remove_tree),
         text("removed"),
     ])
     .await;

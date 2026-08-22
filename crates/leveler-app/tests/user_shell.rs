@@ -272,7 +272,10 @@ async fn hard_gate_shell_output_never_enters_model_context() {
 async fn shell_runs_in_the_repository_root() {
     let server = MockServer::start(vec![sse_text("unused")]).await;
     let mut h = harness(&server).await;
-    h.client.send(run_shell(&h, "pwd")).await.unwrap();
+    // `pwd` is not a command on Windows; `cd` with no argument is how cmd
+    // prints the working directory. The property is the same either way.
+    let print_cwd = if cfg!(windows) { "cd" } else { "pwd" };
+    h.client.send(run_shell(&h, print_cwd)).await.unwrap();
     let events = wait_for_exit(&mut h).await;
     let repo = h._tmp.path().canonicalize().unwrap();
     let output: String = events
@@ -402,7 +405,14 @@ async fn busy_agent_turn_rejects_a_user_shell_without_side_effects() {
 async fn snapshot_restores_active_shell_with_elapsed() {
     let server = MockServer::start(vec![sse_text("unused")]).await;
     let mut h = harness(&server).await;
-    h.client.send(run_shell(&h, "sleep 5")).await.unwrap();
+    // Something that stays alive for a few seconds on either platform. cmd has
+    // no `sleep`; `ping -n` is the portable stand-in that needs no console.
+    let stay_alive = if cfg!(windows) {
+        "ping -n 6 127.0.0.1"
+    } else {
+        "sleep 5"
+    };
+    h.client.send(run_shell(&h, stay_alive)).await.unwrap();
     // Started…
     loop {
         let ev = tokio::time::timeout(Duration::from_secs(10), h.events.recv())
@@ -421,7 +431,7 @@ async fn snapshot_restores_active_shell_with_elapsed() {
         .iter()
         .find(|s| s.status == "running")
         .expect("active user shell rides the snapshot");
-    assert_eq!(shell.command, "sleep 5");
+    assert_eq!(shell.command, stay_alive);
     assert!(shell.elapsed_secs >= 1, "elapsed does not reset");
     // Clean up: cancel it.
     h.client
