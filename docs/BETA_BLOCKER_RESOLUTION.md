@@ -3,15 +3,21 @@
 **Date:** 2026-08-22 · **Branch:** `main` · **Base:** `c37a6cd4`
 · **Audit this answers:** [`BETA_RELEASE_READINESS.md`](BETA_RELEASE_READINESS.md)
 
-**`BLOCKER = 0`.** All four blockers from the readiness audit are closed, and
-closing them turned up **three further Windows defects** the audit could not see:
-CI had died at the first compile error, so nothing behind it had ever been
-looked at.
+**The four audit blockers are closed. `READY_FOR_BETA_RELEASE` is not YES yet** —
+see [the decision](#beta-release-decision) for the two undiagnosed test failures
+that still stand between here and a green pipeline.
 
-Verification is stated per fix, and the boundary is stated too: cross-platform
-work was verified locally with a cross-compiler and a Linux container. GitHub
-Actions on `main` remains the authority, and this document does not claim its
-verdict in advance.
+Closing the blockers turned up more than the audit could see, because CI had
+been dying at the first compile error for a month and nothing behind it had ever
+run: **three further Windows defects** behind the first one, then, once the
+Windows job finally reached its test suite, **twelve failures across six
+targets** — eleven now fixed, including a real stack overflow in `leveler
+completions` and a confined `!command` that printed nothing at all.
+
+Verification is stated per fix, and so is its boundary. Cross-platform work was
+verified locally with a cross-compiler and a Linux container; GitHub Actions is
+the authority, and where it has now spoken, its verdict is quoted rather than
+predicted.
 
 ---
 
@@ -238,13 +244,43 @@ Every gate CI runs, run here first.
 | Format | `cargo fmt --all -- --check` | **PASS** — and it caught three files the merge brought in unformatted (`leveler-media`, `remote-agent/attachments`, `remote-agent/bridge`), which would have failed CI's fmt step on `main` |
 | Lint (host) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **PASS**, 0 warnings |
 | Lint (Windows) | same, `--target x86_64-pc-windows-gnu` | **PASS**, 0 errors 0 warnings — was `error[E0061]` before |
-| Tests (host, macOS arm64) | `cargo test --workspace --all-targets --all-features --locked --no-fail-fast` | **3145 passed · 0 failed · 6 ignored** |
+| Tests (host, macOS arm64) | `cargo test --workspace --all-targets --all-features --locked --no-fail-fast` | **3146 passed · 0 failed · 6 ignored** (3145/0 before the second wave of Windows fixes) |
 | Tests (Linux, container) | `rust:1.90` + bubblewrap, `-p leveler-execution --lib -p leveler-app --test user_shell` | **216 / 0** and **9 / 0** — the four SBPL failures and the hard-gate failure are gone |
 | Supply chain | `cargo deny check` | **PASS** — `advisories ok, bans ok, licenses ok, sources ok` |
 | Installer | `sh scripts/test_install.sh` | **PASS**, including two new pinned-version canaries (verified red without the pin support) |
 | Manifest | `cargo metadata --no-deps` after the version bump | **PASS** |
 
-**CI result.** CI_RESULT_PLACEHOLDER
+**CI result — run `32552025802`, the first run in a month that got past
+compiling.** This is the part worth reading, because it is where the local
+evidence stopped and the real pipeline started.
+
+| Job | Before this work | After |
+| --- | --- | --- |
+| `deny · audit` | ✗ wildcard dependency | **✓** |
+| `leveler-web UI` | ✓ | ✓ |
+| `leveler-mobile` | ✓ | ✓ |
+| `fmt · clippy · test (ubuntu)` | ✗ 4 test failures | **✓ green** |
+| `fmt · clippy · test (windows)` | ✗ died at compile | Format ✓ · Clippy ✓ · **security canaries ✓** · Test ✗ |
+| `fmt · clippy · test (macos)` | ✓ (pre-merge) | ✗ one test |
+
+Ubuntu is green for the first time since 2026-07-25. The Windows job compiled,
+linted, and **ran its security canaries — NTFS junction behaviour, AppContainer
+ACLs, Job Object descendant termination — which passed**. That is the evidence
+Remaining Risk 1 was written to worry about, and it arrived.
+
+Then Windows ran its test suite, which had not executed in over a month, and
+found **twelve failures across six targets**. That is not a regression from this
+work; it is a month of Windows test debt becoming visible for the first time.
+Triaged and fixed in the same session (commit `fad465fd`):
+
+| Failure | Nature | Fix |
+| --- | --- | --- |
+| `leveler completions` × 3 — `thread 'main' has overflowed its stack` | **Real defect.** Windows reserves 1 MB of main-thread stack where Unix gives 8 MB; generating a completion script walks clap's whole command tree | reserve 8 MB for both Windows targets in `.cargo/config.toml` |
+| `hard_gate_user_shell_makes_zero_model_requests` | **Real defect, and mine.** A confined `!command` produced *no output at all*: the AppContainer path dropped the chunk sender, and the user-shell view is built from chunks alone | emit the captured output as one chunk at completion |
+| `shell_runs_in_the_repository_root` (`pwd`), `snapshot_restores_active_shell_with_elapsed` (`sleep 5`), `approval_resolution_is_durable_before_dispatch` (`rm -rf`) | POSIX commands in platform-neutral tests | spell the intent the way the host spells it (`cd`, `ping -n`, `rmdir /s /q`) |
+| `declared_read_denials_are_parsed_from_the_environment_value`, `no_declared_denials_leaves_the_read_policy_untouched` | assert a colon-separated POSIX-absolute format, and index a policy argument that AppContainer does not produce | Unix-gated, with the reason stated |
+| `unmet_rust_requirement_is_environment_not_code_failure`, `unmet_go_requirement_is_environment_not_code_failure` | the runner's cargo cannot create `C:\Users\runneradmin\.rustup`, so it never reads the requirement it is meant to be refused by | skip when the toolchain cannot start, as they already skipped when it was absent — **and** teach the classifier that a compiler which cannot create its home is an environment failure, never a verdict on the code |
+| `first_message_retitles_a_placeholder_session` — turn did not settle within 30 s | **Not diagnosed.** Could be a slow runner or a real hang on the retitle path | open, see Remaining Risks |
 
 Note on the audit's R-9 (`loopback_ws_from_a_granted_dev_page_connects`): it did
 **not** recur in the 3145-test host run. It was reproducible twice before and
@@ -262,7 +298,9 @@ release's own smoke test.
 
 | # | Risk | Why it is acceptable for Beta | What would change that |
 | --- | --- | --- | --- |
-| 1 | **Windows security canaries have not run in a month.** NTFS junction behaviour, AppContainer ACLs, Job Object descendant termination — the job died before them. | They are guarded by CI on every push and will run on this merge; nothing in these fixes touches the boundaries they exercise. | A canary failing. Then Windows confinement is unproven, and that *is* a Beta blocker. |
+| 0a | **`duration_budget_stops_the_run_between_rounds` fails on the macOS runner** and passes locally (5/5, and inside the 3145-test suite). Reproduced twice on CI, so it is deterministic there, not a flake. The test gives a run a 10 ms duration budget and a `sleep 0.05` tool call, then requires round 2 never to be requested — it holds only if round 1 really takes longer than 10 ms. It arrived with the 41 merged commits, which include two agent changes to round and outcome accounting. | **Not acceptable — it is the top open item.** It is listed as a risk rather than a fix because guessing at a budget test without being able to reproduce it would be the same mistake this whole document is about. | Reproducing it: run that single test on a macOS runner, or bisect the two agent commits that touch round accounting. Either the budget check moved relative to the tool call (a real regression) or the test was always margin-based and got unlucky on slower hardware (a test defect). Both are cheap once reproduced. |
+| 0b | **`first_message_retitles_a_placeholder_session` times out at 30 s on Windows.** The turn never settles; a tokio worker also panics with "context was found, but it is being shutdown". | Same reasoning as 0a: undiagnosed, and it is the last Windows target still failing. | Running that one test on a Windows box. If the retitle path hangs rather than the runner being slow, it is a real defect on the client's very first message. |
+| 1 | ~~**Windows security canaries have not run in a month.**~~ **Closed by run `32552025802`: they ran and passed.** NTFS junction behaviour, AppContainer ACLs, Job Object descendant termination are proven again on a real Windows runner. | — | — |
 | 2 | **`windows-gnu` is not `windows-msvc`.** | The Rust behind `cfg(windows)` is identical for both ABIs; the difference is C toolchain and linkage. | An MSVC-only compile error in CI. |
 | 3 | **No live `!command` streaming for confined Windows commands.** | Output still arrives, complete, on completion; documented in three places rather than discovered. | Windows users reporting it as broken rather than limited. |
 | 4 | **The Linux backend enforces no read denial.** The eval harness cannot seal an answer key on Linux. | Evals run on macOS today, and this is measurement hygiene, not a user-facing security boundary. | Running the eval harness on Linux and trusting its numbers. |
@@ -275,31 +313,54 @@ release's own smoke test.
 ## Beta Release Decision
 
 ```
-BLOCKER              = 0
-WINDOWS_BUILD        = FIXED   (verified on windows-gnu; msvc pending CI)
-LINUX_CI             = FIXED   (verified in a Linux container)
-SUPPLY_CHAIN         = PASS
-CANDIDATE_ON_MAIN    = YES
-VERSION              = 0.2.0-beta.1
-PRE_RELEASE_CHANNEL  = READY
+THE FOUR AUDIT BLOCKERS = CLOSED
+  WINDOWS_BUILD         = FIXED   (CI: compile ✓ clippy ✓ security canaries ✓)
+  LINUX_CI              = GREEN   (CI: ubuntu job green, first time since 2026-07-25)
+  SUPPLY_CHAIN          = GREEN   (CI: deny · audit green)
+  CANDIDATE_ON_MAIN     = YES
+VERSION                 = 0.2.0-beta.1
+PRE_RELEASE_CHANNEL     = READY
 
-READY_FOR_BETA_RELEASE = YES, conditional on the first green CI run on `main`
+READY_FOR_BETA_RELEASE  = NOT YET — two test failures stand between here and a
+                          green pipeline, and neither is diagnosed.
 ```
 
-**The condition is not a formality, and it is deliberate.** Every blocker was
-found because the pipeline was red and nobody had looked; declaring the pipeline
-fixed without letting it run would repeat exactly that mistake. Three of the
-four blockers were verified against a cross-compiler and a container — good
-evidence, and not the same as the machine that builds what users download.
+**Why not YES.** The four blockers this document was asked to close are closed,
+and three of them are confirmed by the pipeline itself rather than by local
+proxies. But letting CI run — the whole point of the exercise — surfaced two
+failures that were invisible before, and honesty about them is worth more than a
+green-sounding verdict:
 
-So: push, watch the run, and read it. If Windows compiles and its security
-canaries pass, if Ubuntu is green and cargo-deny is green, then
-`READY_FOR_BETA_RELEASE = YES` stands unconditionally and tagging
-`v0.2.0-beta.1` is the next action. If the Windows job surfaces an MSVC-only
-problem, that is one more defect of the same family, fixed the same way — and it
-will be visible in minutes rather than in a month.
+- `duration_budget_stops_the_run_between_rounds` on macOS (risk 0a), which came
+  in with the merged branch and reproduces only on the runner.
+- `first_message_retitles_a_placeholder_session` on Windows (risk 0b), the last
+  of twelve Windows failures, eleven of which are fixed.
 
-What ships when it does: a local-first coding agent runtime with a **secure
+Both are single tests with a clear next step, and both need a machine this
+session does not have. Neither is a reason to reopen a blocker; both are a
+reason not to claim `YES` yet.
+
+**What that means practically.** The Beta is one green CI run away, not one
+project away. The path:
+
+1. Reproduce 0a on a macOS runner — or bisect the two agent commits that touch
+   round accounting. If the budget check moved relative to the tool call, that
+   is a real regression and worth finding; if the test was always margin-based,
+   make its margin honest instead of lucky.
+2. Run 0b's single test on Windows and find out whether the retitle path hangs
+   or the runner is just slow.
+3. Green run → tag `v0.2.0-beta.1` → publish as a pre-release → verify the
+   install path on each platform the way a user would.
+
+**What ships when it does:** a local-first coding agent runtime with a **secure
 Multi-Agent Runtime** — reliable, isolated execution whenever the model elects
 to collaborate — with the surfaces it promises marked Frozen, the ones still
 moving marked Provisional, and the two newest marked Unstable.
+
+**And what this round is worth on its own,** whatever the last two tests turn
+out to be: Windows compiles and its security boundaries are proven again after a
+month, Linux is green, the supply-chain gate is green, a beta can be published
+without landing on stable users, and the interface promise is written down. The
+pipeline that found the last two failures is the deliverable — it was dead
+before, and dead pipelines are how a month-old Windows regression stays
+invisible.
