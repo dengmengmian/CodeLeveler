@@ -56,8 +56,27 @@ pub enum EngineError {
     Serde(#[from] serde_json::Error),
     #[error("configuration error: {0}")]
     Config(String),
-    #[error("engine event buffer overloaded")]
-    EventBufferOverloaded,
+    /// The turn's event channel filled and a canonical event could not enter
+    /// it, so the run was cancelled rather than lose durable history.
+    ///
+    /// Carries what it takes to act on: the bare string this used to be said
+    /// nothing about which producer was flooding, which is the first question
+    /// anyone asks. A real Multi-Agent turn hit this and the log named neither
+    /// the event nor the agent.
+    #[error(
+        "engine event buffer overloaded: `{event_type}` from {producer} could not enter a full \
+         {capacity}-slot channel (turn {turn_id}). The run was cancelled rather than drop a \
+         canonical event"
+    )]
+    EventBufferOverloaded {
+        /// The canonical event that could not be queued.
+        event_type: String,
+        /// Which agent emitted it — `main`, or a child's nickname/id.
+        producer: String,
+        /// The channel's capacity, so the message says what was exhausted.
+        capacity: usize,
+        turn_id: String,
+    },
     #[error(
         "recovery requires manual confirmation: tool `{tool}` (call `{call_id}`) may have already produced a side effect; inspect the workspace before retrying"
     )]

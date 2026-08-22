@@ -300,6 +300,90 @@ mod tests {
         ));
     }
 
+    /// The shape that broke in production: one parent and three children all
+    /// emitting canonical tool events into a single channel. With the capacity
+    /// the turn actually uses, a burst that large must fit — this is the
+    /// regression for session `446c71ad`, where 256 slots did not.
+    #[tokio::test]
+    async fn a_four_agent_burst_fits_the_turn_s_buffer() {
+        // Same capacity `run_turn` allocates.
+        const CAPACITY: usize = 4096;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (emitter, mut rx, state) = EventEmitter::channel(CAPACITY, cancel.clone());
+
+        // 230 tool calls is what the real session made; four producers
+        // interleaved, two canonical events each.
+        let agents = ["main", "agent-euclid", "agent-newton", "agent-curie"];
+        let mut emitted = 0;
+        for i in 0..230 {
+            let agent = agents[i % agents.len()];
+            let agent_id = (agent != "main").then(|| agent.to_string());
+            emitter.emit(EngineEvent::ToolCallStarted {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel: true,
+                risk: None,
+                agent_id: agent_id.clone(),
+            });
+            emitter.emit(EngineEvent::ToolCallFinished {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                is_error: false,
+                preview: "ok".into(),
+                agent_id,
+            });
+            emitted += 2;
+        }
+        drop(emitter);
+
+        assert!(
+            !state.is_overloaded(),
+            "a four-agent burst must not overload the buffer"
+        );
+        assert!(!cancel.is_cancelled(), "and must not cancel the run");
+        let mut drained = 0;
+        while let Some(item) = rx.recv().await {
+            if matches!(item, PumpItem::Event(_)) {
+                drained += 1;
+            }
+        }
+        assert_eq!(drained, emitted, "no canonical event was dropped");
+    }
+
+    /// When it does overload, the report must name the event and the agent.
+    /// The bare "engine event buffer overloaded" string sent someone reading
+    /// SQLite by hand to find out which of four agents was flooding.
+    #[tokio::test]
+    async fn an_overflow_names_the_event_and_the_producer() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (emitter, _rx, state) = EventEmitter::channel(1, cancel.clone());
+        emitter.emit(EngineEvent::AssistantDelta { text: "a".into() });
+        emitter.emit(EngineEvent::ToolCallFinished {
+            call_id: "c9".into(),
+            name: "read_file".into(),
+            is_error: false,
+            preview: "ok".into(),
+            agent_id: Some("agent-newton".into()),
+        });
+
+        let overflow = state.take_overflow().expect("the canonical event is kept");
+        assert_eq!(overflow.producer(), "agent-newton");
+        let rendered = crate::EngineError::EventBufferOverloaded {
+            event_type: overflow.to_row().unwrap().0,
+            producer: overflow.producer().to_string(),
+            capacity: 1,
+            turn_id: "t-1".into(),
+        }
+        .to_string();
+        for expected in ["tool_call_finished", "agent-newton", "1-slot", "t-1"] {
+            assert!(
+                rendered.contains(expected),
+                "diagnostic must name {expected}: {rendered}"
+            );
+        }
+    }
+
     /// A flush marker is acknowledged only after the pump has consumed every
     /// item queued before it, and an overloaded pump refuses the flush — the
     /// barrier never resolves optimistically.

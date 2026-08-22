@@ -139,18 +139,51 @@ impl<'a> EventRepository<'a> {
         let created_at = now.to_rfc3339();
         let turn = turn_id.map(|t| t.as_str().to_string());
         let mut tx = self.db.pool().begin().await?;
-        // One aggregate for the whole range. The transaction plus the UNIQUE
-        // index on (session_id, sequence) is what makes that safe against a
-        // concurrent writer: a racing batch fails loudly rather than
-        // interleaving silently.
+        // The transaction's FIRST statement must be a write.
+        //
+        // SQLite's `BEGIN` is deferred: a leading `SELECT` takes a read lock,
+        // and the following INSERT then has to upgrade it. If another
+        // connection wrote in between, that upgrade returns SQLITE_BUSY
+        // immediately and is not retried — the deadlock-avoidance rule. So the
+        // sequence is computed inside the first INSERT, exactly as the
+        // single-event path does, and the aggregate that tells us where the
+        // range started is read afterwards, under a write lock we already hold.
+        let mut prepared = prepared.into_iter();
+        let (first_id, first_type, first_payload) =
+            prepared.next().expect("non-empty checked above");
+        sqlx::query(
+            "INSERT INTO events \
+             (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
+             SELECT ?1, ?2, ?3, COALESCE(MAX(sequence), 0) + 1, ?4, ?5, ?6, ?7 \
+             FROM events WHERE session_id = ?2",
+        )
+        .bind(&first_id)
+        .bind(session_id.as_str())
+        .bind(&turn)
+        .bind(&first_type)
+        .bind(&first_payload)
+        .bind(&created_at)
+        .bind(EVENT_SCHEMA_VERSION)
+        .execute(&mut *tx)
+        .await?;
         let (base,): (i64,) =
-            sqlx::query_as("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?1")
+            sqlx::query_as("SELECT MAX(sequence) FROM events WHERE session_id = ?1")
                 .bind(session_id.as_str())
                 .fetch_one(&mut *tx)
                 .await?;
 
-        let mut records = Vec::with_capacity(prepared.len());
-        for (offset, (id, event_type, payload)) in prepared.into_iter().enumerate() {
+        let mut records = Vec::with_capacity(prepared.len() + 1);
+        records.push(EventRecord {
+            id: first_id,
+            session_id: session_id.as_str().to_string(),
+            turn_id: turn.clone(),
+            sequence: base,
+            event_type: first_type,
+            payload: first_payload,
+            created_at: created_at.clone(),
+            schema_version: EVENT_SCHEMA_VERSION,
+        });
+        for (offset, (id, event_type, payload)) in prepared.enumerate() {
             let sequence = base + offset as i64 + 1;
             sqlx::query(
                 "INSERT INTO events \

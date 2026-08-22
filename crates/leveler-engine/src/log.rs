@@ -110,6 +110,58 @@ impl<'a> EventLog<'a> {
         Ok(())
     }
 
+    /// Persist a run of events as one unit, THEN forward them in emission
+    /// order. Same contract as [`Self::append`], applied to a burst.
+    ///
+    /// This is what the turn pump uses. Per-event persistence costs two
+    /// database round-trips, and a Multi-Agent turn (parent plus three
+    /// explorer children sharing one bounded channel) produces canonical
+    /// events faster than that drains — the channel fills and the run is
+    /// cancelled. Persisting the burst in one transaction is the fix.
+    ///
+    /// Transient events are not persisted, exactly as in [`Self::append`], but
+    /// they are still forwarded **in place**, so an observer sees the same
+    /// interleaving it would have seen event by event.
+    ///
+    /// Nothing is forwarded unless persistence succeeded: an observer must
+    /// never see an event that is not durable.
+    pub async fn append_batch(
+        &self,
+        turn_id: Option<&TurnId>,
+        events: Vec<EngineEvent>,
+        forward: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<(), EngineError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let rows = events
+            .iter()
+            .filter(|event| !event.is_transient())
+            .map(|event| event.to_row())
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        if !rows.is_empty() {
+            let borrowed: Vec<(&str, &str)> =
+                rows.iter().map(|(t, p)| (t.as_str(), p.as_str())).collect();
+            let now = leveler_core::now();
+            match &self.owner {
+                Some(token) => {
+                    self.store
+                        .append_batch_owned(token, &self.session_id, turn_id, &borrowed, now)
+                        .await?;
+                }
+                None => {
+                    self.store
+                        .append_batch(&self.session_id, turn_id, &borrowed, now)
+                        .await?;
+                }
+            }
+        }
+        for event in events {
+            forward(event);
+        }
+        Ok(())
+    }
+
     /// Replay every persisted event of this session, in sequence order.
     /// Unknown event types are hard errors (never silently skipped).
     pub async fn replay(&self) -> Result<Vec<EngineEvent>, EngineError> {
@@ -166,6 +218,38 @@ impl<'a> EventLog<'a> {
                 "context_expanded row carried a different event".into(),
             )),
         }
+    }
+
+    /// Children with a persisted `SubAgentStarted` and no `SubAgentFinished`,
+    /// in the order they were started.
+    ///
+    /// Every reader derives a child's status from that pair — `running` until
+    /// the finish arrives — so a child whose finish never lands stays running
+    /// forever. That is what session `446c71ad` left behind: the turn was
+    /// cancelled mid-flight and two of three explorers are `running` in the log
+    /// to this day. A ghost like that is not cosmetic; it is the log asserting
+    /// something false about work that has stopped.
+    pub async fn unfinished_children(&self) -> Result<Vec<UnfinishedChild>, EngineError> {
+        // Raw rows, not `replay`: the reconciling event has to be attributed to
+        // the turn the child was started in.
+        let rows = self.store.load(&self.session_id).await?;
+        let mut open: Vec<UnfinishedChild> = Vec::new();
+        for row in &rows {
+            match decode_row(row)? {
+                EngineEvent::SubAgentStarted { id, nickname, .. } => {
+                    open.push(UnfinishedChild {
+                        turn_id: row.turn_id.clone(),
+                        id,
+                        nickname,
+                    });
+                }
+                EngineEvent::SubAgentFinished { id, .. } => {
+                    open.retain(|child| child.id != id);
+                }
+                _ => {}
+            }
+        }
+        Ok(open)
     }
 
     /// Tool calls with a persisted `ToolCallStarted` but no matching
@@ -257,6 +341,16 @@ fn set_pending(
 pub struct SnapshotView {
     pub messages: Vec<leveler_model::Message>,
     pub through_ordinal: Option<u64>,
+}
+
+/// A child that was started and never reported finishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedChild {
+    /// The turn the child was started in, so its terminal event is attributed
+    /// there rather than to whatever turn happens to be reconciling.
+    pub turn_id: Option<String>,
+    pub id: String,
+    pub nickname: String,
 }
 
 /// A tool call started but never finished — the crash window M5 reconciles.
@@ -556,6 +650,170 @@ mod tests {
         assert_eq!(forwarded, 2);
         let rows = EventRepository::new(&db).load(&session).await.unwrap();
         assert!(rows.is_empty(), "transients must never hit the database");
+    }
+
+    /// Session `446c71ad`, reduced: three explorers started, one finished, and
+    /// the turn died. Every reader derives a child's status from the
+    /// started/finished pair, so the two without a finish read as `running`
+    /// forever — the log asserting that stopped work is still in flight.
+    #[tokio::test]
+    async fn unfinished_children_are_the_ones_with_no_finish_event() {
+        let (db, session) = db_with_session().await;
+        let log = EventLog::new(&db, session.clone());
+        let mut sink = |_: EngineEvent| {};
+
+        for (id, nickname) in [("a1", "Euclid"), ("a2", "Newton"), ("a3", "Curie")] {
+            log.append(
+                None,
+                EngineEvent::SubAgentStarted {
+                    id: id.into(),
+                    nickname: nickname.into(),
+                    role: "explorer".into(),
+                    task: "explore the repository".into(),
+                },
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        }
+        log.append(
+            None,
+            EngineEvent::SubAgentFinished {
+                id: "a1".into(),
+                nickname: "Euclid".into(),
+                ok: true,
+                summary: "done".into(),
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+
+        let open = log.unfinished_children().await.unwrap();
+        assert_eq!(
+            open.iter().map(|c| c.nickname.as_str()).collect::<Vec<_>>(),
+            vec!["Newton", "Curie"],
+            "the finished child is not a ghost; the other two are"
+        );
+        assert_eq!(open[0].id, "a2");
+    }
+
+    /// A session where every child settled has no ghosts — the reconciler must
+    /// not invent terminal events for children that already reported.
+    #[tokio::test]
+    async fn a_fully_settled_session_has_no_unfinished_children() {
+        let (db, session) = db_with_session().await;
+        let log = EventLog::new(&db, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(
+            None,
+            EngineEvent::SubAgentStarted {
+                id: "a1".into(),
+                nickname: "Euclid".into(),
+                role: "explorer".into(),
+                task: "t".into(),
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        log.append(
+            None,
+            EngineEvent::SubAgentFinished {
+                id: "a1".into(),
+                nickname: "Euclid".into(),
+                ok: false,
+                summary: "failed, but it reported".into(),
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(log.unfinished_children().await.unwrap().is_empty());
+    }
+
+    /// The pump drains in batches now. A batch must be indistinguishable from
+    /// the same events appended one at a time: canonical ones persisted in
+    /// emission order, transient ones persisted never but forwarded **in
+    /// place**, so an observer sees the same interleaving either way.
+    #[tokio::test]
+    async fn a_batch_persists_canonicals_in_order_and_forwards_transients_in_place() {
+        let (db, session) = db_with_session().await;
+        let log = EventLog::new(&db, session.clone());
+
+        let events = vec![
+            EngineEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+            },
+            EngineEvent::AssistantDelta {
+                text: "thinking".into(),
+            },
+            EngineEvent::ToolCallFinished {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+                is_error: false,
+                preview: "ok".into(),
+                agent_id: Some("agent-2".into()),
+            },
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        log.append_batch(None, events, &mut |e| {
+            seen.push(e.to_row().map(|(t, _)| t).unwrap_or_default())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec!["tool_call_started", "assistant_delta", "tool_call_finished"],
+            "every event is forwarded, transient included, in emission order"
+        );
+        let rows = EventRepository::new(&db).load(&session).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_call_started", "tool_call_finished"],
+            "the transient is forwarded but never persisted"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the batch occupies a contiguous range"
+        );
+    }
+
+    /// An all-transient batch touches the database at all — not even an empty
+    /// transaction — and still forwards everything.
+    #[tokio::test]
+    async fn an_all_transient_batch_forwards_without_persisting() {
+        let (db, session) = db_with_session().await;
+        let log = EventLog::new(&db, session.clone());
+        let mut forwarded = 0;
+        log.append_batch(
+            None,
+            vec![
+                EngineEvent::AssistantDelta { text: "a".into() },
+                EngineEvent::AssistantDelta { text: "b".into() },
+            ],
+            &mut |_| forwarded += 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(forwarded, 2);
+        assert!(
+            EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

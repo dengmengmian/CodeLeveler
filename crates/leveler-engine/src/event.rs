@@ -477,6 +477,23 @@ pub enum EngineEvent {
 impl EngineEvent {
     /// Transient events are forwarded to observers but never persisted (they
     /// are the overwhelming write volume and carry no replay value).
+    /// Which agent emitted this event, for diagnostics.
+    ///
+    /// `"main"` for the top-level agent; a child's id when the event carries
+    /// one. Only tool events are attributed today, which is enough for the
+    /// question this exists to answer — under an event-buffer overload the
+    /// flood is tool traffic, and "which of the four agents" is the first thing
+    /// worth knowing.
+    pub fn producer(&self) -> &str {
+        match self {
+            EngineEvent::ToolCallStarted { agent_id, .. }
+            | EngineEvent::ToolCallFinished { agent_id, .. } => {
+                agent_id.as_deref().unwrap_or("main")
+            }
+            _ => "main",
+        }
+    }
+
     pub fn is_transient(&self) -> bool {
         matches!(
             self,

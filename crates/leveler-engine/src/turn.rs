@@ -207,7 +207,11 @@ impl TurnRunner<'_> {
             )
             .await?;
 
-        const EVENT_BUFFER_CAPACITY: usize = 256;
+        // Margin, not the fix. The fix is the batching pump below: raising this
+        // alone only moves the cliff, and a wider fan-out would walk straight
+        // back off it. Sized so a burst from several agents has somewhere to sit
+        // while a batch commits.
+        const EVENT_BUFFER_CAPACITY: usize = 4096;
         let (events, mut rx, pump_state) =
             EventEmitter::channel(EVENT_BUFFER_CAPACITY, cancellation.clone());
         let mut sink = TurnSink {
@@ -395,36 +399,85 @@ impl TurnRunner<'_> {
         // markers (the side-effect barrier) are acknowledged with the current
         // persistence state: after a failed append the barrier reports the
         // failure, so the executor refuses to run the tool it was announcing.
+        // Drain in batches. One `append` per event costs two database
+        // round-trips, and a Multi-Agent turn out-produces that: parent plus
+        // children plus background tasks all emit into this one channel, and a
+        // canonical event arriving at a full channel cancels the run. Batching
+        // raises the drain rate; the buffer's own size is only margin on top.
+        //
+        // A flush marker ends the batch it lands in. The side-effect barrier
+        // must resolve only after everything emitted BEFORE it is durable, so
+        // the marker cannot be acknowledged while its predecessors are still
+        // sitting in the batch.
+        const MAX_DRAIN_BATCH: usize = 64;
         let pump = async {
             let mut result: Result<(), EngineError> = Ok(());
+            let mut batch: Vec<EngineEvent> = Vec::with_capacity(MAX_DRAIN_BATCH);
             while let Some(item) = rx.recv().await {
-                let mut event = match item {
-                    crate::recorders::PumpItem::Event(event) => event,
-                    crate::recorders::PumpItem::Flush(ack) => {
-                        let _ = ack.send(match &result {
-                            Ok(()) => Ok(()),
-                            Err(error) => Err(error.to_string()),
-                        });
-                        continue;
-                    }
-                };
-                if let EngineEvent::ToolCallStarted { name, risk, .. } = &mut event {
-                    *risk = self.factory.registry.get(name).map(|tool| tool.risk());
+                let mut pending_ack = None;
+                match item {
+                    crate::recorders::PumpItem::Event(event) => batch.push(event),
+                    crate::recorders::PumpItem::Flush(ack) => pending_ack = Some(ack),
                 }
-                if result.is_ok() {
-                    result = self.log.append(Some(&turn_id), event, observer).await;
+                // Opportunistically take whatever else is already queued, up to
+                // the batch bound, stopping at a flush marker.
+                while pending_ack.is_none() && batch.len() < MAX_DRAIN_BATCH {
+                    match rx.try_recv() {
+                        Ok(crate::recorders::PumpItem::Event(event)) => batch.push(event),
+                        Ok(crate::recorders::PumpItem::Flush(ack)) => pending_ack = Some(ack),
+                        Err(_) => break,
+                    }
+                }
+                if !batch.is_empty() {
+                    for event in &mut batch {
+                        if let EngineEvent::ToolCallStarted { name, risk, .. } = event {
+                            *risk = self.factory.registry.get(name).map(|tool| tool.risk());
+                        }
+                    }
+                    let drained = std::mem::take(&mut batch);
+                    if result.is_ok() {
+                        result = self
+                            .log
+                            .append_batch(Some(&turn_id), drained, observer)
+                            .await;
+                    }
+                }
+                if let Some(ack) = pending_ack {
+                    let _ = ack.send(match &result {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    });
                 }
             }
+            // The one canonical event that could not be queued is still
+            // persisted — it is why the run is failing, so losing it would be
+            // the worst possible moment to lose an event. Its identity is also
+            // what the diagnostic needs, so read that off before it moves.
+            let mut overflow_diagnostic = None;
             if let Some(mut event) = pump_state.take_overflow() {
                 if let EngineEvent::ToolCallStarted { name, risk, .. } = &mut event {
                     *risk = self.factory.registry.get(name).map(|tool| tool.risk());
                 }
+                overflow_diagnostic = Some((
+                    event
+                        .to_row()
+                        .map(|(tag, _)| tag)
+                        .unwrap_or_else(|_| "unknown".to_string()),
+                    event.producer().to_string(),
+                ));
                 if result.is_ok() {
                     result = self.log.append(Some(&turn_id), event, observer).await;
                 }
             }
             if result.is_ok() && pump_state.is_overloaded() {
-                result = Err(EngineError::EventBufferOverloaded);
+                let (event_type, producer) = overflow_diagnostic
+                    .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+                result = Err(EngineError::EventBufferOverloaded {
+                    event_type,
+                    producer,
+                    capacity: EVENT_BUFFER_CAPACITY,
+                    turn_id: turn_id.as_str().to_string(),
+                });
             }
             result
         };
@@ -453,6 +506,55 @@ impl TurnRunner<'_> {
             ),
             Err(error) => (TurnOutcome::Failed, error.to_string(), None, 0, Vec::new()),
         };
+        // Settle any child that never reported, BEFORE the turn's terminal
+        // event, so a replay sees children stop and then the turn end.
+        //
+        // A child's status is derived from the `SubAgentStarted` /
+        // `SubAgentFinished` pair — nothing else records it — so a child whose
+        // finish never lands reads as `running` forever. Session `446c71ad`
+        // still has two explorers in that state: the turn was cancelled
+        // mid-flight and nobody spoke for them. The turn ending IS the child
+        // ending; there is no child that legitimately outlives its turn.
+        //
+        // Best-effort on purpose. This is reconciliation, and the authoritative
+        // record of how the turn ended matters more: if settling a ghost fails
+        // (a stale token, say), that is worth a warning, not a reason to skip
+        // the terminal event below.
+        match self.log.unfinished_children().await {
+            Ok(open) => {
+                for child in open {
+                    let event = EngineEvent::SubAgentFinished {
+                        id: child.id.clone(),
+                        nickname: child.nickname.clone(),
+                        ok: false,
+                        summary: format!(
+                            "[sub-agent {}] did not report before the turn ended ({})",
+                            child.nickname,
+                            match terminal {
+                                TurnOutcome::Interrupted => "cancelled",
+                                TurnOutcome::Failed => "failed",
+                                _ => "ended",
+                            }
+                        ),
+                    };
+                    if let Err(error) = self.log.append(Some(&turn_id), event, observer).await {
+                        tracing::warn!(
+                            session_id = %self.session_id.as_str(),
+                            child = %child.id,
+                            %error,
+                            "could not settle an unfinished child; it stays running in the log"
+                        );
+                        break;
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                session_id = %self.session_id.as_str(),
+                %error,
+                "could not scan for unfinished children"
+            ),
+        }
+
         let event = EngineEvent::TurnFinished {
             turn_id: turn_id.clone(),
             outcome: terminal,

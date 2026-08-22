@@ -377,55 +377,84 @@ impl EventStore for Database {
         let created_at = now.to_rfc3339();
         let turn = turn_id.map(|t| t.as_str().to_string());
         let mut tx = self.pool().begin().await.map_err(StorageError::from)?;
+        // The ownership guard rides the FIRST insert, exactly as the
+        // single-event path does, so there is still no window between "token
+        // verified" and "row written". That statement is also deliberately the
+        // transaction's first: `BEGIN` is deferred, so a leading SELECT takes a
+        // read lock the insert must then upgrade, and a losing upgrade is
+        // SQLITE_BUSY with no retry (SQLite's deadlock-avoidance rule). Writing
+        // first takes the write lock outright. Once it lands, no other
+        // connection can flip ownership until we commit, which is what covers
+        // the remaining inserts.
+        //
+        // A stale token affects 0 rows here and the transaction is dropped
+        // uncommitted, so nothing persists — including the first member.
+        let mut prepared = prepared.into_iter();
+        let (first_id, first_type, first_payload) =
+            prepared.next().expect("non-empty checked above");
+        let inserted = sqlx::query(
+            "INSERT INTO events \
+             (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
+             SELECT ?1, ?2, ?3, \
+                    (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE session_id = ?2), \
+                    ?4, ?5, ?6, ?7 \
+             WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 \
+                           AND id = ?8 AND owner_runtime_id = ?9 AND owner_epoch = ?10)",
+        )
+        .bind(&first_id)
+        .bind(session_id.as_str())
+        .bind(&turn)
+        .bind(&first_type)
+        .bind(&first_payload)
+        .bind(&created_at)
+        .bind(EVENT_SCHEMA_VERSION)
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        if inserted.rows_affected() != 1 {
+            drop(tx);
+            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+        }
+        // Safe to read now: this transaction already holds the write lock.
         let (base,): (i64,) =
-            sqlx::query_as("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?1")
+            sqlx::query_as("SELECT MAX(sequence) FROM events WHERE session_id = ?1")
                 .bind(session_id.as_str())
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(StorageError::from)?;
 
-        let mut records = Vec::with_capacity(prepared.len());
-        for (offset, (id, event_type, payload)) in prepared.into_iter().enumerate() {
+        let mut records = Vec::with_capacity(prepared.len() + 1);
+        records.push(EventRecord {
+            id: first_id,
+            session_id: session_id.as_str().to_string(),
+            turn_id: turn.clone(),
+            sequence: base,
+            event_type: first_type,
+            payload: first_payload,
+            created_at: created_at.clone(),
+            schema_version: EVENT_SCHEMA_VERSION,
+        });
+        for (offset, (id, event_type, payload)) in prepared.enumerate() {
             let sequence = base + offset as i64 + 1;
-            // The ownership guard rides the FIRST insert, exactly as the
-            // single-event path does, so there is still no window between
-            // "token verified" and "row written". Once that statement lands,
-            // this transaction holds SQLite's write lock: no other connection
-            // can flip ownership until we commit, so the remaining inserts are
-            // covered by it. A stale token affects 0 rows here, and the
-            // transaction is dropped without commit — nothing persists.
-            let guarded = offset == 0;
-            let sql = if guarded {
+            sqlx::query(
                 "INSERT INTO events \
                  (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
-                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
-                 WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 \
-                               AND id = ?9 AND owner_runtime_id = ?10 AND owner_epoch = ?11)"
-            } else {
-                "INSERT INTO events \
-                 (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-            };
-            let mut query = sqlx::query(sql)
-                .bind(&id)
-                .bind(session_id.as_str())
-                .bind(&turn)
-                .bind(sequence)
-                .bind(&event_type)
-                .bind(&payload)
-                .bind(&created_at)
-                .bind(EVENT_SCHEMA_VERSION);
-            if guarded {
-                query = query
-                    .bind(token.task_id.as_str())
-                    .bind(token.runtime_id.as_str())
-                    .bind(token.owner_epoch.get() as i64);
-            }
-            let inserted = query.execute(&mut *tx).await.map_err(StorageError::from)?;
-            if guarded && inserted.rows_affected() != 1 {
-                drop(tx);
-                return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
-            }
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .bind(&id)
+            .bind(session_id.as_str())
+            .bind(&turn)
+            .bind(sequence)
+            .bind(&event_type)
+            .bind(&payload)
+            .bind(&created_at)
+            .bind(EVENT_SCHEMA_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
             records.push(EventRecord {
                 id,
                 session_id: session_id.as_str().to_string(),
