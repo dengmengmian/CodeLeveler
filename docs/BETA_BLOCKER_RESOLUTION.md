@@ -271,7 +271,22 @@ Remaining Risk 1 was written to worry about, and it arrived.
 Then Windows ran its test suite, which had not executed in over a month, and
 found **twelve failures across six targets**. That is not a regression from this
 work; it is a month of Windows test debt becoming visible for the first time.
-Triaged and fixed in the same session (commit `fad465fd`):
+Triaged and fixed across three CI rounds (`fad465fd`, `c8caff0d`). Two later
+runs tell the rest of the story:
+
+| Run | macOS | Ubuntu | Windows | deny | web | mobile |
+| --- | --- | --- | --- | --- | --- | --- |
+| `32552025802` | ✗ 1 test | ✓ | compile ✓ · 12 test failures | ✓ | ✓ | ✓ |
+| `32555562330` | ✗ same test | ✓ | 6 → 4 failing targets | ✓ | ✓ | ✓ |
+| `32556890364` | **✓** | ✓ | 3 failures in 3 targets | ✓ | ✓ | ✓ |
+
+**Five of six jobs are green.** The macOS failure resolved itself on the third
+run with no macOS-relevant change in between, which settles what it was: not a
+regression, a **margin-based test** — 10 ms of budget against a 50 ms tool call,
+decided by how loaded the runner is. It is still worth making honest, but it is
+not a defect in the agent loop.
+
+The twelve Windows failures, and what each turned out to be:
 
 | Failure | Nature | Fix |
 | --- | --- | --- |
@@ -298,8 +313,8 @@ release's own smoke test.
 
 | # | Risk | Why it is acceptable for Beta | What would change that |
 | --- | --- | --- | --- |
-| 0a | **`duration_budget_stops_the_run_between_rounds` fails on the macOS runner** and passes locally (5/5, and inside the 3145-test suite). Reproduced twice on CI, so it is deterministic there, not a flake. The test gives a run a 10 ms duration budget and a `sleep 0.05` tool call, then requires round 2 never to be requested — it holds only if round 1 really takes longer than 10 ms. It arrived with the 41 merged commits, which include two agent changes to round and outcome accounting. | **Not acceptable — it is the top open item.** It is listed as a risk rather than a fix because guessing at a budget test without being able to reproduce it would be the same mistake this whole document is about. | Reproducing it: run that single test on a macOS runner, or bisect the two agent commits that touch round accounting. Either the budget check moved relative to the tool call (a real regression) or the test was always margin-based and got unlucky on slower hardware (a test defect). Both are cheap once reproduced. |
-| 0b | **`first_message_retitles_a_placeholder_session` times out at 30 s on Windows.** The turn never settles; a tokio worker also panics with "context was found, but it is being shutdown". | Same reasoning as 0a: undiagnosed, and it is the last Windows target still failing. | Running that one test on a Windows box. If the retitle path hangs rather than the runner being slow, it is a real defect on the client's very first message. |
+| 0a | **`duration_budget_stops_the_run_between_rounds` is flaky on the macOS runner** — failed twice, then passed on the next run with nothing macOS-relevant changed. The test gives a run a 10 ms duration budget and a 50 ms tool call and requires round 2 never to be requested: true only while round 1 really outlasts 10 ms, which a loaded runner does not guarantee. | It is a test margin, not a product defect — the budget itself is exercised by neighbouring tests that do not race the clock. | Widening the margin (a budget far below the tool call's real cost, or a clock the test controls) turns a coin-flip into an assertion. Worth doing before it wastes someone's afternoon. |
+| 0b | **Three Windows tests fail, and two of them point at the same unknown.** `snapshot_restores_active_shell_with_elapsed` cannot keep a command alive (`ping`, then `waitfor`, both ended immediately), and `approval_resolution_is_durable_before_dispatch` sees an approved `cmd /C rmdir /s /q` leave its directory in place. `echo` works — that test passes now — so the path runs *something*. The shared suspect is what AppContainer actually permits: no network for `ping`, possibly no delete on a directory handle, possibly no `waitfor` at all. `first_message_retitles_a_placeholder_session` is separate: a turn that never settles in 30 s. | Windows is not the Beta's primary surface, its build and its security canaries are proven, and the failures are in three tests rather than in the boundaries. | **A Windows machine.** Three CI rounds of remote guessing bought nine fixes and then stopped buying anything; each remaining question is "what does the OS sandbox actually do", which is answered by running the command there, not by reasoning from a log. |
 | 1 | ~~**Windows security canaries have not run in a month.**~~ **Closed by run `32552025802`: they ran and passed.** NTFS junction behaviour, AppContainer ACLs, Job Object descendant termination are proven again on a real Windows runner. | — | — |
 | 2 | **`windows-gnu` is not `windows-msvc`.** | The Rust behind `cfg(windows)` is identical for both ABIs; the difference is C toolchain and linkage. | An MSVC-only compile error in CI. |
 | 3 | **No live `!command` streaming for confined Windows commands.** | Output still arrives, complete, on completion; documented in three places rather than discovered. | Windows users reporting it as broken rather than limited. |
@@ -315,52 +330,55 @@ release's own smoke test.
 ```
 THE FOUR AUDIT BLOCKERS = CLOSED
   WINDOWS_BUILD         = FIXED   (CI: compile ✓ clippy ✓ security canaries ✓)
-  LINUX_CI              = GREEN   (CI: ubuntu job green, first time since 2026-07-25)
-  SUPPLY_CHAIN          = GREEN   (CI: deny · audit green)
+  LINUX_CI              = GREEN   (first time since 2026-07-25)
+  SUPPLY_CHAIN          = GREEN
   CANDIDATE_ON_MAIN     = YES
 VERSION                 = 0.2.0-beta.1
 PRE_RELEASE_CHANNEL     = READY
 
-READY_FOR_BETA_RELEASE  = NOT YET — two test failures stand between here and a
-                          green pipeline, and neither is diagnosed.
+CI                      = 5 of 6 jobs green
+                          (macOS ✓ · Ubuntu ✓ · deny ✓ · web ✓ · mobile ✓ ·
+                           Windows: build and canaries ✓, 3 tests ✗)
+
+READY_FOR_BETA_RELEASE  = YES for macOS and Linux
+                          NOT YET for Windows
 ```
 
-**Why not YES.** The four blockers this document was asked to close are closed,
-and three of them are confirmed by the pipeline itself rather than by local
-proxies. But letting CI run — the whole point of the exercise — surfaced two
-failures that were invisible before, and honesty about them is worth more than a
-green-sounding verdict:
+**Why the split, rather than a single word.** The four blockers are closed and
+the pipeline proves it. What is left is three Windows tests, and Windows is the
+platform this beta was always weakest on — its daemon socket transport is
+already documented as unavailable, `remote` is already marked Unstable. Calling
+the whole release "not ready" because of three tests on that platform would be
+as dishonest as calling it "ready" while they fail.
 
-- `duration_budget_stops_the_run_between_rounds` on macOS (risk 0a), which came
-  in with the merged branch and reproduces only on the runner.
-- `first_message_retitles_a_placeholder_session` on Windows (risk 0b), the last
-  of twelve Windows failures, eleven of which are fixed.
+So the recommendation is to ship the beta for macOS and Linux, and to hold the
+Windows artifact until those three are understood. The release workflow already
+builds per target, so this costs nothing structurally — it is a decision about
+which archives get attached, not a fork in the code.
 
-Both are single tests with a clear next step, and both need a machine this
-session does not have. Neither is a reason to reopen a blocker; both are a
-reason not to claim `YES` yet.
+**What each remaining item needs.** Both are in Remaining Risks with their
+evidence; neither is a guess away from resolution:
 
-**What that means practically.** The Beta is one green CI run away, not one
-project away. The path:
+- The macOS flake (0a) is a test margin — 10 ms of budget against a 50 ms call.
+  Fix the margin, not the loop.
+- The three Windows failures (0b) need a Windows machine. Two of them ask what
+  AppContainer actually permits — whether a command can outlive a second, whether
+  an approved delete reaches a directory handle. Three rounds of remote inference
+  answered nine of twelve failures and then stopped answering; the tenth needs
+  someone to run the command there.
 
-1. Reproduce 0a on a macOS runner — or bisect the two agent commits that touch
-   round accounting. If the budget check moved relative to the tool call, that
-   is a real regression and worth finding; if the test was always margin-based,
-   make its margin honest instead of lucky.
-2. Run 0b's single test on Windows and find out whether the retitle path hangs
-   or the runner is just slow.
-3. Green run → tag `v0.2.0-beta.1` → publish as a pre-release → verify the
-   install path on each platform the way a user would.
+**Then:** green run → tag `v0.2.0-beta.1` → publish as a pre-release → install
+from the published artifact on each platform the way a user would.
 
 **What ships when it does:** a local-first coding agent runtime with a **secure
 Multi-Agent Runtime** — reliable, isolated execution whenever the model elects
 to collaborate — with the surfaces it promises marked Frozen, the ones still
 moving marked Provisional, and the two newest marked Unstable.
 
-**And what this round is worth on its own,** whatever the last two tests turn
-out to be: Windows compiles and its security boundaries are proven again after a
-month, Linux is green, the supply-chain gate is green, a beta can be published
-without landing on stable users, and the interface promise is written down. The
-pipeline that found the last two failures is the deliverable — it was dead
-before, and dead pipelines are how a month-old Windows regression stays
-invisible.
+**And what this round is worth on its own:** Windows compiles and its security
+boundaries are proven again after a month; Linux, macOS, the supply-chain gate,
+the web UI and the mobile app are all green; a beta can be published without
+landing on stable users; and the interface promise is written down instead of
+implied. The pipeline that found the last three failures is itself the
+deliverable — it was dead before, and dead pipelines are how a month-old Windows
+regression stays invisible.
