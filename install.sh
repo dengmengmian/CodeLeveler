@@ -36,10 +36,24 @@ case "$os" in
   *) die "unsupported OS: $os; on Windows use the .zip from the releases page" ;;
 esac
 
-# Resolve the latest published release tag (drafts are not 'latest').
-tag="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
-[ -n "$tag" ] || die "could not find a published release (is one published yet?)"
+# Which release to install.
+#
+# `LEVELER_VERSION` pins one explicitly, and it is the ONLY way to reach a
+# pre-release: GitHub's `releases/latest` returns the latest *stable* release
+# and never a pre-release, which is exactly what keeps a beta off the machines
+# of people who did not ask for it. Accepts `v0.2.0-beta.1` or `0.2.0-beta.1`.
+if [ -n "${LEVELER_VERSION:-}" ]; then
+  case "$LEVELER_VERSION" in
+    v*) tag="$LEVELER_VERSION" ;;
+    *)  tag="v$LEVELER_VERSION" ;;
+  esac
+  echo "Installing pinned version ${tag} ..."
+else
+  # Latest published stable release (drafts and pre-releases are not 'latest').
+  tag="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+  [ -n "$tag" ] || die "could not find a published release (is one published yet?)"
+fi
 ver="${tag#v}"
 
 name="leveler-${tag}-${triple}"

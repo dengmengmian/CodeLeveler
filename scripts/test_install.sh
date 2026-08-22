@@ -35,6 +35,11 @@ while [ "$#" -gt 0 ]; do
 done
 case "$url" in
   */releases/latest)
+    # A pinned install must never ask for 'latest' — GitHub answers that with
+    # the newest STABLE release, which is exactly what a beta is not.
+    if [ "${INSTALL_TEST_MODE:-}" = pinned ]; then
+      exit 22
+    fi
     printf '%s\n' '{"tag_name":"v1.2.3"}'
     ;;
   *.tar.gz.sha256)
@@ -87,11 +92,29 @@ EOF
 run_installer() {
   fixture="$1"
   mode="$2"
+  pin="${3:-}"
   HOME="$fixture/home" \
     LEVELER_BIN_DIR="$fixture/install" \
     INSTALL_TEST_MODE="$mode" \
+    LEVELER_VERSION="$pin" \
     PATH="$fixture/bin" \
     /bin/sh "$ROOT/install.sh"
+}
+
+# `LEVELER_VERSION` installs exactly the named tag and asks nothing about
+# 'latest'. This is the only route to a pre-release, so it has to work with the
+# latest endpoint refusing to answer.
+expect_pinned_success() {
+  name="$1"
+  pin="$2"
+  fixture="$TEST_ROOT/$name"
+  make_fixture "$fixture"
+  add_hash_tool "$fixture"
+  run_installer "$fixture" pinned "$pin" >/dev/null
+  [ -x "$fixture/install/leveler" ] || {
+    printf 'FAIL: %s did not install the pinned version\n' "$name" >&2
+    exit 1
+  }
 }
 
 expect_failure() {
@@ -132,5 +155,8 @@ run_installer "$success" valid >/dev/null
   printf 'FAIL: verified binary was not installed\n' >&2
   exit 1
 }
+
+expect_pinned_success pinned-with-v v1.2.3
+expect_pinned_success pinned-without-v 1.2.3
 
 printf 'install.sh checksum tests passed\n'
