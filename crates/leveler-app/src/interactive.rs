@@ -671,6 +671,16 @@ impl InProcessRuntimeClient {
                 let duration_ms = store
                     .finish(&session_id, &id, exit_code, status)
                     .unwrap_or(0);
+                // Release the session BEFORE the terminal event is published.
+                // A client enables its composer on `UserShellExited`, so the
+                // next `SubmitMessage` can arrive within microseconds; holding
+                // the slot past the event leaves a window where the command is
+                // visibly finished and the session still answers "already has
+                // an active turn". Nothing below needs the slot: the process
+                // has exited, its output is drained, and `store.finish` has
+                // already made `CancelUserShell` a no-op. This matches the
+                // failure paths above, which release before they notify.
+                active.finish(&session_id);
                 let _ = log
                     .append(
                         None,
@@ -683,7 +693,6 @@ impl InProcessRuntimeClient {
                         &mut forward,
                     )
                     .await;
-                active.finish(&session_id);
             });
         });
         Ok(())

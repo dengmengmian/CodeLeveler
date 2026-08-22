@@ -177,6 +177,45 @@ async fn hard_gate_user_shell_makes_zero_model_requests() {
     );
 }
 
+/// The session must be free the instant the shell says it finished.
+///
+/// A client reacts to `UserShellExited` by enabling its composer, and a user
+/// who types immediately submits within microseconds. If the runtime publishes
+/// the terminal event before it releases the session's turn slot, that submit
+/// is rejected with "session ... already has an active turn" — a real user
+/// seeing a finished command and being told the agent is busy.
+///
+/// Ten rounds because the window is small: on a loaded machine (CI) it opens
+/// wide enough to fail, on an idle laptop it can stay shut all day. After the
+/// release-before-publish ordering it is not a window at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_is_free_the_moment_the_shell_reports_exit() {
+    use leveler_local_transport::LocalRuntimeService;
+
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+    let mut h = harness(&server).await;
+
+    for round in 0..10 {
+        h.client
+            .send(run_shell(&h, &format!("echo round-{round}")))
+            .await
+            .unwrap();
+        wait_for_exit(&mut h).await;
+        let info = h.client.runtime_info().await.expect("runtime info");
+        assert_eq!(
+            info.health.active_turns, 0,
+            "round {round}: the shell reported exit while the session was still \
+             holding its turn slot — the next user message would be refused"
+        );
+    }
+
+    assert_eq!(
+        server.request_count(),
+        0,
+        "this test must not reach the model at all"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_gate_shell_output_never_enters_model_context() {
     let server = MockServer::start(vec![sse_text("model answer")]).await;
