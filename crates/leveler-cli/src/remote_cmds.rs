@@ -9,13 +9,13 @@
 //! own terminal, and it is what writes the key to `devices.json`.
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
-use leveler_remote_agent::{
-    AgentBridge, ProjectRouter, RemoteConfig, RemoteHome, TrustedDevices, run_tunnel,
-    runtime_id_for,
-};
+#[cfg(unix)]
+use leveler_remote_agent::{AgentBridge, ProjectRouter, run_tunnel};
+use leveler_remote_agent::{RemoteConfig, RemoteHome, TrustedDevices, runtime_id_for};
 use leveler_remote_protocol::VerifyingKey;
 use leveler_remote_protocol::auth::{RUNTIME_AUTH_HEADER, RuntimeAssertion, runtime_action};
 use leveler_remote_protocol::pairing::{PairingQrPayload, PairingScope};
@@ -56,6 +56,7 @@ fn devices_path() -> PathBuf {
 
 /// The multi-project registry the browser UI writes. Read-only from here: what
 /// is "open" is decided by opening it, not by a phone asking.
+#[cfg(unix)]
 fn registry_path() -> PathBuf {
     leveler_home().web_projects_registry()
 }
@@ -387,6 +388,7 @@ async fn finish_pairing(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+#[cfg(unix)]
 async fn projects() -> anyhow::Result<std::process::ExitCode> {
     let router = project_router();
     let listed = leveler_remote_agent::ProjectRoutes::projects(&router).await;
@@ -415,12 +417,29 @@ async fn projects() -> anyhow::Result<std::process::ExitCode> {
 
 /// The router every remote path shares: the browser UI's registry, and the same
 /// per-repository socket the daemon already listens on.
+/// Remote control routes a phone to a per-repository daemon over the local
+/// socket, and that transport does not exist on this platform (see
+/// `docs/STABILITY.md`: `remote` is Unstable, and the Windows daemon socket is
+/// deferred). Refusing here is the honest answer — the alternative is a paired
+/// device that lists no projects and never explains why.
+#[cfg(not(unix))]
+async fn projects() -> anyhow::Result<std::process::ExitCode> {
+    bail!("`leveler remote projects` 需要本机 daemon socket，当前平台尚不支持")
+}
+
+#[cfg(not(unix))]
+async fn agent() -> anyhow::Result<std::process::ExitCode> {
+    bail!("`leveler remote agent` 需要本机 daemon socket，当前平台尚不支持")
+}
+
+#[cfg(unix)]
 fn project_router() -> ProjectRouter {
     ProjectRouter::new(registry_path(), |repo: &std::path::Path| {
         leveler_project::Layout::resolve(repo.to_path_buf(), None).socket_path()
     })
 }
 
+#[cfg(unix)]
 async fn agent() -> anyhow::Result<std::process::ExitCode> {
     let (config, key, home) = require_enabled()?;
     let devices = TrustedDevices::load(home.devices_path())?;

@@ -169,10 +169,7 @@ pub trait LocalRuntimeService: InteractiveRuntimeClient {
     ///
     /// Default: unsupported. Production runtimes override. Callers must not
     /// invent a second store or open workspace paths.
-    async fn fetch_attachment(
-        &self,
-        _sha256: &str,
-    ) -> Result<AttachmentBytes, ClientError> {
+    async fn fetch_attachment(&self, _sha256: &str) -> Result<AttachmentBytes, ClientError> {
         Err(ClientError::Runtime(
             "fetch_attachment is not supported by this runtime".to_string(),
         ))
@@ -1014,10 +1011,7 @@ mod unix {
             }
         }
 
-        async fn fetch_attachment(
-            &self,
-            sha256: &str,
-        ) -> Result<AttachmentBytes, ClientError> {
+        async fn fetch_attachment(&self, sha256: &str) -> Result<AttachmentBytes, ClientError> {
             match self
                 .request(WireRequest::FetchAttachment {
                     sha256: sha256.to_string(),
@@ -1549,18 +1543,16 @@ mod unsupported {
             LocalSocketRuntimeClient::create_session(self, request).await
         }
 
-        /// Ask the daemon, because a sidecar process cannot see this machine's
-        /// terminals from inside its own.
+        /// The Unix build asks the daemon, because a sidecar process cannot
+        /// see this machine's terminals from inside its own. Here there is no
+        /// daemon to ask, so this reports unavailable like every other method
+        /// on this stub rather than inventing a count. Both callers already
+        /// read the error correctly: remote-agent approvals assume a person is
+        /// watching, and project reattach treats the handle as dead.
         async fn local_waiter_count(&self) -> Result<usize, ClientError> {
-            match self
-                .request(WireRequest::LocalWaiters)
-                .await
-                .map_err(transport_client_error)?
-            {
-                WireResponse::LocalWaiters(count) => Ok(count),
-                WireResponse::Error(error) => Err(error.into_client_error()),
-                response => Err(unexpected_response(response)),
-            }
+            Err(ClientError::Runtime(
+                "Unix sockets are not supported on this platform".to_string(),
+            ))
         }
     }
 

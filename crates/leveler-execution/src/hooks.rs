@@ -451,7 +451,9 @@ mod lifecycle_hook_tests {
     use super::tests::shell_exit;
     use super::*;
 
-    /// A hook fixture that records the event it saw into `path`.
+    /// A hook fixture that records the event it saw into `path`. Unix-shaped
+    /// (`/bin/sh`), like the two tests that use it.
+    #[cfg(unix)]
     fn record_to(path: &Path) -> Vec<String> {
         let p = path.display().to_string();
         vec![

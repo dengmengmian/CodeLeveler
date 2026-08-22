@@ -12,12 +12,15 @@ use leveler_client_protocol::{
     ClientCommand, ClientError, InteractiveRuntimeClient, PermissionProfile, RuntimeEvent,
     SessionId, UiSessionSnapshot,
 };
-use leveler_local_transport::{
-    CreateSessionRequest, LocalRuntimeService, LocalSocketServer, SessionBootstrap,
-};
-use leveler_remote_agent::{
-    AgentBridge, ProjectInfo, ProjectRouter, ProjectRoutes, RouteError, TrustedDevices,
-};
+use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
+use leveler_remote_agent::{AgentBridge, ProjectInfo, ProjectRoutes, RouteError, TrustedDevices};
+// The registry-backed router and the daemon it attaches to are Unix-only, and
+// so are the two tests at the bottom that use them. The project-isolation tests
+// above them are not, and must keep running everywhere.
+#[cfg(unix)]
+use leveler_local_transport::LocalSocketServer;
+#[cfg(unix)]
+use leveler_remote_agent::ProjectRouter;
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::tunnel::{RpcMethod, RpcRequestPayload, rpc_stream_id};
 use leveler_remote_protocol::{
@@ -25,6 +28,7 @@ use leveler_remote_protocol::{
 };
 use leveler_session_wire::ProjectStatus;
 use tokio::sync::broadcast;
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
 const DEVICE_SEED: [u8; 32] = [81u8; 32];

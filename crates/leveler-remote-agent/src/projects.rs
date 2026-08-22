@@ -15,8 +15,12 @@
 //!   registry are reachable; "open this path" from a phone is a later phase with
 //!   its own confirmation UX, because it is a request to run code somewhere new.
 
+#[cfg(any(unix, test))]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(any(unix, test))]
+use std::path::Path;
+#[cfg(any(unix, test))]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -128,6 +132,10 @@ impl ProjectRoutes for SingleProject {
 /// Read-only here, and every field defaults, so a registry written by a newer
 /// web build stays readable rather than making every project disappear. The
 /// authority for what is open remains that file; the agent adds nothing to it.
+///
+/// Only the socket-backed router reads it, so on a platform without that
+/// transport this type exists for the tests alone.
+#[cfg(any(unix, test))]
 #[derive(Debug, Default, Deserialize)]
 struct Registry {
     #[serde(default)]
@@ -141,6 +149,7 @@ struct Registry {
 }
 
 /// Display name for a repository: the user's alias, else the last path segment.
+#[cfg(any(unix, test))]
 fn display_for(path: &Path, aliases: &HashMap<PathBuf, String>) -> String {
     aliases
         .get(path)

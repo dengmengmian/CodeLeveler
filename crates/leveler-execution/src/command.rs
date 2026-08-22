@@ -362,11 +362,15 @@ pub(crate) fn sandbox_command_with_read_denials_ro(
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        // Windows confines through AppContainer (see `windows_sandbox`), not
+        // through an argv wrapper, so every confinement input is consumed
+        // there and none of them shape the command line here.
         let _ = (
             write_root,
             extra_read_roots,
             scratch_root,
             cache_write_roots,
+            read_only_workspace,
         );
         (program.to_string(), args.to_vec())
     }
@@ -519,7 +523,7 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 /// host processes and turn a cache compatibility allowance into persistence.
 /// Writable roots for a pre-claim (read-only-workspace) process: scratch and
 /// toolchain caches only — deliberately never the workspace itself.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn writable_roots_without_workspace(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
@@ -1024,6 +1028,15 @@ impl CommandRunner {
 
 /// Windows: Unrestricted → Job Object only; restricted intents → AppContainer FS.
 #[cfg(windows)]
+/// `chunks` is the live-output sender that `run_observed` (the user shell's
+/// `!command` view) passes down. The Job Object path reads its pipes exactly
+/// like Unix does, so it streams. The AppContainer path does not: `rappct`
+/// hands back synchronous readers, and giving it a live view means restructuring
+/// that launcher rather than threading one argument. So on Windows a confined
+/// command (`ReadOnly` / `WorkspaceWrite`, i.e. anything below full access)
+/// delivers its output when it finishes instead of as it arrives. The sender is
+/// dropped here deliberately, and dropping it closes the channel — the consumer
+/// sees "no live view", never a stall waiting for chunks that will not come.
 async fn run_windows_dispatch(
     request: ProcessRequest,
     intent: crate::windows_sandbox::FilesystemIntent,
@@ -1031,13 +1044,15 @@ async fn run_windows_dispatch(
     args: &[String],
     cancellation: CancellationToken,
     environment: std::sync::Arc<leveler_core::EnvSnapshot>,
+    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
 ) -> Result<ProcessOutput, ProcessError> {
     use crate::windows_sandbox::FilesystemIntent;
     match intent {
         FilesystemIntent::Unrestricted => {
-            run_with_windows_job(request, program, args, cancellation, &environment).await
+            run_with_windows_job(request, program, args, cancellation, &environment, chunks).await
         }
         FilesystemIntent::ReadOnly { .. } | FilesystemIntent::WorkspaceWrite { .. } => {
+            drop(chunks);
             crate::windows_appcontainer::run_appcontainer(
                 request,
                 intent,
@@ -1197,6 +1212,7 @@ async fn run_with_windows_job(
     args: &[String],
     cancellation: CancellationToken,
     environment: &leveler_core::EnvSnapshot,
+    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
 ) -> Result<ProcessOutput, ProcessError> {
     use process_wrap::tokio::*;
 
@@ -1217,11 +1233,13 @@ async fn run_with_windows_job(
     let drain = CancellationToken::new();
     let stdout_task = {
         let drain = drain.clone();
-        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, None).await })
+        let tx = chunks.clone().map(|tx| (OutputStream::Stdout, tx));
+        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, tx).await })
     };
     let stderr_task = {
         let drain = drain.clone();
-        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, None).await })
+        let tx = chunks.map(|tx| (OutputStream::Stderr, tx));
+        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx).await })
     };
 
     // Bound post-kill wait so a stuck job cannot trap the agent turn (same
@@ -1802,6 +1820,86 @@ mod tests {
         );
         let go = a.iter().position(|s| s == "go").expect("command present");
         assert_eq!(a[go + 1], "build", "command args follow the program");
+    }
+
+    /// Which confinement backend a platform actually gets. The policy-text
+    /// tests below each speak one backend's dialect; this one asserts that the
+    /// dialect matches the host, so neither of them can quietly become the
+    /// authority on a platform it does not describe.
+    #[test]
+    fn confinement_selects_the_platform_backend() {
+        let root = std::path::Path::new("/tmp");
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (program, args) = sandbox_command(
+            "touch",
+            &["x".into()],
+            true,
+            Some(root),
+            &[],
+            Some(scratch.path()),
+            &[],
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(program, "/usr/bin/sandbox-exec");
+            let sep = args.iter().position(|a| a == "--").expect("-- separator");
+            assert_eq!(args[sep + 1], "touch", "command follows the separator");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(program, "bwrap");
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/"),
+                "/ bound read-only: {args:?}"
+            );
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp"),
+                "declared write root re-bound writable: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a == "--unshare-net"),
+                "network denied: {args:?}"
+            );
+            let cmd = args
+                .iter()
+                .position(|a| a == "touch")
+                .expect("command present");
+            assert_eq!(args[cmd + 1], "x", "command args follow the program");
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            assert_eq!(program, "touch", "no OS confinement backend here");
+            assert_eq!(args, vec!["x".to_string()]);
+        }
+    }
+
+    /// The harness read seal (C2.3C-S) is macOS-only today. Pinned rather than
+    /// left implicit: on Linux a sealed root with no write confinement runs the
+    /// command bare, so an eval harness cannot put its answer key out of reach
+    /// there. Delete this test when the Linux backend grows a read denial —
+    /// its failure is then the signal that the seal arrived.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_denials_are_a_macos_only_seal_today() {
+        let secret = std::path::PathBuf::from("/home/someone/project/evals");
+        let (program, args) = sandbox_command_with_read_denials(
+            "cat",
+            &["x".into()],
+            false,
+            None,
+            &[],
+            None,
+            &[],
+            std::slice::from_ref(&secret),
+        );
+        assert_eq!(
+            program, "cat",
+            "known gap: bwrap has no read-denial mechanism, so the seal is dropped"
+        );
+        assert_eq!(args, vec!["x".to_string()]);
     }
 
     #[test]
@@ -3031,6 +3129,13 @@ mod tests {
     /// indifferent to whether the read came from cat, python, sqlite3,
     /// `git -C`, a nested shell, or a symlink, which is exactly why this is not
     /// a command blacklist.
+    ///
+    /// macOS only, and deliberately so: the seal is an SBPL `deny file-read*`
+    /// rule, and the Linux backend has no equivalent — `linux_sandbox_command`
+    /// does not even take `read_denied_roots`, because bwrap's `--ro-bind /`
+    /// grants reads rather than withholding them. The gap is pinned by
+    /// [`read_denials_are_a_macos_only_seal_today`] so it stays visible.
+    #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_denies_reads_of_declared_host_roots() {
         let root = std::path::Path::new("/tmp");
@@ -3069,6 +3174,11 @@ mod tests {
     /// must be able to READ every root it may WRITE, so the profile must
     /// re-allow reads on the writable roots AFTER the denial block (SBPL:
     /// last matching rule wins). Answer keys never live in a writable root.
+    ///
+    /// macOS only: it reads an SBPL policy, and the seal it protects does not
+    /// exist on the Linux backend (see
+    /// [`read_denials_are_a_macos_only_seal_today`]).
+    #[cfg(target_os = "macos")]
     #[test]
     fn read_denials_do_not_swallow_the_sandboxes_own_writable_roots() {
         let base = tempfile::tempdir().expect("base");
@@ -3361,6 +3471,11 @@ mod tests {
     /// roots. Full-access with network normally skips `sandbox-exec` entirely;
     /// that is exactly the state a granted `request_permissions` produces, so
     /// it must still carry the denials.
+    ///
+    /// macOS only for the same reason as
+    /// [`seatbelt_denies_reads_of_declared_host_roots`]: there is no Linux read
+    /// seal to survive anything.
+    #[cfg(target_os = "macos")]
     #[test]
     fn sealed_roots_survive_the_unconfined_execution_path() {
         let secret = std::path::PathBuf::from("/Users/someone/project/evals");
@@ -3402,6 +3517,12 @@ mod tests {
         );
     }
 
+    /// The macOS half of write confinement, asserted through the artefact that
+    /// backend actually produces (an SBPL policy passed by `-D` params). The
+    /// Linux half of the same property is
+    /// [`bwrap_confines_writes_to_roots`], and which backend gets selected on
+    /// which platform is [`confinement_selects_the_platform_backend`].
+    #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_confines_writes_via_params() {
         let root = std::path::Path::new("/tmp");

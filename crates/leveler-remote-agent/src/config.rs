@@ -107,8 +107,12 @@ pub enum ConfigError {
     #[error("could not parse {path}: {source}")]
     Parse {
         path: PathBuf,
+        // Boxed: `toml::de::Error` carries the input span and is wide enough to
+        // make every `Result<_, ConfigError>` in this module large on targets
+        // with a bigger `PathBuf` (Windows). Config load/save is cold, so the
+        // indirection costs nothing and keeps the Ok path small everywhere.
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("the runtime key at {0} is not a 32-byte Ed25519 seed")]
     MalformedKey(PathBuf),
@@ -146,7 +150,10 @@ impl RemoteHome {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let config = toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })?;
+        let config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path,
+            source: Box::new(source),
+        })?;
         Ok(Some(config))
     }
 

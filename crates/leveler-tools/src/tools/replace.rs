@@ -617,6 +617,7 @@ pub(crate) async fn commit_remove(
             .await
             .map_err(|e| ToolError::Io(format!("remove {}: {e}", resolved.display())))?;
         context
+            .execution
             .checkpoint
             .record_captured(resolved, current.into_bytes(), permissions);
         drop(lock);

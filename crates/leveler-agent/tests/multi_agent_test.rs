@@ -547,6 +547,7 @@ async fn a_worker_cannot_keep_a_shell_write_outside_its_scope() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(unix)]
 fn init_git(dir: &std::path::Path) {
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
