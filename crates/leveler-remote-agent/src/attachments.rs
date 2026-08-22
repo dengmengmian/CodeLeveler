@@ -62,7 +62,10 @@ pub struct FetchChunkResponse {
 /// Content-address ids are 64 lowercase hex characters. Anything else is
 /// refused before the runtime is asked, so `../` never becomes a path.
 pub fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// One piece of an upload, as it arrives inside a signed `rpc_request`.

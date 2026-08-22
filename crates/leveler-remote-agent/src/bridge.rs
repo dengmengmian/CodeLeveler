@@ -306,10 +306,8 @@ impl AgentBridge {
                         reason: "attachment exceeds the remote fetch limit",
                     });
                 }
-                let chunk_total = std::cmp::max(
-                    1u32,
-                    blob.bytes.len().div_ceil(FETCH_CHUNK_BYTES) as u32,
-                );
+                let chunk_total =
+                    std::cmp::max(1u32, blob.bytes.len().div_ceil(FETCH_CHUNK_BYTES) as u32);
                 if fetch.chunk_index >= chunk_total {
                     return Err(AdmissionError::MalformedPayload);
                 }

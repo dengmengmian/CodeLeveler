@@ -279,15 +279,18 @@ impl MediaStore {
 }
 
 fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn sanitize_mime(mime: &str) -> String {
     let trimmed = mime.trim();
     if trimmed.len() <= 80
-        && trimmed
-            .bytes()
-            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'+' | b'-'))
+        && trimmed.bytes().all(
+            |b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'+' | b'-'),
+        )
         && trimmed.contains('/')
     {
         trimmed.to_ascii_lowercase()
