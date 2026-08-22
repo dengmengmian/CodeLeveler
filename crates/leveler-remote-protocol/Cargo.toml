@@ -33,4 +33,4 @@ base64 = { workspace = true }
 # mutation pass would leave a hole exactly where the payload is attacker-chosen.
 # The dependency stays out of the built library, so the rule that this crate
 # does not carry session framing is unchanged.
-leveler-session-wire = { path = "../leveler-session-wire" }
+leveler-session-wire = { workspace = true }
