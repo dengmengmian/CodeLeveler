@@ -95,6 +95,93 @@ impl<'a> EventRepository<'a> {
         Ok(row)
     }
 
+    /// Append many events as one transaction, assigning one contiguous
+    /// sequence range in the order given.
+    ///
+    /// Same durability and redaction contract as [`Self::append`]; the
+    /// difference is cost. Per-event append pays a `MAX(sequence)` aggregate,
+    /// an INSERT and a readback SELECT — two round-trips each. A real
+    /// Multi-Agent turn (parent plus three explorer children, all emitting into
+    /// one bounded channel) out-produced that drain rate, overflowed the
+    /// channel, and the run was cancelled. Here the aggregate and the commit
+    /// are paid once for the whole burst, and each record is built from what
+    /// was just written instead of read back.
+    ///
+    /// Every payload is redacted and validated **before** any INSERT, so one
+    /// malformed member refuses the whole batch without consuming a sequence
+    /// or persisting a sibling.
+    pub async fn append_batch(
+        &self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        events: &[(&str, &str)],
+        now: Timestamp,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prepared = events
+            .iter()
+            .map(|(event_type, payload)| {
+                let payload = crate::redact_json_payload_for_session(
+                    &format!("event (type '{event_type}')"),
+                    payload,
+                    Some(session_id.as_str()),
+                )?;
+                Ok((
+                    leveler_core::EventId::generate().into_inner(),
+                    (*event_type).to_string(),
+                    payload,
+                ))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+
+        let created_at = now.to_rfc3339();
+        let turn = turn_id.map(|t| t.as_str().to_string());
+        let mut tx = self.db.pool().begin().await?;
+        // One aggregate for the whole range. The transaction plus the UNIQUE
+        // index on (session_id, sequence) is what makes that safe against a
+        // concurrent writer: a racing batch fails loudly rather than
+        // interleaving silently.
+        let (base,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?1")
+                .bind(session_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+
+        let mut records = Vec::with_capacity(prepared.len());
+        for (offset, (id, event_type, payload)) in prepared.into_iter().enumerate() {
+            let sequence = base + offset as i64 + 1;
+            sqlx::query(
+                "INSERT INTO events \
+                 (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .bind(&id)
+            .bind(session_id.as_str())
+            .bind(&turn)
+            .bind(sequence)
+            .bind(&event_type)
+            .bind(&payload)
+            .bind(&created_at)
+            .bind(EVENT_SCHEMA_VERSION)
+            .execute(&mut *tx)
+            .await?;
+            records.push(EventRecord {
+                id,
+                session_id: session_id.as_str().to_string(),
+                turn_id: turn.clone(),
+                sequence,
+                event_type,
+                payload,
+                created_at: created_at.clone(),
+                schema_version: EVENT_SCHEMA_VERSION,
+            });
+        }
+        tx.commit().await?;
+        Ok(records)
+    }
+
     /// All events of a session in sequence order.
     pub async fn load(&self, session_id: &SessionId) -> Result<Vec<EventRecord>, StorageError> {
         self.load_after(session_id, 0).await
@@ -333,6 +420,106 @@ mod tests {
         );
         assert_eq!(loaded[0].event_type, "task_started");
         assert_eq!(loaded[2].payload, r#"{"i":2}"#);
+    }
+
+    /// A batch is one transaction assigning one contiguous sequence range.
+    /// The pump persists bursts this way: a real Multi-Agent turn (parent plus
+    /// three explorer children, session `446c71ad`) produced canonical events
+    /// faster than one-INSERT-plus-one-readback per event could drain them, the
+    /// bounded channel overflowed, and the run was cancelled. Ordering and
+    /// gaplessness are what must survive the change.
+    #[tokio::test]
+    async fn append_batch_assigns_one_contiguous_range_in_order() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+
+        repo.append(
+            &session,
+            None,
+            "task_started",
+            r#"{"i":0}"#,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+        let payloads: Vec<String> = (1..=4).map(|i| format!(r#"{{"i":{i}}}"#)).collect();
+        let batch: Vec<(&str, &str)> = payloads
+            .iter()
+            .map(|p| ("tool_call_finished", p.as_str()))
+            .collect();
+        let rows = repo
+            .append_batch(&session, None, &batch, leveler_core::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![2, 3, 4, 5],
+            "a batch continues the session's sequence without gaps"
+        );
+
+        let loaded = repo.load(&session).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|e| e.payload.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                r#"{"i":0}"#,
+                r#"{"i":1}"#,
+                r#"{"i":2}"#,
+                r#"{"i":3}"#,
+                r#"{"i":4}"#
+            ],
+            "emission order is preserved inside the batch"
+        );
+    }
+
+    /// An empty batch is a no-op: not an error, and it consumes no sequence.
+    #[tokio::test]
+    async fn append_batch_of_nothing_touches_nothing() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        assert!(
+            repo.append_batch(&session, None, &[], leveler_core::now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repo.load(&session).await.unwrap().is_empty());
+    }
+
+    /// Redaction and validation run before any INSERT, exactly as for a single
+    /// append: one malformed member refuses the whole batch without consuming a
+    /// sequence or landing a sibling.
+    #[tokio::test]
+    async fn a_malformed_member_rejects_the_whole_batch_before_insert() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        let outcome = repo
+            .append_batch(
+                &session,
+                None,
+                &[
+                    ("task_started", r#"{"ok":1}"#),
+                    ("task_started", "{not json"),
+                ],
+                leveler_core::now(),
+            )
+            .await;
+        assert!(
+            outcome.is_err(),
+            "a malformed payload must be refused loudly"
+        );
+        assert!(
+            repo.load(&session).await.unwrap().is_empty(),
+            "no sibling may be persisted when the batch is refused"
+        );
     }
 
     #[tokio::test]

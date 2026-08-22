@@ -45,6 +45,36 @@ pub trait EventStore: Send + Sync {
         now: Timestamp,
     ) -> Result<EventRecord, StorageError>;
 
+    /// Append many events as one unit, in the order given.
+    ///
+    /// The default loops [`Self::append`], which is correct but pays a
+    /// `MAX(sequence)` aggregate, an INSERT and a readback per event. Backends
+    /// that can do better should override it — the SQLite adapter commits the
+    /// whole batch in one transaction. Test doubles that gate on a specific
+    /// event keep working through the default, which is why this is not a
+    /// required method.
+    ///
+    /// Ordering, gapless sequencing and redaction are unchanged from
+    /// [`Self::append`]. A failure mid-batch reports it; whether earlier
+    /// members survived is backend-specific and callers must not assume either
+    /// way.
+    async fn append_batch(
+        &self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        events: &[(&str, &str)],
+        now: Timestamp,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        let mut records = Vec::with_capacity(events.len());
+        for (event_type, payload) in events {
+            records.push(
+                self.append(session_id, turn_id, event_type, payload, now)
+                    .await?,
+            );
+        }
+        Ok(records)
+    }
+
     /// All events of a session in sequence order.
     async fn load(&self, session_id: &SessionId) -> Result<Vec<EventRecord>, StorageError>;
 
@@ -148,6 +178,35 @@ pub trait EventStore: Send + Sync {
         payload: &str,
         now: Timestamp,
     ) -> Result<EventRecord, crate::OwnershipError>;
+
+    /// Fenced batch append: [`Self::append_batch`] under [`Self::append_owned`]'s
+    /// ownership guarantee.
+    ///
+    /// This is the one that matters in production — every engine `EventLog` is
+    /// built with `new_owned`, so the unfenced batch path is never the hot one.
+    /// A stale token must persist **nothing**: the fence is what stops a
+    /// runtime that lost its task from extending the canonical log, and a batch
+    /// must not weaken it into "some of the burst got through".
+    ///
+    /// The default loops [`Self::append_owned`], preserving behaviour for test
+    /// doubles that gate on individual events.
+    async fn append_batch_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        events: &[(&str, &str)],
+        now: Timestamp,
+    ) -> Result<Vec<EventRecord>, crate::OwnershipError> {
+        let mut records = Vec::with_capacity(events.len());
+        for (event_type, payload) in events {
+            records.push(
+                self.append_owned(token, session_id, turn_id, event_type, payload, now)
+                    .await?,
+            );
+        }
+        Ok(records)
+    }
 }
 
 /// The production SQLite adapter: delegates to [`EventRepository`].
@@ -163,6 +222,21 @@ impl EventStore for Database {
     ) -> Result<EventRecord, StorageError> {
         EventRepository::new(self)
             .append(session_id, turn_id, event_type, payload, now)
+            .await
+    }
+
+    /// One transaction for the whole batch — see
+    /// [`EventRepository::append_batch`] for why the default loop is not good
+    /// enough under a Multi-Agent burst.
+    async fn append_batch(
+        &self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        events: &[(&str, &str)],
+        now: Timestamp,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        EventRepository::new(self)
+            .append_batch(session_id, turn_id, events, now)
             .await
     }
 
@@ -272,6 +346,99 @@ impl EventStore for Database {
         .fetch_one(self.pool())
         .await
         .map_err(StorageError::from)?)
+    }
+
+    async fn append_batch_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        events: &[(&str, &str)],
+        now: Timestamp,
+    ) -> Result<Vec<EventRecord>, crate::OwnershipError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Redact and validate every member before any INSERT: one malformed
+        // payload refuses the batch without consuming a sequence.
+        let prepared = events
+            .iter()
+            .map(|(event_type, payload)| {
+                let payload = redact_validated(event_type, payload, session_id)?;
+                Ok((
+                    leveler_core::EventId::generate().into_inner(),
+                    (*event_type).to_string(),
+                    payload,
+                ))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()
+            .map_err(crate::OwnershipError::Storage)?;
+
+        let created_at = now.to_rfc3339();
+        let turn = turn_id.map(|t| t.as_str().to_string());
+        let mut tx = self.pool().begin().await.map_err(StorageError::from)?;
+        let (base,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?1")
+                .bind(session_id.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(StorageError::from)?;
+
+        let mut records = Vec::with_capacity(prepared.len());
+        for (offset, (id, event_type, payload)) in prepared.into_iter().enumerate() {
+            let sequence = base + offset as i64 + 1;
+            // The ownership guard rides the FIRST insert, exactly as the
+            // single-event path does, so there is still no window between
+            // "token verified" and "row written". Once that statement lands,
+            // this transaction holds SQLite's write lock: no other connection
+            // can flip ownership until we commit, so the remaining inserts are
+            // covered by it. A stale token affects 0 rows here, and the
+            // transaction is dropped without commit — nothing persists.
+            let guarded = offset == 0;
+            let sql = if guarded {
+                "INSERT INTO events \
+                 (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+                 WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 \
+                               AND id = ?9 AND owner_runtime_id = ?10 AND owner_epoch = ?11)"
+            } else {
+                "INSERT INTO events \
+                 (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            };
+            let mut query = sqlx::query(sql)
+                .bind(&id)
+                .bind(session_id.as_str())
+                .bind(&turn)
+                .bind(sequence)
+                .bind(&event_type)
+                .bind(&payload)
+                .bind(&created_at)
+                .bind(EVENT_SCHEMA_VERSION);
+            if guarded {
+                query = query
+                    .bind(token.task_id.as_str())
+                    .bind(token.runtime_id.as_str())
+                    .bind(token.owner_epoch.get() as i64);
+            }
+            let inserted = query.execute(&mut *tx).await.map_err(StorageError::from)?;
+            if guarded && inserted.rows_affected() != 1 {
+                drop(tx);
+                return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+            }
+            records.push(EventRecord {
+                id,
+                session_id: session_id.as_str().to_string(),
+                turn_id: turn.clone(),
+                sequence,
+                event_type,
+                payload,
+                created_at: created_at.clone(),
+                schema_version: EVENT_SCHEMA_VERSION,
+            });
+        }
+        tx.commit().await.map_err(StorageError::from)?;
+        Ok(records)
     }
 }
 

@@ -52,6 +52,27 @@ async fn assert_fencing_contract(
         "a stale append must store no event"
     );
 
+    // Scenario D-batch: the batched canonical append is the production path
+    // (the engine's EventLog is always `new_owned`, and the turn pump drains in
+    // batches). A stale token must persist NOTHING — not "some of the burst".
+    assert_stale(
+        ports
+            .events
+            .append_batch_owned(
+                stale,
+                session,
+                None,
+                &[("task_started", "{}"), ("tool_call_started", "{}")],
+                now(),
+            )
+            .await,
+        "event batch append",
+    );
+    assert!(
+        ports.events.load(session).await.unwrap().is_empty(),
+        "a stale batch must store no event, including its first member"
+    );
+
     // Scenario F: stale turn start → no turn row.
     assert_stale(
         ports
@@ -88,6 +109,44 @@ async fn assert_fencing_contract(
         )
         .await
         .unwrap();
+    // …and the current owner's batch lands whole, in order, continuing the
+    // session's sequence without a gap.
+    let batched = ports
+        .events
+        .append_batch_owned(
+            current,
+            session,
+            Some(&turn_id),
+            &[
+                ("tool_call_started", r#"{"n":1}"#),
+                ("tool_call_finished", r#"{"n":2}"#),
+                ("tool_call_started", r#"{"n":3}"#),
+            ],
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(batched.len(), 3, "the whole batch lands");
+    let seqs: Vec<i64> = batched.iter().map(|r| r.sequence).collect();
+    assert_eq!(
+        seqs,
+        vec![seqs[0], seqs[0] + 1, seqs[0] + 2],
+        "a batch occupies one contiguous range: {seqs:?}"
+    );
+    let payloads: Vec<String> = ports
+        .events
+        .load(session)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type.starts_with("tool_call_"))
+        .map(|e| e.payload)
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#],
+        "emission order survives the batch"
+    );
     ports
         .messages
         .append_in_turn_owned(
