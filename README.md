@@ -26,8 +26,11 @@ APP productization, long-running NPC workflows, and a Capability/Extension
 framework are architectural directions — not all shipped yet. See
 [Architecture](docs/ARCHITECTURE.md) for CURRENT vs TARGET vs FUTURE.
 
-Windows, macOS, and Linux are tested in CI. CodeLeveler is currently in public
-beta (`0.1.x`).
+CodeLeveler is in public beta: **`0.2.0-beta.1`**, published as a pre-release
+(see [Installing a beta](#1-install)). The latest stable release is `0.1.4`.
+Windows, macOS, and Linux all run the suite in CI; macOS and Linux are green,
+and Windows builds, lints and passes its security canaries with three known
+test failures recorded in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Three focused tools, one workflow
 

@@ -24,8 +24,10 @@ bridge。完整桌面/移动 APP、长期运行的 NPC 工作流、Capability/Ex
 架构方向，**并非全部已交付**。CURRENT / TARGET / FUTURE 见
 [架构说明](docs/ARCHITECTURE.zh-CN.md)。
 
-Windows、macOS 和 Linux 均纳入 CI。CodeLeveler 目前处于 public beta
-（`0.1.x`）。
+CodeLeveler 目前处于 public beta：**`0.2.0-beta.1`**，以 pre-release 形式发布
+（见[安装 beta](#1-安装)）。最新 stable 版本是 `0.1.4`。Windows、macOS 和 Linux
+都在 CI 里跑完整测试；macOS 与 Linux 全绿，Windows 编译、lint 与安全 canary 通过，
+另有三个已知测试失败，记录在 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 三个专注的工具，一套工作流
 
@@ -66,13 +68,20 @@ brew install dengmengmian/tap/leveler
 
 之后用 `brew upgrade leveler` 升级。
 
+**安装 beta。** pre-release 版本刻意不会被 `brew`、一键安装脚本或
+`leveler upgrade` 默认取到 —— 只有点名要它才会装上：
+
+```sh
+LEVELER_VERSION=v0.2.0-beta.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
+```
+
 **方式 B — 下载预编译二进制**
 
 从[最新发布页](https://github.com/dengmengmian/CodeLeveler/releases/latest)下载对应
 平台的压缩包，解压后把 `leveler` 放到 `PATH`。示例（按平台替换 `V`/`T`）：
 
 ```sh
-V=0.1.0; T=aarch64-apple-darwin   # 或 x86_64-apple-darwin、x86_64-unknown-linux-gnu
+V=0.1.4; T=aarch64-apple-darwin   # 或 x86_64-apple-darwin、x86_64-unknown-linux-gnu
 curl -LO https://github.com/dengmengmian/CodeLeveler/releases/download/v$V/leveler-v$V-$T.tar.gz
 tar -xzf "leveler-v$V-$T.tar.gz"
 sudo mv "leveler-v$V-$T/leveler" /usr/local/bin/

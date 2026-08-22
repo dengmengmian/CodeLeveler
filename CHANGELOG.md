@@ -6,6 +6,29 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0-beta.1] - 2026-08-22
+
+First public pre-release. Published as a GitHub **pre-release**, so `brew`,
+`install.sh` and `leveler upgrade` keep serving the latest stable (`0.1.4`)
+unless a beta is asked for by name (`LEVELER_VERSION=v0.2.0-beta.1`).
+
+**Known limitations** — these are stated, not hidden:
+- **Delegation is opportunity-based.** The runtime executes a delegation
+  reliably whenever the model elects to collaborate; it does not promise that
+  the agent splits a task on its own. Measured adoption on qualified tasks is
+  10–30 %. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+- **Windows has no daemon socket transport.** Sessions and `resume` work;
+  `leveler serve` / `web` / `remote projects` / `remote agent` refuse with a
+  clear message rather than pretending. `!command` output for a *confined*
+  Windows command arrives on completion instead of streaming live.
+- **Three Windows tests fail on `main`** (`command_delivery`, `user_shell`,
+  `side_effect_barrier_test`). The Windows build, clippy and security canaries
+  are green. Diagnosis needs a Windows machine — see
+  [`docs/BETA_BLOCKER_RESOLUTION.md`](docs/BETA_BLOCKER_RESOLUTION.md) risk 0b.
+- **Long-running goals and structured sub-agent workflows are post-Beta.**
+  Durable child sessions, a delegation advisor and capability negotiation are
+  designed but not shipped.
+
 ### Added
 - Mobile Beta MVP (`apps/leveler-mobile`, tag `mobile-beta-mvp`): workspace
   Home, agent timeline, `steer_current_turn` while a turn is running,

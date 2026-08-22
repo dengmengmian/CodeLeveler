@@ -1,5 +1,13 @@
 # Beta Release Readiness
 
+> **Superseded — this is the audit that opened the Beta, kept as the record of
+> what it found.** All four blockers it names are closed; the workspace version
+> is `0.2.0-beta.1`, not the `0.1.4` this page audited, and the target is
+> `0.2.0-beta.1`, not `1.0.0-beta.1`. For the current state read
+> [`BETA_BLOCKER_RESOLUTION.md`](BETA_BLOCKER_RESOLUTION.md); nothing below is
+> edited to match, because an audit that is rewritten to agree with its outcome
+> stops being evidence.
+
 **Audit date:** 2026-08-22 · **Audited tree:** `fix/ma-wa1-delegation-reliability` @ `4a7d6616`
 · **`main`:** `b967f9fe` · **Workspace version:** `0.1.4` · **Target:** `1.0.0-beta.1`
 
