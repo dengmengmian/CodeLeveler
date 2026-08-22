@@ -925,6 +925,13 @@ mod toolchain_provenance_tests {
         report.checks.into_iter().next().unwrap()
     }
 
+    /// Unix only, and not because the rule is: it needs a host toolchain that
+    /// can actually read a version. The Windows runner's cargo cannot create
+    /// `%USERPROFILE%\\.rustup`, so it never reaches the `rust-version` it is
+    /// supposed to be refused by, and the assertion would be measuring the
+    /// runner rather than the classifier. The classifier's own rules are unit
+    /// tested on every platform in `failure.rs`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unmet_rust_requirement_is_environment_not_code_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -959,6 +966,9 @@ mod toolchain_provenance_tests {
         );
     }
 
+    /// Unix only, for the same reason as the cargo case above: it depends on the
+    /// host's `go` answering a version probe.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unmet_go_requirement_is_environment_not_code_failure() {
         let dir = tempfile::tempdir().unwrap();

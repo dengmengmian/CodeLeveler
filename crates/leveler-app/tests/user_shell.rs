@@ -406,9 +406,11 @@ async fn snapshot_restores_active_shell_with_elapsed() {
     let server = MockServer::start(vec![sse_text("unused")]).await;
     let mut h = harness(&server).await;
     // Something that stays alive for a few seconds on either platform. cmd has
-    // no `sleep`; `ping -n` is the portable stand-in that needs no console.
+    // no `sleep`, and `ping` needs a network the confined profile does not
+    // grant; `waitfor` blocks on a signal that never arrives and needs neither
+    // a console nor a socket.
     let stay_alive = if cfg!(windows) {
-        "ping -n 6 127.0.0.1"
+        "waitfor /t 5 LevelerUserShellTest"
     } else {
         "sleep 5"
     };
