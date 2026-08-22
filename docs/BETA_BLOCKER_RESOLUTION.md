@@ -418,3 +418,48 @@ beta; both block calling Windows supported.
 [`evaluations/REAL_USAGE_BETA_001.md`](evaluations/REAL_USAGE_BETA_001.md) —
 six tasks in six third-party repositories, run against the published binary
 rather than a checkout, because that is the artifact users actually get.
+
+---
+
+## New finding: the suite is flaky, and that is why the debt hid
+
+Cutting the tag produced three more CI runs, and they answer a question the
+earlier rounds could only guess at. Two of the three commits were **docs only**;
+the third restored a text file and added a shell script. None of them can reach
+the agent loop, the browser runtime, or process control.
+
+| Run | Commit touches | macOS | Windows |
+| --- | --- | --- | --- |
+| `32557567392` | docs | ✓ | 3 tests ✗ |
+| `32571429358` | docs only | ✗ `sessions_and_new_tabs_are_owned_by_the_originating_session` | same 3 ✗ |
+| `32571930103` | `NOTICE`, a script, a CI step | ✗ `loopback_ws_from_a_granted_dev_page_connects` | canaries ✗ `windows_job_timeout_kills_grandchildren` |
+
+**A docs-only commit cannot break a browser test.** So the macOS failures are
+flakes, and they are not one flake: three different tests failed across four
+runs — `duration_budget_stops_the_run_between_rounds` twice and then never
+again, then two different cases in
+`crates/leveler-browser/tests/reliability.rs` (`:527` "target=_blank opened a
+new page", `:714` a granted loopback page reporting `WS_SELF_BLOCKED` instead of
+`WS_SELF_OPEN`). The Windows security canaries did the same thing in the other
+direction: green for three runs, then `windows_job_timeout_kills_grandchildren`
+failed at its 10-second wait for a PowerShell grandchild to write a pidfile —
+another margin against a loaded runner.
+
+**The three Windows test failures are not in this category.** They reproduced
+identically in every run: same three tests, same three targets, same messages.
+Deterministic. They stay diagnosed-by-a-real-machine, as recorded in risk 0b.
+
+**Why this matters more than the individual tests.** This document opened by
+explaining how a month of Windows regressions stayed invisible: the pipeline was
+red, so nobody read it. A suite that fails on a docs commit produces exactly
+that condition — if red is the normal state, red stops carrying information, and
+the next real regression arrives indistinguishable from noise. "Green CI" cannot
+be a release gate while it is partly a coin flip.
+
+**Recorded as a Post-Beta item, not fixed here.** This session was a release
+closure, and the honest boundary is: these tests were flaky before the tag and
+are flaky after it, and none of them is a product defect the beta ships. The
+work is to make the margins deterministic — a clock the test controls rather
+than a budget racing a real `sleep`, and a wait that fails on a signal rather
+than on a stopwatch — starting with `reliability.rs`, which produced two of the
+three flakes.
