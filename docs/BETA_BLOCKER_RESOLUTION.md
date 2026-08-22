@@ -463,3 +463,45 @@ work is to make the margins deterministic — a clock the test controls rather
 than a budget racing a real `sleep`, and a wait that fails on a signal rather
 than on a stopwatch — starting with `reliability.rs`, which produced two of the
 three flakes.
+
+---
+
+## Post-release finding: `upgrade` cannot see past a pre-release
+
+Publishing the beta and then running the thing surfaced a defect that could not
+exist before, because this is the project's first pre-release.
+
+`upgrade_cmd::Version` is `{major, minor, patch}` and `parse_version` discards
+any `-suffix` on purpose — `parse_version("v1.2.3-beta.1") == 1.2.3` is asserted
+by a test. The same struct is then used for display, so a beta user running
+`leveler upgrade --check` is told:
+
+```
+  current:  v0.2.0
+  latest:   v0.1.4 (0.1.4)
+✓ Already up to date.
+```
+
+Two problems, one cosmetic and one not.
+
+**Cosmetic:** `current: v0.2.0` names a version that does not exist. The binary
+is `0.2.0-beta.1`; `--version` says so correctly, and only the upgrade path
+disagrees with it.
+
+**Substantive:** SemVer orders `0.2.0-beta.1 < 0.2.0`, and this parser does not.
+When `0.2.0` ships stable, a beta user's `current` is already `0.2.0`, so
+`should_upgrade(0.2.0, 0.2.0, force=false)` is `false` and **the stable release
+is never offered.** Every `v0.2.0-beta.n` user silently stays on a beta,
+and `--force` becomes the only way off it. The failure is quiet, arrives later,
+and lands on exactly the people who volunteered to test.
+
+**Not a blocker for what shipped.** The channel guarantees hold and were
+verified live after publishing: a bare `install.sh` run installs `0.1.4`, a
+`0.1.4` user is not offered the beta, and a beta user is not silently downgraded
+to `0.1.4`. Nothing published is wrong; the bug is in what happens next.
+
+**Recorded, not fixed.** The fix is not one line — ordering has to learn that a
+pre-release precedes its release, display has to stop borrowing the ordering
+type, and the test that pins the current behaviour has to be rewritten rather
+than deleted. That belongs in its own change with its own tests, before `0.2.0`
+stable, not appended to a release that is already out.
