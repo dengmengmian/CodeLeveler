@@ -96,6 +96,22 @@ fn goal_profile(spec: &TaskSpec) -> TurnProfile {
     }
 }
 
+/// The round policy for the NEXT supervised window. A pinned (bounded) budget
+/// is a task TOTAL: a follow-up window may only consume rounds the epoch has
+/// not already spent — `None` means the total is exhausted and no window may
+/// open, whatever the policy decided (settlement × continuation seam: the
+/// integration window spends the remainder, it never manufactures budget).
+pub(crate) fn continuation_for_next_window(
+    policy: ContinuationPolicy,
+    epoch_rounds_spent: u32,
+) -> Option<ContinuationPolicy> {
+    match policy.round_limit() {
+        Some(total) if epoch_rounds_spent >= total => None,
+        Some(total) => Some(ContinuationPolicy::bounded(total - epoch_rounds_spent)),
+        None => Some(policy),
+    }
+}
+
 /// Fold a continuation turn's outcome into the running aggregate — the ONE
 /// merge that both goal continuation and budget extension use. Rounds, token
 /// spend, and modified files accumulate; the latest turn's text, stop reason,
@@ -1298,8 +1314,26 @@ impl TaskEngine {
                     break;
                 }
                 crate::Continuation::DriveGoalAgain => {
-                    self.drive_goal_again(log, runner, spec, &outcome, observer, &cancellation)
-                        .await?
+                    // Engine bound, not policy: a pinned round budget is a task
+                    // TOTAL. The next window may only consume what the epoch
+                    // has not already spent; at zero remainder no window opens,
+                    // whatever the policy asked for.
+                    let Some(continuation) = continuation_for_next_window(
+                        spec.runtime.continuation,
+                        outcome.progress.cumulative_rounds,
+                    ) else {
+                        break;
+                    };
+                    self.drive_goal_again(
+                        log,
+                        runner,
+                        spec,
+                        continuation,
+                        &outcome,
+                        observer,
+                        &cancellation,
+                    )
+                    .await?
                 }
                 crate::Continuation::ExtendBudget(exhaustion) => {
                     extensions = extensions.saturating_add(1);
@@ -1347,11 +1381,15 @@ impl TaskEngine {
 
     /// Mechanism for [`crate::Continuation::DriveGoalAgain`]: restate the
     /// objective over the latest model-visible context and run one more turn.
+    /// `continuation` is the window's round policy — for pinned budgets the
+    /// supervisor passes the REMAINING total, never the original.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_goal_again(
         &self,
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
+        continuation: ContinuationPolicy,
         outcome: &leveler_agent::AgentOutcome,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
@@ -1411,7 +1449,10 @@ impl TaskEngine {
         let recorded = runner
             .run_turn(
                 TurnKind::User,
-                goal_profile(spec),
+                TurnProfile::Goal {
+                    continuation,
+                    limits: spec.runtime.limits,
+                },
                 TurnInput::Content {
                     prior: context.prior,
                     content: vec![leveler_model::ContentPart::Text {
@@ -2305,6 +2346,91 @@ mod continue_cap_tests {
         assert_eq!(
             windows_opened, MAX_SUPERVISED_TURNS,
             "a progressing goal opens windows up to — and never beyond — the hard bound"
+        );
+    }
+
+    #[test]
+    fn the_next_window_gets_the_remaining_pinned_budget_only() {
+        use leveler_agent::ContinuationPolicy;
+        // ORC-B1 shape: 280 total, first window spent 100 → the integration
+        // window may consume at most the remaining 180.
+        assert_eq!(
+            continuation_for_next_window(ContinuationPolicy::bounded(280), 100),
+            Some(ContinuationPolicy::bounded(180))
+        );
+        // Exhausted total: no window opens, whatever the policy decided.
+        assert_eq!(
+            continuation_for_next_window(ContinuationPolicy::bounded(280), 280),
+            None
+        );
+        assert_eq!(
+            continuation_for_next_window(ContinuationPolicy::bounded(280), 300),
+            None
+        );
+        // Unpinned goals keep their policy untouched.
+        assert_eq!(
+            continuation_for_next_window(ContinuationPolicy::UntilTerminal, 100),
+            Some(ContinuationPolicy::UntilTerminal)
+        );
+    }
+
+    #[test]
+    fn settlement_debt_windows_consume_the_pinned_total_and_terminate() {
+        // Deterministic simulation of the supervise loop for the accident
+        // shape: SAME policy decision (`after_turn`), SAME counter rule
+        // (`advance_no_progress_windows`), SAME engine clamp
+        // (`continuation_for_next_window`) — a goal whose every window ceilings
+        // with unconsumed settlement debt spends the 280 total exactly, never
+        // more, across clamped windows (100-round local ceiling per window).
+        use crate::SupervisorPolicy;
+        use leveler_agent::ContinuationPolicy;
+        const TOTAL: u32 = 280;
+        const LOCAL_WINDOW: u32 = 100;
+        let policy = crate::DefaultSupervisorPolicy::default();
+        let mut spent = LOCAL_WINDOW; // window 1 hit the local ceiling
+        let mut wwp = 0u32;
+        let mut windows_opened = 0u32;
+        for _ in 0..MAX_SUPERVISED_TURNS {
+            let progress = ProgressLedger {
+                phase: leveler_lifecycle::TurnPhase::Active,
+                closing: false,
+                cumulative_rounds: spent,
+                unconsumed_child_settlements: 1,
+                ..Default::default()
+            };
+            let mut ended = goal_ended(&progress, wwp);
+            ended.round_budget = ContinuationPolicy::bounded(TOTAL);
+            match policy.after_turn(&ended) {
+                crate::Continuation::Stop => break,
+                crate::Continuation::DriveGoalAgain => {
+                    let Some(next) =
+                        continuation_for_next_window(ContinuationPolicy::bounded(TOTAL), spent)
+                    else {
+                        break;
+                    };
+                    let window = next
+                        .round_limit()
+                        .expect("pinned budgets clamp to a bounded window")
+                        .min(LOCAL_WINDOW);
+                    windows_opened += 1;
+                    spent += window;
+                    // Integration windows move the workspace in this shape.
+                    wwp = advance_no_progress_windows(wwp, /*made_progress*/ true);
+                }
+                other => panic!("unexpected continuation {other:?}"),
+            }
+        }
+        assert!(
+            spent <= TOTAL,
+            "debt windows must never spend past the pinned total (spent {spent})"
+        );
+        assert_eq!(
+            spent, TOTAL,
+            "with debt standing the goal consumes the full remaining budget"
+        );
+        assert_eq!(
+            windows_opened, 2,
+            "280 total / 100 local = two follow-up windows"
         );
     }
 

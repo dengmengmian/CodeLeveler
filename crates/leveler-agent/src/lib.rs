@@ -17,6 +17,7 @@ mod executor;
 mod injected_tools;
 pub mod named_agent;
 mod nudges;
+pub mod ownership;
 mod prompt;
 mod sub_agent;
 
@@ -42,7 +43,7 @@ pub use leveler_lifecycle::{
     ObjectiveAnchor, ObjectiveSource, PlanOrigin, PlanState, PlanStep, ProgressCaps,
     ProgressLedger, TaskContract, TurnPhase, WorkProfile, check, task_looks_like_implementation,
 };
-pub use sub_agent::{ChildResult, ChildStatus};
+pub use sub_agent::{ChildResult, ChildStatus, DelegationTiming};
 pub use sub_agent::{
     multi_agent_steer_hint, should_inject_delegation_hint, task_suggests_delegation,
 };

@@ -18,6 +18,16 @@ use leveler_model::{
 };
 use leveler_tools::{ToolContext, default_registry};
 
+fn first_started_id(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SubAgentStarted { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("SubAgentStarted")
+}
+
 /// Replays scripted responses in order; each `stream` sleeps either the next
 /// staged delay or the default delay, so concurrent sub-agents can overlap.
 struct SleepyRuntime {
@@ -324,6 +334,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
         .await
         .unwrap();
 
+    let child = first_started_id(&events);
     assert!(
         events.iter().any(|event| {
             matches!(event, AgentEvent::SubAgentProgress {
@@ -332,7 +343,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
             input_tokens: 1_900,
             output_tokens: 110,
             cached_input_tokens: 900,
-        } if id == "agent-1")
+        } if id == &child)
         }),
         "per-agent progress must bubble while it is executing: {events:?}"
     );
@@ -2417,6 +2428,7 @@ mod child_side_effects_are_recoverable {
             self.order.lock().unwrap().push(match event {
                 ChildToolEvent::Started { .. } => "started",
                 ChildToolEvent::Finished { .. } => "finished",
+                ChildToolEvent::Ownership { .. } => "ownership",
             });
             self.events.lock().unwrap().push(event);
         }
@@ -2564,6 +2576,123 @@ mod child_side_effects_are_recoverable {
         assert!(
             flush_after,
             "the child's call was recorded but never flushed before dispatch: {order:?}"
+        );
+    }
+
+    /// The M7 audit is ordered by rowid, so PRESENCE of the grant is not
+    /// enough — it must be durable BEFORE the write it authorizes. A child's
+    /// tool calls flush immediately on its own task, while a grant emitted
+    /// only as `DelegationStage` waits for the parent to drain the activity
+    /// channel at a round boundary. Two durability paths with no ordering
+    /// between them means an offline reader can still see an authorized write
+    /// land ahead of its authorization and call it a bypass — which is the
+    /// entire failure this provenance work exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_durable_before_the_write_it_authorizes() {
+        let dir = tmp("lbo-grant-order", 91);
+        std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+
+        let barrier = Arc::new(RecordingBarrier::default());
+        let runtime = Arc::new(RoutedRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": format!("{CHILD_MARKER}: change old to new")}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "claim_write_scope",
+                        serde_json::json!({"paths": ["b.txt"]}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_with(
+                    vec![patch_call("w1", "b.txt", "old", "new")],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child done"),
+            ],
+            CHILD_MARKER,
+            Duration::from_millis(10),
+        ));
+
+        let workspace = Workspace::new(&dir).unwrap();
+        let mut observed = Vec::new();
+        Executor::new(
+            runtime,
+            Arc::new(default_registry()),
+            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_event_barrier(barrier.clone())
+        .run(
+            "update b",
+            &mut |e| observed.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let events = barrier.events.lock().unwrap().clone();
+        let grant = events
+            .iter()
+            .position(|e| matches!(e, ChildToolEvent::Ownership { action, .. } if action == "ownership_granted"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the grant never reached the durable queue the child's writes use: {events:#?}"
+                )
+            });
+        let write = events
+            .iter()
+            .position(
+                |e| matches!(e, ChildToolEvent::Started { name, .. } if name == "apply_patch"),
+            )
+            .expect("the child's write must be recorded");
+        assert!(
+            grant < write,
+            "the write was durable before its grant — an offline audit ordered by \
+             rowid still reads this as a pre-claim bypass: grant@{grant} write@{write}"
+        );
+        // Exactly ONE durable record per transition. The observer copy is
+        // forwarded to the parent and persisted from there, so recording on
+        // the barrier AND emitting it writes the same grant twice and an
+        // offline audit reads two grants for one claim.
+        let grants = events
+            .iter()
+            .filter(|e| matches!(e, ChildToolEvent::Ownership { .. }))
+            .count();
+        assert_eq!(
+            grants, 1,
+            "one claim produced {grants} records: {events:#?}"
+        );
+        assert!(
+            !observed.iter().any(|e| matches!(
+                e,
+                AgentEvent::DelegationStage { action, .. } if action.starts_with("ownership_")
+            )),
+            "with a durable barrier the transition must not ALSO travel the \
+             observer path, or the parent persists a second copy: {observed:#?}"
+        );
+        // The claim must NOT appear as a tool-call lifecycle: it is a virtual
+        // tool the drive loop answers inline and never registers, so a
+        // ToolCallStarted for it reads as a dangling call to crash recovery
+        // and blocks resume on an operation with no external side effect.
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ChildToolEvent::Started { name, .. } | ChildToolEvent::Finished { name, .. }
+                    if name == "claim_write_scope"
+            )),
+            "the claim must not be recorded as a registered tool's lifecycle: {events:#?}"
         );
     }
 }
@@ -3147,7 +3276,8 @@ async fn an_explorer_finding_is_adopted_by_the_parent_at_acknowledged() {
     assert_eq!(ledger.findings.len(), 1, "one adopted finding");
     let f = &ledger.findings[0];
     assert_eq!(f.state, leveler_lifecycle::FindingState::Acknowledged);
-    assert_eq!(f.source_child, "agent-1");
+    // 970e5db: child ids are session-unique UUIDs, not run ordinals.
+    assert!(!f.source_child.is_empty() && f.source_child != "agent-1");
     assert_eq!(f.role, "explorer");
     assert_eq!(f.summary, "config loader lives here");
     assert_eq!(f.file.as_deref(), Some("src/config.rs"));
@@ -3537,7 +3667,7 @@ async fn an_incomplete_worker_raises_a_blocking_finding() {
     let open = ledger.open_blocking_findings();
     assert_eq!(open.len(), 1, "an incomplete worker must block: {open:?}");
     assert_eq!(open[0].role, "worker");
-    assert_eq!(open[0].source_child, "agent-1");
+    assert!(!open[0].source_child.is_empty() && open[0].source_child != "agent-1");
     assert!(
         open[0].summary.contains("did not complete"),
         "the finding must name the incomplete work: {}",
@@ -3960,7 +4090,9 @@ async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded()
         messages
             .iter()
             .filter(|m| {
-                m.role == Role::User && m.text_content().contains("## Delegation disposition")
+                m.role == Role::User
+                    && m.text_content()
+                        .contains("## Background delegation is available")
             })
             .count()
     };
@@ -3977,7 +4109,11 @@ async fn plan_registration_offers_the_decision_point_once_and_keep_is_recorded()
     );
     let offer_text = last
         .iter()
-        .find(|m| m.role == Role::User && m.text_content().contains("## Delegation disposition"))
+        .find(|m| {
+            m.role == Role::User
+                && m.text_content()
+                    .contains("## Background delegation is available")
+        })
         .unwrap()
         .text_content();
     assert!(
@@ -4053,6 +4189,171 @@ async fn the_second_mutating_round_is_the_fallback_decision_point_without_a_plan
         stages.iter().filter(|(action, _)| action == "kept").count(),
         1,
         "{stages:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// MA-WA1 repair accident regression (EB-3 shape), executor level: the offer
+/// lands at plan registration when the tail steps are dependency-blocked →
+/// rational KEEP; the plan then progresses (a step completes, ≥2 bounded
+/// steps remain) — the harness raises exactly ONE reconsideration, grounded
+/// in the parent's own edited paths, records the durable `reoffered` fact,
+/// and never asks again.
+#[tokio::test]
+async fn plan_progress_after_keep_raises_one_reconsideration_with_parent_scope_facts() {
+    let dir = tmp("decision-reconsider", 44);
+    std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            // r1: decomposition on record → offer this round.
+            assistant_with(
+                vec![tool_call_part(
+                    "p1",
+                    "update_plan",
+                    serde_json::json!({
+                        "plan": [
+                            {"step": "implement core", "status": "in_progress"},
+                            {"step": "add regression tests", "status": "pending"},
+                            {"step": "update docs", "status": "pending"}
+                        ]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: mutation after the visible offer → durable KEEP.
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            // r3: core completed; two bounded steps remain open → the one
+            // reconsideration fires at this round boundary.
+            assistant_with(
+                vec![tool_call_part(
+                    "p2",
+                    "update_plan",
+                    serde_json::json!({
+                        "plan": [
+                            {"step": "implement core", "status": "completed"},
+                            {"step": "add regression tests", "status": "in_progress"},
+                            {"step": "update docs", "status": "pending"}
+                        ]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r4: more progress — must NOT re-ask again.
+            assistant_with(
+                vec![tool_call_part(
+                    "p3",
+                    "update_plan",
+                    serde_json::json!({
+                        "plan": [
+                            {"step": "implement core", "status": "completed"},
+                            {"step": "add regression tests", "status": "completed"},
+                            {"step": "update docs", "status": "in_progress"}
+                        ]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        Duration::from_millis(1),
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "land the feature",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let stages = delegation_stages(&events);
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|(action, _)| action == "offered")
+            .count(),
+        1,
+        "{stages:?}"
+    );
+    assert_eq!(
+        stages.iter().filter(|(action, _)| action == "kept").count(),
+        1,
+        "{stages:?}"
+    );
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|(action, _)| action == "reoffered")
+            .count(),
+        1,
+        "exactly one event-driven reconsideration: {stages:?}"
+    );
+    assert!(
+        stages
+            .iter()
+            .any(|(action, detail)| action == "reoffered" && detail == "plan_progress"),
+        "{stages:?}"
+    );
+
+    // The durable fact survives into the ledger (resume windows never re-ask).
+    let last_ledger = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::ProgressUpdated { ledger } => Some(ledger.clone()),
+            _ => None,
+        })
+        .expect("progress ledger updates exist");
+    assert!(last_ledger.delegation_reconsidered);
+    assert!(last_ledger.delegation_kept_recorded);
+
+    // The reconsideration reaches the model exactly once, enumerates the
+    // remaining open steps, and grounds independence in the parent's own
+    // edited paths.
+    let requests = runtime.requests.lock().unwrap();
+    let last = requests.last().unwrap();
+    let reconsider_count = last
+        .iter()
+        .filter(|m| {
+            m.role == Role::User && m.text_content().contains("## Delegation reconsideration")
+        })
+        .count();
+    assert_eq!(reconsider_count, 1, "one reconsideration, never repeated");
+    let text = last
+        .iter()
+        .find(|m| {
+            m.role == Role::User && m.text_content().contains("## Delegation reconsideration")
+        })
+        .unwrap()
+        .text_content();
+    assert!(
+        text.contains("1. add regression tests") && text.contains("2. update docs"),
+        "remaining open steps are enumerated: {text}"
+    );
+    assert!(
+        text.contains("a.txt"),
+        "parent-edited paths ground the boundary: {text}"
+    );
+    // Phase B: the surface states availability and expects no answer —
+    // not calling spawn_agent already IS keeping the work.
+    assert!(
+        text.to_ascii_lowercase().contains("no reply is expected"),
+        "the reconsideration must not demand a disposition: {text}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -4357,8 +4658,9 @@ async fn a_default_spawn_runs_in_background_and_settles_into_a_later_round() {
         spawn_result.contains("started in the background"),
         "{spawn_result}"
     );
+    let child = first_started_id(&events);
     assert!(
-        spawn_result.contains("agent-1"),
+        spawn_result.contains(&child),
         "durable child id must be model-visible: {spawn_result}"
     );
     // Settlement notice reached the model: some later PARENT request carries
@@ -4377,11 +4679,13 @@ async fn a_default_spawn_runs_in_background_and_settles_into_a_later_round() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::SubAgentStarted { id, .. } if id == "agent-1"))
+            .any(|e| matches!(e, AgentEvent::SubAgentStarted { id, .. } if id == &child))
     );
-    assert!(events.iter().any(
-        |e| matches!(e, AgentEvent::SubAgentFinished { id, ok: true, .. } if id == "agent-1")
-    ));
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::SubAgentFinished { id, ok: true, .. } if id == &child)
+        )
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -4479,7 +4783,7 @@ async fn a_running_workers_scope_fences_the_parent_and_new_workers() {
     );
     let overlap_spawn = refusal("s2");
     assert!(
-        overlap_spawn.contains("STILL RUNNING"),
+        overlap_spawn.contains("overlaps exclusive ownership held by"),
         "overlapping worker vs ACTIVE child must be refused: {overlap_spawn}"
     );
     // The child, not the parent, owns the final content of b.txt.
@@ -4810,10 +5114,11 @@ async fn the_round_limit_exit_drains_running_children_instead_of_aborting() {
         leveler_agent::StopReason::BudgetExhausted | leveler_agent::StopReason::TurnLimitReached
     ));
     // The child settled truthfully at the exit drain — it was NOT aborted.
+    let child = first_started_id(&events);
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::SubAgentFinished { id, .. } if id == "agent-1")),
+            .any(|e| matches!(e, AgentEvent::SubAgentFinished { id, .. } if id == &child)),
         "round-limit exit must settle the running child, not abort it"
     );
     // Its work landed and its scope record is cleared.
@@ -4981,11 +5286,1403 @@ async fn settlement_notices_are_appended_to_the_transcript_sink() {
         .await
         .unwrap();
     let recorded = transcript.lock().unwrap();
-    assert!(
-        recorded.iter().any(|m| {
+    let notices = recorded
+        .iter()
+        .filter(|m| {
             m.role == Role::User && m.text_content().contains("## Background sub-agent settled")
-        }),
-        "the settlement notice must be persisted to the sink when injected"
+        })
+        .count();
+    assert_eq!(
+        notices, 1,
+        "the settlement notice must be persisted to the sink when injected — exactly once \
+         (a duplicate would double-inject the child's report on resume)"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Settlement × continuation seam (FA-2 / ORC-B1): a child that settles at the
+/// exit drain — the parent's window closed before it could act on the notice —
+/// must be recorded as UNCONSUMED settlement debt on the progress ledger, so
+/// the continuation layer above can tell a stranded result from a consumed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settlement_at_the_exit_drain_is_recorded_as_unconsumed_debt() {
+    let dir = tmp("bg-debt-strand", 69);
+    std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // r1: delegate; the slow child outlives the 3-round window.
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2/r3: busy observe-only rounds exhaust the window while the
+            // child still runs — it settles at the exit drain, unconsumed.
+            assistant_with(
+                vec![tool_call_part(
+                    "r1",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "r2",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(300),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        3,
+    );
+    let outcome = executor
+        .run(
+            "delegate then run out of window",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // The child's work is real and settled (drained, not aborted) …
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    // … and the ledger names it as debt the parent never got to act on.
+    assert_eq!(
+        outcome.progress.unconsumed_child_settlements, 1,
+        "a settlement the parent had no round to act on must read as unconsumed debt"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── Late-bound ownership (SPAWN != WRITE AUTHORITY) ─────────────────────────
+
+/// A normal `spawn_agent(task)` child (no role, no files) starts WITHOUT write
+/// authority: a mutation before any claim is denied, not executed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_spawned_child_starts_without_write_authority() {
+    let dir = tmp("lbo-noauth", 80);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // Foreground spawn: the child's whole run folds synchronously.
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        vec![
+            // Child writes WITHOUT claiming first: must be denied.
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run(
+            "update b",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "old\n",
+        "a spawned child must not mutate the workspace before claiming a write scope"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The full late-bound protocol: read → claim_write_scope → mutate inside the
+/// claim succeeds; the claim tool result is a grant, not an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_claim_enables_scoped_write() {
+    let dir = tmp("lbo-claim", 81);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "update b",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // The claim's own ToolResult stays inside the child executor's event
+    // stream; the decisive proof is behavioral — the companion no-claim test
+    // shows this exact write is DENIED without a grant, so "new" here can
+    // only mean the claim was granted and enabled the scoped write.
+    let _ = &events;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "new\n",
+        "a granted claim must enable the scoped write"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A write OUTSIDE the claimed scope stays denied after a grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_write_outside_its_claim_is_denied() {
+    let dir = tmp("lbo-outside", 82);
+    std::fs::write(dir.join("a.txt"), "keep\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: edit files")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Outside the claim: must be denied.
+            assistant_with(
+                vec![patch_call("w1", "a.txt", "keep", "stolen")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run("edit", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "keep\n",
+        "a claim on b.txt must not authorize writes to a.txt"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Settlement releases the claim: a second child can then claim the same path
+/// and be granted (no zombie ownership).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settlement_releases_the_claimed_scope_for_the_next_child() {
+    let dir = tmp("lbo-release", 83);
+    std::fs::write(dir.join("b.txt"), "one\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: step one")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![spawn_call(
+                    "s2",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: step two")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        vec![
+            // Child 1: claim + write + settle.
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "one", "two")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("first done"),
+            // Child 2: the SAME path must be claimable after child 1 settled.
+            assistant_with(
+                vec![tool_call_part(
+                    "c2",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("w2", "b.txt", "two", "three")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("second done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    executor
+        .run(
+            "two steps",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "three\n",
+        "the second child must be able to claim and write the released scope"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Marker-routed runtime with TWO independent child queues (and per-queue
+/// delays), so two concurrent children are fully deterministic.
+struct DualChildRuntime {
+    parent: Mutex<VecDeque<ModelResponse>>,
+    child1: Mutex<VecDeque<ModelResponse>>,
+    child2: Mutex<VecDeque<ModelResponse>>,
+    marker1: &'static str,
+    marker2: &'static str,
+    delay1: Duration,
+    delay2: Duration,
+    /// Delay before each PARENT response (lets children win a race on purpose).
+    parent_delay: Duration,
+}
+
+#[async_trait]
+impl ModelRuntime for DualChildRuntime {
+    async fn generate(
+        &self,
+        _request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        unimplemented!()
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        use leveler_model::ModelEvent;
+        let text: String = request
+            .messages
+            .iter()
+            .map(|m| m.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (queue, delay) = if text.contains(self.marker2) {
+            (&self.child2, self.delay2)
+        } else if text.contains(self.marker1) {
+            (&self.child1, self.delay1)
+        } else {
+            (&self.parent, self.parent_delay)
+        };
+        tokio::time::sleep(delay).await;
+        let response =
+            queue.lock().unwrap().pop_front().ok_or_else(|| {
+                ModelError::new(leveler_model::ModelErrorKind::Other, "queue empty")
+            })?;
+        let mut events: Vec<Result<ModelEvent, ModelError>> =
+            vec![Ok(ModelEvent::MessageStarted {
+                request_id: response.request_id.clone(),
+            })];
+        for part in &response.message.content {
+            match part {
+                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                    delta: text.clone(),
+                })),
+                ContentPart::ToolCall { call } => {
+                    events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
+                }
+                _ => {}
+            }
+        }
+        events.push(Ok(ModelEvent::MessageCompleted {
+            finish_reason: response.finish_reason,
+        }));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+        unimplemented!()
+    }
+}
+
+/// M7 measurement failure, turned into a regression: a granted claim must be
+/// reconstructable from the durable event stream ALONE. Previously
+/// claim_write_scope was answered inside the drive loop and emitted only a
+/// ToolResult — no ToolCall event — so an audit keyed on tool starts could
+/// not see that a child had been authorized, and a perfectly legal write read
+/// as a security bypass for an entire investigation round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_claim_is_reconstructable_from_durable_events() {
+    let dir = tmp("lbo-claimprov", 89);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({"task": format!("{CHILD_MARKER}: change old to new")}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "update b",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // The audit an offline reader performs. A child's tool events reach the
+    // parent stream as SubAgentActivity, so the claim must be visible there
+    // with BOTH phases — a result-only claim is exactly the blind spot that
+    // made M7 read as a bypass.
+    let started = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::SubAgentActivity { tool, phase, .. }
+                if tool == "claim_write_scope" && phase == "tool_started"
+        )
+    });
+    assert!(
+        started,
+        "a claim must announce itself in the child activity stream, not only settle: {events:#?}"
+    );
+    let finished = events.iter().find_map(|e| match e {
+        AgentEvent::SubAgentActivity {
+            tool,
+            phase,
+            preview,
+            is_error,
+            ..
+        } if tool == "claim_write_scope" && phase != "tool_started" => {
+            Some((preview.clone(), *is_error))
+        }
+        _ => None,
+    });
+    let (preview, is_error) = finished.expect("claim outcome must be observable");
+    assert!(!is_error, "the grant must not read as an error: {preview}");
+    assert!(
+        preview.contains("granted") || preview.contains("own"),
+        "the observable outcome must record the decision: {preview}"
+    );
+    // …and the DURABLE half: child activity is transient, so the ownership
+    // transition itself must land on the persisted delegation channel or an
+    // offline audit still cannot tell an authorized write from a bypass.
+    let durable = events.iter().find_map(|e| match e {
+        AgentEvent::DelegationStage { action, detail } if action.starts_with("ownership_") => {
+            Some((action.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (action, detail) = durable.expect("the ownership transition must be durable");
+    assert_eq!(action, "ownership_granted");
+    assert!(
+        detail.contains("b.txt"),
+        "the durable record must name the owned path: {detail}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M7 production shape: an unclaimed background Default child first tried
+/// `Add File` on a path the PARENT had already created (which failed only
+/// with "cannot add existing file" — a functional error, not an ownership
+/// denial), then succeeded with `Update File`. Both calls must be refused for
+/// want of a claim; the earlier tests only covered Add-on-absent and
+/// Update-in-a-workspace-the-parent-had-not-touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_update_a_file_the_parent_created() {
+    let dir = tmp("lbo-m7shape", 88);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // Parent creates the file FIRST (as in M7), then delegates.
+            assistant_with(
+                vec![tool_call_part(
+                    "p1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: probe.txt\nparent\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({"task": format!("{CHILD_MARKER}: rewrite probe.txt")}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            // Child, no claim: Add (fails functionally) then Update.
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: probe.txt\nchild\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![patch_call("c2", "probe.txt", "parent", "child")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    executor
+        .run(
+            "rewrite",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("probe.txt")).unwrap(),
+        "parent\n",
+        "an unclaimed child must not update a file the parent created"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// PB_B_ORCH_1 root cause (event rowids 874-877): an UNCLAIMED child ran
+/// `shell_command: rmdir <dir>` and it returned exit 0 — the directory was
+/// really removed. The command path enforces write scope by diffing a git
+/// snapshot AFTER the fact, and git does not track empty directories, so the
+/// mutation was invisible to the check and no violation fired. An unclaimed
+/// child holds NO write authority at all: a command that can mutate must be
+/// refused BEFORE it runs, not audited afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_mutate_through_a_shell_command() {
+    let dir = tmp("lbo-shellwrite", 87);
+    std::fs::create_dir_all(dir.join("victim")).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: tidy up")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            // No claim; a shell mutation that git cannot see afterwards.
+            assistant_with(
+                vec![tool_call_part(
+                    "sh1",
+                    "shell_command",
+                    serde_json::json!({"cmd": "rmdir victim"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run("tidy", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        dir.join("victim").is_dir(),
+        "an unclaimed child must not mutate the workspace through a shell command"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// PB_B_ORCH_1 forensics: the first production run that actually delegated
+/// showed the child creating NEW files (`*** Add File:`) with zero claims —
+/// 11 successful writes. The unit-level fence handles Add File correctly, so
+/// this pins the whole runtime path for the create shape, not just Update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_create_new_files_either() {
+    let dir = tmp("lbo-addfile", 86);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // BACKGROUND spawn — the production shape (PB_B_ORCH_1).
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: scaffold new case files")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            // Create a brand-new file with NO claim: must be refused.
+            assistant_with(
+                vec![tool_call_part(
+                    "w1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: cases/0001/input.csv\nname\nvalue\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run(
+            "scaffold",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !dir.join("cases/0001/input.csv").exists(),
+        "an unclaimed child must not be able to CREATE files either"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// PB2_B_ORCH_1: the child landed an Update File on
+/// `docs/src/reference-verbs.md.in` with zero claims. Empty-allowlist refusal
+/// must not depend on parsing patch targets — mutating tools are refused
+/// outright until claim_write_scope succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_child_cannot_update_an_existing_file_either() {
+    let dir = tmp("lbo-updatefile", 88);
+    std::fs::create_dir_all(dir.join("docs/src")).unwrap();
+    std::fs::write(
+        dir.join("docs/src/reference-verbs.md.in"),
+        "GENMD-RUN-COMMAND\nmlr bootstrap --help\nGENMD-EOF\n",
+    )
+    .unwrap();
+    let original = std::fs::read_to_string(dir.join("docs/src/reference-verbs.md.in")).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: update verb docs")
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting"),
+            assistant_text("done"),
+        ],
+        vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "w1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Update File: docs/src/reference-verbs.md.in\n@@\n GENMD-RUN-COMMAND\n mlr bootstrap --help\n GENMD-EOF\n+\n+## basename\n*** End Patch"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(10),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    executor
+        .run("docs", &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    let now = std::fs::read_to_string(dir.join("docs/src/reference-verbs.md.in")).unwrap();
+    assert_eq!(
+        now, original,
+        "an unclaimed child must not Update File either"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review 必改: a LATE-BOUND child claim must fence the PARENT too. The old
+/// fence only knew legacy `role="worker"` children's pre-declared `.scope`,
+/// so a Default child's registry claim left the parent free to edit the very
+/// files it had exclusively granted — while the tool description promised the
+/// opposite.
+///
+/// Deterministic shape: the child claims and then BLOCKS (its second round is
+/// slow), so the claim is provably live when the parent's edit is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_bound_child_claim_fences_the_parent() {
+    let dir = tmp("lbo-parentfence", 85);
+    std::fs::write(dir.join("b.txt"), "child-owns\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(DualChildRuntime {
+        parent: Mutex::new(VecDeque::from(vec![
+            // r1: normal background spawn — NO role, NO files (late-bound).
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({"task": "HOLDER-CHILD: own and edit b.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: parent tries to edit the file the child claimed. The parent's
+            // own round takes a model call (marker2 delay = 400ms) so the
+            // child's fast claim (5ms) is already in the registry.
+            assistant_with(
+                vec![patch_call("e1", "b.txt", "child-owns", "parent-stole")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("done"),
+        ])),
+        child1: Mutex::new(VecDeque::from(vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // Hold the claim: this round is slow, so the child is still alive
+            // (and still owning b.txt) while the parent attempts its edit.
+            assistant_text("holding my scope"),
+        ])),
+        child2: Mutex::new(VecDeque::new()),
+        marker1: "HOLDER-CHILD",
+        marker2: "NEVER-USED-MARKER",
+        delay1: Duration::from_millis(5),
+        delay2: Duration::ZERO,
+        parent_delay: Duration::from_millis(400),
+    });
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "parent and child contend",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let refusal = events.iter().find_map(|e| match e {
+        AgentEvent::ToolResult {
+            id,
+            is_error: true,
+            preview,
+            ..
+        } if id == "e1" => Some(preview.clone()),
+        _ => None,
+    });
+    assert!(
+        refusal.is_some(),
+        "the parent's edit inside a live child claim must be refused"
+    );
+    let refusal = refusal.unwrap();
+    assert!(
+        refusal.contains("exclusive scope"),
+        "the refusal must name the ownership reason: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "child-owns\n",
+        "the parent must not have written into the claimed scope"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A denied claim is a coordination result, not a child failure: the child
+/// keeps running, and the parent's edit inside the live claim is fenced too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_claim_does_not_kill_the_child() {
+    let dir = tmp("lbo-denied", 84);
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(DualChildRuntime {
+        parent: Mutex::new(VecDeque::from(vec![
+            // r1: legacy background worker pre-claims b.txt SYNCHRONOUSLY at
+            // spawn admission (deterministic — no child round needed).
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": "HOLDER-CHILD: slow-edit b.txt",
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: foreground default child that tries to claim the same path.
+            assistant_with(
+                vec![spawn_call(
+                    "s2",
+                    serde_json::json!({
+                        "task": "CLAIMER-CHILD: also wants b.txt"
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("waiting for the worker"),
+            assistant_text("done"),
+        ])),
+        child1: Mutex::new(VecDeque::from(vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("worker done"),
+        ])),
+        child2: Mutex::new(VecDeque::from(vec![
+            assistant_with(
+                vec![tool_call_part(
+                    "c1",
+                    "claim_write_scope",
+                    serde_json::json!({"paths": ["b.txt"]}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("scope busy; narrowed my plan and reported instead"),
+        ])),
+        marker1: "HOLDER-CHILD",
+        marker2: "CLAIMER-CHILD",
+        delay1: Duration::from_millis(1200),
+        delay2: Duration::from_millis(30),
+        parent_delay: Duration::ZERO,
+    });
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "two children contend",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Child 2 finished normally (ok=true settlement), not a failure.
+    let child2_ok = events.iter().any(|e| {
+        matches!(e, AgentEvent::SubAgentFinished { nickname, ok: true, .. } if nickname == "Newton")
+    });
+    assert!(
+        child2_ok,
+        "a denied claim must leave the child alive to finish honestly"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The debt resets once the parent ACTS after the settlement notice became
+/// model-visible — a consumed settlement must not read as debt (and must not
+/// buy a spurious continuation window upstream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settlement_the_parent_acts_on_is_consumed() {
+    let dir = tmp("bg-debt-consume", 70);
+    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // r1: delegate.
+            assistant_with(
+                vec![spawn_call_default(
+                    "s1",
+                    serde_json::json!({
+                        "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                        "role": "worker",
+                        "files": ["b.txt"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            // r2: quiet — the harness waits for the settlement notice.
+            assistant_text("waiting on my delegation"),
+            // r3: informed by the notice, the parent integrates (non-observe
+            // success) — this consumes the settlement.
+            assistant_with(
+                vec![patch_call("e1", "a.txt", "parent", "parent-integrated")],
+                FinishReason::ToolCalls,
+            ),
+            // r4: finish.
+            assistant_text("integrated the worker result"),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("scoped edit done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(150),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let outcome = executor
+        .run(
+            "delegate, then integrate the result",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "parent-integrated\n"
+    );
+    assert_eq!(
+        outcome.progress.unconsumed_child_settlements, 0,
+        "a settlement the parent acted on must not read as debt"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review 必改A: a FOREGROUND spawn folds mid-batch, so its report is not
+/// model-visible until the NEXT round — a successful sibling tool call in the
+/// same batch must not consume that debt. Only settlements the model already
+/// saw when the round's actions ran are consumable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreground_settlement_is_not_consumed_by_same_round_siblings() {
+    let dir = tmp("bg-debt-foreground", 71);
+    std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(RoutedRuntime::new(
+        vec![
+            // r1: foreground spawn AND a sibling patch in the SAME batch. The
+            // child's report lands as this round's tool result — the model has
+            // not seen it yet; the sibling patch is a non-observe success that
+            // must NOT consume the just-folded settlement.
+            assistant_with(
+                vec![
+                    spawn_call(
+                        "s1",
+                        serde_json::json!({
+                            "task": format!("{CHILD_MARKER}: change old to new in b.txt"),
+                            "role": "worker",
+                            "files": ["b.txt"],
+                            "run_in_background": false
+                        }),
+                    ),
+                    patch_call("e1", "a.txt", "parent", "parent-edited"),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            // r2/r3: observe-only rounds run out the window — the parent never
+            // acts WITH the report in context.
+            assistant_with(
+                vec![tool_call_part(
+                    "r1",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            assistant_with(
+                vec![tool_call_part(
+                    "r2",
+                    "read_file",
+                    serde_json::json!({"path": "a.txt"}),
+                )],
+                FinishReason::ToolCalls,
+            ),
+        ],
+        vec![
+            assistant_with(
+                vec![patch_call("w1", "b.txt", "old", "new")],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+        ],
+        CHILD_MARKER,
+        Duration::from_millis(20),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        3,
+    );
+    let outcome = executor
+        .run(
+            "delegate in the foreground, then run out of window",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new\n");
+    assert_eq!(
+        outcome.progress.unconsumed_child_settlements, 1,
+        "a settlement the model has not seen must survive same-round consumption"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── MCP mutation boundary ───────────────────────────────────────────────────
+//
+// An MCP tool is a JSON-RPC proxy to a SEPARATE process that CodeLeveler
+// launches with no sandbox, no workspace path preflight and no checkpoint
+// (`mcp.rs` uses tokio::process::Command directly, not CommandRunner), and
+// `McpTool::execute` discards its ToolContext outright. So its effect cannot
+// be bounded to a claimed scope even AFTER a claim — routing it through
+// ownership admission would only pretend the claim constrains it.
+//
+// It also declares no `mutates_files()`, inheriting `false`, which is what all
+// three ownership fences key on. A delegated child could therefore mutate the
+// workspace through MCP with no ownership check firing anywhere.
+//
+// Beta semantics: a delegated child may not invoke MCP at all. The top-level
+// agent keeps it, approval-gated, with the human in the loop.
+mod mcp_ownership_boundary {
+    use super::*;
+
+    /// Stands in for an MCP tool: the `mcp__` prefix a real server's tools get
+    /// (`McpClient::parse_tools`), inheriting `mutates_files() == false` just
+    /// as `McpTool` does, and a side effect on the workspace to make a bypass
+    /// observable rather than theoretical.
+    struct FakeMcpTool {
+        touched: Arc<std::path::PathBuf>,
+    }
+
+    #[async_trait]
+    impl leveler_tools::Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            "mcp__probe__write"
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn risk(&self) -> leveler_execution::RiskLevel {
+            leveler_execution::RiskLevel::Network
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: ToolContext,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_tools::ToolOutput, leveler_tools::ToolError> {
+            std::fs::write(self.touched.as_ref(), "written by mcp\n").unwrap();
+            Ok(leveler_tools::ToolOutput::ok("done"))
+        }
+    }
+
+    fn registry_with_fake_mcp(touched: std::path::PathBuf) -> Arc<leveler_tools::ToolRegistry> {
+        let mut registry = default_registry();
+        registry.register(Arc::new(FakeMcpTool {
+            touched: Arc::new(touched),
+        }));
+        Arc::new(registry)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unclaimed_child_cannot_mutate_the_workspace_through_mcp() {
+        let dir = tmp("mcp-child-bypass", 93);
+        let touched = dir.join("mcp_written.txt");
+        let workspace = Workspace::new(&dir).unwrap();
+        let runtime = Arc::new(RoutedRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": format!("{CHILD_MARKER}: use the probe")}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "mcp__probe__write",
+                        serde_json::json!({}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child done"),
+            ],
+            CHILD_MARKER,
+            Duration::from_millis(10),
+        ));
+        Executor::new(
+            runtime,
+            registry_with_fake_mcp(touched.clone()),
+            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .run(
+            "delegate",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !touched.exists(),
+            "a child with no claimed scope mutated the workspace through an MCP \
+             tool — the ownership fences key on mutates_files(), which MCP never \
+             declares, and the effect lands outside the sandbox and checkpoint"
+        );
+    }
+
+    /// A claim must NOT unlock MCP. The scope bounds what the ownership model
+    /// can enforce inside CodeLeveler; it says nothing about a separate
+    /// process that never sees the ToolContext. Treating a claim as
+    /// sufficient would be exactly the false safety claim this boundary
+    /// exists to avoid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claimed_child_still_cannot_reach_mcp() {
+        let dir = tmp("mcp-claimed-child", 95);
+        std::fs::write(dir.join("owned.txt"), "old\n").unwrap();
+        let touched = dir.join("mcp_written.txt");
+        let workspace = Workspace::new(&dir).unwrap();
+        let runtime = Arc::new(RoutedRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": format!("{CHILD_MARKER}: claim then probe")}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "claim_write_scope",
+                        serde_json::json!({"paths": ["owned.txt"]}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_with(
+                    vec![tool_call_part(
+                        "c2",
+                        "mcp__probe__write",
+                        serde_json::json!({}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("child done"),
+            ],
+            CHILD_MARKER,
+            Duration::from_millis(10),
+        ));
+        Executor::new(
+            runtime,
+            registry_with_fake_mcp(touched.clone()),
+            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .run(
+            "delegate",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !touched.exists(),
+            "holding a claimed scope must not unlock a tool whose effect lands \
+             outside that scope entirely"
+        );
+    }
+
+    /// The boundary must not be a blanket ban: the top-level agent is the
+    /// human's own agent, MCP is approval-gated there, and taking it away
+    /// would break every configured MCP server for ordinary use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_top_level_agent_still_reaches_mcp() {
+        let dir = tmp("mcp-parent-allowed", 94);
+        let touched = dir.join("mcp_written.txt");
+        let workspace = Workspace::new(&dir).unwrap();
+        let runtime = Arc::new(SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![tool_call_part(
+                        "p1",
+                        "mcp__probe__write",
+                        serde_json::json!({}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("done"),
+            ],
+            Duration::from_millis(0),
+        ));
+        Executor::new(
+            runtime,
+            registry_with_fake_mcp(touched.clone()),
+            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .run(
+            "use the probe",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            touched.exists(),
+            "the top-level agent must keep MCP; the boundary is about delegated children"
+        );
+    }
 }

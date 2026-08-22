@@ -1,0 +1,29 @@
+id: a08-new-module-plus-glue
+name: "New module plus a one-line registration"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn first_unique(values: &[String]) -> Vec<String> {
+        values.to_vec()
+    }
+  tests/spec.rs: |
+    use evalcase::first_unique;
+    #[test]
+    fn keeps_first_seen() {
+        let input = ["b", "a", "b"].map(String::from);
+        assert_eq!(first_unique(&input), ["b", "a"]);
+    }
+task: |
+  Put first_unique in a new src/unique.rs module that keeps first-seen order
+  while dropping later duplicates. Register that module from src/lib.rs so
+  existing tests/spec.rs keep compiling. Do not edit the tests.
+expect:
+  program: "true"
+  args: []

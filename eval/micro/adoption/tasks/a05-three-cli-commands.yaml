@@ -1,0 +1,49 @@
+id: a05-three-cli-commands
+name: "Three disjoint CLI commands"
+max_rounds: 18
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [[bin]]
+    name = "evalcase"
+    path = "src/main.rs"
+  src/main.rs: |
+    mod cmd_echo;
+    mod cmd_count;
+    mod cmd_rev;
+
+    fn main() {
+        let mut args = std::env::args().skip(1);
+        let cmd = args.next().unwrap_or_default();
+        let rest: Vec<String> = args.collect();
+        let out = match cmd.as_str() {
+            "echo" => cmd_echo::run(&rest),
+            "count" => cmd_count::run(&rest),
+            "rev" => cmd_rev::run(&rest),
+            _ => "unknown".into(),
+        };
+        print!("{out}");
+    }
+  src/cmd_echo.rs: |
+    pub fn run(args: &[String]) -> String {
+        todo!("join args with a single space, no trailing newline beyond the join")
+    }
+  src/cmd_count.rs: |
+    pub fn run(args: &[String]) -> String {
+        todo!("print the number of args as decimal")
+    }
+  src/cmd_rev.rs: |
+    pub fn run(args: &[String]) -> String {
+        todo!("join args with space, then reverse the whole string")
+    }
+task: |
+  Finish three command modules. echo joins its arguments with spaces. count
+  prints how many arguments it received. rev joins arguments with spaces and
+  reverses that string. Each command lives in its own file and does not need
+  the others.
+expect:
+  program: "true"
+  args: []

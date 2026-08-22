@@ -23,6 +23,8 @@ pub enum Screen {
     /// live output; Esc backs out, `x` stops a running one.
     Shell,
     Help,
+    /// Durable runtime observatory (`/trace`).
+    Trace,
 }
 
 /// Help / popup grouping for slash commands.
@@ -151,6 +153,13 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         &[],
         SlashCategory::View,
         SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/trace",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
     slash(
@@ -312,6 +321,7 @@ pub const SLASH_NAMES: &[&str] = &[
     "/collab",
     "/plan",
     "/diff",
+    "/trace",
     "/tools",
     "/sessions",
     "/memory",
@@ -396,6 +406,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/skill" => s.skill,
         "/feature-dev" => s.feature_dev,
         "/diff" => s.diff,
+        "/trace" => s.trace,
         "/tools" => s.tools,
         "/sessions" => s.sessions,
         "/restore" | "/checkpoint" | "/rewind" => s.restore,

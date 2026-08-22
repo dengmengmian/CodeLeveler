@@ -218,6 +218,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Remote => render_remote_screen(frame, chunks[1], state),
         Screen::Shell => render_shell_screen(frame, chunks[1], state),
         Screen::Help => render_help_screen(frame, chunks[1], state),
+        Screen::Trace => crate::observability::render_trace_screen(frame, chunks[1], state),
     }
     frame.render_widget(
         Paragraph::new(status_line_content(state, area.width as usize)),

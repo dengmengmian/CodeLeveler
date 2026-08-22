@@ -36,6 +36,9 @@ export type CheckState = 'running' | 'passed' | 'failed' | 'skipped';
 /** Identifies a pending clarification (ask-user) request. */
 export type ClarificationId = string;
 
+/** Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice. */
+export type CommandId = string;
+
 /** Identifies a single assistant/user message in the transcript. A protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message. */
 export type MessageId = string;
 
@@ -47,6 +50,9 @@ export interface ModelRef {
 
 /** Severity for a transient notification . */
 export type NotificationLevel = 'info' | 'warning' | 'error';
+
+/** Presentation class for a meaningful durable event. Unknown tools map to [`Self::Tool`]. */
+export type ObservationClass = 'model' | 'read' | 'search' | 'edit' | 'shell' | 'tool' | 'verify' | 'agent' | 'recovery' | 'system' | 'terminal';
 
 export type PermissionProfile = 'request_approval' | 'assisted' | 'full_access';
 
@@ -64,6 +70,15 @@ export interface UiActiveToolCall {
   arguments: string;
   id: ToolCallId;
   name: string;
+}
+
+/** Durable sub-agent / reviewer observation. */
+export interface UiAgentObservation {
+  id: string;
+  nickname: string;
+  role: string;
+  status: string;
+  summary?: string;
 }
 
 /** A pending permission request, projected for display. */
@@ -128,6 +143,14 @@ export interface UiDiffFile {
   removed: number;
 }
 
+/** Identity-based relation (never inferred from wall-clock proximity). */
+export interface UiEventRelation {
+  /** pair_start | pair_end | same_turn | same_agent */
+  kind: string;
+  label: string;
+  sequence: number;
+}
+
 /** Compact durable-memory row for TUI list surfaces. */
 export interface UiMemoryEntry {
   id: string;
@@ -139,6 +162,42 @@ export interface UiMessage {
   id: MessageId;
   role: UiRole;
   text: string;
+}
+
+/** Bounded event window + related observation slices. Current and historical sessions use this same payload. */
+export interface UiObservabilityLoaded {
+  agents: UiAgentObservation[];
+  recovery: UiRecoveryObservation;
+  relations?: UiEventRelation[];
+  requests: UiRequestObservation[];
+  session: UiSessionObservation;
+  tools: UiToolAggregate[];
+  window: UiObservationRow[];
+  window_from: number;
+  window_to: number;
+}
+
+/** One inspect key/value. Avoids tuple arrays in the JSON schema. */
+export interface UiObservationField {
+  key: string;
+  value: string;
+}
+
+/** One bounded, safe trace row. */
+export interface UiObservationRow {
+  class: ObservationClass;
+  created_at: string;
+  duration_ms?: number | null;
+  /** Durable event type tag (`tool_call_finished`, …). */
+  event_type: string;
+  /** Safe inspect fields only (no raw args, no prompt, no secrets). */
+  fields?: UiObservationField[];
+  sequence: number;
+  /** running | ok | fail | info */
+  status: string;
+  target?: string;
+  title: string;
+  turn_id?: string | null;
 }
 
 /** A live control request included in a reconnect snapshot. Only requests with an in-process waiter are projected; interrupted turns never resurrect stale buttons after a process restart. */
@@ -164,8 +223,57 @@ export interface UiReasoningState {
   effective?: string | null;
 }
 
+/** Recovery facts that are already durable and safe to show. */
+export interface UiRecoveryObservation {
+  interrupted_turns: number;
+  repair_attempts: number;
+  review_stages: string[];
+  workspace_snapshots: number;
+}
+
+/** One durable model-request row (no prompt/body). */
+export interface UiRequestObservation {
+  created_at: string;
+  error_kind?: string | null;
+  finish_reason?: string | null;
+  id: string;
+  input_tokens: number;
+  latency_ms?: number | null;
+  model: string;
+  output_tokens: number;
+  provider: string;
+  retry_count: number;
+}
+
 /** Who authored a message. */
 export type UiRole = 'user' | 'assistant' | 'system' | 'tool';
+
+/** Session-level observation header + aggregates from durable stores. */
+export interface UiSessionObservation {
+  avg_latency_ms?: number | null;
+  collaboration: string;
+  compact_count: number;
+  created_at: string;
+  goal: string;
+  input_tokens: number;
+  last_latency_ms?: number | null;
+  last_sequence?: number | null;
+  model: string;
+  output_tokens: number;
+  repair_started: number;
+  repository: string;
+  request_count: number;
+  request_failures: number;
+  request_retries: number;
+  session_id: SessionId;
+  status: string;
+  subagent_started: number;
+  tool_finished: number;
+  tool_started: number;
+  updated_at: string;
+  verification_runs: number;
+  work_profile: string;
+}
 
 /** Everything a client needs to render a session's header and transcript. */
 export interface UiSessionSnapshot {
@@ -213,6 +321,21 @@ export interface UiSessionSummary {
   repository?: string | null;
   status: string;
   updated_at: string;
+}
+
+/** Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration. */
+export interface UiToolAggregate {
+  avg_ms?: number | null;
+  calls: number;
+  class: ObservationClass;
+  /** Finished with `is_error = true`. */
+  failed: number;
+  name: string;
+  /** Finished with `is_error = false`. */
+  succeeded?: number;
+  total_ms?: number | null;
+  /** `tool_call_started` with no matching `tool_call_finished`. */
+  unfinished?: number;
 }
 
 /** One user shell execution (`!command`) as the reconnect snapshot carries it: the active one plus a bounded recent history. `output_tail` is the bounded end of the combined output (never the full log). */
@@ -308,6 +431,8 @@ export type ClientCommand =
   /** Cancel exactly one user shell execution. Deliberately separate from `CancelCurrentTurn`: a user shell is not an agent turn, and the id match ensures a stale cancel can never kill a newer execution. */
   | { type: 'cancel_user_shell'; execution_id: UserShellId; session_id: SessionId }
   | { type: 'btw'; question: string; session_id: SessionId }
+  /** Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`]. */
+  | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id?: CommandId | null; session_id: SessionId }
   /** The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command. */
   | { type: 'quit' };
 
@@ -416,4 +541,6 @@ export type RuntimeEvent =
   /** Side-question failed. */
   | { type: 'btw_failed'; error: string }
   /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
-  | { type: 'turn_progress'; closeout_deny_rounds: number; closing: boolean; no_progress_streak: number; phase: string };
+  | { type: 'turn_progress'; closeout_deny_rounds: number; closing: boolean; no_progress_streak: number; phase: string }
+  /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a 1.6 client must not treat that as ownership. */
+  | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id?: CommandId | null };

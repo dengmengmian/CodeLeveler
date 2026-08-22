@@ -1,0 +1,28 @@
+# M-2 budget experiment (config stub).
+# Same tasks and product policy as M-3. Budget is recorded as metadata only:
+# this file MUST NOT be interpreted as an eval_mode cap on the agent.
+suite: adoption
+experiment: m2-budget
+description: "M-2 budget — same adoption micro set; budget is metadata until a product knob exists"
+model: deepseek-v4-flash
+provider: deepseek
+binary: leveler
+tasks: []
+shape: null
+runs: 1
+timeout_seconds: 1200
+arm: control
+population: model_initiated_only
+exclude:
+  - scripted_spawn
+  - safety_probe
+  - forced_workflow
+changes_runtime: false
+metrics:
+  - adoption_rate
+  - spawn_statistics
+  - decision_latency
+  - wilson90
+  - verifier
+output: eval/reports/adoption/m2-budget
+notes: "Do not inject a round/token cap from this config. Product max_rounds stay on the task YAML."

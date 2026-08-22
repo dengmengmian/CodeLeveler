@@ -1,0 +1,40 @@
+id: a12-parse-and-count
+name: "Independent parse and count"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub mod parse_lines;
+    pub mod count_lines;
+  src/parse_lines.rs: |
+    pub fn non_empty_lines(text: &str) -> Vec<String> {
+        todo!("trimmed lines that are not empty")
+    }
+  src/count_lines.rs: |
+    pub fn line_count(text: &str) -> usize {
+        todo!("number of newline-terminated lines, including blanks; no trailing newline counts as one if the file is non-empty")
+    }
+  tests/spec.rs: |
+    use evalcase::count_lines::line_count;
+    use evalcase::parse_lines::non_empty_lines;
+    #[test]
+    fn drops_blank() {
+        assert_eq!(non_empty_lines("a\n\n b \n"), vec!["a", "b"]);
+    }
+    #[test]
+    fn counts_newlines() {
+        assert_eq!(line_count("a\nb\n"), 2);
+    }
+task: |
+  Implement non_empty_lines in src/parse_lines.rs and line_count in
+  src/count_lines.rs. They do not share types. Match tests/spec.rs. Do not
+  edit the tests.
+expect:
+  program: "true"
+  args: []

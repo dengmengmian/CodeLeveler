@@ -95,13 +95,11 @@ export function deriveRunState(s: SessionView): RunView | null {
 
     // 计划步骤不在中间区域重复展示（右侧面板负责完整执行计划）。
 
-    // agent_activity 的 label 本身是人类可读的阶段描述，优先直接展示；
-    // 没有 activity 时用推理流的尾巴当思考注脚（reasoning_delta）。
-    const thought = s.reasoning ? truncate(s.reasoning.slice(-200)) : null;
+    // agent_activity 是阶段标题；完整推理走 ReasoningDisclosure，不塞进 detail。
     if (s.activity) {
-      return live('thinking', s.activity, thought);
+      return live('thinking', s.activity, null);
     }
-    return live('thinking', '正在思考', thought);
+    return live('thinking', '正在思考', null);
   }
 
   if (s.lastTurn) {

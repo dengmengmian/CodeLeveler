@@ -12,7 +12,7 @@ use leveler_execution::PermissionProfile;
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_project::Layout;
 
-use crate::cli::EvalCommand;
+use crate::cli::{AdoptionMicroCommand, EvalCommand};
 use crate::common::resolve_model;
 use crate::output::Line;
 
@@ -24,12 +24,29 @@ pub(crate) async fn cmd_eval(
     match command {
         EvalCommand::Run {
             model,
+            provider,
+            suite,
+            experiment,
+            output,
             cases,
             direct,
             no_verify_gate,
             repetitions,
             json_out,
         } => {
+            if let Some(suite) = suite {
+                let experiment = experiment
+                    .ok_or_else(|| anyhow::anyhow!("--experiment is required with --suite"))?;
+                return run_framework(
+                    &layout,
+                    suite,
+                    experiment,
+                    model,
+                    provider,
+                    repetitions,
+                    output,
+                );
+            }
             let app = Application::assemble(layout)?;
             let model_ref = resolve_model(&app, model)?;
             let cases_dir = cases.clone();
@@ -304,6 +321,120 @@ pub(crate) async fn cmd_eval(
             .await
         }
         EvalCommand::Trend { history, out } => run_trend(&history, out),
+        EvalCommand::AdoptionMicro(cmd) => run_adoption_micro(&layout, cmd),
+    }
+}
+
+/// Observer-only framework entry: `eval/runner/run.py`.
+fn run_framework(
+    layout: &Layout,
+    suite: String,
+    experiment: String,
+    model: Option<String>,
+    provider: Option<String>,
+    runs: u32,
+    output: Option<std::path::PathBuf>,
+) -> anyhow::Result<std::process::ExitCode> {
+    let script = layout.repo_root.join("eval/runner/run.py");
+    if !script.is_file() {
+        anyhow::bail!(
+            "eval runner not found at {} (run from the CodeLeveler repo)",
+            script.display()
+        );
+    }
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script)
+        .arg("--suite")
+        .arg(suite)
+        .arg("--experiment")
+        .arg(experiment)
+        .arg("--runs")
+        .arg(runs.to_string());
+    if let Some(model) = model {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(provider) = provider {
+        cmd.arg("--provider").arg(provider);
+    }
+    if let Some(output) = output {
+        cmd.arg("--output").arg(output);
+    }
+    cmd.current_dir(&layout.repo_root);
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn python3 eval runner: {e}"))?;
+    Ok(if status.success() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    })
+}
+
+/// Observer-only: shells to `eval/micro/adoption/runner/run.py`. No product
+/// runtime flags, no eval_mode, no forced spawn.
+fn run_adoption_micro(
+    layout: &Layout,
+    command: AdoptionMicroCommand,
+) -> anyhow::Result<std::process::ExitCode> {
+    let script = layout.repo_root.join("eval/micro/adoption/runner/run.py");
+    if !script.is_file() {
+        anyhow::bail!(
+            "adoption micro runner not found at {} (run from the CodeLeveler repo)",
+            script.display()
+        );
+    }
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script);
+    match command {
+        AdoptionMicroCommand::Run {
+            model,
+            provider,
+            task,
+            shape,
+            repetitions,
+            json_out,
+            md_out,
+        } => {
+            cmd.arg("run");
+            if let Some(model) = model {
+                cmd.arg("--model").arg(model);
+            }
+            if let Some(provider) = provider {
+                cmd.arg("--provider").arg(provider);
+            }
+            if let Some(task) = task {
+                cmd.arg("--task").arg(task);
+            }
+            if let Some(shape) = shape {
+                cmd.arg("--shape").arg(shape);
+            }
+            cmd.arg("--repetitions").arg(repetitions.to_string());
+            cmd.arg("--config-dir").arg(&layout.config_dir);
+            if let Some(path) = json_out {
+                cmd.arg("--json-out").arg(path);
+            }
+            if let Some(path) = md_out {
+                cmd.arg("--md-out").arg(path);
+            }
+        }
+        AdoptionMicroCommand::Report { batch, md, csv } => {
+            cmd.arg("report").arg("--batch").arg(batch);
+            if let Some(path) = md {
+                cmd.arg("--md").arg(path);
+            }
+            if let Some(path) = csv {
+                cmd.arg("--csv").arg(path);
+            }
+        }
+    }
+    cmd.current_dir(&layout.repo_root);
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn python3 adoption runner: {e}"))?;
+    if status.success() {
+        Ok(std::process::ExitCode::SUCCESS)
+    } else {
+        Ok(std::process::ExitCode::FAILURE)
     }
 }
 

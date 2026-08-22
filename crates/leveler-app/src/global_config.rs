@@ -88,11 +88,18 @@ struct GlobalAgents {
     /// Advertise `spawn_agent` (default true).
     #[serde(default = "default_true")]
     delegation: bool,
+    /// EXPERIMENT KNOB (H-C): when the keep-vs-delegate surface is raised.
+    /// Default `plan_registration` is the shipped behaviour.
+    #[serde(default)]
+    offer_timing: leveler_project::OfferTiming,
 }
 
 impl Default for GlobalAgents {
     fn default() -> Self {
-        Self { delegation: true }
+        Self {
+            delegation: true,
+            offer_timing: leveler_project::OfferTiming::default(),
+        }
     }
 }
 
@@ -273,6 +280,8 @@ pub struct GlobalBundle {
     pub mcp_servers: Vec<McpServerConfig>,
     /// Multi-agent: advertise `spawn_agent` when true (default).
     pub agents_delegation: bool,
+    /// Multi-agent experiment: delegation offer timing.
+    pub agents_offer_timing: leveler_project::OfferTiming,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -518,6 +527,7 @@ impl GlobalConfig {
             vcs_co_author: self.vcs.co_author,
             mcp_servers,
             agents_delegation: self.agents.delegation,
+            agents_offer_timing: self.agents.offer_timing,
         }
     }
 }

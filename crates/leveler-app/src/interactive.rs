@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::{CheckpointId, SessionId};
 use leveler_execution::{Approver, AutoApprove, PermissionProfile};
-use leveler_media::MediaStore;
+use leveler_media::{MediaError, MediaStore};
 use leveler_model::{
     ContentPart, ImageSource, Message, ModelProfile, ModelRef, ModelRequest, ModelRuntime, Role,
     ToolChoice, resolve_reasoning_effort,
@@ -1380,25 +1380,42 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let media_root = self.media_root.clone();
                 let events = self.events_for(&session_id);
                 tokio::task::spawn_blocking(move || {
-                    match MediaStore::new(&media_root).import_base64(&data_base64) {
-                        Ok(stored) => {
-                            let _ = events.send(RuntimeEvent::AttachmentAdded {
-                                attachment: AttachmentRef {
+                    let store = MediaStore::new(&media_root);
+                    let result = match store.import_base64(&data_base64) {
+                        Ok(stored) => Ok(AttachmentRef {
+                            id: AttachmentId::new(leveler_core::new_uuid_string()),
+                            kind: AttachmentKind::Image,
+                            name,
+                            mime_type: stored.mime_type,
+                            size_bytes: stored.size_bytes,
+                            sha256: stored.sha256,
+                            width: Some(stored.width),
+                            height: Some(stored.height),
+                        }),
+                        Err(MediaError::Unsupported(_)) => {
+                            let mime = mime_from_name(&name);
+                            match store.put_base64(&data_base64, &mime) {
+                                Ok((sha256, size_bytes)) => Ok(AttachmentRef {
                                     id: AttachmentId::new(leveler_core::new_uuid_string()),
-                                    kind: AttachmentKind::Image,
+                                    kind: kind_from_mime(&mime),
                                     name,
-                                    mime_type: stored.mime_type,
-                                    size_bytes: stored.size_bytes,
-                                    sha256: stored.sha256,
-                                    width: Some(stored.width),
-                                    height: Some(stored.height),
-                                },
-                            });
+                                    mime_type: mime,
+                                    size_bytes,
+                                    sha256,
+                                    width: None,
+                                    height: None,
+                                }),
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
+                    match result {
+                        Ok(attachment) => {
+                            let _ = events.send(RuntimeEvent::AttachmentAdded { attachment });
                         }
                         Err(error) => {
-                            let _ = events.send(RuntimeEvent::AttachmentProcessingFailed {
-                                error: error.to_string(),
-                            });
+                            let _ = events.send(RuntimeEvent::AttachmentProcessingFailed { error });
                         }
                     }
                 });
@@ -1942,6 +1959,44 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::QueryObservability {
+                session_id,
+                query_id,
+                center_seq,
+                before,
+                after,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                match crate::observability::query_observability(
+                    &db,
+                    &session_id,
+                    center_seq,
+                    before,
+                    after,
+                )
+                .await
+                {
+                    Ok(observation) => {
+                        // Echo the caller's token. `None` is a 1.5 query:
+                        // still serve the read model; 1.6 clients will not
+                        // treat the response as owned.
+                        let _ =
+                            self.events_for(&session_id)
+                                .send(RuntimeEvent::ObservabilityLoaded {
+                                    query_id,
+                                    observation,
+                                });
+                    }
+                    Err(error) => {
+                        self.notify_error(&session_id, format!("observability: {error}"));
+                    }
+                }
+                Ok(())
+            }
             ClientCommand::Quit => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2292,9 +2347,19 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         })
     }
 
-    /// The in-process runtime IS the runtime for this state directory: its
-    /// identity is the directory's persisted RuntimeId, not anything about
-    /// this process.
+    async fn fetch_attachment(
+        &self,
+        sha256: &str,
+    ) -> Result<leveler_local_transport::AttachmentBytes, ClientError> {
+        let root = self.media_root.clone();
+        let sha = sha256.to_string();
+        tokio::task::spawn_blocking(move || MediaStore::new(&root).load_bytes(&sha))
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .map(|(mime_type, bytes)| leveler_local_transport::AttachmentBytes { mime_type, bytes })
+            .map_err(|_| ClientError::Runtime("attachment not found".to_string()))
+    }
+
     async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
         let runtime_id = self
             .app
@@ -2315,6 +2380,31 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 shutting_down,
             },
         })
+    }
+}
+
+fn mime_from_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".md") {
+        "text/markdown".to_string()
+    } else if lower.ends_with(".diff") || lower.ends_with(".patch") {
+        "text/x-diff".to_string()
+    } else if lower.ends_with(".txt") {
+        "text/plain".to_string()
+    } else if lower.ends_with(".json") {
+        "application/json".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+fn kind_from_mime(mime: &str) -> AttachmentKind {
+    if mime.starts_with("image/") {
+        AttachmentKind::Image
+    } else if mime.starts_with("text/") || mime == "application/json" {
+        AttachmentKind::TextFile
+    } else {
+        AttachmentKind::Document
     }
 }
 

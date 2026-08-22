@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::{ApprovalId, ClarificationId, ToolCallId};
+use leveler_core::{ApprovalId, ClarificationId, CommandId, ToolCallId};
 
 use super::approval::{UiApprovalRequest, UiClarificationRequest};
 use super::media::AttachmentRef;
@@ -265,6 +265,15 @@ pub enum RuntimeEvent {
         no_progress_streak: u32,
         closeout_deny_rounds: u32,
     },
+    /// Result of [`crate::ClientCommand::QueryObservability`]. Read-only
+    /// projection of durable facts for the current or a historical session.
+    /// Echoes the command's `query_id` when the peer sent one. Absent on
+    /// protocol 1.5 peers — a 1.6 client must not treat that as ownership.
+    ObservabilityLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        observation: crate::UiObservabilityLoaded,
+    },
 }
 
 /// Deserialize a runtime event, treating **unknown** `type` tags as
@@ -302,7 +311,8 @@ mod tests {
         MessageId, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot, UiSessionSummary,
     };
     use crate::{
-        ApprovalId, AttachmentId, AttachmentKind, ClarificationId, ModelRef, SessionId, ToolCallId,
+        ApprovalId, AttachmentId, AttachmentKind, ClarificationId, CommandId, ModelRef, SessionId,
+        ToolCallId,
     };
     use crate::{UiApprovalRequest, UiClarificationRequest};
 
@@ -364,6 +374,79 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn observation_fixture() -> crate::UiObservabilityLoaded {
+        crate::UiObservabilityLoaded {
+            session: crate::UiSessionObservation {
+                session_id: SessionId::new("s1"),
+                goal: "g".into(),
+                repository: "/repo".into(),
+                created_at: "t".into(),
+                updated_at: "t".into(),
+                status: "idle".into(),
+                model: "m".into(),
+                work_profile: "balanced".into(),
+                collaboration: "chat".into(),
+                last_sequence: Some(100),
+                request_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                avg_latency_ms: None,
+                last_latency_ms: None,
+                request_failures: 0,
+                request_retries: 0,
+                tool_started: 0,
+                tool_finished: 0,
+                verification_runs: 0,
+                compact_count: 0,
+                subagent_started: 0,
+                repair_started: 0,
+            },
+            window: Vec::new(),
+            window_from: 1,
+            window_to: 1,
+            requests: Vec::new(),
+            tools: Vec::new(),
+            agents: Vec::new(),
+            recovery: crate::UiRecoveryObservation {
+                interrupted_turns: 0,
+                repair_attempts: 0,
+                workspace_snapshots: 0,
+                review_stages: Vec::new(),
+            },
+            relations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn observability_loaded_decodes_protocol_1_5_without_query_id() {
+        let json = serde_json::json!({
+            "type": "observability_loaded",
+            "observation": observation_fixture(),
+        });
+        let ev: RuntimeEvent = serde_json::from_value(json).expect("1.5 observability_loaded");
+        match ev {
+            RuntimeEvent::ObservabilityLoaded { query_id, .. } => assert_eq!(query_id, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observability_loaded_echoes_a_1_6_query_id() {
+        let ev = RuntimeEvent::ObservabilityLoaded {
+            query_id: Some(CommandId::new("q1")),
+            observation: observation_fixture(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["query_id"], "q1");
+        let back: RuntimeEvent = serde_json::from_value(json).unwrap();
+        match back {
+            RuntimeEvent::ObservabilityLoaded { query_id, .. } => {
+                assert_eq!(query_id, Some(CommandId::new("q1")));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     fn roundtrip(event: RuntimeEvent, expected_type: &str) {

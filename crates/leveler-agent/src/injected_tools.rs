@@ -158,17 +158,16 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
         description: "Delegate a self-contained subtask to a focused sub-agent so it \
             does not consume this conversation's context. The child shares your model \
             and workspace but starts a FRESH conversation — put everything it needs \
-            in `task`. This tool runs the child IN THE BACKGROUND BY DEFAULT: the \
-            call returns immediately with the child's id, you continue working, and \
-            the runtime tells you when it settles (its truthful result, partial work \
-            included). Start independent delegations together in one assistant \
-            message; they run concurrently. \
-            role='worker' performs scoped writes inside `files` (its exclusive \
-            ownership — your own edits there are refused while it runs) and can run \
-            targeted verification; assign disjoint `files` to parallel workers. \
-            role='explorer' is read-only investigation/Q&A. \
-            Keep the work yourself when it is small, tightly coupled, or needs your \
-            in-flight context. Do NOT spawn the whole task as one blob. \
+            in `task`; that is the only required argument. This tool runs the child \
+            IN THE BACKGROUND BY DEFAULT: the call returns immediately with the \
+            child's id, you continue working, and the runtime tells you when it \
+            settles (its truthful result, partial work included). Start independent \
+            delegations together in one assistant message; they run concurrently. \
+            The child starts read-capable and claims a bounded write scope itself \
+            (claim_write_scope) after inspecting the code; the runtime enforces \
+            exclusive ownership and denies conflicts, so you do not pre-plan file \
+            ownership. Keep the work yourself when it is small, tightly coupled, or \
+            needs your in-flight context. Do NOT spawn the whole task as one blob. \
             agent='<name>' runs a reusable named persona (project \
             `.leveler/agents/<name>.md`, user-level, or built-in); its instructions \
             are prepended to `task` and supply the role unless you override it."
@@ -180,12 +179,12 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                 "role": {
                     "type": "string",
                     "enum": ["default", "explorer", "worker"],
-                    "description": "explorer = read-only investigation; worker = writes code within `files`; default = full tools."
+                    "description": "Optional. explorer = read-only investigation; worker = legacy pre-scoped writer (requires `files`); default = normal child that claims its own write scope."
                 },
                 "files": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "For role='worker': the paths this agent exclusively owns and may edit. Each entry is a relative file path or a directory (a directory grants its whole subtree, e.g. 'src/output/'). Edits outside them are rejected."
+                    "description": "Legacy, for role='worker' only: pre-claimed exclusive paths. Normal children omit this and claim their own scope after reading the code."
                 },
                 "agent": {
                     "type": "string",
@@ -197,6 +196,39 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["task"]
+        }),
+    }
+}
+
+/// The tool a CHILD calls to acquire exclusive write authority over the paths
+/// it actually needs, after reading enough code to know them (late-bound
+/// ownership: SPAWN != WRITE AUTHORITY).
+pub(crate) const CLAIM_WRITE_SCOPE_TOOL: &str = "claim_write_scope";
+
+pub(crate) fn claim_write_scope_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+        description: "Claim exclusive write authority over the files or directories \
+            you are about to modify. Use it AFTER reading enough code to know what \
+            this task actually needs to change; before your first claim every \
+            mutation is refused. The grant is exclusive and atomic (all paths or \
+            none); overlapping claims by others are denied while you hold it, and \
+            it is released automatically when you finish. A denial is a coordination \
+            result, not a failure: narrow the scope, work on something else, or \
+            retry after the owner settles. You may claim additional paths later as \
+            you discover them. Re-read a claimed file before your first write to it \
+            if time has passed since you read it."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Relative files or directories to own exclusively (a directory covers its whole subtree, e.g. 'src/output/'). Claim the smallest scope that covers your work — never the repository root."
+                }
+            },
+            "required": ["paths"]
         }),
     }
 }
@@ -530,8 +562,17 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            files_desc.contains("directory"),
-            "files scope must advertise directory grants: {files_desc}"
+            files_desc.contains("Legacy") && files_desc.contains("claim"),
+            "files must read as the legacy path, pointing at claim_write_scope: {files_desc}"
+        );
+        // Late-bound ownership: the claim tool advertises directory grants.
+        let claim = claim_write_scope_tool_definition();
+        let claim_desc = claim.input_schema["properties"]["paths"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            claim_desc.contains("director"),
+            "claim paths must advertise directory grants: {claim_desc}"
         );
     }
 
@@ -549,8 +590,8 @@ mod tests {
         assert!(d.contains("returns immediately"), "{}", def.description);
         assert!(d.contains("settle"), "{}", def.description);
         assert!(
-            d.contains("scoped") && (d.contains("write") || d.contains("edit")),
-            "Worker scoped write must stay model-visible: {}",
+            d.contains("claim") && d.contains("write"),
+            "the late-bound claim protocol must be model-visible: {}",
             def.description
         );
         assert!(

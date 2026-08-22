@@ -8,6 +8,7 @@ import {
   commandProgressLabel,
   presentTurnEnd,
   turnEndFromEvent,
+  turnFooterPrimary,
   turnProgressLabel,
 } from './turn';
 
@@ -93,6 +94,16 @@ describe('presentTurnEnd', () => {
     expect(presentTurnEnd({ outcome: 'answered', detail: null }).label).toBe('已回答');
     expect(presentTurnEnd({ outcome: 'completed', detail: null }).tone).toBe('success');
     expect(presentTurnEnd({ outcome: 'answered', detail: null }).tone).toBe('success');
+  });
+});
+
+describe('turnFooterPrimary', () => {
+  it('appends duration, not a wall-clock', () => {
+    expect(turnFooterPrimary({ outcome: 'answered', detail: null }, 2100)).toBe('已回答 · 2s');
+    expect(turnFooterPrimary({ outcome: 'completed', detail: null }, 13000)).toBe('任务已完成 · 13s');
+    expect(turnFooterPrimary({ outcome: 'failed', detail: 'boom' }, 8000)).toBe('执行失败 · 8s');
+    expect(turnFooterPrimary({ outcome: 'answered', detail: null }, 0)).toBe('已回答');
+    expect(turnFooterPrimary({ outcome: 'answered', detail: null }, 2100)).not.toMatch(/\d{1,2}:\d{2}:\d{2}/);
   });
 });
 

@@ -68,6 +68,9 @@ impl Tool for ReplaceTool {
         if input.old.is_empty() {
             return Ok(ToolOutput::error("`old` must not be empty"));
         }
+        if let Some(denied) = context.policy.write_path_denied(&input.path) {
+            return Ok(ToolOutput::error(denied));
+        }
         let resolved = match context.execution.workspace.resolve(&input.path) {
             Ok(p) => p,
             Err(e) => return Ok(ToolOutput::error(e.to_string())),

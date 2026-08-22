@@ -1,0 +1,41 @@
+id: a13-helper-and-callers
+name: "Shared helper plus two call sites"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub mod trim;
+    pub fn first_word(s: &str) -> &str {
+        s.split_whitespace().next().unwrap_or("")
+    }
+    pub fn last_word(s: &str) -> &str {
+        s.split_whitespace().last().unwrap_or("")
+    }
+  src/trim.rs: |
+    pub fn trim_ascii(s: &str) -> &str {
+        todo!("trim ASCII whitespace from both ends")
+    }
+  tests/spec.rs: |
+    use evalcase::{first_word, last_word, trim::trim_ascii};
+    #[test]
+    fn trims() {
+        assert_eq!(trim_ascii("  hi\t"), "hi");
+    }
+    #[test]
+    fn words_use_trimmed_input() {
+        assert_eq!(first_word(trim_ascii("  a b  ")), "a");
+        assert_eq!(last_word(trim_ascii("  a b  ")), "b");
+    }
+task: |
+  Implement trim_ascii in src/trim.rs. Then make first_word and last_word in
+  src/lib.rs operate on a trimmed view so leading and trailing ASCII spaces
+  do not become words. Do not edit tests.
+expect:
+  program: "true"
+  args: []

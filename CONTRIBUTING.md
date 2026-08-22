@@ -52,9 +52,11 @@ edge from a lower-level crate back to a user-facing layer.
 
 ## Evaluation cases
 
-Read `evals/README.md` before adding cases. Keep cases self-contained, verify
-fail/pass behavior, preserve any required attribution, and do not commit
-external fixture repositories or generated results.
+Read `evals/README.md` before adding capability cases. Read `eval/README.md`
+before adding adoption / timing / long-task / safety observer cases. Keep
+cases self-contained, verify fail/pass behavior, preserve any required
+attribution, and do not commit external fixture repositories or generated
+results. Do not add `eval_mode` branches to the product runtime.
 
 ## License
 

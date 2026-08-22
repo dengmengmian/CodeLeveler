@@ -12,6 +12,17 @@
 | [../configs/example.yaml](../configs/example.yaml) | Users | Global + bundle provider/model schema |
 | [../README.md](../README.md) | Everyone | English entry |
 | [../README.zh-CN.md](../README.zh-CN.md) | Everyone (中文) | Chinese entry |
+| [BETA_RELEASE_READINESS.md](BETA_RELEASE_READINESS.md) | Maintainers | Beta release gate: blockers, required items, release recommendation |
+| [evaluations/README.md](evaluations/README.md) | Contributors | Eval framework: capability `evals/` vs observer `eval/` |
+| [eval-methodology.md](eval-methodology.md) | Contributors | Adoption vs safety denominators; what counts as a spawn |
+| [MOBILE_UI_UX_CLOSURE.md](MOBILE_UI_UX_CLOSURE.md) | Contributors | Mobile UI/UX closure: workspace, not chat (v1.0) |
+| [MOBILE_UI_UX_CLOSURE.zh-CN.md](MOBILE_UI_UX_CLOSURE.zh-CN.md) | Contributors (中文) | 同上 |
+| [MOBILE_RUNTIME_ALIGNMENT.md](MOBILE_RUNTIME_ALIGNMENT.md) | Contributors | Mobile M8–M12: steer, artifacts, coverage |
+| [MOBILE_RUNTIME_ALIGNMENT.zh-CN.md](MOBILE_RUNTIME_ALIGNMENT.zh-CN.md) | Contributors (中文) | 同上 |
+| [MOBILE_BETA_CLOSURE.md](MOBILE_BETA_CLOSURE.md) | Contributors | Mobile Beta: fetch_attachment + Task Detail |
+| [MOBILE_BETA_CLOSURE.zh-CN.md](MOBILE_BETA_CLOSURE.zh-CN.md) | Contributors (中文) | 同上 |
+| [MOBILE_FREEZE.md](MOBILE_FREEZE.md) | Contributors | Mobile feature work frozen at `mobile-beta-mvp` |
+| [MOBILE_FREEZE.zh-CN.md](MOBILE_FREEZE.zh-CN.md) | Contributors (中文) | 同上 |
 
 ## Config layers (quick)
 

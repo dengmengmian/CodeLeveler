@@ -1,251 +1,233 @@
-// 左栏：项目工作台导航。顶部品牌 + 新对话入口；面板切换：
-// 会话（按仓库分组的会话列表）/ 文件（仓库文件树，前缀过滤）/
-// 搜索（内容搜索）/ Git（工作区改动）。数据走 REST，按当前会话定位仓库；
-// 底部 daemon 连接状态。
+// Single sidebar: Brand, New Task, Conversations / Files / Search,
+// Workspaces (projects → sessions), Settings. Changes and Execution
+// live in the workspace tabs, not here.
 
+import {
+  ChevronDown,
+  ChevronRight,
+  Files,
+  MessageSquare,
+  Plus,
+  RefreshCw,
+  Search,
+  Settings,
+  SquarePen,
+  type LucideIcon,
+} from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useAppState } from '../state/store';
-import { useBridge } from '../state/bridge';
-import { BrandMark } from './BrandMark';
-import { ProjectPicker } from './ProjectPicker';
-import { useOpenFile } from './FileViewer';
 import { gitStatus, listFiles, searchFiles, type GitStatus, type SearchMatch } from '../lib/api';
-import { formatRelative, repoShortName, statusDot } from '../lib/format';
-import type { UiSessionSummary } from '../types/protocol';
+import { formatRelative, repoShortName } from '../lib/format';
+import { CTRL_ICON, NAV_ICON } from '../lib/icons';
+import { sessionStatusCue, sessionsForProject } from '../lib/projectScope';
+import { SIDEBAR_NAV } from '../lib/railNav';
+import { groupByDay } from '../lib/sessionDay';
+import { useBridge } from '../state/bridge';
+import { useAppDispatch, useAppState, type RailNav } from '../state/store';
+import { AppearancePanel } from './Appearance';
+import { BrandMark } from './BrandMark';
+import { useOpenFile } from './FileViewer';
+import { ProjectPicker } from './ProjectPicker';
 
-interface ProjectGroup {
-  repository: string;
-  sessions: UiSessionSummary[];
-}
+const NAV_ICONS: Record<Exclude<RailNav, 'settings'>, LucideIcon> = {
+  sessions: MessageSquare,
+  files: Files,
+  search: Search,
+};
 
-type Panel = 'sessions' | 'files' | 'search' | 'git';
-
-const PANELS: ReadonlyArray<readonly [Panel, string]> = [
-  ['sessions', '会话'],
-  ['files', '文件'],
-  ['search', '搜索'],
-  ['git', 'Git'],
-];
-
-export function Rail() {
+export function Sidebar() {
   const state = useAppState();
+  const dispatch = useAppDispatch();
   const bridge = useBridge();
-  const [panel, setPanel] = useState<Panel>('sessions');
+  const [picking, setPicking] = useState(false);
+
+  const newTask = () => {
+    const path = state.selectedProject ?? (state.repository || null);
+    if (!path) {
+      setPicking(true);
+      return;
+    }
+    bridge.newDraft(path);
+    dispatch({ type: 'set_rail_nav', nav: 'sessions' });
+  };
 
   return (
-    <aside className="rail">
-      <div className="brand" title={`CodeLeveler web · v${__APP_VERSION__}`}>
+    <aside className={`sidebar${state.railOpen ? '' : ' is-hidden'}`} aria-label="Sidebar">
+      {picking && <ProjectPicker onClose={() => setPicking(false)} />}
+      <div className="sb-brand" title={`CodeLeveler web · v${__APP_VERSION__}`}>
         <BrandMark />
-        <div className="name">CodeLeveler</div>
-        <span className="ver">v{__APP_VERSION__}</span>
+        <span className="sb-word">CodeLeveler</span>
       </div>
-
-      <button className="rail-new" onClick={() => bridge.newDraft()}>
-        ＋ 新对话
+      <button type="button" className="sb-new" onClick={newTask}>
+        <SquarePen {...NAV_ICON} aria-hidden="true" />
+        New Task
       </button>
-
-      <div className="rail-tabs">
-        {PANELS.map(([key, label]) => (
-          <button
-            key={key}
-            className={`rail-tab${panel === key ? ' on' : ''}`}
-            onClick={() => setPanel(key)}
-          >
-            {label}
-          </button>
-        ))}
+      <nav className="sb-nav" aria-label="Primary">
+        {SIDEBAR_NAV.map((item) => {
+          const Icon = NAV_ICONS[item.id];
+          const on = state.railNav === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              className={`sb-nav-btn${on ? ' on' : ''}`}
+              aria-current={on ? 'page' : undefined}
+              onClick={() => dispatch({ type: 'set_rail_nav', nav: item.id })}
+            >
+              <Icon {...NAV_ICON} aria-hidden="true" />
+              {item.label}
+            </button>
+          );
+        })}
+      </nav>
+      <div className="sb-body">
+        {state.railNav === 'sessions' && <WorkspacesPanel onOpenProject={() => setPicking(true)} />}
+        {state.railNav === 'files' && (
+          <>
+            <FilesPanel />
+            <GitPanel />
+          </>
+        )}
+        {state.railNav === 'search' && <SearchPanel />}
+        {state.railNav === 'settings' && <AppearancePanel />}
       </div>
-
-      {panel === 'sessions' && <SessionsPanel />}
-      {panel === 'files' && <FilesPanel />}
-      {panel === 'search' && <SearchPanel />}
-      {panel === 'git' && <GitPanel />}
-
-      <div className="rail-foot">
-        <span className={`led${state.connection === 'online' ? '' : ' off'}`} />
-        <span>
-          Daemon · {state.connection === 'online' ? '已连接' : '重连中'} · {window.location.host}
-        </span>
-      </div>
+      <button
+        type="button"
+        className={`sb-settings${state.railNav === 'settings' ? ' on' : ''}`}
+        aria-current={state.railNav === 'settings' ? 'page' : undefined}
+        onClick={() => dispatch({ type: 'set_rail_nav', nav: 'settings' })}
+      >
+        <Settings {...NAV_ICON} aria-hidden="true" />
+        Settings
+      </button>
     </aside>
   );
 }
 
-// ── 会话面板 ────────────────────────────────────────────────────────
-
-// 每个项目组默认只展示最新 N 条会话，超出折叠进「加载更多」。
-const SESSION_PREVIEW_COUNT = 5;
-
-function SessionsPanel() {
+function WorkspacesPanel({ onOpenProject }: { onOpenProject: () => void }) {
   const state = useAppState();
-  const bridge = useBridge();
-  const [closed, setClosed] = useState<ReadonlySet<string>>(new Set());
-  // 会话列表展开为全量的项目路径集合（默认都只显示最新 5 条）
-  const [expandedSessions, setExpandedSessions] = useState<ReadonlySet<string>>(new Set());
-  const [picking, setPicking] = useState(false);
-  // 正在 inline 重命名的项目路径（null = 无）
-  const [renaming, setRenaming] = useState<string | null>(null);
-  // 正在 inline 重命名的会话 id（null = 无）
-  const [renamingSession, setRenamingSession] = useState<string | null>(null);
-
-  // 会话按 repository 分组（组内按 updated_at 倒序），骨架是注册的项目
-  // 列表 —— 没有会话或 daemon 离线的项目也显示；不在项目列表里的会话
-  // 分组（单项目模式回退）追加在最后。
-  const groups = useMemo<ProjectGroup[]>(() => {
-    const byRepo = new Map<string, UiSessionSummary[]>();
-    for (const s of state.sessions) {
-      const repo = s.repository ?? state.repository ?? '';
-      const list = byRepo.get(repo);
-      if (list) list.push(s);
-      else byRepo.set(repo, [s]);
-    }
-    for (const list of byRepo.values()) {
-      list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-    }
-    const out: ProjectGroup[] = [];
-    const seen = new Set<string>();
-    for (const p of state.projects) {
-      seen.add(p.path);
-      out.push({ repository: p.path, sessions: byRepo.get(p.path) ?? [] });
-    }
-    for (const [repo, sessions] of byRepo) {
-      if (!seen.has(repo)) out.push({ repository: repo, sessions });
-    }
-    // 有会话的组按最近活动倒序（沿用旧的首见顺序体验）；无会话的组保持
-    // projects 顺序排在最后（sessions 已按 updated_at 倒序，首条即最新）。
-    out.sort((a, b) => {
-      const ta = a.sessions[0]?.updated_at;
-      const tb = b.sessions[0]?.updated_at;
-      if (ta && tb) return tb.localeCompare(ta);
-      if (ta) return -1;
-      if (tb) return 1;
-      return 0;
-    });
-    return out;
-  }, [state.sessions, state.projects, state.repository]);
-
-  const toggle = (repo: string) => {
-    setClosed((prev) => {
-      const next = new Set(prev);
-      if (next.has(repo)) next.delete(repo);
-      else next.add(repo);
-      return next;
-    });
-  };
-
-  const toggleSessionList = (repo: string) => {
-    setExpandedSessions((prev) => {
-      const next = new Set(prev);
-      if (next.has(repo)) next.delete(repo);
-      else next.add(repo);
-      return next;
-    });
-  };
-
-  const projectOf = (repo: string) => state.projects.find((p) => p.path === repo);
-
-  const submitRename = (repo: string, current: string, raw: string) => {
-    setRenaming(null);
-    const value = raw.trim();
-    if (value === current) return;
-    // 空串交给后端：清除别名、恢复路径末段的默认名
-    void bridge.renameProject(repo, value);
-  };
+  const currentPath = state.selectedProject ?? (state.repository || null);
+  const groups = useMemo(() => {
+    if (state.projects.length > 0) return state.projects;
+    if (!currentPath) return [];
+    return [{ path: currentPath, name: repoShortName(currentPath), status: 'online' as const }];
+  }, [state.projects, currentPath]);
 
   return (
     <div className="sessions">
-      {picking && <ProjectPicker onClose={() => setPicking(false)} />}
-      <div className="rail-head">
-        <span>项目</span>
-        <button className="p-open" title="打开项目（浏览并选择一个仓库目录）" onClick={() => setPicking(true)}>
-          ＋ 打开项目
-        </button>
-      </div>
+      <div className="sb-kicker">WORKSPACES</div>
       {groups.length === 0 && (
         <div className="rail-empty">
-          还没有会话。
-          <br />
-          点击「＋ 新对话」或在下方输入开始。
+          Open a project
+          <button type="button" className="rail-new" onClick={onOpenProject}>
+            打开项目
+          </button>
         </div>
       )}
-      {groups.map((g) => {
-        const proj = projectOf(g.repository);
-        const status = proj?.status ?? null;
-        const name = proj?.name ?? repoShortName(g.repository);
-        return (
-          <div className={`proj${closed.has(g.repository) ? ' closed' : ''}`} key={g.repository || '_'}>
-            <button className="proj-head" onClick={() => toggle(g.repository)}>
-              <span className="fold">▼</span>
-              <span className="pmeta">
-                <span className="pname">
-                  {status && <i className={`pdot ${status}`} />}
-                  {renaming === g.repository ? (
-                    <RenameInput
-                      initial={name}
-                      onSubmit={(value) => submitRename(g.repository, name, value)}
-                      onCancel={() => setRenaming(null)}
-                    />
-                  ) : (
-                    name
-                  )}
-                </span>
-                <span className="ppath">{g.repository || '当前仓库'}</span>
-              </span>
-              <span className="pcount">{g.sessions.length}</span>
-              {status === 'offline' ? (
-                <span
-                  className="p-add restart"
-                  role="button"
-                  title="重启该项目 daemon"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void bridge.restartProject(g.repository);
-                  }}
-                >
-                  ⟳
-                </span>
-              ) : (
-                <span
-                  className="p-add"
-                  role="button"
-                  title="在此项目中新建对话"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    bridge.newDraft(g.repository || undefined);
-                  }}
-                >
-                  ＋
-                </span>
-              )}
-              <ProjectMenu
-                repo={g.repository}
-                name={name}
-                canManage={!!proj}
-                isPrimary={state.projects[0]?.path === g.repository}
-                onRename={() => setRenaming(g.repository)}
-              />
+      {groups.map((p) => (
+        <WorkspaceGroup key={p.path} path={p.path} name={p.name} status={p.status} />
+      ))}
+      {groups.length > 0 && (
+        <button type="button" className="sb-open-proj" onClick={onOpenProject}>
+          <Plus {...CTRL_ICON} aria-hidden="true" />
+          打开项目…
+        </button>
+      )}
+    </div>
+  );
+}
+
+function WorkspaceGroup({
+  path,
+  name,
+  status,
+}: {
+  path: string;
+  name: string;
+  status: string;
+}) {
+  const state = useAppState();
+  const selected = (state.selectedProject ?? state.repository) === path;
+  const [open, setOpen] = useState(selected);
+  const [renaming, setRenaming] = useState(false);
+  const [renamingSession, setRenamingSession] = useState<string | null>(null);
+  const bridge = useBridge();
+  const proj = state.projects.find((p) => p.path === path) ?? null;
+  const sessions = useMemo(() => {
+    const rows = sessionsForProject(state.sessions, path);
+    return [...rows].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }, [state.sessions, path]);
+
+  const submitRename = (raw: string) => {
+    setRenaming(false);
+    const value = raw.trim();
+    if (value === name) return;
+    void bridge.renameProject(path, value);
+  };
+
+  return (
+    <div className={`proj${open ? '' : ' closed'}`}>
+      <div className="proj-head-row">
+        <button
+          type="button"
+          className="proj-head"
+          title={path}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? (
+            <ChevronDown {...CTRL_ICON} aria-hidden="true" />
+          ) : (
+            <ChevronRight {...CTRL_ICON} aria-hidden="true" />
+          )}
+          {renaming ? (
+            <RenameInput initial={name} onSubmit={submitRename} onCancel={() => setRenaming(false)} />
+          ) : (
+            <span className="pname">{name}</span>
+          )}
+          {status === 'offline' && <span className="proj-offline">Offline</span>}
+        </button>
+        <ProjectMenu
+          repo={path}
+          name={name}
+          canManage={!!proj}
+          isPrimary={state.projects[0]?.path === path}
+          onRename={() => setRenaming(true)}
+        />
+      </div>
+      {open && (
+        <div className="proj-sessions">
+          {status === 'offline' && (
+            <button type="button" className="rail-new" onClick={() => void bridge.restartProject(path)}>
+              Restart
             </button>
-            <div className="proj-sessions">
-              {g.sessions.length === 0 && (
-                <div className="sess-empty">
-                  {status === 'offline' ? 'daemon 离线 —— 点 ⟳ 重启后加载会话' : '暂无会话'}
-                </div>
-              )}
-              {(expandedSessions.has(g.repository)
-                ? g.sessions
-                : g.sessions.slice(0, SESSION_PREVIEW_COUNT)
-              ).map((s) => {
-                const dot = statusDot(s.status);
+          )}
+          {sessions.length === 0 && status !== 'offline' && <div className="rail-empty">No sessions yet</div>}
+          {groupByDay(sessions).map((day) => (
+            <div key={day.bucket} className="sess-day">
+              <div className="sess-day-label">{day.label}</div>
+              {day.items.map((s) => {
+                const liveWait =
+                  state.current?.id === s.id &&
+                  (state.current.pendingApprovals.length > 0 ||
+                    state.current.pendingClarifications.length > 0);
+                const cue = liveWait
+                  ? { kind: 'waiting' as const, label: 'Waiting' }
+                  : sessionStatusCue(s.status);
+                const showStatus =
+                  cue.kind === 'running' ||
+                  cue.kind === 'waiting' ||
+                  cue.kind === 'failed' ||
+                  cue.kind === 'blocked';
                 return (
-                  // 单行紧凑式：标题 + 右侧相对时间;状态点只在「运行中/等待
-                  // 输入」时出现,完成态不再各占一行刷 COMPLETED 噪声。
                   <button
                     key={s.id}
+                    type="button"
                     className={`sess${state.current?.id === s.id ? ' active' : ''}`}
                     onClick={() => bridge.selectSession(s.id)}
-                    title={`${dot.label} · ${formatRelative(s.updated_at)}`}
+                    title={
+                      cue.label ? `${cue.label} · ${formatRelative(s.updated_at)}` : formatRelative(s.updated_at)
+                    }
                   >
-                    {dot.cls !== 'idle' && <i className={`dot ${dot.cls}`} />}
+                    {showStatus ? <i className={`dot ${cue.kind}`} /> : null}
                     {renamingSession === s.id ? (
                       <RenameInput
                         initial={s.goal}
@@ -258,36 +240,21 @@ function SessionsPanel() {
                     ) : (
                       <span className="t">{s.goal || '未命名会话'}</span>
                     )}
-                    <span className="ago">{formatRelative(s.updated_at)}</span>
-                    <SessionMenu
-                      id={s.id}
-                      title={s.goal}
-                      onRename={() => setRenamingSession(s.id)}
-                    />
+                    <span className="ago">
+                      {showStatus ? `${cue.label} · ` : ''}
+                      {formatRelative(s.updated_at)}
+                    </span>
+                    <SessionMenu id={s.id} title={s.goal} onRename={() => setRenamingSession(s.id)} />
                   </button>
                 );
               })}
-              {g.sessions.length > SESSION_PREVIEW_COUNT &&
-                (expandedSessions.has(g.repository) ? (
-                  <button className="sess-more" onClick={() => toggleSessionList(g.repository)}>
-                    收起
-                  </button>
-                ) : (
-                  <button className="sess-more" onClick={() => toggleSessionList(g.repository)}>
-                    加载更多 {g.sessions.length - SESSION_PREVIEW_COUNT} 个对话
-                  </button>
-                ))}
             </div>
-          </div>
-        );
-      })}
+          ))}
+        </div>
+      )}
     </div>
   );
 }
-
-// ── 项目「⋯」菜单：复制路径 / 重命名 / 移除工作区 ──────────────────────
-// 仿 ThemeMenu 模式：open 状态 + 外部点击 / Escape 关闭。proj-head 本身是
-// <button>，内部沿用 .p-add 的 span[role=button] 惯例避免嵌套按钮。
 
 function ProjectMenu({
   repo,
@@ -298,9 +265,7 @@ function ProjectMenu({
 }: {
   repo: string;
   name: string;
-  /** 是否在项目列表里（聚合模式）；否则只提供复制路径 */
   canManage: boolean;
-  /** primary 项目不可移除 */
   isPrimary: boolean;
   onRename: () => void;
 }) {
@@ -366,8 +331,20 @@ function ProjectMenu({
             </span>
           )}
           {canManage && !isPrimary && (
+            <span
+              className="p-item"
+              role="button"
+              onClick={() => {
+                setOpen(false);
+                void bridge.restartProject(repo);
+              }}
+            >
+              重启 Runtime
+            </span>
+          )}
+          {canManage && !isPrimary && (
             <span className="p-item danger" role="button" onClick={remove}>
-              移除工作区
+              移除项目
             </span>
           )}
         </span>
@@ -375,9 +352,6 @@ function ProjectMenu({
     </span>
   );
 }
-
-// ── 会话「⋯」菜单：复制 Session ID / 重命名 / 分叉 / 导出 / 归档 ────────
-// 复用 ProjectMenu 的 open + 外部点击/Escape 关闭模式与 .p-* 样式。
 
 function SessionMenu({
   id,
@@ -470,13 +444,22 @@ function SessionMenu({
           <span className="p-item danger" role="button" onClick={archive}>
             归档
           </span>
+          <span
+            className="p-item danger"
+            role="button"
+            onClick={() => {
+              setOpen(false);
+              if (window.confirm(`删除会话「${title || id}」？`)) bridge.deleteSession(id);
+            }}
+          >
+            删除
+          </span>
         </span>
       )}
     </span>
   );
 }
 
-/** inline 重命名输入框：Enter / 失焦提交，Escape 取消。 */
 function RenameInput({
   initial,
   onSubmit,
@@ -486,7 +469,6 @@ function RenameInput({
   onSubmit: (value: string) => void;
   onCancel: () => void;
 }) {
-  // Escape 取消后 input 卸载，失焦回调不得再提交
   const cancelled = useRef(false);
   return (
     <input
@@ -510,8 +492,6 @@ function RenameInput({
   );
 }
 
-// ── 共用：面板数据加载 ───────────────────────────────────────────────
-
 function useSessionId(): string | null {
   return useAppState().current?.id ?? null;
 }
@@ -519,8 +499,6 @@ function useSessionId(): string | null {
 function NoSession() {
   return <div className="rail-empty">进入会话后可用 —— 面板数据按当前会话定位仓库。</div>;
 }
-
-// ── 文件面板 ────────────────────────────────────────────────────────
 
 function FilesPanel() {
   const sessionId = useSessionId();
@@ -573,9 +551,6 @@ function FilesPanel() {
   );
 }
 
-// ── 文件树 ──────────────────────────────────────────────────────────
-// 平铺路径拼成目录树；目录可折叠。过滤时全部展开只显示命中路径的分支。
-
 interface TreeNode {
   name: string;
   path: string;
@@ -600,9 +575,7 @@ function buildTree(paths: string[]): TreeNode[] {
     });
   }
   const sort = (nodes: TreeNode[]) => {
-    nodes.sort((a, b) =>
-      a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name),
-    );
+    nodes.sort((a, b) => (a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name)));
     for (const n of nodes) if (n.dir) sort(n.children);
   };
   sort(root.children);
@@ -618,7 +591,6 @@ function FileTree({
   filtering: boolean;
   onOpen: (path: string) => void;
 }) {
-  // 默认全部折叠（大仓库友好）；用户展开的目录记在集合里。过滤时忽略折叠状态。
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const tree = useMemo(() => buildTree(paths.slice(0, 4000)), [paths]);
 
@@ -633,16 +605,11 @@ function FileTree({
   const rows: ReactNode[] = [];
   const walk = (nodes: TreeNode[], depth: number) => {
     for (const node of nodes) {
-      const pad = { paddingLeft: `${6 + depth * 12}px` };
+      const pad = { paddingLeft: `${8 + depth * 12}px` };
       if (node.dir) {
         const open = filtering || expanded.has(node.path);
         rows.push(
-          <button
-            className="ft-dir"
-            key={`d:${node.path}`}
-            style={pad}
-            onClick={() => toggle(node.path)}
-          >
+          <button className="ft-dir" key={`d:${node.path}`} style={pad} onClick={() => toggle(node.path)}>
             <span className="ft-caret">{open ? '▾' : '▸'}</span>
             <span className="ft-name">{node.name}</span>
           </button>,
@@ -668,8 +635,6 @@ function FileTree({
   return <div className="ft">{rows}</div>;
 }
 
-// ── 搜索面板 ────────────────────────────────────────────────────────
-
 function SearchPanel() {
   const sessionId = useSessionId();
   const openFile = useOpenFile();
@@ -678,7 +643,6 @@ function SearchPanel() {
   const [matchesTruncated, setMatchesTruncated] = useState(false);
   const [searching, setSearching] = useState(false);
 
-  // 输入防抖 300ms
   useEffect(() => {
     if (!sessionId || !query.trim()) {
       setMatches(null);
@@ -718,11 +682,7 @@ function SearchPanel() {
       {matchesTruncated && <div className="rail-empty">已达到搜索预算，仅显示部分结果。</div>}
       <div className="rp-list">
         {(matches ?? []).map((m, i) => (
-          <button
-            className="rp-match"
-            key={`${m.path}:${m.line}:${i}`}
-            onClick={() => openFile(m.path, m.line)}
-          >
+          <button className="rp-match" key={`${m.path}:${m.line}:${i}`} onClick={() => openFile(m.path, m.line)}>
             <span className="rp-loc">
               {m.path}:{m.line}
             </span>
@@ -733,8 +693,6 @@ function SearchPanel() {
     </div>
   );
 }
-
-// ── Git 面板 ────────────────────────────────────────────────────────
 
 const GIT_TAG: Record<string, { tag: string; cls: string }> = {
   modified: { tag: 'M', cls: 'mod' },
@@ -761,20 +719,18 @@ function GitPanel() {
     refresh();
   }, [refresh]);
 
-  if (!sessionId) return <NoSession />;
+  if (!sessionId) return null;
 
   return (
-    <div className="rail-panel">
+    <div className="rail-panel git-foot">
       <div className="rp-bar">
         <span className="rp-branch">{status?.branch ?? '…'}</span>
-        <button className="rp-refresh" onClick={refresh} title="刷新">
-          ⟳
+        <button type="button" className="rp-refresh" onClick={refresh} title="刷新">
+          <RefreshCw {...CTRL_ICON} aria-hidden="true" />
         </button>
       </div>
       {status === null && <div className="rail-empty">加载中…</div>}
-      {status !== null && status.files.length === 0 && (
-        <div className="rail-empty">工作区干净。</div>
-      )}
+      {status !== null && status.files.length === 0 && <div className="rail-empty">工作区干净。</div>}
       <div className="rp-list">
         {(status?.files ?? []).map((f) => {
           const t = GIT_TAG[f.status] ?? GIT_TAG.modified;

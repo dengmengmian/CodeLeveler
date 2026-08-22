@@ -6,10 +6,19 @@
 // incomplete/unverified 永远不显示成绿色完成。
 
 import { useEffect, useState } from 'react';
-import { useAppState, type BackgroundTaskView } from '../state/store';
+import {
+  useAppState,
+  type BackgroundTaskView,
+  type LastTurn,
+  type ToolCallView,
+} from '../state/store';
 import { useBridge } from '../state/bridge';
+import { completionTruth } from '../lib/completionTruth';
 import { deriveRunState, type AgentRunState } from '../lib/runstate';
 import { formatSeconds, statsLine, summarizeTools } from '../lib/toolstats';
+import { presentTurnEnd, turnFooterPrimary } from '../lib/turn';
+import { CopyButton } from './CopyButton';
+import { ReasoningDisclosure } from './ReasoningDisclosure';
 import { ToolCallRow } from './ToolCallRow';
 
 /** 每秒重渲染以刷新耗时；active=false 时停走。 */
@@ -59,35 +68,36 @@ function BackgroundTaskRow({ task }: { task: BackgroundTaskView }) {
   );
 }
 
-export function AgentRunBlock() {
+export function AgentRunBlock({
+  variant = 'live',
+  tools: toolsProp,
+  backgroundTasks: bgProp,
+  lastTurn: lastTurnProp,
+  copyText = null,
+  live: liveFooter = false,
+}: {
+  variant?: 'live' | 'process' | 'footer';
+  tools?: ToolCallView[];
+  backgroundTasks?: BackgroundTaskView[];
+  lastTurn?: LastTurn | null;
+  copyText?: string | null;
+  live?: boolean;
+} = {}) {
   const current = useAppState().current;
   const bridge = useBridge();
   const [expanded, setExpanded] = useState(false);
+  const elapsed = useElapsedSeconds(
+    current?.turnStartedAt ?? null,
+    variant === 'live' && (current?.turnActive ?? false),
+  );
 
-  const run = current ? deriveRunState(current) : null;
-  const elapsed = useElapsedSeconds(current?.turnStartedAt ?? null, current?.turnActive ?? false);
-
-  if (!current || !run) return null;
-
-  const tools = current.tools;
-  const stats = summarizeTools(tools);
-  const spinning = SPINNING.has(run.state);
-  const backgroundTasks = current.backgroundTasks;
-
-  const recentDone = tools.filter((t) => t.status !== 'run').slice(-RECENT_DONE);
-
-  // 终态：语气化标记（✓/◇/⚠/✕/■）+ reason + 聚合摘要 + 按需展开的执行明细
-  if (run.terminal) {
-    const tone = run.tone ?? 'muted';
-    const retry =
-      run.outcome === 'failed' || run.outcome === 'cancelled' || run.outcome === 'truncated';
+  if (variant === 'process') {
+    const tools = toolsProp ?? current?.tools ?? [];
+    const backgroundTasks = bgProp ?? current?.backgroundTasks ?? [];
+    if (tools.length === 0 && backgroundTasks.length === 0) return null;
+    const stats = summarizeTools(tools);
     return (
-      <div className={`run-summary r-terminal tone-${tone}`}>
-        <div className="rs-head">
-          <span className="rs-icon">{run.glyph}</span>
-          <span className="rs-primary">{run.primary}</span>
-        </div>
-        {run.detail && <div className="rs-detail">原因：{run.detail}</div>}
+      <div className="run-summary r-process tone-muted">
         {tools.length > 0 && <div className="rs-sub">{statsLine(stats)}</div>}
         {backgroundTasks.map((t) => (
           <BackgroundTaskRow key={t.id} task={t} />
@@ -104,19 +114,58 @@ export function AgentRunBlock() {
             ))}
           </div>
         )}
-        {retry && (
-          <div className="rs-actions">
-            <button className="rs-btn" onClick={() => bridge.rerunLast()}>
-              {run.outcome === 'failed' ? '重试' : '重新运行'}
-            </button>
+      </div>
+    );
+  }
+
+  if (variant === 'footer') {
+    const lastTurn = lastTurnProp ?? current?.lastTurn ?? null;
+    if (!lastTurn) return null;
+    const p = presentTurnEnd(lastTurn);
+    const primary = turnFooterPrimary(lastTurn, lastTurn.ms);
+    const retry =
+      liveFooter &&
+      (lastTurn.outcome === 'failed' || lastTurn.outcome === 'cancelled' || lastTurn.outcome === 'truncated');
+    const truth = current ? completionTruth(current) : null;
+    const showFacts = Boolean(liveFooter && truth && truth.facts.length > 0);
+    return (
+      <div className={`run-summary r-footer tone-${p.tone}`}>
+        <div className="rs-head">
+          <span className="rs-icon">{p.glyph}</span>
+          <span className="rs-primary">{primary}</span>
+          <span className="turn-actions">
+            {retry && (
+              <button type="button" className="rs-btn" onClick={() => bridge.rerunLast()}>
+                {lastTurn.outcome === 'failed' ? '重试' : '重新运行'}
+              </button>
+            )}
+            {copyText ? <CopyButton text={copyText} className="copy-btn-compact" /> : null}
+          </span>
+        </div>
+        {p.detail && <div className="rs-detail">原因：{p.detail}</div>}
+        {showFacts && truth && (
+          <div className="rs-facts">
+            {truth.facts.map((f) => (
+              <div key={f}>{f}</div>
+            ))}
           </div>
         )}
       </div>
     );
   }
 
+  const run = current ? deriveRunState(current) : null;
+
+  if (!current || !run || run.terminal) return null;
+
+  const tools = current.tools;
+  const spinning = SPINNING.has(run.state);
+  const backgroundTasks = current.backgroundTasks;
+
+  const recentDone = tools.filter((t) => t.status !== 'run').slice(-RECENT_DONE);
+
   return (
-    <div className={`run-summary r-${run.state}`}>
+    <div className={`run-summary r-live r-${run.state}`}>
       <div className="rs-head">
         <span className="rs-icon">{spinning ? <span className="rs-spin" /> : '⏸'}</span>
         <span className="rs-primary">{run.primary}</span>
@@ -129,6 +178,8 @@ export function AgentRunBlock() {
       </div>
 
       {run.detail && <div className="rs-detail">{run.detail}</div>}
+
+      <ReasoningDisclosure text={current.reasoning} />
 
       {backgroundTasks.map((t) => (
         <BackgroundTaskRow key={t.id} task={t} />

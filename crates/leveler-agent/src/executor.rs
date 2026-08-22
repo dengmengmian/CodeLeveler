@@ -635,6 +635,24 @@ pub enum ChildToolEvent {
         is_error: bool,
         preview: String,
     },
+    /// A write-ownership transition (`claim_write_scope` granted or denied).
+    ///
+    /// Rides this queue, not the activity channel, because the grant must be
+    /// durable BEFORE any event whose authorization depends on it — a child's
+    /// writes flush here immediately, so a grant recorded anywhere else can
+    /// land after the write it authorized and read as a bypass.
+    ///
+    /// Deliberately NOT a `Started`/`Finished` pair: `claim_write_scope` is a
+    /// virtual tool the drive loop answers inline and never registers, so a
+    /// `ToolCallStarted` for it would look like a dangling call to crash
+    /// recovery and demand human reconciliation for an operation with no
+    /// external side effect — the registry it mutates is in memory and dies
+    /// with the process.
+    Ownership {
+        agent_id: String,
+        action: String,
+        detail: String,
+    },
 }
 
 /// A sink that persists the transcript as the loop advances, enabling resume.
@@ -835,6 +853,10 @@ pub struct TurnPolicy {
     // ── Delegation ──────────────────────────────────────────────────────────
     /// When false, `spawn_agent` is not advertised (delegation kill-switch).
     pub allow_delegation: bool,
+    /// H-C experiment: WHEN the keep-vs-delegate surface is raised. Default is
+    /// `PlanRegistration`, the shipped behaviour; the other arm exists solely
+    /// so the timing hypothesis can be tested causally.
+    pub delegation_timing: crate::sub_agent::DelegationTiming,
     /// Max sub-agents running at once (within a spawn batch).
     pub max_concurrent_agents: usize,
     /// Max sub-agents spawned across the whole top-level run.
@@ -860,6 +882,7 @@ impl Default for TurnPolicy {
             delivery_gate: false,
             progress_guards: true,
             allow_delegation: true,
+            delegation_timing: crate::sub_agent::DelegationTiming::default(),
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
         }
@@ -906,6 +929,9 @@ pub struct Executor {
     /// When `Some`, `apply_patch` may only touch these files (worker ownership).
     /// `None` = unrestricted.
     write_allowlist: Option<Vec<String>>,
+    /// Workspace-wide write-ownership truth, shared by the whole execution
+    /// tree (late-bound ownership: spawned children claim scopes here).
+    ownership: Arc<crate::ownership::OwnershipRegistry>,
     /// Role-specific policies resolved by the engine for delegated executors.
     /// Direct library users fall back to the parent's settings, with writes
     /// serialized, so the safety invariant does not depend on the app layer.
@@ -960,6 +986,11 @@ impl Executor {
         model: ModelRef,
         max_rounds: u32,
     ) -> Self {
+        // Ownership exclusivity must follow the workspace volume's real path
+        // identity, not a platform guess: a case-folding volume makes
+        // `src/Parser.rs` and `src/parser.rs` one file, and treating them as
+        // two hands both children "exclusive" ownership of the same bytes.
+        let case_insensitive = tool_context.execution.workspace.path_case_insensitive();
         Self {
             base_instructions: None,
             commit_co_author: true,
@@ -983,6 +1014,7 @@ impl Executor {
             depth: 0,
             agent_role: AgentRole::Default,
             write_allowlist: None,
+            ownership: Arc::new(crate::ownership::OwnershipRegistry::new(case_insensitive)),
             sub_agent_policies: None,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
@@ -1111,9 +1143,96 @@ impl Executor {
 
     /// Restrict edits (`apply_patch`/`replace`) to these paths (files or
     /// directory prefixes). Enforced BEFORE the tool runs; `None` = unrestricted.
+    /// The write authority actually in force for THIS executor right now.
+    /// `None` = unrestricted (the top-level agent / orchestrated hosts without
+    /// a static allowlist). For a spawned child the answer is the live
+    /// ownership registry: everything it has claimed (a legacy Worker's
+    /// `files` arrive there as a pre-claim), which is EMPTY before its first
+    /// grant — so every mutation is refused until it claims.
+    pub(crate) fn effective_write_allowlist(&self) -> Option<Vec<String>> {
+        if crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only {
+            // Structurally read-only: no write tools exist; an empty list is
+            // a consistent answer for the command pipeline.
+            return Some(Vec::new());
+        }
+        // Any executor stamped with a delegated identity is governed by the
+        // registry, even if depth were wrongly left at 0. The parent has no
+        // agent_id and stays unrestricted except for others' claims.
+        if let Some(id) = &self.agent_id {
+            return Some(self.ownership.owned_by(id));
+        }
+        if self.depth > 0 {
+            // Fail closed: a child factory that forgot `with_agent_id` must
+            // not become a full-workspace writer.
+            return Some(Vec::new());
+        }
+        self.write_allowlist.clone()
+    }
+
     pub fn with_write_allowlist(mut self, paths: Option<Vec<String>>) -> Self {
         self.write_allowlist = paths.filter(|p| !p.is_empty());
         self
+    }
+
+    /// `Some(msg)` when a DELEGATED agent asks for a tool whose workspace
+    /// effect the ownership model cannot bound.
+    ///
+    /// An MCP tool is a JSON-RPC proxy to a separate process that CodeLeveler
+    /// launches with no sandbox, no workspace path preflight and no
+    /// checkpoint, and `McpTool::execute` discards its `ToolContext`. So a
+    /// claimed scope does not constrain it — admitting it through the
+    /// ownership fence would assert a safety property that does not hold.
+    /// It also declares no `mutates_files()`, which is the predicate all
+    /// three fences key on, so today it passes every one of them untouched.
+    ///
+    /// Depth 0 is the user's own agent and keeps MCP, gated by approval.
+    pub(crate) fn refuse_unboundable_delegated_tool(
+        &self,
+        call: &leveler_model::ToolCall,
+    ) -> Option<String> {
+        let delegated = self.depth > 0 || self.agent_id.is_some();
+        (delegated && call.name.starts_with("mcp__")).then(|| {
+            format!(
+                "{} is unavailable to a delegated agent: an MCP server runs outside \
+                 the workspace sandbox and outside any claimed write scope, so its \
+                 effect cannot be bounded to yours. Report what you need in your \
+                 result and let the main agent run it.",
+                call.name
+            )
+        })
+    }
+
+    /// `Some(msg)` when this mutating call is not allowed under live write
+    /// authority. An empty claimed set is zero authority: refuse even if the
+    /// patch parser cannot name the target files.
+    pub(crate) fn refuse_unscoped_mutation(
+        &self,
+        call: &leveler_model::ToolCall,
+    ) -> Option<String> {
+        if !self.registry.mutates_files(&call.name) {
+            return None;
+        }
+        match self.effective_write_allowlist() {
+            Some(allow) if allow.is_empty() => Some(
+                "Edit rejected: no write scope is currently owned. Read the relevant \
+                 code, then use claim_write_scope(paths) before modifying files."
+                    .to_string(),
+            ),
+            Some(allow) => {
+                let outside = crate::authorization::write_targets_outside_allowlist(call, &allow);
+                if outside.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "Edit rejected: {} is outside your claimed scope ({}). \
+                         Claim it with claim_write_scope first, or stay within your scope.",
+                        outside.join(", "),
+                        allow.join(", ")
+                    ))
+                }
+            }
+            None => None,
+        }
     }
 
     /// Enable goal mode: require an explicit `update_goal(complete|blocked)` to
@@ -1172,7 +1291,10 @@ impl Executor {
         let registry = if profile.read_only {
             Arc::new(self.registry.read_only_subset())
         } else {
-            self.registry.clone()
+            // A writer child keeps the full toolset EXCEPT MCP proxies, whose
+            // effect lands in a separate unsandboxed process that no claimed
+            // scope can bound (see `refuse_unboundable_delegated_tool`).
+            Arc::new(self.registry.without_mcp_tools())
         };
         let write_allowlist = (!profile.read_only && !files.is_empty()).then_some(files);
         let child_policy = self.sub_agent_policies.map_or(
@@ -1244,6 +1366,9 @@ impl Executor {
                 max_total_agents: self.policy.max_total_agents,
                 // Children never advertise spawn_agent (depth already blocks it).
                 allow_delegation: false,
+                // Irrelevant for a child (no offer is ever raised), carried so
+                // the field stays a single source of truth.
+                delegation_timing: self.policy.delegation_timing,
                 // A sub-agent finishes when it goes quiet; only the top-level
                 // run uses explicit goal resolution.
                 goal_mode: false,
@@ -1255,6 +1380,7 @@ impl Executor {
             depth: self.depth + 1,
             agent_role: role,
             write_allowlist,
+            ownership: self.ownership.clone(),
             sub_agent_policies: self.sub_agent_policies,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
@@ -1294,6 +1420,13 @@ impl Executor {
     /// Product kill-switch: when false, `spawn_agent` is not in the tool list.
     pub fn with_delegation(mut self, allow: bool) -> Self {
         self.policy.allow_delegation = allow;
+        self
+    }
+
+    /// H-C experiment: when the keep-vs-delegate surface is raised. Leaving
+    /// this unset keeps the shipped `PlanRegistration` behaviour.
+    pub fn with_delegation_timing(mut self, timing: crate::sub_agent::DelegationTiming) -> Self {
+        self.policy.delegation_timing = timing;
         self
     }
 
@@ -1675,6 +1808,139 @@ impl Executor {
             .unwrap_or_else(|| ObjectiveAnchor::from_user_message(first_user_text(&prior)));
         self.drive(prior, objective, observer, sink, cancellation)
             .await
+    }
+}
+
+#[cfg(test)]
+mod ownership_authority_tests {
+    use super::*;
+
+    struct NullRuntime;
+
+    #[async_trait]
+    impl leveler_model::ModelRuntime for NullRuntime {
+        async fn generate(
+            &self,
+            _request: leveler_model::ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_model::ModelResponse, leveler_model::ModelError> {
+            unreachable!("write-authority resolution never queries the model")
+        }
+        async fn stream(
+            &self,
+            _request: leveler_model::ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_model::ModelEventStream, leveler_model::ModelError> {
+            unreachable!("write-authority resolution never queries the model")
+        }
+        async fn profile(
+            &self,
+            _model: &leveler_model::ModelRef,
+        ) -> Result<leveler_model::ModelProfile, leveler_model::ModelError> {
+            unreachable!("write-authority resolution never queries the model")
+        }
+    }
+
+    fn executor() -> Executor {
+        let dir = std::env::temp_dir().join(format!("leveler-lbo-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Executor::new(
+            Arc::new(NullRuntime),
+            Arc::new(leveler_tools::default_registry()),
+            ToolContext::new(
+                leveler_execution::Workspace::new(&dir).unwrap(),
+                leveler_execution::PermissionProfile::Assisted,
+            ),
+            leveler_model::ModelRef::new("mock", "m"),
+            4,
+        )
+    }
+
+    /// The write-authority fallback is the dangerous edge: `effective_write_
+    /// allowlist` returns the STATIC list when `agent_id` is None, and a
+    /// static None means UNRESTRICTED. Every child construction path stamps an
+    /// id (`sub_agent_run_future` → `with_agent_id`), so a child can never
+    /// reach that branch — this pins both halves.
+    #[test]
+    fn a_child_without_a_claim_has_an_empty_write_authority() {
+        let parent = executor();
+        // Parent (depth 0): unrestricted unless a host pinned an allowlist.
+        assert_eq!(parent.effective_write_allowlist(), None);
+
+        // Identity, not depth, is the authority gate: a delegated id at
+        // depth 0 (should not happen) still holds no write authority.
+        let mis_depth = executor().with_agent_id("orphan-depth0");
+        assert_eq!(
+            mis_depth.effective_write_allowlist(),
+            Some(Vec::new()),
+            "agent_id without a claim is never unrestricted"
+        );
+
+        // A child WITH an id (the only shape the runtime builds) starts empty.
+        let child = parent
+            .child_for_role_on(AgentRole::Default, Vec::new(), None)
+            .with_agent_id("child-1");
+        assert_eq!(
+            child.effective_write_allowlist(),
+            Some(Vec::new()),
+            "an unclaimed child must hold NO write authority"
+        );
+
+        // After a claim in the SHARED registry, the authority is exactly it.
+        child
+            .ownership
+            .try_claim("child-1", &["src/a.rs".to_string()])
+            .unwrap();
+        assert_eq!(
+            child.effective_write_allowlist(),
+            Some(vec!["src/a.rs".to_string()])
+        );
+        // …and the parent sees the same truth (one registry, shared).
+        assert_eq!(
+            parent.ownership.owned_by("child-1"),
+            vec!["src/a.rs".to_string()]
+        );
+    }
+
+    /// A read-only role holds no authority regardless of registry state.
+    #[test]
+    fn a_read_only_child_never_gains_write_authority() {
+        let parent = executor();
+        for role in [AgentRole::Explorer, AgentRole::Reviewer] {
+            let child = parent
+                .child_for_role_on(role, Vec::new(), None)
+                .with_agent_id("ro-1");
+            child
+                .ownership
+                .try_claim("ro-1", &["src/a.rs".to_string()])
+                .unwrap();
+            assert_eq!(
+                child.effective_write_allowlist(),
+                Some(Vec::new()),
+                "{role:?} must stay write-less"
+            );
+            child.ownership.release_all("ro-1");
+        }
+    }
+
+    #[test]
+    fn empty_authority_refuses_a_mutating_call_even_without_parseable_targets() {
+        use leveler_core::ToolCallId;
+        use leveler_model::ToolCall;
+        let child = executor()
+            .child_for_role_on(AgentRole::Default, Vec::new(), None)
+            .with_agent_id("child-1");
+        let call = ToolCall {
+            id: ToolCallId::new("c1"),
+            name: "apply_patch".into(),
+            // Not a string — drive used to skip the fence when it could not
+            // name target files. Empty authority must still refuse.
+            arguments: serde_json::json!({ "patch": ["not", "a", "string"] }),
+        };
+        let msg = child
+            .refuse_unscoped_mutation(&call)
+            .expect("empty authority must refuse");
+        assert!(msg.contains("no write scope"), "{msg}");
     }
 }
 

@@ -76,6 +76,71 @@ pub struct Workspace {
     root_dir: std::sync::Arc<cap_std::fs::Dir>,
     /// Extra trees allowed for [`PathAccess::Read`] only (canonicalized).
     readonly_roots: Vec<PathBuf>,
+    /// Whether this root's filesystem treats `Foo.rs` and `foo.rs` as ONE
+    /// file. Probed once when the workspace opens (see
+    /// [`detect_case_insensitive`]) because it is a property of the volume,
+    /// not of the platform: macOS ships case-insensitive APFS by default but
+    /// case-sensitive volumes are supported, and a Linux root can sit on a
+    /// case-insensitive mount.
+    case_insensitive: bool,
+}
+
+/// Probe the root's actual case semantics WITHOUT writing to the user's
+/// workspace: take an existing entry whose name has letters, flip its case,
+/// and ask the filesystem whether that resolves to the same file.
+///
+/// Unknown (empty root, no letters in any name, unreadable) answers `true`.
+/// That is the conservative direction for the one caller that matters —
+/// ownership treats the spellings as the same file and DENIES the second
+/// claim, which costs a false denial rather than handing two owners the same
+/// bytes.
+fn detect_case_insensitive(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let flipped: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
+            .collect();
+        if flipped == name {
+            continue; // no letters to flip — tells us nothing
+        }
+        let (original, alternate) = (root.join(name), root.join(&flipped));
+        return match (
+            std::fs::symlink_metadata(&original),
+            std::fs::symlink_metadata(&alternate),
+        ) {
+            // Both spellings resolve: the same file means the volume folds
+            // case; two different files mean it does not (a case-sensitive
+            // root legitimately holding both `README` and `readme`).
+            (Ok(a), Ok(b)) => same_file(&a, &b),
+            // The flipped spelling does not exist: case-sensitive.
+            (Ok(_), Err(_)) => false,
+            _ => true,
+        };
+    }
+    true
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    // Windows resolves a flipped spelling only when the volume folds case.
+    true
 }
 
 impl Workspace {
@@ -104,6 +169,7 @@ impl Workspace {
         #[cfg(windows)]
         let root_dir = cap_std::fs::Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())
             .map_err(|_| WorkspaceError::Root(root.display().to_string()))?;
+        let case_insensitive = detect_case_insensitive(&canonical);
         Ok(Self {
             root: canonical,
             #[cfg(unix)]
@@ -111,7 +177,15 @@ impl Workspace {
             #[cfg(windows)]
             root_dir: std::sync::Arc::new(root_dir),
             readonly_roots: Vec::new(),
+            case_insensitive,
         })
+    }
+
+    /// Whether this workspace's volume treats two spellings that differ only
+    /// in case as the SAME file. Fixed when the workspace opens. Write
+    /// ownership uses it so exclusivity follows the file, not the spelling.
+    pub fn path_case_insensitive(&self) -> bool {
+        self.case_insensitive
     }
 
     /// Add directories that may be **read** via absolute paths (or paths under
@@ -564,5 +638,48 @@ mod tests {
         std::fs::remove_file(dir.join("src")).ok();
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The probe must report what the VOLUME actually does, not what the
+    /// platform usually does — ownership exclusivity is decided by it, and a
+    /// wrong answer either hands two owners one file or falsely denies a
+    /// legitimate claim. Checked against the filesystem's own behaviour so the
+    /// test is right on a case-sensitive macOS volume too.
+    #[test]
+    fn case_semantics_match_what_the_filesystem_actually_does() {
+        let dir = std::env::temp_dir().join(format!("leveler-ws-case-{}", ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Probe.txt"), "x").unwrap();
+        let truth = std::fs::metadata(dir.join("probe.txt")).is_ok();
+        let ws = Workspace::new(&dir).unwrap();
+        assert_eq!(
+            ws.path_case_insensitive(),
+            truth,
+            "probe disagreed with the filesystem at {}",
+            dir.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A root holding BOTH spellings as distinct files is the case a naive
+    /// "flipped name resolves" probe gets backwards: the alternate spelling
+    /// does resolve, but to a different inode.
+    #[test]
+    fn two_distinct_spellings_are_not_read_as_case_folding() {
+        let dir = std::env::temp_dir().join(format!("leveler-ws-case2-{}", ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Probe.txt"), "upper").unwrap();
+        let distinct = std::fs::write(dir.join("probe.txt"), "lower").is_ok()
+            && std::fs::read_to_string(dir.join("Probe.txt")).unwrap() == "upper";
+        let ws = Workspace::new(&dir).unwrap();
+        if distinct {
+            assert!(
+                !ws.path_case_insensitive(),
+                "two distinct files with the same folded name means the volume is case-sensitive"
+            );
+        } else {
+            assert!(ws.path_case_insensitive());
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

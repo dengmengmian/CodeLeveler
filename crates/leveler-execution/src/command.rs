@@ -64,6 +64,14 @@ pub struct ProcessRequest {
     /// an edit outside the repo at the OS level; `None` applies no write
     /// confinement (full-access / legacy).
     pub write_root: Option<PathBuf>,
+    /// Pre-claim child semantics: run the process, but make the WORKSPACE
+    /// read-only at the OS boundary (scratch and toolchain caches stay
+    /// writable so builds still work). A child that owns no write scope can
+    /// therefore observe the repository — the thing it must do before it can
+    /// know what to claim — while every workspace mutation fails in the
+    /// kernel, whatever program attempts it. This replaces guessing which
+    /// commands are "read-only": the boundary is the effect, not the intent.
+    pub read_only_workspace: bool,
     /// Extra project trees for host-side absolute-arg preflight (e.g.
     /// `--readonly-root`). OS sandbox reads are unrestricted;
     /// writes still use [`Self::write_root`] + toolchain caches.
@@ -98,6 +106,7 @@ impl ProcessRequest {
             timeout: Duration::from_secs(600),
             deny_network: false,
             write_root: None,
+            read_only_workspace: false,
             extra_read_roots: Vec::new(),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             deny_env: Vec::new(),
@@ -237,8 +246,35 @@ pub(crate) fn sandbox_command(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
+    sandbox_command_read_only(
+        program,
+        args,
+        deny_network,
+        write_root,
+        extra_read_roots,
+        scratch_root,
+        cache_write_roots,
+        false,
+    )
+}
+
+/// [`sandbox_command`] with the pre-claim read-only-workspace switch: when
+/// `read_only_workspace` is set the workspace root is NOT a writable root, so
+/// the process runs and reads normally while every workspace mutation fails
+/// in the kernel. Scratch and toolchain caches stay writable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sandbox_command_read_only(
+    program: &str,
+    args: &[String],
+    deny_network: bool,
+    write_root: Option<&Path>,
+    extra_read_roots: &[PathBuf],
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
+    read_only_workspace: bool,
+) -> (String, Vec<String>) {
     let denials = configured_read_denials();
-    sandbox_command_with_read_denials(
+    sandbox_command_with_read_denials_ro(
         program,
         args,
         deny_network,
@@ -247,10 +283,14 @@ pub(crate) fn sandbox_command(
         scratch_root,
         cache_write_roots,
         &denials,
+        read_only_workspace,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Test-facing entry: the production callers all go through
+/// [`sandbox_command_read_only`], which carries the pre-claim switch.
+#[cfg(test)]
 pub(crate) fn sandbox_command_with_read_denials(
     program: &str,
     args: &[String],
@@ -260,6 +300,31 @@ pub(crate) fn sandbox_command_with_read_denials(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
     read_denied_roots: &[PathBuf],
+) -> (String, Vec<String>) {
+    sandbox_command_with_read_denials_ro(
+        program,
+        args,
+        deny_network,
+        write_root,
+        extra_read_roots,
+        scratch_root,
+        cache_write_roots,
+        read_denied_roots,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sandbox_command_with_read_denials_ro(
+    program: &str,
+    args: &[String],
+    deny_network: bool,
+    write_root: Option<&Path>,
+    extra_read_roots: &[PathBuf],
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
+    read_denied_roots: &[PathBuf],
+    read_only_workspace: bool,
 ) -> (String, Vec<String>) {
     // Defense in depth. Without confinement to apply this would normally run
     // the command bare — but once a harness has sealed host roots, "no
@@ -279,6 +344,7 @@ pub(crate) fn sandbox_command_with_read_denials(
             extra_read_roots,
             scratch_root,
             cache_write_roots,
+            read_only_workspace,
         )
     }
     #[cfg(target_os = "linux")]
@@ -291,6 +357,7 @@ pub(crate) fn sandbox_command_with_read_denials(
             write_root,
             scratch_root,
             cache_write_roots,
+            read_only_workspace,
         )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -322,6 +389,7 @@ fn macos_sandbox_command(
     extra_read_roots: &[PathBuf],
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
+    read_only_workspace: bool,
 ) -> (String, Vec<String>) {
     let Some(root) = write_root else {
         // No write confinement (full-access dropping only the network): keep the
@@ -349,7 +417,14 @@ fn macos_sandbox_command(
     // `extra_read_roots` is reserved for future write/read carve-outs; write
     // roots already include toolchain trees.
     let _ = extra_read_roots;
-    let write_roots = writable_roots(root, scratch_root, cache_write_roots);
+    // Pre-claim: the workspace is NOT writable; scratch and toolchain caches
+    // still are, so a build/test can run while every repository mutation
+    // fails in the kernel regardless of which program attempts it.
+    let write_roots = if read_only_workspace {
+        writable_roots_without_workspace(scratch_root, cache_write_roots)
+    } else {
+        writable_roots(root, scratch_root, cache_write_roots)
+    };
     let protected = git_write_protected_paths(root);
     let mut policy = String::from(SEATBELT_BASE);
     policy.push_str("\n; unrestricted file reads, writes limited to approved roots\n");
@@ -365,6 +440,24 @@ fn macos_sandbox_command(
         policy.push_str(&format!(
             "(deny file-read* (subpath (param \"READ_DENIED_{i}\")) (literal (param \"READ_DENIED_{i}\")))\n"
         ));
+    }
+    // A confined command must be able to READ every root it may WRITE. A
+    // harness seal can overlap them — an eval launched with LEVELER_HOME
+    // under its (sealed) cwd puts the Leveler tool cache Go/npm/pip are
+    // redirected into inside a read-denied subtree, and the toolchain dies on
+    // stat ("could not create module cache: … operation not permitted",
+    // FA-2/ORC-B1 environment failure). Re-allow AFTER the denials so the
+    // last-match rule restores exactly the writable roots: the workspace, the
+    // per-command scratch, and the Leveler-owned caches. Answer keys never
+    // live in a writable root (cases/fixtures sit beside them in the sealed
+    // tree; projects_dir/config are sealed explicitly), so the seal holds.
+    // Guarded so the profile stays byte-identical when nothing is sealed.
+    if !read_denied_roots.is_empty() {
+        for i in 0..write_roots.len() {
+            policy.push_str(&format!(
+                "(allow file-read* (subpath (param \"WRITABLE_ROOT_{i}\")))\n"
+            ));
+        }
     }
     policy.push_str("(allow file-write*");
     for i in 0..write_roots.len() {
@@ -424,6 +517,32 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 /// In particular, never add a shared temp directory or a whole user directory
 /// here. Both allow a confined command to tamper with files consumed by other
 /// host processes and turn a cache compatibility allowance into persistence.
+/// Writable roots for a pre-claim (read-only-workspace) process: scratch and
+/// toolchain caches only — deliberately never the workspace itself.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn writable_roots_without_workspace(
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut add = |p: PathBuf| {
+        if !p.is_dir() {
+            return;
+        }
+        let real = p.canonicalize().unwrap_or(p);
+        if !roots.contains(&real) {
+            roots.push(real);
+        }
+    };
+    if let Some(scratch_root) = scratch_root {
+        add(scratch_root.to_path_buf());
+    }
+    for cache_root in cache_write_roots {
+        add(cache_root.clone());
+    }
+    roots
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn writable_roots(
     root: &Path,
@@ -617,6 +736,7 @@ fn linux_sandbox_command(
     write_root: Option<&Path>,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
+    read_only_workspace: bool,
 ) -> (String, Vec<String>) {
     let Some(root) = write_root else {
         // No write confinement (full-access): only optionally drop the network,
@@ -633,7 +753,14 @@ fn linux_sandbox_command(
         }
         return (program.to_string(), args.to_vec());
     };
-    let roots = writable_roots(root, scratch_root, cache_write_roots);
+    // Pre-claim: bwrap binds `/` read-only and then re-binds each writable
+    // root rw — omitting the workspace leaves it read-only while scratch and
+    // toolchain caches stay usable.
+    let roots = if read_only_workspace {
+        writable_roots_without_workspace(scratch_root, cache_write_roots)
+    } else {
+        writable_roots(root, scratch_root, cache_write_roots)
+    };
     let protected = git_write_protected_paths(root);
     (
         "bwrap".to_string(),
@@ -852,7 +979,7 @@ impl CommandRunner {
             .unwrap_or(&[]);
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let sandbox_cache_write_roots: &[PathBuf] = &[];
-        let (program, args) = sandbox_command(
+        let (program, args) = sandbox_command_read_only(
             &request.program,
             &request.args,
             request.deny_network,
@@ -860,6 +987,7 @@ impl CommandRunner {
             &request.extra_read_roots,
             sandbox_scratch_root,
             sandbox_cache_write_roots,
+            request.read_only_workspace,
         );
 
         #[cfg(windows)]
@@ -2935,6 +3063,128 @@ mod tests {
         );
     }
 
+    /// Eval Go-sandbox repair: a harness seal may overlap the roots the
+    /// sandbox itself made writable (the eval cwd containing LEVELER_HOME —
+    /// so the Leveler tool cache Go is redirected into). A confined command
+    /// must be able to READ every root it may WRITE, so the profile must
+    /// re-allow reads on the writable roots AFTER the denial block (SBPL:
+    /// last matching rule wins). Answer keys never live in a writable root.
+    #[test]
+    fn read_denials_do_not_swallow_the_sandboxes_own_writable_roots() {
+        let base = tempfile::tempdir().expect("base");
+        let workspace = base.path().join("ws");
+        let sealed = base.path().join("gate");
+        let cache = sealed.join("home/cache/tools/x/go/mod");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (_, args) = sandbox_command_with_read_denials(
+            "go",
+            &["build".into()],
+            true,
+            Some(&workspace),
+            &[],
+            Some(scratch.path()),
+            std::slice::from_ref(&cache),
+            std::slice::from_ref(&sealed.to_path_buf()),
+        );
+        let policy = &args[1];
+        let deny_at = policy
+            .find("(deny file-read* (subpath (param \"READ_DENIED_0\"))")
+            .expect("seal emitted");
+        let reallow_at = policy
+            .find("(allow file-read* (subpath (param \"WRITABLE_ROOT_")
+            .expect("writable roots must be re-allowed for reads when a seal is declared");
+        assert!(
+            reallow_at > deny_at,
+            "the re-allow only wins if it comes after the deny in SBPL: {policy}"
+        );
+    }
+
+    /// The kernel-level proof of the same repair: with a seal covering the
+    /// directory that CONTAINS the redirected Go caches (the FA-2/ORC-B1
+    /// environment shape), a confined `go build` must still work. Runs real
+    /// `sandbox-exec` + real `go`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_sealed_harness_root_does_not_break_the_confined_go_toolchain() {
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: go is not installed");
+            return;
+        }
+        let base = tempfile::tempdir().expect("base");
+        let base_path = base.path().canonicalize().unwrap();
+        // The sealed "gate" dir contains the leveler-home-shaped cache tree,
+        // exactly like an eval launched with LEVELER_HOME under its cwd.
+        let sealed = base_path.join("gate");
+        let go_cache = sealed.join("home/cache/tools/k/go/build");
+        let go_mod = sealed.join("home/cache/tools/k/go/mod");
+        std::fs::create_dir_all(&go_cache).unwrap();
+        std::fs::create_dir_all(&go_mod).unwrap();
+        let workspace = base_path.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("go.mod"), "module sealed-smoke\n\ngo 1.22\n").unwrap();
+        std::fs::write(workspace.join("main.go"), "package main\nfunc main() {}\n").unwrap();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let tmp = scratch.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cache_roots = vec![go_cache.clone(), go_mod.clone()];
+        let (program, args) = sandbox_command_with_read_denials(
+            "go",
+            &["build".into(), "./...".into()],
+            true,
+            Some(&workspace),
+            &[],
+            Some(scratch.path()),
+            &cache_roots,
+            std::slice::from_ref(&sealed),
+        );
+        let output = std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&workspace)
+            .env("GOCACHE", &go_cache)
+            .env("GOMODCACHE", &go_mod)
+            .env("GOPATH", scratch.path().join("gopath"))
+            .env("TMPDIR", &tmp)
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOPROXY", "off")
+            .output()
+            .expect("spawn sandbox-exec go");
+        assert!(
+            output.status.success(),
+            "confined go build must survive a seal overlapping its caches:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // And the seal still holds for non-writable content beside the caches.
+        let key = sealed.join("case.yaml");
+        std::fs::write(&key, "answer").unwrap();
+        let (program, args) = sandbox_command_with_read_denials(
+            "cat",
+            &[key.display().to_string()],
+            true,
+            Some(&workspace),
+            &[],
+            Some(scratch.path()),
+            &cache_roots,
+            std::slice::from_ref(&sealed),
+        );
+        let output = std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&workspace)
+            .output()
+            .expect("spawn sandbox-exec cat");
+        assert!(
+            !output.status.success(),
+            "the answer-key seal must still hold outside the writable roots: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     /// Without declared denials the profile is byte-for-byte what it was:
     /// production reads stay unrestricted, and this change is inert there.
     #[test]
@@ -3199,6 +3449,102 @@ mod tests {
             .position(|a| a == "--")
             .expect("has -- separator");
         assert_eq!(args[sep + 1], "touch");
+    }
+
+    /// Pre-claim child semantics: the process RUNS (observation is the whole
+    /// point of exploring before claiming a scope) but the workspace is
+    /// read-only at the OS boundary — so `rmdir`, shell redirection and a
+    /// scripting language all fail the same way, and no runtime has to guess
+    /// which commands are "read-only". Scratch/toolchain caches stay writable
+    /// so builds can still run.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_read_only_workspace_command_can_observe_but_not_write() {
+        let base = tempfile::tempdir().expect("base");
+        let ws = base.path().join("ws");
+        std::fs::create_dir_all(ws.join("victim")).unwrap();
+        std::fs::write(ws.join("keep.txt"), "original\n").unwrap();
+        let ws = ws.canonicalize().unwrap();
+        let runner = unix_host_runner();
+
+        let read_only = |program: &str, args: Vec<String>| {
+            let mut req = ProcessRequest::new(program, args, ws.clone());
+            req.write_root = Some(ws.clone());
+            req.read_only_workspace = true;
+            req
+        };
+
+        // RO1/RO2: observation works.
+        let out = runner
+            .run(
+                read_only("sh", vec!["-c".into(), "ls && cat keep.txt".into()]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.success() && out.stdout.contains("original"),
+            "a pre-claim child must still be able to observe: {out:?}"
+        );
+
+        // RO3: the PB_B mutation class — git cannot see it, so the OS must.
+        let out = runner
+            .run(
+                read_only("sh", vec!["-c".into(), "rmdir victim".into()]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            ws.join("victim").is_dir(),
+            "rmdir must fail with a read-only workspace: {out:?}"
+        );
+
+        // RO4: shell redirection.
+        let out = runner
+            .run(
+                read_only("sh", vec!["-c".into(), "echo x > new.txt".into()]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !ws.join("new.txt").exists(),
+            "redirection must not create files: {out:?}"
+        );
+
+        // RO4b: overwriting an existing file.
+        let _ = runner
+            .run(
+                read_only("sh", vec!["-c".into(), "echo tampered > keep.txt".into()]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("keep.txt")).unwrap(),
+            "original\n",
+            "an existing workspace file must not be rewritten"
+        );
+
+        // RO6: scratch/temp stays writable so toolchains keep working.
+        let out = runner
+            .run(
+                read_only(
+                    "sh",
+                    vec![
+                        "-c".into(),
+                        "echo ok > \"$TMPDIR/probe\" && cat \"$TMPDIR/probe\"".into(),
+                    ],
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.success() && out.stdout.contains("ok"),
+            "the private scratch must stay writable: {out:?}"
+        );
     }
 
     // The real proof: a sandboxed process may write inside the workspace but not

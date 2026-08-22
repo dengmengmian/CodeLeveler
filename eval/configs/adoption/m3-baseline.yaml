@@ -1,0 +1,26 @@
+# M-3 baseline: product default, task-shape experiment, no prompt change.
+# Observer only. Does not change spawn/claim/ownership/settlement.
+suite: adoption
+experiment: m3-baseline
+description: "M-3 baseline — model-initiated delegation on the 15-task micro set"
+model: deepseek-v4-flash
+provider: deepseek
+binary: leveler
+tasks: []
+shape: null
+runs: 1
+timeout_seconds: 1200
+arm: control
+population: model_initiated_only
+exclude:
+  - scripted_spawn
+  - safety_probe
+  - forced_workflow
+changes_runtime: false
+metrics:
+  - adoption_rate
+  - spawn_statistics
+  - decision_latency
+  - wilson90
+  - verifier
+output: eval/reports/adoption/m3-baseline

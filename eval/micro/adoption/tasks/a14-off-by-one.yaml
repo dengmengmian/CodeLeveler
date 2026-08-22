@@ -1,0 +1,35 @@
+id: a14-off-by-one
+name: "One off-by-one in one function"
+max_rounds: 12
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub fn nth(values: &[i32], i: usize) -> Option<i32> {
+        if i <= values.len() {
+            Some(values[i])
+        } else {
+            None
+        }
+    }
+  tests/spec.rs: |
+    use evalcase::nth;
+    #[test]
+    fn last_is_some() {
+        assert_eq!(nth(&[1, 2], 1), Some(2));
+    }
+    #[test]
+    fn past_end_is_none() {
+        assert_eq!(nth(&[1, 2], 2), None);
+    }
+task: |
+  Fix nth so index equal to len is None and does not panic. Keep the change
+  in src/lib.rs. Do not edit tests.
+expect:
+  program: "true"
+  args: []

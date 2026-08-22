@@ -7150,3 +7150,220 @@ async fn headless_denial_is_not_labeled_as_user_refusal() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Engagement guard (NEVER_ENGAGED_EXPLORATION_SPIRAL).
+///
+/// Eight recorded qualified orchestration runs spent their whole turn budget on
+/// successful, novel observation and produced ZERO material progress — no plan,
+/// no mutation, no passing verification — with `cumulative_modified_files: 0`
+/// and `closeout_deny_rounds: 0` at the ceiling. Neither existing streak can see
+/// it: `round_verdict::classify` grades a round with a successful non-observe
+/// call as `Progress`, and `made_progress` accepts a command that merely exited
+/// 0. Both are correct for what they measure and must not change (dropping the
+/// command term force-stops healthy runs at round ~5).
+///
+/// What was missing is upstream of both: across 100 rounds the model is never
+/// told it has written nothing. This pins that one factual advisory.
+#[tokio::test]
+async fn a_run_that_only_observes_is_told_it_has_made_no_material_progress() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-engagement-advisory-{}",
+        std::process::id() as u64 * 41 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Distinct files so every read is NOVEL: this is exploration the product
+    // deliberately allows (R007 F1), not loop-guard thrash.
+    for i in 0..60 {
+        std::fs::write(
+            dir.join(format!("f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let mut script: Vec<ModelResponse> = (0..50)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({ "path": format!("f{i}.rs") }),
+            )
+        })
+        .collect();
+    script.push(assistant_text("done"));
+
+    let runtime = Arc::new(MockRuntime::new(script));
+    Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        60,
+    )
+    .run(
+        "add six new verbs to this tool",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let requests = runtime.recorded_requests();
+    let advisory_seen = requests.iter().any(|r| {
+        r.messages
+            .iter()
+            .any(|m| m.text_content().contains("no edit has been applied"))
+    });
+    assert!(
+        advisory_seen,
+        "after 45+ rounds with zero material progress the model must be told so; \
+         it explored {} rounds and was never informed",
+        requests.len()
+    );
+}
+
+/// The advisory must not reach a run that is working. A single successful edit
+/// is material progress, so the counter never reaches the threshold — this is
+/// the guard against turning a factual note into a nag.
+#[tokio::test]
+async fn a_run_that_edits_never_sees_the_engagement_advisory() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-engagement-quiet-{}",
+        std::process::id() as u64 * 43 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..60 {
+        std::fs::write(
+            dir.join(format!("g{i}.rs")),
+            format!("pub fn g{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let mut script: Vec<ModelResponse> = vec![assistant_tool_call(
+        "edit",
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: g0.rs\n@@\n-pub fn g0() {}\n+pub fn g0() { let _ = 1; }\n*** End Patch\n"
+        }),
+    )];
+    script.extend((0..50).map(|i| {
+        assistant_tool_call(
+            &format!("r{i}"),
+            "read_file",
+            serde_json::json!({ "path": format!("g{i}.rs") }),
+        )
+    }));
+    script.push(assistant_text("done"));
+
+    let runtime = Arc::new(MockRuntime::new(script));
+    Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        60,
+    )
+    .run(
+        "add six new verbs to this tool",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let advisory_seen = runtime.recorded_requests().iter().any(|r| {
+        r.messages
+            .iter()
+            .any(|m| m.text_content().contains("no edit has been applied"))
+    });
+    assert!(
+        !advisory_seen,
+        "a run that landed a real edit must never be told it made no progress"
+    );
+}
+
+/// Byproduct files must not silence the engagement advisory.
+///
+/// `CTL_LONG_B_ORCH_3` (same-day control, `ec39621a`) ran 139 tool calls across
+/// 99 rounds, registered no plan, applied no edit, and produced nothing — yet
+/// its ledger reports `cumulative_modified_files: 2`, both of them shell
+/// byproducts: `docs/src/reference-verbs.md.bak` and `.tmp`. Workspace diffing
+/// cannot tell an intended edit from a sed-in-place leftover.
+///
+/// The first version of this advisory latched material progress on that ledger
+/// count, so the very run that proves the spiral still exists would have been
+/// silenced by its own `.bak` file. The latch must key on a deliberate edit —
+/// a successful call to a tool the registry declares `mutates_files` — not on
+/// the workspace having changed. Filename heuristics are exactly what the
+/// original observe classifier got wrong, so none are used.
+#[tokio::test]
+async fn a_shell_byproduct_does_not_count_as_material_progress() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-engagement-byproduct-{}",
+        std::process::id() as u64 * 47 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..60 {
+        std::fs::write(
+            dir.join(format!("h{i}.rs")),
+            format!("pub fn h{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let workspace = Workspace::new(&dir).unwrap();
+    // FullAccess so the byproduct-producing command runs without an approval.
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+
+    // Round 1 leaves a .bak behind — exactly the CTL_LONG_B_ORCH_3 shape.
+    let mut script: Vec<ModelResponse> = vec![assistant_tool_call(
+        "bak",
+        "shell_command",
+        serde_json::json!({ "cmd": "cp h0.rs h0.rs.bak" }),
+    )];
+    script.extend((0..50).map(|i| {
+        assistant_tool_call(
+            &format!("r{i}"),
+            "read_file",
+            serde_json::json!({ "path": format!("h{i}.rs") }),
+        )
+    }));
+    script.push(assistant_text("done"));
+
+    let runtime = Arc::new(MockRuntime::new(script));
+    Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        60,
+    )
+    .run(
+        "add six new verbs to this tool",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let advisory_seen = runtime.recorded_requests().iter().any(|r| {
+        r.messages
+            .iter()
+            .any(|m| m.text_content().contains("no edit has been applied"))
+    });
+    assert!(
+        advisory_seen,
+        "a run whose only workspace change is a shell byproduct has produced \
+         nothing and must still be told so"
+    );
+}

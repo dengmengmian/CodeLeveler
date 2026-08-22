@@ -5,7 +5,9 @@
 import type { Dispatch } from 'react';
 import * as api from './api';
 import { formatClock, modelRefString } from './format';
+import { loadLastSession, saveLastSession } from './lastSession';
 import { getToken } from './token';
+import { shouldRefreshObservability } from './observabilityView';
 import { commandProgressLabel, turnEndFromEvent, turnProgressLabel } from './turn';
 import { deliverFrame, WsClient } from './ws';
 import type { Action, AppState } from '../state/store';
@@ -84,9 +86,24 @@ export class RuntimeBridge {
     }
   }
 
+  queryObservability(sessionId?: SessionId): void {
+    const id = sessionId ?? this.getState().current?.id;
+    if (!id) return;
+    const queryId = crypto.randomUUID();
+    this.dispatch({ type: 'observation_loading', queryId });
+    this.deliver({
+      type: 'query_observability',
+      session_id: id,
+      query_id: queryId,
+      before: 0,
+      after: 80,
+    });
+  }
+
   private applySnapshot(snap: UiSessionSnapshot, contextWindow?: number | null): void {
     const { current, draft } = this.getState();
-    // 广播流里可能夹带别会话的 session_opened/updated：只接收当前会话的整量；
+    const previousId = current?.id;
+    // 广播流里可能夹带别会话的 session_opened：只接收当前会话的整量；
     // 例外一是 selectSession 后等待目标会话 snapshot 的窗口期；
     // 例外二是 `/clear`：宿主刚建的新会话 id 与当前不同，正是要切过去的那个。
     if (current && current.id !== snap.id) {
@@ -103,8 +120,19 @@ export class RuntimeBridge {
     }
     this.pendingSessionId = null;
     this.dispatch({ type: 'snapshot', session: snap, contextWindow });
+    saveLastSession(snap.id);
+    if (previousId !== snap.id || this.getState().observation === null) {
+      this.queryObservability(snap.id);
+    }
     // 整量落地后若回合空闲，补发排队消息
     this.flushQueue();
+  }
+
+  /** SessionUpdated = TUI apply_meta. Same-session header only; never a full resync. */
+  private applySessionMeta(snap: UiSessionSnapshot): void {
+    const { current } = this.getState();
+    if (!current || current.id !== snap.id) return;
+    this.dispatch({ type: 'session_meta', session: snap });
   }
 
   private applyEvent(ev: RuntimeEvent): void {
@@ -112,10 +140,13 @@ export class RuntimeBridge {
     switch (ev.type) {
       case 'session_list':
         this.dispatch({ type: 'session_list', sessions: ev.sessions });
+        this.maybeRestoreLastSession();
         return;
       case 'session_opened':
-      case 'session_updated':
         this.applySnapshot(ev.session);
+        return;
+      case 'session_updated':
+        this.applySessionMeta(ev.session);
         return;
       case 'runtime_ready':
         this.requestSessionList();
@@ -306,10 +337,21 @@ export class RuntimeBridge {
           message: `上下文预算已扩张 ${ev.from_tokens} → ${ev.to_tokens} tokens`,
         });
         break;
+      case 'observability_loaded':
+        this.dispatch({
+          type: 'observation_loaded',
+          observation: ev.observation,
+          queryId: ev.query_id ?? null,
+        });
+        break;
       default:
         // user_shell_*（web 无 !command 入口，本期不渲染）/ project_rules_loaded /
         // 未知（更新的 runtime 新增的）事件：忽略不崩。
         break;
+    }
+
+    if (ev.type !== 'observability_loaded' && shouldRefreshObservability(ev)) {
+      this.queryObservability(current.id);
     }
 
     const end = turnEndFromEvent(ev);
@@ -345,12 +387,43 @@ export class RuntimeBridge {
     this.pendingSessionId = id;
     this.dispatch({ type: 'select_session', id });
     this.ws.setSession(id);
+    saveLastSession(id);
     // 让 runtime 把该会话 transcript 载入视图（网关也会主动推 snapshot，双保险）
     this.deliver({ type: 'open_session', session_id: id });
   }
 
   newDraft(project?: string): void {
-    this.dispatch({ type: 'new_draft', project: project ?? null });
+    const state = this.getState();
+    const path = project ?? state.selectedProject ?? (state.repository || null);
+    this.dispatch({ type: 'new_draft', project: path });
+    saveLastSession(null);
+    this.leaveSessionSubscription();
+  }
+
+  /** Refresh should reopen the conversation that was on screen, not the hero. */
+  private maybeRestoreLastSession(): void {
+    const state = this.getState();
+    if (!state.draft || state.current || this.pendingSessionId) return;
+    const last = loadLastSession();
+    if (!last) return;
+    if (!state.sessions.some((s) => s.id === last)) return;
+    this.selectSession(last);
+  }
+
+  selectProject(path: string): void {
+    const before = this.getState().current?.id ?? null;
+    this.dispatch({ type: 'select_project', path });
+    this.dispatch({ type: 'set_rail_nav', nav: 'sessions' });
+    if (before && this.getState().current?.id !== before) {
+      this.leaveSessionSubscription();
+    }
+  }
+
+  /** Stop receiving the previous session's subscribe_session stream. */
+  private leaveSessionSubscription(): void {
+    this.pendingSessionId = null;
+    this.awaitingNewSession = false;
+    this.ws.setSession(null);
   }
 
   // ── 多项目（聚合层）─────────────────────────────────────────────────
@@ -381,6 +454,7 @@ export class RuntimeBridge {
     try {
       await api.addProject(path);
       await this.refreshProjects();
+      this.dispatch({ type: 'select_project', path });
       this.requestSessionList();
       return true;
     } catch (err) {
@@ -430,6 +504,12 @@ export class RuntimeBridge {
     this.deliver({ type: 'archive_session', session_id: id });
     this.requestSessionList();
     this.notice('会话已归档');
+  }
+
+  deleteSession(id: SessionId): void {
+    this.deliver({ type: 'delete_session', session_id: id });
+    if (this.getState().current?.id === id) this.newDraft();
+    this.requestSessionList();
   }
 
   forkSession(id: SessionId): void {
@@ -485,7 +565,7 @@ export class RuntimeBridge {
           text,
           state.current?.model ?? null,
           state.current?.permission ?? 'assisted',
-          state.draftProject ?? undefined,
+          state.draftProject ?? state.selectedProject ?? undefined,
         );
         this.dispatch({
           type: 'snapshot',
@@ -648,6 +728,24 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return;
     this.deliver({ type: 'request_diff', session_id: current.id });
+  }
+
+  sendBtw(question: string): void {
+    const q = question.trim();
+    if (!q) return;
+    const current = this.getState().current;
+    if (!current) return;
+    this.deliver({ type: 'btw', session_id: current.id, question: q });
+  }
+
+  openChanges(): void {
+    this.requestDiff();
+    this.dispatch({ type: 'stage_view', view: 'diff' });
+  }
+
+  openMemory(): void {
+    this.listMemory();
+    this.dispatch({ type: 'set_inspector_more', open: true });
   }
 
   /** 仅从待发列表移除附件（服务端已注册的无法撤回） */

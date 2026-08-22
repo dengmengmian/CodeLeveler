@@ -746,6 +746,58 @@
       }
     },
     {
+      "description": "Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "after": {
+          "description": "Events at/after the center (capped by the runtime).",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "before": {
+          "description": "Events strictly before the center (capped by the runtime).",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "center_seq": {
+          "description": "Sequence to center the event window on. `None` = latest durable seq.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`]. Distinct from envelope `command_id` (delivery idempotency): this names the query so a client can ignore another client's (or its own stale) observatory response. Absent on protocol 1.5 peers. Not a session identity.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_observability"
+          ]
+        }
+      }
+    },
+    {
       "description": "The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command.",
       "type": "object",
       "required": [
@@ -846,6 +898,10 @@
     },
     "ClarificationId": {
       "description": "Identifies a pending clarification (ask-user) request.",
+      "type": "string"
+    },
+    "CommandId": {
+      "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
       "type": "string"
     },
     "ModelRef": {

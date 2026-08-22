@@ -1,0 +1,14 @@
+suite: capability
+experiment: smoke
+description: "Existing capability harness — evals/smoke via leveler eval run --cases"
+model: deepseek-v4-flash
+provider: deepseek
+binary: leveler
+cases: evals/smoke
+runs: 1
+timeout_seconds: 600
+changes_runtime: false
+metrics:
+  - completion_rate
+  - false_completion_rate
+output: eval/reports/capability/smoke

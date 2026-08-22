@@ -1,6 +1,11 @@
 # leveler-mobile
 
-手机端远程控制客户端（iOS / Android，Flutter）。控制你**自己的**开发机上的 CodeLeveler：切换项目、对话、处理审批、取消回合。
+**状态：FROZEN（tag `mobile-beta-mvp`）。** 功能投入停止，等真实 Beta 用户用过再决定下一轮。权威说明：[`docs/MOBILE_FREEZE.zh-CN.md`](../../docs/MOBILE_FREEZE.zh-CN.md)。
+
+手机端远程控制客户端（iOS / Android，Flutter）。控制你**自己的**开发机上的 CodeLeveler：切换项目、跑任务、处理审批、中途干预、预览已登记产物。
+
+产品收口（工作台，不是 Chat App）：[`docs/MOBILE_UI_UX_CLOSURE.zh-CN.md`](../../docs/MOBILE_UI_UX_CLOSURE.zh-CN.md)。  
+Steer / 产物 / Task Detail：[`docs/MOBILE_RUNTIME_ALIGNMENT.zh-CN.md`](../../docs/MOBILE_RUNTIME_ALIGNMENT.zh-CN.md)、[`docs/MOBILE_BETA_CLOSURE.zh-CN.md`](../../docs/MOBILE_BETA_CLOSURE.zh-CN.md)。不推翻本目录已有配对 / 验签 / 会话栈。
 
 ---
 
@@ -12,7 +17,7 @@
 | --- | --- |
 | `flutter pub get` | ✅ 64 个依赖解析通过 |
 | `flutter analyze` | ✅ **No issues found** |
-| `flutter test` | ✅ **16 条全绿**，含跨语言 golden |
+| `flutter test` | ✅ 全绿，含跨语言 golden、Steer、事件覆盖、产物卡片 |
 | iOS 模拟器（iPhone 17 Pro / iOS 26.5）构建并启动 | ✅ 装进模拟器跑起来了，中文渲染正常，设备密钥真的写进了 Keychain |
 | **模拟器上的完整配对验收** | ✅ `scripts/simulator_pairing.sh`：真 relay + 真 agent + 真人工确认，一条命令跑完 |
 | Android | ❌ 无 Android SDK，未构建 |
@@ -44,7 +49,7 @@
 - **Android 构建**：平台目录已生成（最低 API 29 = Android 10），但本机没有 Android SDK，没构建过。
 - **附件上传**：电脑端的 `upload_attachment` 也还没实现。
 - **未确认指令的重发队列没有单测**：上限 16 条，重连后用**原 `command_id`** 重发（电脑端按该 id 去重，所以重发是同一条指令而不是第二条）。逻辑写了，没跑过。
-- **推送通知、生物识别锁、产物下载**：Phase 2（PR12）。
+- **推送通知、生物识别锁**：未做。产物卡片/预览/`fetch_attachment` 已接；系统 Share sheet 未接。
 - **内测分发**（TestFlight / Play 内测轨）：需要真机构建，见上。
 
 ## 安全上的硬规则（代码里已体现）

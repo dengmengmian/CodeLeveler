@@ -1,0 +1,48 @@
+id: a01-independent-modules
+name: "Two independent utility modules"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub mod normalize;
+    pub mod checksum;
+  src/normalize.rs: |
+    /// Collapse runs of ASCII whitespace to a single space and trim.
+    pub fn normalize_ws(input: &str) -> String {
+        todo!("implement in this file")
+    }
+  src/checksum.rs: |
+    /// One-byte rotating checksum: wrapping add of each byte, then XOR 0xA5.
+    pub fn crc8_rot(input: &[u8]) -> u8 {
+        todo!("implement in this file")
+    }
+  tests/spec.rs: |
+    use evalcase::checksum::crc8_rot;
+    use evalcase::normalize::normalize_ws;
+
+    #[test]
+    fn normalize_collapses_ws() {
+        assert_eq!(normalize_ws("  a \t b\n c  "), "a b c");
+    }
+
+    #[test]
+    fn checksum_is_stable() {
+        assert_eq!(crc8_rot(b"ab"), crc8_rot(b"ab"));
+        assert_ne!(crc8_rot(b"ab"), crc8_rot(b"ba"));
+    }
+task: |
+  Finish two small utilities that do not share types or files:
+
+  - `normalize_ws` in src/normalize.rs
+  - `crc8_rot` in src/checksum.rs
+
+  Match tests/spec.rs. Do not edit the tests.
+expect:
+  program: "true"
+  args: []

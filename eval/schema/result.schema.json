@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeleveler.dev/eval/schema/result.json",
+  "title": "CodeLevelerEvalRun",
+  "description": "One observer record of a CodeLeveler eval run. Produced by eval/ scripts from EventLog; never written by the product runtime.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run",
+    "task",
+    "arm",
+    "model",
+    "delegation",
+    "edits",
+    "verifier",
+    "safety",
+    "metrics"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "run": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string" },
+        "started_at": { "type": ["string", "null"] },
+        "git_sha": { "type": ["string", "null"] },
+        "binary": { "type": ["string", "null"] },
+        "leveler_home": { "type": ["string", "null"] },
+        "session_db": { "type": ["string", "null"] }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": ["id", "suite"],
+      "properties": {
+        "id": { "type": "string" },
+        "suite": { "type": "string" },
+        "max_rounds": { "type": ["integer", "null"] },
+        "expected_disposition": {
+          "description": "Metrics-only author label. Never shown to the model.",
+          "type": ["string", "null"],
+          "enum": ["spawn", "keep", "either", null]
+        }
+      }
+    },
+    "arm": {
+      "type": "object",
+      "required": ["name", "factor", "value"],
+      "properties": {
+        "name": { "type": "string" },
+        "factor": {
+          "type": "string",
+          "description": "What this arm varies: baseline | prompt | timing | model"
+        },
+        "value": { "type": "string" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "properties": {
+        "ref": { "type": ["string", "null"] }
+      }
+    },
+    "delegation": {
+      "type": "object",
+      "properties": {
+        "offered": { "type": "boolean" },
+        "offer_trigger": { "type": ["string", "null"] },
+        "offer_round": { "type": ["integer", "null"] },
+        "reoffered": { "type": "boolean" },
+        "reoffer_round": { "type": ["integer", "null"] },
+        "kept": { "type": "boolean" },
+        "kept_round": { "type": ["integer", "null"] },
+        "delegated": { "type": "boolean" },
+        "delegated_round": { "type": ["integer", "null"] },
+        "natural_spawn_count": { "type": "integer" },
+        "useful_child_count": { "type": "integer" },
+        "reviewer_children": { "type": "integer" },
+        "children": { "type": "array" },
+        "stages": { "type": "array" },
+        "delayed_spawn_after_keep": { "type": "boolean" }
+      }
+    },
+    "edits": {
+      "type": "object",
+      "properties": {
+        "first_edit_round": { "type": ["integer", "null"] },
+        "first_plan_round": { "type": ["integer", "null"] },
+        "parent_edit_count": { "type": "integer" },
+        "parent_mutations": { "type": "integer" },
+        "parent_tool_calls": { "type": "integer" },
+        "rounds": { "type": "integer" },
+        "plan_updates": { "type": "integer" },
+        "claim_count": { "type": "integer" }
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "properties": {
+        "ran": { "type": "boolean" },
+        "passed": { "type": ["boolean", "null"] },
+        "command": { "type": ["string", "null"] }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "properties": {
+        "ownership_granted": { "type": "integer" },
+        "ownership_denied": { "type": "integer" },
+        "claim_count": { "type": "integer" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["valid", "spawn", "disposition"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "engaged": { "type": "boolean" },
+        "spawn": { "type": "boolean" },
+        "disposition": {
+          "type": ["string", "null"],
+          "enum": ["delegated", "kept", "offered_only", "none", null]
+        }
+      }
+    }
+  }
+}

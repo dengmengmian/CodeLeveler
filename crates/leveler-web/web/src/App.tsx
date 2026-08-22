@@ -1,21 +1,25 @@
-// 应用外壳：三栏布局 + RuntimeBridge 生命周期 + 全局快捷键
-// （y/s/a/n 审批决策、Esc 取消当前回合；焦点在输入框时自动忽略）。
-// 顶部状态栏：项目/分支 · 会话 · 视图切换（对话/改动） · 运行状态 · 上下文。
+// 应用外壳：Single Sidebar + Workspace + Contextual Inspector。
+// 顶栏：项目 / 分支 | 运行状态 | 上下文 · 更多 · Inspector。
 
+import { PanelLeftClose, PanelLeftOpen, PanelRight } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { RuntimeBridge } from './lib/controller';
-import { repoShortName } from './lib/format';
-import { AppProvider, useAppDispatch, useAppState, type AppState } from './state/store';
-import { BridgeProvider, useBridge } from './state/bridge';
-import { ThemeMenu, SettingsButton } from './components/Appearance';
+import { MoreMenu } from './components/Appearance';
 import { Composer } from './components/Composer';
 import { DiffView } from './components/DiffView';
+import { ExecutionView } from './components/ExecutionView';
 import { FileViewerProvider } from './components/FileViewer';
 import { Hero } from './components/Hero';
 import { Inspector } from './components/Inspector';
 import { LevelMeter } from './components/LevelMeter';
-import { Rail } from './components/Rail';
+import { Sidebar } from './components/Rail';
 import { Timeline } from './components/Timeline';
+import { RuntimeBridge } from './lib/controller';
+import { formatElapsed, repoShortName } from './lib/format';
+import { CTRL_ICON } from './lib/icons';
+import { headerWaitingCue, inspectorMode } from './lib/inspectorModel';
+import { presentTurnEnd } from './lib/turn';
+import { BridgeProvider, useBridge } from './state/bridge';
+import { AppProvider, useAppDispatch, useAppState, type AppState, type StageView } from './state/store';
 import type { ApprovalDecision } from './types/protocol';
 
 const APPROVAL_KEYS: Record<string, ApprovalDecision> = {
@@ -25,22 +29,34 @@ const APPROVAL_KEYS: Record<string, ApprovalDecision> = {
   n: 'deny',
 };
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.tagName === 'TEXTAREA' || target.tagName === 'INPUT' || target.isContentEditable;
+}
+
 function Shell() {
   const state = useAppState();
   const dispatch = useAppDispatch();
   const stateRef = useRef<AppState>(state);
   stateRef.current = state;
   const [bridge] = useState(() => new RuntimeBridge(dispatch, () => stateRef.current));
-  // 中央视图在 store（Inspector 的改动摘要可以切过来）
   const view = state.stageView;
-  const setView = (v: 'chat' | 'diff') => dispatch({ type: 'stage_view', view: v });
+  const setView = (v: StageView) => dispatch({ type: 'stage_view', view: v });
+
+  useEffect(() => {
+    if (window.matchMedia('(max-width: 1439px)').matches) {
+      dispatch({ type: 'set_inspector', open: false });
+    }
+    if (window.matchMedia('(max-width: 1099px)').matches && stateRef.current.railOpen) {
+      dispatch({ type: 'toggle_rail' });
+    }
+  }, [dispatch]);
 
   useEffect(() => {
     bridge.start();
     return () => bridge.dispose();
   }, [bridge]);
 
-  // 重连恢复后补发排队消息
   const prevConnection = useRef(state.connection);
   useEffect(() => {
     if (prevConnection.current !== 'online' && state.connection === 'online') {
@@ -49,67 +65,140 @@ function Shell() {
     prevConnection.current = state.connection;
   }, [state.connection, bridge]);
 
-  // 全局快捷键
+  const mode = inspectorMode(state.current);
+  useEffect(() => {
+    if (mode === 'waiting') dispatch({ type: 'set_inspector', open: true });
+  }, [mode, dispatch]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT' || e.isComposing) return;
       const st = stateRef.current;
+      const meta = e.metaKey || e.ctrlKey;
 
+      if (e.key === 'Escape') {
+        if (st.current?.turnActive && !isTypingTarget(e.target)) {
+          bridge.cancelTurn();
+        }
+        return;
+      }
+
+      if (meta && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus();
+        return;
+      }
+      if (meta && e.shiftKey && e.key.toLowerCase() === 'd') {
+        e.preventDefault();
+        dispatch({ type: 'stage_view', view: 'diff' });
+        return;
+      }
+      if (meta && e.shiftKey && e.key.toLowerCase() === 't') {
+        e.preventDefault();
+        dispatch({ type: 'set_inspector', open: true });
+        dispatch({ type: 'stage_view', view: 'chat' });
+        return;
+      }
+      if (meta && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        dispatch({ type: 'toggle_rail' });
+        return;
+      }
+      if (meta && e.key.toLowerCase() === 'i') {
+        e.preventDefault();
+        dispatch({ type: 'toggle_inspector' });
+        return;
+      }
+
+      if (isTypingTarget(e.target) || e.isComposing) return;
       const decision = APPROVAL_KEYS[e.key];
       if (decision && st.current && st.current.pendingApprovals.length > 0) {
         e.preventDefault();
         bridge.decideApproval(st.current.pendingApprovals[0].id, decision);
-        return;
-      }
-      if (e.key === 'Escape' && st.current?.turnActive) {
-        bridge.cancelTurn();
       }
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [bridge]);
+  }, [bridge, dispatch]);
 
-  const title = state.current?.title ?? '新对话';
   const current = state.current;
-  const project = repoShortName(current?.repository ?? state.repository);
+  const projectPath = current?.repository ?? state.selectedProject ?? state.repository;
+  const project =
+    state.projects.find((p) => p.path === projectPath)?.name ?? repoShortName(projectPath);
   const branch = current?.branch ?? null;
 
   return (
     <BridgeProvider value={bridge}>
       <FileViewerProvider>
-        <div className="deck">
-          <Rail />
+        <div
+          className={`deck${state.railOpen ? '' : ' sidebar-off'}${state.inspectorOpen ? '' : ' insp-off'}`}
+        >
+          <Sidebar />
           <main className="stage">
             <header className="stage-head">
-              <span className="sh-proj">
-                {project}
+              <button
+                type="button"
+                className="chrome-toggle"
+                title="切换侧栏 (⌘B)"
+                aria-label="切换侧栏"
+                onClick={() => dispatch({ type: 'toggle_rail' })}
+              >
+                {state.railOpen ? (
+                  <PanelLeftClose {...CTRL_ICON} aria-hidden="true" />
+                ) : (
+                  <PanelLeftOpen {...CTRL_ICON} aria-hidden="true" />
+                )}
+              </button>
+              <span className="sh-identity">
+                <span className="sh-proj">{project}</span>
                 {branch && <span className="sh-branch">{branch}</span>}
               </span>
-              <span className="sh-sep" />
-              <span className="sh-title">{title}</span>
-              <span className="spacer" />
-              <span className="view-tabs">
+              <span className="sh-right">
+                <RunStatus />
+                <LevelMeter />
+                <MoreMenu />
                 <button
-                  className={`view-tab${view === 'chat' ? ' on' : ''}`}
-                  onClick={() => setView('chat')}
+                  type="button"
+                  className="chrome-toggle"
+                  title="任务面板 (⌘I)"
+                  aria-label="切换任务面板"
+                  onClick={() => dispatch({ type: 'toggle_inspector' })}
                 >
-                  对话
-                </button>
-                <button
-                  className={`view-tab${view === 'diff' ? ' on' : ''}`}
-                  onClick={() => setView('diff')}
-                >
-                  改动
+                  <PanelRight {...CTRL_ICON} aria-hidden="true" />
                 </button>
               </span>
-              <RunStatus />
-              <LevelMeter />
-              <span className="sh-sep" />
-              <ThemeMenu />
-              <SettingsButton />
             </header>
-            {view === 'diff' && !state.draft ? (
+            <div className="ws-tabs" role="tablist" aria-label="Workspace">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'chat'}
+                className={`ws-tab${view === 'chat' ? ' on' : ''}`}
+                onClick={() => setView('chat')}
+              >
+                Conversation
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'diff'}
+                className={`ws-tab${view === 'diff' ? ' on' : ''}`}
+                onClick={() => setView('diff')}
+              >
+                Changes
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'execution'}
+                className={`ws-tab${view === 'execution' ? ' on' : ''}`}
+                onClick={() => setView('execution')}
+              >
+                Execution
+              </button>
+            </div>
+            {view === 'execution' ? (
+              <ExecutionView />
+            ) : view === 'diff' && !state.draft ? (
               <DiffView />
             ) : state.draft ? (
               <Hero />
@@ -119,46 +208,77 @@ function Shell() {
             <Composer />
           </main>
           <Inspector />
+          <div
+            className="chrome-scrim"
+            onClick={() => {
+              dispatch({ type: 'set_inspector', open: false });
+              if (state.railOpen) dispatch({ type: 'toggle_rail' });
+            }}
+          />
         </div>
       </FileViewerProvider>
     </BridgeProvider>
   );
 }
 
-/** 运行状态行：当前活动标签 + 回合计时 + 停止；空闲时显示「就绪」。 */
 function RunStatus() {
   const current = useAppState().current;
+  const dispatch = useAppDispatch();
   const bridge = useBridge();
-  const running = current?.turnActive ?? false;
+  const mode = inspectorMode(current);
+  const waiting = headerWaitingCue(current);
   const startedAt = current?.turnStartedAt ?? null;
-  const activity = current?.activity ?? null;
   const [, forceTick] = useState(0);
 
-  // 运行中每秒刷新一次计时
   useEffect(() => {
-    if (!running) return;
+    if (mode !== 'running' && mode !== 'waiting') return;
     const timer = setInterval(() => forceTick((n) => n + 1), 1000);
     return () => clearInterval(timer);
-  }, [running]);
+  }, [mode]);
 
-  if (!running) {
+  if (waiting) {
     return (
-      <span className="sh-status">
+      <button
+        type="button"
+        className="sh-status wait"
+        title="打开任务面板"
+        aria-label={`${waiting.label}，打开任务面板`}
+        onClick={() => dispatch({ type: 'set_inspector', open: true })}
+      >
+        <span aria-hidden="true">{waiting.glyph}</span>
+        {waiting.label}
+      </button>
+    );
+  }
+
+  if (mode === 'running') {
+    const elapsed = startedAt ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : 0;
+    return (
+      <span className="sh-status run">
         <i className="dot" />
-        就绪
+        <span className="sh-activity">{current?.activity ?? '正在运行'}</span>
+        <span className="sh-elapsed">{formatElapsed(elapsed)}</span>
+        <button type="button" className="sh-stop" title="取消当前回合 (Esc)" onClick={() => bridge.cancelTurn()}>
+          停止
+        </button>
       </span>
     );
   }
 
-  const elapsed = startedAt ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : 0;
+  if (mode === 'terminal' && current?.lastTurn) {
+    const p = presentTurnEnd(current.lastTurn);
+    return (
+      <span className={`sh-status term tone-${p.tone}`}>
+        <span aria-hidden="true">{p.glyph}</span>
+        {p.label}
+      </span>
+    );
+  }
+
   return (
-    <span className="sh-status run">
+    <span className="sh-status">
       <i className="dot" />
-      <span className="sh-activity">{activity ?? '运行中'}</span>
-      <span className="sh-elapsed">{elapsed}s</span>
-      <button className="sh-stop" title="取消当前回合 (Esc)" onClick={() => bridge.cancelTurn()}>
-        ■ 停止
-      </button>
+      就绪
     </span>
   );
 }

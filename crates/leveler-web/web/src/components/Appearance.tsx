@@ -2,6 +2,8 @@
 // 主题状态来自 lib/theme.ts（外部存储），组件通过 useSyncExternalStore 订阅，
 // 切换立即生效并持久化。
 
+import { MoreHorizontal, Settings } from 'lucide-react';
+import { CTRL_ICON } from '../lib/icons';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
   THEME_OPTIONS,
@@ -17,9 +19,9 @@ function useThemeChoice(): ThemeChoice {
 
 /** 预览卡片的代表色（展示各主题外观，与 app.css 的调色板对应）。 */
 const SWATCH: Record<'graphite' | 'midnight' | 'paper', { app: string; surface: string; accent: string; text: string }> = {
-  graphite: { app: '#11161d', surface: '#19222d', accent: '#9ddd48', text: '#e8edf4' },
-  midnight: { app: '#0f1520', surface: '#192434', accent: '#8fda45', text: '#edf3fb' },
-  paper: { app: '#f4f6f8', surface: '#ffffff', accent: '#6fae1f', text: '#1b2530' },
+  graphite: { app: '#121416', surface: '#1c1f23', accent: '#9ddd48', text: '#eceff2' },
+  midnight: { app: '#0d121c', surface: '#172033', accent: '#8fda45', text: '#edf3fb' },
+  paper: { app: '#ffffff', surface: '#f7f7f5', accent: '#5b8f1f', text: '#202326' },
 };
 
 function swatchFor(choice: ThemeChoice) {
@@ -27,6 +29,74 @@ function swatchFor(choice: ThemeChoice) {
 }
 
 // ── 顶栏快捷切换 ────────────────────────────────────────────────────
+
+/** Header ⋯：外观 / 设置。不占主栏权重。 */
+export function MoreMenu() {
+  const [open, setOpen] = useState(false);
+  const [settings, setSettings] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('click', onDocClick);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', onDocClick);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="more-menu" ref={wrapRef}>
+      <button
+        type="button"
+        className="th-btn more-btn"
+        title="更多"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <MoreHorizontal {...CTRL_ICON} aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="th-pop" role="menu">
+          <button
+            type="button"
+            className="th-item"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              setSettings(true);
+            }}
+          >
+            <span className="th-name">Appearance</span>
+          </button>
+          <button
+            type="button"
+            className="th-item"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              setSettings(true);
+            }}
+          >
+            <span className="th-name">Settings</span>
+          </button>
+          <button type="button" className="th-item" role="menuitem" disabled>
+            <span className="th-name">Keyboard Shortcuts</span>
+          </button>
+        </div>
+      )}
+      {settings && <SettingsModal onClose={() => setSettings(false)} />}
+    </div>
+  );
+}
 
 export function ThemeMenu() {
   const choice = useThemeChoice();
@@ -84,16 +154,55 @@ export function SettingsButton() {
   return (
     <>
       <button className="set-gear" title="设置" onClick={() => setOpen(true)}>
-        ⚙
+        <Settings size={16} strokeWidth={1.75} aria-hidden="true" />
       </button>
       {open && <SettingsModal onClose={() => setOpen(false)} />}
     </>
   );
 }
 
-function SettingsModal({ onClose }: { onClose: () => void }) {
+/** Theme cards for the Settings sidebar (no extra API). */
+export function AppearancePanel() {
   const choice = useThemeChoice();
+  return (
+    <div className="set-body">
+      <div className="set-sec">外观</div>
+      <div className="set-hint">主题立即生效并保存到本机，刷新后保持。</div>
+      <div className="theme-cards">
+        {THEME_OPTIONS.map((t) => {
+          const sw = swatchFor(t.choice);
+          const active = choice === t.choice;
+          return (
+            <button
+              key={t.choice}
+              className={`theme-card${active ? ' active' : ''}`}
+              onClick={() => setThemeChoice(t.choice)}
+            >
+              <span
+                className="tc-preview"
+                style={{ background: sw.app, borderColor: sw.surface }}
+              >
+                <i className="tc-side" style={{ background: sw.surface }} />
+                <i className="tc-bar" style={{ background: sw.accent }} />
+                <i className="tc-line" style={{ background: sw.text, opacity: 0.5 }} />
+                <i className="tc-line short" style={{ background: sw.text, opacity: 0.3 }} />
+              </span>
+              <span className="tc-meta">
+                <span className="tc-name">
+                  {t.label}
+                  {active && <span className="tc-cur">当前</span>}
+                </span>
+                <span className="tc-desc">{t.desc}</span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
+function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
@@ -111,40 +220,7 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
             ✕
           </button>
         </div>
-        <div className="set-body">
-          <div className="set-sec">外观</div>
-          <div className="set-hint">主题立即生效并保存到本机，刷新后保持。</div>
-          <div className="theme-cards">
-            {THEME_OPTIONS.map((t) => {
-              const sw = swatchFor(t.choice);
-              const active = choice === t.choice;
-              return (
-                <button
-                  key={t.choice}
-                  className={`theme-card${active ? ' active' : ''}`}
-                  onClick={() => setThemeChoice(t.choice)}
-                >
-                  <span
-                    className="tc-preview"
-                    style={{ background: sw.app, borderColor: sw.surface }}
-                  >
-                    <i className="tc-side" style={{ background: sw.surface }} />
-                    <i className="tc-bar" style={{ background: sw.accent }} />
-                    <i className="tc-line" style={{ background: sw.text, opacity: 0.5 }} />
-                    <i className="tc-line short" style={{ background: sw.text, opacity: 0.3 }} />
-                  </span>
-                  <span className="tc-meta">
-                    <span className="tc-name">
-                      {t.label}
-                      {active && <span className="tc-cur">当前</span>}
-                    </span>
-                    <span className="tc-desc">{t.desc}</span>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
+        <AppearancePanel />
       </div>
     </div>
   );

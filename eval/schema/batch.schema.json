@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codeleveler.dev/eval/schema/batch.json",
+  "title": "CodeLevelerEvalBatch",
+  "type": "object",
+  "required": ["schema_version", "batch_id", "runs"],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "batch_id": { "type": "string" },
+    "arm": { "type": ["object", "null"] },
+    "model": { "type": ["string", "null"] },
+    "notes": { "type": ["string", "null"] },
+    "runs": {
+      "type": "array",
+      "items": { "$ref": "result.json" }
+    }
+  }
+}

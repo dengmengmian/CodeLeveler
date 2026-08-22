@@ -6,12 +6,17 @@
 //! web 网关自己的契约：WS 帧、多项目聚合层、REST DTO —— 它们的事实源是
 //! crates/leveler-web，不在 client-protocol schema 里。
 
-import type { ClientCommand, ModelRef, PermissionProfile, RuntimeEvent, SessionId, UiSessionSnapshot } from './protocol.gen';
+import type {
+  ClientCommand,
+  CommandId,
+  ModelRef,
+  PermissionProfile,
+  RuntimeEvent,
+  SessionId,
+  UiSessionSnapshot,
+} from './protocol.gen';
 
 export * from './protocol.gen';
-
-/** 网关 deliver 帧的命令回执 id（web 网关概念，不在 client-protocol 里）。 */
-export type CommandId = string;
 
 /** turn 终态事件集合（驱动消息队列出队与终态渲染）。 */
 export const TURN_TERMINAL_TYPES: ReadonlySet<RuntimeEvent['type']> = new Set([

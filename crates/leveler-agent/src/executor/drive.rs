@@ -29,20 +29,20 @@ use super::dispatch::{
 };
 use super::host::AdmitError;
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, Executor, ModelRequestRecord, StopReason,
-    TranscriptSink,
+    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, ChildToolEvent, Executor,
+    ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
     collect_scoped_paths_from_call, counts_as_verification_evidence, extract_command,
     is_observe_result_tool, is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
-    write_targets_outside_allowlist,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
-    COMPLETE_STEP_TOOL, PermissionRequestOutcome, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL,
-    RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL, apply_turn_grants,
-    ask_user_tool_definition, complete_step_tool_definition, is_user_input_tool,
-    parse_permission_request, permission_already_denied_message, report_finding_tool_definition,
+    CLAIM_WRITE_SCOPE_TOOL, COMPLETE_STEP_TOOL, PermissionRequestOutcome, REPORT_FINDING_TOOL,
+    REQUEST_PERMISSIONS_TOOL, RESOLVE_FINDING_TOOL, SPAWN_AGENT_TOOL, UPDATE_GOAL_TOOL,
+    apply_turn_grants, ask_user_tool_definition, claim_write_scope_tool_definition,
+    complete_step_tool_definition, is_user_input_tool, parse_permission_request,
+    permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     resolve_finding_tool_definition, spawn_agent_tool_definition, update_goal_tool_definition,
 };
@@ -50,7 +50,7 @@ use crate::nudges::{first_user_text, goal_resolve_nudge};
 use crate::sub_agent::{
     AgentRole, ChildProfile, DelegationDecisionPoint, DelegationRoundAction, MAX_SUB_AGENT_DEPTH,
     agent_nickname, delegation_decision_request, lost_children_note, multi_agent_steer_hint,
-    scopes_overlap, settlement_notice, should_inject_delegation_hint,
+    new_delegated_agent_id, scopes_overlap, settlement_notice, should_inject_delegation_hint,
 };
 
 /// One still-running background delegation (V2). The join handle is owned by
@@ -69,13 +69,24 @@ struct BackgroundChild {
 /// Abort-on-drop guard: if the drive future is dropped on an unexpected path,
 /// spawned children must not keep running as orphans. Every NORMAL exit drains
 /// (settles) children first, so this abort is strictly the crash path.
+///
+/// Review 必改②: an aborted child never reaches a settle fold, so its write
+/// ownership must be released HERE too — otherwise a mid-round `return Err`
+/// (model decode/length/content-filter/fatal-admission) leaves the registry
+/// holding a claim for a child that no longer exists.
 #[derive(Default)]
-struct BackgroundChildren(Vec<BackgroundChild>);
+struct BackgroundChildren {
+    children: Vec<BackgroundChild>,
+    ownership: Option<Arc<crate::ownership::OwnershipRegistry>>,
+}
 
 impl Drop for BackgroundChildren {
     fn drop(&mut self) {
-        for child in &self.0 {
+        for child in &self.children {
             child.handle.abort();
+            if let Some(ownership) = &self.ownership {
+                ownership.release_all(&child.id);
+            }
         }
     }
 }
@@ -112,6 +123,11 @@ impl Executor {
         // can also hide spawn_agent entirely.
         if self.policy.allow_delegation && self.depth < MAX_SUB_AGENT_DEPTH {
             tools.push(spawn_agent_tool_definition());
+        }
+        // Late-bound ownership: a spawned child starts read-capable and
+        // claims its own bounded write scope. Read-only roles never claim.
+        if self.depth > 0 && !crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only {
+            tools.push(claim_write_scope_tool_definition());
         }
         // Children report typed findings; the parent judges adopted ones.
         // The parent also gets resolve_finding with delegation off when a
@@ -151,6 +167,12 @@ impl Executor {
         const PLAN_SOFT_NUDGE_AFTER_ROUNDS: u32 = 2;
         let mut plan_explore_rounds_used = 0u32;
         let mut plan_soft_nudge_sent = false;
+        // Engagement guard (NEVER_ENGAGED_EXPLORATION_SPIRAL). Drive-local like
+        // the plan nudge above: these are advisory counters, not durable
+        // lifecycle facts, so they stay out of the ProgressLedger schema.
+        let mut engagement_tool_rounds = 0u32;
+        let mut engagement_advisories_sent = 0u32;
+        let mut engagement_material_progress = false;
         let mut plan_state = self.seeded_plan.clone();
         let mut structured_plan_started = !plan_state.is_empty();
         // Short tasks: no host-seeded one-step plan shell. Plan UI appears only when
@@ -194,7 +216,10 @@ impl Executor {
         // covers foreground batches AND background children; the progress
         // channel outlives any single spawn batch and is drained at round
         // boundaries.
-        let mut background_children = BackgroundChildren::default();
+        let mut background_children = BackgroundChildren {
+            children: Vec::new(),
+            ownership: Some(self.ownership.clone()),
+        };
         let run_agents_semaphore = Arc::new(tokio::sync::Semaphore::new(
             self.policy.max_concurrent_agents.max(1),
         ));
@@ -217,17 +242,20 @@ impl Executor {
             sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
         }
-        // MA-WA1: one-shot keep-vs-delegate decision point. Eligible only for
+        // MA-WA1: keep-vs-delegate decision point (one offer + at most one
+        // event-driven reconsideration per goal epoch). Eligible only for
         // top-level runs with delegation on; a prior window's offer and
         // disposition facts (seeded via ProgressLedger) are never re-asked or
         // re-recorded.
-        let mut delegation_decision = DelegationDecisionPoint::new(
+        let mut delegation_decision = DelegationDecisionPoint::with_timing(
             self.policy.allow_delegation && self.depth == 0,
             crate::sub_agent::DelegationPrior {
                 offered: progress.delegation_decision_offered,
                 kept: progress.delegation_kept_recorded,
                 delegated: progress.delegation_delegated_recorded,
+                reconsidered: progress.delegation_reconsidered,
             },
+            self.policy.delegation_timing,
         );
         // Accumulated elevations from approved request_permissions this turn.
         let mut turn_grants = crate::injected_tools::TurnPermissionGrants::default();
@@ -374,9 +402,9 @@ impl Executor {
                 }
                 let mut settled = Vec::new();
                 let mut i = 0;
-                while i < background_children.0.len() {
-                    if background_children.0[i].handle.is_finished() {
-                        settled.push(background_children.0.remove(i));
+                while i < background_children.children.len() {
+                    if background_children.children[i].handle.is_finished() {
+                        settled.push(background_children.children.remove(i));
                     } else {
                         i += 1;
                     }
@@ -404,6 +432,9 @@ impl Executor {
                         &result,
                     );
                     clear_outstanding_child(&mut progress, &id);
+                    // Terminal release: the child's exclusive claims end with
+                    // it, whatever its terminal state (idempotent).
+                    self.ownership.release_all(&id);
                     let notice = Message::text(
                         Role::User,
                         settlement_notice(&nickname, &id, role, &scope, &content),
@@ -426,9 +457,9 @@ impl Executor {
         // caps, so this terminates.
         macro_rules! drain_background_children {
             ($rounds:expr) => {{
-                while !background_children.0.is_empty() {
+                while !background_children.children.is_empty() {
                     settle_finished_children!($rounds);
-                    if background_children.0.is_empty() {
+                    if background_children.children.is_empty() {
                         break;
                     }
                     tokio::select! {
@@ -505,6 +536,12 @@ impl Executor {
             // nudge continue), the model never runs a round blind to a child
             // that already finished.
             settle_finished_children!(round);
+            // Everything in the debt counter NOW is model-visible this round
+            // (the notices are already in `messages`). Debt added later in the
+            // round — a foreground spawn folding mid-batch, a child settling
+            // at the round's end — is invisible until the next model call and
+            // must survive this round's consumption reset.
+            let visible_settlement_debt = progress.unconsumed_child_settlements;
             if let Some(max) = self.step_limits.max_model_tokens
                 && model_tokens_spent >= max
             {
@@ -653,6 +690,42 @@ impl Executor {
                 sink.append(std::slice::from_ref(&nudge)).await?;
                 messages.push(nudge);
                 plan_soft_nudge_sent = true;
+            }
+
+            // Engagement guard: a top-level run that has registered no plan and
+            // modified no file after this many tool-using rounds is told that
+            // fact. Eight recorded qualified runs spent a whole 100-round budget
+            // on successful, novel observation with cumulative_modified_files: 0
+            // and were never informed — neither progress streak can see it,
+            // because a successful non-observe call reads as Progress and a
+            // command that exits 0 clears the stagnation streak.
+            //
+            // Advisory ONLY: no tool is removed, no ToolChoice is forced, no
+            // call is refused, no turn is terminated, and delegation is not
+            // steered. Exploration stays legal at any round (R007 F1).
+            if self.depth == 0
+                && self.policy.progress_guards
+                && round_verdict::engagement_advisory_due(&round_verdict::EngagementInput {
+                    tool_rounds: engagement_tool_rounds,
+                    any_material_progress: engagement_material_progress,
+                    advisories_sent: engagement_advisories_sent,
+                    children_outstanding: !progress.outstanding_children.is_empty(),
+                })
+            {
+                let note = Message::text(
+                    Role::User,
+                    format!(
+                        "Progress check: {engagement_tool_rounds} rounds into this task, \
+                         no edit has been applied and no plan is registered. Exploration \
+                         remains available and nothing is being refused. If you already \
+                         know enough to start, make the first concrete change now. If the \
+                         task cannot be done in this repository, say so plainly and stop \
+                         instead of continuing to look."
+                    ),
+                );
+                sink.append(std::slice::from_ref(&note)).await?;
+                messages.push(note);
+                engagement_advisories_sent = engagement_advisories_sent.saturating_add(1);
             }
 
             let mut request = ModelRequest::new(self.model.clone(), messages.clone());
@@ -892,15 +965,15 @@ impl Executor {
                 ));
             }
 
-            if calls.is_empty() && !background_children.0.is_empty() {
+            if calls.is_empty() && !background_children.children.is_empty() {
                 // V2: a quiet round while background children run is WAITING,
                 // not a stall — hold for the next settlement instead of
                 // burning closeout nudges or classifying no-progress. The
                 // settlement itself is injected at the next round top.
                 sink.append(&[assistant]).await?;
-                while !background_children.0.is_empty()
+                while !background_children.children.is_empty()
                     && !background_children
-                        .0
+                        .children
                         .iter()
                         .any(|child| child.handle.is_finished())
                     && !cancellation.is_cancelled()
@@ -1076,6 +1149,10 @@ impl Executor {
             // Tools seen this round for pure-observe streak detection.
             let mut observe_only_tools_this_round = 0u32;
             let mut non_observe_success_this_round = 0u32;
+            // A tool the REGISTRY declares file-mutating succeeded this round.
+            // The engagement latch reads this rather than the workspace diff, so
+            // a shell byproduct (`.bak`, `.tmp`) is not mistaken for an edit.
+            let mut edit_applied_this_round = false;
             // Calls a guard refused before they ran (loop guard, plan gate,
             // budgets, allowlist, permission). A round consisting solely of
             // refusals is no progress — it must not reset the AC3 streak.
@@ -1416,10 +1493,10 @@ impl Executor {
                     // wall caps), inject the settlements, and refuse this
                     // resolution once so the model integrates first.
                     if call.arguments.get("status").and_then(|v| v.as_str()) == Some("complete")
-                        && !background_children.0.is_empty()
+                        && !background_children.children.is_empty()
                     {
                         let waiting: Vec<String> = background_children
-                            .0
+                            .children
                             .iter()
                             .map(|c| format!("{} ({})", c.nickname, c.id))
                             .collect();
@@ -1638,6 +1715,142 @@ impl Executor {
                     continue;
                 }
 
+                // Late-bound ownership: a child claims exclusive write scope
+                // against the shared registry. Atomic; a denial is an honest
+                // coordination result (is_error=false) the child works around.
+                if call.name == CLAIM_WRITE_SCOPE_TOOL {
+                    // Durable lifecycle FIRST: an ownership transition that
+                    // decides what a child may mutate has to be
+                    // reconstructable from the event log like any other tool
+                    // call. Emitting only a result made a granted claim
+                    // invisible to an audit keyed on tool starts, and a legal
+                    // write read as a pre-claim bypass (M7 measurement error).
+                    observer(AgentEvent::ToolCall {
+                        id: call.id.as_str().to_string(),
+                        name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+                        arguments: compact_json(&call.arguments),
+                        parallel: false,
+                    });
+                    let paths: Vec<String> = call
+                        .arguments
+                        .get("paths")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut granted = false;
+                    let mut decision_detail = String::new();
+                    let (content, is_error) = if self.depth == 0 {
+                        (
+                            "You are the top-level agent: you already write directly \
+                             (outside children's claimed scopes). claim_write_scope is \
+                             for spawned children."
+                                .to_string(),
+                            true,
+                        )
+                    } else {
+                        let owner = self
+                            .agent_id
+                            .clone()
+                            .unwrap_or_else(|| format!("child-depth-{}", self.depth));
+                        match self.ownership.try_claim(&owner, &paths) {
+                            Ok(owned) => {
+                                granted = true;
+                                decision_detail = owned.join(", ");
+                                (
+                                    format!(
+                                        "granted — you exclusively own: {}. Re-read a claimed \
+                                         file before your first write to it if time has passed \
+                                         since you read it.",
+                                        owned.join(", ")
+                                    ),
+                                    false,
+                                )
+                            }
+                            Err(rejection) => {
+                                decision_detail = match &rejection {
+                                    crate::ownership::ClaimRejection::Conflicts(conflicts) => {
+                                        conflicts
+                                            .iter()
+                                            .map(|c| format!("{} owned by {}", c.path, c.owner))
+                                            .collect::<Vec<_>>()
+                                            .join("; ")
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                (rejection.for_model(), false)
+                            }
+                        }
+                    };
+                    observer(AgentEvent::ToolResult {
+                        id: call.id.as_str().to_string(),
+                        name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
+                        is_error,
+                        preview: preview(&content),
+                    });
+                    // Durable ownership provenance. A child's tool events reach
+                    // the parent as TRANSIENT activity, so without a durable
+                    // record an offline audit cannot tell an authorized write
+                    // from a bypass — the M7 measurement failure.
+                    //
+                    // It must also be durable BEFORE the write it authorizes:
+                    // a child's tool calls flush on the child's own task, so a
+                    // grant emitted only through the activity channel waits for
+                    // the parent's next drain and can land after the write,
+                    // which is exactly how a legal write reads as a bypass.
+                    // Riding the barrier queue is what orders the two.
+                    //
+                    // Exactly ONE durable record per transition. The observer
+                    // copy is forwarded to the parent and persisted from there,
+                    // so emitting it as well as recording on the barrier writes
+                    // the same grant twice and an offline audit reads two grants
+                    // for one claim. The barrier is the primary path; the
+                    // observer is the fallback when there is no durable host
+                    // (standalone library use).
+                    if self.depth > 0 {
+                        let action = if granted {
+                            "ownership_granted".to_string()
+                        } else {
+                            "ownership_denied".to_string()
+                        };
+                        match (&self.event_barrier, &self.agent_id) {
+                            (Some(barrier), Some(agent_id)) => {
+                                barrier.record_child_tool_event(ChildToolEvent::Ownership {
+                                    agent_id: agent_id.clone(),
+                                    action,
+                                    detail: decision_detail.clone(),
+                                });
+                                // The registry has already changed, so a flush
+                                // failure aborts the run rather than continuing
+                                // with owned paths no durable record accounts
+                                // for.
+                                barrier.flush().await?;
+                            }
+                            _ => {
+                                let owner = self
+                                    .agent_id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("child-depth-{}", self.depth));
+                                observer(AgentEvent::DelegationStage {
+                                    action,
+                                    detail: format!("{owner}: {decision_detail}"),
+                                });
+                            }
+                        }
+                    }
+                    results[index] = Some(ContentPart::ToolResult {
+                        result: ToolResultContent {
+                            call_id: call.id,
+                            content,
+                            is_error,
+                        },
+                    });
+                    continue;
+                }
+
                 // request_permissions is answered by the user, not the registry.
                 if call.name == REQUEST_PERMISSIONS_TOOL {
                     let (_, _, requested) = parse_permission_request(&call.arguments);
@@ -1811,34 +2024,45 @@ impl Executor {
                     results[index] = Some(deny_call(observer, call, msg));
                     continue;
                 }
-                // V2 parent write fence: a running background Worker owns its
-                // scope EXCLUSIVELY — including against the parent. An edit
-                // there would race the child the parent itself delegated to;
-                // integration waits for the settlement notice.
-                if self.registry.mutates_files(&call.name) && !background_children.0.is_empty() {
-                    let active_scopes: Vec<String> = background_children
-                        .0
-                        .iter()
-                        .filter(|child| child.role == AgentRole::Worker)
-                        .flat_map(|child| child.scope.iter().cloned())
-                        .collect();
-                    let inside =
-                        crate::authorization::write_targets_inside_scopes(&call, &active_scopes);
-                    if !inside.is_empty() {
-                        let owners: Vec<String> = background_children
-                            .0
-                            .iter()
-                            .filter(|child| {
-                                child.role == AgentRole::Worker
-                                    && inside.iter().any(|t| {
-                                        crate::sub_agent::scopes_overlap(
-                                            &child.scope,
-                                            std::slice::from_ref(t),
-                                        )
-                                    })
-                            })
-                            .map(|child| format!("{} ({})", child.nickname, child.id))
-                            .collect();
+                // Write-ownership fence: a live claim is EXCLUSIVE against
+                // everyone, the parent included. The registry is the one
+                // authority, so this covers a late-bound child's own
+                // claim_write_scope grant as well as a legacy Worker's
+                // pre-claim — an edit there would race the child this agent
+                // delegated to; integration waits for the settlement notice.
+                //
+                // A writer at depth 0 checks and commits in ONE locked
+                // registry operation and holds the guard for the rest of the
+                // call. Asking `conflicts_for` here and taking the guard later
+                // left a window in which a background child — a separate task,
+                // genuinely parallel on the multi-thread runtime — claimed the
+                // same path: its claim saw an empty `parent_active` and was
+                // granted, and the later guard marked without re-checking, so
+                // both wrote one file.
+                let mut _mutation_guard = None;
+                if self.registry.mutates_files(&call.name) {
+                    let owner_key = match (&self.agent_id, self.depth) {
+                        (Some(id), _) => id.clone(),
+                        (None, 0) => "parent".to_string(),
+                        (None, depth) => format!("child-depth-{depth}"),
+                    };
+                    let targets = crate::authorization::mutation_targets(&call);
+                    let hits = if self.depth == 0 {
+                        match self.ownership.try_mutation_guard(&owner_key, &targets) {
+                            Ok(guard) => {
+                                _mutation_guard = Some(guard);
+                                Vec::new()
+                            }
+                            Err(conflicts) => conflicts,
+                        }
+                    } else {
+                        self.ownership.conflicts_for(&targets, &owner_key)
+                    };
+                    if !hits.is_empty() {
+                        let inside: Vec<String> = hits.iter().map(|c| c.path.clone()).collect();
+                        let mut owners: Vec<String> =
+                            hits.iter().map(|c| c.owner.clone()).collect();
+                        owners.dedup();
                         let msg = format!(
                             "Edit refused: {} belongs to the exclusive scope of \
                              still-running sub-agent(s) {}. Wait for the settlement \
@@ -1854,24 +2078,26 @@ impl Executor {
                     }
                 }
 
-                // Write allowlist (worker sub-agents, orchestrated nodes):
-                // reject an edit that reaches outside the allowed paths BEFORE
-                // it runs, feeding the reason back so the model stays in scope.
-                if self.registry.mutates_files(&call.name)
-                    && let Some(allow) = &self.write_allowlist
-                {
-                    let outside = write_targets_outside_allowlist(&call, allow);
-                    if !outside.is_empty() {
-                        let msg = format!(
-                            "Edit rejected: {} is outside your allowed paths ({}). Only edit \
-                             within them; ask for the others if you truly need them.",
-                            outside.join(", "),
-                            allow.join(", ")
-                        );
-                        denied_calls_this_round += 1;
-                        results[index] = Some(deny_call(observer, call, msg));
-                        continue;
-                    }
+                // Write authority (late-bound ownership): a child's effective
+                // allowlist is what it has CLAIMED (plus any legacy pre-claim);
+                // before its first grant that set is empty and EVERY mutating
+                // tool is refused — do not wait to parse patch paths
+                // (PB2_B_ORCH_1: Update File landed because an empty-target
+                // miss skipped this fence). The parent stays unrestricted
+                // (fenced above by others' claims).
+                // An MCP tool's effect lands in a separate, unsandboxed
+                // process and cannot be bounded by a claimed scope, so a
+                // delegated agent may not reach one at all.
+                if let Some(msg) = self.refuse_unboundable_delegated_tool(&call) {
+                    denied_calls_this_round += 1;
+                    policy_blocked_calls_this_round += 1;
+                    results[index] = Some(deny_call(observer, call, msg));
+                    continue;
+                }
+                if let Some(msg) = self.refuse_unscoped_mutation(&call) {
+                    denied_calls_this_round += 1;
+                    results[index] = Some(deny_call(observer, call, msg));
+                    continue;
                 }
 
                 // Read-only, side-effect-free tools are deferred to the
@@ -1901,16 +2127,33 @@ impl Executor {
                     .max_modified_files
                     .map(|max| max.saturating_sub(epoch_paths.len()));
                 let ctx = ctx.with_command_write_constraints(
-                    self.write_allowlist.clone(),
+                    self.effective_write_allowlist(),
                     remaining_files,
                     epoch_paths,
                 );
+                // What a concurrent sibling owns right now. A command's changes
+                // are attributed by diffing the whole workspace, which in a
+                // shared tree also sees the sibling's writes; this call cannot
+                // have made them, so they must not be charged here and rolled
+                // back with it.
+                let owner_key = match (&self.agent_id, self.depth) {
+                    (Some(id), _) => id.clone(),
+                    (None, 0) => "parent".to_string(),
+                    (None, depth) => format!("child-depth-{depth}"),
+                };
+                let ctx =
+                    ctx.with_foreign_owned_paths(self.ownership.paths_owned_by_others(&owner_key));
 
                 // Admission: the ToolHost pipeline (side-effect barrier →
                 // hooks → rules → policy → approval → barrier). Execution
                 // requires the AdmittedCall it returns; `parallel` (computed
                 // above) decides deferral to the batch — every other admitted
                 // call runs here, in order.
+                // §19: while the parent executes a mutation, an overlapping
+                // child claim is denied retryably. The guard was acquired
+                // atomically with the ownership check above and lives until
+                // this call resolves — taking it here instead would reopen the
+                // window it exists to close.
                 let (
                     content,
                     is_error,
@@ -2071,6 +2314,11 @@ impl Executor {
                                         .filter(|s| s.status != "completed")
                                         .map(|s| s.step.clone())
                                         .collect::<Vec<_>>(),
+                                    plan_state
+                                        .steps
+                                        .iter()
+                                        .filter(|s| s.status == "completed")
+                                        .count() as u32,
                                 );
                                 observer(AgentEvent::PlanUpdated {
                                     steps: plan_state.steps.clone(),
@@ -2115,6 +2363,12 @@ impl Executor {
                 }
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.
+                if !is_error && self.registry.mutates_files(&call.name) {
+                    edit_applied_this_round = true;
+                    // Same signal the timing experiment gates on: a deliberate
+                    // edit, not a workspace diff.
+                    delegation_decision.note_edit_applied();
+                }
                 if !is_error && call_mutated {
                     delegation_decision.note_mutation();
                     if !newly_modified.is_empty() {
@@ -2407,18 +2661,21 @@ impl Executor {
                             files.join(", ")
                         ))
                     } else if role == AgentRole::Worker
-                        && background_children.0.iter().any(|child| {
-                            child.role == AgentRole::Worker && scopes_overlap(&child.scope, &files)
-                        })
+                        && !self.ownership.conflicts_for(&files, "").is_empty()
                     {
-                        // V2: exclusive means exclusive across the whole run —
-                        // a still-running background worker owns its scope
-                        // until it settles, not just within one batch.
+                        // Legacy pre-scoped Worker: its files are an exclusive
+                        // claim in the SAME registry late-bound children use —
+                        // a conflict with any live claim is an honest denial.
+                        let hits = self.ownership.conflicts_for(&files, "");
                         Some(format!(
-                            "Worker scope {} overlaps a background worker that is STILL \
-                             RUNNING. Wait for its settlement notice, or scope this \
-                             worker to disjoint files.",
-                            files.join(", ")
+                            "Worker scope {} overlaps exclusive ownership held by {}. \
+                             Wait for its settlement notice, or scope this worker to \
+                             disjoint files.",
+                            files.join(", "),
+                            hits.iter()
+                                .map(|c| c.owner.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ))
                     } else if agents_spawned >= self.policy.max_total_agents {
                         Some(format!(
@@ -2451,8 +2708,34 @@ impl Executor {
                         delegation_decision.note_worker_admitted(&files);
                     }
                     agents_spawned += 1;
-                    let id = format!("agent-{agents_spawned}");
+                    let id = new_delegated_agent_id();
                     let nickname = agent_nickname(agents_spawned);
+                    self.ownership
+                        .register_owner(&id, &format!("{nickname} ({id})"));
+                    if role == AgentRole::Worker && !files.is_empty() {
+                        // Atomic legacy pre-claim; admission above already
+                        // verified there is no live conflict, and this batch's
+                        // earlier spawns claim before later ones are admitted.
+                        if let Err(rejection) = self.ownership.try_claim(&id, &files) {
+                            let msg = rejection.for_model();
+                            self.ownership.release_all(&id);
+                            observer(AgentEvent::ToolResult {
+                                id: call.id.as_str().to_string(),
+                                name: SPAWN_AGENT_TOOL.to_string(),
+                                is_error: true,
+                                preview: preview(&msg),
+                            });
+                            results[index] = Some(ContentPart::ToolResult {
+                                result: ToolResultContent {
+                                    call_id: call.id,
+                                    content: msg,
+                                    is_error: true,
+                                },
+                            });
+                            agents_spawned -= 1;
+                            continue;
+                        }
+                    }
                     let started_task = if role == AgentRole::Worker && !files.is_empty() {
                         format!("{task}\n[scope: {}]", files.join(", "))
                     } else {
@@ -2568,7 +2851,7 @@ impl Executor {
                             is_error: false,
                             preview: preview(&content),
                         });
-                        background_children.0.push(BackgroundChild {
+                        background_children.children.push(BackgroundChild {
                             id,
                             nickname,
                             role,
@@ -2612,6 +2895,7 @@ impl Executor {
                         biased;
                         Some(progress_ev) = progress_rx.recv() => observer(progress_ev),
                         Some((index, call_id, id, nickname, role, result)) = futs.next() => {
+                            self.ownership.release_all(&id);
                             let (content, ok) = fold_child_settlement(
                                 &mut progress,
                                 &mut commands_run,
@@ -2689,6 +2973,17 @@ impl Executor {
                 return Err(AgentError::Cancelled);
             }
 
+            // A successful non-observe action this round ran with the round's
+            // MODEL-VISIBLE settlement notices in context — the parent has
+            // acted on those, so exactly that portion of the debt is consumed.
+            // Debt added during this round (foreground folds, this boundary's
+            // settle below) was never seen by a model call and survives.
+            if non_observe_success_this_round > 0 {
+                progress.unconsumed_child_settlements = progress
+                    .unconsumed_child_settlements
+                    .saturating_sub(visible_settlement_debt);
+            }
+
             // V2: forward background children's live progress and settle any
             // that finished — the notice must be in context before the next
             // model round ("you are told when one finishes"; no polling).
@@ -2718,6 +3013,41 @@ impl Executor {
                         observer(AgentEvent::ProgressUpdated {
                             ledger: progress.clone(),
                         });
+                    }
+                    DelegationRoundAction::Offer {
+                        trigger: "reconsideration",
+                        steps,
+                    } => {
+                        // The one event-driven re-ask: the plan materially
+                        // changed after a kept disposition. Grounded in the
+                        // ledger's first-touch mutation paths — the parent's
+                        // real context boundary, not an inferred scope.
+                        progress.delegation_reconsidered = true;
+                        observer(AgentEvent::DelegationStage {
+                            action: "reoffered".to_string(),
+                            detail: "plan_progress".to_string(),
+                        });
+                        observer(AgentEvent::ProgressUpdated {
+                            ledger: progress.clone(),
+                        });
+                        let parent_edited: Vec<String> = {
+                            let mut seen = Vec::new();
+                            for m in &ledger.mutations {
+                                for p in &m.paths {
+                                    if !seen.contains(p) {
+                                        seen.push(p.clone());
+                                    }
+                                }
+                            }
+                            seen
+                        };
+                        messages.push(Message::text(
+                            Role::User,
+                            crate::sub_agent::delegation_reconsideration_request(
+                                &steps,
+                                &parent_edited,
+                            ),
+                        ));
                     }
                     DelegationRoundAction::Offer { trigger, steps } => {
                         progress.delegation_decision_offered = true;
@@ -2940,6 +3270,29 @@ impl Executor {
             // fire later. Never caps navigation; not a hard budget.
             if structured_plan_required && !structured_plan_started {
                 plan_explore_rounds_used = plan_explore_rounds_used.saturating_add(1);
+            }
+
+            // Engagement guard bookkeeping. Material progress is a LATCH over
+            // deliberate acts: a registered plan, or a successful call to a tool
+            // the REGISTRY declares file-mutating. Never a tool's name, never
+            // its exit status, and never the workspace merely having changed.
+            //
+            // Not the workspace diff: CTL_LONG_B_ORCH_3 ran 139 tool calls over
+            // 99 rounds, registered no plan, applied no edit, and produced
+            // nothing — yet its ledger reports cumulative_modified_files: 2,
+            // both shell byproducts (`reference-verbs.md.bak` and `.tmp`).
+            // Latching on that count would have silenced the advisory on the
+            // very run that proves the spiral. Filename heuristics are not the
+            // answer either — `mutates_files` is a product-declared property.
+            //
+            // Not a passing verification: running the repository's existing
+            // suite proves nothing about what THIS run produced, and would be a
+            // one-command way to silence the advisory for the rest of the turn.
+            if !call_snapshot.is_empty() {
+                engagement_tool_rounds = engagement_tool_rounds.saturating_add(1);
+            }
+            if structured_plan_started || edit_applied_this_round {
+                engagement_material_progress = true;
             }
 
             // Goal mode: an explicit update_goal this round ends the run now that
@@ -3180,6 +3533,12 @@ fn fold_child_settlement(
 ) -> (String, bool) {
     // Roll sub-agent spend into the parent task epoch.
     progress.absorb_child_spend(&result.progress);
+    // Settlement × continuation seam: every settled result starts as debt the
+    // parent has not acted on. The round loop resets the counter when a round
+    // with the notice model-visible performs a successful non-observe action,
+    // so a nonzero value at a window boundary means a stranded result the
+    // continuation layer must give the parent a bounded window to integrate.
+    progress.unconsumed_child_settlements = progress.unconsumed_child_settlements.saturating_add(1);
     *commands_run = progress.cumulative_commands;
     *model_tokens_spent = progress.cumulative_model_tokens;
     *cost_spent_micros = progress.cumulative_cost_usd_micros;

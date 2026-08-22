@@ -1,0 +1,60 @@
+id: a02-shared-record-exporters
+name: "Two exporters of one shared record"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub mod record;
+    pub mod json_export;
+    pub mod toml_export;
+  src/record.rs: |
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Record {
+        pub name: String,
+        pub value: Option<i64>,
+    }
+  src/json_export.rs: |
+    use crate::record::Record;
+    pub fn to_json(row: &Record) -> String {
+        todo!("same field order and null policy as toml_export")
+    }
+  src/toml_export.rs: |
+    use crate::record::Record;
+    pub fn to_toml(row: &Record) -> String {
+        todo!("same field order and null policy as json_export")
+    }
+  tests/spec.rs: |
+    use evalcase::json_export::to_json;
+    use evalcase::record::Record;
+    use evalcase::toml_export::to_toml;
+
+    fn sample() -> Record {
+        Record { name: "n".into(), value: None }
+    }
+
+    #[test]
+    fn json_omits_null_value() {
+        let s = to_json(&sample());
+        assert!(s.contains("n"));
+        assert!(!s.contains("null"));
+    }
+
+    #[test]
+    fn toml_omits_null_value() {
+        let s = to_toml(&sample());
+        assert!(s.contains("n"));
+        assert!(!s.contains("null"));
+    }
+task: |
+  Implement json and toml exporters for Record so missing `value` is omitted
+  in both formats, never printed as null, and field order stays name then
+  value. The two exporters must agree on that policy. Do not edit tests.
+expect:
+  program: "true"
+  args: []

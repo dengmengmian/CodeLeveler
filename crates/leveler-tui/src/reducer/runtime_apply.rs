@@ -514,6 +514,19 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 message: format!("bg {task_id}: {program} started"),
             });
         }
+        RuntimeEvent::ObservabilityLoaded {
+            observation,
+            query_id,
+        } => {
+            // Only a correlated 1.6 response for the query this view owns.
+            // `query_id: None` is a legacy 1.5 payload — decode-safe, not owned.
+            match (&state.trace.pending_query_id, &query_id) {
+                (Some(pending), Some(incoming)) if pending == incoming => {}
+                _ => return,
+            }
+            state.trace.loaded = Some(observation);
+            state.trace.clamp();
+        }
         RuntimeEvent::BackgroundTaskExited {
             task_id,
             exit_code,

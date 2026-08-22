@@ -7,9 +7,13 @@ import type { Action, AppState } from '../state/store';
 import { initialState, reducer } from '../state/store';
 import type { ClientCommand, RuntimeEvent, UpFrame } from '../types/protocol';
 import { RuntimeBridge } from './controller';
+import { loadLastSession, saveLastSession } from './lastSession';
+
+const localStore = new Map<string, string>();
 
 // getToken 需要 window/sessionStorage；node 环境下补最小桩。
 beforeEach(() => {
+  localStore.clear();
   const g = globalThis as Record<string, unknown>;
   g.window = {
     location: { href: 'http://localhost/', protocol: 'http:', host: 'localhost' },
@@ -20,6 +24,15 @@ beforeEach(() => {
     setItem: () => {},
     removeItem: () => {},
   };
+  g.localStorage = {
+    getItem: (key: string) => localStore.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      localStore.set(key, value);
+    },
+    removeItem: (key: string) => {
+      localStore.delete(key);
+    },
+  };
 });
 
 interface Harness {
@@ -27,6 +40,7 @@ interface Harness {
   state: AppState;
   sent: ClientCommand[];
   apply: (ev: RuntimeEvent) => void;
+  wsSession: { id: string | null };
 }
 
 function harness(): Harness {
@@ -34,11 +48,20 @@ function harness(): Harness {
   const dispatch = (action: Action) => reducer(state, action);
   const bridge = new RuntimeBridge(dispatch, () => state);
   const sent: ClientCommand[] = [];
+  const wsSession = { id: 's1' as string | null };
   // 拦截 WS 出站帧：只关心命令语义，不建真连接。
-  (bridge as unknown as { ws: { send: (f: UpFrame) => boolean } }).ws = {
+  (bridge as unknown as {
+    ws: {
+      send: (f: UpFrame) => boolean;
+      setSession: (id: string | null) => void;
+    };
+  }).ws = {
     send: (frame: UpFrame) => {
       if (frame.type === 'deliver') sent.push(frame.command);
       return true;
+    },
+    setSession: (id: string | null) => {
+      wsSession.id = id;
     },
   };
   reducer(state, {
@@ -56,7 +79,7 @@ function harness(): Harness {
   });
   const apply = (ev: RuntimeEvent) =>
     (bridge as unknown as { applyEvent: (ev: RuntimeEvent) => void }).applyEvent(ev);
-  return { bridge, state, sent, apply };
+  return { bridge, state, sent, apply, wsSession };
 }
 
 describe('product axes commands', () => {
@@ -91,6 +114,187 @@ describe('product axes commands', () => {
   });
 });
 
+function emptyHarness(): Harness {
+  const state: AppState = structuredClone(initialState);
+  const dispatch = (action: Action) => reducer(state, action);
+  const bridge = new RuntimeBridge(dispatch, () => state);
+  const sent: ClientCommand[] = [];
+  const wsSession = { id: null as string | null };
+  (bridge as unknown as {
+    ws: {
+      send: (f: UpFrame) => boolean;
+      setSession: (id: string | null) => void;
+    };
+  }).ws = {
+    send: (frame: UpFrame) => {
+      if (frame.type === 'deliver') sent.push(frame.command);
+      return true;
+    },
+    setSession: (id: string | null) => {
+      wsSession.id = id;
+    },
+  };
+  const apply = (ev: RuntimeEvent) =>
+    (bridge as unknown as { applyEvent: (ev: RuntimeEvent) => void }).applyEvent(ev);
+  return { bridge, state, sent, apply, wsSession };
+}
+
+function summary(id: string, repository = '/repo'): {
+  id: string;
+  goal: string;
+  model: string;
+  status: string;
+  updated_at: string;
+  repository: string;
+} {
+  return {
+    id,
+    goal: id,
+    model: 'm',
+    status: 'idle',
+    updated_at: '2026-08-20T00:00:00Z',
+    repository,
+  };
+}
+
+describe('new session', () => {
+  it('newDraft without an argument targets the selected project', () => {
+    const { bridge, state } = harness();
+    reducer(state, { type: 'select_project', path: '/A' });
+    bridge.newDraft();
+    expect(state.draft).toBe(true);
+    expect(state.draftProject).toBe('/A');
+    expect(state.selectedProject).toBe('/A');
+  });
+
+  it('newDraft forgets the last conversation so refresh stays on new task', () => {
+    const { bridge } = harness();
+    saveLastSession('s1');
+    bridge.newDraft('/A');
+    expect(loadLastSession()).toBeNull();
+  });
+});
+
+describe('reopen last conversation on refresh', () => {
+  it('selectSession remembers the conversation', () => {
+    const { bridge } = emptyHarness();
+    bridge.selectSession('sess-keep');
+    expect(loadLastSession()).toBe('sess-keep');
+  });
+
+  it('session_list reopens the last conversation instead of staying on the hero', () => {
+    saveLastSession('sess-keep');
+    const { state, sent, apply, wsSession } = emptyHarness();
+    expect(state.draft).toBe(true);
+    apply({
+      type: 'session_list',
+      sessions: [summary('other'), summary('sess-keep')],
+    });
+    expect(state.draft).toBe(false);
+    expect(wsSession.id).toBe('sess-keep');
+    expect(sent.some((c) => c.type === 'open_session' && c.session_id === 'sess-keep')).toBe(true);
+  });
+
+  it('does not invent a conversation when nothing was open', () => {
+    const { state, sent, apply } = emptyHarness();
+    apply({ type: 'session_list', sessions: [summary('sess-keep')] });
+    expect(state.draft).toBe(true);
+    expect(sent.some((c) => c.type === 'open_session')).toBe(false);
+  });
+
+  it('stays on new task when the last conversation is gone', () => {
+    saveLastSession('deleted');
+    const { state, apply } = emptyHarness();
+    apply({ type: 'session_list', sessions: [summary('other')] });
+    expect(state.draft).toBe(true);
+    expect(state.current).toBeNull();
+  });
+});
+
+describe('project switch isolation', () => {
+  it('leaving a project unsubscribes the previous session websocket', () => {
+    const { bridge, state, wsSession } = harness();
+    expect(state.current?.repository).toBe('/repo');
+    bridge.selectProject('/B');
+    expect(state.current).toBeNull();
+    expect(state.draft).toBe(true);
+    expect(wsSession.id).toBeNull();
+  });
+
+  it('keeps the websocket on the open session when re-selecting its project', () => {
+    const { bridge, state, wsSession } = harness();
+    bridge.selectProject('/repo');
+    expect(state.current?.id).toBe('s1');
+    expect(wsSession.id).toBe('s1');
+  });
+
+  it('newDraft unsubscribes so the draft is not still bound to the left session', () => {
+    const { bridge, wsSession } = harness();
+    bridge.newDraft('/A');
+    expect(wsSession.id).toBeNull();
+  });
+
+  it('drops late events from the left session after a project switch', () => {
+    const { bridge, state, apply } = harness();
+    bridge.selectProject('/B');
+    apply({ type: 'assistant_text_delta', message_id: 'm1', delta: 'leak from A' });
+    expect(state.current).toBeNull();
+    expect(state.observation).toBeNull();
+  });
+
+  it('does not adopt a late snapshot of the left session while drafting on another project', () => {
+    const { bridge, state } = harness();
+    bridge.selectProject('/B');
+    (
+      bridge as unknown as {
+        applySnapshot: (snap: {
+          id: string;
+          repository: string;
+          goal: string;
+          model: null;
+          mode: 'assisted';
+          branch: null;
+          status: string;
+          messages: Array<{ id: string; role: 'assistant'; text: string }>;
+        }) => void;
+      }
+    ).applySnapshot({
+      id: 's1',
+      repository: '/repo',
+      goal: 'g',
+      model: null,
+      mode: 'assisted',
+      branch: null,
+      status: 'running',
+      messages: [{ id: 'm', role: 'assistant', text: 'leaked' }],
+    });
+    expect(state.current).toBeNull();
+    expect(state.draft).toBe(true);
+  });
+
+  it('session mutations stay ClientCommand on the session id', () => {
+    const { bridge, sent } = harness();
+    bridge.renameSession('s1', 'new title');
+    bridge.archiveSession('s1');
+    bridge.forkSession('s1');
+    bridge.deleteSession('s1');
+    expect(sent.map((c) => c.type)).toEqual([
+      'rename_session',
+      'request_session_list',
+      'archive_session',
+      'request_session_list',
+      'fork_session',
+      'request_session_list',
+      'delete_session',
+      'request_session_list',
+    ]);
+    expect(sent[0]).toMatchObject({ type: 'rename_session', session_id: 's1', name: 'new title' });
+    expect(sent[2]).toMatchObject({ type: 'archive_session', session_id: 's1' });
+    expect(sent[4]).toMatchObject({ type: 'fork_session', session_id: 's1' });
+    expect(sent[6]).toMatchObject({ type: 'delete_session', session_id: 's1' });
+  });
+});
+
 describe('memory commands', () => {
   it('accept/forget send the user-authoritative variants then refresh the list', () => {
     const { bridge, sent } = harness();
@@ -102,6 +306,145 @@ describe('memory commands', () => {
       'forget_memory',
       'list_memory',
     ]);
+  });
+});
+
+describe('interaction commands', () => {
+  it('sendBtw delivers the typed btw command, not a slash string', () => {
+    const { bridge, sent } = harness();
+    bridge.sendBtw('这是什么');
+    expect(sent).toEqual([{ type: 'btw', session_id: 's1', question: '这是什么' }]);
+  });
+
+  it('openChanges requests a fresh diff then stages Changes', () => {
+    const { bridge, sent, state } = harness();
+    bridge.openChanges();
+    expect(sent[0]).toMatchObject({ type: 'request_diff', session_id: 's1' });
+    expect(state.stageView).toBe('diff');
+  });
+
+  it('openMemory lists memory and opens Inspector More', () => {
+    const { bridge, sent, state } = harness();
+    reducer(state, { type: 'set_inspector', open: false });
+    expect(state.inspectorOpen).toBe(false);
+    bridge.openMemory();
+    expect(sent[0]).toMatchObject({ type: 'list_memory', session_id: 's1', include_archived: true });
+    expect(state.inspectorOpen).toBe(true);
+    expect(state.inspectorMore).toBe(true);
+  });
+});
+
+describe('session_updated vs session_opened', () => {
+  it('session_updated merges metadata and does not replace completed tools', () => {
+    const { apply, state } = harness();
+    reducer(state, {
+      type: 'tool_started',
+      id: 't1',
+      name: 'read_file',
+      arguments: '{"path":"README.md"}',
+      parallel: false,
+    });
+    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 8 });
+    apply({
+      type: 'session_updated',
+      session: {
+        id: 's1',
+        repository: '/repo',
+        goal: 'g',
+        model: null,
+        mode: 'full_access',
+        branch: 'main',
+        status: 'idle',
+        messages: [],
+        active_tools: [],
+        work_profile: 'delivery',
+        collaboration: 'goal',
+      },
+    });
+    expect(state.current?.tools).toHaveLength(1);
+    expect(state.current?.tools[0]?.status).toBe('done');
+    expect(state.current?.permission).toBe('full_access');
+    expect(state.current?.workProfile).toBe('delivery');
+    expect(state.current?.collaboration).toBe('goal');
+  });
+
+  it('session_opened still replaces the session view from the snapshot', () => {
+    const { apply, state } = harness();
+    reducer(state, {
+      type: 'tool_started',
+      id: 't1',
+      name: 'read_file',
+      arguments: '{}',
+      parallel: false,
+    });
+    apply({
+      type: 'session_opened',
+      session: {
+        id: 's1',
+        repository: '/repo',
+        goal: 'g',
+        model: null,
+        mode: 'assisted',
+        branch: null,
+        status: 'idle',
+        messages: [],
+        active_tools: [],
+      },
+    });
+    expect(state.current?.tools).toHaveLength(0);
+  });
+});
+
+describe('query observability', () => {
+  it('sends query_observability and stores ObservabilityLoaded off live tools', () => {
+    const { bridge, sent, apply, state } = harness();
+    bridge.queryObservability('s1');
+    const sentQuery = sent[sent.length - 1];
+    expect(sentQuery).toMatchObject({
+      type: 'query_observability',
+      session_id: 's1',
+      before: 0,
+      after: 80,
+    });
+    expect(sentQuery.type === 'query_observability' && sentQuery.query_id).toBeTruthy();
+    const queryId = sentQuery.type === 'query_observability' ? sentQuery.query_id : '';
+    apply({
+      type: 'observability_loaded',
+      query_id: queryId,
+      observation: {
+        agents: [],
+        recovery: { interrupted_turns: 0, repair_attempts: 0, workspace_snapshots: 0, review_stages: [] },
+        requests: [],
+        tools: [{ name: 'read_file', class: 'read', calls: 40, succeeded: 40, failed: 0, unfinished: 0 }],
+        window: [],
+        window_from: 1,
+        window_to: 2,
+        session: {
+          session_id: 's1',
+          goal: 'fix auth',
+          repository: '/repo',
+          created_at: 't',
+          updated_at: 't',
+          status: 'completed',
+          model: 'deepseek/v4',
+          work_profile: 'balanced',
+          collaboration: 'chat',
+          request_count: 3,
+          input_tokens: 10,
+          output_tokens: 2,
+          request_failures: 0,
+          request_retries: 0,
+          tool_started: 21,
+          tool_finished: 21,
+          verification_runs: 1,
+          compact_count: 0,
+          subagent_started: 0,
+          repair_started: 0,
+        },
+      },
+    });
+    expect(state.observation?.session.tool_started).toBe(21);
+    expect(state.current?.tools).toEqual([]);
   });
 });
 

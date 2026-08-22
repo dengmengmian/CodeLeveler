@@ -23,7 +23,7 @@ pub use environment::{
 };
 pub use home::LevelerHome;
 pub use ids::{
-    ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, RequestId,
+    AgentId, ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, RequestId,
     RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, UserShellId, new_uuid_string,
 };
 pub use ownership::{OwnerEpoch, OwnershipToken};

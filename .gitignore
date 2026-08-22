@@ -22,6 +22,23 @@ CLAUDE.md
 # Generated evaluation output
 evals/baselines/*.json
 evals/baselines/*.jsonl
+eval/runs/*/
+eval/**/__pycache__/
+eval/**/*.pyc
+eval/reports/*.json
+eval/reports/*.jsonl
+eval/reports/*.md
+eval/reports/*.csv
+eval/reports/adoption/
+eval/reports/capability/
+eval/reports/safety/
+!eval/reports/README.md
+!eval/reports/EXAMPLE.md
+!eval/runs/README.md
+eval/micro/adoption/reports/*.json
+eval/micro/adoption/reports/*.csv
+eval/micro/adoption/reports/REPORT.md
+eval/micro/adoption/reports/batch.json
 # Version-trend history (run baselines) + generated regression report
 evals/history/*.json
 evals/history/*.jsonl

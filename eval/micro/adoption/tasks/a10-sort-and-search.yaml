@@ -1,0 +1,43 @@
+id: a10-sort-and-search
+name: "Independent sort and search"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub mod sort_stable;
+    pub mod find_first;
+  src/sort_stable.rs: |
+    pub fn sort_stable(values: &mut [i32]) {
+        todo!("ascending, stable")
+    }
+  src/find_first.rs: |
+    pub fn find_first(values: &[i32], needle: i32) -> Option<usize> {
+        todo!("index of the first equal element")
+    }
+  tests/spec.rs: |
+    use evalcase::find_first::find_first;
+    use evalcase::sort_stable::sort_stable;
+    #[test]
+    fn sorts() {
+        let mut v = [3, 1, 2];
+        sort_stable(&mut v);
+        assert_eq!(v, [1, 2, 3]);
+    }
+    #[test]
+    fn finds() {
+        assert_eq!(find_first(&[1, 2, 2], 2), Some(1));
+        assert_eq!(find_first(&[1, 2], 9), None);
+    }
+task: |
+  Implement sort_stable in src/sort_stable.rs and find_first in
+  src/find_first.rs. They do not share types or helpers. Match tests/spec.rs.
+  Do not edit the tests.
+expect:
+  program: "true"
+  args: []

@@ -10,9 +10,9 @@ import 'package:flutter/material.dart';
 import 'crypto/store.dart';
 import 'domain/app_controller.dart';
 import 'ui/chat_screen.dart';
+import 'ui/home_screen.dart';
 import 'ui/theme.dart';
 import 'ui/pairing_screen.dart';
-import 'ui/projects_screen.dart';
 import 'ui/sessions_screen.dart';
 
 void main() {
@@ -75,7 +75,7 @@ class _Root extends StatelessWidget {
                 '项目',
           );
         }
-        return ProjectsScreen(controller: controller);
+        return HomeScreen(controller: controller);
       },
     );
   }

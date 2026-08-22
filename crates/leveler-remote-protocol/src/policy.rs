@@ -231,6 +231,13 @@ impl RemotePolicy {
                 }
             }
 
+            // Local-only observatory: path/command summaries must not leave
+            // the machine. PublicEvent remains the remote projection.
+            ClientCommand::QueryObservability { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "runtime observatory is local-only",
+            },
+
             // Shuts down the runtime for every client, local ones included.
             // The local socket transport refuses it too.
             ClientCommand::Quit => RemoteVerdict::Deny {

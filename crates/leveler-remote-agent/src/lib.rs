@@ -21,7 +21,10 @@ mod projects;
 mod tunnel;
 
 pub use approvals::WAITER_POLL;
-pub use attachments::{MAX_ATTACHMENT_BYTES, MAX_SESSION_BYTES, UploadChunk, UploadError};
+pub use attachments::{
+    FETCH_CHUNK_BYTES, FetchChunkRequest, FetchChunkResponse, MAX_ATTACHMENT_BYTES,
+    MAX_SESSION_BYTES, UploadChunk, UploadError, is_sha256_hex,
+};
 pub use audit::{AuditEvent, AuditLog, DEFAULT_RETENTION_DAYS, hashed};
 pub use bridge::{AdmissionError, Admitted, AgentBridge};
 pub use config::{

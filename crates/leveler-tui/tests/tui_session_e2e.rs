@@ -6,8 +6,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use leveler_client_protocol::{
-    MessageId, PermissionProfile, PlanStepStatus, RuntimeEvent, SessionId, ToolCallId, UiDiff,
-    UiDiffFile, UiPlan, UiPlanStep, UiSessionSnapshot,
+    ClientCommand, CommandId, MessageId, ObservationClass, PermissionProfile, PlanStepStatus,
+    RuntimeEvent, SessionId, ToolCallId, UiDiff, UiDiffFile, UiObservabilityLoaded, UiPlan,
+    UiPlanStep, UiRecoveryObservation, UiSessionObservation, UiSessionSnapshot, UiToolAggregate,
 };
 use leveler_tui::action::{Action, Effect};
 use leveler_tui::reducer::reduce;
@@ -422,4 +423,212 @@ fn tui_esc_dismisses_slash_popup() {
     reduce(&mut s, key(KeyCode::Esc));
     assert!(leveler_tui::screen::visible_slash_popup(&s).is_empty());
     assert_eq!(s.composer.text(), "/");
+}
+
+#[test]
+fn tui_trace_queries_durable_observatory_and_esc_returns() {
+    let mut s = opened();
+    typed(&mut s, "/trace");
+    let effects = enter(&mut s);
+    assert_eq!(s.active_screen, Screen::Trace);
+    let query_id = sent_query_id(&effects);
+    assert!(
+        query_id.is_some(),
+        " /trace must query the runtime, not SQLite: {effects:?}"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id,
+            observation: UiObservabilityLoaded {
+                session: UiSessionObservation {
+                    session_id: SessionId::new("e2e"),
+                    goal: "e2e".into(),
+                    repository: "/repo".into(),
+                    created_at: "t".into(),
+                    updated_at: "t".into(),
+                    status: "completed".into(),
+                    model: "glm-5.2".into(),
+                    work_profile: "balanced".into(),
+                    collaboration: "goal".into(),
+                    last_sequence: Some(12),
+                    request_count: 3,
+                    input_tokens: 1000,
+                    output_tokens: 40,
+                    avg_latency_ms: Some(2000),
+                    last_latency_ms: Some(1800),
+                    request_failures: 0,
+                    request_retries: 0,
+                    tool_started: 5,
+                    tool_finished: 5,
+                    verification_runs: 1,
+                    compact_count: 0,
+                    subagent_started: 0,
+                    repair_started: 0,
+                },
+                window: Vec::new(),
+                window_from: 1,
+                window_to: 12,
+                requests: Vec::new(),
+                tools: vec![UiToolAggregate {
+                    name: "read_file".into(),
+                    class: ObservationClass::Read,
+                    calls: 40,
+                    succeeded: 40,
+                    failed: 0,
+                    unfinished: 0,
+                    total_ms: Some(1840),
+                    avg_ms: Some(46),
+                }],
+                agents: Vec::new(),
+                recovery: UiRecoveryObservation {
+                    interrupted_turns: 0,
+                    repair_attempts: 0,
+                    workspace_snapshots: 0,
+                    review_stages: Vec::new(),
+                },
+                relations: Vec::new(),
+            },
+        }),
+    );
+    let ui = screen(&mut s);
+    assert!(
+        ui.contains("Observatory") || ui.contains("MODEL") || ui.contains("glm"),
+        "trace screen: {ui}"
+    );
+    reduce(&mut s, key(KeyCode::Char('4')));
+    let tools_ui = screen(&mut s);
+    assert!(
+        tools_ui.contains("全会话汇总")
+            && tools_ui.contains("read_file")
+            && tools_ui.contains("40"),
+        "Tools tab is session-wide, not the event window: {tools_ui}"
+    );
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+fn sent_query_id(effects: &[Effect]) -> Option<CommandId> {
+    effects.iter().find_map(|e| match e {
+        Effect::Send(ClientCommand::QueryObservability {
+            query_id: Some(id), ..
+        }) => Some(id.clone()),
+        _ => None,
+    })
+}
+
+fn trace_observation(window_from: i64, window_to: i64) -> UiObservabilityLoaded {
+    UiObservabilityLoaded {
+        session: UiSessionObservation {
+            session_id: SessionId::new("e2e"),
+            goal: "e2e".into(),
+            repository: "/repo".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            status: "completed".into(),
+            model: "glm-5.2".into(),
+            work_profile: "balanced".into(),
+            collaboration: "goal".into(),
+            last_sequence: Some(100),
+            request_count: 3,
+            input_tokens: 1000,
+            output_tokens: 40,
+            avg_latency_ms: Some(2000),
+            last_latency_ms: Some(1800),
+            request_failures: 0,
+            request_retries: 0,
+            tool_started: 5,
+            tool_finished: 5,
+            verification_runs: 1,
+            compact_count: 0,
+            subagent_started: 0,
+            repair_started: 0,
+        },
+        window: Vec::new(),
+        window_from,
+        window_to,
+        requests: Vec::new(),
+        tools: Vec::new(),
+        agents: Vec::new(),
+        recovery: UiRecoveryObservation {
+            interrupted_turns: 0,
+            repair_attempts: 0,
+            workspace_snapshots: 0,
+            review_stages: Vec::new(),
+        },
+        relations: Vec::new(),
+    }
+}
+
+#[test]
+fn tui_trace_ignores_observability_loaded_for_a_foreign_query() {
+    let mut s = opened();
+    typed(&mut s, "/trace");
+    let effects = enter(&mut s);
+    let owned = sent_query_id(&effects).expect("trace query");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: Some(CommandId::new("foreign-historical")),
+            observation: trace_observation(20, 60),
+        }),
+    );
+    assert!(
+        s.trace.loaded.is_none(),
+        "foreign query must not populate /trace"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: Some(owned),
+            observation: trace_observation(21, 100),
+        }),
+    );
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_from), Some(21));
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_to), Some(100));
+}
+
+#[test]
+fn tui_trace_drops_a_stale_owned_query_after_refresh() {
+    let mut s = opened();
+    typed(&mut s, "/trace");
+    let first = enter(&mut s);
+    let query_a = sent_query_id(&first).expect("first query");
+    let second = reduce(&mut s, key(KeyCode::Char('r')));
+    let query_b = sent_query_id(&second).expect("refresh query");
+    assert_ne!(query_a, query_b);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: Some(query_b.clone()),
+            observation: trace_observation(21, 100),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: Some(query_a),
+            observation: trace_observation(20, 60),
+        }),
+    );
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_from), Some(21));
+    assert_eq!(s.trace.loaded.as_ref().map(|l| l.window_to), Some(100));
+}
+
+#[test]
+fn tui_trace_ignores_legacy_observability_loaded_without_query_id() {
+    let mut s = opened();
+    typed(&mut s, "/trace");
+    let _ = enter(&mut s);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ObservabilityLoaded {
+            query_id: None,
+            observation: trace_observation(20, 60),
+        }),
+    );
+    assert!(
+        s.trace.loaded.is_none(),
+        "1.5 uncorrelated payload must not populate a 1.6 /trace"
+    );
 }

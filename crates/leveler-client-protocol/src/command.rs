@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::{ApprovalId, CheckpointId, ClarificationId, SessionId};
+use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, SessionId};
 use leveler_model::ModelRef;
 
 use super::media::AttachmentRef;
@@ -174,6 +174,27 @@ pub enum ClientCommand {
         session_id: SessionId,
         question: String,
     },
+    /// Read-only observatory query. Does not mutate runtime, tools, or
+    /// verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].
+    QueryObservability {
+        session_id: SessionId,
+        /// Correlation token for [`crate::RuntimeEvent::ObservabilityLoaded`].
+        /// Distinct from envelope `command_id` (delivery idempotency): this
+        /// names the query so a client can ignore another client's (or its
+        /// own stale) observatory response. Absent on protocol 1.5 peers.
+        /// Not a session identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        /// Sequence to center the event window on. `None` = latest durable seq.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        center_seq: Option<i64>,
+        /// Events strictly before the center (capped by the runtime).
+        #[serde(default)]
+        before: u32,
+        /// Events at/after the center (capped by the runtime).
+        #[serde(default)]
+        after: u32,
+    },
     /// The runtime owner is shutting down; all work should stop. Disconnecting
     /// an individual UI client must not issue this command.
     Quit,
@@ -211,7 +232,8 @@ impl ClientCommand {
             | ClientCommand::RestoreCheckpoint { session_id, .. }
             | ClientCommand::RunUserShell { session_id, .. }
             | ClientCommand::CancelUserShell { session_id, .. }
-            | ClientCommand::Btw { session_id, .. } => Some(session_id),
+            | ClientCommand::Btw { session_id, .. }
+            | ClientCommand::QueryObservability { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
                 requester_session_id,
             }
@@ -412,6 +434,60 @@ mod tests {
                 mode: PermissionProfile::FullAccess,
             },
             "set_permission_profile",
+        );
+    }
+
+    #[test]
+    fn query_observability_roundtrips() {
+        roundtrip(
+            ClientCommand::QueryObservability {
+                session_id: SessionId::new("s1"),
+                query_id: Some(CommandId::new("q1")),
+                center_seq: Some(42),
+                before: 10,
+                after: 20,
+            },
+            "query_observability",
+        );
+    }
+
+    #[test]
+    fn query_observability_decodes_protocol_1_5_without_query_id() {
+        let cmd: ClientCommand = serde_json::from_str(
+            r#"{"type":"query_observability","session_id":"s1","before":0,"after":80}"#,
+        )
+        .expect("1.5 query_observability must decode on 1.6");
+        match cmd {
+            ClientCommand::QueryObservability {
+                session_id,
+                query_id,
+                center_seq,
+                before,
+                after,
+            } => {
+                assert_eq!(session_id.as_str(), "s1");
+                assert_eq!(query_id, None);
+                assert_eq!(center_seq, None);
+                assert_eq!(before, 0);
+                assert_eq!(after, 80);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_observability_omits_absent_query_id_on_the_wire() {
+        let json = serde_json::to_string(&ClientCommand::QueryObservability {
+            session_id: SessionId::new("s1"),
+            query_id: None,
+            center_seq: None,
+            before: 0,
+            after: 80,
+        })
+        .unwrap();
+        assert!(
+            !json.contains("query_id"),
+            "legacy-shaped query must not emit query_id: {json}"
         );
     }
 

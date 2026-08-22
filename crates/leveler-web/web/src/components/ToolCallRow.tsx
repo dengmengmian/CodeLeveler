@@ -4,7 +4,7 @@
 // 其余工具有输出时 hover 出现「输出」入口；失败命令默认展开末尾 30 行输出。
 
 import { useState } from 'react';
-import type { ToolCallView } from '../state/store';
+import { useAppDispatch, type ToolCallView } from '../state/store';
 import { formatDuration, toolSummary } from '../lib/format';
 import { tailLines } from '../lib/toolstats';
 import { DiffBlock, parseDiff, patchFromArguments } from './DiffBlock';
@@ -19,6 +19,7 @@ const GLYPH: Record<ToolCallView['status'], string> = {
 const FAIL_TAIL = 30;
 
 export function ToolCallRow({ tool }: { tool: ToolCallView }) {
+  const dispatch = useAppDispatch();
   const failed = tool.status === 'fail';
   const [open, setOpen] = useState(failed);
   const { verb, main } = toolSummary(tool.name, tool.arguments);
@@ -43,7 +44,24 @@ export function ToolCallRow({ tool }: { tool: ToolCallView }) {
       >
         <span className="glyph">{GLYPH[tool.status]}</span>
         <span className="cmd">
-          {verb} <span className="path">{diff && diff.files.length > 0 ? diff.files.join(', ') : main}</span>
+          {verb}{' '}
+          <span className="path">
+            {diff && diff.files.length > 0
+              ? diff.files.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    className="path-jump"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      dispatch({ type: 'focus_diff', path: p });
+                    }}
+                  >
+                    {p}
+                  </button>
+                ))
+              : main}
+          </span>
         </span>
         {diff && (
           <span className="tool-stat">

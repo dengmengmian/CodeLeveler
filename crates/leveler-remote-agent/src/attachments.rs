@@ -35,6 +35,36 @@ pub const MAX_SESSION_BYTES: usize = 20 * 1024 * 1024;
 /// thousands of assemblies that never complete.
 pub const MAX_CHUNKS: u32 = 64;
 
+/// Raw bytes per fetch chunk. Base64 expands ~4/3, so this stays under the
+/// 1 MiB envelope cap with room for JSON wrapping.
+pub const FETCH_CHUNK_BYTES: usize = 512 * 1024;
+
+/// One `fetch_attachment` request. `chunk_index` 0 is the first piece.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchChunkRequest {
+    pub sha256: String,
+    #[serde(default)]
+    pub chunk_index: u32,
+}
+
+/// One piece of a fetched attachment. The phone concatenates `data_base64`
+/// across `chunk_total` responses. There is no public download URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchChunkResponse {
+    pub sha256: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub chunk_index: u32,
+    pub chunk_total: u32,
+    pub data_base64: String,
+}
+
+/// Content-address ids are 64 lowercase hex characters. Anything else is
+/// refused before the runtime is asked, so `../` never becomes a path.
+pub fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// One piece of an upload, as it arrives inside a signed `rpc_request`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadChunk {

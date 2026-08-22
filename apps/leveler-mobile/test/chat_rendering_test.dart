@@ -80,8 +80,8 @@ void main() {
     // The goal names the session in the app bar, so it is on screen exactly
     // once; the body says what to do next rather than repeating it.
     expect(find.text('把登录页的报错文案改掉'), findsOneWidget);
-    expect(find.textContaining('说点什么'), findsWidgets);
-    expect(find.text('会话已经建好了'), findsOneWidget);
+    expect(find.textContaining('追加要求'), findsWidgets);
+    expect(find.text('任务已经建立'), findsOneWidget);
   });
 
   testWidgets('a short conversation sits against the composer', (tester) async {
@@ -109,6 +109,23 @@ void main() {
     );
   });
 
+  testWidgets('a tool call is shown as a timeline step, not as a chat bubble',
+      (tester) async {
+    final session = SessionState('s1')
+      ..applyEvent({
+        'type': 'tool_call_started',
+        'id': 't1',
+        'name': 'read_file',
+        'arguments': '{"path":"src/lib.rs"}',
+      });
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('读取文件'), findsOneWidget);
+    expect(find.byType(MarkdownBody), findsNothing);
+  });
+
   testWidgets('a host notification is shown, and not as the assistant speaking',
       (tester) async {
     // Dropped silently before. The host has no other way to say something that
@@ -131,6 +148,113 @@ void main() {
     expect(find.text('磁盘快满了'), findsOneWidget);
     // One Markdown body: the answer. The notice is not a second one.
     expect(find.byType(MarkdownBody), findsOneWidget);
+  });
+
+  testWidgets('a running turn labels the composer as a steer', (tester) async {
+    final session = SessionState('s1')
+      ..applyEvent({
+        'type': 'user_message_added',
+        'message': {'id': 'u1', 'role': 'user', 'text': '实现 Browser'},
+      });
+    expect(session.status, 'running');
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    final field = tester.widget<TextField>(find.byType(TextField));
+    expect(field.decoration?.hintText, '干预当前回合（立刻生效）');
+  });
+
+  testWidgets('an idle composer still says it will start a follow-up', (tester) async {
+    final session = SessionState('s1')
+      ..applySnapshot({
+        'status': 'idle',
+        'goal': '改报错文案',
+        'messages': const [],
+        'pending_interactions': const [],
+      });
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    final field = tester.widget<TextField>(find.byType(TextField));
+    expect(field.decoration?.hintText, '追加要求…');
+  });
+
+  testWidgets('thinking stays collapsed until tapped', (tester) async {
+    final session = SessionState('s1')
+      ..applyEvent({'type': 'reasoning_delta', 'delta': '秘密推理过程'});
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('思考中'), findsOneWidget);
+    expect(find.text('秘密推理过程'), findsNothing);
+
+    await tester.tap(find.text('思考中'));
+    await tester.pumpAndSettle();
+    expect(find.text('秘密推理过程'), findsOneWidget);
+  });
+
+  testWidgets('the task header shows plan progress without inventing a percentage', (tester) async {
+    final session = SessionState('s1')
+      ..goal = '实现 Browser Capability'
+      ..applyEvent({
+        'type': 'plan_updated',
+        'plan': {
+          'steps': [
+            {'description': '查 Trait', 'status': 'done'},
+            {'description': '改协议', 'status': 'running'},
+            {'description': '跑测试', 'status': 'pending'},
+          ],
+        },
+      })
+      ..applyEvent({'type': 'agent_activity', 'label': 'Running tests'});
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('1 / 3'), findsOneWidget);
+    expect(find.textContaining('Running tests'), findsWidgets);
+    expect(find.textContaining('60%'), findsNothing);
+  });
+
+  testWidgets('the task header opens a task workspace that shares session state', (tester) async {
+    final session = SessionState('s1')
+      ..goal = 'Implement Browser Capability'
+      ..applyEvent({
+        'type': 'plan_updated',
+        'plan': {
+          'steps': [
+            {'description': '查 Trait', 'status': 'done'},
+            {'description': '改协议', 'status': 'running'},
+            {'description': '跑测试', 'status': 'pending'},
+          ],
+        },
+      })
+      ..applyEvent({
+        'type': 'attachment_added',
+        'attachment': {
+          'id': 'a1',
+          'kind': 'text_file',
+          'name': 'review-report.md',
+          'mime_type': 'text/markdown',
+          'size_bytes': 12,
+          'sha256': 'aa',
+        },
+      });
+
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.textContaining('1 / 3'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Implement Browser Capability'), findsWidgets);
+    expect(find.text('计划'), findsOneWidget);
+    expect(find.text('产物'), findsOneWidget);
+    expect(find.text('review-report.md'), findsWidgets);
+    expect(find.textContaining('60%'), findsNothing);
   });
 
   testWidgets('a long conversation scrolls', (tester) async {

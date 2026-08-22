@@ -111,6 +111,17 @@ pub(crate) fn write_targets_outside_allowlist(
         .collect()
 }
 
+/// The paths a direct write tool would touch, normalized — for callers that
+/// need the target set itself (ownership fences) rather than a containment
+/// verdict against a fixed list.
+pub(crate) fn mutation_targets(call: &ToolCall) -> Vec<String> {
+    write_targets(call)
+        .into_iter()
+        .map(|p| norm_scope_path(&p))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 /// The paths a direct write tool would touch, unnormalized.
 fn write_targets(call: &ToolCall) -> Vec<String> {
     match call.name.as_str() {
@@ -149,30 +160,12 @@ fn scope_covers(a: &str, target: &str) -> bool {
     !a.is_empty() && (target == a || target.starts_with(&format!("{a}/")))
 }
 
-/// V2 parent write fence: the paths this call would write that fall INSIDE any
-/// of `scopes` (the exclusive scopes of still-running background Workers). A
-/// parent edit there would race the child it delegated to — integration waits
-/// for settlement.
-pub(crate) fn write_targets_inside_scopes(call: &ToolCall, scopes: &[String]) -> Vec<String> {
-    let owned: Vec<String> = scopes
-        .iter()
-        .map(|p| norm_scope_path(p))
-        .filter(|p| !p.is_empty())
-        .collect();
-    write_targets(call)
-        .into_iter()
-        .map(|p| norm_scope_path(&p))
-        .filter(|target| {
-            // This check DENIES matches, so an unresolvable spelling must
-            // fail CLOSED: a target using `..` segments or an absolute path
-            // cannot be proven outside the owned scopes by string comparison,
-            // so it is treated as inside (review: fence was fail-open for
-            // `foo/../b.txt`).
-            let unresolvable =
-                target.starts_with('/') || target.split('/').any(|segment| segment == "..");
-            unresolvable || owned.iter().any(|a| scope_covers(a, target))
-        })
-        .collect()
+/// Whether a normalized write target cannot be proven in-workspace by string
+/// comparison (absolute, or containing `..`). The ownership fence DENIES on a
+/// match, so such a spelling must fail CLOSED — it is treated as inside every
+/// claimed scope rather than silently escaping one.
+pub(crate) fn target_is_unresolvable(target: &str) -> bool {
+    target.starts_with('/') || target.split('/').any(|segment| segment == "..")
 }
 
 pub(crate) fn push_unique_path(out: &mut Vec<String>, path: &str) {

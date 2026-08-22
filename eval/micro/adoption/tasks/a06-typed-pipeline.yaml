@@ -1,0 +1,39 @@
+id: a06-typed-pipeline
+name: "Typed pipeline with a compile-time dependency"
+max_rounds: 16
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+    [lib]
+    path = "src/lib.rs"
+  src/lib.rs: |
+    pub mod types;
+    pub mod pipeline;
+  src/types.rs: |
+    /// Token produced by stage one. Stage two must consume this type.
+    pub struct Token(pub String);
+  src/pipeline.rs: |
+    use crate::types::Token;
+    pub fn tokenize(raw: &str) -> Vec<Token> {
+        todo!("split on ASCII whitespace")
+    }
+    pub fn join(tokens: &[Token]) -> String {
+        todo!("join with a single space")
+    }
+  tests/spec.rs: |
+    use evalcase::pipeline::{join, tokenize};
+    #[test]
+    fn round_trip() {
+        let t = tokenize("a  b");
+        assert_eq!(join(&t), "a b");
+    }
+task: |
+  Implement tokenize and join. join takes the Token type from src/types.rs —
+  do not invent a second token type. Keep the type definition in types.rs.
+  Do not edit tests.
+expect:
+  program: "true"
+  args: []

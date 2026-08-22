@@ -257,7 +257,7 @@ class _PairingScreenState extends State<PairingScreen> {
             value: _observeOnly,
             onChanged: (value) => setState(() => _observeOnly = value),
             title: const Text('只读配对'),
-            subtitle: const Text('可以看会话与事件，不能发送任何指令'),
+            subtitle: const Text('可以看任务与事件，不能发送任何指令'),
             contentPadding: EdgeInsets.zero,
           ),
           if (_error != null) ...[

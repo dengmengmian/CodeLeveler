@@ -1,0 +1,31 @@
+# Frozen LONG_A/B/C live in the private control plane. This repo does not
+# vendor those checkouts or hidden verifiers.
+#
+#   CONTROL_ROOT  default: $HOME/Develop/codeleveler-dogfood-control
+#   DOGFOOD_ROOT  default: $HOME/Develop/codeleveler-dogfood
+#
+# Cases are EvaluationCase YAML. Verifiers stay outside the agent workspace.
+
+control_root: ${CONTROL_ROOT}
+dogfood_root: ${DOGFOOD_ROOT}
+
+tasks:
+  LONG_A:
+    dir: cargo
+    shape: rust-cli
+    case_rel: ma-wa1-taskset-requalification/cases/long-a
+    repo_rel: maa/WA-xsv
+    verifier_rel: ma-wa1-long-task-orchestration-utility/scripts/verify-long-a.sh
+    note: Frozen as xsv four-command (cargo build). Not rust-lang/cargo.
+  LONG_B:
+    dir: miller
+    shape: go-cli
+    case_rel: ma-wa1-taskset-requalification/cases/long-b
+    repo_rel: maa/B-miller
+    verifier_rel: ma-wa1-long-task-orchestration-utility/scripts/verify-long-b.sh
+  LONG_C:
+    dir: yq
+    shape: go-cli
+    case_rel: ma-wa1-taskset-requalification/cases/long-c
+    repo_rel: maa/A-yq
+    verifier_rel: ma-wa1-long-task-orchestration-utility/scripts/verify-long-c.sh

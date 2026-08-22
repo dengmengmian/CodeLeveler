@@ -31,7 +31,10 @@ use leveler_remote_protocol::{
 };
 use leveler_session_wire::UpstreamMessage;
 
-use crate::attachments::{ChunkOutcome, UploadChunk, UploadError, Uploads};
+use crate::attachments::{
+    ChunkOutcome, FETCH_CHUNK_BYTES, FetchChunkRequest, FetchChunkResponse, MAX_ATTACHMENT_BYTES,
+    UploadChunk, UploadError, Uploads, is_sha256_hex,
+};
 use crate::audit::{AuditEvent, AuditLog, hashed};
 use crate::devices::{TrustError, TrustedDevices};
 use crate::projects::{ProjectRoutes, RouteError};
@@ -275,6 +278,54 @@ impl AgentBridge {
                             .map_err(|_| AdmissionError::MalformedPayload)?
                     }
                 }
+            }
+            RpcMethod::FetchAttachment => {
+                // A read. Observe pairings may fetch; they cannot upload.
+                let runtime = self.runtime_for(request.project_id.as_deref()).await?;
+                let fetch: FetchChunkRequest = serde_json::from_value(request.body)
+                    .map_err(|_| AdmissionError::MalformedPayload)?;
+                if !is_sha256_hex(&fetch.sha256) {
+                    return Err(AdmissionError::MalformedPayload);
+                }
+                let blob = match runtime.fetch_attachment(&fetch.sha256).await {
+                    Ok(blob) => blob,
+                    Err(error) => {
+                        let message = error.to_string();
+                        if message.contains("attachment not found") {
+                            return Err(AdmissionError::Refused {
+                                code: "not_found",
+                                reason: "no attachment with that sha256",
+                            });
+                        }
+                        return Err(AdmissionError::Runtime(message));
+                    }
+                };
+                if blob.bytes.len() > MAX_ATTACHMENT_BYTES {
+                    return Err(AdmissionError::Refused {
+                        code: "payload_too_large",
+                        reason: "attachment exceeds the remote fetch limit",
+                    });
+                }
+                let chunk_total = std::cmp::max(
+                    1u32,
+                    blob.bytes.len().div_ceil(FETCH_CHUNK_BYTES) as u32,
+                );
+                if fetch.chunk_index >= chunk_total {
+                    return Err(AdmissionError::MalformedPayload);
+                }
+                let start = fetch.chunk_index as usize * FETCH_CHUNK_BYTES;
+                let end = std::cmp::min(start + FETCH_CHUNK_BYTES, blob.bytes.len());
+                let slice = &blob.bytes[start..end];
+                use base64::Engine as _;
+                let response = FetchChunkResponse {
+                    sha256: fetch.sha256,
+                    mime_type: blob.mime_type,
+                    size_bytes: blob.bytes.len() as u64,
+                    chunk_index: fetch.chunk_index,
+                    chunk_total,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(slice),
+                };
+                serde_json::to_vec(&response).map_err(|_| AdmissionError::MalformedPayload)?
             }
         };
 
@@ -583,6 +634,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::Btw { .. } => "btw",
         ClientCommand::RunUserShell { .. } => "run_user_shell",
         ClientCommand::CancelUserShell { .. } => "cancel_user_shell",
+        ClientCommand::QueryObservability { .. } => "query_observability",
         ClientCommand::Quit => "quit",
     }
 }

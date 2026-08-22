@@ -5,6 +5,7 @@
 // 保持同构：同一事件在两个 UI 里表达同一产品事实。
 
 import { createContext, useContext, type Dispatch, type ReactNode } from 'react';
+import { isCompactionSummaryText, isTurnUser } from '../lib/presentationKind';
 import { useImmerReducer } from '../lib/useImmerReducer';
 import type { TurnOutcome } from '../lib/turn';
 import type {
@@ -23,6 +24,7 @@ import type {
   UiMemoryEntry,
   UiPlan,
   UiRole,
+  UiObservabilityLoaded,
   UiSessionSnapshot,
   UiSessionSummary,
   UiVerification,
@@ -47,6 +49,8 @@ export interface ChatMessage {
   seq: number;
   /** 旁问（/btw）侧答：存被问的问题，非空即渲染为独立侧答卡片 */
   btw?: string;
+  /** Product presentation; compaction is stamped by the runtime prefix. */
+  kind?: 'compaction_summary';
 }
 
 export interface ToolCallView {
@@ -72,6 +76,14 @@ export interface LastTurn {
   outcome: TurnOutcome;
   ms: number;
   detail: string | null;
+}
+
+/** Frozen per-turn execution process. Live `tools` still clear on the next user message. */
+export interface TurnTrace {
+  userSeq: number;
+  tools: ToolCallView[];
+  backgroundTasks: BackgroundTaskView[];
+  lastTurn: LastTurn;
 }
 
 /** 一个 spawn 出来的子 agent（多 agent 委派），running → done 原地更新。 */
@@ -116,6 +128,8 @@ export interface SessionView {
   messages: ChatMessage[];
   /** 当前回合的工具调用（下一回合开始时清空） */
   tools: ToolCallView[];
+  /** Completed turns' tool process, keyed by that turn's user message seq. */
+  traces: TurnTrace[];
   /** 当前回合的子 agent（下一回合开始时清空） */
   agents: SubAgentView[];
   /** 当前回合的后台任务（下一回合开始时清空） */
@@ -156,7 +170,14 @@ export interface SessionView {
 
 export type ConnectionStatus = 'connecting' | 'online';
 
-export type StageView = 'chat' | 'diff';
+/** Central workspace surface. `execution` is a Phase 1 slot only (no observatory). */
+export type StageView = 'chat' | 'diff' | 'execution';
+
+/** Sidebar destination. Workspace tabs (Conversation / Changes / Execution) are independent. */
+export type RailNav = 'sessions' | 'files' | 'search' | 'settings';
+
+/** Sections inside the Workspace sidebar. Symbols/Environment have no extra API. */
+export type WorkspaceSection = 'files' | 'symbols' | 'repository' | 'environment';
 
 export interface AppState {
   connection: ConnectionStatus;
@@ -166,8 +187,12 @@ export interface AppState {
   draft: boolean;
   /** 当前 runtime 的仓库路径（分组回退值 + hero 项目选择器） */
   repository: string;
-  /** 中央主区域视图（对话 / 改动）；Inspector 任务 tab 的改动摘要可切过来 */
+  /** 中央主区域视图（对话 / 改动 / Execution 占位） */
   stageView: StageView;
+  /** Single-sidebar destination. Independent of workspace tabs. */
+  railNav: RailNav;
+  /** Workspace sidebar subsection. */
+  workspaceSection: WorkspaceSection;
   queue: QueuedMessage[];
   notice: string | null;
   /** 已上传、待随下一条消息提交的附件 */
@@ -176,8 +201,22 @@ export interface AppState {
   projects: ProjectInfo[];
   /** 新对话的目标项目（= 项目分组上的 ＋ 入口）；null = 当前仓库 */
   draftProject: string | null;
+  /** Selected Project identity: canonical repository path. */
+  selectedProject: string | null;
   /** 待注入到输入框的文本（空状态快捷操作 → Composer 消费后清空） */
   composerSeed: string | null;
+  /** Diff 工作区当前聚焦的文件；null = 用列表第一项 */
+  diffFocus: string | null;
+  /** Single sidebar open. */
+  railOpen: boolean;
+  inspectorOpen: boolean;
+  /** Open the Inspector More disclosure (Checkpoints / Memory). */
+  inspectorMore: boolean;
+  /** Durable observatory payload (QueryObservability). Not live SessionView.tools. */
+  observation: UiObservabilityLoaded | null;
+  observationStatus: 'idle' | 'loading' | 'ready' | 'error';
+  /** QueryObservability.query_id this view currently owns. */
+  pendingObservationQuery: string | null;
 }
 
 export const initialState: AppState = {
@@ -187,12 +226,22 @@ export const initialState: AppState = {
   draft: true,
   repository: '',
   stageView: 'chat',
+  railNav: 'sessions',
+  workspaceSection: 'files',
   queue: [],
   notice: null,
   pendingAttachments: [],
   projects: [],
   draftProject: null,
+  selectedProject: null,
   composerSeed: null,
+  diffFocus: null,
+  railOpen: true,
+  inspectorOpen: true,
+  inspectorMore: false,
+  observation: null,
+  observationStatus: 'idle',
+  pendingObservationQuery: null,
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -201,9 +250,21 @@ export type Action =
   | { type: 'connection'; status: ConnectionStatus }
   | { type: 'session_list'; sessions: UiSessionSummary[] }
   | { type: 'snapshot'; session: UiSessionSnapshot; contextWindow?: number | null }
+  /** SessionUpdated: TUI apply_meta. Metadata only; never rebuilds the turn presentation. */
+  | { type: 'session_meta'; session: UiSessionSnapshot }
   | { type: 'select_session'; id: SessionId }
   | { type: 'new_draft'; project?: string | null }
+  | { type: 'select_project'; path: string }
   | { type: 'stage_view'; view: StageView }
+  | { type: 'set_rail_nav'; nav: RailNav }
+  | { type: 'set_workspace_section'; section: WorkspaceSection }
+  | { type: 'focus_diff'; path: string | null }
+  | { type: 'toggle_rail' }
+  | { type: 'toggle_inspector' }
+  | { type: 'set_inspector'; open: boolean }
+  | { type: 'set_inspector_more'; open: boolean }
+  | { type: 'observation_loading'; queryId: string }
+  | { type: 'observation_loaded'; observation: UiObservabilityLoaded; queryId: string | null }
   | { type: 'user_message'; id: string; text: string; time: string }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
@@ -262,8 +323,8 @@ function viewFromSnapshot(
     if (pi.type === 'approval') pendingApprovals.push(pi.request);
     else pendingClarifications.push(pi.request);
   }
-  // On a snapshot the interleave order between history messages and in-flight
-  // tools is not recoverable, so keep messages first, then the active tools.
+  // Full replace (SessionOpened / WS snapshot). SessionUpdated must NOT use this:
+  // active_tools is only in-flight, and rebuilding here wipes the current turn.
   const messages: ChatMessage[] = snap.messages.map((m) => ({
     id: m.id,
     role: m.role,
@@ -271,6 +332,8 @@ function viewFromSnapshot(
     streaming: false,
     time: null,
     seq: nextSeq(),
+    kind:
+      m.role === 'user' && isCompactionSummaryText(m.text) ? 'compaction_summary' : undefined,
   }));
   const tools: ToolCallView[] = (snap.active_tools ?? []).map((t) => ({
     id: t.id,
@@ -298,6 +361,7 @@ function viewFromSnapshot(
     status: snap.status,
     messages,
     tools,
+    traces: sameSession ? (prev.traces ?? []) : [],
     agents: sameSession ? prev.agents : [],
     backgroundTasks: sameSession ? prev.backgroundTasks : [],
     pendingApprovals,
@@ -334,6 +398,17 @@ function viewFromSnapshot(
   };
 }
 
+/** Drop every projection that belongs to the session currently on screen. */
+function leaveSessionView(state: AppState): void {
+  state.current = null;
+  state.diffFocus = null;
+  state.observation = null;
+  state.observationStatus = 'idle';
+  state.pendingObservationQuery = null;
+  state.pendingAttachments = [];
+  state.composerSeed = null;
+}
+
 /** TUI mark_turn_busy 的对应物：事件到来说明回合在跑。 */
 function markBusy(current: SessionView): void {
   if (!current.turnActive) {
@@ -343,9 +418,48 @@ function markBusy(current: SessionView): void {
   }
 }
 
+/** TUI `apply_meta`: header fields only. Does not touch transcript, tools, agents, lastTurn. */
+function applySessionMeta(current: SessionView, snap: UiSessionSnapshot): void {
+  current.repository = snap.repository;
+  current.branch = snap.branch ?? null;
+  current.model = snap.model ?? null;
+  current.availableModels = snap.available_models ?? [];
+  current.permission = snap.mode;
+  if (snap.status) current.status = snap.status;
+  if (snap.goal) current.title = snap.goal || current.title;
+  if (snap.work_profile) current.workProfile = snap.work_profile;
+  if (snap.collaboration) current.collaboration = snap.collaboration;
+  if (snap.reasoning !== undefined && snap.reasoning !== null) {
+    current.reasoningEffort = snap.reasoning.effective ?? null;
+  }
+}
+
 function resetReasoning(current: SessionView): void {
   current.reasoning = '';
   current.reasoningSuperseded = false;
+}
+
+function snapshotTurnTrace(current: SessionView): void {
+  if (!current.lastTurn) return;
+  if (!current.traces) current.traces = [];
+  let userSeq: number | null = null;
+  for (let i = current.messages.length - 1; i >= 0; i -= 1) {
+    const m = current.messages[i];
+    if (isTurnUser(m)) {
+      userSeq = m.seq;
+      break;
+    }
+  }
+  if (userSeq === null) return;
+  const trace: TurnTrace = {
+    userSeq,
+    tools: current.tools.slice(),
+    backgroundTasks: current.backgroundTasks.slice(),
+    lastTurn: current.lastTurn,
+  };
+  const idx = current.traces.findIndex((t) => t.userSeq === userSeq);
+  if (idx >= 0) current.traces[idx] = trace;
+  else current.traces.push(trace);
 }
 
 // ── reducer ─────────────────────────────────────────────────────────
@@ -368,20 +482,89 @@ export function reducer(state: AppState, action: Action): void {
       const view = viewFromSnapshot(action.session, state.current, action.contextWindow);
       state.current = view;
       state.draft = false;
-      if (view.repository) state.repository = view.repository;
+      if (view.repository) {
+        state.repository = view.repository;
+        state.selectedProject = view.repository;
+      }
       return;
     }
+    case 'session_meta': {
+      if (!state.current || state.current.id !== action.session.id) return;
+      applySessionMeta(state.current, action.session);
+      if (state.current.repository) {
+        state.repository = state.current.repository;
+        state.selectedProject = state.current.repository;
+      }
+      return;
+    }
+    case 'select_project':
+      if (state.selectedProject === action.path && state.draftProject === action.path) {
+        return;
+      }
+      state.selectedProject = action.path;
+      state.draftProject = action.path;
+      if (state.current && state.current.repository !== action.path) {
+        state.draft = true;
+        leaveSessionView(state);
+      } else if (!state.current) {
+        state.draft = true;
+      }
+      return;
     case 'select_session':
       state.draft = false;
-      if (state.current?.id !== action.id) state.current = null; // 等 snapshot
+      if (state.current?.id !== action.id) {
+        leaveSessionView(state); // 等 snapshot
+      }
       return;
     case 'new_draft':
       state.draft = true;
-      state.current = null;
-      state.draftProject = action.project ?? null;
+      state.draftProject = action.project ?? state.selectedProject;
+      if (state.draftProject) state.selectedProject = state.draftProject;
+      leaveSessionView(state);
       return;
     case 'stage_view':
       state.stageView = action.view;
+      return;
+    case 'set_rail_nav':
+      state.railNav = action.nav;
+      return;
+    case 'set_workspace_section':
+      state.workspaceSection = action.section;
+      return;
+    case 'focus_diff':
+      state.stageView = 'diff';
+      state.diffFocus = action.path;
+      return;
+    case 'toggle_rail':
+      state.railOpen = !state.railOpen;
+      return;
+    case 'toggle_inspector':
+      state.inspectorOpen = !state.inspectorOpen;
+      return;
+    case 'set_inspector':
+      state.inspectorOpen = action.open;
+      return;
+    case 'set_inspector_more':
+      state.inspectorMore = action.open;
+      if (action.open) state.inspectorOpen = true;
+      return;
+    case 'observation_loading':
+      state.observationStatus = 'loading';
+      state.pendingObservationQuery = action.queryId;
+      return;
+    case 'observation_loaded':
+      if (state.current && action.observation.session.session_id !== state.current.id) {
+        return;
+      }
+      if (
+        state.pendingObservationQuery == null ||
+        action.queryId == null ||
+        state.pendingObservationQuery !== action.queryId
+      ) {
+        return;
+      }
+      state.observation = action.observation;
+      state.observationStatus = 'ready';
       return;
     case 'user_message': {
       if (!state.current) return;
@@ -672,6 +855,7 @@ export function reducer(state: AppState, action: Action): void {
         state.current.activity = null;
         resetReasoning(state.current);
         for (const m of state.current.messages) m.streaming = false;
+        snapshotTurnTrace(state.current);
       }
       return;
     case 'seed_composer':
@@ -720,9 +904,31 @@ export function reducer(state: AppState, action: Action): void {
     case 'attachments_cleared':
       state.pendingAttachments = [];
       return;
-    case 'projects':
+    case 'projects': {
       state.projects = action.projects;
+      if (action.projects.length === 0) {
+        if (!state.selectedProject) {
+          state.selectedProject =
+            state.current?.repository ||
+            state.draftProject ||
+            state.repository ||
+            null;
+        }
+        return;
+      }
+      const listed = action.projects.some((p) => p.path === state.selectedProject);
+      if (!state.selectedProject || !listed) {
+        const fromSession = action.projects.find((p) => p.path === state.current?.repository)?.path;
+        const next = fromSession ?? action.projects[0].path;
+        state.selectedProject = next;
+        state.draftProject = next;
+        if (state.current && state.current.repository !== next) {
+          state.draft = true;
+          leaveSessionView(state);
+        }
+      }
       return;
+    }
     case 'project_status': {
       const p = state.projects.find((p) => p.path === action.path);
       if (p) p.status = action.status;
