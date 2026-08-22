@@ -382,3 +382,39 @@ landing on stable users; and the interface promise is written down instead of
 implied. The pipeline that found the last three failures is itself the
 deliverable — it was dead before, and dead pipelines are how a month-old Windows
 regression stays invisible.
+
+---
+
+## Closed: the tag exists
+
+**2026-08-22.** `v0.2.0-beta.1` is tagged and pushed at `4fbcb3cb`. The owner
+took the decision this document anticipated: **build all four targets, publish
+three.** Windows is built — its compile, its lints and its security canaries are
+part of what makes the tag trustworthy — and its archive is deliberately not
+attached to the published release. Windows users stay on stable `0.1.4`, which
+ships a Windows build, so declining to publish this one costs them nothing they
+had.
+
+That decision has exactly one enforcement point, and it is a human: the release
+workflow uploads all four archives to the draft and has no idea one of them is
+unwanted. Deleting `leveler-v0.2.0-beta.1-x86_64-pc-windows-msvc.zip` and its
+`.sha256` before publishing is step 2 of the checklist in
+[`releases/v0.2.0-beta.1.md`](releases/v0.2.0-beta.1.md). It is written down
+rather than automated because a later beta may want Windows back, and a release
+job that silently drops a target is a worse failure than a checklist that is not
+followed.
+
+**Channel separation, verified rather than assumed.** At the time of tagging,
+`releases/latest` resolves to `v0.1.4` with `prerelease: false`; `install.sh`
+and `leveler upgrade` both read that endpoint, which never returns a
+pre-release; `release.yml` sets `prerelease` from the `-` in the tag name. The
+beta is reachable only by name.
+
+**What is still open** is unchanged and unhidden: risk 0a (a macOS test margin)
+and risk 0b (three Windows tests needing a real machine). Neither blocks the
+beta; both block calling Windows supported.
+
+**What comes next is not features.** The tag opens
+[`evaluations/REAL_USAGE_BETA_001.md`](evaluations/REAL_USAGE_BETA_001.md) —
+six tasks in six third-party repositories, run against the published binary
+rather than a checkout, because that is the artifact users actually get.
