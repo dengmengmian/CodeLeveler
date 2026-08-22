@@ -25,9 +25,12 @@ bridge。完整桌面/移动 APP、长期运行的 NPC 工作流、Capability/Ex
 [架构说明](docs/ARCHITECTURE.zh-CN.md)。
 
 CodeLeveler 目前处于 public beta：**`0.2.0-beta.1`**，以 pre-release 形式发布
-（见[安装 beta](#1-安装)）。最新 stable 版本是 `0.1.4`。Windows、macOS 和 Linux
-都在 CI 里跑完整测试；macOS 与 Linux 全绿，Windows 编译、lint 与安全 canary 通过，
-另有三个已知测试失败，记录在 [`CHANGELOG.md`](CHANGELOG.md)。
+（见[安装 beta](#1-安装)）。最新 stable 版本是 `0.1.4`。
+
+**beta 只提供 macOS 与 Linux 二进制。** Windows、macOS 和 Linux 都在 CI 里跑完整
+测试；macOS 与 Linux 全绿，Windows 编译、lint 与安全 canary 通过，但仍有三个测试
+失败（见 [`CHANGELOG.md`](CHANGELOG.md)）。与其发一个测试没全绿的二进制，不如让
+Windows 留在 stable `0.1.4`（它有 Windows 构建），等这三个失败在真机上诊断清楚。
 
 ## 三个专注的工具，一套工作流
 

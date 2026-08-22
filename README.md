@@ -28,9 +28,13 @@ framework are architectural directions — not all shipped yet. See
 
 CodeLeveler is in public beta: **`0.2.0-beta.1`**, published as a pre-release
 (see [Installing a beta](#1-install)). The latest stable release is `0.1.4`.
-Windows, macOS, and Linux all run the suite in CI; macOS and Linux are green,
-and Windows builds, lints and passes its security canaries with three known
-test failures recorded in [`CHANGELOG.md`](CHANGELOG.md).
+
+**The beta ships macOS and Linux binaries only.** Windows, macOS and Linux all
+run the suite in CI; macOS and Linux are green, and the Windows job compiles,
+lints and passes its security canaries but still has three failing tests
+([`CHANGELOG.md`](CHANGELOG.md)). Rather than hand out a binary whose suite is
+red, the beta leaves Windows on stable `0.1.4` — which does ship a Windows
+build — until those three are diagnosed on a real Windows machine.
 
 ## Three focused tools, one workflow
 

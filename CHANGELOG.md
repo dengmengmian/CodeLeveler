@@ -12,6 +12,10 @@ First public pre-release. Published as a GitHub **pre-release**, so `brew`,
 `install.sh` and `leveler upgrade` keep serving the latest stable (`0.1.4`)
 unless a beta is asked for by name (`LEVELER_VERSION=v0.2.0-beta.1`).
 
+**macOS and Linux binaries only.** The Windows target is built and its build,
+lints and security canaries pass, but three of its tests do not, so the artifact
+is deliberately not published. Windows stays on stable `0.1.4`.
+
 **Known limitations** — these are stated, not hidden:
 - **Delegation is opportunity-based.** The runtime executes a delegation
   reliably whenever the model elects to collaborate; it does not promise that
