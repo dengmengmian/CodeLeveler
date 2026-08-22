@@ -15,24 +15,93 @@ use crate::output::Line;
 pub const DEFAULT_GITHUB_REPO: &str = "dengmengmian/CodeLeveler";
 
 /// Semantic version used for update comparisons (release tags only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// The pre-release part is carried rather than discarded. It has to be: it
+/// decides ordering (`0.2.0-beta.1` precedes `0.2.0`), it is what the binary
+/// calls itself, and it is part of the release asset's file name.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
+    /// Dot-separated identifiers from `-a.b.c`; empty for a release.
+    pub pre: Vec<String>,
 }
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if !self.pre.is_empty() {
+            write!(f, "-{}", self.pre.join("."))?;
+        }
+        Ok(())
     }
 }
 
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => Ordering::Equal,
+                // SemVer §11: a release outranks any pre-release of the same
+                // `x.y.z`. This is the line that lets a beta user be offered
+                // the stable release their beta led to.
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => cmp_pre(&self.pre, &other.pre),
+            })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Compare two non-empty pre-release identifier lists (SemVer §11): numeric
+/// identifiers compare numerically and rank below alphanumeric ones, and when
+/// every shared identifier is equal, the longer list wins (`beta` < `beta.1`).
+fn cmp_pre(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b.iter()) {
+        // An identifier too large for u64 is treated as alphanumeric rather
+        // than panicking; no real tag reaches that, and failing safe beats
+        // failing loudly in the upgrade path.
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => x.as_str().cmp(y.as_str()),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 /// Parse `0.1.0`, `v0.1.0`, or a tag with a pre-release suffix (`0.1.0-beta.1`).
-/// Pre-release / build metadata is ignored for ordering; only `x.y.z` is kept.
+///
+/// Build metadata (`+abc123`) is dropped: SemVer §10 keeps it out of
+/// precedence, and no release asset carries it.
 pub fn parse_version(raw: &str) -> Option<Version> {
     let s = raw.trim().trim_start_matches('v');
-    let core = s.split(['-', '+']).next().unwrap_or("");
+    let s = s.split('+').next().unwrap_or("");
+    let (core, pre) = match s.split_once('-') {
+        // `1.0.0-` has a pre-release marker and no identifiers: not a version.
+        Some((_, "")) => return None,
+        Some((core, rest)) => (
+            core,
+            rest.split('.').map(str::to_string).collect::<Vec<_>>(),
+        ),
+        None => (s, Vec::new()),
+    };
+    if pre.iter().any(String::is_empty) {
+        return None;
+    }
     let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -44,11 +113,12 @@ pub fn parse_version(raw: &str) -> Option<Version> {
         major,
         minor,
         patch,
+        pre,
     })
 }
 
 /// Whether an install should proceed.
-pub fn should_upgrade(current: Version, target: Version, force: bool) -> bool {
+pub fn should_upgrade(current: &Version, target: &Version, force: bool) -> bool {
     force || target > current
 }
 
@@ -69,7 +139,7 @@ pub fn host_target_triple() -> Option<&'static str> {
 ///
 /// Unix: `leveler-v{version}-{triple}.tar.gz`
 /// Windows: `leveler-v{version}-{triple}.zip`
-pub fn release_asset_name(version: Version, triple: &str) -> String {
+pub fn release_asset_name(version: &Version, triple: &str) -> String {
     let ext = if triple.contains("windows") {
         "zip"
     } else {
@@ -151,7 +221,7 @@ pub async fn fetch_release(
 
     let (asset_name, download_url, checksum_url) = match host_target_triple() {
         Some(triple) => {
-            let want = release_asset_name(ver, triple);
+            let want = release_asset_name(&ver, triple);
             let checksum = release
                 .assets
                 .iter()
@@ -231,7 +301,7 @@ pub(crate) async fn cmd_upgrade(
     let release = fetch_release(&client, &repo, version.as_deref()).await?;
     println!("  latest:   {} ({})", release.tag, release.version);
 
-    if !should_upgrade(current, release.version, force) {
+    if !should_upgrade(&current, &release.version, force) {
         println!("{}", Line::ok("Already up to date."));
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -545,33 +615,30 @@ mod tests {
 
     #[test]
     fn parse_plain_and_v_prefix() {
-        assert_eq!(
-            parse_version("0.1.0").unwrap(),
-            Version {
-                major: 0,
-                minor: 1,
-                patch: 0
-            }
-        );
-        assert_eq!(
-            parse_version("v0.1.0").unwrap(),
-            Version {
-                major: 0,
-                minor: 1,
-                patch: 0
-            }
-        );
+        let v010 = Version {
+            major: 0,
+            minor: 1,
+            patch: 0,
+            pre: Vec::new(),
+        };
+        assert_eq!(parse_version("0.1.0").unwrap(), v010);
+        assert_eq!(parse_version("v0.1.0").unwrap(), v010);
+        // This used to assert that the suffix was thrown away. It is kept.
         assert_eq!(
             parse_version("v1.2.3-beta.1").unwrap(),
             Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                pre: vec!["beta".into(), "1".into()],
             }
         );
         assert!(parse_version("").is_none());
         assert!(parse_version("v1.2").is_none());
         assert!(parse_version("nope").is_none());
+        // A pre-release marker with nothing after it, and an empty identifier.
+        assert!(parse_version("1.0.0-").is_none());
+        assert!(parse_version("1.0.0-a..b").is_none());
     }
 
     #[test]
@@ -581,26 +648,26 @@ mod tests {
         let c = parse_version("0.2.0").unwrap();
         assert!(a < b);
         assert!(b < c);
-        assert!(!should_upgrade(b, a, false));
-        assert!(should_upgrade(a, b, false));
-        assert!(should_upgrade(b, a, true));
-        assert!(!should_upgrade(a, a, false));
-        assert!(should_upgrade(a, a, true));
+        assert!(!should_upgrade(&b, &a, false));
+        assert!(should_upgrade(&a, &b, false));
+        assert!(should_upgrade(&b, &a, true));
+        assert!(!should_upgrade(&a, &a, false));
+        assert!(should_upgrade(&a, &a, true));
     }
 
     #[test]
     fn asset_names_match_convention() {
         let v = parse_version("0.1.0").unwrap();
         assert_eq!(
-            release_asset_name(v, "aarch64-apple-darwin"),
+            release_asset_name(&v, "aarch64-apple-darwin"),
             "leveler-v0.1.0-aarch64-apple-darwin.tar.gz"
         );
         assert_eq!(
-            release_asset_name(v, "x86_64-pc-windows-msvc"),
+            release_asset_name(&v, "x86_64-pc-windows-msvc"),
             "leveler-v0.1.0-x86_64-pc-windows-msvc.zip"
         );
         assert_eq!(
-            release_asset_name(v, "x86_64-unknown-linux-gnu"),
+            release_asset_name(&v, "x86_64-unknown-linux-gnu"),
             "leveler-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
         );
     }
@@ -614,5 +681,84 @@ mod tests {
     #[test]
     fn display_version() {
         assert_eq!(parse_version("v0.1.0").unwrap().to_string(), "0.1.0");
+    }
+
+    // ── Pre-releases. Reproduced against the published v0.2.0-beta.1: the
+    // suffix was dropped at parse time, so it was missing from ordering,
+    // from display, and from the asset name the download path looks for.
+
+    /// SemVer §11: a pre-release precedes the release it leads to. Without
+    /// this, a `0.2.0-beta.n` user is never offered `0.2.0` stable — the
+    /// versions compare equal, `should_upgrade` says no, and the people who
+    /// volunteered to test are the ones stranded.
+    #[test]
+    fn a_prerelease_precedes_its_own_release() {
+        let beta = parse_version("v0.2.0-beta.1").unwrap();
+        let stable = parse_version("v0.2.0").unwrap();
+        assert!(beta < stable, "0.2.0-beta.1 must sort before 0.2.0");
+        assert!(
+            should_upgrade(&beta, &stable, false),
+            "a beta user must be offered the stable release it leads to"
+        );
+        assert!(
+            !should_upgrade(&stable, &beta, false),
+            "a stable user must never be offered a pre-release as an upgrade"
+        );
+    }
+
+    /// Precedence *within* a pre-release line, so `beta.2` supersedes
+    /// `beta.1` and `rc` supersedes `beta`. Numeric identifiers compare
+    /// numerically (`beta.9` before `beta.10`, not after it, which is what a
+    /// string comparison would give).
+    #[test]
+    fn prereleases_order_among_themselves() {
+        let v = |s: &str| parse_version(s).unwrap();
+        assert!(v("0.2.0-alpha.1") < v("0.2.0-beta.1"));
+        assert!(v("0.2.0-beta.1") < v("0.2.0-beta.2"));
+        assert!(v("0.2.0-beta.9") < v("0.2.0-beta.10"));
+        assert!(v("0.2.0-beta.2") < v("0.2.0-rc.1"));
+        assert!(v("0.2.0-beta") < v("0.2.0-beta.1"));
+        assert!(v("0.1.9") < v("0.2.0-beta.1"));
+    }
+
+    /// `--version` prints `0.2.0-beta.1`; the upgrade path must not disagree
+    /// with the binary about which build is running.
+    #[test]
+    fn a_prerelease_keeps_its_suffix_when_displayed() {
+        assert_eq!(
+            parse_version("v0.2.0-beta.1").unwrap().to_string(),
+            "0.2.0-beta.1"
+        );
+    }
+
+    /// The published asset really is named `leveler-v0.2.0-beta.1-…`. Building
+    /// the name from a suffix-stripped version looked for
+    /// `leveler-v0.2.0-…`, found nothing, and silently fell back to
+    /// compiling from source — on a machine that may have no Rust toolchain.
+    #[test]
+    fn a_prerelease_asset_name_carries_the_suffix() {
+        let v = parse_version("v0.2.0-beta.1").unwrap();
+        assert_eq!(
+            release_asset_name(&v, "aarch64-apple-darwin"),
+            "leveler-v0.2.0-beta.1-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            release_asset_name(&v, "x86_64-pc-windows-msvc"),
+            "leveler-v0.2.0-beta.1-x86_64-pc-windows-msvc.zip"
+        );
+    }
+
+    /// Build metadata stays out of precedence (SemVer §10) and out of the
+    /// asset name, which never carries it.
+    #[test]
+    fn build_metadata_is_ignored() {
+        assert_eq!(
+            parse_version("0.2.0+d0fc362").unwrap(),
+            parse_version("0.2.0").unwrap()
+        );
+        assert_eq!(
+            parse_version("0.2.0-beta.1+d0fc362").unwrap(),
+            parse_version("0.2.0-beta.1").unwrap()
+        );
     }
 }

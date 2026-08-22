@@ -59,14 +59,7 @@ async fn main() -> std::process::ExitCode {
     // Record panics before anything else can install a hook — the TUI's
     // terminal-restore hook chains to this one.
     crash::install(env!("CARGO_PKG_VERSION"));
-    // Build provenance is part of the version string: an official binary must
-    // be traceable to a commit, and one built from a dirty tree must say so
-    // rather than let a reader assume it IS that commit. Handled before clap
-    // so it replaces the default --version output.
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("{}", build_provenance());
-        return std::process::ExitCode::SUCCESS;
-    }
+    // `--version` is clap's (see the `version = build_provenance()` on `Cli`).
     let args = Cli::parse();
     // No subcommand or `tui` takes over the terminal (ratatui alternate
     // screen). Logs written to stderr there paint straight over the UI and
@@ -357,18 +350,83 @@ fn build_provenance() -> String {
     format_provenance(env!("CARGO_PKG_VERSION"), commit, dirty)
 }
 
+/// The same line, borrowed for the process lifetime. `clap`'s `version` takes
+/// a `&'static str`, and the string is built once from compile-time constants.
+pub(crate) fn build_provenance_static() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(build_provenance).as_str()
+}
+
+/// The version *string* only — clap prints the command name in front of it, so
+/// naming `leveler` here too would render `leveler leveler 0.2.0-beta.1`.
 fn format_provenance(version: &str, commit: &str, dirty: bool) -> String {
     let short = commit.get(..12).unwrap_or(commit);
     if dirty {
-        format!("leveler {version} ({short}-dirty) UNTRUSTED: built from a modified working tree")
+        format!("{version} ({short}-dirty) UNTRUSTED: built from a modified working tree")
     } else {
-        format!("leveler {version} ({short})")
+        format!("{version} ({short})")
     }
 }
 
 #[cfg(test)]
 mod provenance_tests {
+    use clap::Parser;
+
     use super::format_provenance;
+    use crate::cli::{Cli, Command};
+
+    /// A top-level `--version` prints the provenance string, not clap's plain
+    /// `CARGO_PKG_VERSION`. Asserted through the real parser: clap reports it
+    /// as a `DisplayVersion` "error" whose message is what the user sees.
+    #[test]
+    fn a_top_level_version_flag_prints_provenance() {
+        for argv in [
+            vec!["leveler", "--version"],
+            vec!["leveler", "-V"],
+            // A global flag that takes a value may precede it. Scanning the
+            // raw argument list got this one wrong; clap does not.
+            vec!["leveler", "--repo", "/tmp/x", "--version"],
+        ] {
+            let err = Cli::try_parse_from(&argv).expect_err("--version exits via clap");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayVersion,
+                "{argv:?} must be a version query"
+            );
+            assert!(
+                err.to_string()
+                    .contains(env!("LEVELER_BUILD_COMMIT").get(..12).unwrap_or("")),
+                "the version output must name the commit: {err}"
+            );
+        }
+    }
+
+    /// The regression this replaced: `--version` after a subcommand belongs to
+    /// that subcommand. `upgrade --version <TAG>` is the documented way to
+    /// install a specific release, and the only way to install a pre-release.
+    #[test]
+    fn upgrade_owns_its_own_version_flag() {
+        let cli = Cli::try_parse_from([
+            "leveler",
+            "upgrade",
+            "--check",
+            "--version",
+            "v0.2.0-beta.1",
+        ])
+        .expect("upgrade --version names a release tag, it is not a version query");
+        match cli.command {
+            Some(Command::Upgrade {
+                check,
+                force,
+                version,
+            }) => {
+                assert!(check);
+                assert!(!force);
+                assert_eq!(version.as_deref(), Some("v0.2.0-beta.1"));
+            }
+            other => panic!("expected upgrade, got {other:?}"),
+        }
+    }
 
     /// A clean build names its commit and claims nothing more.
     #[test]
@@ -377,6 +435,9 @@ mod provenance_tests {
         assert!(line.contains("0.1.4"), "{line}");
         assert!(line.contains("c3bf11ba01c3"), "{line}");
         assert!(!line.contains("UNTRUSTED"), "{line}");
+        // clap prints the command name itself; carrying one here rendered
+        // `leveler leveler 0.2.0-beta.1`.
+        assert!(!line.contains("leveler"), "{line}");
     }
 
     /// The accident this exists for: HEAD said one commit, the binary carried

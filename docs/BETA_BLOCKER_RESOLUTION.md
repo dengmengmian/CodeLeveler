@@ -500,8 +500,43 @@ verified live after publishing: a bare `install.sh` run installs `0.1.4`, a
 `0.1.4` user is not offered the beta, and a beta user is not silently downgraded
 to `0.1.4`. Nothing published is wrong; the bug is in what happens next.
 
-**Recorded, not fixed.** The fix is not one line — ordering has to learn that a
-pre-release precedes its release, display has to stop borrowing the ordering
-type, and the test that pins the current behaviour has to be rewritten rather
-than deleted. That belongs in its own change with its own tests, before `0.2.0`
-stable, not appended to a release that is already out.
+**Fixed, in its own change with its own tests.** `Version` now carries its
+pre-release identifiers and orders them per SemVer §11, `Display` renders them,
+and the asset name is built from the full version. The test that pinned the old
+behaviour was rewritten rather than deleted.
+
+**A fourth defect surfaced while verifying the first three, and it was the worst
+of them.** `leveler upgrade --version <TAG>` did not work at all on
+`0.2.0-beta.1`: the build-provenance shortcut in `main.rs` matched `--version`
+*anywhere* on the command line, so the flag that names a release to install was
+captured by the flag that prints the binary's own version. It printed the
+version and exited. That is a regression introduced together with build
+provenance — `0.1.4` handles the same command correctly — and it broke the one
+documented way to install a pre-release from the CLI, on the release that
+introduced pre-releases.
+
+The fix hands the provenance line to `clap` as the command's `version` instead
+of intercepting the flag beforehand, so `clap` decides which `--version`
+belongs to which command. The first attempt scanned the raw argument list for a
+`--version` preceding the subcommand, which is the same kind of guess in a
+smaller costume: it got `leveler --repo /x --version` wrong, falling through to
+clap's plain version string and quietly dropping the `UNTRUSTED` marker a dirty
+build is supposed to carry. Deleting the scanner removed that whole class.
+
+**Verified against the published release, not only in unit tests**, since
+running the thing is what found the bug in the first place:
+
+```
+  current:  v0.2.0-beta.1                                  # was v0.2.0
+  latest:   v0.2.0-beta.1 (0.2.0-beta.1)
+  asset:    leveler-v0.2.0-beta.1-aarch64-apple-darwin.tar.gz
+```
+
+The last line is the one that matters: before, this printed *"no prebuilt asset
+for this host; `leveler upgrade` will use cargo"* while the asset sat in the
+release, downloadable, under the name the lookup had truncated.
+
+**This does not require re-cutting `v0.2.0-beta.1`.** Nothing published is
+wrong, and the channel guarantees were verified live after publishing. What was
+broken is the upgrade path *out of* the beta, which matters when the next
+version ships — so it needs to be in that version, not in this one.

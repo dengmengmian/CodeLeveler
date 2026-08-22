@@ -7,7 +7,13 @@ use clap::{Parser, Subcommand};
 
 /// CodeLeveler — a model-agnostic coding agent CLI.
 #[derive(Debug, Parser)]
-#[command(name = "leveler", version, about, long_about = None)]
+// Build provenance IS the version string: an official binary must be traceable
+// to a commit, and one built from a dirty tree must say so rather than let a
+// reader assume it IS that commit. Handing it to clap rather than intercepting
+// `--version` before clap runs is what keeps `leveler upgrade --version <TAG>`
+// working — clap knows that flag belongs to the subcommand; a scan of the raw
+// argument list does not.
+#[command(name = "leveler", version = crate::build_provenance_static(), about, long_about = None)]
 pub struct Cli {
     /// Repository root (defaults to the current directory).
     #[arg(long, global = true)]

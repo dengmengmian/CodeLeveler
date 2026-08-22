@@ -6,6 +6,31 @@ All notable changes to CodeLeveler are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **`leveler upgrade` understands pre-releases.** Publishing `0.2.0-beta.1` and
+  then running the binary exposed four defects with one root cause: the version
+  type discarded any `-suffix` at parse time, and it was used for ordering, for
+  display, and for building the release asset's file name.
+  - *Ordering.* SemVer puts `0.2.0-beta.1` before `0.2.0`; the parser made them
+    equal. When `0.2.0` shipped, **no beta user would ever have been offered
+    it** — `should_upgrade` would say no and `--force` would be the only way
+    off the beta. Precedence now follows SemVer §11, including numeric
+    identifiers comparing numerically (`beta.9` before `beta.10`).
+  - *Display.* `upgrade --check` told a `0.2.0-beta.1` user they were on
+    `v0.2.0`, contradicting `leveler --version`.
+  - *Asset lookup.* The download path looked for `leveler-v0.2.0-…`, which does
+    not exist, found nothing, and silently fell back to compiling from source —
+    on a machine that may have no Rust toolchain.
+  - *Flag capture.* The build-provenance shortcut ran before `clap` and matched
+    `--version` **anywhere** on the command line, so
+    `leveler upgrade --version <TAG>` printed the binary's own version and
+    exited instead of installing that tag — breaking the only documented way to
+    install a pre-release from the CLI, on the release that introduced
+    pre-releases. A regression against `0.1.4`, which handles it correctly. The
+    provenance line is now `clap`'s own `version`, so `clap` decides which
+    `--version` belongs to which command instead of a scan of the raw argument
+    list guessing at it.
+
 ## [0.2.0-beta.1] - 2026-08-22
 
 First public pre-release. Published as a GitHub **pre-release**, so `brew`,
