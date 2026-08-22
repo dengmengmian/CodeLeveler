@@ -70,6 +70,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sh scripts/test_install.sh
 
+      # `release.yml` only runs on a tag, so a root file it packages can be
+      # deleted and stay broken until someone actually wants a release. That is
+      # exactly what happened to `NOTICE`. Check the payload on every push.
+      - name: Release payload
+        if: runner.os == 'Linux'
+        run: sh scripts/check_release_payload.sh
+
       # The remote-control surface as its own required step. It is one chain
       # across three crates — a phone, a relay nobody trusts, and a host — and a
       # break in pairing, project isolation, the approval timeout or revocation

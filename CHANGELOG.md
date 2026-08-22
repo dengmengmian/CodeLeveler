@@ -43,6 +43,16 @@ is deliberately not published. Windows stays on stable `0.1.4`.
   in scope.
 
 ### Fixed
+- **The release pipeline builds again.** `release.yml` copied a root `NOTICE`
+  into all four archives; `NOTICE` had been removed on 2026-08-05 by a sweep of
+  unreferenced root files. Because the release workflow only runs on a tag,
+  nothing caught it for seventeen days — it surfaced as four failed builds the
+  moment a release was wanted. `NOTICE` is restored (it carries the Apache-2.0
+  attribution for the sandbox policy adapted from openai/codex, which
+  `evals/THIRD_PARTY.md` still promised was there, and which every published
+  release through `v0.1.4` shipped), and `scripts/check_release_payload.sh` now
+  runs on every push to assert that every file `release.yml` packages exists and
+  that both platforms ship the same list.
 - **Windows builds again.** Four defects had accumulated behind `cfg(windows)`,
   none of them visible to a macOS or Linux compiler: `run_windows_dispatch` was
   called with the `chunks` argument the `!command` streaming work added to the
