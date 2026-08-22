@@ -72,6 +72,14 @@ brew install dengmengmian/tap/leveler
 
 `brew upgrade leveler` moves you to newer releases.
 
+**Installing a beta.** Pre-releases are deliberately not what `brew`, the
+one-line installer, or `leveler upgrade` pick up by default — a beta arrives
+only if you ask for it by name:
+
+```sh
+LEVELER_VERSION=v0.2.0-beta.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh)"
+```
+
 **Option B — Download a prebuilt binary**
 
 From the [latest release](https://github.com/dengmengmian/CodeLeveler/releases/latest),
@@ -79,7 +87,7 @@ download the archive for your platform, unpack it, and move `leveler` onto your
 `PATH`. Example (replace `V`/`T` for your platform):
 
 ```sh
-V=0.1.0; T=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
+V=0.1.4; T=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
 curl -LO https://github.com/dengmengmian/CodeLeveler/releases/download/v$V/leveler-v$V-$T.tar.gz
 tar -xzf "leveler-v$V-$T.tar.gz"
 sudo mv "leveler-v$V-$T/leveler" /usr/local/bin/
@@ -115,6 +123,18 @@ cargo install --path crates/leveler-cli --locked
   sandbox degrades — `leveler doctor` reports what is available.
 
 ### 2. Configure a model
+
+```sh
+leveler login
+```
+
+It lists the built-in providers (DeepSeek, Moonshot/Kimi, OpenAI, Anthropic),
+takes your API key, asks the provider which models that key can actually reach,
+and writes `~/.leveler/config.toml` with owner-only permissions. Pass the
+provider directly to skip the menu: `leveler login deepseek`.
+
+For a self-hosted or OpenAI-compatible gateway that is not in that list, write
+the config yourself.
 
 On Windows, set a persistent Leveler home and create the config from PowerShell:
 
@@ -243,9 +263,19 @@ Run `leveler --help` or `leveler <command> --help` for the CLI reference. Use
 
 ## Public beta
 
-The command surface and configuration format may change before 1.0. Cross-
-platform CI covers Windows, macOS, and Linux, but OS-level isolation still
-depends on capabilities installed and enabled on each machine.
+What will and will not keep working is written down rather than implied:
+[docs/STABILITY.md](docs/STABILITY.md) marks each CLI subcommand and config file
+Frozen, Provisional, or Unstable. `run`, `resume`, `tui` and the setup commands
+are Frozen — name, arguments and meaning hold through 1.0. `serve`, `web`,
+`lsp`, `mcp`, `login`, `logout`, `completions` and `trust` are Provisional, and
+`eval` and `remote` are Unstable.
+
+Cross-platform CI covers Windows, macOS, and Linux, but OS-level isolation still
+depends on capabilities installed and enabled on each machine. Two platform
+gaps worth knowing before you rely on them: the daemon socket transport is not
+available on Windows (sessions and `resume` are), and `!command` output streams
+live everywhere except a *confined* Windows command, which delivers its output
+when it finishes.
 
 ## Contributing and security
 

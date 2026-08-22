@@ -1,13 +1,15 @@
 # Interface stability
 
-> **Status: DRAFT — the tier marks below are proposals, not commitments.**
+> **Status: ADOPTED for the 0.2 beta line (2026-08-22).** The tier marks below
+> are commitments, not proposals.
 >
-> D1/D2/D3 have *recommended* answers (see "Decisions"), written during
-> convergence-plan phase 7 and following common pre-1.0 practice. They are
-> **awaiting maintainer sign-off**: freezing a CLI or config surface is the
-> project owner's call, not a decision a contributor makes on their behalf.
-> Once signed off, change this banner to ADOPTED and link the file from
+> D1/D2/D3 were signed off as their recommended answers (see "Decisions"), which
+> is what a beta needs: an early adopter automating around `leveler run` and
+> `config.toml` can now be told what will keep working. Linked from
 > `README.md` and `CONTRIBUTING.md`.
+>
+> Adopting these tiers is not a claim that every surface is finished — three of
+> them are explicitly Provisional or Unstable, and saying so *is* the promise.
 
 ## Why this exists
 
@@ -135,22 +137,23 @@ Without that enforcement point, this document goes stale within two releases.
 
 ## Decisions
 
-**Recommended, pending maintainer sign-off.** Each is the option a typical
-pre-1.0 project takes; none is in force until confirmed:
+**Signed off 2026-08-22, in force for the 0.2 beta line.** Each was the option
+a typical pre-1.0 project takes, and each is now a commitment rather than a
+recommendation:
 
-| Id | Recommendation | Rationale |
+| Id | Decision | Rationale |
 | --- | --- | --- |
 | D1 | *Recommend* option 1: keep `deny_unknown_fields`; config is forward-incompatible and that is documented ("downgrading may require removing newly added config keys", noted in the config examples). | Typo-catching is a real usability win today; a `schema_version` key (option 3) is the 1.0-time upgrade if the downgrade complaint materializes. Existing keys keep name/type/meaning through 1.0; removal or retyping requires a major version; adding keys is always allowed. |
 | D2 | *Recommend*: the Rust API is not a public surface before 1.0. No trait is frozen; the supported surface is the CLI + configuration. `ProtocolAdapter` / `Tool` / `EventStore` are the designated candidates for an additive-only promise at 1.0. | Nobody outside the workspace depends on these crates; a promise nobody needs is pure maintenance cost. |
 | D3 | *Recommend*: `serve` / `web` (and `lsp`/`mcp`/`login`/`logout`/`completions`/`trust`) stay Provisional through 1.0. Breaking changes require a `### Changed` changelog entry. | The daemon/transport/auth story is still settling (see the Windows gap in `README.md`). |
 
-Proposed deprecation cycle for Frozen surfaces, if D1–D3 are accepted:
-deprecate in release N with a changelog entry and a runtime warning where
-feasible; remove no earlier than N+2 (or 1.0, whichever is later).
+Deprecation cycle for Frozen surfaces: deprecate in release N with a changelog
+entry and a runtime warning where feasible; remove no earlier than N+2 (or 1.0,
+whichever is later).
 
-The body below still reads as a proposal ("Open decision (D1)", "Proposed
-freeze") — deliberately, because it is one. When the decisions are signed off,
-that wording and this section should be reconciled in the same edit.
+Wording note: the body above still asks D1 and D2 as open questions. The answers
+are the table here; the prose was left as the record of what was weighed rather
+than rewritten to look like it was always settled.
 
 ## Storage: migrations and backup
 

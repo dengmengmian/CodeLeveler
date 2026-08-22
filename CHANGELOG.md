@@ -16,6 +16,26 @@ All notable changes to CodeLeveler are documented here. The format follows
   in scope.
 
 ### Fixed
+- **Windows builds again.** Four defects had accumulated behind `cfg(windows)`,
+  none of them visible to a macOS or Linux compiler: `run_windows_dispatch` was
+  called with the `chunks` argument the `!command` streaming work added to the
+  Unix path only; `replace`'s non-Unix commit path still reached for
+  `context.checkpoint` after that field moved under `context.execution`; the
+  Unix-socket stub in `leveler-local-transport` carried a copy of the real
+  `local_waiter_count` body, referring to types the stub does not have; and the
+  Unix-only `ProjectRouter` was imported unconditionally by `leveler remote`.
+  `leveler remote projects` / `agent` now refuse with a clear message on a
+  platform without the daemon socket instead of failing to compile.
+- **`!command` streams live on Windows too**, on the unconfined path. A
+  confined Windows command (AppContainer) still delivers its output on
+  completion — stated in the dispatch and in `README.md` rather than left to be
+  discovered.
+- **A finished `!command` no longer leaves the session briefly busy.** The
+  runtime released the session's turn slot *after* publishing
+  `UserShellExited`, so a client that enables its composer on that event could
+  have the next message refused with "session … already has an active turn".
+  The slot is released before the event is published. Reproduced on Linux,
+  where the window is wide enough to fail reliably.
 - After a user denies a permission request, the harness no longer auto-nudges
   or `DriveGoalAgain` past that boundary. The agent can still adapt with
   already-available tools; same or broader elevations are not re-prompted
@@ -27,6 +47,25 @@ All notable changes to CodeLeveler are documented here. The format follows
   calls a local daemon a "remote daemon".
 
 ### Changed
+- Sandbox tests assert the backend the host actually gets: the SBPL policy tests
+  are macOS-only, `bwrap` argv has its own, and one new test pins which backend
+  each platform selects. The harness read seal (`READ_DENIED_*`) is macOS-only
+  today, and a Linux test now says so out loud instead of leaving it implied.
+- `cargo deny check` passes: `leveler-session-wire` was a path dependency
+  without a version (a wildcard under `wildcards = "deny"`), and the
+  `RUSTSEC-2023-0071` ignore no longer matched any crate in the graph.
+- Interface stability is **ADOPTED** rather than draft
+  (`docs/STABILITY.md`), and linked from `README.md`: `run` / `resume` / `tui`
+  and the setup commands are Frozen; `serve` / `web` / `lsp` / `mcp` / `login` /
+  `logout` / `completions` / `trust` are Provisional; `eval` and `remote` are
+  Unstable.
+- Pre-releases have a channel of their own: `install.sh` takes
+  `LEVELER_VERSION` to pin a tag, and the release workflow marks any tag with a
+  SemVer pre-release part as a GitHub pre-release, so `releases/latest`, the
+  installer and the Homebrew tap keep serving the last stable build.
+- The quick start uses `leveler login` — the onboarding the binary already
+  ships, which asks the provider which models the key can reach — with the
+  hand-written `config.toml` kept as the explicit alternative.
 - Empty-session splash is a terminal-native hero card: the Level Mark
   (Master / Compact / Micro), product mission, and three first-run
   commands (`/feature-dev`, `/model`, `/help`). `/plan` stays a slash
