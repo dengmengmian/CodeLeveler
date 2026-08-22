@@ -1,8 +1,13 @@
 # MA-WA1 — Final Report
 
-**Status:** `MA-WA1 = OPEN_BETA_REQUIRED` · `MULTI_AGENT_PRODUCT = NOT_ACCEPTED`
+**Status:** `MA-WA1 = CLOSED` · `BETA_DECISION = ACCEPT` (Opportunity-based Delegation)
 **Scope of this document:** the closing record of the MA-WA1 investigation. It
 changes no runtime behaviour and proposes none.
+
+The decision was taken on 2026-08-22 and is recorded in §5: delegation stays
+model-elected, the `p_min = 0.50` dependability threshold is withdrawn, and Beta
+ships the runtime rather than the behaviour. Everything below is the evidence
+that decision rests on, unchanged.
 
 Raw evidence lives in the dogfood-control repository; every claim below names
 the experiment directory that holds its data.
@@ -86,11 +91,16 @@ flat.
 ## 4. Final conclusion
 
 ```
+DELEGATION_RUNTIME         = PASS
+DELEGATION_SAFETY          = PASS
+DELEGATION_ADOPTION        = NOT_GUARANTEED
 ADOPTION_ROOT_CAUSE        = MODEL_INTRINSIC_ADOPTION_LIMIT (leading)
-DELEGATION_ADOPTION        = NOT_ACCEPTED
-MA-WA1                     = OPEN_BETA_REQUIRED
-MULTI_AGENT_PRODUCT        = NOT_ACCEPTED
+BETA_DECISION              = ACCEPT
 ```
+
+`NOT_GUARANTEED` rather than `NOT_ACCEPTED`: the number is unchanged, what
+changed is what the product claims. Beta does not promise delegation happens; it
+promises that when the model elects to delegate, execution is safe and correct.
 
 The model completes qualified coding work well and does not reliably judge
 *"this piece should go to another agent."* Every lever CodeLeveler owns has been
@@ -124,28 +134,36 @@ against noise nobody had measured.
 
 ## 5. Beta implication
 
-**Execution is Beta-ready; adoption is not, and the two should be separated.**
+**Execution is Beta-ready; adoption is not, and the two are separated.**
 
 Ownership safety, claim/settlement, durable provenance and engagement
-reliability are validated and can ship. What cannot ship as advertised is a
-*dependable* multi-agent capability, because dependability was defined as
-"delegation happens on the majority of qualified tasks" and the product achieves
-10–30 %.
+reliability are validated and ship. What does not ship is a *dependable*
+multi-agent capability, because dependability was defined as "delegation happens
+on the majority of qualified tasks" and the product achieves 10–30 %.
 
-That leaves a decision, and it is a product decision rather than an experiment:
+**Decision taken (2026-08-22): Option A — Opportunity-based Delegation.**
 
-**Option A — re-derive the gate.** If delegation stays model-elected, MA-WA1's
-`p_min = 0.50` is a threshold no model-elected system in this evidence base can
-meet. The honest move is to re-derive the threshold from what such a system
-achieves, and describe multi-agent as opportunistic rather than dependable.
+`p_min = 0.50` is withdrawn. It is a threshold no model-elected system in this
+evidence base can meet, and eight eliminations say the shortfall is not in
+CodeLeveler. Multi-agent is described as opportunistic, and the Beta claim moves
+from behaviour to runtime:
 
-**Option B — change the decision surface.** Replace an availability notice the
-model must act on unaided with a concrete proposal built from work items the
-runtime already tracks. This is a real product change with its own RED tests,
-KEEP controls and safety re-run. Design: `docs/design/DELEGATION_ADVISOR_DESIGN.md`.
+| Beta does not promise | Beta promises |
+| --- | --- |
+| "the agent will split the task on its own" | a secure Multi-Agent Runtime that executes reliably whenever the model elects to collaborate |
 
-Both are post-Beta. Neither is a reason to hold ownership safety or engagement
-reliability, which are done.
+Consequences, all documentation-level:
+
+- MA-WA1 closes. No further adoption experiments are scheduled against the
+  current decision surface — the surface itself is what remains untested.
+- Product copy drops automatic-orchestration language. See `docs/multi-agent.md`.
+- The adoption number is not a Beta blocker and is not a release gate.
+
+**Option B — change the decision surface** — is not discarded, it is
+sequenced. Replacing an availability notice the model must act on unaided with a
+concrete proposal built from work items the runtime already tracks is a real
+product change, with its own RED tests, KEEP controls and safety re-run. It is
+post-Beta Phase 1: `docs/design/DELEGATION_ADVISOR_DESIGN.md`.
 
 ### Standing constraint
 

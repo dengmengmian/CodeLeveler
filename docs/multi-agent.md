@@ -14,14 +14,20 @@ synthesizes child results. Sub-agents do not talk to each other (star topology).
 The model calls the injected `spawn_agent` tool. Emitting **several**
 `spawn_agent` calls in **one** assistant turn runs them **concurrently**.
 
-The product steers the model toward this when:
+**Delegation is model-elected, not automatic.** CodeLeveler makes the capability
+available and executes it safely; it does not decide for the model and does not
+auto-spawn. On qualified long tasks the model elects to delegate on a minority of
+runs — measured at 10–30 %, unaffected by offer timing, context size, task size
+or model capability ([evidence](evaluations/MA-WA1-FINAL.md)). Ask explicitly if
+you want it.
+
+The capability is offered when:
 
 - You ask for parallel / multi-agent work (e.g. “并行 review”, “split the work”).
 - The task has independent facets (e.g. architecture + stability + tools review).
 - A one-shot host hint is injected for matching request text (`## Multi-agent delegation`).
 
-It does **not** auto-spawn without a model `spawn_agent` call. Trivial one-step
-tasks should stay on the parent.
+Trivial one-step tasks should stay on the parent.
 
 ## Roles
 

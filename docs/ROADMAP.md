@@ -14,18 +14,21 @@ it is settled and splits in two:
 | --- | --- | --- |
 | Ownership safety, claim/settlement, durable provenance | **Beta-ready** | FS1–FS16 PASS, 13 safety counters 0, across every scored run |
 | Engagement reliability | **Beta-ready** | never-engaged spiral closed and revalidated ([evidence](evaluations/MA-WA1-FINAL.md)) |
-| Delegation adoption | **OPEN_BETA_REQUIRED** | 10–30 % on qualified tasks; eight hypotheses eliminated, cause is not in CodeLeveler |
+| Delegation adoption | **NOT_GUARANTEED — accepted** | 10–30 % on qualified tasks; eight hypotheses eliminated, cause is not in CodeLeveler |
 
-**The Beta decision this forces** — one of:
+**Decision taken (2026-08-22): Opportunity-based Delegation.** MA-WA1 closes with
+`BETA_DECISION = ACCEPT`. `p_min = 0.50` is withdrawn as a threshold no
+model-elected system in this evidence base can meet, and the Beta claim moves
+from behaviour to runtime:
 
-- **A. Re-derive the gate.** Keep delegation model-elected and set MA-WA1's
-  threshold to what such a system demonstrably achieves. Multi-agent is then
-  described as opportunistic, not dependable.
-- **B. Change the decision surface.** Post-Beta work, Phase 1 below.
+> Beta ships a **secure Multi-Agent Runtime** — reliable execution whenever the
+> model elects to collaborate. It does **not** promise that the agent splits
+> tasks on its own.
 
-A is a documentation and expectation change and could land inside Beta. B cannot.
+Adoption is therefore not a Beta blocker and not a release gate. Changing the
+decision surface — the one lever never tested — is post-Beta Phase 1 below.
 
-## After Beta — Multi-Agent Product Closure
+## Post Beta Multi-Agent Product Closure
 
 Ordered by dependency, not by appeal. Each phase states the evidence that
 justifies it and what would prove it wrong.
@@ -43,7 +46,8 @@ Design: [`design/DELEGATION_ADVISOR_DESIGN.md`](design/DELEGATION_ADVISOR_DESIGN
 - **Success:** `appropriate_delegation_rate` rises with `unnecessary = 0` and no
   verifier regression. **Not** spawn rate.
 - **Falsified by:** correct path-level proposals declined at the same rate. That
-  outcome sends the product to Option A above, and is worth knowing.
+  outcome makes Opportunity-based Delegation permanent rather than provisional,
+  and is worth knowing.
 - **Blocked on:** nothing technical. Should not start before the Beta gate.
 
 ### Phase 2 · SubAgentProvider
