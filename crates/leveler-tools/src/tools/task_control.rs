@@ -300,6 +300,61 @@ mod tests {
         (ctx, reg)
     }
 
+    /// A background command that exits non-zero must surface as a tool ERROR
+    /// carrying its exit code — never as a quiet success.
+    ///
+    /// Spawn Reliability Gate, Experiment 3c. The Multi-Agent shape this
+    /// guards is a parent that fans out children *and* leaves a verification
+    /// command running in the background: if that command's failure arrives as
+    /// `ok`, the parent synthesises a conclusion on top of a check that did not
+    /// pass, and reports success it has not earned.
+    #[tokio::test]
+    async fn a_failing_background_command_is_reported_as_an_error_with_its_exit_code() {
+        let dir = scratch_repo();
+        let (ctx, _reg) = ctx_with_reg(dir.path());
+
+        let start = RunCommandTool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "echo failing >&2; exit 3"],
+                    "background": true,
+                }),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!start.is_error, "spawn should succeed: {}", start.content);
+        let task_id = start
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("task_id: "))
+            .expect("task_id in spawn output")
+            .to_string();
+
+        let wait = WaitTaskTool
+            .execute(
+                serde_json::json!({"task_id": task_id, "timeout_seconds": 10}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            wait.is_error,
+            "a non-zero background exit must not read as success: {}",
+            wait.content
+        );
+        assert_eq!(
+            wait.metadata.get("exit_code").and_then(|v| v.as_i64()),
+            Some(3),
+            "the exit code has to reach the caller, not just the word 'failed': {:?}",
+            wait.metadata
+        );
+    }
+
     #[tokio::test]
     async fn wait_accounts_modified_files_without_restoring_when_no_allowlist() {
         // Default Goal background (dev server / watcher): account diffs, never

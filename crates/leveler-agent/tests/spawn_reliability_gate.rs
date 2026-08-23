@@ -37,13 +37,33 @@ use leveler_tools::{ToolContext, default_registry};
 /// A scripted model: hands back one prepared response per request.
 struct ScriptedRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
+    /// Delay before each stream, so concurrent children genuinely overlap and
+    /// a cancellation can land while they are in flight.
+    delay: std::time::Duration,
+    /// Called with the 0-based stream index before each response. Cancelling
+    /// from here is deterministic; a wall-clock timer races the children.
+    on_stream: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    stream_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ScriptedRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
+            delay: std::time::Duration::ZERO,
+            on_stream: None,
+            stream_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    fn with_stream_hook(mut self, hook: impl Fn(usize) + Send + Sync + 'static) -> Self {
+        self.on_stream = Some(Arc::new(hook));
+        self
     }
 }
 
@@ -63,6 +83,15 @@ impl ModelRuntime for ScriptedRuntime {
         _cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         use leveler_model::ModelEvent;
+        let index = self
+            .stream_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(hook) = &self.on_stream {
+            hook(index);
+        }
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         // Running out mid-fan-out would look like a child hanging, so say what
         // actually happened rather than stalling.
         let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
@@ -385,5 +414,94 @@ async fn a_wide_fan_out_loses_no_lifecycle_event() {
         life.refusals.len(),
         10,
         "the ten surplus spawns are each refused explicitly"
+    );
+}
+
+/// EXPERIMENT 3b — parent cancellation with children in flight.
+///
+/// The gap the first pass of this gate reported. A cancelled parent must not
+/// strand its children: every child that started has to reach a terminal, or
+/// the log keeps asserting that stopped work is still running. That is exactly
+/// the state session `446c71ad` left behind — two explorers `running` forever,
+/// there because the turn died mid-flight and nobody spoke for them.
+///
+/// Cancellation fires from the stream hook rather than a timer: a wall-clock
+/// race against three children is the kind of test that passes on a quiet
+/// machine and fails in CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_the_parent_settles_every_child_in_flight() {
+    let dir = tmp("cancel-fanout", 41);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let mut script = vec![assistant_with(
+        (0..3)
+            .map(|i| spawn_call(&format!("s{i}"), &format!("explore slice {i}")))
+            .collect(),
+        FinishReason::ToolCalls,
+    )];
+    for i in 0..3 {
+        script.push(assistant_text(&format!("child {i} report")));
+    }
+    script.push(assistant_text("parent synthesis"));
+
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    // Stream 0 is the parent's spawn round; 1.. are the children. Cancel once
+    // the children are actually running.
+    let runtime = Arc::new(
+        ScriptedRuntime::new(script)
+            .with_delay(std::time::Duration::from_millis(40))
+            .with_stream_hook(move |index| {
+                if index == 2 {
+                    cancel.cancel();
+                }
+            }),
+    );
+
+    let lifecycle = Arc::new(Mutex::new(Lifecycle::default()));
+    let sink = lifecycle.clone();
+    let mut observer = move |event: AgentEvent| match event {
+        AgentEvent::SubAgentStarted { id, .. } => sink.lock().unwrap().started.push(id),
+        AgentEvent::SubAgentFinished { id, .. } => sink.lock().unwrap().finished.push(id),
+        _ => {}
+    };
+
+    let result = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "spawn three, then cancel",
+        &mut observer,
+        &mut NoopSink,
+        token,
+    )
+    .await;
+
+    let life = lifecycle.lock().unwrap().clone();
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Guard against passing for the wrong reason. If the cancellation landed
+    // after every child had already reported, nothing about stranding was
+    // tested — the run has to have actually been cancelled, with children
+    // already started when it was.
+    assert!(
+        matches!(result, Err(leveler_agent::AgentError::Cancelled)),
+        "cancellation never took effect, so nothing was tested: {result:?}"
+    );
+    assert!(
+        !life.started.is_empty(),
+        "the test is meaningless unless children actually started"
+    );
+    assert!(
+        life.ghosts().is_empty(),
+        "cancelling the parent stranded {} of {} children: {:?}",
+        life.ghosts().len(),
+        life.started.len(),
+        life.ghosts()
     );
 }
