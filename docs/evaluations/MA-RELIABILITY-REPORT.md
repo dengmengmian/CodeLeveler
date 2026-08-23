@@ -1,19 +1,21 @@
 # MA-RELIABILITY — Spawn Reliability Gate
 
-**Opened:** 2026-08-23 · **Subject:** `main` @ `0a462660` · **Suite:**
-`crates/leveler-agent/tests/spawn_reliability_gate.rs`
+**Opened:** 2026-08-23 · **Closed:** 2026-08-23 · **Subject:** `main` @
+`ce5b7d8b` · **Suite:** `crates/leveler-agent/tests/spawn_reliability_gate.rs`
+· **Live sessions:** `9c4f6d0c` `705c5b3e` `466934ee`
 
 ## Executive Summary
 
 ```
-Spawn Reliability:  PARTIAL
+Spawn Reliability:  PASS
 ```
 
-Lifecycle integrity holds at every width tested, including past the cap. What is
-**not** covered is the half of the gate that needs a runtime, not an agent
-harness: parent cancellation, background-task failure, and a realistic
-long-running baseline. Calling this PASS would claim coverage the suite does not
-have.
+Lifecycle integrity holds at every width tested, past the cap, under
+cancellation, and across three real long-running Multi-Agent sessions. **Zero
+ghost children in 34 scripted runs and 3 live ones.**
+
+The gate opened as PARTIAL with two gaps — parent cancellation and
+background-task failure — and one unrun experiment. All three are now closed.
 
 ## How this was measured, and why not with a model
 
@@ -29,8 +31,9 @@ willingness. Scripting the fan-out gives exact concurrency, free repetitions —
 **five per width instead of the n≥3 a paid run could afford** — and results that
 model variance cannot confound.
 
-What still requires a real session is the realistic baseline: completion, wall
-time, tokens, child contribution. That is Experiment 4, not yet run.
+What still required a real session is the realistic baseline — completion,
+fan-out, settlement, tokens. That is Experiment 4, and it has now been run at
+n=3.
 
 ## Runtime Boundary
 
@@ -74,7 +77,9 @@ no finish arrived without a start, and refusals matched the surplus exactly.
 | Over cap | 8 | 6 | 2 | 0 | 0 | PASS |
 | Over cap | 16 | 6 | 10 | 0 | 0 | PASS |
 
-30 runs, 0 ghosts, 0 orphans, 0 double-reports.
+30 runs across the widths above, plus a wide-fan-out check, a child-failure case,
+a cancellation case and one background-failure case: **34 scripted runs, 0
+ghosts, 0 orphans, 0 double-reports.**
 
 ## Experiment results
 
@@ -93,22 +98,66 @@ completed a three-explorer run at **288 tool calls and 1.74M input tokens**,
 against the 230 calls that overflowed the old 256-slot channel. Root cause and
 replay: `beta-001/EVENT_PIPELINE_ROOT_CAUSE.md` in the dogfood-control repo.
 
-### 3 · Failure propagation — PARTIAL
+### 3 · Failure propagation — PASS
 
 | Case | Status |
 | --- | --- |
 | Child failure | **PASS** — a child that reaches for a tool it does not have still emits a terminal; the parent is not left waiting |
-| Parent cancellation | **NOT COVERED** — engine-level; the turn now settles unfinished children before `TurnFinished` (`0a462660`), but no test drives cancellation mid-fan-out |
-| Background task failure | **NOT COVERED** |
+| Parent cancellation | **PASS** — cancelling a parent with children in flight strands none of them |
+| Background task failure | **PASS** — a non-zero background exit surfaces as a tool error carrying its exit code |
 
-The parent-cancellation gap is the important one. The fix exists and its unit
-tests pass, but "cancel a parent with three children in flight and prove all
-three settle" has not been run.
+The cancellation test is written to fail rather than flatter: if the cancel
+lands after every child has already reported, nothing about stranding was
+tested and a naive test would still go green. So it asserts the run actually
+returned `Cancelled` **and** that children had started, and it fires the cancel
+from a stream hook rather than a wall-clock timer — racing three children on a
+loaded machine is how a test passes locally and fails in CI.
 
-### 4 · Long-running realistic baseline — NOT RUN
+Background failure turned out to be implemented correctly already; what was
+missing was anything holding it there. The Multi-Agent shape that makes it
+matter is a parent fanning out children while a verification command runs
+behind them: if that failure arrives as `ok`, the parent synthesises on top of a
+check that never passed.
 
-Needs real model calls, n≥3. The single verification run so far (`0f5a5d60`)
-completed with three explorers in 6m24s, but one run is not a baseline.
+### 4 · Long-running realistic baseline — PASS (n=3)
+
+Same frozen goal (90 bytes, sha256 `49bd2321…`), same model
+(`deepseek-v4-flash`), same repository at `0a462660`, `git reset --hard` between
+runs so every run starts identically. Sessions `9c4f6d0c`, `705c5b3e`,
+`466934ee`.
+
+| | run 1 | run 2 | run 3 |
+| --- | --- | --- | --- |
+| Session status | **completed** | **completed** | **completed** |
+| Children spawned | 4 | 3 | 4 |
+| Children settled | **4/4** | **3/3** | **4/4** |
+| **Stuck / ghost** | **0** | **0** | **0** |
+| Tool calls | 332 | 163 | 409 |
+| Tool failures | 18 | 0 | 4 |
+| Input tokens | 2.69 M | 0.90 M | 3.36 M |
+| Model requests | 42 | 19 | 46 |
+
+**3/3 completed. 11 children spawned, 11 settled, 0 ghosts.**
+
+Two children across the three runs terminated `INCOMPLETE_PARTIAL (stopped: it
+hit the round ceiling)`. That is the **right** outcome, not a failure of the
+gate: the child ran out of budget and *said so*. An honest incomplete is what
+this whole line of work is for — the defect class was children that stop and
+never report, not children that report having stopped.
+
+The load matters. The session that originally overflowed the pipeline made 230
+tool calls. These made 332, 163 and 409, with up to 3.36 M input tokens, and all
+three completed.
+
+**Wall time is not reported as an agent metric.** Runs took 1060 s, 1205 s and
+1020 s, but the clone had no build cache — every `cargo test` the agent issued
+was a cold compile of the whole workspace. That number measures the toolchain,
+not the runtime. Fan-out, settlement, completion and tokens are unaffected.
+
+**Variance is large and worth saying so.** Tool calls ranged 163–409 and tokens
+0.90–3.36 M on an identical starting state: a 2.5× and 3.7× spread across three
+runs. Reliability was invariant; *cost* was not. Any future claim about
+Multi-Agent efficiency needs far more than n=3.
 
 ## Failure Analysis
 
@@ -126,8 +175,8 @@ mine:
 
 ## Recommendation
 
-**Multi-Agent can enter the Beta capability list as a bounded capability**, and
-the bound should be stated rather than discovered:
+**Multi-Agent enters the Beta capability list as a bounded capability**, and the
+bound is stated rather than left to be discovered:
 
 > Up to 6 delegated agents per run, at most 4 concurrent. Past that the runtime
 > refuses the spawn and tells the agent to do the work itself.
@@ -135,17 +184,17 @@ the bound should be stated rather than discovered:
 That is a defensible product claim: a reliable 4-to-6-agent system, not an
 unstable twenty-agent one.
 
-**Before PASS**, two gaps close:
-
-1. Parent cancellation with children in flight — all children must reach a
-   terminal state.
-2. Background task failure — represented, never silent.
-
-Both are engine-level and deterministic. Neither needs a model, and neither is
-large.
-
 ## What this does not claim
 
-Thirty scripted runs prove the lifecycle contract holds under exact concurrency.
-They do not prove the runtime survives a real model driving real tools for an
-hour. That is Experiment 4, and it is still owed.
+- **Nothing above 6 children.** It is unreachable by design, so it is untested
+  and should stay unclaimed.
+- **No efficiency claim.** Identical inputs produced 163–409 tool calls and
+  0.90–3.36 M tokens. Reliability was invariant across that spread; cost was
+  not, and n=3 cannot resolve it. Whether Multi-Agent is *worth* its cost is the
+  next question and a different experiment.
+- **One task shape, one model.** Every live run asked the same repository
+  question of `deepseek-v4-flash`. Fan-out behaviour is model-dependent — the
+  cross-model work already showed `k3` fanning out where DeepSeek issues one —
+  so these numbers describe this pairing, not the runtime's whole envelope.
+- **No wall-time figure.** See Experiment 4: the clone had no build cache, so
+  the clock measured cold compiles.
