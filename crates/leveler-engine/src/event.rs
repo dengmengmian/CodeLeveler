@@ -337,6 +337,12 @@ pub enum EngineEvent {
         nickname: String,
         ok: bool,
         summary: String,
+        /// What this child contributed, as counts joined on `source_child`.
+        /// A reference, never the finding records — the ledger stays the
+        /// authority. `serde(default)` so events written before contribution
+        /// tracing existed still replay.
+        #[serde(default)]
+        contribution: Option<leveler_lifecycle::ChildResultProjection>,
     },
     /// TRANSIENT: live tool/step for one sub-agent (attributed by `id`).
     SubAgentActivity {
@@ -1005,11 +1011,13 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 nickname,
                 ok,
                 summary,
+                contribution,
             } => EngineEvent::SubAgentFinished {
                 id,
                 nickname,
                 ok,
                 summary,
+                contribution,
             },
             A::SubAgentActivity {
                 id,

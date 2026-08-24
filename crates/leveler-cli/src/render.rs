@@ -326,9 +326,14 @@ fn render_event_jsonl(event: AgentEvent) {
             nickname,
             ok,
             summary,
+            contribution,
         } => serde_json::json!({
             "type": "sub_agent_finished",
             "id": id, "nickname": nickname, "ok": ok, "summary": summary,
+            // Machine-readable contribution, so eval collectors read counts
+            // instead of parsing prose. Null for children that never reported
+            // and for logs written before contribution tracing.
+            "contribution": contribution,
         }),
         AgentEvent::SubAgentActivity {
             id,

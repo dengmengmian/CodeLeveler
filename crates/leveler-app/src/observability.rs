@@ -327,15 +327,39 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             nickname,
             ok,
             summary,
+            contribution,
         } => (
             ObservationClass::Agent,
             format!("{nickname} done"),
             String::new(),
             if *ok { "ok" } else { "fail" }.into(),
-            vec![
-                ("Id".into(), id.clone()),
-                ("Summary".into(), truncate(summary, 64)),
-            ],
+            {
+                let mut fields = vec![
+                    ("Id".into(), id.clone()),
+                    ("Summary".into(), truncate(summary, 64)),
+                ];
+                // What makes a child's contribution readable without joining
+                // the ledger by hand. Absent for children that never reported
+                // and for events written before contribution tracing.
+                if let Some(c) = contribution {
+                    fields.push((
+                        "Findings".into(),
+                        format!(
+                            "{} reported · {} accepted · {} rejected · {} verified{}",
+                            c.findings_total,
+                            c.findings_accepted,
+                            c.findings_rejected,
+                            c.findings_verified,
+                            if c.findings_open_blocking > 0 {
+                                format!(" · {} open blocking", c.findings_open_blocking)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    ));
+                }
+                fields
+            },
         ),
         EngineEvent::ReviewStage { action, detail, .. } => (
             ObservationClass::Agent,
@@ -559,11 +583,17 @@ fn collect_agents(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiAgentObservat
                     },
                 );
             }
+            // Not folded into `UiAgentObservation`: that type lives in the
+            // client protocol, and widening it pulls in schema regeneration and
+            // generated TS — UX-phase work. Contribution is already readable
+            // through `leveler trace` (the Findings field above), which is what
+            // traceability required.
             EngineEvent::SubAgentFinished {
                 id,
                 nickname,
                 ok,
                 summary,
+                ..
             } => {
                 let row = by_id.entry(id.clone()).or_insert_with(|| {
                     order.push(id.clone());
@@ -826,6 +856,16 @@ mod tests {
                 nickname: "Reviewer".into(),
                 ok: true,
                 summary: "ok".into(),
+                contribution: Some(leveler_lifecycle::ChildResultProjection {
+                    child_id: "ag1".into(),
+                    role: "reviewer".into(),
+                    findings_total: 3,
+                    findings_acknowledged: 3,
+                    findings_accepted: 2,
+                    findings_verified: 1,
+                    findings_rejected: 1,
+                    findings_open_blocking: 0,
+                }),
             },
         )
         .await;
@@ -857,6 +897,22 @@ mod tests {
                 .iter()
                 .any(|r| r.class == ObservationClass::Read),
             "read_file must classify as READ: {:?}",
+            loaded.window
+        );
+        // Contribution has to reach the trace, not merely compile. Without
+        // this, a child's findings stay joinable only by hand — which is the
+        // state MA-VALUE-A was measured in.
+        let findings_field = loaded
+            .window
+            .iter()
+            .filter(|r| r.class == ObservationClass::Agent)
+            .flat_map(|r| r.fields.iter())
+            .find(|f| f.key == "Findings")
+            .map(|f| f.value.clone());
+        assert_eq!(
+            findings_field.as_deref(),
+            Some("3 reported · 2 accepted · 1 rejected · 1 verified"),
+            "the child's contribution must be readable from the trace: {:?}",
             loaded.window
         );
         assert!(
@@ -1057,6 +1113,7 @@ mod tests {
             nickname: nickname.into(),
             ok,
             summary: summary.into(),
+            contribution: None,
         }
     }
 

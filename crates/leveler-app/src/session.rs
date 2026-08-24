@@ -194,11 +194,13 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             nickname,
             ok,
             summary,
+            contribution,
         } => AgentEvent::SubAgentFinished {
             id,
             nickname,
             ok,
             summary,
+            contribution,
         },
         EngineEvent::SubAgentActivity {
             id,

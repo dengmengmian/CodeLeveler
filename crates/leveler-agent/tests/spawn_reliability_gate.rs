@@ -505,3 +505,77 @@ async fn cancelling_the_parent_settles_every_child_in_flight() {
         life.ghosts()
     );
 }
+
+/// Contribution trace, end to end: a settled child's terminal event must carry
+/// a projection naming that child, not just a prose preview.
+///
+/// This is the gap MA-VALUE-A ran into. That round could measure that
+/// Multi-Agent scored 16 % higher and not why, because the scorer graded the
+/// parent's prose — while 490 finding records sat in the ledger with
+/// `source_child` on every one and nothing joined them to the outcome.
+///
+/// The assertion is deliberately about *presence and attribution*, not counts:
+/// a scripted child reports no findings, so the counts are zero. Zero from a
+/// child that ran is a different fact from `None`, which means "not measured",
+/// and conflating them is how a child that contributed nothing would become
+/// indistinguishable from a child nobody looked at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settled_child_reports_a_contribution_projection() {
+    let dir = tmp("contribution", 77);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let script = vec![
+        assistant_with(
+            vec![spawn_call("s0", "look at the repository")],
+            FinishReason::ToolCalls,
+        ),
+        assistant_text("child report"),
+        assistant_text("parent synthesis"),
+    ];
+
+    let seen: Arc<Mutex<Vec<(String, Option<leveler_lifecycle::ChildResultProjection>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let mut observer = move |event: AgentEvent| {
+        if let AgentEvent::SubAgentFinished {
+            id, contribution, ..
+        } = event
+        {
+            sink.lock().unwrap().push((id, contribution));
+        }
+    };
+
+    let _ = Executor::new(
+        Arc::new(ScriptedRuntime::new(script)),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .run(
+        "spawn one and settle it",
+        &mut observer,
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let seen = seen.lock().unwrap().clone();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(seen.len(), 1, "exactly one child settled");
+    let (id, contribution) = &seen[0];
+    let projection = contribution
+        .as_ref()
+        .expect("a settled child must carry a projection, not None");
+    assert_eq!(
+        &projection.child_id, id,
+        "the projection must name the child it projects, or it cannot be joined"
+    );
+    assert_eq!(projection.role, "explorer");
+    assert!(
+        !projection.contributed(),
+        "this child reported nothing, and the projection must say so rather than flatter it"
+    );
+}

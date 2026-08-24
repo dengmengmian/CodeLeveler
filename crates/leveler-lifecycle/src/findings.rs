@@ -163,6 +163,88 @@ pub fn transition_allowed(from: FindingState, to: FindingState) -> bool {
     )
 }
 
+/// A compact, durable view of what one child produced — enough to trace its
+/// contribution without copying its findings into an event.
+///
+/// The terminal event `SubAgentFinished` used to carry a prose preview and
+/// nothing else, so replaying a log told you a child finished and roughly what
+/// it said, never what it found in a form anything could join on. The finding
+/// records existed the whole time (490 of them across twenty MA-VALUE-A runs)
+/// with `source_child` on every one; nothing connected them to the outcome.
+///
+/// This is deliberately counts and a reference, not the records themselves.
+/// Embedding payloads in events is what the event pipeline just finished paying
+/// down — the authority stays in the ledger, which is already persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ChildResultProjection {
+    /// The child this projects. Joins to `FindingRecord::source_child`.
+    pub child_id: String,
+    pub role: String,
+    /// Findings in the parent ledger attributed to this child.
+    pub findings_total: u32,
+    /// Reached the parent at all — every state except `Created`, which means
+    /// the record never left the child's own ledger.
+    pub findings_acknowledged: u32,
+    /// The parent judged it relevant (`Accepted`, `Addressed` or `Verified`).
+    pub findings_accepted: u32,
+    /// Proven by fresh post-mutation verification.
+    pub findings_verified: u32,
+    /// Declined with a reason. Counted because a rejection IS a contribution
+    /// — the parent looked and decided — and a rate that ignores it would
+    /// reward children whose findings are merely never judged.
+    pub findings_rejected: u32,
+    /// Still blocking a verified closure.
+    pub findings_open_blocking: u32,
+}
+
+impl ChildResultProjection {
+    /// Project one child's contribution out of the parent's ledger findings.
+    ///
+    /// Pure: takes the records, returns counts. The caller owns where the
+    /// records come from, so this is testable without a running agent.
+    pub fn from_findings(child_id: &str, role: &str, findings: &[FindingRecord]) -> Self {
+        let mine: Vec<&FindingRecord> = findings
+            .iter()
+            .filter(|f| f.source_child == child_id)
+            .collect();
+        Self {
+            child_id: child_id.to_string(),
+            role: role.to_string(),
+            findings_total: mine.len() as u32,
+            findings_acknowledged: mine
+                .iter()
+                .filter(|f| !matches!(f.state, FindingState::Created))
+                .count() as u32,
+            findings_accepted: mine
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.state,
+                        FindingState::Accepted | FindingState::Addressed | FindingState::Verified
+                    )
+                })
+                .count() as u32,
+            findings_verified: mine
+                .iter()
+                .filter(|f| matches!(f.state, FindingState::Verified))
+                .count() as u32,
+            findings_rejected: mine
+                .iter()
+                .filter(|f| matches!(f.state, FindingState::Rejected))
+                .count() as u32,
+            findings_open_blocking: mine.iter().filter(|f| f.open_blocking()).count() as u32,
+        }
+    }
+
+    /// Did the parent act on anything this child reported?
+    ///
+    /// A rejection counts: the parent read it and made a call. What does not
+    /// count is a finding nobody ever judged.
+    pub fn contributed(&self) -> bool {
+        self.findings_accepted > 0 || self.findings_rejected > 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +378,109 @@ mod tests {
         assert!(json.contains("\"created\""), "{json}");
         let back: FindingRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rec);
+    }
+    fn rec(id: &str, child: &str, state: FindingState, blocking: bool) -> FindingRecord {
+        FindingRecord {
+            id: id.into(),
+            source_child: child.into(),
+            role: "explorer".into(),
+            kind: FindingKind::Observation,
+            summary: "s".into(),
+            file: None,
+            symbol: None,
+            blocking,
+            state,
+            resolution_reason: None,
+        }
+    }
+
+    /// The projection answers "which child produced this, and did the parent
+    /// act on it" from records alone — the join MA-VALUE-A could not make.
+    #[test]
+    fn a_projection_counts_only_its_own_child() {
+        let all = vec![
+            rec("f1", "agent-1", FindingState::Accepted, false),
+            rec("f2", "agent-1", FindingState::Verified, false),
+            rec("f3", "agent-2", FindingState::Accepted, false),
+            rec("f4", "agent-1", FindingState::Created, false),
+        ];
+        let p = ChildResultProjection::from_findings("agent-1", "explorer", &all);
+        assert_eq!(p.findings_total, 3, "agent-2's finding is not agent-1's");
+        assert_eq!(
+            p.findings_acknowledged, 2,
+            "a Created record never left the child's own ledger"
+        );
+        assert_eq!(p.findings_accepted, 2, "Accepted and Verified both count");
+        assert_eq!(p.findings_verified, 1);
+    }
+
+    /// A rejection IS a contribution: the parent read the finding and made a
+    /// call. Counting only acceptances would reward a child whose findings are
+    /// never judged over one whose findings are judged and declined.
+    #[test]
+    fn a_rejected_finding_still_counts_as_contribution() {
+        let all = vec![rec("f1", "agent-1", FindingState::Rejected, false)];
+        let p = ChildResultProjection::from_findings("agent-1", "explorer", &all);
+        assert_eq!(p.findings_rejected, 1);
+        assert_eq!(p.findings_accepted, 0);
+        assert!(
+            p.contributed(),
+            "the parent looked and decided — that is contribution"
+        );
+    }
+
+    /// A child whose findings were never judged has not contributed yet, and
+    /// must not be scored as if it had.
+    #[test]
+    fn findings_nobody_judged_are_not_contribution() {
+        let all = vec![
+            rec("f1", "agent-1", FindingState::Created, false),
+            rec("f2", "agent-1", FindingState::Acknowledged, false),
+        ];
+        let p = ChildResultProjection::from_findings("agent-1", "explorer", &all);
+        assert_eq!(p.findings_total, 2);
+        assert_eq!(p.findings_acknowledged, 1);
+        assert!(
+            !p.contributed(),
+            "receipt is not judgment — acknowledged alone is not contribution"
+        );
+    }
+
+    /// An open blocking finding is what stops a verified closure, so it is
+    /// counted separately from the accept/reject question.
+    #[test]
+    fn open_blocking_findings_are_surfaced_separately() {
+        let all = vec![
+            rec("f1", "agent-1", FindingState::Acknowledged, true),
+            rec("f2", "agent-1", FindingState::Rejected, true),
+        ];
+        let p = ChildResultProjection::from_findings("agent-1", "explorer", &all);
+        assert_eq!(
+            p.findings_open_blocking, 1,
+            "a rejected blocking finding no longer blocks"
+        );
+    }
+
+    /// A child that reported nothing projects cleanly rather than panicking or
+    /// looking like a child that was never asked.
+    #[test]
+    fn a_child_with_no_findings_projects_zeros() {
+        let p = ChildResultProjection::from_findings("agent-9", "explorer", &[]);
+        assert_eq!(p.findings_total, 0);
+        assert!(!p.contributed());
+        assert_eq!(p.child_id, "agent-9");
+    }
+
+    /// The projection rides events and must survive replay.
+    #[test]
+    fn a_projection_roundtrips_through_json() {
+        let p = ChildResultProjection::from_findings(
+            "agent-1",
+            "reviewer",
+            &[rec("f1", "agent-1", FindingState::Verified, false)],
+        );
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ChildResultProjection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
     }
 }

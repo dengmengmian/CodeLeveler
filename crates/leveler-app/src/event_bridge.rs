@@ -508,6 +508,7 @@ impl EventBridge {
                 nickname,
                 ok,
                 summary,
+                ..
             } => {
                 let _ = self.events.send(RuntimeEvent::SubAgentUpdated {
                     id,
@@ -1447,6 +1448,7 @@ mod projection_equivalence {
                 nickname: "Newton".into(),
                 ok: true,
                 summary: "done".into(),
+                contribution: None,
             },
         ]);
         assert_eq!(

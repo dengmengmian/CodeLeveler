@@ -3601,11 +3601,19 @@ fn fold_child_settlement(
             content.push_str(&adopted_line);
         }
     }
+    // Project this child's contribution out of the parent ledger. Computed
+    // here because this is the one point that owns both the child's identity
+    // and the ledger its findings were adopted into — and computed at
+    // settlement rather than read later, so a replay of the terminal event
+    // alone can answer "did the parent act on what this child found".
+    let contribution =
+        leveler_lifecycle::ChildResultProjection::from_findings(id, role.label(), &ledger.findings);
     observer(AgentEvent::SubAgentFinished {
         id: id.to_string(),
         nickname: nickname.to_string(),
         ok: result.result.status.completed(),
         summary: preview(&content),
+        contribution: Some(contribution),
     });
     (content, result.result.status.completed())
 }

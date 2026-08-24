@@ -173,12 +173,20 @@ pub enum AgentEvent {
         output_tokens: u32,
         cached_input_tokens: u32,
     },
-    /// A sub-agent finished, with a short summary of its result.
+    /// A sub-agent finished, with a short summary of its result and a compact
+    /// projection of what it contributed.
+    ///
+    /// The projection is counts and a child id, never the finding records: the
+    /// authority stays in the ledger, which is already durable. Carrying the
+    /// records here would put a payload in every terminal event, which is the
+    /// cost the event pipeline just finished paying down.
     SubAgentFinished {
         id: String,
         nickname: String,
         ok: bool,
         summary: String,
+        /// Absent on events written before contribution tracing existed.
+        contribution: Option<leveler_lifecycle::ChildResultProjection>,
     },
     /// Live step for one spawned sub-agent (tool start/finish). Transient UI
     /// signal — not full child transcript. Attributed by `id` so concurrent

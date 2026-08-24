@@ -527,6 +527,10 @@ impl TurnRunner<'_> {
                         id: child.id.clone(),
                         nickname: child.nickname.clone(),
                         ok: false,
+                        // A child that never reported contributed nothing, and
+                        // an empty projection says that rather than leaving the
+                        // question open.
+                        contribution: None,
                         summary: format!(
                             "[sub-agent {}] did not report before the turn ended ({})",
                             child.nickname,
@@ -737,6 +741,11 @@ impl TurnRunner<'_> {
                     nickname: "reviewer".to_string(),
                     ok: result.ok,
                     summary: leveler_core::truncate_head_bytes(summary.trim(), 4000, "…"),
+                    // The review stage runs outside the executor's ledger, so
+                    // no projection is available here. `None` says "not
+                    // measured", which is the truth; a zeroed projection would
+                    // read as "contributed nothing".
+                    contribution: None,
                 },
                 observer,
             )

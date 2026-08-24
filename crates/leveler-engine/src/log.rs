@@ -683,6 +683,7 @@ mod tests {
                 nickname: "Euclid".into(),
                 ok: true,
                 summary: "done".into(),
+                contribution: None,
             },
             &mut sink,
         )
@@ -724,6 +725,7 @@ mod tests {
                 nickname: "Euclid".into(),
                 ok: false,
                 summary: "failed, but it reported".into(),
+                contribution: None,
             },
             &mut sink,
         )
