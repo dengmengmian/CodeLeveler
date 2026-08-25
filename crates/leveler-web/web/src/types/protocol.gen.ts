@@ -383,6 +383,23 @@ export interface UiToolAggregate {
   unfinished?: number;
 }
 
+/** One goal that still owes work. */
+export interface UiUnfinishedGoal {
+  /** A turn is still running for it — it is being driven right now, and is therefore not unfinished work. */
+  driving: boolean;
+  goal_id: string;
+  /** What the user asked, verbatim. */
+  objective: string;
+  /** RFC3339. When the goal was opened. */
+  opened_at: string;
+  /** Whether this runtime may act on it. `false` means another runtime holds the task; the goal is still listed, because omitting work that exists is worse than naming work nobody here can act on. */
+  ours: boolean;
+  /** The conversation it ran in, so the user can go read it. */
+  session_id: string;
+  /** Work windows it consumed before stopping. */
+  windows_run: number;
+}
+
 /** One user shell execution (`!command`) as the reconnect snapshot carries it: the active one plus a bounded recent history. `output_tail` is the bounded end of the combined output (never the full log). */
 export interface UiUserShell {
   command: string;
@@ -480,6 +497,8 @@ export type ClientCommand =
   | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id?: CommandId | null; session_id: SessionId }
   /** Load one child's findings for the Contribution Inspector. A query, not a subscription: findings live in the ledger, and pushing them through the event stream would duplicate the record and re-grow the payloads the event pipeline was trimmed of. The client asks when the user opens a detail view. */
   | { type: 'query_child_contribution'; child_id: string; query_id?: CommandId | null; session_id: SessionId }
+  /** List goals that still owe work (long-goal P2). Read-only, and there is deliberately no companion command that continues one: resume is a policy this runtime has not decided, and a protocol that can only report is a protocol that cannot accidentally restart somebody's half-finished mutation. */
+  | { type: 'list_unfinished_goals'; query_id?: CommandId | null; session_id: SessionId }
   /** The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command. */
   | { type: 'quit' };
 
@@ -573,6 +592,8 @@ export type RuntimeEvent =
   | { type: 'sub_agent_activity'; id: string; is_error: boolean; phase: string; preview: string; tool: string }
   /** Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only: a snapshot of the ledger, never a mutation. */
   | { type: 'child_contribution_loaded'; detail: UiChildContribution; query_id?: CommandId | null }
+  /** Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only. */
+  | { type: 'unfinished_goals_loaded'; goals?: UiUnfinishedGoal[]; query_id?: CommandId | null }
   /** A transient notification for the status line. */
   | { type: 'notification'; level: NotificationLevel; message: string }
   /** A background process task was started (`run_command` background=true). */

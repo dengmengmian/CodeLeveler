@@ -282,6 +282,13 @@ pub enum RuntimeEvent {
         query_id: Option<leveler_core::CommandId>,
         detail: crate::UiChildContribution,
     },
+    /// Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only.
+    UnfinishedGoalsLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        goals: Vec<crate::UiUnfinishedGoal>,
+    },
     /// A transient notification for the status line.
     Notification {
         level: NotificationLevel,

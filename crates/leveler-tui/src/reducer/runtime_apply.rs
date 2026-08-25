@@ -346,6 +346,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     .push_sub_agent_started(id, nickname, role, detail, started);
             }
         }
+        RuntimeEvent::UnfinishedGoalsLoaded { goals, .. } => {
+            state.unfinished_goals = goals;
+        }
         RuntimeEvent::ChildContributionLoaded { detail, .. } => {
             state.team.apply_detail(detail);
         }

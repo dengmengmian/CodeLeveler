@@ -247,6 +247,14 @@ impl RemotePolicy {
                 reason: "contribution detail is local-only",
             },
 
+            // An unfinished goal names what the user asked, verbatim, and the
+            // session it ran in. Same class as the observatory: the objective
+            // is repository content in prose form.
+            ClientCommand::ListUnfinishedGoals { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "goal listing is local-only",
+            },
+
             // Shuts down the runtime for every client, local ones included.
             // The local socket transport refuses it too.
             ClientCommand::Quit => RemoteVerdict::Deny {

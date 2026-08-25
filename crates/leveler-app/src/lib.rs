@@ -12,6 +12,7 @@ pub mod contribution_query;
 pub mod doctor;
 mod event_bridge;
 pub mod global_config;
+pub mod goal_discovery;
 mod interactive;
 mod live_view;
 pub mod mcp_config;

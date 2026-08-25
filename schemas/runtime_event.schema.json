@@ -1053,6 +1053,37 @@
       }
     },
     {
+      "description": "Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "goals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiUnfinishedGoal"
+          }
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "unfinished_goals_loaded"
+          ]
+        }
+      }
+    },
+    {
       "description": "A transient notification for the status line.",
       "type": "object",
       "required": [
@@ -2681,6 +2712,50 @@
         "unfinished": {
           "description": "`tool_call_started` with no matching `tool_call_finished`.",
           "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiUnfinishedGoal": {
+      "description": "One goal that still owes work.",
+      "type": "object",
+      "required": [
+        "driving",
+        "goal_id",
+        "objective",
+        "opened_at",
+        "ours",
+        "session_id",
+        "windows_run"
+      ],
+      "properties": {
+        "driving": {
+          "description": "A turn is still running for it — it is being driven right now, and is therefore not unfinished work.",
+          "type": "boolean"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "objective": {
+          "description": "What the user asked, verbatim.",
+          "type": "string"
+        },
+        "opened_at": {
+          "description": "RFC3339. When the goal was opened.",
+          "type": "string"
+        },
+        "ours": {
+          "description": "Whether this runtime may act on it. `false` means another runtime holds the task; the goal is still listed, because omitting work that exists is worse than naming work nobody here can act on.",
+          "type": "boolean"
+        },
+        "session_id": {
+          "description": "The conversation it ran in, so the user can go read it.",
+          "type": "string"
+        },
+        "windows_run": {
+          "description": "Work windows it consumed before stopping.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0

@@ -42,6 +42,7 @@ mod tool_cell;
 mod tool_result;
 pub mod tool_taxonomy;
 pub mod transcript;
+pub mod unfinished_goals;
 mod url_link;
 mod workbench;
 

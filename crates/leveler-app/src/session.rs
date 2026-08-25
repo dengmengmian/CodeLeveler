@@ -613,10 +613,60 @@ impl Application {
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.runtime.continuation = continuation;
         spec.runtime.limits = limits;
+        // Goal identity (long-goal P1/P2). Recorded HERE rather than at the
+        // interactive call site because this is the seam both paths cross:
+        // `leveler run` (headless) and the TUI's RunGoal reach the engine
+        // through it. Wiring only the interactive one left every headless run
+        // — the ones most likely to be killed unattended — with no record
+        // that work was owed.
+        let goal_record = self.open_goal_record(session_id, goal).await;
         let result = engine.run(session_id, &spec, observer, cancellation).await;
+        // The goal stops owing work when its driving run reaches a terminal
+        // state, including an error: a run that failed is finished, not owed.
+        // Only a process that never got here leaves the goal `running`, which
+        // is exactly the signal P2 reports.
+        self.settle_goal_record(goal_record).await;
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
+        }
+    }
+
+    /// Record that a long-lived intent exists, before the work starts.
+    ///
+    /// Best-effort: a goal whose bookkeeping cannot be written must still run.
+    /// `None` means "not recorded", and every caller treats that as nothing to
+    /// settle rather than as a settled goal.
+    async fn open_goal_record(
+        &self,
+        session_id: &leveler_core::SessionId,
+        objective: &str,
+    ) -> Option<leveler_core::GoalId> {
+        let db = self.open_database().await.ok()?;
+        let now = leveler_core::now();
+        let task = leveler_storage::TaskStore::ensure_for_session(&db, session_id, now)
+            .await
+            .ok()?;
+        match leveler_storage::GoalStore::open(&db, &task, objective, now).await {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::warn!(%error, "could not record goal identity; the goal still runs");
+                None
+            }
+        }
+    }
+
+    /// Mark a goal as owing no further work.
+    async fn settle_goal_record(&self, goal: Option<leveler_core::GoalId>) {
+        let Some(goal) = goal else { return };
+        let Ok(db) = self.open_database().await else {
+            tracing::warn!("could not settle goal: database unavailable");
+            return;
+        };
+        if let Err(error) =
+            leveler_storage::GoalStore::settle(&db, &goal, leveler_core::now()).await
+        {
+            tracing::warn!(%error, "could not settle goal record");
         }
     }
 

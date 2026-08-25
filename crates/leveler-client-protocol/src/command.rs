@@ -210,6 +210,18 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// List goals that still owe work (long-goal P2).
+    ///
+    /// Read-only, and there is deliberately no companion command that
+    /// continues one: resume is a policy this runtime has not decided, and a
+    /// protocol that can only report is a protocol that cannot accidentally
+    /// restart somebody's half-finished mutation.
+    ListUnfinishedGoals {
+        session_id: SessionId,
+        /// Correlation token for [`crate::RuntimeEvent::UnfinishedGoalsLoaded`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// The runtime owner is shutting down; all work should stop. Disconnecting
     /// an individual UI client must not issue this command.
     Quit,
@@ -249,6 +261,7 @@ impl ClientCommand {
             | ClientCommand::CancelUserShell { session_id, .. }
             | ClientCommand::Btw { session_id, .. }
             | ClientCommand::QueryChildContribution { session_id, .. }
+            | ClientCommand::ListUnfinishedGoals { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
                 requester_session_id,

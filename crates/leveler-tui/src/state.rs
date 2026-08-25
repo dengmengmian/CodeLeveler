@@ -99,6 +99,11 @@ pub struct AppState {
     /// Multi-agent view model: what each child is for and what the parent did
     /// with what it produced. Built from events, never from prose.
     pub team: crate::multi_agent::TaskTeamView,
+    /// Goals that still owe work, loaded on request (long-goal P2).
+    ///
+    /// Read-only. There is no action attached and no command to attach one to:
+    /// resume is a policy the runtime has not decided.
+    pub unfinished_goals: Vec<leveler_client_protocol::UiUnfinishedGoal>,
     pub composer: Composer,
     pub theme: Theme,
     /// Terminal size (cols, rows).
@@ -282,6 +287,7 @@ impl AppState {
             session_id: boot.session_id.clone(),
             transcript: TranscriptState::new(),
             team: crate::multi_agent::TaskTeamView::default(),
+            unfinished_goals: Vec::new(),
             composer: Composer::new(),
             theme,
             size: (80, 24),
