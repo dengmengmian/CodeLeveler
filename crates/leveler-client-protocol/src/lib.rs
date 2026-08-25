@@ -40,9 +40,9 @@ mod approval;
 mod client;
 mod command;
 mod command_envelope;
+mod contribution;
 mod event;
 mod media;
-mod contribution;
 mod observability;
 mod origin;
 mod progress;
@@ -56,11 +56,11 @@ pub use command::ClientCommand;
 pub use command_envelope::{
     CommandEnvelope, CommandReceipts, Receipt, Recovery, recovery_for_tool,
 };
-pub use event::{
-    ChildContribution, NotificationLevel, REASON_NO_AUTOMATIC_VERIFICATION,
-    REASON_NO_CODE_CHANGES, RuntimeEvent, UiMemoryEntry, parse_runtime_event,
-};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
+pub use event::{
+    ChildContribution, NotificationLevel, REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES,
+    RuntimeEvent, UiMemoryEntry, parse_runtime_event,
+};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
 pub use observability::{
     OBSERVABILITY_REQUESTS_MAX, OBSERVABILITY_WINDOW_MAX, ObservationClass, UiAgentObservation,

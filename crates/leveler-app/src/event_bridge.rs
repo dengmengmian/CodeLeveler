@@ -8,9 +8,8 @@ use leveler_core::ToolCallId;
 use leveler_engine::EngineEvent;
 
 use leveler_client_protocol::{
-    ChildContribution,
-    CheckState, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent, UiCheck, UiPlan,
-    UiPlanStep, UiVerification,
+    CheckState, ChildContribution, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
+    UiCheck, UiPlan, UiPlanStep, UiVerification,
 };
 
 use crate::AppError;
@@ -104,9 +103,7 @@ pub(crate) struct EventBridge {
 /// Deliberately total: every field crosses. Dropping one here is invisible at
 /// the call site and unrecoverable downstream — which is exactly how
 /// `contribution` was lost before.
-fn project_contribution(
-    c: &leveler_lifecycle::ChildResultProjection,
-) -> ChildContribution {
+fn project_contribution(c: &leveler_lifecycle::ChildResultProjection) -> ChildContribution {
     ChildContribution {
         role: c.role.clone(),
         profile_id: c.profile_id.clone(),
@@ -555,7 +552,11 @@ impl EventBridge {
                 let role = self
                     .child_roles
                     .remove(&id)
-                    .or_else(|| projected.as_ref().map(|c: &ChildContribution| c.role.clone()))
+                    .or_else(|| {
+                        projected
+                            .as_ref()
+                            .map(|c: &ChildContribution| c.role.clone())
+                    })
                     .unwrap_or_default();
                 let _ = self.events.send(RuntimeEvent::SubAgentUpdated {
                     id,

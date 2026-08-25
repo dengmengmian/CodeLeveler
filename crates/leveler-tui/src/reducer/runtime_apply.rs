@@ -315,18 +315,18 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             contribution,
         } => {
             let started = state.elapsed_secs;
-            state.team.apply_update(
-                id.clone(),
-                nickname.clone(),
-                role.clone(),
+            state.team.apply_update(crate::multi_agent::ChildUpdate {
+                id: id.clone(),
+                nickname: nickname.clone(),
+                role: role.clone(),
                 done,
                 ok,
-                detail.clone(),
+                detail: detail.clone(),
                 profile_id,
                 capabilities,
-                contribution.clone(),
-                started,
-            );
+                contribution: contribution.clone(),
+                started_elapsed_secs: started,
+            });
             if done {
                 // The projection is the source of truth now, not a count
                 // scraped out of the parent-facing summary.

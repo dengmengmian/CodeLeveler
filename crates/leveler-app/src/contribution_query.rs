@@ -220,7 +220,8 @@ mod tests {
         let many: Vec<_> = (0..CONTRIBUTION_FINDINGS_MAX + 50)
             .map(|i| rec(&format!("f-{i}"), "r1", FindingState::Accepted, false))
             .collect();
-        let got = project_child_contribution(Some(&ledger(many)), "r1", "reviewer", None, Vec::new());
+        let got =
+            project_child_contribution(Some(&ledger(many)), "r1", "reviewer", None, Vec::new());
         assert_eq!(got.findings.len(), CONTRIBUTION_FINDINGS_MAX);
     }
 

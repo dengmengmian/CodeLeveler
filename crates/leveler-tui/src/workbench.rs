@@ -170,7 +170,8 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
 
     let input_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
     let hint_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
-    let footer_slot = crate::layout::horizontal_inset(chunks[10], crate::layout::WORKSPACE_GUTTER_X);
+    let footer_slot =
+        crate::layout::horizontal_inset(chunks[10], crate::layout::WORKSPACE_GUTTER_X);
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
@@ -406,7 +407,9 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 truncate(
                     line.detail,
-                    area.width.saturating_sub(line.role.chars().count() as u16 + 3) as usize,
+                    area.width
+                        .saturating_sub(line.role.chars().count() as u16 + 3)
+                        as usize,
                 ),
                 Style::default().fg(theme.text.secondary),
             ),
@@ -686,18 +689,18 @@ mod tests {
     fn team_with(children: &[(&str, &str, &str)]) -> crate::multi_agent::TaskTeamView {
         let mut team = crate::multi_agent::TaskTeamView::default();
         for (id, role, purpose) in children {
-            team.apply_update(
-                (*id).into(),
-                "Newton".into(),
-                (*role).into(),
-                false,
-                false,
-                (*purpose).into(),
-                Some((*role).into()),
-                vec!["read_file".into()],
-                None,
-                0,
-            );
+            team.apply_update(crate::multi_agent::ChildUpdate {
+                id: (*id).into(),
+                nickname: "Newton".into(),
+                role: (*role).into(),
+                done: false,
+                ok: false,
+                detail: (*purpose).into(),
+                profile_id: Some((*role).into()),
+                capabilities: vec!["read_file".into()],
+                contribution: None,
+                started_elapsed_secs: 0,
+            });
         }
         team
     }
@@ -708,7 +711,10 @@ mod tests {
             ("a1", "explorer", "analyzing repository structure"),
             ("w1", "worker", "implementing the change"),
         ]));
-        assert!(screen.contains("analyzing repository structure"), "{screen}");
+        assert!(
+            screen.contains("analyzing repository structure"),
+            "{screen}"
+        );
         assert!(screen.contains("implementing the change"), "{screen}");
     }
 
@@ -758,18 +764,18 @@ mod tests {
             findings_open_blocking: 1,
         };
         c.findings_open_blocking = 1;
-        team.apply_update(
-            "r1".into(),
-            "reviewer".into(),
-            "reviewer".into(),
-            true,
-            true,
-            "done".into(),
-            None,
-            Vec::new(),
-            Some(c),
-            0,
-        );
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "r1".into(),
+            nickname: "reviewer".into(),
+            role: "reviewer".into(),
+            done: true,
+            ok: true,
+            detail: "done".into(),
+            profile_id: None,
+            capabilities: Vec::new(),
+            contribution: Some(c),
+            started_elapsed_secs: 0,
+        });
         let screen = render_with_team(team);
         assert!(screen.contains("1 blocking"), "{screen}");
     }

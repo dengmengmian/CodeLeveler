@@ -81,11 +81,17 @@ impl UiChildContribution {
     }
 
     pub fn verified(&self) -> usize {
-        self.findings.iter().filter(|f| f.state == "verified").count()
+        self.findings
+            .iter()
+            .filter(|f| f.state == "verified")
+            .count()
     }
 
     pub fn rejected(&self) -> usize {
-        self.findings.iter().filter(|f| f.state == "rejected").count()
+        self.findings
+            .iter()
+            .filter(|f| f.state == "rejected")
+            .count()
     }
 
     /// Reported, and nobody ever judged it. The protocol's definition of noise.

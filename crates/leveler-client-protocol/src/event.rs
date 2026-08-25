@@ -75,7 +75,6 @@ impl ChildContribution {
     }
 }
 
-
 /// An event flowing from the runtime to clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

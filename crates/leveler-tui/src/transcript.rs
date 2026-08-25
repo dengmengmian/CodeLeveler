@@ -732,7 +732,11 @@ impl TranscriptState {
         summary: String,
         contribution: crate::multi_agent::Contribution,
     ) {
-        let status = if ok { ToolStatus::Ok } else { ToolStatus::Failed };
+        let status = if ok {
+            ToolStatus::Ok
+        } else {
+            ToolStatus::Failed
+        };
         if let Some(block) = self.sub_agent_mut(id) {
             block.status = status;
             block.detail = summary;

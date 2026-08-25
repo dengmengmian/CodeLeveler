@@ -8,8 +8,8 @@
 
 mod active_turns;
 mod checkpoints;
-pub mod doctor;
 pub mod contribution_query;
+pub mod doctor;
 mod event_bridge;
 pub mod global_config;
 mod interactive;

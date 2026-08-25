@@ -683,8 +683,11 @@ impl TurnRunner<'_> {
         let id = format!("reviewer-{}", leveler_core::RequestId::generate());
         let (profile_id, profile_role, capabilities) =
             leveler_agent::child_profile_trace("reviewer");
-        let (profile_id_trace, profile_role_trace, capabilities_trace) =
-            (profile_id.clone(), profile_role.clone(), capabilities.clone());
+        let (profile_id_trace, profile_role_trace, capabilities_trace) = (
+            profile_id.clone(),
+            profile_role.clone(),
+            capabilities.clone(),
+        );
         self.log
             .append(
                 None,

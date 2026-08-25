@@ -195,7 +195,14 @@ Rendering them means parsing prose — the defect this whole phase removed.
 Options, recorded not chosen: `modified_files` as an additive field on
 `SubAgentFinished`, or a `FindingsUpdated` event carrying findings only.
 
-### 3. The dogfood harness reports FAIL on round count
+### 3. Deliberately out of scope
+
+Not started, and not started by accident: agent marketplace, external
+providers, remote workers, ACP, new child roles, and any change to trigger
+policy. This milestone made an existing capability visible; it did not widen
+the capability.
+
+### 4. The dogfood harness reports FAIL on round count
 
 `tui_drive.py` expects ≥11 rounds per project; these tasks produced 10 and 9,
 so its own gate says FAIL. That gate is about matrix coverage, not about this

@@ -2023,9 +2023,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // Role and profile are the child's own facts and are not in
                 // the ledger; recover them from the spawn event rather than
                 // guessing from the id shape.
-                let (role, profile_id, capabilities) =
-                    crate::contribution_query::child_identity(stores.events.as_ref(), &session_id, &child_id)
-                        .await;
+                let (role, profile_id, capabilities) = crate::contribution_query::child_identity(
+                    stores.events.as_ref(),
+                    &session_id,
+                    &child_id,
+                )
+                .await;
                 let detail = crate::contribution_query::project_child_contribution(
                     ledger.as_ref(),
                     &child_id,

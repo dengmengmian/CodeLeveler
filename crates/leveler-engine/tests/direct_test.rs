@@ -2510,7 +2510,12 @@ async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
     let mut seen: Vec<EngineEvent> = Vec::new();
     let _ = h
         .engine
-        .run(&session, &s, &mut |e| seen.push(e), CancellationToken::new())
+        .run(
+            &session,
+            &s,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -2566,7 +2571,12 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
     let mut seen: Vec<EngineEvent> = Vec::new();
     let _ = h
         .engine
-        .run(&session, &s, &mut |e| seen.push(e), CancellationToken::new())
+        .run(
+            &session,
+            &s,
+            &mut |e| seen.push(e),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 

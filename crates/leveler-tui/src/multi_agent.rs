@@ -112,6 +112,30 @@ impl ChildAgentView {
     }
 }
 
+/// One `SubAgentUpdated`, as the view model consumes it.
+///
+/// A struct rather than ten positional parameters: the call site passes three
+/// `Option<String>`-shaped things and two bools, and a transposed pair there
+/// would compile and be wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildUpdate {
+    pub id: String,
+    pub nickname: String,
+    pub role: String,
+    /// false while running; true once the child finished.
+    pub done: bool,
+    /// Whether it finished successfully. Only meaningful when `done`, and
+    /// load-bearing: zero findings from `ok == false` certifies nothing.
+    pub ok: bool,
+    /// The task while running; a short result summary once done.
+    pub detail: String,
+    pub profile_id: Option<String>,
+    pub capabilities: Vec<String>,
+    /// `None` means the runtime produced no projection — not measured.
+    pub contribution: Option<ChildContribution>,
+    pub started_elapsed_secs: u64,
+}
+
 /// The team working on one task.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskTeamView {
@@ -130,24 +154,27 @@ impl TaskTeamView {
     /// at task level because a block discovered at the end is a block the user
     /// should have seen coming.
     pub fn open_blocking(&self) -> u32 {
-        self.children.iter().map(|c| c.contribution.open_blocking()).sum()
+        self.children
+            .iter()
+            .map(|c| c.contribution.open_blocking())
+            .sum()
     }
 
     /// Apply one `SubAgentUpdated`. Upserts by id so a child transitions in
     /// place rather than appearing twice.
-    pub fn apply_update(
-        &mut self,
-        id: String,
-        nickname: String,
-        role: String,
-        done: bool,
-        ok: bool,
-        detail: String,
-        profile_id: Option<String>,
-        capabilities: Vec<String>,
-        contribution: Option<ChildContribution>,
-        started_elapsed_secs: u64,
-    ) {
+    pub fn apply_update(&mut self, update: ChildUpdate) {
+        let ChildUpdate {
+            id,
+            nickname,
+            role,
+            done,
+            ok,
+            detail,
+            profile_id,
+            capabilities,
+            contribution,
+            started_elapsed_secs,
+        } = update;
         let contribution = if !done {
             Contribution::Pending
         } else {
@@ -270,39 +297,44 @@ mod tests {
     }
 
     fn started(team: &mut TaskTeamView, id: &str, role: &str, purpose: &str) {
-        team.apply_update(
-            id.into(),
-            "Newton".into(),
-            role.into(),
-            false,
-            false,
-            purpose.into(),
-            Some(role.into()),
-            vec!["read_file".into()],
-            None,
-            0,
-        );
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: id.into(),
+            nickname: "Newton".into(),
+            role: role.into(),
+            done: false,
+            ok: false,
+            detail: purpose.into(),
+            profile_id: Some(role.into()),
+            capabilities: vec!["read_file".into()],
+            contribution: None,
+            started_elapsed_secs: 0,
+        });
     }
 
     fn finished(team: &mut TaskTeamView, id: &str, ok: bool, c: Option<ChildContribution>) {
-        team.apply_update(
-            id.into(),
-            "Newton".into(),
-            "reviewer".into(),
-            true,
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: id.into(),
+            nickname: "Newton".into(),
+            role: "reviewer".into(),
+            done: true,
             ok,
-            "summary".into(),
-            None,
-            Vec::new(),
-            c,
-            0,
-        );
+            detail: "summary".into(),
+            profile_id: None,
+            capabilities: Vec::new(),
+            contribution: c,
+            started_elapsed_secs: 0,
+        });
     }
 
     #[test]
     fn a_running_child_leads_with_its_purpose_not_its_state() {
         let mut team = TaskTeamView::default();
-        started(&mut team, "a1", "explorer", "analyzing repository structure");
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
         let c = &team.children[0];
         assert_eq!(c.purpose, "analyzing repository structure");
         assert_eq!(c.status, ChildStatus::Waiting);
@@ -331,7 +363,12 @@ mod tests {
     #[test]
     fn a_finish_event_does_not_erase_the_purpose() {
         let mut team = TaskTeamView::default();
-        started(&mut team, "a1", "explorer", "analyzing repository structure");
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
         finished(&mut team, "a1", true, Some(contribution(1, 1, 0, 0)));
         assert_eq!(
             team.children[0].purpose, "analyzing repository structure",
@@ -419,18 +456,18 @@ mod tests {
         assert!(team.children[0].is_read_only());
 
         let mut team2 = TaskTeamView::default();
-        team2.apply_update(
-            "w1".into(),
-            "Worker".into(),
-            "worker".into(),
-            false,
-            false,
-            "implement".into(),
-            Some("worker".into()),
-            vec!["read_file".into(), "apply_patch".into()],
-            None,
-            0,
-        );
+        team2.apply_update(crate::multi_agent::ChildUpdate {
+            id: "w1".into(),
+            nickname: "Worker".into(),
+            role: "worker".into(),
+            done: false,
+            ok: false,
+            detail: "implement".into(),
+            profile_id: Some("worker".into()),
+            capabilities: vec!["read_file".into(), "apply_patch".into()],
+            contribution: None,
+            started_elapsed_secs: 0,
+        });
         assert!(!team2.children[0].is_read_only());
     }
 
@@ -448,18 +485,18 @@ mod tests {
     fn the_role_from_spawn_survives_a_finish_without_one() {
         let mut team = TaskTeamView::default();
         started(&mut team, "a1", "explorer", "look");
-        team.apply_update(
-            "a1".into(),
-            "Newton".into(),
-            String::new(),
-            true,
-            true,
-            "done".into(),
-            None,
-            Vec::new(),
-            None,
-            0,
-        );
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            role: String::new(),
+            done: true,
+            ok: true,
+            detail: "done".into(),
+            profile_id: None,
+            capabilities: Vec::new(),
+            contribution: None,
+            started_elapsed_secs: 0,
+        });
         assert_eq!(team.children[0].role, "explorer");
     }
 
@@ -519,7 +556,12 @@ mod tests {
     fn waiting_explains_itself_with_the_purpose() {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
-        started(&mut team, "a1", "explorer", "analyzing repository structure");
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
         let line = running_line(&team.children[0], t);
         assert_eq!(line, "analyzing repository structure");
         assert_ne!(line, "waiting", "a bare status word explains nothing");
@@ -579,13 +621,23 @@ mod tests {
         started(&mut team, "r1", "explorer", "repository analysis");
         team.apply_detail(detail(
             true,
-            vec![finding("f-1", "accepted", false, None), finding("f-2", "verified", false, None)],
+            vec![
+                finding("f-1", "accepted", false, None),
+                finding("f-2", "verified", false, None),
+            ],
         ));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("src/auth.rs"), "{joined}");
         assert!(joined.contains("[accepted]"), "{joined}");
-        assert!(joined.contains("2 accepted · 1 verified · 0 rejected"), "{joined}");
+        assert!(
+            joined.contains("2 accepted · 1 verified · 0 rejected"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -595,9 +647,16 @@ mod tests {
         started(&mut team, "r1", "reviewer", "review the diff");
         team.apply_detail(detail(true, Vec::new()));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("nothing to flag"), "{joined}");
-        assert!(!joined.contains("0 accepted"), "a clean review is not a tally: {joined}");
+        assert!(
+            !joined.contains("0 accepted"),
+            "a clean review is not a tally: {joined}"
+        );
     }
 
     #[test]
@@ -607,12 +666,24 @@ mod tests {
         started(&mut team, "r1", "reviewer", "review");
         team.apply_detail(detail(
             true,
-            vec![finding("f-1", "rejected", false, Some("covered by the existing guard"))],
+            vec![finding(
+                "f-1",
+                "rejected",
+                false,
+                Some("covered by the existing guard"),
+            )],
         ));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("covered by the existing guard"), "{joined}");
-        assert!(joined.contains("0 accepted · 0 verified · 1 rejected"), "{joined}");
+        assert!(
+            joined.contains("0 accepted · 0 verified · 1 rejected"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -622,7 +693,11 @@ mod tests {
         started(&mut team, "r1", "reviewer", "review");
         team.apply_detail(detail(false, Vec::new()));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("not measured"), "{joined}");
         assert!(!joined.contains("nothing to flag"), "{joined}");
     }
@@ -652,10 +727,17 @@ mod tests {
         started(&mut team, "r1", "reviewer", "review");
         team.apply_detail(detail(
             true,
-            vec![finding("f-1", "acknowledged", false, None), finding("f-2", "accepted", false, None)],
+            vec![
+                finding("f-1", "acknowledged", false, None),
+                finding("f-2", "accepted", false, None),
+            ],
         ));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("1 not judged"), "{joined}");
     }
 
@@ -666,7 +748,11 @@ mod tests {
         started(&mut team, "r1", "reviewer", "review");
         team.apply_detail(detail(true, Vec::new()));
         let rows = inspector_rows(&team.children[0], t).expect("loaded");
-        let joined = rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("read-only"), "{joined}");
     }
 
@@ -704,7 +790,12 @@ mod tests {
     fn a_working_child_shows_its_purpose_not_a_status_word() {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
-        started(&mut team, "a1", "explorer", "analyzing repository structure");
+        started(
+            &mut team,
+            "a1",
+            "explorer",
+            "analyzing repository structure",
+        );
         started(&mut team, "w1", "worker", "implementing the change");
         let lines = team_lines(&team, t);
         assert_eq!(lines[0].glyph, "○");
@@ -732,7 +823,10 @@ mod tests {
         started(&mut team, "r1", "reviewer", "review");
         finished(&mut team, "r1", true, Some(contribution(0, 0, 0, 0)));
         let lines = team_lines(&team, t);
-        let reviewer = lines.iter().find(|l| l.status == ChildStatus::Completed).unwrap();
+        let reviewer = lines
+            .iter()
+            .find(|l| l.status == ChildStatus::Completed)
+            .unwrap();
         assert!(reviewer.detail.contains("nothing to flag"), "{reviewer:?}");
     }
 
@@ -744,7 +838,10 @@ mod tests {
         started(&mut team, "a1", "explorer", "look");
         finished(&mut team, "w1", false, None);
         let lines = team_lines(&team, t);
-        let failed = lines.iter().find(|l| l.status == ChildStatus::Failed).unwrap();
+        let failed = lines
+            .iter()
+            .find(|l| l.status == ChildStatus::Failed)
+            .unwrap();
         assert_eq!(failed.glyph, "✗");
         assert!(!failed.detail.contains("not measured"), "{failed:?}");
     }
@@ -850,10 +947,6 @@ pub fn contribution_line(view: &ChildAgentView, t: &crate::i18n::UiText) -> Opti
             t.child_contribution_incomplete
                 .replace("{n}", &reported.to_string()),
         ),
-        Contribution::Incomplete { reported } => Some(
-            t.child_contribution_incomplete
-                .replace("{n}", &reported.to_string()),
-        ),
         Contribution::Reported {
             total,
             accepted,
@@ -944,10 +1037,7 @@ pub struct InspectorRow {
 /// Returns `None` when nothing has been loaded yet — the caller shows a
 /// loading state rather than an empty list, because an empty list is a claim
 /// and "not asked yet" is not one.
-pub fn inspector_rows(
-    view: &ChildAgentView,
-    t: &crate::i18n::UiText,
-) -> Option<Vec<InspectorRow>> {
+pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<Vec<InspectorRow>> {
     let detail = view.detail.as_ref()?;
     let mut rows = Vec::new();
 
@@ -1020,9 +1110,7 @@ pub fn inspector_rows(
     let unjudged = detail.unjudged();
     if unjudged > 0 {
         rows.push(InspectorRow {
-            text: t
-                .inspector_unjudged
-                .replace("{n}", &unjudged.to_string()),
+            text: t.inspector_unjudged.replace("{n}", &unjudged.to_string()),
             blocking: false,
         });
     }
@@ -1086,9 +1174,7 @@ pub fn team_lines(team: &TaskTeamView, t: &crate::i18n::UiText) -> Vec<TeamLine>
 pub fn team_panel_title(team: &TaskTeamView, t: &crate::i18n::UiText) -> String {
     let blocking = team.open_blocking();
     if blocking > 0 {
-        return t
-            .team_panel_blocking
-            .replace("{n}", &blocking.to_string());
+        return t.team_panel_blocking.replace("{n}", &blocking.to_string());
     }
     if team.active().next().is_some() {
         return t.team_panel_working.to_string();

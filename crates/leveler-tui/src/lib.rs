@@ -12,7 +12,6 @@
 //! [`render`]: render::render
 #![forbid(unsafe_code)]
 
-pub mod multi_agent;
 pub mod action;
 mod activity_stream;
 mod brand;
@@ -24,6 +23,7 @@ pub mod external_editor;
 pub mod i18n;
 mod layout;
 pub mod markdown;
+pub mod multi_agent;
 mod observability;
 pub mod overlay;
 mod plan_cell;
