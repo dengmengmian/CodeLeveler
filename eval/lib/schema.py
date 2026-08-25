@@ -123,12 +123,14 @@ def make_run(
     verifier_passed: bool | None = None,
     verifier_command: str | None = None,
     shape: str | None = None,
+    experiment: str | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     spawn = timeline.get("spawn_metric") or {}
     decision_round, latency = _decision(timeline)
     offered = bool(timeline.get("offered"))
     spawned = bool(timeline.get("spawn"))
-    return {
+    doc = {
         "schema_version": SCHEMA_VERSION,
         "run": {
             "id": run_id,
@@ -201,6 +203,48 @@ def make_run(
             "disposition": timeline.get("disposition"),
         },
     }
+    if experiment:
+        doc["experiment"] = experiment
+    if mode:
+        doc["mode"] = mode
+    if experiment or mode:
+        used = timeline.get("child_result_used")
+        if used is None:
+            used = bool(spawn.get("useful_child_count")) or bool(
+                spawn.get("parent_tool_calls_after_child")
+            ) or int(spawn.get("parent_resolve_finding_count") or 0) > 0
+        roles = [c.get("role") for c in (spawn.get("children") or []) if c.get("role")]
+        outcomes = spawn.get("sub_agent_outcomes") or {}
+        doc["task_success"] = verifier_passed if verifier_ran else None
+        doc["efficiency"] = {
+            "turns": timeline.get("rounds", 0),
+            "input_tokens": timeline.get("input_tokens"),
+            "output_tokens": timeline.get("output_tokens"),
+            "total_tokens": timeline.get("total_tokens"),
+            "wall_time_ms": timeline.get("wall_time_ms"),
+            "tool_calls": spawn.get("parent_tool_calls", timeline.get("parent_tool_calls", 0)),
+        }
+        doc["multi_agent"] = {
+            "spawn_count": spawn.get("natural_spawn_count", 0),
+            "child_roles": roles,
+            "child_completed": len(outcomes),
+            "child_result_used": bool(used),
+            "child_contributions": timeline.get("child_contributions") or [],
+            "children": spawn.get("children") or [],
+            "profile_effectiveness": timeline.get("profile_effectiveness") or {},
+        }
+        quality = timeline.get("quality")
+        if not isinstance(quality, dict):
+            quality = {
+                "tests_passed": timeline.get("tests_passed"),
+                "regressions": timeline.get("regressions"),
+                "review_findings": timeline.get("review_findings"),
+                "missed_issues": timeline.get("missed_issues"),
+            }
+        doc["quality"] = quality
+        if timeline.get("reviewer") is not None:
+            doc["reviewer"] = timeline.get("reviewer")
+    return doc
 
 
 def make_batch(

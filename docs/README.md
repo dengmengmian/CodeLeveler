@@ -17,6 +17,10 @@
 | [multi-agent.md](multi-agent.md) | Users | Sub-agent delegation: what it does, and that the model elects it |
 | [multi-agent.zh-CN.md](multi-agent.zh-CN.md) | Users (中文) | 同上 |
 | [evaluations/MA-WA1-FINAL.md](evaluations/MA-WA1-FINAL.md) | Contributors | Delegation adoption: what was tested, eliminated, and decided |
+| [evaluations/MA-VALUE-001.md](evaluations/MA-VALUE-001.md) | Contributors | Single vs multi-agent value on R005–R010; spawn rate is not a success metric |
+| [evaluations/MA-VALUE-REVIEWER-PILOT.md](evaluations/MA-VALUE-REVIEWER-PILOT.md) | Contributors | Independent Reviewer vs self-verify; finding count is not a success metric |
+| [design/CHILD_PROFILE_ANALYSIS.md](design/CHILD_PROFILE_ANALYSIS.md) | Contributors | Why generic children were insufficient, and what already existed |
+| [design/CHILD_PROFILE.md](design/CHILD_PROFILE.md) | Contributors | Child capability contract: Explorer / Reviewer / Worker |
 | [BETA_RELEASE_READINESS.md](BETA_RELEASE_READINESS.md) | Maintainers | Beta release gate: blockers, required items, release recommendation |
 | [BETA_BLOCKER_RESOLUTION.md](BETA_BLOCKER_RESOLUTION.md) | Maintainers | How those blockers were closed, and what verification backs each |
 | [evaluations/README.md](evaluations/README.md) | Contributors | Eval framework: capability `evals/` vs observer `eval/` |

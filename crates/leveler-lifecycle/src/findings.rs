@@ -163,6 +163,50 @@ pub fn transition_allowed(from: FindingState, to: FindingState) -> bool {
     )
 }
 
+/// Which mechanism produced a contribution.
+///
+/// Three producers exist today and the ledger cannot tell the last two apart
+/// on its own: `FindingRecord` carries `source_child` + `role`, and a
+/// harness-launched reviewer and an executor-spawned child with role
+/// `reviewer` write the same two fields. The eval observer needs the
+/// distinction — the pilot could not answer "did the independent review stage
+/// contribute?" — so the settlement site, which knows exactly what it is,
+/// stamps it here.
+///
+/// Deliberately not a field on `FindingRecord`: that record is persisted in
+/// every ledger snapshot, and this question is answered once per child at
+/// settlement, not once per finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContributionSource {
+    /// The agent that owns the ledger established it itself
+    /// (`EvidenceLedger::record_finding`, `source_child` empty).
+    SelfReported,
+    /// A child spawned through the executor's `spawn_agent` primitive.
+    ExecutorChild { child_id: String },
+    /// The harness-launched independent review stage (`TurnRunner::run_review`).
+    IndependentReviewer { review_id: String },
+}
+
+impl ContributionSource {
+    /// The producer's id, or empty for a self-reported finding.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::SelfReported => "",
+            Self::ExecutorChild { child_id } => child_id,
+            Self::IndependentReviewer { review_id } => review_id,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::SelfReported => "self_reported",
+            Self::ExecutorChild { .. } => "executor_child",
+            Self::IndependentReviewer { .. } => "independent_reviewer",
+        }
+    }
+}
+
 /// A compact, durable view of what one child produced — enough to trace its
 /// contribution without copying its findings into an event.
 ///
@@ -180,6 +224,18 @@ pub struct ChildResultProjection {
     /// The child this projects. Joins to `FindingRecord::source_child`.
     pub child_id: String,
     pub role: String,
+    /// Built-in capability contract that produced this child. Absent on
+    /// events written before Child Profile existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Which mechanism produced this contribution. Absent on events written
+    /// before the source was stamped; `None` means unknown, not self-reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ContributionSource>,
     /// Findings in the parent ledger attributed to this child.
     pub findings_total: u32,
     /// Reached the parent at all — every state except `Created`, which means
@@ -210,6 +266,10 @@ impl ChildResultProjection {
         Self {
             child_id: child_id.to_string(),
             role: role.to_string(),
+            profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            source: None,
             findings_total: mine.len() as u32,
             findings_acknowledged: mine
                 .iter()
@@ -234,6 +294,27 @@ impl ChildResultProjection {
                 .count() as u32,
             findings_open_blocking: mine.iter().filter(|f| f.open_blocking()).count() as u32,
         }
+    }
+
+    /// Attach the child's capability contract. Counts stay as `from_findings`
+    /// computed them; this is the join from role → profile for trace/eval.
+    pub fn with_profile(
+        mut self,
+        profile_id: impl Into<String>,
+        profile_role: impl Into<String>,
+        capabilities: Vec<String>,
+    ) -> Self {
+        self.profile_id = Some(profile_id.into());
+        self.profile_role = Some(profile_role.into());
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Stamp which mechanism produced this contribution. Called at the
+    /// settlement site, the one place that knows.
+    pub fn with_source(mut self, source: ContributionSource) -> Self {
+        self.source = Some(source);
+        self
     }
 
     /// Did the parent act on anything this child reported?
@@ -478,9 +559,25 @@ mod tests {
             "agent-1",
             "reviewer",
             &[rec("f1", "agent-1", FindingState::Verified, false)],
+        )
+        .with_profile(
+            "reviewer",
+            "reviewer",
+            vec!["code_review".into(), "verification".into()],
         );
         let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"profile_id\":\"reviewer\""), "{json}");
         let back: ChildResultProjection = serde_json::from_str(&json).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn a_legacy_projection_without_profile_fields_still_deserializes() {
+        let json = r#"{"child_id":"a1","role":"explorer","findings_total":1,"findings_acknowledged":1,"findings_accepted":0,"findings_verified":0,"findings_rejected":0,"findings_open_blocking":0}"#;
+        let p: ChildResultProjection = serde_json::from_str(json).unwrap();
+        assert_eq!(p.child_id, "a1");
+        assert_eq!(p.role, "explorer");
+        assert_eq!(p.profile_id, None);
+        assert!(p.capabilities.is_empty());
     }
 }

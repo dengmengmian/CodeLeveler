@@ -515,12 +515,18 @@ pub enum EvalCommand {
         /// Provider prefix for framework runs (`provider/model` when model has no `/`).
         #[arg(long)]
         provider: Option<String>,
-        /// Eval framework suite (`adoption` | `capability` | `safety`).
+        /// Eval framework suite (`adoption` | `capability` | `safety` | `multi_agent`).
         #[arg(long)]
         suite: Option<String>,
         /// Experiment id under `eval/configs/<suite>/` (requires `--suite`).
         #[arg(long)]
         experiment: Option<String>,
+        /// Experiment arm for `--suite multi_agent`.
+        /// MA-VALUE-001: `single` | `multi` (`agents.delegation`).
+        /// MA-VALUE-REVIEWER-PILOT: `self` | `reviewer` (`agents.independent_review`).
+        /// Isolated home only. Does not change spawn runtime or reviewer permissions.
+        #[arg(long)]
+        mode: Option<String>,
         /// Report directory for framework runs (`eval/reports/<suite>/<experiment>`).
         #[arg(long)]
         output: Option<PathBuf>,
@@ -1037,6 +1043,34 @@ mod tests {
                 );
             }
             other => panic!("expected Eval Run suite mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_run_parses_multi_agent_mode() {
+        let cli = parse(&[
+            "leveler",
+            "eval",
+            "run",
+            "--suite",
+            "multi_agent",
+            "--experiment",
+            "MA-VALUE-001",
+            "--mode",
+            "single",
+        ]);
+        match cli.command {
+            Some(Command::Eval(EvalCommand::Run {
+                suite,
+                experiment,
+                mode,
+                ..
+            })) => {
+                assert_eq!(suite.as_deref(), Some("multi_agent"));
+                assert_eq!(experiment.as_deref(), Some("MA-VALUE-001"));
+                assert_eq!(mode.as_deref(), Some("single"));
+            }
+            other => panic!("expected Eval Run multi_agent mode, got {other:?}"),
         }
     }
 

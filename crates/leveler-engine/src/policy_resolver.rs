@@ -42,6 +42,18 @@ pub enum ExecutionRole {
     Reviewer,
 }
 
+/// How the harness launches an independent reviewer after a mutation.
+///
+/// `Auto` is the shipped product (shape trigger). `Always` / `Off` exist so
+/// Reviewer Value Eval can assign the factor without `eval_mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IndependentReviewPolicy {
+    #[default]
+    Auto,
+    Always,
+    Off,
+}
+
 /// When an independent review is warranted.
 ///
 /// The batch refutes "always review": R008 and R009 both passed with no

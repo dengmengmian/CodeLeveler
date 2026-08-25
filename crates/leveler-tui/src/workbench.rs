@@ -102,6 +102,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         1
     };
     let plan_rows = plan_panel_height(state);
+    let team_rows = team_panel_height(state);
     // An open overlay takes the composer's slot rather than floating over the
     // transcript, so the conversation shrinks by exactly what the decision box
     // needs and the message that raised it stays visible right above it.
@@ -142,6 +143,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // (status / plan / attachments) sits on top of it; blank below always so
     // Context footer is not flush on the composer border.
     let chrome_above = status_rows
+        .saturating_add(team_rows)
         .saturating_add(plan_rows)
         .saturating_add(attach_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
@@ -155,6 +157,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Min(3), // conversation viewport
         Constraint::Length(gap_rows),
         Constraint::Length(status_rows),
+        Constraint::Length(team_rows),
         Constraint::Length(plan_rows),
         Constraint::Length(attach_rows),
         Constraint::Length(pre_composer_gap),
@@ -165,9 +168,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     ])
     .split(area);
 
-    let input_slot = crate::layout::horizontal_inset(chunks[7], crate::layout::WORKSPACE_GUTTER_X);
-    let hint_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
-    let footer_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
+    let input_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
+    let hint_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
+    let footer_slot = crate::layout::horizontal_inset(chunks[10], crate::layout::WORKSPACE_GUTTER_X);
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
@@ -179,16 +182,17 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     if status_rows > 0 {
         frame.render_widget(Paragraph::new(status_line), chunks[3]);
     }
-    render_plan_panel(frame, chunks[4], state);
-    render_attachments(frame, chunks[5], state);
-    // chunks[6] = pre_composer_gap (leave blank)
+    render_team_panel(frame, chunks[4], state);
+    render_plan_panel(frame, chunks[5], state);
+    render_attachments(frame, chunks[6], state);
+    // chunks[7] = pre_composer_gap (leave blank)
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
         }
         None => render_input(frame, input_slot, state),
     }
-    // chunks[8]: the key hints when there are any, otherwise the blank gap.
+    // chunks[9]: the key hints when there are any, otherwise the blank gap.
     if let Some(line) = hints.into_iter().next() {
         frame.render_widget(Paragraph::new(line), hint_slot);
     }
@@ -347,6 +351,69 @@ fn plan_panel_height(state: &AppState) -> u16 {
         }
         _ => 0,
     }
+}
+
+/// Rows the Task Team panel needs, or 0 when it should not appear.
+///
+/// Capped: a task is the primary object and the team is a caption on it. A
+/// panel that grows with the child count would turn the workbench into an
+/// agent dashboard, which is the shape this product deliberately avoids.
+fn team_panel_height(state: &AppState) -> u16 {
+    if !crate::multi_agent::team_panel_should_show(&state.team) {
+        return 0;
+    }
+    (state.team.children.len() + 1).min(5) as u16
+}
+
+fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.height == 0 {
+        return;
+    }
+    let theme = &state.theme;
+    let t = state.t();
+    let title = truncate(
+        crate::multi_agent::team_panel_title(&state.team, t),
+        area.width as usize,
+    );
+    let blocking = state.team.open_blocking() > 0;
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        title,
+        Style::default()
+            .fg(if blocking {
+                theme.status.error
+            } else {
+                theme.accent.primary
+            })
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    for line in crate::multi_agent::team_lines(&state.team, t)
+        .into_iter()
+        .take(area.height.saturating_sub(1) as usize)
+    {
+        let color = match line.status {
+            crate::multi_agent::ChildStatus::Completed => theme.status.success,
+            crate::multi_agent::ChildStatus::Failed => theme.status.error,
+            crate::multi_agent::ChildStatus::Running => theme.accent.primary,
+            crate::multi_agent::ChildStatus::Waiting => theme.text.secondary,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", line.glyph), Style::default().fg(color)),
+            Span::styled(
+                format!("{} ", line.role),
+                Style::default().fg(theme.text.primary),
+            ),
+            Span::styled(
+                truncate(
+                    line.detail,
+                    area.width.saturating_sub(line.role.chars().count() as u16 + 3) as usize,
+                ),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -578,6 +645,133 @@ mod tests {
             .draw(|frame| crate::render::render(frame, &mut state))
             .unwrap();
         (state.theme.clone(), terminal.backend().buffer().clone())
+    }
+
+    /// Render the workbench with a given team and return the screen text.
+    fn render_with_team(team: crate::multi_agent::TaskTeamView) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(
+            crate::theme::Theme::default(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::En,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.team = team;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn team_with(children: &[(&str, &str, &str)]) -> crate::multi_agent::TaskTeamView {
+        let mut team = crate::multi_agent::TaskTeamView::default();
+        for (id, role, purpose) in children {
+            team.apply_update(
+                (*id).into(),
+                "Newton".into(),
+                (*role).into(),
+                false,
+                false,
+                (*purpose).into(),
+                Some((*role).into()),
+                vec!["read_file".into()],
+                None,
+                0,
+            );
+        }
+        team
+    }
+
+    #[test]
+    fn a_team_panel_explains_why_the_user_is_waiting() {
+        let screen = render_with_team(team_with(&[
+            ("a1", "explorer", "analyzing repository structure"),
+            ("w1", "worker", "implementing the change"),
+        ]));
+        assert!(screen.contains("analyzing repository structure"), "{screen}");
+        assert!(screen.contains("implementing the change"), "{screen}");
+    }
+
+    #[test]
+    fn no_team_no_panel_and_no_stolen_rows() {
+        let empty = render_with_team(crate::multi_agent::TaskTeamView::default());
+        let staffed = render_with_team(team_with(&[
+            ("a1", "explorer", "look"),
+            ("w1", "worker", "implement"),
+        ]));
+        assert!(!empty.contains("AI team"), "{empty}");
+        assert!(staffed.contains("AI team"), "{staffed}");
+    }
+
+    /// The layout indices shift when a panel is inserted; a footer that moved
+    /// would be an off-by-one nobody notices until it ships.
+    #[test]
+    fn inserting_the_team_panel_does_not_displace_the_rest_of_the_chrome() {
+        let empty = render_with_team(crate::multi_agent::TaskTeamView::default());
+        let lines: Vec<&str> = empty.lines().collect();
+        assert!(
+            lines.len() >= 30,
+            "the workbench must still fill the terminal: {} rows",
+            lines.len()
+        );
+        // Composer and footer chrome still render with no team present.
+        assert!(
+            empty.trim().len() > 50,
+            "an empty team must not blank the workbench: {empty}"
+        );
+    }
+
+    #[test]
+    fn a_blocking_finding_is_named_in_the_panel_title() {
+        let mut team = team_with(&[("w1", "worker", "implement"), ("r1", "reviewer", "review")]);
+        let mut c = leveler_client_protocol::ChildContribution {
+            role: "reviewer".into(),
+            profile_id: Some("reviewer".into()),
+            profile_role: Some("reviewer".into()),
+            capabilities: vec!["code_review".into()],
+            source: Some("independent_reviewer".into()),
+            findings_total: 2,
+            findings_acknowledged: 2,
+            findings_accepted: 1,
+            findings_verified: 0,
+            findings_rejected: 0,
+            findings_open_blocking: 1,
+        };
+        c.findings_open_blocking = 1;
+        team.apply_update(
+            "r1".into(),
+            "reviewer".into(),
+            "reviewer".into(),
+            true,
+            true,
+            "done".into(),
+            None,
+            Vec::new(),
+            Some(c),
+            0,
+        );
+        let screen = render_with_team(team);
+        assert!(screen.contains("1 blocking"), "{screen}");
     }
 
     fn buffer_has_bg(buf: &ratatui::buffer::Buffer, want: ratatui::style::Color) -> bool {

@@ -31,6 +31,50 @@ pub enum NotificationLevel {
     Warning,
     Error,
 }
+/// What one child contributed, as counts plus its capability contract.
+///
+/// A flat mirror of the runtime's projection rather than the runtime type
+/// itself: this crate is the stable wire, so an internal refactor of the
+/// ledger must not change what clients parse.
+///
+/// Counts are about the PARENT's judgement, not the child's output volume.
+/// `findings_total` is not a success metric; `findings_accepted` and
+/// `findings_verified` are what say the work mattered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ChildContribution {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Which mechanism produced it: `executor_child`, `independent_reviewer`
+    /// or `self_reported`. `None` on events written before it was stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub findings_total: u32,
+    pub findings_acknowledged: u32,
+    pub findings_accepted: u32,
+    pub findings_verified: u32,
+    pub findings_rejected: u32,
+    pub findings_open_blocking: u32,
+}
+
+impl ChildContribution {
+    /// Did the parent act on anything this child reported? A rejection counts
+    /// — the parent looked and decided. A finding nobody judged does not.
+    pub fn engaged(&self) -> bool {
+        self.findings_accepted > 0 || self.findings_rejected > 0
+    }
+
+    /// The child ran and reported nothing. A real answer, not an empty state.
+    pub fn reported_nothing(&self) -> bool {
+        self.findings_total == 0
+    }
+}
+
 
 /// An event flowing from the runtime to clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,6 +241,22 @@ pub enum RuntimeEvent {
         ok: bool,
         /// The task while running; a short result summary once done.
         detail: String,
+        /// Built-in capability contract this child was launched under.
+        /// `None` means the runtime did not record one, not "no profile".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_role: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+        /// What the parent did with what this child found, once it finished.
+        ///
+        /// `None` means NOT MEASURED — the runtime produced no projection —
+        /// and must never be rendered as a zero. A child that reported
+        /// nothing arrives as `Some` with zero counts, which is a different
+        /// fact and reads differently to the user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contribution: Option<ChildContribution>,
     },
     /// Live execution state and cumulative model usage for one spawned agent.
     SubAgentProgress {
@@ -215,6 +275,13 @@ pub enum RuntimeEvent {
         tool: String,
         preview: String,
         is_error: bool,
+    },
+    /// Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only:
+    /// a snapshot of the ledger, never a mutation.
+    ChildContributionLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        detail: crate::UiChildContribution,
     },
     /// A transient notification for the status line.
     Notification {

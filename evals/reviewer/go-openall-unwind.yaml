@@ -1,0 +1,222 @@
+id: go-openall-unwind
+name: Acquire a chain of resources, unwind correctly when one fails
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  openall.go: |
+    package openall
+
+    import "context"
+
+    // Resource is one thing that must be acquired before use and released after.
+    type Resource interface {
+        Name() string
+        Acquire(ctx context.Context) error
+        Release() error
+    }
+
+    // OpenAll acquires every resource in slice order.
+    //
+    // Contract:
+    //   - on success it returns a closer that releases everything in REVERSE
+    //     acquisition order, each resource exactly once
+    //   - if an Acquire fails, OpenAll releases every resource it already
+    //     acquired, in REVERSE order, each exactly once, and returns that
+    //     Acquire error
+    //   - the resource whose Acquire failed is NOT released: it was never
+    //     acquired
+    //   - a Release error during unwind does not stop the remaining releases
+    //   - on failure the returned closer is nil
+    //   - calling the success closer twice releases nothing the second time
+    func OpenAll(ctx context.Context, rs []Resource) (func() error, error) {
+        panic("not implemented")
+    }
+  openall_test.go: |
+    package openall
+
+    import (
+        "context"
+        "errors"
+        "testing"
+    )
+
+    type fake struct {
+        name       string
+        acquireErr error
+        releaseErr error
+        log        *[]string
+    }
+
+    func (f *fake) Name() string { return f.name }
+    func (f *fake) Acquire(ctx context.Context) error {
+        if f.acquireErr != nil {
+            return f.acquireErr
+        }
+        *f.log = append(*f.log, "acquire:"+f.name)
+        return nil
+    }
+    func (f *fake) Release() error {
+        *f.log = append(*f.log, "release:"+f.name)
+        return f.releaseErr
+    }
+
+    func TestSuccessClosesInReverse(t *testing.T) {
+        var log []string
+        rs := []Resource{
+            &fake{name: "a", log: &log},
+            &fake{name: "b", log: &log},
+        }
+        closer, err := OpenAll(context.Background(), rs)
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if err := closer(); err != nil {
+            t.Fatalf("closer error: %v", err)
+        }
+        want := []string{"acquire:a", "acquire:b", "release:b", "release:a"}
+        if len(log) != len(want) {
+            t.Fatalf("log = %v, want %v", log, want)
+        }
+        for i := range want {
+            if log[i] != want[i] {
+                t.Fatalf("log = %v, want %v", log, want)
+            }
+        }
+    }
+
+    func TestFirstAcquireFailureReturnsError(t *testing.T) {
+        var log []string
+        boom := errors.New("boom")
+        rs := []Resource{&fake{name: "a", acquireErr: boom, log: &log}}
+        closer, err := OpenAll(context.Background(), rs)
+        if !errors.Is(err, boom) {
+            t.Fatalf("err = %v, want boom", err)
+        }
+        if closer != nil {
+            t.Fatal("closer must be nil on failure")
+        }
+        if len(log) != 0 {
+            t.Fatalf("nothing was acquired, so nothing may be released: %v", log)
+        }
+    }
+
+    func TestEmpty(t *testing.T) {
+        closer, err := OpenAll(context.Background(), nil)
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if closer == nil {
+            t.Fatal("closer must not be nil on success")
+        }
+        if err := closer(); err != nil {
+            t.Fatalf("closer error: %v", err)
+        }
+    }
+task: |
+  Implement OpenAll in openall.go according to the contract in its doc comment.
+
+  `go test ./...` must pass. Do NOT modify openall_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package openall
+
+      import (
+          "context"
+          "errors"
+          "strings"
+          "testing"
+      )
+
+      // Unwinding after a mid-chain failure: everything acquired is released,
+      // in reverse, exactly once — and the one that failed to acquire is not
+      // released at all.
+      func TestHiddenMidChainFailureUnwindsInReverse(t *testing.T) {
+          var log []string
+          boom := errors.New("boom")
+          rs := []Resource{
+              &fake{name: "a", log: &log},
+              &fake{name: "b", log: &log},
+              &fake{name: "c", acquireErr: boom, log: &log},
+              &fake{name: "d", log: &log},
+          }
+          closer, err := OpenAll(context.Background(), rs)
+          if !errors.Is(err, boom) {
+              t.Fatalf("err = %v, want boom", err)
+          }
+          if closer != nil {
+              t.Fatal("closer must be nil on failure")
+          }
+          got := strings.Join(log, ",")
+          want := "acquire:a,acquire:b,release:b,release:a"
+          if got != want {
+              t.Fatalf("log = %q, want %q", got, want)
+          }
+      }
+
+      // d was never reached; releasing it would release something never held.
+      func TestHiddenUnacquiredIsNeverReleased(t *testing.T) {
+          var log []string
+          rs := []Resource{
+              &fake{name: "a", log: &log},
+              &fake{name: "b", acquireErr: errors.New("boom"), log: &log},
+              &fake{name: "c", log: &log},
+          }
+          if _, err := OpenAll(context.Background(), rs); err == nil {
+              t.Fatal("expected an error")
+          }
+          for _, entry := range log {
+              if entry == "release:b" || entry == "release:c" {
+                  t.Fatalf("released a resource that was never acquired: %v", log)
+              }
+          }
+      }
+
+      // One failing Release must not abort the rest of the unwind.
+      func TestHiddenReleaseErrorDoesNotStopUnwind(t *testing.T) {
+          var log []string
+          rs := []Resource{
+              &fake{name: "a", log: &log},
+              &fake{name: "b", releaseErr: errors.New("release failed"), log: &log},
+              &fake{name: "c", acquireErr: errors.New("boom"), log: &log},
+          }
+          if _, err := OpenAll(context.Background(), rs); err == nil {
+              t.Fatal("expected an error")
+          }
+          got := strings.Join(log, ",")
+          want := "acquire:a,acquire:b,release:b,release:a"
+          if got != want {
+              t.Fatalf("log = %q, want %q — a failing Release must not skip the rest", got, want)
+          }
+      }
+
+      // The success closer is not a double-release footgun.
+      func TestHiddenCloserIsIdempotent(t *testing.T) {
+          var log []string
+          rs := []Resource{&fake{name: "a", log: &log}, &fake{name: "b", log: &log}}
+          closer, err := OpenAll(context.Background(), rs)
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if err := closer(); err != nil {
+              t.Fatalf("first close: %v", err)
+          }
+          before := len(log)
+          if err := closer(); err != nil {
+              t.Fatalf("second close: %v", err)
+          }
+          if len(log) != before {
+              t.Fatalf("second close released again: %v", log)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

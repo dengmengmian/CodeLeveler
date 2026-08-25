@@ -983,7 +983,7 @@ mod tests {
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
-            finding_count: 0,
+            contribution: crate::multi_agent::Contribution::Pending,
         });
         let text: String = item_render(
             &item,
@@ -1017,7 +1017,7 @@ mod tests {
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
-            finding_count: 0,
+            contribution: crate::multi_agent::Contribution::Pending,
         });
         let text: String = item_render(
             &item,
@@ -1055,7 +1055,7 @@ mod tests {
             },
             recent_step: None,
             started_elapsed_secs: 0,
-            finding_count: 0,
+            contribution: crate::multi_agent::Contribution::Pending,
         });
         let text = item_render(
             &item,
@@ -1097,6 +1097,10 @@ mod tests {
                     done: false,
                     ok: false,
                     detail: task.into(),
+                    profile_id: None,
+                    profile_role: None,
+                    capabilities: Vec::new(),
+                    contribution: None,
                 }),
             );
         }
@@ -1150,6 +1154,10 @@ mod tests {
                 done: false,
                 ok: false,
                 detail: "Inspect provider architecture".into(),
+                profile_id: None,
+                profile_role: None,
+                capabilities: Vec::new(),
+                contribution: None,
             }),
         );
         let agents = render_text(&mut state, 100, 28);

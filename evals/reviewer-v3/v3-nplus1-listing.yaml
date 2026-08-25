@@ -1,0 +1,277 @@
+id: v3-nplus1-listing
+name: Add author names to the article listing
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  internal/db/db.go: |
+    // Package db is the data access layer.
+    //
+    // Every method here is one round trip to the database. The batch methods
+    // exist because per-row queries were the cause of the last two latency
+    // incidents; prefer them wherever a set of ids is already known.
+    package db
+
+    import (
+        "errors"
+        "sync"
+    )
+
+    var ErrNotFound = errors.New("not found")
+
+    type Article struct {
+        ID       string
+        Title    string
+        AuthorID string
+    }
+
+    type Author struct {
+        ID   string
+        Name string
+    }
+
+    type DB struct {
+        mu       sync.Mutex
+        articles []Article
+        authors  map[string]Author
+        queries  int
+    }
+
+    func New() *DB {
+        return &DB{authors: map[string]Author{}}
+    }
+
+    func (d *DB) SeedArticle(a Article) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        d.articles = append(d.articles, a)
+    }
+
+    func (d *DB) SeedAuthor(a Author) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        d.authors[a.ID] = a
+    }
+
+    // ListArticles returns every article. One query.
+    func (d *DB) ListArticles() ([]Article, error) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        d.queries++
+        out := make([]Article, len(d.articles))
+        copy(out, d.articles)
+        return out, nil
+    }
+
+    // GetAuthor reads one author. One query.
+    func (d *DB) GetAuthor(id string) (Author, error) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        d.queries++
+        a, ok := d.authors[id]
+        if !ok {
+            return Author{}, ErrNotFound
+        }
+        return a, nil
+    }
+
+    // GetAuthors reads many authors. One query regardless of how many ids.
+    // Ids with no author are omitted from the result.
+    func (d *DB) GetAuthors(ids []string) (map[string]Author, error) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        d.queries++
+        out := make(map[string]Author, len(ids))
+        for _, id := range ids {
+            if a, ok := d.authors[id]; ok {
+                out[id] = a
+            }
+        }
+        return out, nil
+    }
+
+    // Queries counts round trips since the DB was created.
+    func (d *DB) Queries() int {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        return d.queries
+    }
+  internal/feed/feed.go: |
+    package feed
+
+    import "evalcase/internal/db"
+
+    // Item is one row in the article listing the API returns.
+    type Item struct {
+        ID         string
+        Title      string
+        AuthorName string
+    }
+
+    type Feed struct {
+        db *db.DB
+    }
+
+    func New(d *db.DB) *Feed { return &Feed{db: d} }
+
+    // List returns the article listing.
+    func (f *Feed) List() ([]Item, error) {
+        arts, err := f.db.ListArticles()
+        if err != nil {
+            return nil, err
+        }
+        items := make([]Item, 0, len(arts))
+        for _, a := range arts {
+            items = append(items, Item{ID: a.ID, Title: a.Title})
+        }
+        return items, nil
+    }
+  internal/feed/feed_test.go: |
+    package feed
+
+    import (
+        "testing"
+
+        "evalcase/internal/db"
+    )
+
+    func seed(n int) *db.DB {
+        d := db.New()
+        d.SeedAuthor(db.Author{ID: "au-1", Name: "Ada"})
+        d.SeedAuthor(db.Author{ID: "au-2", Name: "Grace"})
+        for i := 0; i < n; i++ {
+            author := "au-1"
+            if i%2 == 1 {
+                author = "au-2"
+            }
+            d.SeedArticle(db.Article{ID: string(rune('a' + i%26)), Title: "t", AuthorID: author})
+        }
+        return d
+    }
+
+    func TestListReturnsEveryArticle(t *testing.T) {
+        d := seed(3)
+        items, err := New(d).List()
+        if err != nil {
+            t.Fatalf("List: %v", err)
+        }
+        if len(items) != 3 {
+            t.Fatalf("got %d items, want 3", len(items))
+        }
+    }
+
+    func TestListIncludesAuthorName(t *testing.T) {
+        d := seed(2)
+        items, err := New(d).List()
+        if err != nil {
+            t.Fatalf("List: %v", err)
+        }
+        if items[0].AuthorName != "Ada" {
+            t.Fatalf("item 0 author = %q, want Ada", items[0].AuthorName)
+        }
+        if items[1].AuthorName != "Grace" {
+            t.Fatalf("item 1 author = %q, want Grace", items[1].AuthorName)
+        }
+    }
+
+    func TestEmptyListing(t *testing.T) {
+        items, err := New(db.New()).List()
+        if err != nil {
+            t.Fatalf("List: %v", err)
+        }
+        if len(items) != 0 {
+            t.Fatalf("got %d items, want 0", len(items))
+        }
+    }
+task: |
+  The article listing shows a title but no author. Product wants the author's
+  name on every row.
+
+  Fill in AuthorName in feed.List. The listing is one of the highest-traffic
+  endpoints and routinely returns a few hundred articles.
+
+  `go test ./...` must pass. Do NOT modify any _test.go file.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f internal/feed/hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > internal/feed/hidden_calib_test.go <<'EOF'
+      package feed
+
+      import (
+          "testing"
+
+          "evalcase/internal/db"
+      )
+
+      // A listing of 300 articles must not become 300 round trips.
+      func TestHiddenQueryCountDoesNotGrowWithTheListing(t *testing.T) {
+          d := seed(300)
+          before := d.Queries()
+          if _, err := New(d).List(); err != nil {
+              t.Fatalf("List: %v", err)
+          }
+          used := d.Queries() - before
+          if used > 4 {
+              t.Fatalf("List used %d queries for 300 articles; the batch reader exists so this should be a small constant", used)
+          }
+      }
+
+      // The count must not depend on the number of rows at all.
+      func TestHiddenQueryCountIsConstant(t *testing.T) {
+          small := seed(5)
+          if _, err := New(small).List(); err != nil {
+              t.Fatalf("List: %v", err)
+          }
+          large := seed(200)
+          if _, err := New(large).List(); err != nil {
+              t.Fatalf("List: %v", err)
+          }
+          if small.Queries() != large.Queries() {
+              t.Fatalf("5 articles used %d queries, 200 used %d — the cost scales with the listing", small.Queries(), large.Queries())
+          }
+      }
+
+      // Correctness under repeated authors: the mapping must stay per-article.
+      func TestHiddenAuthorsAreMappedPerArticle(t *testing.T) {
+          d := seed(6)
+          items, err := New(d).List()
+          if err != nil {
+              t.Fatalf("List: %v", err)
+          }
+          for i, it := range items {
+              want := "Ada"
+              if i%2 == 1 {
+                  want = "Grace"
+              }
+              if it.AuthorName != want {
+                  t.Fatalf("item %d author = %q, want %q", i, it.AuthorName, want)
+              }
+          }
+      }
+
+      // A missing author is a blank name, not a failed listing.
+      func TestHiddenMissingAuthorDoesNotFailTheListing(t *testing.T) {
+          d := db.New()
+          d.SeedAuthor(db.Author{ID: "au-1", Name: "Ada"})
+          d.SeedArticle(db.Article{ID: "a1", Title: "t", AuthorID: "au-1"})
+          d.SeedArticle(db.Article{ID: "a2", Title: "t", AuthorID: "ghost"})
+          items, err := New(d).List()
+          if err != nil {
+              t.Fatalf("List: %v — one unknown author must not fail the whole listing", err)
+          }
+          if len(items) != 2 {
+              t.Fatalf("got %d items, want 2", len(items))
+          }
+          if items[0].AuthorName != "Ada" || items[1].AuthorName != "" {
+              t.Fatalf("names = %q/%q, want Ada and empty", items[0].AuthorName, items[1].AuthorName)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

@@ -17,6 +17,8 @@ from metrics import (
     summarize_runs,
     value_by_disposition,
 )
+from reviewer import reviewer_eval_result, reviewer_summary
+from value import aggregate_profile_effectiveness, value_eval_result, value_summary
 
 
 def _pct(v: float | None) -> str:
@@ -147,6 +149,10 @@ def experiment_report(batch: dict[str, Any], *, experiment: dict[str, Any] | Non
     """Auto report. Headings are fixed so CC/M-3 does not hand-edit numbers."""
     runs = batch.get("runs") or []
     exp = experiment or batch.get("experiment") or {}
+    if (exp.get("experiment") or "") == "MA-VALUE-REVIEWER-PILOT":
+        return reviewer_experiment_report(batch, experiment=exp)
+    if (exp.get("suite") or batch.get("suite")) == "multi_agent":
+        return value_experiment_report(batch, experiment=exp)
     adopt = adoption_summary(runs)
     spawn_rate = summarize_runs(runs, spawn_likely_only=False)
     latencies = []
@@ -347,6 +353,232 @@ def adoption_micro_report(batch: dict[str, Any], *, title: str = "Adoption Micro
         "2. Model/provider (`--model` / `--provider`).",
         "3. Tool schema of `spawn_agent` (product change, measured here after).",
         "4. Reconsideration / planner — only after 1–2 show a shape-specific gap.",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def value_experiment_report(batch: dict[str, Any], *, experiment: dict[str, Any] | None = None) -> str:
+    """MA-VALUE-001 report. Spawn rate is diagnostic only."""
+    runs = batch.get("runs") or []
+    exp = experiment or batch.get("experiment") or {}
+    name = exp.get("experiment") or batch.get("batch_id") or "MA-VALUE-001"
+    mode = exp.get("mode") or batch.get("mode") or (runs[0].get("mode") if runs else None)
+    summary = value_summary(runs)
+    compact = [value_eval_result(r) for r in runs]
+    success_n = summary["success_n"]
+    scored = summary["n_scored"]
+    lines = [
+        f"# multi_agent / {name}",
+        "",
+        "Observer report. Spawn rate is **not** a success metric.",
+        "Task success comes from the independent verifier, not the agent's summary.",
+        "",
+        "## Experiment",
+        "",
+        f"- suite: `multi_agent`",
+        f"- experiment: `{name}`",
+        f"- mode: `{mode}`",
+        f"- model: `{exp.get('model') or batch.get('model')}`",
+        f"- provider: `{exp.get('provider')}`",
+        f"- binary: `{exp.get('binary')}`",
+        f"- runs per task: {exp.get('runs')}",
+        f"- tasks: {', '.join(str(t) for t in (exp.get('tasks') or [])) or 'R005–R010'}",
+        f"- changes_runtime: {exp.get('changes_runtime', False)}",
+        f"- execute: {exp.get('execute', False)}",
+        f"- description: {exp.get('description') or '—'}",
+        "",
+        "## Dataset",
+        "",
+        f"- n records: {len(runs)}",
+        f"- n with independent verifier: {scored}",
+        "",
+        "## Task success",
+        "",
+        f"- passed: {success_n}/{scored if scored else len(runs)}",
+        f"- rate: {_pct(summary['success_rate'])}",
+        "",
+        "## Efficiency",
+        "",
+        f"- turns mean/median: {summary['turns']['mean']} / {summary['turns']['median']} (n={summary['turns']['n']})",
+        f"- tokens mean/median: {summary['tokens']['mean']} / {summary['tokens']['median']} (n={summary['tokens']['n']})",
+        f"- wall_time_ms mean/median: {summary['wall_time_ms']['mean']} / {summary['wall_time_ms']['median']} (n={summary['wall_time_ms']['n']})",
+        f"- tool_calls mean/median: {summary['tool_calls']['mean']} / {summary['tool_calls']['median']} (n={summary['tool_calls']['n']})",
+        "",
+        "## Multi-agent utility",
+        "",
+        f"- child_result_used: {summary['child_used_n']}/{summary['n']}",
+        f"- spawn (diagnostic, not a success metric): {summary['spawn_n']}/{summary['n']}",
+        "",
+        "## Profile effectiveness",
+        "",
+    ]
+    profiles = aggregate_profile_effectiveness(runs)
+    if not profiles:
+        lines += [
+            "No profile-attributed children in this sample. Old EventLogs without "
+            "`profile_id` still score via `role` fallback once children are present.",
+            "",
+        ]
+    else:
+        lines += [
+            "| profile | role | spawned | completed | findings gen/acc/ver | bugs found/confirmed | changes acc | verification passed |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for pid, b in profiles.items():
+            findings = f"{b['findings_generated']}/{b['findings_accepted']}/{b['findings_verified']}"
+            bugs = f"{b['bugs_found']}/{b['bugs_confirmed']}"
+            lines.append(
+                f"| `{pid}` | {b.get('profile_role')} | {b['spawned']} | {b['completed']} | "
+                f"{findings} | {bugs} | {b['changes_accepted']} | {b['verification_passed']} |"
+            )
+        lines.append("")
+    lines += [
+        "## Compact eval_result",
+        "",
+    ]
+    if not compact:
+        lines.append("No runs scored. Framework is ready; a real-model execution was not performed.")
+        lines.append("")
+        lines.append("## Decision")
+        lines.append("")
+        lines.append("- verdict: not scored")
+        lines.append("- Do not conclude that Multi-Agent has no value from an empty sample.")
+        lines.append("")
+        return "\n".join(lines) + "\n"
+    lines.append("| task | mode | success | turns | tokens | duration | spawn_count | child_result_used |")
+    lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | --- |")
+    for run, doc in zip(runs, compact):
+        tid = (run.get("task") or {}).get("id")
+        m = doc.get("metrics") or {}
+        ma = doc.get("multi_agent") or {}
+        lines.append(
+            f"| `{tid}` | {doc.get('mode')} | {doc.get('task_success')} | "
+            f"{m.get('turns')} | {m.get('tokens')} | {m.get('duration')} | "
+            f"{ma.get('spawn_count')} | {ma.get('child_result_used')} |"
+        )
+    lines += [
+        "",
+        "## Decision",
+        "",
+        "PASS requires: (1) task success does not drop vs single-agent, "
+        "(2) at least one of turns/tokens/wall/verification/useful-child improves, "
+        "(3) child output is used by the parent. Compare both arms before publishing a verdict.",
+        "",
+        f"- insufficient_n: {summary['insufficient_n']}",
+        "",
+        "If this arm fails, inspect task type, delegation timing, child usefulness, "
+        "and runtime overhead. Do not conclude that Multi-Agent has no value.",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def reviewer_experiment_report(batch: dict[str, Any], *, experiment: dict[str, Any] | None = None) -> str:
+    """Reviewer Value Pilot report. Finding count is not a success metric."""
+    runs = batch.get("runs") or []
+    exp = experiment or batch.get("experiment") or {}
+    name = exp.get("experiment") or "MA-VALUE-REVIEWER-PILOT"
+    mode = exp.get("mode") or batch.get("mode")
+    summary = reviewer_summary(runs)
+    compact = [reviewer_eval_result(r) for r in runs]
+    lines = [
+        f"# multi_agent / {name}",
+        "",
+        "Observer report. Finding count is **not** a success metric.",
+        "A reviewer with zero findings is valid. Noise (generated, never judged) is a regression.",
+        "Task success comes from the independent verifier.",
+        "",
+        "## Experiment",
+        "",
+        f"- suite: `multi_agent`",
+        f"- experiment: `{name}`",
+        f"- mode: `{mode}`",
+        f"- model: `{exp.get('model') or batch.get('model')}`",
+        f"- runs per task: {exp.get('runs')}",
+        f"- tasks: {', '.join(str(t) for t in (exp.get('tasks') or []))}",
+        f"- changes_runtime: {exp.get('changes_runtime', False)}",
+        f"- execute: {exp.get('execute', False)}",
+        "",
+        "## Dataset",
+        "",
+        f"- n records: {len(runs)}",
+        f"- n with independent verifier: {summary['n_scored']}",
+        "",
+        "## Task success",
+        "",
+        f"- passed: {summary['success_n']}/{summary['n_scored'] if summary['n_scored'] else len(runs)}",
+        f"- rate: {_pct(summary['success_rate'])}",
+        "",
+        "## Reviewer contribution",
+        "",
+        f"- reviewer spawned: {summary['reviewer_spawned_n']}/{summary['n']}",
+        f"- useful findings (accepted): {summary['useful_findings_n']}/{summary['n']}",
+        f"- zero-finding reviewers: {summary['zero_findings_n']}",
+        f"- contribution UNMEASURED (runtime emitted null): "
+        f"{summary.get('contribution_unmeasured_n', 0)}/{summary['n']}",
+        f"- noise (unjudged findings): {summary['noise_n']}",
+        f"- findings generated mean: {summary['findings_generated']['mean']}",
+        f"- findings accepted mean: {summary['findings_accepted']['mean']}",
+        f"- findings verified mean: {summary['findings_verified']['mean']}",
+        "",
+        "",
+    ]
+    if summary.get("contribution_unmeasured_n"):
+        lines += [
+            f"> **Findings lifecycle not observable in {summary['contribution_unmeasured_n']}"
+            f"/{summary['n']} runs.** The runtime emitted `contribution: null` — the",
+            "> independent-review stage runs outside the executor ledger, so no projection",
+            "> exists. Created/Accepted/Addressed/Verified counts are unavailable, not zero.",
+            "> Reviewer usefulness cannot be scored from this batch.",
+        ]
+    lines += [
+        "",
+        "## Cost",
+        "",
+        f"- turns mean/median: {summary['turns']['mean']} / {summary['turns']['median']}",
+        f"- tokens mean/median: {summary['tokens']['mean']} / {summary['tokens']['median']}",
+        f"- wall_time_ms mean/median: {summary['wall_time_ms']['mean']} / {summary['wall_time_ms']['median']}",
+        f"- tool_calls mean/median: {summary['tool_calls']['mean']} / {summary['tool_calls']['median']}",
+        "",
+        "## Compact eval_result",
+        "",
+    ]
+    if not compact:
+        lines += [
+            "No runs scored. Framework is ready; a real-model execution was not performed.",
+            "",
+            "## Decision",
+            "",
+            "- verdict: not scored",
+            "- n=5 pairs is a pipeline check. min_n=6 for a published verdict.",
+            "- Do not conclude that Reviewer has no value from an empty sample.",
+            "- Do not implement product changes based only on this pilot.",
+            "",
+        ]
+        return "\n".join(lines) + "\n"
+    lines.append("| task | mode | success | spawned | useful | verified | noise | turns | tokens |")
+    lines.append("| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |")
+    for run, doc in zip(runs, compact):
+        tid = (run.get("task") or {}).get("id")
+        m = doc.get("metrics") or {}
+        rv = doc.get("reviewer") or {}
+        lines.append(
+            f"| `{tid}` | {doc.get('mode')} | {doc.get('task_success')} | "
+            f"{rv.get('spawned')} | {rv.get('useful_findings')} | "
+            f"{rv.get('findings_verified')} | {rv.get('noise')} | "
+            f"{m.get('turns')} | {m.get('tokens')} |"
+        )
+    lines += [
+        "",
+        "## Decision",
+        "",
+        "Pilot n=5 is `insufficient_n`. PASS on a later formal run requires: "
+        "(1) task success does not drop, (2) reviewer ran, (3) useful findings "
+        "or a quality improvement, (4) not a noise regression. Finding count is "
+        "not a success metric. Do not implement product changes based only on the pilot.",
+        "",
+        f"- insufficient_n: {summary['insufficient_n']}",
         "",
     ]
     return "\n".join(lines) + "\n"

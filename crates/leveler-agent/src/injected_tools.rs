@@ -170,16 +170,23 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
             needs your in-flight context. Do NOT spawn the whole task as one blob. \
             agent='<name>' runs a reusable named persona (project \
             `.leveler/agents/<name>.md`, user-level, or built-in); its instructions \
-            are prepended to `task` and supply the role unless you override it."
+            are prepended to `task` and supply the role unless you override it. \
+            Optional `profile` selects a capability contract (tools, workspace, \
+            output); omit it for the default child."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "task": { "type": "string", "description": "The complete, self-contained instruction for the sub-agent." },
+                "profile": {
+                    "type": "string",
+                    "enum": ["default", "explorer", "worker"],
+                    "description": "Optional capability contract: explorer = read-only investigation; worker = scoped writer (requires `files`); default = claims its own write scope. Omit for the default child. Reviewer is harness-launched and cannot be requested here. Alias of `role` when both agree; conflicting values are refused."
+                },
                 "role": {
                     "type": "string",
                     "enum": ["default", "explorer", "worker"],
-                    "description": "Optional. explorer = read-only investigation; worker = legacy pre-scoped writer (requires `files`); default = normal child that claims its own write scope."
+                    "description": "Optional. Historical alias of `profile`. explorer = read-only investigation; worker = legacy pre-scoped writer (requires `files`); default = normal child that claims its own write scope."
                 },
                 "files": {
                     "type": "array",

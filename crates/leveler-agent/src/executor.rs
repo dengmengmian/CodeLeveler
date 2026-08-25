@@ -163,6 +163,11 @@ pub enum AgentEvent {
         nickname: String,
         role: String,
         task: String,
+        /// Built-in capability contract. Absent on events written before
+        /// Child Profile existed (`None` means "not recorded", not "no profile").
+        profile_id: Option<String>,
+        profile_role: Option<String>,
+        capabilities: Vec<String>,
     },
     /// A spawned sub-agent acquired an execution slot and/or reported updated
     /// cumulative token usage. Transient: the final result remains authoritative.
@@ -1158,7 +1163,7 @@ impl Executor {
     /// `files` arrive there as a pre-claim), which is EMPTY before its first
     /// grant — so every mutation is refused until it claims.
     pub(crate) fn effective_write_allowlist(&self) -> Option<Vec<String>> {
-        if crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only {
+        if crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only() {
             // Structurally read-only: no write tools exist; an empty list is
             // a consistent answer for the command pipeline.
             return Some(Vec::new());
@@ -1293,22 +1298,15 @@ impl Executor {
     ) -> Executor {
         // The role's capability profile decides the toolset shape in ONE
         // place: read-only roles get a registry that physically holds no
-        // write tools; a writer is pinned to `files` and runs its tools
-        // serially. See [`crate::sub_agent::ChildProfile`].
+        // write tools; a writer drops MCP proxies whose effect no claimed
+        // scope can bound. See [`crate::child_profile::ChildProfile`].
         let profile = crate::sub_agent::ChildProfile::resolve(role);
-        let registry = if profile.read_only {
-            Arc::new(self.registry.read_only_subset())
-        } else {
-            // A writer child keeps the full toolset EXCEPT MCP proxies, whose
-            // effect lands in a separate unsandboxed process that no claimed
-            // scope can bound (see `refuse_unboundable_delegated_tool`).
-            Arc::new(self.registry.without_mcp_tools())
-        };
-        let write_allowlist = (!profile.read_only && !files.is_empty()).then_some(files);
+        let registry = Arc::new(profile.apply_to_registry(&self.registry));
+        let write_allowlist = (!profile.read_only() && !files.is_empty()).then_some(files);
         let child_policy = self.sub_agent_policies.map_or(
             SubAgentExecutionPolicy {
                 max_search_calls_per_step: self.policy.max_search_calls_per_step,
-                max_parallel_tools: if profile.serial_tools {
+                max_parallel_tools: if profile.serial_tools() {
                     1
                 } else {
                     self.policy.max_parallel_tools
@@ -1322,7 +1320,7 @@ impl Executor {
         // source resolved the loop shape: a writer sharing the workspace never
         // runs tools in parallel.
         let child_policy = SubAgentExecutionPolicy {
-            max_parallel_tools: if profile.serial_tools {
+            max_parallel_tools: if profile.serial_tools() {
                 1
             } else {
                 child_policy.max_parallel_tools
@@ -1343,7 +1341,10 @@ impl Executor {
             registry,
             tool_context: self.tool_context.clone(),
             model: model_override.unwrap_or_else(|| self.model.clone()),
-            continuation: ContinuationPolicy::UntilTerminal,
+            continuation: match profile.max_rounds() {
+                Some(n) if n > 0 => ContinuationPolicy::bounded(n),
+                _ => ContinuationPolicy::UntilTerminal,
+            },
             max_output_tokens: self.max_output_tokens,
             pricing: self.pricing,
             approver: self.approver.clone(),

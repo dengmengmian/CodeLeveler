@@ -32,6 +32,7 @@ eval/reports/*.csv
 eval/reports/adoption/
 eval/reports/capability/
 eval/reports/safety/
+eval/reports/multi_agent/
 !eval/reports/README.md
 !eval/reports/EXAMPLE.md
 !eval/runs/README.md

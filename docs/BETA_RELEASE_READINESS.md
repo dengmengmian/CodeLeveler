@@ -214,6 +214,7 @@ is made against a complete list. Nothing here blocks the release.
 | `SubAgentProvider` seam; durable child sessions (a resumed run reports children lost and releases their scopes); background-first multi-agent UX; capability negotiation | `ROADMAP.md` Phases 2–5 |
 | Web has no multi-agent chrome (`MAPC-W1`); explorer has no browser-read tools (`MAPC-B1`) | `MULTI_AGENT_PRODUCT_CLOSURE.md` |
 | Sub-agent token totals not durable after restart; model TTFT / request id not recorded on tools | `DURABLE_RUNTIME_OBSERVATORY.md` |
+| MA-VALUE-001 observer cannot attribute tokens per child (`model_requests` has no `agent_id`); `child_contribution` / `missed_issues` / `regressions` are not durable EventLog fields | `evaluations/MA-VALUE-001.md` |
 | `R012-F1` durable-args truncation — `OPEN_EVIDENCE_NEEDED` | `BATCH_02_TARGETED_REPAIR_CLOSEOUT.md` |
 | `R004-F6` vite websocket through the forward proxy — fixed but never re-observed, recorded as unproven | `GATE_6_BROWSER_CLOSURE.md` |
 | Cross-client resume of an unfinished goal; goal-owned process survival — `NOT_OBSERVED` (driver limitation) | `BATCH_02_TARGETED_REPAIR_CLOSEOUT.md` |

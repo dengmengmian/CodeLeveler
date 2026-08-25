@@ -83,6 +83,8 @@ pub struct ExecutorFactory {
     pub steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
     /// When false, top-level executors do not advertise `spawn_agent`.
     pub allow_delegation: bool,
+    /// When the harness launches an independent reviewer. Default `Auto`.
+    pub independent_review: crate::policy_resolver::IndependentReviewPolicy,
 }
 
 impl ExecutorFactory {

@@ -110,8 +110,32 @@ def load_experiment(path: Path) -> dict[str, Any]:
     cfg.setdefault("exclude", [])
     cfg.setdefault("population", "model_initiated_only")
     cfg.setdefault("changes_runtime", False)
+    cfg.setdefault("execute", False)
+    cfg.setdefault("mode", None)
     cfg["_path"] = str(path)
     return cfg
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    """Load a restricted YAML mapping. No experiment-key check."""
+    return _parse_restricted_yaml(path.read_text(encoding="utf-8"))
+
+
+def normalize_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    text = str(mode).strip().lower()
+    if text in ("single", "single_agent"):
+        return "single"
+    if text in ("multi", "multi_agent"):
+        return "multi"
+    if text in ("self", "self_verify"):
+        return "self"
+    if text in ("reviewer", "independent_review"):
+        return "reviewer"
+    raise ValueError(
+        f"mode must be single, multi, self, or reviewer, got {mode!r}"
+    )
 
 
 def resolve_experiment(eval_root: Path, suite: str, experiment: str) -> Path:
@@ -131,6 +155,8 @@ def apply_overrides(
     binary: str | None = None,
     task: str | None = None,
     shape: str | None = None,
+    mode: str | None = None,
+    execute: bool | None = None,
 ) -> dict[str, Any]:
     out = dict(cfg)
     if model:
@@ -147,6 +173,12 @@ def apply_overrides(
         out["tasks"] = [task]
     if shape:
         out["shape"] = shape
+    if mode:
+        normalized = normalize_mode(mode)
+        out["mode"] = normalized
+        out["arm"] = normalized
+    if execute is not None:
+        out["execute"] = execute
     return out
 
 

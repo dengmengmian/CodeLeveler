@@ -550,13 +550,11 @@ fn sub_agent_lines(
         format!(" · {}", sub_agent_status(block, t)),
         Style::default().fg(theme.text.secondary),
     ));
-    if block.finding_count > 0 {
+    // Contribution, not volume. "reviewed, nothing to flag" is a result and
+    // gets a line; an unmeasured child says so rather than showing a zero.
+    if let Some(line) = crate::multi_agent::contribution_line_for_block(block, t) {
         head_spans.push(Span::styled(
-            format!(
-                " · {}",
-                t.sub_agent_findings
-                    .replace("{}", &block.finding_count.to_string())
-            ),
+            format!(" · {line}"),
             Style::default().fg(theme.text.secondary),
         ));
     }
@@ -781,10 +779,7 @@ fn sub_agent_tree_group_lines(
             (text, theme.accent.primary)
         } else if all_ok {
             let usage = sub_agent_tree_child_usage(block);
-            if block.finding_count > 0 {
-                let findings = t
-                    .sub_agent_findings
-                    .replace("{}", &block.finding_count.to_string());
+            if let Some(findings) = crate::multi_agent::contribution_line_for_block(block, t) {
                 let text = if usage.is_empty() {
                     findings
                 } else {
@@ -1214,7 +1209,7 @@ mod tests {
             recent_step: None,
             started_elapsed_secs: 0,
             expanded: false,
-            finding_count: 0,
+            contribution: crate::multi_agent::Contribution::Pending,
         }
     }
 
@@ -1272,7 +1267,13 @@ mod tests {
         let theme = Theme::default();
         let t = Locale::Zh.text();
         let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Ok);
-        a.finding_count = 3;
+        a.contribution = crate::multi_agent::Contribution::Reported {
+            total: 3,
+            accepted: 2,
+            verified: 1,
+            rejected: 0,
+            open_blocking: 0,
+        };
         let lines = sub_agent_tree_lines(&[&a], &theme, 80, t, 0);
         let text: String = lines
             .iter()

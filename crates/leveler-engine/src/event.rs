@@ -323,6 +323,15 @@ pub enum EngineEvent {
         nickname: String,
         role: String,
         task: String,
+        /// Built-in capability contract. `serde(default)` so events written
+        /// before Child Profile existed still replay. `None` / empty means
+        /// "not recorded", not "no profile".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_role: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     /// TRANSIENT: live execution state and cumulative usage for one sub-agent.
     SubAgentProgress {
@@ -987,11 +996,17 @@ impl From<leveler_agent::AgentEvent> for EngineEvent {
                 nickname,
                 role,
                 task,
+                profile_id,
+                profile_role,
+                capabilities,
             } => EngineEvent::SubAgentStarted {
                 id,
                 nickname,
                 role,
                 task,
+                profile_id,
+                profile_role,
+                capabilities,
             },
             A::SubAgentProgress {
                 id,

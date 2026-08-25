@@ -1,0 +1,41 @@
+# Reviewer Value Pilot: self-verify vs independent review on coding tasks.
+# Observer only. Does not change reviewer permissions or spawn runtime.
+# --mode self writes independent_review="off" in isolated LEVELER_HOME.
+# --mode reviewer writes independent_review="always" (launch after mutation).
+# Product default stays auto (shape trigger). n=5 pairs; insufficient for a
+# published verdict (min_n=6). Finding count is not a success metric.
+suite: multi_agent
+experiment: MA-VALUE-REVIEWER-PILOT
+description: "Independent Reviewer vs self-verify on coding tasks. Finding count is not a success metric. Pilot n=5 pairs."
+model: deepseek-v4-flash
+provider: deepseek
+binary: leveler
+tasks:
+  - icg-2-bug-fix
+  - rust-race-counter
+  - ts-concurrency-limit
+  - ts-redact-secrets
+  - icg-3-cross-module
+runs: 1
+timeout_seconds: 3600
+arm: control
+mode: null
+population: coding_tasks_error_space
+exclude:
+  - finding_count_as_success
+  - scripted_spawn
+  - forced_workflow
+  - audit_only
+changes_runtime: false
+execute: false
+metrics:
+  - task_success
+  - useful_findings
+  - findings_verified
+  - tests_passed
+  - turns
+  - tokens
+  - wall_time
+  - tool_calls
+  - reviewer_spawned
+output: eval/reports/multi_agent/MA-VALUE-REVIEWER-PILOT

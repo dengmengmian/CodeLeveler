@@ -74,6 +74,9 @@ def extract_con(con: sqlite3.Connection) -> dict[str, Any]:
             "sequence": seq,
             "spawned_by_agent_id": p.get("agent_id") or p.get("parent_agent_id"),
             "task": (p.get("task") or "")[:300],
+            "profile_id": p.get("profile_id"),
+            "profile_role": p.get("profile_role"),
+            "capabilities": p.get("capabilities") or [],
         }
         order.append(cid)
 
@@ -88,13 +91,17 @@ def extract_con(con: sqlite3.Connection) -> dict[str, Any]:
             old_count += 1
 
     finished: dict[str, Any] = {}
-    for _seq, p in event_rows(con, "sub_agent_finished"):
+    finished_seq: dict[str, int] = {}
+    for seq, p in event_rows(con, "sub_agent_finished"):
         if p.get("id"):
             finished[p["id"]] = {
                 "ok": p.get("ok"),
                 "outcome": p.get("outcome"),
                 "summary": (p.get("summary") or "")[:300],
+                "sequence": seq,
+                "contribution": p.get("contribution"),
             }
+            finished_seq[p["id"]] = seq
 
     stages = [
         {
@@ -124,6 +131,40 @@ def extract_con(con: sqlite3.Connection) -> dict[str, Any]:
 
     first = task_children[0]["sequence"] if task_children else None
     offer_seqs = [s["sequence"] for s in stages if s["action"] in ("offered", "reoffered")]
+    min_finish = min(finished_seq.values()) if finished_seq else None
+
+    parent_after = False
+    parent_mut_after = False
+    resolve_n = 0
+    report_ids: list[str] = []
+    reads_before = 0
+    reads_after = 0
+    for seq, p in event_rows(con, "tool_call_started"):
+        name = p.get("name") or p.get("tool")
+        agent = p.get("agent_id")
+        if name == "report_finding" and agent:
+            report_ids.append(str(agent))
+        if agent is not None:
+            continue
+        after = min_finish is not None and seq > min_finish
+        if after:
+            parent_after = True
+            if name in MUTATORS:
+                parent_mut_after = True
+        if name == "resolve_finding":
+            resolve_n += 1
+        if name == "read_file":
+            if after:
+                reads_after += 1
+            elif first is None or seq < first:
+                reads_before += 1
+
+    plan_after = False
+    if min_finish is not None:
+        for seq, _p in event_rows(con, "plan_updated"):
+            if seq > min_finish:
+                plan_after = True
+                break
 
     return {
         "natural_spawn_count": len(parent_task_children),
@@ -145,6 +186,13 @@ def extract_con(con: sqlite3.Connection) -> dict[str, Any]:
         "reoffer_count": sum(1 for s in stages if s["action"] == "reoffered"),
         "parent_tool_calls": parent_tool_calls,
         "sub_agent_outcomes": finished,
+        "parent_tool_calls_after_child": parent_after,
+        "parent_mutations_after_child": parent_mut_after,
+        "parent_resolve_finding_count": resolve_n,
+        "child_report_finding_ids": report_ids,
+        "parent_reads_before_child": reads_before,
+        "parent_reads_after_child": reads_after,
+        "plan_updates_after_child": plan_after,
     }
 
 

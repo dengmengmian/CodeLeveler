@@ -100,6 +100,28 @@ class EventLogTests(unittest.TestCase):
         t = extract_timeline(con)
         self.assertFalse(t["spawn"])
         self.assertEqual(t["spawn_metric"]["reviewer_children"], 1)
+        self.assertEqual(t["reviewer"]["reviewer_spawned"], 1)
+        self.assertFalse(t["reviewer"]["noise"])
+
+    def test_missing_model_requests_is_null_not_zero(self):
+        con = _seq([("plan_updated", {"steps": [{"step": "a"}]})])
+        t = extract_timeline(con)
+        self.assertIsNone(t["input_tokens"])
+        self.assertIsNone(t["output_tokens"])
+        self.assertIsNone(t["total_tokens"])
+        self.assertIsNone(t["wall_time_ms"])
+
+    def test_model_requests_are_summed(self):
+        con = _seq([("plan_updated", {"steps": [{"step": "a"}]})])
+        con.execute(
+            "create table model_requests (input_tokens integer, output_tokens integer)"
+        )
+        con.execute("insert into model_requests values (10, 4)")
+        con.execute("insert into model_requests values (6, 2)")
+        t = extract_timeline(con)
+        self.assertEqual(t["input_tokens"], 16)
+        self.assertEqual(t["output_tokens"], 6)
+        self.assertEqual(t["total_tokens"], 22)
 
 
 if __name__ == "__main__":

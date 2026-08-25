@@ -91,7 +91,11 @@ fn agents_screen_lists_spawned_sub_agents_in_direct_mode() {
             done: false,
             ok: false,
             detail: "investigating the parser".into(),
-        }),
+                    profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            contribution: None,
+}),
     );
     reduce(
         &mut s,
@@ -193,7 +197,11 @@ fn visual_inspect() {
             done: true,
             ok: true,
             detail: "resolver.go 定义了 4 个 provider adapter".into(),
-        }),
+                    profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            contribution: None,
+}),
     );
 
     // Full-screen views.

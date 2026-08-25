@@ -92,6 +92,9 @@ struct GlobalAgents {
     /// Default `plan_registration` is the shipped behaviour.
     #[serde(default)]
     offer_timing: leveler_project::OfferTiming,
+    /// When the harness launches an independent reviewer. Default `auto`.
+    #[serde(default)]
+    independent_review: leveler_project::IndependentReview,
 }
 
 impl Default for GlobalAgents {
@@ -99,6 +102,7 @@ impl Default for GlobalAgents {
         Self {
             delegation: true,
             offer_timing: leveler_project::OfferTiming::default(),
+            independent_review: leveler_project::IndependentReview::default(),
         }
     }
 }
@@ -282,6 +286,8 @@ pub struct GlobalBundle {
     pub agents_delegation: bool,
     /// Multi-agent experiment: delegation offer timing.
     pub agents_offer_timing: leveler_project::OfferTiming,
+    /// When the harness launches an independent reviewer (default Auto).
+    pub agents_independent_review: leveler_project::IndependentReview,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -528,6 +534,7 @@ impl GlobalConfig {
             mcp_servers,
             agents_delegation: self.agents.delegation,
             agents_offer_timing: self.agents.offer_timing,
+            agents_independent_review: self.agents.independent_review,
         }
     }
 }

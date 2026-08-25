@@ -1,0 +1,47 @@
+{
+  "suite": "multi_agent",
+  "experiment": "MA-VALUE-REVIEWER-PILOT",
+  "purpose": "Pointers to vendored EvaluationCase YAML with independent expect. Coding tasks with error space. Not audit. Never rendered as extra prompt text by the observer.",
+  "tasks": {
+    "icg-2-bug-fix": {
+      "id": "icg-2-bug-fix",
+      "case_file": "icg-2-bug-fix.yaml",
+      "evals_path": "evals/icg/icg-2-bug-fix.yaml",
+      "kind": "bug_fix",
+      "pressure": "hidden_defect",
+      "source": "evals"
+    },
+    "rust-race-counter": {
+      "id": "rust-race-counter",
+      "case_file": "rust-race-counter.yaml",
+      "evals_path": "evals/hard/rust-race-counter.yaml",
+      "kind": "concurrency",
+      "pressure": "race",
+      "source": "evals"
+    },
+    "ts-concurrency-limit": {
+      "id": "ts-concurrency-limit",
+      "case_file": "ts-concurrency-limit.yaml",
+      "evals_path": "evals/core/ts-concurrency-limit.yaml",
+      "kind": "concurrency",
+      "pressure": "async_limit",
+      "source": "evals"
+    },
+    "ts-redact-secrets": {
+      "id": "ts-redact-secrets",
+      "case_file": "ts-redact-secrets.yaml",
+      "evals_path": "evals/core/ts-redact-secrets.yaml",
+      "kind": "security",
+      "pressure": "secrets",
+      "source": "evals"
+    },
+    "icg-3-cross-module": {
+      "id": "icg-3-cross-module",
+      "case_file": "icg-3-cross-module.yaml",
+      "evals_path": "evals/icg/icg-3-cross-module.yaml",
+      "kind": "api_change",
+      "pressure": "cross_module",
+      "source": "evals"
+    }
+  }
+}

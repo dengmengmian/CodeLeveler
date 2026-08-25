@@ -27,6 +27,7 @@ pub(crate) async fn cmd_eval(
             provider,
             suite,
             experiment,
+            mode,
             output,
             cases,
             direct,
@@ -45,6 +46,7 @@ pub(crate) async fn cmd_eval(
                     provider,
                     repetitions,
                     output,
+                    mode,
                 );
             }
             let app = Application::assemble(layout)?;
@@ -334,6 +336,7 @@ fn run_framework(
     provider: Option<String>,
     runs: u32,
     output: Option<std::path::PathBuf>,
+    mode: Option<String>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let script = layout.repo_root.join("eval/runner/run.py");
     if !script.is_file() {
@@ -358,6 +361,9 @@ fn run_framework(
     }
     if let Some(output) = output {
         cmd.arg("--output").arg(output);
+    }
+    if let Some(mode) = mode {
+        cmd.arg("--mode").arg(mode);
     }
     cmd.current_dir(&layout.repo_root);
     let status = cmd

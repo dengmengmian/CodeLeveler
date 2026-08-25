@@ -1,0 +1,4 @@
+# Isolated-home overlay for the treatment arm.
+mode: reviewer
+agents:
+  independent_review: always

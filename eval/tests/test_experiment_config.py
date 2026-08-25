@@ -35,6 +35,18 @@ class ExperimentConfigTests(unittest.TestCase):
         self.assertEqual(cfg["suite"], "adoption")
         self.assertFalse(cfg.get("changes_runtime"))
 
+    def test_reviewer_pilot_loads(self):
+        cfg = load_experiment(
+            EVAL / "configs" / "multi_agent" / "MA-VALUE-REVIEWER-PILOT.yaml"
+        )
+        self.assertEqual(cfg["experiment"], "MA-VALUE-REVIEWER-PILOT")
+        self.assertEqual(cfg["runs"], 1)
+        self.assertFalse(cfg.get("execute"))
+        over = apply_overrides(cfg, mode="self")
+        self.assertEqual(over["mode"], "self")
+        self.assertEqual(over["arm"], "self")
+        self.assertNotEqual(cfg.get("mode"), "self")
+
     def test_cli_overrides_do_not_mutate_file(self):
         cfg = load_experiment(M3)
         over = apply_overrides(

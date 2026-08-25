@@ -1,0 +1,9 @@
+id: R010
+name: frontend
+source: real_usage_batch_01
+repository: TailAdmin
+kind: frontend_long
+pressure: long_task_browser
+spawn_expectation: useful
+control_plane_rel: batch-01/R010
+note: Pointer only. Batch #1 used TailAdmin. Task statement and hidden verifier stay in the dogfood-control repo. Not an EvaluationCase.

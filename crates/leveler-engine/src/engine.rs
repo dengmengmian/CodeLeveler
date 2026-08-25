@@ -1536,9 +1536,25 @@ impl TaskEngine {
             .await?;
             return Ok(ClosureReview::NotRequired);
         }
+        use crate::policy_resolver::IndependentReviewPolicy;
+        match self.factory.independent_review {
+            IndependentReviewPolicy::Off => {
+                log.append(
+                    None,
+                    stage(false, "not_required", "independent_review off".to_string()),
+                    observer,
+                )
+                .await?;
+                return Ok(ClosureReview::NotRequired);
+            }
+            IndependentReviewPolicy::Always | IndependentReviewPolicy::Auto => {}
+        }
         let trigger = crate::policy_resolver::ReviewTrigger::from_modified_paths(
             &outcome.modified_files,
-            false,
+            matches!(
+                self.factory.independent_review,
+                IndependentReviewPolicy::Always
+            ),
         );
         let reason = review_reason(&trigger);
         if !trigger.review_required() {

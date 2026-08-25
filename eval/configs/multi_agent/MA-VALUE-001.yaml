@@ -1,0 +1,45 @@
+# MA-VALUE-001: single-agent vs multi-agent value on Real Usage R005–R010.
+# Observer only. Does not change spawn/claim/ownership/settlement/prompts/schema.
+# --mode single writes shipped agents.delegation=false in isolated LEVELER_HOME.
+# --mode multi uses the product default. Same model/provider/repo/task/tools/budget.
+suite: multi_agent
+experiment: MA-VALUE-001
+description: "Single vs multi-agent value on Real Usage R005–R010. Spawn rate is not a success metric."
+model: deepseek-v4-flash
+provider: deepseek
+binary: leveler
+tasks:
+  - R005
+  - R006
+  - R007
+  - R008
+  - R009
+  - R010
+runs: 3
+timeout_seconds: 14400
+arm: control
+mode: null
+population: real_usage_r005_r010
+exclude:
+  - spawn_rate_as_success
+  - scripted_spawn
+  - safety_probe
+  - forced_workflow
+changes_runtime: false
+execute: false
+metrics:
+  - task_success
+  - turns
+  - tokens
+  - wall_time
+  - tool_calls
+  - child_spawned
+  - child_role
+  - child_completed
+  - child_result_consumed
+  - child_contribution
+  - tests_passed
+  - regressions
+  - review_findings
+  - missed_issues
+output: eval/reports/multi_agent/MA-VALUE-001

@@ -1,0 +1,185 @@
+id: go-config-legacy-compat
+name: Migrate the timeout field without breaking old config files
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  config.go: |
+    package config
+
+    import "time"
+
+    // Config is the parsed service configuration.
+    type Config struct {
+        Timeout time.Duration
+        Retries int
+        Name    string
+    }
+
+    // Parse reads a JSON config document.
+    //
+    // Current format:
+    //     {"timeout": "5s", "retries": 3, "name": "svc"}
+    //
+    // Legacy format, still written by deployed clients and still supported:
+    //     {"timeout_ms": 5000, "retries": 3, "name": "svc"}
+    //
+    // Rules:
+    //   - when both "timeout" and "timeout_ms" are present, "timeout" wins
+    //   - a timeout that is absent from BOTH keys defaults to 30s
+    //   - retries absent defaults to 3; retries present defaults to nothing,
+    //     including when it is explicitly 0
+    //   - name absent defaults to "default"
+    //   - an unparseable "timeout" string is an error
+    //   - a negative timeout or negative retries is an error
+    //   - unknown keys are ignored, not an error
+    func Parse(data []byte) (Config, error) {
+        panic("not implemented")
+    }
+  config_test.go: |
+    package config
+
+    import (
+        "testing"
+        "time"
+    )
+
+    func TestCurrentFormat(t *testing.T) {
+        c, err := Parse([]byte(`{"timeout":"5s","retries":7,"name":"svc"}`))
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if c.Timeout != 5*time.Second {
+            t.Errorf("Timeout = %v, want 5s", c.Timeout)
+        }
+        if c.Retries != 7 {
+            t.Errorf("Retries = %d, want 7", c.Retries)
+        }
+        if c.Name != "svc" {
+            t.Errorf("Name = %q, want svc", c.Name)
+        }
+    }
+
+    func TestLegacyFormat(t *testing.T) {
+        c, err := Parse([]byte(`{"timeout_ms":5000,"retries":7,"name":"svc"}`))
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if c.Timeout != 5*time.Second {
+            t.Errorf("Timeout = %v, want 5s", c.Timeout)
+        }
+    }
+
+    func TestDefaults(t *testing.T) {
+        c, err := Parse([]byte(`{}`))
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if c.Timeout != 30*time.Second {
+            t.Errorf("Timeout = %v, want 30s", c.Timeout)
+        }
+        if c.Retries != 3 {
+            t.Errorf("Retries = %d, want 3", c.Retries)
+        }
+        if c.Name != "default" {
+            t.Errorf("Name = %q, want default", c.Name)
+        }
+    }
+
+    func TestBadTimeoutString(t *testing.T) {
+        if _, err := Parse([]byte(`{"timeout":"soon"}`)); err == nil {
+            t.Fatal("expected an error for an unparseable timeout")
+        }
+    }
+task: |
+  Implement Parse in config.go according to the contract in its doc comment.
+
+  `go test ./...` must pass. Do NOT modify config_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package config
+
+      import (
+          "testing"
+          "time"
+      )
+
+      // An explicit 0 is a value the operator chose. Defaulting it back to 3
+      // silently re-enables retries somebody deliberately turned off.
+      func TestHiddenExplicitZeroRetriesIsKept(t *testing.T) {
+          c, err := Parse([]byte(`{"timeout":"5s","retries":0}`))
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if c.Retries != 0 {
+              t.Fatalf("Retries = %d, want 0 — an explicit 0 is not an absent field", c.Retries)
+          }
+      }
+
+      // Current format wins over legacy when both are present.
+      func TestHiddenCurrentWinsOverLegacy(t *testing.T) {
+          c, err := Parse([]byte(`{"timeout":"2s","timeout_ms":9000}`))
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if c.Timeout != 2*time.Second {
+              t.Fatalf("Timeout = %v, want 2s (current format wins)", c.Timeout)
+          }
+      }
+
+      // A legacy zero is also a chosen value, not an absent field.
+      func TestHiddenLegacyZeroTimeoutIsKept(t *testing.T) {
+          c, err := Parse([]byte(`{"timeout_ms":0}`))
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if c.Timeout != 0 {
+              t.Fatalf("Timeout = %v, want 0 — timeout_ms was present and 0", c.Timeout)
+          }
+      }
+
+      func TestHiddenNegativesAreErrors(t *testing.T) {
+          for _, doc := range []string{
+              `{"timeout":"-1s"}`,
+              `{"timeout_ms":-1}`,
+              `{"retries":-1}`,
+          } {
+              if _, err := Parse([]byte(doc)); err == nil {
+                  t.Fatalf("Parse(%s) succeeded; want an error", doc)
+              }
+          }
+      }
+
+      func TestHiddenUnknownKeysIgnored(t *testing.T) {
+          c, err := Parse([]byte(`{"timeout":"1s","future_flag":true,"nested":{"a":1}}`))
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if c.Timeout != time.Second {
+              t.Fatalf("Timeout = %v, want 1s", c.Timeout)
+          }
+      }
+
+      func TestHiddenLegacyOnlyStillDefaultsRetriesAndName(t *testing.T) {
+          c, err := Parse([]byte(`{"timeout_ms":1500}`))
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if c.Timeout != 1500*time.Millisecond {
+              t.Fatalf("Timeout = %v, want 1.5s", c.Timeout)
+          }
+          if c.Retries != 3 || c.Name != "default" {
+              t.Fatalf("Retries = %d, Name = %q; want 3 and default", c.Retries, c.Name)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

@@ -32,6 +32,10 @@ pub(crate) struct EventEmitter {
 
 /// One unit of pump work: an event to persist-then-forward, or a flush marker
 /// to acknowledge once every item before it has been handled.
+///
+/// `EngineEvent` is large (trace payloads on `SubAgentStarted` /
+/// `SubAgentFinished`); boxing it would add a heap hop on every persist.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PumpItem {
     Event(EngineEvent),
     Flush(tokio::sync::oneshot::Sender<Result<(), String>>),

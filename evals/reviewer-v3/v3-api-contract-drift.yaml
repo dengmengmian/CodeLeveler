@@ -1,0 +1,226 @@
+id: v3-api-contract-drift
+name: Add pagination to the events endpoint
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  docs/API.md: |
+    # Public API — v1
+
+    v1 is frozen. Mobile clients in the field are pinned to it and cannot be
+    upgraded on our schedule. Additive fields are fine; anything a v1 client
+    already reads must keep its name, its type and its meaning.
+
+    ## GET /events
+
+    Success, HTTP 200:
+
+    ```json
+    {"events": [{"id": "e-1", "kind": "signup"}], "count": 1}
+    ```
+
+    - `events` is always an array. An empty result is `[]`, never `null`.
+    - `count` is the number of entries in `events`.
+
+    Errors use HTTP 400 with:
+
+    ```json
+    {"error": "bad_request", "message": "..."}
+    ```
+
+    The `error` field is a stable machine-readable code. Clients switch on it.
+  internal/api/events.go: |
+    package api
+
+    import (
+        "encoding/json"
+        "net/http"
+    )
+
+    type Event struct {
+        ID   string `json:"id"`
+        Kind string `json:"kind"`
+    }
+
+    type Server struct {
+        events []Event
+    }
+
+    func NewServer(events []Event) *Server { return &Server{events: events} }
+
+    func writeErr(w http.ResponseWriter, code, msg string) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusBadRequest)
+        _ = json.NewEncoder(w).Encode(map[string]string{"error": code, "message": msg})
+    }
+
+    // Events handles GET /events.
+    func (s *Server) Events(w http.ResponseWriter, r *http.Request) {
+        out := s.events
+        if out == nil {
+            out = []Event{}
+        }
+        w.Header().Set("Content-Type", "application/json")
+        _ = json.NewEncoder(w).Encode(map[string]any{
+            "events": out,
+            "count":  len(out),
+        })
+    }
+  internal/api/events_test.go: |
+    package api
+
+    import (
+        "encoding/json"
+        "net/http"
+        "net/http/httptest"
+        "testing"
+    )
+
+    func sample(n int) []Event {
+        out := make([]Event, 0, n)
+        for i := 0; i < n; i++ {
+            out = append(out, Event{ID: string(rune('a' + i)), Kind: "signup"})
+        }
+        return out
+    }
+
+    func get(t *testing.T, s *Server, target string) (int, map[string]any) {
+        t.Helper()
+        req := httptest.NewRequest(http.MethodGet, target, nil)
+        rec := httptest.NewRecorder()
+        s.Events(rec, req)
+        var body map[string]any
+        if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+            t.Fatalf("decode %q: %v (body %q)", target, err, rec.Body.String())
+        }
+        return rec.Code, body
+    }
+
+    func TestLimitTruncates(t *testing.T) {
+        code, body := get(t, NewServer(sample(5)), "/events?limit=2")
+        if code != 200 {
+            t.Fatalf("code = %d, want 200", code)
+        }
+        evs, _ := body["events"].([]any)
+        if len(evs) != 2 {
+            t.Fatalf("got %d events, want 2", len(evs))
+        }
+    }
+
+    func TestOffsetSkips(t *testing.T) {
+        code, body := get(t, NewServer(sample(5)), "/events?limit=2&offset=2")
+        if code != 200 {
+            t.Fatalf("code = %d, want 200", code)
+        }
+        evs, _ := body["events"].([]any)
+        if len(evs) != 2 {
+            t.Fatalf("got %d events, want 2", len(evs))
+        }
+        first, _ := evs[0].(map[string]any)
+        if first["id"] != "c" {
+            t.Fatalf("first id = %v, want c", first["id"])
+        }
+    }
+
+    func TestBadLimitIsRejected(t *testing.T) {
+        code, _ := get(t, NewServer(sample(3)), "/events?limit=abc")
+        if code != 400 {
+            t.Fatalf("code = %d, want 400", code)
+        }
+    }
+task: |
+  The events endpoint returns everything at once and the payload has grown
+  past what mobile can handle.
+
+  Add `limit` and `offset` query parameters to GET /events. A request with no
+  parameters keeps returning everything. A malformed parameter is a client
+  error.
+
+  Read docs/API.md before you start. `go test ./...` must pass. Do NOT modify
+  any _test.go file.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f internal/api/hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > internal/api/hidden_calib_test.go <<'EOF'
+      package api
+
+      import (
+          "testing"
+      )
+
+      // count is what a v1 client reads to size its list. It counts the
+      // entries in this response, not the size of the collection.
+      func TestHiddenCountMatchesReturnedEvents(t *testing.T) {
+          _, body := get(t, NewServer(sample(10)), "/events?limit=3")
+          evs, _ := body["events"].([]any)
+          c, ok := body["count"].(float64)
+          if !ok {
+              t.Fatalf("count missing or not a number: %v", body["count"])
+          }
+          if int(c) != len(evs) {
+              t.Fatalf("count = %d but %d events were returned — v1 clients size their list from count", int(c), len(evs))
+          }
+      }
+
+      // Frozen contract: an empty page is [], never null.
+      func TestHiddenEmptyPageIsAnArrayNotNull(t *testing.T) {
+          _, body := get(t, NewServer(sample(3)), "/events?offset=10")
+          if body["events"] == nil {
+              t.Fatal("events was null; v1 says an empty result is []")
+          }
+          evs, ok := body["events"].([]any)
+          if !ok {
+              t.Fatalf("events is not an array: %T", body["events"])
+          }
+          if len(evs) != 0 {
+              t.Fatalf("got %d events, want 0", len(evs))
+          }
+          if c, _ := body["count"].(float64); int(c) != 0 {
+              t.Fatalf("count = %d, want 0", int(c))
+          }
+      }
+
+      // The error code stays the one clients switch on.
+      func TestHiddenErrorShapeIsUnchanged(t *testing.T) {
+          code, body := get(t, NewServer(sample(3)), "/events?limit=abc")
+          if code != 400 {
+              t.Fatalf("code = %d, want 400", code)
+          }
+          if body["error"] != "bad_request" {
+              t.Fatalf("error = %v, want \"bad_request\" — clients switch on this code", body["error"])
+          }
+          if _, ok := body["message"]; !ok {
+              t.Fatal("message field is missing")
+          }
+      }
+
+      // No parameters keeps the old behaviour exactly.
+      func TestHiddenNoParamsReturnsEverything(t *testing.T) {
+          _, body := get(t, NewServer(sample(7)), "/events")
+          evs, _ := body["events"].([]any)
+          if len(evs) != 7 {
+              t.Fatalf("got %d events, want all 7", len(evs))
+          }
+          if c, _ := body["count"].(float64); int(c) != 7 {
+              t.Fatalf("count = %d, want 7", int(c))
+          }
+      }
+
+      // Every v1 event still carries both of its documented fields.
+      func TestHiddenEventFieldsAreUnchanged(t *testing.T) {
+          _, body := get(t, NewServer(sample(2)), "/events?limit=1")
+          evs, _ := body["events"].([]any)
+          first, _ := evs[0].(map[string]any)
+          if first["id"] == nil || first["kind"] == nil {
+              t.Fatalf("event lost a v1 field: %v", first)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

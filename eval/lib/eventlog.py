@@ -13,9 +13,49 @@ from pathlib import Path
 from typing import Any
 
 from spawn_metric import MUTATORS, connect_ro, extract_con
+from reviewer import extract_reviewer
+from value import child_result_used, classify_child_contributions, profile_effectiveness
 
 EDIT_TOOLS = {"apply_patch", "replace"}
 CLAIM_TOOL = "claim_write_scope"
+
+
+def extract_usage(con: sqlite3.Connection) -> dict[str, int | None]:
+    """Sum provider usage from `model_requests`. Missing table → null, not 0."""
+    cur = con.cursor()
+    try:
+        cur.execute("select name from sqlite_master where type='table' and name='model_requests'")
+        if not cur.fetchone():
+            return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+        cur.execute("select input_tokens, output_tokens from model_requests")
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    inp = sum(int(r[0] or 0) for r in rows)
+    out = sum(int(r[1] or 0) for r in rows)
+    return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+
+
+def extract_wall_time_ms(con: sqlite3.Connection) -> int | None:
+    """First-to-last `events.created_at`. Missing column or unparseable → null."""
+    cur = con.cursor()
+    try:
+        cur.execute("select created_at from events order by sequence")
+        rows = [r[0] for r in cur.fetchall() if r and r[0]]
+    except sqlite3.OperationalError:
+        return None
+    if len(rows) < 2:
+        return None
+    try:
+        from datetime import datetime
+
+        def parse(ts: str) -> datetime:
+            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+
+        delta = parse(str(rows[-1])) - parse(str(rows[0]))
+        return int(delta.total_seconds() * 1000)
+    except (TypeError, ValueError):
+        return None
 
 
 def load_events(con: sqlite3.Connection) -> list[tuple[int, str, dict[str, Any]]]:
@@ -140,6 +180,25 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
     first_spawn_seq = spawn.get("first_spawn_sequence")
     first_spawn_round = round_at.get(first_spawn_seq) if isinstance(first_spawn_seq, int) else None
 
+    task_outcome = None
+    verification_passed = None
+    tests_passed: int | None = None
+    review_findings = 0
+    for _seq, etype, body in events:
+        if etype == "task_finished":
+            task_outcome = body.get("outcome")
+        elif etype == "verification_finished":
+            verification_passed = body.get("passed")
+        elif etype == "verification_check":
+            status = body.get("status")
+            if status in ("passed", "pass", True):
+                tests_passed = (tests_passed or 0) + 1
+        elif etype == "review_stage" and body.get("action") == "finished_ok":
+            review_findings += 1
+
+    usage = extract_usage(con)
+    wall_ms = extract_wall_time_ms(con)
+
     return {
         "goal": goal,
         "model_from_event": model,
@@ -170,6 +229,20 @@ def extract_timeline(con: sqlite3.Connection) -> dict[str, Any]:
         "ownership_granted": ownership_granted,
         "ownership_denied": ownership_denied,
         "spawn_metric": spawn,
+        "input_tokens": usage["input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "total_tokens": usage["total_tokens"],
+        "wall_time_ms": wall_ms,
+        "task_outcome": task_outcome,
+        "verification_passed": verification_passed,
+        "tests_passed": tests_passed,
+        "review_findings": review_findings if review_findings else None,
+        "regressions": None,
+        "missed_issues": None,
+        "child_result_used": child_result_used(spawn),
+        "child_contributions": classify_child_contributions(spawn),
+        "profile_effectiveness": profile_effectiveness(spawn),
+        "reviewer": extract_reviewer(spawn),
     }
 
 

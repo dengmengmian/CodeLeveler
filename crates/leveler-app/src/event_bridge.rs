@@ -8,6 +8,7 @@ use leveler_core::ToolCallId;
 use leveler_engine::EngineEvent;
 
 use leveler_client_protocol::{
+    ChildContribution,
     CheckState, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent, UiCheck, UiPlan,
     UiPlanStep, UiVerification,
 };
@@ -93,6 +94,32 @@ pub(crate) struct EventBridge {
     /// fold (a nudged model repeating its "task complete" summary). Display
     /// layer only — the persisted transcript keeps every message.
     recent_assistant_texts: std::collections::VecDeque<String>,
+    /// Role per in-flight child, so the terminal event can carry the role the
+    /// spawn announced instead of an empty string.
+    child_roles: HashMap<String, String>,
+}
+
+/// Map the runtime's projection onto the wire type.
+///
+/// Deliberately total: every field crosses. Dropping one here is invisible at
+/// the call site and unrecoverable downstream — which is exactly how
+/// `contribution` was lost before.
+fn project_contribution(
+    c: &leveler_lifecycle::ChildResultProjection,
+) -> ChildContribution {
+    ChildContribution {
+        role: c.role.clone(),
+        profile_id: c.profile_id.clone(),
+        profile_role: c.profile_role.clone(),
+        capabilities: c.capabilities.clone(),
+        source: c.source.as_ref().map(|s| s.label().to_string()),
+        findings_total: c.findings_total,
+        findings_acknowledged: c.findings_acknowledged,
+        findings_accepted: c.findings_accepted,
+        findings_verified: c.findings_verified,
+        findings_rejected: c.findings_rejected,
+        findings_open_blocking: c.findings_open_blocking,
+    }
 }
 
 /// How many completed texts the fold compares against. Nudge rounds can carry
@@ -146,6 +173,7 @@ impl EventBridge {
             open_assistant: None,
             verification_checks: Vec::new(),
             recent_assistant_texts: std::collections::VecDeque::new(),
+            child_roles: HashMap::new(),
         }
     }
 
@@ -478,7 +506,13 @@ impl EventBridge {
                 nickname,
                 role,
                 task,
+                profile_id,
+                profile_role,
+                capabilities,
             } => {
+                // The capability contract travels with the child so the UI can
+                // state what it was allowed to do rather than implying it.
+                self.child_roles.insert(id.clone(), role.clone());
                 let _ = self.events.send(RuntimeEvent::SubAgentUpdated {
                     id,
                     nickname,
@@ -486,6 +520,10 @@ impl EventBridge {
                     done: false,
                     ok: false,
                     detail: task,
+                    profile_id,
+                    profile_role,
+                    capabilities,
+                    contribution: None,
                 });
             }
             EngineEvent::SubAgentProgress {
@@ -508,15 +546,31 @@ impl EventBridge {
                 nickname,
                 ok,
                 summary,
-                ..
+                contribution,
             } => {
+                let projected = contribution.as_ref().map(project_contribution);
+                // Prefer the role recorded at spawn; a projection carries it
+                // too, but a child that was never announced has neither and an
+                // empty string is honest about that.
+                let role = self
+                    .child_roles
+                    .remove(&id)
+                    .or_else(|| projected.as_ref().map(|c: &ChildContribution| c.role.clone()))
+                    .unwrap_or_default();
                 let _ = self.events.send(RuntimeEvent::SubAgentUpdated {
                     id,
                     nickname,
-                    role: String::new(),
+                    role,
                     done: true,
                     ok,
                     detail: summary,
+                    profile_id: projected.as_ref().and_then(|c| c.profile_id.clone()),
+                    profile_role: projected.as_ref().and_then(|c| c.profile_role.clone()),
+                    capabilities: projected
+                        .as_ref()
+                        .map(|c| c.capabilities.clone())
+                        .unwrap_or_default(),
+                    contribution: projected,
                 });
             }
             EngineEvent::SubAgentActivity {
@@ -1420,6 +1474,86 @@ mod projection_equivalence {
         );
     }
 
+    /// The projection is what every client renders. Facts the runtime already
+    /// computed must survive the hop: a contribution dropped here cannot be
+    /// recovered downstream, and the UI would have to invent it or omit it.
+    #[test]
+    fn a_child_contribution_survives_the_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: true,
+            summary: "done".into(),
+            contribution: Some(
+                leveler_lifecycle::ChildResultProjection::from_findings("a1", "explorer", &[])
+                    .with_profile("explorer", "explorer", vec!["read_file".into()]),
+            ),
+        });
+        let ev = rx.try_recv().expect("one event");
+        match ev {
+            RuntimeEvent::SubAgentUpdated {
+                role, contribution, ..
+            } => {
+                assert_eq!(role, "explorer", "role must not be blanked on finish");
+                let c = contribution.expect("the projection must reach the client");
+                assert_eq!(c.role, "explorer");
+                assert_eq!(c.profile_id.as_deref(), Some("explorer"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// `None` means the runtime did not measure this child. It must stay
+    /// distinguishable from a measured zero all the way to the renderer.
+    #[test]
+    fn an_unmeasured_contribution_stays_none() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentFinished {
+            id: "a1".into(),
+            nickname: "Newton".into(),
+            ok: false,
+            summary: "did not report".into(),
+            contribution: None,
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated { contribution, .. } => {
+                assert!(contribution.is_none(), "unmeasured must not become a zero");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The capability contract is what lets the UI say "read-only" instead of
+    /// implying it.
+    #[test]
+    fn a_child_profile_survives_the_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::SubAgentStarted {
+            id: "r1".into(),
+            nickname: "reviewer".into(),
+            role: "reviewer".into(),
+            task: "review the diff".into(),
+            profile_id: Some("reviewer".into()),
+            profile_role: Some("reviewer".into()),
+            capabilities: vec!["code_review".into(), "verification".into()],
+        });
+        match rx.try_recv().expect("one event") {
+            RuntimeEvent::SubAgentUpdated {
+                profile_id,
+                capabilities,
+                ..
+            } => {
+                assert_eq!(profile_id.as_deref(), Some("reviewer"));
+                assert_eq!(capabilities, vec!["code_review", "verification"]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
     #[test]
     fn sub_agent_lifecycle_projects() {
         let shapes = project(vec![
@@ -1428,6 +1562,9 @@ mod projection_equivalence {
                 nickname: "Newton".into(),
                 role: "explorer".into(),
                 task: "look".into(),
+                profile_id: None,
+                profile_role: None,
+                capabilities: Vec::new(),
             },
             EngineEvent::SubAgentProgress {
                 id: "a1".into(),

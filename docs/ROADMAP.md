@@ -11,10 +11,16 @@ Beta Candidate            v0.2.0-beta.1 · on main · pre-release channel ready
         ↓
 Real Usage Batch #1       six tasks against the PUBLISHED binary
         ↓                 docs/evaluations/REAL_USAGE_BETA_001.md
+Multi-Agent Value Eval    MA-VALUE-001: single vs multi on R005–R010
+        ↓                 docs/evaluations/MA-VALUE-001.md
 Capability Closure        driven by what that round finds
 ```
 
-The current step is **Real Usage**, not feature work. The Post-Beta phases below
+MA-VALUE-001 is an eval, not a product change. Structured SubAgent /
+Explorer-Worker-Reviewer wait on its results. Spawn rate is not a success
+metric.
+
+The current step is **Real Usage** plus the MA-VALUE-001 eval, not feature work. The Post-Beta phases below
 (Delegation Advisor, SubAgentProvider, Durable Child Session, Background-first
 UX, Capability Negotiation) stay post-Beta and do not start early — including
 Remote Worker, which is not on this roadmap at all yet because nothing has asked

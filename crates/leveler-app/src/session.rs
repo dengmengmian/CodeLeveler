@@ -170,11 +170,17 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             nickname,
             role,
             task,
+            profile_id,
+            profile_role,
+            capabilities,
         } => AgentEvent::SubAgentStarted {
             id,
             nickname,
             role,
             task,
+            profile_id,
+            profile_role,
+            capabilities,
         },
         EngineEvent::SubAgentProgress {
             id,

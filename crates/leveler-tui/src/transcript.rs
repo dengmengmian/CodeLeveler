@@ -119,9 +119,11 @@ pub struct SubAgentBlock {
     /// show each agent's own running time (`now_elapsed - started`). `0` when the
     /// start time is unknown (finish-without-start fallback).
     pub started_elapsed_secs: u64,
-    /// Typed findings adopted from this child (from the durable finish
-    /// summary). Zero until the child finishes.
-    pub finding_count: usize,
+    /// What the parent did with what this child produced, projected from
+    /// the runtime's `contribution`. `Pending` until the child finishes;
+    /// `NotMeasured` when the runtime produced no projection — which is not
+    /// the same fact as a measured zero and must not render as one.
+    pub contribution: crate::multi_agent::Contribution,
 }
 
 /// Ephemeral side question (`/btw`) — rendered in the UI but never loaded
@@ -711,32 +713,46 @@ impl TranscriptState {
             progress: SubAgentProgress::default(),
             recent_step: None,
             started_elapsed_secs,
-            finding_count: 0,
+            contribution: crate::multi_agent::Contribution::Pending,
         }));
-    }
-
-    /// Count typed findings named in the durable finish summary. The runtime
-    /// writes `Structured findings adopted: f-1, f-2` — this is a projection
-    /// of that authoritative line, not a second source of truth.
-    pub(crate) fn count_adopted_findings(summary: &str) -> usize {
-        const MARK: &str = "Structured findings adopted: ";
-        summary
-            .lines()
-            .find_map(|line| {
-                let rest = line.trim().strip_prefix(MARK)?;
-                let ids = rest.split('—').next().unwrap_or(rest);
-                let n = ids
-                    .split(',')
-                    .filter(|s| s.trim().starts_with("f-"))
-                    .count();
-                (n > 0).then_some(n)
-            })
-            .unwrap_or(0)
     }
 
     /// Mark a sub-agent done, updating its status and result summary in place. If
     /// the finish arrives before/without a start (e.g. a dropped event), still
     /// show a completed block so the result isn't lost.
+    /// Finish a child using the runtime's projected finding count.
+    ///
+    /// `None` means the runtime did not measure this child; it is not a zero,
+    /// and the renderer must be able to tell the two apart.
+    pub fn complete_sub_agent_with_contribution(
+        &mut self,
+        id: &str,
+        nickname: &str,
+        ok: bool,
+        summary: String,
+        contribution: crate::multi_agent::Contribution,
+    ) {
+        let status = if ok { ToolStatus::Ok } else { ToolStatus::Failed };
+        if let Some(block) = self.sub_agent_mut(id) {
+            block.status = status;
+            block.detail = summary;
+            block.contribution = contribution.clone();
+            return;
+        }
+        self.items.push(TranscriptItem::SubAgent(SubAgentBlock {
+            id: id.to_string(),
+            expanded: false,
+            nickname: nickname.to_string(),
+            role: String::new(),
+            status,
+            detail: summary,
+            progress: SubAgentProgress::default(),
+            recent_step: None,
+            started_elapsed_secs: 0,
+            contribution,
+        }));
+    }
+
     pub fn complete_sub_agent(&mut self, id: &str, nickname: &str, ok: bool, summary: String) {
         self.bump();
         let status = if ok {
@@ -744,12 +760,15 @@ impl TranscriptState {
         } else {
             ToolStatus::Failed
         };
-        let finding_count = Self::count_adopted_findings(&summary);
+        // No projection reached us: the runtime did not measure this child.
+        // Saying so is honest; scanning the model-facing summary for a count
+        // is how the UI used to invent one.
+        let contribution = crate::multi_agent::Contribution::NotMeasured;
         if let Some(block) = self.sub_agent_mut(id) {
             block.status = status;
             block.detail = summary;
             block.progress.active = false;
-            block.finding_count = finding_count;
+            block.contribution = contribution.clone();
             return;
         }
         self.close_tool_group();
@@ -763,7 +782,7 @@ impl TranscriptState {
             progress: SubAgentProgress::default(),
             recent_step: None,
             started_elapsed_secs: 0,
-            finding_count,
+            contribution,
         }));
     }
 
@@ -911,23 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn count_adopted_findings_reads_the_authoritative_line() {
-        assert_eq!(
-            TranscriptState::count_adopted_findings(
-                "[sub-agent Euclid] status: COMPLETED_WITH_FINDINGS\n\
-                 found it\n\n\
-                 Structured findings adopted: f-1, f-2 — judge each with resolve_finding."
-            ),
-            2
-        );
-        assert_eq!(
-            TranscriptState::count_adopted_findings("no findings here"),
-            0
-        );
-    }
-
-    #[test]
-    fn completing_a_sub_agent_records_its_finding_count() {
+    fn completing_a_sub_agent_without_a_projection_is_unmeasured_not_zero() {
         let mut ts = TranscriptState::default();
         ts.push_sub_agent_started(
             "agent-1".into(),
@@ -946,7 +949,11 @@ mod tests {
             Some(TranscriptItem::SubAgent(b)) => b,
             _ => panic!("expected sub-agent"),
         };
-        assert_eq!(block.finding_count, 1);
+        assert_eq!(
+            block.contribution,
+            crate::multi_agent::Contribution::NotMeasured,
+            "no projection reached the UI; inventing a count from the summary is what this replaced"
+        );
         assert_eq!(block.status, ToolStatus::Ok);
     }
 }

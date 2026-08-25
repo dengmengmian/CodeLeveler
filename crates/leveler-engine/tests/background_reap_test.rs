@@ -181,6 +181,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
+            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

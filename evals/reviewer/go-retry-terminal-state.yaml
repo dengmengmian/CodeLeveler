@@ -1,0 +1,220 @@
+id: go-retry-terminal-state
+name: Retry loop that reports its own history honestly
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  retry.go: |
+    package retry
+
+    import "errors"
+
+    // ErrExhausted wraps the last error when every attempt failed.
+    var ErrExhausted = errors.New("attempts exhausted")
+
+    // Retryable marks an error worth another attempt. An error that does not
+    // implement it, or reports false, is terminal.
+    type Retryable interface {
+        Retryable() bool
+    }
+
+    // Stats records what actually happened. It is returned on every path,
+    // including the error paths.
+    type Stats struct {
+        // Attempts counts calls to op. Always >= 1 once Do runs.
+        Attempts int
+        // Sleeps counts calls to sleep. A retry sleeps BEFORE the next
+        // attempt; there is no sleep after the final attempt.
+        Sleeps int
+    }
+
+    // Do calls op until it succeeds, an error is terminal, or maxAttempts is
+    // reached.
+    //
+    // Contract:
+    //   - maxAttempts < 1 is an error before op is ever called; Attempts is 0
+    //   - a terminal error is returned as-is, NOT wrapped in ErrExhausted
+    //   - when every attempt failed with a retryable error, the returned error
+    //     wraps ErrExhausted and errors.Is finds the LAST attempt's error too
+    //   - sleep runs between attempts only: with maxAttempts=3 and three
+    //     failures, Sleeps is 2
+    //   - a terminal error on attempt 1 means Sleeps is 0
+    //   - Stats is accurate on every return path
+    func Do(maxAttempts int, sleep func(attempt int), op func(attempt int) error) (Stats, error) {
+        panic("not implemented")
+    }
+  retry_test.go: |
+    package retry
+
+    import (
+        "errors"
+        "testing"
+    )
+
+    type retryErr struct{ msg string }
+
+    func (e *retryErr) Error() string   { return e.msg }
+    func (e *retryErr) Retryable() bool { return true }
+
+    func TestSucceedsFirstTry(t *testing.T) {
+        st, err := Do(3, func(int) {}, func(int) error { return nil })
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if st.Attempts != 1 {
+            t.Errorf("Attempts = %d, want 1", st.Attempts)
+        }
+        if st.Sleeps != 0 {
+            t.Errorf("Sleeps = %d, want 0", st.Sleeps)
+        }
+    }
+
+    func TestSucceedsAfterOneRetry(t *testing.T) {
+        n := 0
+        st, err := Do(3, func(int) {}, func(int) error {
+            n++
+            if n == 1 {
+                return &retryErr{"flaky"}
+            }
+            return nil
+        })
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if st.Attempts != 2 {
+            t.Errorf("Attempts = %d, want 2", st.Attempts)
+        }
+        if st.Sleeps != 1 {
+            t.Errorf("Sleeps = %d, want 1", st.Sleeps)
+        }
+    }
+
+    func TestTerminalErrorIsNotWrapped(t *testing.T) {
+        plain := errors.New("nope")
+        st, err := Do(3, func(int) {}, func(int) error { return plain })
+        if !errors.Is(err, plain) {
+            t.Fatalf("err = %v, want the terminal error", err)
+        }
+        if errors.Is(err, ErrExhausted) {
+            t.Fatal("a terminal error must not be wrapped in ErrExhausted")
+        }
+        if st.Attempts != 1 {
+            t.Errorf("Attempts = %d, want 1", st.Attempts)
+        }
+    }
+task: |
+  Implement Do in retry.go according to the contract in its doc comment.
+
+  `go test ./...` must pass. Do NOT modify retry_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package retry
+
+      import (
+          "errors"
+          "testing"
+      )
+
+      // The off-by-one that survives every happy-path test: sleeping after the
+      // final failure, so the caller waits for a retry that never comes.
+      func TestHiddenNoSleepAfterFinalAttempt(t *testing.T) {
+          st, err := Do(3, func(int) {}, func(int) error { return &retryErr{"always"} })
+          if err == nil {
+              t.Fatal("expected an error")
+          }
+          if st.Attempts != 3 {
+              t.Fatalf("Attempts = %d, want 3", st.Attempts)
+          }
+          if st.Sleeps != 2 {
+              t.Fatalf("Sleeps = %d, want 2 — sleeping after the last attempt makes the caller wait for a retry that never happens", st.Sleeps)
+          }
+      }
+
+      // Exhaustion carries both the marker and the real cause.
+      func TestHiddenExhaustedKeepsTheLastError(t *testing.T) {
+          last := &retryErr{"attempt-3"}
+          n := 0
+          _, err := Do(3, func(int) {}, func(int) error {
+              n++
+              if n == 3 {
+                  return last
+              }
+              return &retryErr{"earlier"}
+          })
+          if !errors.Is(err, ErrExhausted) {
+              t.Fatalf("err = %v, want it to wrap ErrExhausted", err)
+          }
+          if !errors.Is(err, error(last)) {
+              t.Fatalf("err = %v, want errors.Is to find the last attempt's error", err)
+          }
+      }
+
+      // A terminal error part-way through stops immediately and reports honestly.
+      func TestHiddenTerminalMidwayStopsAndCountsRight(t *testing.T) {
+          plain := errors.New("terminal")
+          st, err := Do(5, func(int) {}, func(attempt int) error {
+              if attempt >= 2 {
+                  return plain
+              }
+              return &retryErr{"retry me"}
+          })
+          if !errors.Is(err, plain) {
+              t.Fatalf("err = %v, want the terminal error", err)
+          }
+          if errors.Is(err, ErrExhausted) {
+              t.Fatal("a terminal error must not be wrapped in ErrExhausted")
+          }
+          if st.Attempts != 2 {
+              t.Fatalf("Attempts = %d, want 2", st.Attempts)
+          }
+          if st.Sleeps != 1 {
+              t.Fatalf("Sleeps = %d, want 1", st.Sleeps)
+          }
+      }
+
+      func TestHiddenSingleAttemptNeverSleeps(t *testing.T) {
+          st, err := Do(1, func(int) {}, func(int) error { return &retryErr{"once"} })
+          if err == nil {
+              t.Fatal("expected an error")
+          }
+          if st.Attempts != 1 || st.Sleeps != 0 {
+              t.Fatalf("Attempts/Sleeps = %d/%d, want 1/0", st.Attempts, st.Sleeps)
+          }
+      }
+
+      func TestHiddenZeroMaxAttemptsNeverCallsOp(t *testing.T) {
+          called := false
+          st, err := Do(0, func(int) {}, func(int) error { called = true; return nil })
+          if err == nil {
+              t.Fatal("maxAttempts < 1 must be an error")
+          }
+          if called {
+              t.Fatal("op must not be called when maxAttempts < 1")
+          }
+          if st.Attempts != 0 {
+              t.Fatalf("Attempts = %d, want 0", st.Attempts)
+          }
+      }
+
+      // The attempt number handed to op and sleep is 1-based and increases.
+      func TestHiddenAttemptNumbersAreOneBased(t *testing.T) {
+          var seen []int
+          _, _ = Do(3, func(int) {}, func(attempt int) error {
+              seen = append(seen, attempt)
+              return &retryErr{"again"}
+          })
+          if len(seen) != 3 || seen[0] != 1 || seen[1] != 2 || seen[2] != 3 {
+              t.Fatalf("op saw attempts %v, want [1 2 3]", seen)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

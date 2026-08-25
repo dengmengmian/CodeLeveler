@@ -574,6 +574,16 @@ async fn a_settled_child_reports_a_contribution_projection() {
         "the projection must name the child it projects, or it cannot be joined"
     );
     assert_eq!(projection.role, "explorer");
+    assert_eq!(projection.profile_id.as_deref(), Some("explorer"));
+    assert_eq!(projection.profile_role.as_deref(), Some("explorer"));
+    assert!(
+        projection
+            .capabilities
+            .iter()
+            .any(|c| c == "repository_analysis"),
+        "explorer capabilities must appear on the projection: {:?}",
+        projection.capabilities
+    );
     assert!(
         !projection.contributed(),
         "this child reported nothing, and the projection must say so rather than flatter it"

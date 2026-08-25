@@ -1,0 +1,9 @@
+id: R008
+name: ripgrep
+source: real_usage_batch_01
+repository: BurntSushi/ripgrep
+kind: correctness
+pressure: independent_review
+spawn_expectation: required_reviewer
+control_plane_rel: batch-01/R008
+note: Pointer only. Task statement and hidden verifier stay in the dogfood-control repo. Not an EvaluationCase.

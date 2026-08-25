@@ -1,0 +1,9 @@
+id: R005
+name: cargo
+source: real_usage_batch_01
+repository: rust-lang/cargo
+kind: large_rust
+pressure: exploration
+spawn_expectation: useful_explorer
+control_plane_rel: batch-01/R005
+note: Pointer only. Task statement and hidden verifier stay in the dogfood-control repo. Not an EvaluationCase.

@@ -1,0 +1,7 @@
+id: ts-concurrency-limit
+name: async concurrency limit
+source: evals
+evals_path: evals/core/ts-concurrency-limit.yaml
+kind: concurrency
+pressure: async_limit
+note: Pointer only. Task and independent expect live in evals/core. Not an observer-invented prompt.

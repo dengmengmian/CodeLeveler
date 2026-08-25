@@ -1,0 +1,55 @@
+{
+  "suite": "multi_agent",
+  "experiment": "MA-VALUE-001",
+  "purpose": "Metrics-only pointers to Real Usage Batch #1 R005–R010. Never rendered into a model prompt. Not EvaluationCase YAML.",
+  "tasks": {
+    "R005": {
+      "id": "R005",
+      "case_file": "r005-cargo.yaml",
+      "repository": "rust-lang/cargo",
+      "kind": "large_rust",
+      "pressure": "exploration",
+      "source": "real_usage_batch_01"
+    },
+    "R006": {
+      "id": "R006",
+      "case_file": "r006-casdoor.yaml",
+      "repository": "casdoor/casdoor",
+      "kind": "full_stack",
+      "pressure": "cross_layer",
+      "source": "real_usage_batch_01"
+    },
+    "R007": {
+      "id": "R007",
+      "case_file": "r007-hoppscotch.yaml",
+      "repository": "hoppscotch/hoppscotch",
+      "kind": "typescript_monorepo",
+      "pressure": "impact_exploration",
+      "source": "real_usage_batch_01"
+    },
+    "R008": {
+      "id": "R008",
+      "case_file": "r008-ripgrep.yaml",
+      "repository": "BurntSushi/ripgrep",
+      "kind": "correctness",
+      "pressure": "independent_review",
+      "source": "real_usage_batch_01"
+    },
+    "R009": {
+      "id": "R009",
+      "case_file": "r009-go-task.yaml",
+      "repository": "go-task/task",
+      "kind": "concurrency",
+      "pressure": "independent_review",
+      "source": "real_usage_batch_01"
+    },
+    "R010": {
+      "id": "R010",
+      "case_file": "r010-frontend.yaml",
+      "repository": "TailAdmin",
+      "kind": "frontend_long",
+      "pressure": "long_task_browser",
+      "source": "real_usage_batch_01"
+    }
+  }
+}

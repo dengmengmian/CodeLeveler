@@ -165,6 +165,7 @@ async fn harness(
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
+            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
         },
         approver,
         clarifier: Arc::new(AutoClarify),

@@ -1,0 +1,289 @@
+id: v3-tenant-cache
+name: Speed up profile lookups with a cache
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  internal/tenant/tenant.go: |
+    // Package tenant carries the current tenant through a request.
+    //
+    // Every request arrives on behalf of exactly one tenant. Tenants are
+    // separate customers: their data must never be visible to each other.
+    // User ids are assigned per tenant and are NOT globally unique — tenant
+    // "acme" and tenant "globex" can both have a user "u-1".
+    package tenant
+
+    import "context"
+
+    type key struct{}
+
+    // With returns a context bound to a tenant.
+    func With(ctx context.Context, id string) context.Context {
+        return context.WithValue(ctx, key{}, id)
+    }
+
+    // From returns the tenant bound to ctx, or "" if there is none.
+    func From(ctx context.Context) string {
+        v, _ := ctx.Value(key{}).(string)
+        return v
+    }
+  internal/store/store.go: |
+    package store
+
+    import (
+        "context"
+        "errors"
+        "sync"
+
+        "evalcase/internal/tenant"
+    )
+
+    var ErrNotFound = errors.New("profile not found")
+
+    type Profile struct {
+        UserID string
+        Email  string
+    }
+
+    // Store is the database. Every row is scoped to a tenant; a query without
+    // a tenant returns nothing.
+    type Store struct {
+        mu sync.Mutex
+        // tenant -> userID -> profile
+        rows  map[string]map[string]Profile
+        reads int
+    }
+
+    func New() *Store {
+        return &Store{rows: map[string]map[string]Profile{}}
+    }
+
+    func (s *Store) Seed(tenantID string, p Profile) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        if s.rows[tenantID] == nil {
+            s.rows[tenantID] = map[string]Profile{}
+        }
+        s.rows[tenantID][p.UserID] = p
+    }
+
+    // GetProfile reads one profile for the tenant on ctx.
+    func (s *Store) GetProfile(ctx context.Context, userID string) (Profile, error) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        s.reads++
+        t := tenant.From(ctx)
+        p, ok := s.rows[t][userID]
+        if !ok {
+            return Profile{}, ErrNotFound
+        }
+        return p, nil
+    }
+
+    // Reads counts how many queries reached the database.
+    func (s *Store) Reads() int {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        return s.reads
+    }
+  internal/cache/cache.go: |
+    // Package cache is a small in-memory key/value store with no eviction.
+    // It is shared process-wide by whatever uses it.
+    package cache
+
+    import "sync"
+
+    type Cache struct {
+        mu sync.Mutex
+        m  map[string]any
+    }
+
+    func New() *Cache { return &Cache{m: map[string]any{}} }
+
+    func (c *Cache) Get(key string) (any, bool) {
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        v, ok := c.m[key]
+        return v, ok
+    }
+
+    func (c *Cache) Put(key string, value any) {
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.m[key] = value
+    }
+  internal/service/service.go: |
+    package service
+
+    import (
+        "context"
+
+        "evalcase/internal/cache"
+        "evalcase/internal/store"
+    )
+
+    // Service answers profile lookups for the API layer.
+    type Service struct {
+        store *store.Store
+        cache *cache.Cache
+    }
+
+    func New(s *store.Store, c *cache.Cache) *Service {
+        return &Service{store: s, cache: c}
+    }
+
+    // Lookup returns one profile.
+    func (s *Service) Lookup(ctx context.Context, userID string) (store.Profile, error) {
+        return s.store.GetProfile(ctx, userID)
+    }
+  internal/service/service_test.go: |
+    package service
+
+    import (
+        "context"
+        "testing"
+
+        "evalcase/internal/cache"
+        "evalcase/internal/store"
+        "evalcase/internal/tenant"
+    )
+
+    func TestLookupReturnsTheProfile(t *testing.T) {
+        st := store.New()
+        st.Seed("acme", store.Profile{UserID: "u-1", Email: "a@acme.test"})
+        svc := New(st, cache.New())
+        ctx := tenant.With(context.Background(), "acme")
+
+        p, err := svc.Lookup(ctx, "u-1")
+        if err != nil {
+            t.Fatalf("Lookup: %v", err)
+        }
+        if p.Email != "a@acme.test" {
+            t.Fatalf("email = %q, want a@acme.test", p.Email)
+        }
+    }
+
+    func TestRepeatedLookupDoesNotHitTheDatabaseTwice(t *testing.T) {
+        st := store.New()
+        st.Seed("acme", store.Profile{UserID: "u-1", Email: "a@acme.test"})
+        svc := New(st, cache.New())
+        ctx := tenant.With(context.Background(), "acme")
+
+        for i := 0; i < 5; i++ {
+            if _, err := svc.Lookup(ctx, "u-1"); err != nil {
+                t.Fatalf("Lookup %d: %v", i, err)
+            }
+        }
+        if got := st.Reads(); got != 1 {
+            t.Fatalf("database reads = %d, want 1 — repeated lookups must be served from cache", got)
+        }
+    }
+
+    func TestMissingProfileIsAnError(t *testing.T) {
+        st := store.New()
+        svc := New(st, cache.New())
+        ctx := tenant.With(context.Background(), "acme")
+
+        if _, err := svc.Lookup(ctx, "nobody"); err == nil {
+            t.Fatal("expected an error for an unknown profile")
+        }
+    }
+task: |
+  Profile lookups are the hottest path in the API and every one of them hits
+  the database. Support says the same handful of profiles are fetched over and
+  over.
+
+  Use the cache in internal/cache to serve repeated lookups from memory
+  instead of the database.
+
+  `go test ./...` must pass. Do NOT modify any _test.go file.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f internal/service/hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > internal/service/hidden_calib_test.go <<'EOF'
+      package service
+
+      import (
+          "context"
+          "errors"
+          "testing"
+
+          "evalcase/internal/cache"
+          "evalcase/internal/store"
+          "evalcase/internal/tenant"
+      )
+
+      // User ids are per-tenant, not global. A cache keyed on the user id
+      // alone hands one customer another customer's data.
+      func TestHiddenTenantsDoNotSeeEachOther(t *testing.T) {
+          st := store.New()
+          st.Seed("acme", store.Profile{UserID: "u-1", Email: "alice@acme.test"})
+          st.Seed("globex", store.Profile{UserID: "u-1", Email: "bob@globex.test"})
+          svc := New(st, cache.New())
+
+          acme := tenant.With(context.Background(), "acme")
+          globex := tenant.With(context.Background(), "globex")
+
+          a, err := svc.Lookup(acme, "u-1")
+          if err != nil {
+              t.Fatalf("acme lookup: %v", err)
+          }
+          if a.Email != "alice@acme.test" {
+              t.Fatalf("acme got %q, want alice@acme.test", a.Email)
+          }
+
+          b, err := svc.Lookup(globex, "u-1")
+          if err != nil {
+              t.Fatalf("globex lookup: %v", err)
+          }
+          if b.Email != "bob@globex.test" {
+              t.Fatalf("globex got %q, want bob@globex.test — one tenant was served another tenant's profile", b.Email)
+          }
+      }
+
+      // The leak also runs the other way: a tenant with no such user must not
+      // inherit a cached hit from a tenant that does.
+      func TestHiddenAbsentProfileIsNotSatisfiedFromAnotherTenant(t *testing.T) {
+          st := store.New()
+          st.Seed("acme", store.Profile{UserID: "u-9", Email: "alice@acme.test"})
+          svc := New(st, cache.New())
+
+          if _, err := svc.Lookup(tenant.With(context.Background(), "acme"), "u-9"); err != nil {
+              t.Fatalf("acme lookup: %v", err)
+          }
+          _, err := svc.Lookup(tenant.With(context.Background(), "globex"), "u-9")
+          if !errors.Is(err, store.ErrNotFound) {
+              t.Fatalf("globex err = %v, want ErrNotFound — globex has no u-9", err)
+          }
+      }
+
+      // Caching must still work per tenant, or the change achieved nothing.
+      func TestHiddenCacheStillWorksPerTenant(t *testing.T) {
+          st := store.New()
+          st.Seed("acme", store.Profile{UserID: "u-1", Email: "alice@acme.test"})
+          st.Seed("globex", store.Profile{UserID: "u-1", Email: "bob@globex.test"})
+          svc := New(st, cache.New())
+
+          acme := tenant.With(context.Background(), "acme")
+          globex := tenant.With(context.Background(), "globex")
+          for i := 0; i < 4; i++ {
+              if _, err := svc.Lookup(acme, "u-1"); err != nil {
+                  t.Fatalf("acme lookup: %v", err)
+              }
+              if _, err := svc.Lookup(globex, "u-1"); err != nil {
+                  t.Fatalf("globex lookup: %v", err)
+              }
+          }
+          if got := st.Reads(); got != 2 {
+              t.Fatalf("database reads = %d, want 2 (one per tenant)", got)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

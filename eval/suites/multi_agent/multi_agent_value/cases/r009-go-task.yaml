@@ -1,0 +1,9 @@
+id: R009
+name: go-task
+source: real_usage_batch_01
+repository: go-task/task
+kind: concurrency
+pressure: independent_review
+spawn_expectation: required_reviewer
+control_plane_rel: batch-01/R009
+note: Pointer only. Task statement and hidden verifier stay in the dogfood-control repo. Not an EvaluationCase.

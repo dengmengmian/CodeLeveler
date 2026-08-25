@@ -309,17 +309,45 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             done,
             ok,
             detail,
+            profile_id,
+            profile_role: _,
+            capabilities,
+            contribution,
         } => {
+            let started = state.elapsed_secs;
+            state.team.apply_update(
+                id.clone(),
+                nickname.clone(),
+                role.clone(),
+                done,
+                ok,
+                detail.clone(),
+                profile_id,
+                capabilities,
+                contribution.clone(),
+                started,
+            );
             if done {
+                // The projection is the source of truth now, not a count
+                // scraped out of the parent-facing summary.
+                let projected = state
+                    .team
+                    .children
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.contribution.clone())
+                    .unwrap_or(crate::multi_agent::Contribution::NotMeasured);
                 state
                     .transcript
-                    .complete_sub_agent(&id, &nickname, ok, detail);
+                    .complete_sub_agent_with_contribution(&id, &nickname, ok, detail, projected);
             } else {
-                let started = state.elapsed_secs;
                 state
                     .transcript
                     .push_sub_agent_started(id, nickname, role, detail, started);
             }
+        }
+        RuntimeEvent::ChildContributionLoaded { detail, .. } => {
+            state.team.apply_detail(detail);
         }
         RuntimeEvent::SubAgentProgress {
             id,

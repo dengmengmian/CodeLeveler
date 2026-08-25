@@ -1,0 +1,163 @@
+id: go-safepath-escape
+name: Confine a user-supplied path to a base directory
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  safepath.go: |
+    package safepath
+
+    import "errors"
+
+    // ErrEscape is returned when userPath does not stay inside base.
+    var ErrEscape = errors.New("path escapes base directory")
+
+    // Resolve interprets userPath as relative to base and returns the cleaned
+    // absolute path.
+    //
+    // Contract:
+    //   - the result must be base itself or a path underneath it
+    //   - anything that would land outside base returns ErrEscape
+    //   - an absolute userPath returns ErrEscape; userPath is always relative
+    //   - base is cleaned and made absolute before use
+    //   - "" and "." resolve to base
+    //
+    // This guards a file server: userPath arrives from an HTTP request.
+    func Resolve(base, userPath string) (string, error) {
+        panic("not implemented")
+    }
+  safepath_test.go: |
+    package safepath
+
+    import (
+        "errors"
+        "path/filepath"
+        "testing"
+    )
+
+    func TestAllowsPathsInsideBase(t *testing.T) {
+        base := t.TempDir()
+        got, err := Resolve(base, "sub/file.txt")
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        want := filepath.Join(base, "sub", "file.txt")
+        if got != want {
+            t.Fatalf("got %q, want %q", got, want)
+        }
+    }
+
+    func TestRejectsSimpleTraversal(t *testing.T) {
+        base := t.TempDir()
+        if _, err := Resolve(base, "../etc/passwd"); !errors.Is(err, ErrEscape) {
+            t.Fatalf("err = %v, want ErrEscape", err)
+        }
+    }
+
+    func TestDotResolvesToBase(t *testing.T) {
+        base := t.TempDir()
+        got, err := Resolve(base, ".")
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if got != filepath.Clean(base) {
+            t.Fatalf("got %q, want %q", got, filepath.Clean(base))
+        }
+    }
+
+    func TestInteriorDotDotIsFine(t *testing.T) {
+        base := t.TempDir()
+        got, err := Resolve(base, "a/../b.txt")
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if got != filepath.Join(base, "b.txt") {
+            t.Fatalf("got %q, want %q", got, filepath.Join(base, "b.txt"))
+        }
+    }
+task: |
+  Implement Resolve in safepath.go according to the contract in its doc comment.
+
+  `go test ./...` must pass. Do NOT modify safepath_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package safepath
+
+      import (
+          "errors"
+          "os"
+          "path/filepath"
+          "strings"
+          "testing"
+      )
+
+      // The classic prefix bug: a sibling directory whose name starts with the
+      // base name passes a bare strings.HasPrefix check.
+      func TestHiddenSiblingPrefixIsNotInsideBase(t *testing.T) {
+          root := t.TempDir()
+          base := filepath.Join(root, "data")
+          sibling := filepath.Join(root, "data-evil")
+          if err := os.MkdirAll(base, 0o755); err != nil {
+              t.Fatal(err)
+          }
+          if err := os.MkdirAll(sibling, 0o755); err != nil {
+              t.Fatal(err)
+          }
+          got, err := Resolve(base, "../data-evil/secret.txt")
+          if !errors.Is(err, ErrEscape) {
+              t.Fatalf("Resolve returned %q, err=%v; want ErrEscape — %q is a sibling of base, not inside it", got, err, sibling)
+          }
+      }
+
+      func TestHiddenAbsolutePathIsRejected(t *testing.T) {
+          base := t.TempDir()
+          if got, err := Resolve(base, "/etc/passwd"); !errors.Is(err, ErrEscape) {
+              t.Fatalf("Resolve(%q) = %q, err=%v; want ErrEscape for an absolute userPath", "/etc/passwd", got, err)
+          }
+      }
+
+      func TestHiddenDeepEscapeIsRejected(t *testing.T) {
+          base := t.TempDir()
+          for _, p := range []string{
+              "a/b/../../../outside.txt",
+              "./../outside.txt",
+              "a/../../outside.txt",
+          } {
+              if got, err := Resolve(base, p); !errors.Is(err, ErrEscape) {
+                  t.Fatalf("Resolve(%q) = %q, err=%v; want ErrEscape", p, got, err)
+              }
+          }
+      }
+
+      func TestHiddenEmptyResolvesToBase(t *testing.T) {
+          base := t.TempDir()
+          got, err := Resolve(base, "")
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if got != filepath.Clean(base) {
+              t.Fatalf("got %q, want %q", got, filepath.Clean(base))
+          }
+      }
+
+      func TestHiddenResultStaysUnderBase(t *testing.T) {
+          base := t.TempDir()
+          got, err := Resolve(base, "x/y/z.txt")
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if !strings.HasPrefix(got, filepath.Clean(base)+string(filepath.Separator)) {
+              t.Fatalf("got %q, which is not under %q", got, base)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

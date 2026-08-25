@@ -681,6 +681,10 @@ impl TurnRunner<'_> {
                 token: self.token.clone(),
             }));
         let id = format!("reviewer-{}", leveler_core::RequestId::generate());
+        let (profile_id, profile_role, capabilities) =
+            leveler_agent::child_profile_trace("reviewer");
+        let (profile_id_trace, profile_role_trace, capabilities_trace) =
+            (profile_id.clone(), profile_role.clone(), capabilities.clone());
         self.log
             .append(
                 None,
@@ -689,6 +693,9 @@ impl TurnRunner<'_> {
                     nickname: "reviewer".to_string(),
                     role: "reviewer".to_string(),
                     task: brief.clone(),
+                    profile_id: Some(profile_id),
+                    profile_role: Some(profile_role),
+                    capabilities,
                 },
                 observer,
             )
@@ -702,6 +709,11 @@ impl TurnRunner<'_> {
         // Unified findings: adopt first so the finish summary can name the
         // parent-side ids the TUI projects as a finding count.
         let mut summary = result.result.for_parent("reviewer");
+        // Held across the finish event: the projection below is computed from
+        // the same ledger the findings were adopted into. Scoping it to the
+        // adoption branch is what left `contribution: None` on every reviewer
+        // that ran — the data was there, one block too deep.
+        let mut adopted_ledger: Option<leveler_lifecycle::EvidenceLedger> = None;
         if !result.findings.is_empty() {
             let mut ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
                 .await?
@@ -728,10 +740,13 @@ impl TurnRunner<'_> {
             self.log
                 .append(
                     None,
-                    EngineEvent::EvidenceLedgerUpdated { ledger },
+                    EngineEvent::EvidenceLedgerUpdated {
+                        ledger: ledger.clone(),
+                    },
                     observer,
                 )
                 .await?;
+            adopted_ledger = Some(ledger);
         }
         self.log
             .append(
@@ -741,11 +756,28 @@ impl TurnRunner<'_> {
                     nickname: "reviewer".to_string(),
                     ok: result.ok,
                     summary: leveler_core::truncate_head_bytes(summary.trim(), 4000, "…"),
-                    // The review stage runs outside the executor's ledger, so
-                    // no projection is available here. `None` says "not
-                    // measured", which is the truth; a zeroed projection would
-                    // read as "contributed nothing".
-                    contribution: None,
+                    // A reviewer that ran always reports a projection. Zero
+                    // findings is a measured zero — a real fact about this
+                    // review — and only an absent projection means "not
+                    // measured". MA-VALUE-REVIEWER-PILOT could not tell those
+                    // apart and reported five zero-finding reviewers that had
+                    // every one of them reported.
+                    contribution: Some(
+                        leveler_lifecycle::ChildResultProjection::from_findings(
+                            &id,
+                            "reviewer",
+                            adopted_ledger
+                                .as_ref()
+                                .map(|l| l.findings.as_slice())
+                                .unwrap_or(&[]),
+                        )
+                        .with_profile(profile_id_trace, profile_role_trace, capabilities_trace)
+                        .with_source(
+                            leveler_lifecycle::ContributionSource::IndependentReviewer {
+                                review_id: id.clone(),
+                            },
+                        ),
+                    ),
                 },
                 observer,
             )

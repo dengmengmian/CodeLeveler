@@ -9,7 +9,7 @@ eval/
   runner/      unified runner
   metrics/     metric contract (code in lib/)
   reports/     generated per experiment
-  suites/      pointers: adoption / capability / safety
+  suites/      pointers: adoption / capability / safety / multi_agent
   lib/         EventLog parser, stats, schema
   micro/       adoption task YAML (kept in place for compatibility)
   tests/
@@ -24,6 +24,14 @@ python3 -m unittest discover -s eval/tests -v
 
 # M-3 baseline (task shape, product default)
 leveler eval run --suite adoption --experiment m3-baseline
+
+# Multi-agent value (R005–R010, isolated home, no runtime change)
+leveler eval run --suite multi_agent --experiment MA-VALUE-001 --mode single
+leveler eval run --suite multi_agent --experiment MA-VALUE-001 --mode multi
+
+# Independent Reviewer vs self-verify (pilot, isolated home)
+leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT --mode self
+leveler eval run --suite multi_agent --experiment MA-VALUE-REVIEWER-PILOT --mode reviewer
 
 # Overrides
 leveler eval run \

@@ -9,6 +9,7 @@
 mod active_turns;
 mod checkpoints;
 pub mod doctor;
+pub mod contribution_query;
 mod event_bridge;
 pub mod global_config;
 mod interactive;
@@ -96,6 +97,8 @@ pub struct LoadedConfig {
     pub agents_delegation: bool,
     /// Multi-agent experiment: delegation offer timing (default shipped).
     pub agents_offer_timing: leveler_project::OfferTiming,
+    /// When the harness launches an independent reviewer (default Auto).
+    pub agents_independent_review: leveler_project::IndependentReview,
 }
 
 impl Default for LoadedConfig {
@@ -109,7 +112,21 @@ impl Default for LoadedConfig {
             mcp_servers: Vec::new(),
             agents_delegation: true,
             agents_offer_timing: leveler_project::OfferTiming::default(),
+            agents_independent_review: leveler_project::IndependentReview::default(),
         }
+    }
+}
+
+fn combine_independent_review(
+    global: leveler_project::IndependentReview,
+    project: leveler_project::IndependentReview,
+) -> leveler_engine::IndependentReviewPolicy {
+    use leveler_engine::IndependentReviewPolicy as P;
+    use leveler_project::IndependentReview as I;
+    match (global, project) {
+        (I::Off, _) | (_, I::Off) => P::Off,
+        (I::Always, _) | (_, I::Always) => P::Always,
+        _ => P::Auto,
     }
 }
 
@@ -201,6 +218,7 @@ impl Application {
             mcp_servers: global.mcp_servers,
             agents_delegation: global.agents_delegation,
             agents_offer_timing: global.agents_offer_timing,
+            agents_independent_review: global.agents_independent_review,
         })
     }
 
@@ -550,6 +568,10 @@ impl Application {
                 // Project config wins over global when set; both default true.
                 allow_delegation: self.project_config().agents.delegation
                     && self.config.agents_delegation,
+                independent_review: combine_independent_review(
+                    self.config.agents_independent_review,
+                    self.project_config().agents.independent_review,
+                ),
             },
             approver,
             clarifier,

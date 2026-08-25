@@ -1,0 +1,4 @@
+# Treatment arm overlay. Isolated LEVELER_HOME only.
+# Product default is on. Do not write agents.delegation — a copied-in
+# disable is stripped so this arm is not contaminated by user config.
+mode: multi_agent

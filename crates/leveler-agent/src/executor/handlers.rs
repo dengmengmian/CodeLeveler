@@ -216,7 +216,7 @@ impl Executor {
         // then returns what it has (INCOMPLETE_PARTIAL keeps its findings)
         // instead of burning the parent's budget.
         let reviewer_rounds = crate::sub_agent::ChildProfile::resolve(AgentRole::Reviewer)
-            .max_rounds
+            .max_rounds()
             .unwrap_or(0);
         let result = self
             .run_one_sub_agent_on(

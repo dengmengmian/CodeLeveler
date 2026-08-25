@@ -1,0 +1,5 @@
+# Control arm overlay. Written into isolated LEVELER_HOME only.
+# Uses the shipped agents.delegation key. Does not change product default.
+mode: single_agent
+agents:
+  delegation: false

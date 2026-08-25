@@ -11,6 +11,7 @@
 
 mod authorization;
 mod budget;
+mod child_profile;
 mod compaction;
 pub mod context_budget;
 mod executor;
@@ -25,6 +26,7 @@ pub use budget::{
     BudgetDimension, BudgetExhaustion, MAX_BUDGET_EXTENSIONS, budget_extension_allowed,
     grant_budget_extension, stop_detail_indicates_no_progress,
 };
+pub use child_profile::child_profile_trace;
 pub use compaction::{
     COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages, estimate_tokens,
     summarize_with_model,

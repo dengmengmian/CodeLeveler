@@ -33,6 +33,22 @@ export type CheckpointId = string;
 /** The state of one verification check. */
 export type CheckState = 'running' | 'passed' | 'failed' | 'skipped';
 
+/** What one child contributed, as counts plus its capability contract. A flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse. Counts are about the PARENT's judgement, not the child's output volume. `findings_total` is not a success metric; `findings_accepted` and `findings_verified` are what say the work mattered. */
+export interface ChildContribution {
+  capabilities?: string[];
+  findings_accepted: number;
+  findings_acknowledged: number;
+  findings_open_blocking: number;
+  findings_rejected: number;
+  findings_total: number;
+  findings_verified: number;
+  profile_id?: string | null;
+  profile_role?: string | null;
+  role: string;
+  /** Which mechanism produced it: `executor_child`, `independent_reviewer` or `self_reported`. `None` on events written before it was stamped. */
+  source?: string | null;
+}
+
 /** Identifies a pending clarification (ask-user) request. */
 export type ClarificationId = string;
 
@@ -110,6 +126,18 @@ export interface UiCheckpoint {
   ordinal: number;
 }
 
+/** Everything the inspector shows for one child. */
+export interface UiChildContribution {
+  capabilities?: string[];
+  child_id: string;
+  /** Findings this child produced, in ledger order. */
+  findings?: UiFinding[];
+  /** Whether a ledger snapshot was found at all. `false` means the question could not be answered — no ledger, or the child predates finding adoption. It does NOT mean the child found nothing, and the inspector must not render it that way. */
+  measured: boolean;
+  profile_id?: string | null;
+  role: string;
+}
+
 /** A mid-task clarification the agent needs answered (spec §35). */
 export interface UiClarificationRequest {
   id: ClarificationId;
@@ -149,6 +177,23 @@ export interface UiEventRelation {
   kind: string;
   label: string;
   sequence: number;
+}
+
+/** One finding, as the inspector shows it. A projection of `leveler_lifecycle::FindingRecord`, not the record itself: this crate is the stable wire, and the ledger must stay free to change. */
+export interface UiFinding {
+  /** Still gates a verified closure. */
+  blocking: boolean;
+  file?: string | null;
+  /** Parent-ledger id (`f-1`). Stable enough for a user to refer to. */
+  id: string;
+  /** `relevant_file`, `risk`, `correctness`, … */
+  kind: string;
+  /** Why the parent declined it. Present only on a rejection, where it is required — a rejection without a reason is not a judgement. */
+  resolution_reason?: string | null;
+  /** `created` | `acknowledged` | `accepted` | `rejected` | `addressed` | `verified`. */
+  state: string;
+  summary: string;
+  symbol?: string | null;
 }
 
 /** Compact durable-memory row for TUI list surfaces. */
@@ -433,6 +478,8 @@ export type ClientCommand =
   | { type: 'btw'; question: string; session_id: SessionId }
   /** Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`]. */
   | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id?: CommandId | null; session_id: SessionId }
+  /** Load one child's findings for the Contribution Inspector. A query, not a subscription: findings live in the ledger, and pushing them through the event stream would duplicate the record and re-grow the payloads the event pipeline was trimmed of. The client asks when the user opens a detail view. */
+  | { type: 'query_child_contribution'; child_id: string; query_id?: CommandId | null; session_id: SessionId }
   /** The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command. */
   | { type: 'quit' };
 
@@ -519,11 +566,13 @@ export type RuntimeEvent =
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
-  | { type: 'sub_agent_updated'; detail: string; done: boolean; id: string; nickname: string; ok: boolean; role: string }
+  | { type: 'sub_agent_updated'; capabilities?: string[]; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; nickname: string; ok: boolean; profile_id?: string | null; profile_role?: string | null; role: string }
   /** Live execution state and cumulative model usage for one spawned agent. */
   | { type: 'sub_agent_progress'; active: boolean; cached_input_tokens: number; id: string; input_tokens: number; output_tokens: number }
   /** Live tool/step for one spawned sub-agent (attributed by `id`). Transient; older clients ignore unknown types via [`parse_runtime_event`]. */
   | { type: 'sub_agent_activity'; id: string; is_error: boolean; phase: string; preview: string; tool: string }
+  /** Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only: a snapshot of the ledger, never a mutation. */
+  | { type: 'child_contribution_loaded'; detail: UiChildContribution; query_id?: CommandId | null }
   /** A transient notification for the status line. */
   | { type: 'notification'; level: NotificationLevel; message: string }
   /** A background process task was started (`run_command` background=true). */

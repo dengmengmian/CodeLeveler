@@ -1,0 +1,7 @@
+id: icg-2-bug-fix
+name: last CSV label vanishes
+source: evals
+evals_path: evals/icg/icg-2-bug-fix.yaml
+kind: bug_fix
+pressure: hidden_defect
+note: Pointer only. Task and independent expect live in evals/icg. Not an observer-invented prompt.

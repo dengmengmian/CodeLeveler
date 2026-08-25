@@ -37,8 +37,8 @@ pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::{EventLog, SnapshotView};
 pub use policy_resolver::{
-    CompactionPolicy, ContextPolicy, ExecutionOverrides, ExecutionRole, ResolvedExecutionPolicy,
-    RetentionPolicy, resolve_execution_policy, resolve_tool_limits,
+    CompactionPolicy, ContextPolicy, ExecutionOverrides, ExecutionRole, IndependentReviewPolicy,
+    ResolvedExecutionPolicy, RetentionPolicy, resolve_execution_policy, resolve_tool_limits,
 };
 pub use reaper::{ReapConflict, ReapOutcome, reap_after_restart, reap_running_turns_owned};
 pub use session_context::{RawTranscript, SessionContext};

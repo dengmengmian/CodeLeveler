@@ -63,6 +63,12 @@ pub struct AgentsConfig {
     /// wording, schema, ownership or settlement rule.
     #[serde(default)]
     pub offer_timing: OfferTiming,
+    /// When the harness launches an independent reviewer after a mutation.
+    /// `auto` (default) is the shipped shape trigger; `always` launches after
+    /// any product mutation; `off` never launches. Isolated eval homes write
+    /// this key; product default stays `auto`.
+    #[serde(default)]
+    pub independent_review: IndependentReview,
 }
 
 impl Default for AgentsConfig {
@@ -70,6 +76,7 @@ impl Default for AgentsConfig {
         Self {
             delegation: true,
             offer_timing: OfferTiming::default(),
+            independent_review: IndependentReview::default(),
         }
     }
 }
@@ -83,6 +90,19 @@ pub enum OfferTiming {
     PlanRegistration,
     /// Hold the offer until a file-mutating tool has applied an edit.
     AfterFirstEdit,
+}
+
+/// When the harness launches an independent reviewer (see [`AgentsConfig`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentReview {
+    /// Shape-triggered (security / concurrency / wide diff). Shipped default.
+    #[default]
+    Auto,
+    /// After any product mutation. Reviewer Value Eval treatment arm.
+    Always,
+    /// Never. Reviewer Value Eval control arm.
+    Off,
 }
 
 fn default_true() -> bool {
@@ -200,6 +220,18 @@ ignore:
     fn agents_delegation_can_be_disabled() {
         let cfg: ProjectConfig = serde_yaml::from_str("agents:\n  delegation: false\n").unwrap();
         assert!(!cfg.agents.delegation);
+    }
+
+    #[test]
+    fn independent_review_defaults_to_auto() {
+        let cfg: ProjectConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg.agents.independent_review, IndependentReview::Auto);
+        let off: ProjectConfig =
+            serde_yaml::from_str("agents:\n  independent_review: off\n").unwrap();
+        assert_eq!(off.agents.independent_review, IndependentReview::Off);
+        let always: ProjectConfig =
+            serde_yaml::from_str("agents:\n  independent_review: always\n").unwrap();
+        assert_eq!(always.agents.independent_review, IndependentReview::Always);
     }
 
     #[test]

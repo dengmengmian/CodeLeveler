@@ -312,15 +312,27 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             nickname,
             role,
             task,
+            profile_id,
+            capabilities,
+            ..
         } => (
             ObservationClass::Agent,
             format!("{nickname} started"),
             role.clone(),
             "running".into(),
-            vec![
-                ("Id".into(), id.clone()),
-                ("Task".into(), truncate(task, 64)),
-            ],
+            {
+                let mut fields = vec![
+                    ("Id".into(), id.clone()),
+                    ("Task".into(), truncate(task, 64)),
+                ];
+                if let Some(pid) = profile_id {
+                    fields.push(("Profile".into(), pid.clone()));
+                }
+                if !capabilities.is_empty() {
+                    fields.push(("Capabilities".into(), capabilities.join(", ")));
+                }
+                fields
+            },
         ),
         EngineEvent::SubAgentFinished {
             id,
@@ -342,6 +354,12 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
                 // the ledger by hand. Absent for children that never reported
                 // and for events written before contribution tracing.
                 if let Some(c) = contribution {
+                    if let Some(pid) = &c.profile_id {
+                        fields.push(("Profile".into(), pid.clone()));
+                    }
+                    if !c.capabilities.is_empty() {
+                        fields.push(("Capabilities".into(), c.capabilities.join(", ")));
+                    }
                     fields.push((
                         "Findings".into(),
                         format!(
@@ -568,6 +586,7 @@ fn collect_agents(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiAgentObservat
                 nickname,
                 role,
                 task,
+                ..
             } => {
                 if !by_id.contains_key(id) {
                     order.push(id.clone());
@@ -845,6 +864,9 @@ mod tests {
                 nickname: "Reviewer".into(),
                 role: "reviewer".into(),
                 task: "review patch".into(),
+                profile_id: Some("reviewer".into()),
+                profile_role: Some("reviewer".into()),
+                capabilities: vec!["code_review".into(), "verification".into()],
             },
         )
         .await;
@@ -865,6 +887,7 @@ mod tests {
                     findings_verified: 1,
                     findings_rejected: 1,
                     findings_open_blocking: 0,
+                    ..Default::default()
                 }),
             },
         )
@@ -1104,6 +1127,9 @@ mod tests {
             nickname: nickname.into(),
             role: role.into(),
             task: task.into(),
+            profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
         }
     }
 

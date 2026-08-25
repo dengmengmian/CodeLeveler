@@ -12,6 +12,7 @@
 //! [`render`]: render::render
 #![forbid(unsafe_code)]
 
+pub mod multi_agent;
 pub mod action;
 mod activity_stream;
 mod brand;

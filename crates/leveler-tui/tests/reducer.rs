@@ -1887,7 +1887,11 @@ fn turn_end_finalizes_in_flight_blocks() {
             done: false,
             ok: false,
             detail: "investigating".into(),
-        }),
+                    profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            contribution: None,
+}),
     );
 
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCancelled));
@@ -1990,7 +1994,11 @@ fn repeated_running_sub_agent_updates_in_place_not_duplicated() {
             done: false,
             ok: false,
             detail: detail.into(),
-        })
+                    profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            contribution: None,
+})
     };
     reduce(&mut s, running("step 1"));
     reduce(&mut s, running("step 2")); // progress refresh, same id
@@ -2014,7 +2022,11 @@ fn sub_agent_finish_before_start_still_renders() {
             done: true,
             ok: true,
             detail: "already done".into(),
-        }),
+                    profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            contribution: None,
+}),
     );
     let blocks = sub_agents(&s);
     assert_eq!(
@@ -2038,7 +2050,11 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             done: false,
             ok: false,
             detail: "investigate module A".into(),
-        }),
+                    profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            contribution: None,
+}),
     );
     let running = sub_agents(&s);
     assert_eq!(running.len(), 1);
@@ -2056,7 +2072,11 @@ fn sub_agent_block_updates_in_place_from_running_to_done() {
             done: true,
             ok: true,
             detail: "found 12 crates".into(),
-        }),
+                    profile_id: None,
+            profile_role: None,
+            capabilities: Vec::new(),
+            contribution: None,
+}),
     );
     let done = sub_agents(&s);
     assert_eq!(

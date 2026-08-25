@@ -96,6 +96,9 @@ pub struct AppState {
     pub runtime_connected: bool,
     pub session_id: SessionId,
     pub transcript: TranscriptState,
+    /// Multi-agent view model: what each child is for and what the parent did
+    /// with what it produced. Built from events, never from prose.
+    pub team: crate::multi_agent::TaskTeamView,
     pub composer: Composer,
     pub theme: Theme,
     /// Terminal size (cols, rows).
@@ -278,6 +281,7 @@ impl AppState {
             runtime_connected: true,
             session_id: boot.session_id.clone(),
             transcript: TranscriptState::new(),
+            team: crate::multi_agent::TaskTeamView::default(),
             composer: Composer::new(),
             theme,
             size: (80, 24),

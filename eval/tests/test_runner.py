@@ -52,6 +52,49 @@ class RunnerTests(unittest.TestCase):
             text = (home / "config.toml").read_text(encoding="utf-8")
             self.assertNotIn("offer_timing", text)
 
+    def test_single_arm_disables_delegation_only_in_isolated_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            user = Path(tmp) / "user.toml"
+            user.write_text('default_model = "m"\n[agents]\ndelegation = true\n', encoding="utf-8")
+            home = Path(tmp) / "home"
+            prepare_home(home, "single", user)
+            text = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn("delegation = false", text)
+            self.assertNotIn("delegation = false", user.read_text(encoding="utf-8"))
+            self.assertIn("delegation = true", user.read_text(encoding="utf-8"))
+
+    def test_self_arm_disables_independent_review_only_in_isolated_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            user = Path(tmp) / "user.toml"
+            user.write_text('default_model = "m"\n', encoding="utf-8")
+            home = Path(tmp) / "home"
+            prepare_home(home, "self", user)
+            text = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('independent_review = "off"', text)
+            self.assertNotIn("independent_review", user.read_text(encoding="utf-8"))
+
+    def test_reviewer_arm_writes_always_only_in_isolated_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            user = Path(tmp) / "user.toml"
+            user.write_text('default_model = "m"\n[agents]\nindependent_review = "off"\n', encoding="utf-8")
+            home = Path(tmp) / "home"
+            prepare_home(home, "reviewer", user)
+            text = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('independent_review = "always"', text)
+            self.assertNotIn("always", user.read_text(encoding="utf-8"))
+            self.assertIn('independent_review = "off"', user.read_text(encoding="utf-8"))
+
+    def test_multi_arm_strips_copied_delegation_disable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            user = Path(tmp) / "user.toml"
+            user.write_text('default_model = "m"\n[agents]\ndelegation = false\n', encoding="utf-8")
+            home = Path(tmp) / "home"
+            prepare_home(home, "multi", user)
+            text = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertNotIn("delegation = false", text)
+            self.assertNotIn("delegation = true", text)
+            self.assertIn("delegation = false", user.read_text(encoding="utf-8"))
+
     def test_score_home_matches_case_id_from_path(self):
         catalog = load_catalog(CATALOG)
         with tempfile.TemporaryDirectory() as tmp:

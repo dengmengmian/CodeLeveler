@@ -195,6 +195,21 @@ pub enum ClientCommand {
         #[serde(default)]
         after: u32,
     },
+    /// Load one child's findings for the Contribution Inspector.
+    ///
+    /// A query, not a subscription: findings live in the ledger, and pushing
+    /// them through the event stream would duplicate the record and re-grow
+    /// the payloads the event pipeline was trimmed of. The client asks when
+    /// the user opens a detail view.
+    QueryChildContribution {
+        session_id: SessionId,
+        /// Which child. Joins `FindingRecord::source_child`.
+        child_id: String,
+        /// Correlation token for [`crate::RuntimeEvent::ChildContributionLoaded`],
+        /// so a client ignores another client's — or its own stale — response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// The runtime owner is shutting down; all work should stop. Disconnecting
     /// an individual UI client must not issue this command.
     Quit,
@@ -233,6 +248,7 @@ impl ClientCommand {
             | ClientCommand::RunUserShell { session_id, .. }
             | ClientCommand::CancelUserShell { session_id, .. }
             | ClientCommand::Btw { session_id, .. }
+            | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. } => Some(session_id),
             ClientCommand::RequestSessionListFor {
                 requester_session_id,

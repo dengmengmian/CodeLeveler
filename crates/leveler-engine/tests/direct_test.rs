@@ -182,6 +182,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
+            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -1388,6 +1389,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
+            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -1684,6 +1686,82 @@ async fn ordinary_change_launches_no_reviewer() {
         "a narrow, non-security edit must not pay for an independent review"
     );
     assert_eq!(report.outcome, TaskOutcome::Verified);
+}
+
+#[tokio::test]
+async fn independent_review_off_skips_even_security_shaped_changes() {
+    let mut h = harness(vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+    ])
+    .await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Off;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    h.engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !seen.iter().any(|event| matches!(
+            event,
+            EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"
+        )),
+        "independent_review=off must not launch a reviewer, even on auth.rs"
+    );
+    assert!(seen.iter().any(|event| matches!(
+        event,
+        EngineEvent::ReviewStage { action, .. } if action == "not_required"
+    )));
+}
+
+#[tokio::test]
+async fn independent_review_always_launches_on_an_ordinary_change() {
+    let mut responses = patch_then_resolve();
+    responses.push(text("ordinary change: no blocking defect"));
+    responses.push(text("ordinary change: no blocking defect"));
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_engine::IndependentReviewPolicy::Always;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    h.engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let reviewers: Vec<_> = seen
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::SubAgentStarted { id, role, .. } if role == "reviewer" => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reviewers.len(),
+        1,
+        "always must launch a reviewer after any product mutation"
+    );
 }
 
 /// A harness-launched reviewer judges the change; it must not become a second
@@ -2043,6 +2121,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             grants_state_dir: None,
             steering: None,
             allow_delegation: true,
+            independent_review: leveler_engine::IndependentReviewPolicy::Auto,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -2377,5 +2456,127 @@ async fn persisted_findings_reload_without_duplication() {
     assert_eq!(
         first.findings[0].state,
         leveler_lifecycle::FindingState::Acknowledged
+    );
+}
+
+// ── Phase 1: contribution trace closure on the independent-review path ──
+
+/// The last `SubAgentFinished` contribution projection for one session.
+fn terminal_contribution(
+    seen: &[EngineEvent],
+) -> Option<Option<leveler_lifecycle::ChildResultProjection>> {
+    seen.iter().rev().find_map(|e| match e {
+        EngineEvent::SubAgentFinished { contribution, .. } => Some(contribution.clone()),
+        _ => None,
+    })
+}
+
+/// MA-VALUE-REVIEWER-PILOT found the treatment arm unscorable: the reviewer
+/// adopted findings into the parent ledger, then the terminal event reported
+/// `contribution: null`. Nothing could join "a reviewer ran" to "and this is
+/// what the parent did with what it found".
+#[tokio::test]
+async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
+    let responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+        tool_call(
+            "rf1",
+            "report_finding",
+            serde_json::json!({
+                "kind": "correctness",
+                "summary": "login() accepts any password",
+                "file": "src/auth.rs",
+                "blocking": true
+            }),
+        ),
+        text("reviewed src/auth.rs: one blocking defect reported"),
+        text("reviewed src/auth.rs: one blocking defect reported"),
+    ];
+
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let _ = h
+        .engine
+        .run(&session, &s, &mut |e| seen.push(e), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let contribution = terminal_contribution(&seen)
+        .expect("the reviewer must reach a terminal event")
+        .expect("a reviewer that adopted findings must not report `not measured`");
+    assert_eq!(
+        contribution.findings_total, 1,
+        "the adopted finding must be counted: {contribution:?}"
+    );
+    assert_eq!(
+        contribution.findings_acknowledged, 1,
+        "adoption lands at Acknowledged, so the parent received it"
+    );
+    assert_eq!(contribution.findings_accepted, 0, "nobody judged it yet");
+    assert_eq!(contribution.findings_open_blocking, 1);
+    assert_eq!(contribution.role, "reviewer");
+    assert_eq!(
+        contribution.source,
+        Some(leveler_lifecycle::ContributionSource::IndependentReviewer {
+            review_id: contribution.child_id.clone(),
+        }),
+        "the trace must name which mechanism produced the finding"
+    );
+}
+
+/// A reviewer that reports no structured finding contributed a measured zero.
+/// That is not the same fact as "no projection exists", and the difference is
+/// exactly what made the pilot report claim five zero-finding reviewers that
+/// had in fact all reported.
+#[tokio::test]
+async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
+    let mut responses = vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
+        ),
+    ];
+    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
+    responses.push(text("reviewed src/auth.rs: no blocking defect found"));
+
+    let h = harness(responses).await;
+    let s = spec(&h, gate("ok", "true"));
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen: Vec<EngineEvent> = Vec::new();
+    let _ = h
+        .engine
+        .run(&session, &s, &mut |e| seen.push(e), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let contribution = terminal_contribution(&seen)
+        .expect("the reviewer must reach a terminal event")
+        .expect("a reviewer that ran must report a projection, even an empty one");
+    assert_eq!(contribution.findings_total, 0);
+    assert_eq!(contribution.role, "reviewer");
+    assert!(
+        contribution.profile_id.is_some(),
+        "the capability contract must travel with the trace"
     );
 }

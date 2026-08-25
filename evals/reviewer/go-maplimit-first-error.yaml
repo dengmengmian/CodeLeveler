@@ -1,0 +1,221 @@
+id: go-maplimit-first-error
+name: Bounded parallel map that reports the first failure
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  mapper.go: |
+    package mapper
+
+    import "context"
+
+    // MapLimit applies fn to every item, running at most `limit` calls at once.
+    //
+    // Contract:
+    //   - results are returned in INPUT order, never completion order
+    //   - if any call fails, MapLimit returns the error belonging to the
+    //     LOWEST failing input index, and a nil slice
+    //   - once a failure is known, the context passed to still-running calls
+    //     is cancelled; a call that returns no error after observing that
+    //     cancellation is not itself a failure
+    //   - limit <= 0 means no limit
+    func MapLimit(ctx context.Context, items []int, limit int, fn func(context.Context, int) (string, error)) ([]string, error) {
+        panic("not implemented")
+    }
+  mapper_test.go: |
+    package mapper
+
+    import (
+        "context"
+        "errors"
+        "fmt"
+        "sync"
+        "sync/atomic"
+        "testing"
+        "time"
+    )
+
+    func TestOrderIsInputOrder(t *testing.T) {
+        items := []int{0, 1, 2, 3, 4}
+        got, err := MapLimit(context.Background(), items, 2, func(ctx context.Context, n int) (string, error) {
+            // later items finish sooner
+            time.Sleep(time.Duration(20-n*4) * time.Millisecond)
+            return fmt.Sprintf("v%d", n), nil
+        })
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        want := []string{"v0", "v1", "v2", "v3", "v4"}
+        for i := range want {
+            if got[i] != want[i] {
+                t.Fatalf("index %d = %q, want %q (full: %v)", i, got[i], want[i], got)
+            }
+        }
+    }
+
+    func TestLimitIsRespected(t *testing.T) {
+        var mu sync.Mutex
+        var cur, max int
+        _, err := MapLimit(context.Background(), []int{1, 2, 3, 4, 5, 6}, 2, func(ctx context.Context, n int) (string, error) {
+            mu.Lock()
+            cur++
+            if cur > max {
+                max = cur
+            }
+            mu.Unlock()
+            time.Sleep(10 * time.Millisecond)
+            mu.Lock()
+            cur--
+            mu.Unlock()
+            return "", nil
+        })
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if max > 2 {
+            t.Fatalf("observed %d concurrent calls, limit was 2", max)
+        }
+    }
+
+    func TestSingleFailureIsReturned(t *testing.T) {
+        boom := errors.New("boom")
+        _, err := MapLimit(context.Background(), []int{0, 1, 2}, 3, func(ctx context.Context, n int) (string, error) {
+            if n == 1 {
+                return "", boom
+            }
+            return "ok", nil
+        })
+        if !errors.Is(err, boom) {
+            t.Fatalf("err = %v, want boom", err)
+        }
+    }
+
+    func TestEmptyInput(t *testing.T) {
+        got, err := MapLimit(context.Background(), nil, 2, func(ctx context.Context, n int) (string, error) {
+            return "", nil
+        })
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if len(got) != 0 {
+            t.Fatalf("got %v, want empty", got)
+        }
+    }
+
+    var _ = atomic.AddInt32
+task: |
+  Implement MapLimit in mapper.go according to the contract in its doc comment.
+
+  `go test ./...` must pass. Do NOT modify mapper_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package mapper
+
+      import (
+          "context"
+          "errors"
+          "sync/atomic"
+          "testing"
+          "time"
+      )
+
+      // The lowest failing INPUT index wins, not whichever error arrives first.
+      //
+      // index 3 waits until index 1 is provably inside fn before failing, so
+      // the test does not race the scheduler: both indexes always fail, and
+      // only the selection rule decides the answer.
+      func TestHiddenLowestIndexErrorWins(t *testing.T) {
+          early := errors.New("index-3-early")
+          late := errors.New("index-1-late")
+          started1 := make(chan struct{})
+          _, err := MapLimit(context.Background(), []int{0, 1, 2, 3}, 4, func(ctx context.Context, n int) (string, error) {
+              switch n {
+              case 1:
+                  close(started1)
+                  time.Sleep(80 * time.Millisecond)
+                  return "", late
+              case 3:
+                  select {
+                  case <-started1:
+                  case <-time.After(2 * time.Second):
+                      // index 1 never ran concurrently; limit was not honoured
+                  }
+                  return "", early
+              }
+              select {
+              case <-ctx.Done():
+                  return "cancelled", nil
+              case <-time.After(400 * time.Millisecond):
+                  return "slow", nil
+              }
+          })
+          if !errors.Is(err, late) {
+              t.Fatalf("err = %v, want the index-1 error (lowest failing index)", err)
+          }
+      }
+
+      // A known failure must cancel the context handed to still-running calls.
+      func TestHiddenFailureCancelsSiblings(t *testing.T) {
+          boom := errors.New("boom")
+          var cancelled int32
+          _, err := MapLimit(context.Background(), []int{0, 1, 2, 3, 4, 5}, 6, func(ctx context.Context, n int) (string, error) {
+              if n == 0 {
+                  return "", boom
+              }
+              select {
+              case <-ctx.Done():
+                  atomic.AddInt32(&cancelled, 1)
+                  return "cancelled", nil
+              case <-time.After(400 * time.Millisecond):
+                  return "slow", nil
+              }
+          })
+          if !errors.Is(err, boom) {
+              t.Fatalf("err = %v, want boom", err)
+          }
+          if atomic.LoadInt32(&cancelled) == 0 {
+              t.Fatal("no sibling observed cancellation; the failure did not cancel remaining work")
+          }
+      }
+
+      // Errors return a nil slice, not a partially filled one.
+      func TestHiddenErrorReturnsNilSlice(t *testing.T) {
+          boom := errors.New("boom")
+          got, err := MapLimit(context.Background(), []int{0, 1}, 2, func(ctx context.Context, n int) (string, error) {
+              if n == 1 {
+                  return "", boom
+              }
+              return "ok", nil
+          })
+          if err == nil {
+              t.Fatal("expected an error")
+          }
+          if got != nil {
+              t.Fatalf("results = %v, want nil on error", got)
+          }
+      }
+
+      // limit <= 0 means unlimited, and order still holds.
+      func TestHiddenUnlimited(t *testing.T) {
+          got, err := MapLimit(context.Background(), []int{0, 1, 2}, 0, func(ctx context.Context, n int) (string, error) {
+              time.Sleep(time.Duration(30-n*10) * time.Millisecond)
+              return string(rune('a' + n)), nil
+          })
+          if err != nil {
+              t.Fatalf("unexpected error: %v", err)
+          }
+          if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+              t.Fatalf("got %v, want [a b c]", got)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

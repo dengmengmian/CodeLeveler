@@ -1,0 +1,228 @@
+id: go-wal-idempotent-recover
+name: Crash-safe counter store with an idempotent recovery
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  store.go: |
+    package store
+
+    // Store keeps an integer under a write-ahead log so a crash between the
+    // log write and the value write cannot lose or double-apply a delta.
+    //
+    // Layout, both files in dir:
+    //   value   the committed value, decimal text, created on Open if absent
+    //   wal     a pending delta, decimal text; absent means nothing pending
+    //
+    // Apply must be crash-safe at every point:
+    //   1. write the pending delta to wal
+    //   2. write value+delta to value
+    //   3. remove wal
+    //
+    // Recover finishes an interrupted Apply.
+    //
+    // Contract:
+    //   - Open creates dir's files if missing; value starts at 0
+    //   - Apply(delta) leaves no wal behind on success
+    //   - Recover applies a pending wal to value exactly once, then removes it
+    //   - Recover is IDEMPOTENT: running it twice, or running it when nothing
+    //     is pending, must not change the value a second time
+    //   - Recover returns the value after recovery
+    //   - Value reads the committed value without touching the wal
+    //   - a corrupt wal (not a number) is an error, and the value is untouched
+    type Store struct {
+        dir string
+    }
+
+    // Open prepares dir for use.
+    func Open(dir string) (*Store, error) {
+        panic("not implemented")
+    }
+
+    // Value returns the committed value.
+    func (s *Store) Value() (int, error) {
+        panic("not implemented")
+    }
+
+    // Apply commits delta through the write-ahead log.
+    func (s *Store) Apply(delta int) error {
+        panic("not implemented")
+    }
+
+    // Recover finishes an interrupted Apply and returns the resulting value.
+    func (s *Store) Recover() (int, error) {
+        panic("not implemented")
+    }
+  store_test.go: |
+    package store
+
+    import (
+        "os"
+        "path/filepath"
+        "testing"
+    )
+
+    func TestOpenStartsAtZero(t *testing.T) {
+        s, err := Open(t.TempDir())
+        if err != nil {
+            t.Fatalf("Open: %v", err)
+        }
+        v, err := s.Value()
+        if err != nil {
+            t.Fatalf("Value: %v", err)
+        }
+        if v != 0 {
+            t.Fatalf("value = %d, want 0", v)
+        }
+    }
+
+    func TestApplyCommits(t *testing.T) {
+        dir := t.TempDir()
+        s, err := Open(dir)
+        if err != nil {
+            t.Fatalf("Open: %v", err)
+        }
+        if err := s.Apply(5); err != nil {
+            t.Fatalf("Apply: %v", err)
+        }
+        v, _ := s.Value()
+        if v != 5 {
+            t.Fatalf("value = %d, want 5", v)
+        }
+        if _, err := os.Stat(filepath.Join(dir, "wal")); !os.IsNotExist(err) {
+            t.Fatal("a successful Apply must leave no wal behind")
+        }
+    }
+
+    func TestRecoverAppliesPending(t *testing.T) {
+        dir := t.TempDir()
+        s, _ := Open(dir)
+        if err := os.WriteFile(filepath.Join(dir, "wal"), []byte("7"), 0o644); err != nil {
+            t.Fatal(err)
+        }
+        v, err := s.Recover()
+        if err != nil {
+            t.Fatalf("Recover: %v", err)
+        }
+        if v != 7 {
+            t.Fatalf("value = %d, want 7", v)
+        }
+    }
+task: |
+  Implement Open, Value, Apply and Recover in store.go according to the
+  contract in the Store doc comment.
+
+  `go test ./...` must pass. Do NOT modify store_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package store
+
+      import (
+          "os"
+          "path/filepath"
+          "testing"
+      )
+
+      // Recovery that is not idempotent double-applies the moment anything
+      // retries it — a supervisor restart, a second process, a manual rerun.
+      func TestHiddenRecoverTwiceAppliesOnce(t *testing.T) {
+          dir := t.TempDir()
+          s, _ := Open(dir)
+          if err := os.WriteFile(filepath.Join(dir, "wal"), []byte("7"), 0o644); err != nil {
+              t.Fatal(err)
+          }
+          if _, err := s.Recover(); err != nil {
+              t.Fatalf("first Recover: %v", err)
+          }
+          v, err := s.Recover()
+          if err != nil {
+              t.Fatalf("second Recover: %v", err)
+          }
+          if v != 7 {
+              t.Fatalf("value = %d after two Recovers, want 7 — recovery double-applied", v)
+          }
+      }
+
+      // A no-op recovery on a clean store must not disturb anything.
+      func TestHiddenRecoverWithNothingPendingIsANoop(t *testing.T) {
+          dir := t.TempDir()
+          s, _ := Open(dir)
+          if err := s.Apply(4); err != nil {
+              t.Fatalf("Apply: %v", err)
+          }
+          v, err := s.Recover()
+          if err != nil {
+              t.Fatalf("Recover: %v", err)
+          }
+          if v != 4 {
+              t.Fatalf("value = %d, want 4", v)
+          }
+      }
+
+      // The wal must be gone after recovery, or the next start replays it.
+      func TestHiddenRecoverClearsTheLog(t *testing.T) {
+          dir := t.TempDir()
+          s, _ := Open(dir)
+          if err := os.WriteFile(filepath.Join(dir, "wal"), []byte("3"), 0o644); err != nil {
+              t.Fatal(err)
+          }
+          if _, err := s.Recover(); err != nil {
+              t.Fatalf("Recover: %v", err)
+          }
+          if _, err := os.Stat(filepath.Join(dir, "wal")); !os.IsNotExist(err) {
+              t.Fatal("Recover left the wal in place; the next start would replay it")
+          }
+      }
+
+      // Reopening after recovery sees the recovered value, not the old one.
+      func TestHiddenValueSurvivesReopen(t *testing.T) {
+          dir := t.TempDir()
+          s, _ := Open(dir)
+          if err := s.Apply(9); err != nil {
+              t.Fatalf("Apply: %v", err)
+          }
+          s2, err := Open(dir)
+          if err != nil {
+              t.Fatalf("reopen: %v", err)
+          }
+          v, err := s2.Value()
+          if err != nil {
+              t.Fatalf("Value: %v", err)
+          }
+          if v != 9 {
+              t.Fatalf("value = %d after reopen, want 9 — Open overwrote a committed value", v)
+          }
+      }
+
+      // A corrupt log is an error, and it does not corrupt the value with it.
+      func TestHiddenCorruptWalIsAnErrorAndValueSurvives(t *testing.T) {
+          dir := t.TempDir()
+          s, _ := Open(dir)
+          if err := s.Apply(2); err != nil {
+              t.Fatalf("Apply: %v", err)
+          }
+          if err := os.WriteFile(filepath.Join(dir, "wal"), []byte("garbage"), 0o644); err != nil {
+              t.Fatal(err)
+          }
+          if _, err := s.Recover(); err == nil {
+              t.Fatal("a corrupt wal must be an error")
+          }
+          v, err := s.Value()
+          if err != nil {
+              t.Fatalf("Value: %v", err)
+          }
+          if v != 2 {
+              t.Fatalf("value = %d, want 2 — a corrupt wal must not damage the committed value", v)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

@@ -303,9 +303,15 @@ fn render_event_jsonl(event: AgentEvent) {
             nickname,
             role,
             task,
+            profile_id,
+            profile_role,
+            capabilities,
         } => serde_json::json!({
             "type": "sub_agent_started",
             "id": id, "nickname": nickname, "role": role, "task": task,
+            "profile_id": profile_id,
+            "profile_role": profile_role,
+            "capabilities": capabilities,
         }),
         AgentEvent::SubAgentProgress {
             id,

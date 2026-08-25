@@ -126,7 +126,7 @@ impl Executor {
         }
         // Late-bound ownership: a spawned child starts read-capable and
         // claims its own bounded write scope. Read-only roles never claim.
-        if self.depth > 0 && !crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only {
+        if self.depth > 0 && !crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only() {
             tools.push(claim_write_scope_tool_definition());
         }
         // Children report typed findings; the parent judges adopted ones.
@@ -1373,7 +1373,7 @@ impl Executor {
                                 .get("blocking")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false)
-                                && ChildProfile::resolve(self.agent_role).may_report_blocking;
+                                && ChildProfile::resolve(self.agent_role).may_report_blocking();
                             let id = ledger.record_finding(
                                 kind,
                                 summary,
@@ -2581,13 +2581,24 @@ impl Executor {
                             ),
                         )
                     });
+                    let profile_arg = call
+                        .arguments
+                        .get("profile")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
                     let explicit_role = call.arguments.get("role").and_then(|v| v.as_str());
-                    let role = match &named {
-                        Some((_, Some(agent))) if explicit_role.is_none() => {
-                            AgentRole::parse(Some(agent.role.as_str()))
+                    // A named persona supplies the role only when the caller
+                    // did not override it with `profile` or `role`.
+                    let named_role = match &named {
+                        Some((_, Some(agent)))
+                            if explicit_role.is_none() && profile_arg.is_none() =>
+                        {
+                            Some(agent.role.as_str())
                         }
-                        _ => AgentRole::parse(explicit_role),
+                        _ => None,
                     };
+                    let role_hint = explicit_role.or(named_role);
                     let task = match &named {
                         Some((_, Some(agent))) => agent.compose_task(&task),
                         _ => task,
@@ -2618,6 +2629,8 @@ impl Executor {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let admitted_profile =
+                        ChildProfile::admit_spawn(profile_arg, role_hint, &files);
 
                     // Reject (no agent started) for depth, empty task, or cap.
                     let reject = if let Some((requested, None)) = &named {
@@ -2644,12 +2657,14 @@ impl Executor {
                         ))
                     } else if task.is_empty() {
                         Some("spawn_agent requires a non-empty task.".to_string())
-                    } else if let Err(msg) = ChildProfile::admit(role, &files) {
-                        // Capability negotiation: the requested role + scope
-                        // against the role's profile. Honest denial, never a
+                    } else if let Err(msg) = &admitted_profile {
+                        // Capability negotiation: the requested profile/role +
+                        // scope against the contract. Honest denial, never a
                         // silent downgrade.
-                        Some(msg)
-                    } else if role == AgentRole::Worker
+                        Some(msg.clone())
+                    } else if admitted_profile
+                        .as_ref()
+                        .is_ok_and(|p| p.role == AgentRole::Worker)
                         && admitted_worker_scopes
                             .iter()
                             .any(|scope| scopes_overlap(scope, &files))
@@ -2660,7 +2675,9 @@ impl Executor {
                              overlapping work into one worker or re-scope it.",
                             files.join(", ")
                         ))
-                    } else if role == AgentRole::Worker
+                    } else if admitted_profile
+                        .as_ref()
+                        .is_ok_and(|p| p.role == AgentRole::Worker)
                         && !self.ownership.conflicts_for(&files, "").is_empty()
                     {
                         // Legacy pre-scoped Worker: its files are an exclusive
@@ -2703,6 +2720,10 @@ impl Executor {
                         continue;
                     }
 
+                    let Ok(profile) = admitted_profile else {
+                        unreachable!("admission already succeeded");
+                    };
+                    let role = profile.role;
                     if role == AgentRole::Worker {
                         admitted_worker_scopes.push(files.clone());
                         delegation_decision.note_worker_admitted(&files);
@@ -2741,11 +2762,15 @@ impl Executor {
                     } else {
                         task.clone()
                     };
+                    let (profile_id, profile_role, capabilities) = profile.trace_fields();
                     observer(AgentEvent::SubAgentStarted {
                         id: id.clone(),
                         nickname: nickname.clone(),
                         role: role.label().to_string(),
                         task: started_task,
+                        profile_id: Some(profile_id),
+                        profile_role: Some(profile_role),
+                        capabilities,
                     });
                     accepted.push((
                         index,
@@ -3606,8 +3631,14 @@ fn fold_child_settlement(
     // and the ledger its findings were adopted into — and computed at
     // settlement rather than read later, so a replay of the terminal event
     // alone can answer "did the parent act on what this child found".
+    let profile = ChildProfile::resolve(role);
+    let (profile_id, profile_role, capabilities) = profile.trace_fields();
     let contribution =
-        leveler_lifecycle::ChildResultProjection::from_findings(id, role.label(), &ledger.findings);
+        leveler_lifecycle::ChildResultProjection::from_findings(id, role.label(), &ledger.findings)
+            .with_profile(profile_id, profile_role, capabilities)
+            .with_source(leveler_lifecycle::ContributionSource::ExecutorChild {
+                child_id: id.to_string(),
+            });
     observer(AgentEvent::SubAgentFinished {
         id: id.to_string(),
         nickname: nickname.to_string(),

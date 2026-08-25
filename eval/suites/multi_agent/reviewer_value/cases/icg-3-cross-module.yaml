@@ -1,0 +1,7 @@
+id: icg-3-cross-module
+name: unit field through the pipeline
+source: evals
+evals_path: evals/icg/icg-3-cross-module.yaml
+kind: api_change
+pressure: cross_module
+note: Pointer only. Task and independent expect live in evals/icg. Not an observer-invented prompt.

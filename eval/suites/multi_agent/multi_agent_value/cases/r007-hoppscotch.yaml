@@ -1,0 +1,9 @@
+id: R007
+name: hoppscotch
+source: real_usage_batch_01
+repository: hoppscotch/hoppscotch
+kind: typescript_monorepo
+pressure: impact_exploration
+spawn_expectation: useful_explorers
+control_plane_rel: batch-01/R007
+note: Pointer only. Task statement and hidden verifier stay in the dogfood-control repo. Not an EvaluationCase.

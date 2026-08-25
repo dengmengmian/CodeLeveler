@@ -49,6 +49,31 @@ must never enter P_natural.
 Still `evals/` + `leveler eval run --cases …`. Framework config
 `eval/configs/capability/smoke.yaml` only points at that harness.
 
+## Multi-agent value
+
+Separate suite, separate reports. Question: does allowing spawn improve real
+coding tasks versus a single-agent control?
+
+Control writes the shipped `agents.delegation = false` key into an isolated
+`LEVELER_HOME`. Treatment uses the product default. Same model, repository,
+task, tools, budget. No `eval_mode`.
+
+Primary: independent-verifier task success, then cost/quality. **Do not use
+spawn rate as a success metric.** Protocol: `docs/evaluations/MA-VALUE-001.md`.
+
+## Reviewer value
+
+Separate experiment in the same suite. Question: does an independent
+Reviewer after implementation beat self-verification?
+
+Control writes `agents.independent_review = "off"` into an isolated
+`LEVELER_HOME`. Treatment writes `"always"`. Product default stays `auto`.
+Same model, task, tools, budget. No `eval_mode`. Reviewer stays read-only.
+
+Primary: independent-verifier task success, then useful findings (accepted),
+then cost. **Do not use finding count as a success metric.** Zero findings
+is valid. Protocol: `docs/evaluations/MA-VALUE-REVIEWER-PILOT.md`.
+
 ## Statistics
 
 Do not hand-compute rates. The runner emits:
@@ -66,3 +91,6 @@ n < 6 offer-seen runs → `insufficient_n`, not a published verdict.
 | --- | --- | --- |
 | M-3 baseline | `eval/configs/adoption/m3-baseline.yaml` | product default, task-shape, no prompt change |
 | M-2 budget | `eval/configs/adoption/m2-budget.yaml` | **metadata only** until a product budget knob exists. Must not inject an eval-only cap. |
+| MA-VALUE-001 | `eval/configs/multi_agent/MA-VALUE-001.yaml` | single vs multi on R005–R010; spawn rate is diagnostic |
+| MA-VALUE-REVIEWER-PILOT | `eval/configs/multi_agent/MA-VALUE-REVIEWER-PILOT.yaml` | self-verify vs independent review; finding count is diagnostic |
+| MA-VALUE-001 | `eval/configs/multi_agent/MA-VALUE-001.yaml` | Single vs multi-agent value on Real Usage R005–R010. Spawn rate is not a success metric. |

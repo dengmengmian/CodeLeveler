@@ -2006,6 +2006,38 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::QueryChildContribution {
+                session_id,
+                child_id,
+                query_id,
+            } => {
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                let stores = leveler_storage::EngineStores::from_database(&db);
+                let ledger =
+                    crate::contribution_query::last_ledger(stores.events.as_ref(), &session_id)
+                        .await;
+                // Role and profile are the child's own facts and are not in
+                // the ledger; recover them from the spawn event rather than
+                // guessing from the id shape.
+                let (role, profile_id, capabilities) =
+                    crate::contribution_query::child_identity(stores.events.as_ref(), &session_id, &child_id)
+                        .await;
+                let detail = crate::contribution_query::project_child_contribution(
+                    ledger.as_ref(),
+                    &child_id,
+                    &role,
+                    profile_id,
+                    capabilities,
+                );
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::ChildContributionLoaded { query_id, detail });
+                Ok(())
+            }
             ClientCommand::Quit => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);

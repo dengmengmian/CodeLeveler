@@ -1,0 +1,270 @@
+id: go-session-reap-orphans
+name: Reap a disconnected owner's children without orphaning or over-reaping
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  registry.go: |
+    package registry
+
+    import (
+        "errors"
+        "sync"
+    )
+
+    var (
+        // ErrUnknownOwner is returned when an owner id was never opened, or
+        // was already closed.
+        ErrUnknownOwner = errors.New("unknown owner")
+        // ErrClosed is returned when registering under an owner that has
+        // already disconnected.
+        ErrClosed = errors.New("owner is closed")
+    )
+
+    // Registry tracks child resources so that when an owner disconnects, its
+    // children are released and nobody else's are touched.
+    //
+    // Contract:
+    //   - Open(owner) starts tracking an owner; opening twice is an error
+    //   - Register(owner, child) fails with ErrUnknownOwner if the owner was
+    //     never opened, and ErrClosed if the owner has disconnected — a child
+    //     must never end up tracked under a dead owner
+    //   - Close(owner) releases exactly that owner's children, each once, and
+    //     returns how many it released
+    //   - Close on an unknown or already-closed owner returns ErrUnknownOwner
+    //     and releases nothing
+    //   - after Close, the owner holds no memory: no map entry, no child list
+    //   - release is called exactly once per child, ever
+    //   - every method is safe to call concurrently
+    type Registry struct {
+        mu sync.Mutex
+    }
+
+    // New builds a Registry. release is called once per reaped child.
+    func New(release func(child string)) *Registry {
+        panic("not implemented")
+    }
+
+    func (r *Registry) Open(owner string) error {
+        panic("not implemented")
+    }
+
+    func (r *Registry) Register(owner, child string) error {
+        panic("not implemented")
+    }
+
+    func (r *Registry) Close(owner string) (int, error) {
+        panic("not implemented")
+    }
+
+    // Live reports how many owners are still tracked.
+    func (r *Registry) Live() int {
+        panic("not implemented")
+    }
+  registry_test.go: |
+    package registry
+
+    import (
+        "errors"
+        "sync"
+        "testing"
+    )
+
+    func TestCloseReleasesOwnChildren(t *testing.T) {
+        var mu sync.Mutex
+        var got []string
+        r := New(func(c string) { mu.Lock(); got = append(got, c); mu.Unlock() })
+        if err := r.Open("o1"); err != nil {
+            t.Fatalf("Open: %v", err)
+        }
+        if err := r.Register("o1", "c1"); err != nil {
+            t.Fatalf("Register: %v", err)
+        }
+        if err := r.Register("o1", "c2"); err != nil {
+            t.Fatalf("Register: %v", err)
+        }
+        n, err := r.Close("o1")
+        if err != nil {
+            t.Fatalf("Close: %v", err)
+        }
+        if n != 2 {
+            t.Fatalf("released %d, want 2", n)
+        }
+        if len(got) != 2 {
+            t.Fatalf("release called for %v, want 2 children", got)
+        }
+    }
+
+    func TestUnknownOwner(t *testing.T) {
+        r := New(func(string) {})
+        if err := r.Register("nope", "c1"); !errors.Is(err, ErrUnknownOwner) {
+            t.Fatalf("Register err = %v, want ErrUnknownOwner", err)
+        }
+        if _, err := r.Close("nope"); !errors.Is(err, ErrUnknownOwner) {
+            t.Fatalf("Close err = %v, want ErrUnknownOwner", err)
+        }
+    }
+
+    func TestLiveCountsOpenOwners(t *testing.T) {
+        r := New(func(string) {})
+        if err := r.Open("o1"); err != nil {
+            t.Fatalf("Open: %v", err)
+        }
+        if r.Live() != 1 {
+            t.Fatalf("Live = %d, want 1", r.Live())
+        }
+        if _, err := r.Close("o1"); err != nil {
+            t.Fatalf("Close: %v", err)
+        }
+        if r.Live() != 0 {
+            t.Fatalf("Live = %d after close, want 0", r.Live())
+        }
+    }
+task: |
+  Implement Registry in registry.go according to the contract in its doc
+  comment.
+
+  `go test ./...` must pass. Do NOT modify registry_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 -race ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package registry
+
+      import (
+          "errors"
+          "fmt"
+          "sync"
+          "testing"
+      )
+
+      // One owner's disconnect must not reap another's children.
+      func TestHiddenCloseDoesNotTouchOtherOwners(t *testing.T) {
+          var mu sync.Mutex
+          var got []string
+          r := New(func(c string) { mu.Lock(); got = append(got, c); mu.Unlock() })
+          _ = r.Open("o1")
+          _ = r.Open("o2")
+          _ = r.Register("o1", "a")
+          _ = r.Register("o2", "b")
+          n, err := r.Close("o1")
+          if err != nil {
+              t.Fatalf("Close: %v", err)
+          }
+          if n != 1 {
+              t.Fatalf("released %d, want 1", n)
+          }
+          if len(got) != 1 || got[0] != "a" {
+              t.Fatalf("released %v, want only [a]", got)
+          }
+      }
+
+      // The race a disconnect always loses: a child arriving after Close.
+      // Tracking it orphans a resource nobody will ever reap.
+      func TestHiddenRegisterAfterCloseIsRefused(t *testing.T) {
+          var mu sync.Mutex
+          var got []string
+          r := New(func(c string) { mu.Lock(); got = append(got, c); mu.Unlock() })
+          _ = r.Open("o1")
+          if _, err := r.Close("o1"); err != nil {
+              t.Fatalf("Close: %v", err)
+          }
+          err := r.Register("o1", "late")
+          if err == nil {
+              t.Fatal("registering under a disconnected owner must fail, or the child is orphaned")
+          }
+          if !errors.Is(err, ErrClosed) && !errors.Is(err, ErrUnknownOwner) {
+              t.Fatalf("Register err = %v, want ErrClosed or ErrUnknownOwner", err)
+          }
+          mu.Lock()
+          defer mu.Unlock()
+          if len(got) != 0 {
+              t.Fatalf("released %v, want nothing", got)
+          }
+      }
+
+      // Closing twice must not release anything a second time.
+      func TestHiddenDoubleCloseReleasesOnce(t *testing.T) {
+          var mu sync.Mutex
+          count := 0
+          r := New(func(string) { mu.Lock(); count++; mu.Unlock() })
+          _ = r.Open("o1")
+          _ = r.Register("o1", "a")
+          if _, err := r.Close("o1"); err != nil {
+              t.Fatalf("first Close: %v", err)
+          }
+          if _, err := r.Close("o1"); !errors.Is(err, ErrUnknownOwner) {
+              t.Fatalf("second Close err = %v, want ErrUnknownOwner", err)
+          }
+          mu.Lock()
+          defer mu.Unlock()
+          if count != 1 {
+              t.Fatalf("release called %d times, want 1", count)
+          }
+      }
+
+      // A closed owner leaves no bookkeeping behind.
+      func TestHiddenClosedOwnerLeavesNoEntry(t *testing.T) {
+          r := New(func(string) {})
+          for _, o := range []string{"o1", "o2", "o3"} {
+              _ = r.Open(o)
+              _ = r.Register(o, "c-"+o)
+          }
+          for _, o := range []string{"o1", "o2", "o3"} {
+              if _, err := r.Close(o); err != nil {
+                  t.Fatalf("Close(%s): %v", o, err)
+              }
+          }
+          if r.Live() != 0 {
+              t.Fatalf("Live = %d after closing everything, want 0", r.Live())
+          }
+      }
+
+      func TestHiddenOpenTwiceIsAnError(t *testing.T) {
+          r := New(func(string) {})
+          if err := r.Open("o1"); err != nil {
+              t.Fatalf("Open: %v", err)
+          }
+          if err := r.Open("o1"); err == nil {
+              t.Fatal("opening the same owner twice must be an error")
+          }
+      }
+
+      // Concurrent registers and closes: exactly-once release, no data race.
+      func TestHiddenConcurrentRegisterAndClose(t *testing.T) {
+          var mu sync.Mutex
+          seen := map[string]int{}
+          r := New(func(c string) { mu.Lock(); seen[c]++; mu.Unlock() })
+          var wg sync.WaitGroup
+          for i := 0; i < 40; i++ {
+              owner := string(rune('a' + i%8))
+              wg.Add(1)
+              go func(i int, owner string) {
+                  defer wg.Done()
+                  // A unique child per goroutine: the same owner name is
+                  // reused across lifecycles, so a shared child name would be
+                  // released once per lifecycle and prove nothing.
+                  child := fmt.Sprintf("%s-%d", owner, i)
+                  _ = r.Open(owner)
+                  _ = r.Register(owner, child)
+                  _, _ = r.Close(owner)
+              }(i, owner)
+          }
+          wg.Wait()
+          mu.Lock()
+          defer mu.Unlock()
+          for child, n := range seen {
+              if n > 1 {
+                  t.Fatalf("child %q released %d times, want at most 1", child, n)
+              }
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s -race ./...

@@ -1,0 +1,7 @@
+id: rust-race-counter
+name: shared counter thread-safety
+source: evals
+evals_path: evals/hard/rust-race-counter.yaml
+kind: concurrency
+pressure: race
+note: Pointer only. Task and independent expect live in evals/hard. Not an observer-invented prompt.

@@ -1,0 +1,212 @@
+id: go-transfer-lock-order
+name: Concurrent account transfers without deadlock
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  bank.go: |
+    package bank
+
+    import (
+        "errors"
+        "sync"
+    )
+
+    var ErrInsufficient = errors.New("insufficient funds")
+
+    // Account holds a balance guarded by its own mutex. Two accounts are
+    // always distinct objects; ID is unique and stable.
+    type Account struct {
+        ID      int
+        mu      sync.Mutex
+        balance int
+    }
+
+    func NewAccount(id, balance int) *Account {
+        return &Account{ID: id, balance: balance}
+    }
+
+    // Balance reads the balance under the account's own lock.
+    func (a *Account) Balance() int {
+        a.mu.Lock()
+        defer a.mu.Unlock()
+        return a.balance
+    }
+
+    // Transfer moves amount from one account to another.
+    //
+    // Contract:
+    //   - both balances are updated atomically with respect to other
+    //     Transfers: no observer sees money leave one side without arriving
+    //     at the other
+    //   - returns ErrInsufficient and moves nothing if from.balance < amount
+    //   - a negative amount is an error
+    //   - from == to is a no-op returning nil
+    //   - Transfer is safe to call concurrently from many goroutines over any
+    //     mix of accounts, in any direction, with no possibility of deadlock
+    func Transfer(from, to *Account, amount int) error {
+        panic("not implemented")
+    }
+  bank_test.go: |
+    package bank
+
+    import (
+        "errors"
+        "sync"
+        "testing"
+    )
+
+    func TestSimpleTransfer(t *testing.T) {
+        a := NewAccount(1, 100)
+        b := NewAccount(2, 50)
+        if err := Transfer(a, b, 30); err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if a.Balance() != 70 || b.Balance() != 80 {
+            t.Fatalf("balances = %d/%d, want 70/80", a.Balance(), b.Balance())
+        }
+    }
+
+    func TestInsufficient(t *testing.T) {
+        a := NewAccount(1, 10)
+        b := NewAccount(2, 0)
+        if err := Transfer(a, b, 50); !errors.Is(err, ErrInsufficient) {
+            t.Fatalf("err = %v, want ErrInsufficient", err)
+        }
+        if a.Balance() != 10 || b.Balance() != 0 {
+            t.Fatalf("a failed transfer moved money: %d/%d", a.Balance(), b.Balance())
+        }
+    }
+
+    func TestSameAccountIsNoop(t *testing.T) {
+        a := NewAccount(1, 100)
+        if err := Transfer(a, a, 10); err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+        if a.Balance() != 100 {
+            t.Fatalf("balance = %d, want 100", a.Balance())
+        }
+    }
+
+    func TestConcurrentSameDirection(t *testing.T) {
+        a := NewAccount(1, 1000)
+        b := NewAccount(2, 0)
+        var wg sync.WaitGroup
+        for i := 0; i < 100; i++ {
+            wg.Add(1)
+            go func() {
+                defer wg.Done()
+                _ = Transfer(a, b, 1)
+            }()
+        }
+        wg.Wait()
+        if a.Balance()+b.Balance() != 1000 {
+            t.Fatalf("money was created or destroyed: %d + %d", a.Balance(), b.Balance())
+        }
+    }
+task: |
+  Implement Transfer in bank.go according to the contract in its doc comment.
+
+  `go test ./...` must pass. Do NOT modify bank_test.go.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > hidden_calib_test.go <<'EOF'
+      package bank
+
+      import (
+          "sync"
+          "testing"
+          "time"
+      )
+
+      // Transfers that cross deadlock any implementation that locks in
+      // argument order. The watchdog turns a hang into a failure instead of
+      // letting the suite sit until the harness timeout.
+      func TestHiddenCrossingTransfersDoNotDeadlock(t *testing.T) {
+          accounts := make([]*Account, 8)
+          for i := range accounts {
+              accounts[i] = NewAccount(i+1, 100000)
+          }
+          done := make(chan struct{})
+          go func() {
+              defer close(done)
+              var wg sync.WaitGroup
+              for w := 0; w < 16; w++ {
+                  wg.Add(1)
+                  go func(w int) {
+                      defer wg.Done()
+                      for i := 0; i < 500; i++ {
+                          x := accounts[(w+i)%len(accounts)]
+                          y := accounts[(w*3+i*5+1)%len(accounts)]
+                          _ = Transfer(x, y, 1)
+                      }
+                  }(w)
+              }
+              wg.Wait()
+          }()
+          select {
+          case <-done:
+          case <-time.After(10 * time.Second):
+              t.Fatal("crossing transfers deadlocked: locks are taken in argument order, not a consistent global order")
+          }
+      }
+
+      // Money is conserved under the same crossing load.
+      func TestHiddenNoMoneyCreatedUnderCrossingLoad(t *testing.T) {
+          accounts := make([]*Account, 6)
+          total := 0
+          for i := range accounts {
+              accounts[i] = NewAccount(i+1, 5000)
+              total += 5000
+          }
+          done := make(chan struct{})
+          go func() {
+              defer close(done)
+              var wg sync.WaitGroup
+              for w := 0; w < 12; w++ {
+                  wg.Add(1)
+                  go func(w int) {
+                      defer wg.Done()
+                      for i := 0; i < 400; i++ {
+                          x := accounts[(w+i)%len(accounts)]
+                          y := accounts[(w*5+i*7+2)%len(accounts)]
+                          _ = Transfer(x, y, 3)
+                      }
+                  }(w)
+              }
+              wg.Wait()
+          }()
+          select {
+          case <-done:
+          case <-time.After(10 * time.Second):
+              t.Fatal("deadlocked under crossing load")
+          }
+          sum := 0
+          for _, a := range accounts {
+              sum += a.Balance()
+          }
+          if sum != total {
+              t.Fatalf("total = %d, want %d — balances are not updated atomically", sum, total)
+          }
+      }
+
+      func TestHiddenNegativeAmountIsAnError(t *testing.T) {
+          a := NewAccount(1, 100)
+          b := NewAccount(2, 100)
+          if err := Transfer(a, b, -5); err == nil {
+              t.Fatal("a negative amount must be an error")
+          }
+          if a.Balance() != 100 || b.Balance() != 100 {
+              t.Fatalf("a rejected transfer moved money: %d/%d", a.Balance(), b.Balance())
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...

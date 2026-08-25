@@ -123,6 +123,56 @@
           "enum": ["delegated", "kept", "offered_only", "none", null]
         }
       }
+    },
+    "experiment": { "type": "string" },
+    "mode": { "type": "string", "enum": ["single", "multi"] },
+    "task_success": { "type": ["boolean", "null"] },
+    "efficiency": {
+      "type": "object",
+      "properties": {
+        "turns": { "type": ["integer", "null"] },
+        "input_tokens": { "type": ["integer", "null"] },
+        "output_tokens": { "type": ["integer", "null"] },
+        "total_tokens": { "type": ["integer", "null"] },
+        "wall_time_ms": { "type": ["integer", "null"] },
+        "tool_calls": { "type": ["integer", "null"] }
+      }
+    },
+    "multi_agent": {
+      "type": "object",
+      "properties": {
+        "spawn_count": { "type": "integer" },
+        "child_roles": { "type": "array", "items": { "type": "string" } },
+        "child_completed": { "type": "integer" },
+        "child_result_used": { "type": "boolean" },
+        "child_contributions": { "type": "array", "items": { "type": "string" } },
+        "children": { "type": "array" },
+        "profile_effectiveness": { "type": "object" }
+      }
+    },
+    "reviewer": {
+      "type": "object",
+      "properties": {
+        "reviewer_spawned": { "type": "integer" },
+        "reviewer_completed": { "type": "integer" },
+        "findings_generated": { "type": "integer" },
+        "findings_accepted": { "type": "integer" },
+        "findings_verified": { "type": "integer" },
+        "findings_rejected": { "type": "integer" },
+        "useful_findings": { "type": "integer" },
+        "zero_findings": { "type": "boolean" },
+        "noise": { "type": "boolean" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "properties": {
+        "tests_passed": { "type": ["integer", "null"] },
+        "regressions": { "type": ["integer", "null"] },
+        "review_findings": { "type": ["integer", "null"] },
+        "missed_issues": { "type": ["integer", "null"] }
+      }
     }
-  }
+  },
+  "additionalProperties": true
 }

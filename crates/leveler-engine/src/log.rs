@@ -670,6 +670,9 @@ mod tests {
                     nickname: nickname.into(),
                     role: "explorer".into(),
                     task: "explore the repository".into(),
+                    profile_id: None,
+                    profile_role: None,
+                    capabilities: Vec::new(),
                 },
                 &mut sink,
             )
@@ -713,6 +716,9 @@ mod tests {
                 nickname: "Euclid".into(),
                 role: "explorer".into(),
                 task: "t".into(),
+                profile_id: None,
+                profile_role: None,
+                capabilities: Vec::new(),
             },
             &mut sink,
         )

@@ -1,0 +1,9 @@
+id: R006
+name: casdoor
+source: real_usage_batch_01
+repository: casdoor/casdoor
+kind: full_stack
+pressure: cross_layer
+spawn_expectation: useful_parallel_explorers
+control_plane_rel: batch-01/R006
+note: Pointer only. Task statement and hidden verifier stay in the dogfood-control repo. Not an EvaluationCase.

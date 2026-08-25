@@ -7,6 +7,7 @@ config key, written into the isolated home (never into ~/.leveler).
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -22,10 +23,20 @@ from schema import make_batch, make_run
 
 ARM_CONTROL = "control"
 ARM_TIMING = "timing.after_first_edit"
+ARM_SINGLE = "single"
+ARM_MULTI = "multi"
+ARM_SELF = "self"
+ARM_REVIEWER = "reviewer"
 
 FACTORS = {
     ARM_CONTROL: ("baseline", "product_default"),
     ARM_TIMING: ("timing", "after_first_edit"),
+    ARM_SINGLE: ("mode", "single_agent"),
+    ARM_MULTI: ("mode", "multi_agent"),
+    "single_agent": ("mode", "single_agent"),
+    "multi_agent": ("mode", "multi_agent"),
+    ARM_SELF: ("independent_review", "off"),
+    ARM_REVIEWER: ("independent_review", "always"),
 }
 
 
@@ -54,6 +65,20 @@ def binary_version(binary: str) -> str | None:
         return None
 
 
+def _is_delegation_assignment(line: str) -> bool:
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        return False
+    return stripped.startswith("delegation") and "=" in stripped
+
+
+def _is_independent_review_assignment(line: str) -> bool:
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        return False
+    return stripped.startswith("independent_review") and "=" in stripped
+
+
 def prepare_home(home: Path, arm: str, user_config: Path | None) -> None:
     home.mkdir(parents=True, exist_ok=True)
     text = ""
@@ -66,6 +91,42 @@ def prepare_home(home: Path, arm: str, user_config: Path | None) -> None:
             text = text.replace("[agents]", '[agents]\noffer_timing = "after_first_edit"', 1)
         else:
             text += '\n[agents]\noffer_timing = "after_first_edit"\n'
+    elif arm in (ARM_SINGLE, "single_agent"):
+        # Shipped `agents.delegation` key, isolated home only. Not eval_mode.
+        lines = [ln for ln in text.splitlines() if not _is_delegation_assignment(ln)]
+        text = "\n".join(lines)
+        if "[agents]" in text:
+            text = text.replace("[agents]", "[agents]\ndelegation = false", 1)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += "[agents]\ndelegation = false\n"
+    elif arm in (ARM_MULTI, "multi_agent"):
+        # Product default is on. Strip a copied-in disable so this arm is
+        # not contaminated by the user's global preference.
+        lines = [ln for ln in text.splitlines() if not _is_delegation_assignment(ln)]
+        text = "\n".join(lines)
+        if text and not text.endswith("\n"):
+            text += "\n"
+    elif arm in (ARM_SELF, "self_verify"):
+        # Isolated home only. Product default stays `auto` (shape-triggered).
+        lines = [ln for ln in text.splitlines() if not _is_independent_review_assignment(ln)]
+        text = "\n".join(lines)
+        if "[agents]" in text:
+            text = text.replace("[agents]", '[agents]\nindependent_review = "off"', 1)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += '[agents]\nindependent_review = "off"\n'
+    elif arm in (ARM_REVIEWER, "independent_review"):
+        lines = [ln for ln in text.splitlines() if not _is_independent_review_assignment(ln)]
+        text = "\n".join(lines)
+        if "[agents]" in text:
+            text = text.replace("[agents]", '[agents]\nindependent_review = "always"', 1)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += '[agents]\nindependent_review = "always"\n'
     (home / "config.toml").write_text(text, encoding="utf-8")
 
 
@@ -75,6 +136,46 @@ def infer_task_id(db_path: Path, known_ids: list[str]) -> str | None:
         if tid in blob:
             return tid
     return None
+
+
+
+def load_expect_verdicts(eval_result: Path) -> dict[str, dict[str, Any]]:
+    """Join each case's independent `expect` verdict, keyed by case id.
+
+    `leveler eval run --json-out` already executed `expect`; without this the
+    observer scores `task_success = None` for every run and the experiment
+    cannot answer its primary question.
+
+    A verifier that did not run stays `passed=None` (unscored), never False —
+    an unscored run must not be counted as a failure. With repetitions, every
+    repetition must pass.
+    """
+    try:
+        doc = json.loads(Path(eval_result).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for case in ((doc.get("report") or {}).get("cases") or []):
+        cid = case.get("id")
+        if not cid:
+            continue
+        ran = bool(case.get("verification_ran"))
+        passed = case.get("expect_passed") if ran else None
+        ev = case.get("verification_evidence") or {}
+        argv = [str(ev.get("program") or "")] + [str(a) for a in (ev.get("args") or [])]
+        command = " ".join(x for x in argv if x) or None
+        prev = out.get(cid)
+        if prev is None:
+            out[cid] = {"ran": ran, "passed": passed, "command": command}
+            continue
+        # Repetitions: all must pass; any repetition that ran makes it scored.
+        prev["ran"] = prev["ran"] or ran
+        if passed is False:
+            prev["passed"] = False
+        elif prev["passed"] is None and passed is True:
+            prev["passed"] = True
+        prev["command"] = prev["command"] or command
+    return out
 
 
 def score_home(
@@ -89,6 +190,8 @@ def score_home(
     started_at: str | None,
     suite: str = "adoption",
     max_rounds: int | None = 20,
+    experiment: str | None = None,
+    verdicts: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     factor, value = FACTORS.get(arm, ("unknown", arm))
     known_ids = list((catalog.get("tasks") or {}).keys())
@@ -96,6 +199,7 @@ def score_home(
     for db in find_session_dbs(home):
         timeline = extract_path(db)
         task_id = infer_task_id(db, known_ids) or "unknown"
+        verdict = (verdicts or {}).get(task_id) or {}
         run = make_run(
             run_id=f"{batch_id}:{task_id}:{db.parent.name[-12:]}",
             started_at=started_at,
@@ -113,6 +217,21 @@ def score_home(
             arm_value=value,
             model_ref=model or timeline.get("model_from_event"),
             timeline=timeline,
+            verifier_ran=bool(verdict.get("ran")),
+            verifier_passed=verdict.get("passed"),
+            verifier_command=verdict.get("command"),
+            experiment=experiment,
+            mode=arm
+            if arm
+            in (
+                ARM_SINGLE,
+                ARM_MULTI,
+                "single_agent",
+                "multi_agent",
+                ARM_SELF,
+                ARM_REVIEWER,
+            )
+            else None,
         )
         runs.append(run)
     return make_batch(

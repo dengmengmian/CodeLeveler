@@ -238,6 +238,15 @@ impl RemotePolicy {
                 reason: "runtime observatory is local-only",
             },
 
+            // Same class of data as the observatory: a finding carries the
+            // file path it was found in and a summary of the code. The counts
+            // a remote client needs already ride on SubAgentUpdated; the
+            // per-finding detail stays on the machine.
+            ClientCommand::QueryChildContribution { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "contribution detail is local-only",
+            },
+
             // Shuts down the runtime for every client, local ones included.
             // The local socket transport refuses it too.
             ClientCommand::Quit => RemoteVerdict::Deny {

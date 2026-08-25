@@ -1,0 +1,5 @@
+# Isolated-home overlay for the control arm. Written by prepare_home, not by
+# this file. Kept so the suite documents the shipped key it uses.
+mode: self
+agents:
+  independent_review: off

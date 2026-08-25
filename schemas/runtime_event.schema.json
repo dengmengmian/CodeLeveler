@@ -887,6 +887,23 @@
         "type"
       ],
       "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "contribution": {
+          "description": "What the parent did with what this child found, once it finished.\n\n`None` means NOT MEASURED — the runtime produced no projection — and must never be rendered as a zero. A child that reported nothing arrives as `Some` with zero counts, which is a different fact and reads differently to the user.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ChildContribution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "detail": {
           "description": "The task while running; a short result summary once done.",
           "type": "string"
@@ -904,6 +921,19 @@
         "ok": {
           "description": "Whether it finished successfully (only meaningful when `done`).",
           "type": "boolean"
+        },
+        "profile_id": {
+          "description": "Built-in capability contract this child was launched under. `None` means the runtime did not record one, not \"no profile\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_role": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "role": {
           "type": "string"
@@ -989,6 +1019,35 @@
           "type": "string",
           "enum": [
             "sub_agent_activity"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only: a snapshot of the ledger, never a mutation.",
+      "type": "object",
+      "required": [
+        "detail",
+        "type"
+      ],
+      "properties": {
+        "detail": {
+          "$ref": "#/definitions/UiChildContribution"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "child_contribution_loaded"
           ]
         }
       }
@@ -1345,6 +1404,79 @@
       "description": "Identifies a conversation checkpoint (restore point).",
       "type": "string"
     },
+    "ChildContribution": {
+      "description": "What one child contributed, as counts plus its capability contract.\n\nA flat mirror of the runtime's projection rather than the runtime type itself: this crate is the stable wire, so an internal refactor of the ledger must not change what clients parse.\n\nCounts are about the PARENT's judgement, not the child's output volume. `findings_total` is not a success metric; `findings_accepted` and `findings_verified` are what say the work mattered.",
+      "type": "object",
+      "required": [
+        "findings_accepted",
+        "findings_acknowledged",
+        "findings_open_blocking",
+        "findings_rejected",
+        "findings_total",
+        "findings_verified",
+        "role"
+      ],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "findings_accepted": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "findings_acknowledged": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "findings_open_blocking": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "findings_rejected": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "findings_total": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "findings_verified": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "source": {
+          "description": "Which mechanism produced it: `executor_child`, `independent_reviewer` or `self_reported`. `None` on events written before it was stamped.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "ClarificationId": {
       "description": "Identifies a pending clarification (ask-user) request.",
       "type": "string"
@@ -1557,6 +1689,46 @@
         }
       }
     },
+    "UiChildContribution": {
+      "description": "Everything the inspector shows for one child.",
+      "type": "object",
+      "required": [
+        "child_id",
+        "measured",
+        "role"
+      ],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "child_id": {
+          "type": "string"
+        },
+        "findings": {
+          "description": "Findings this child produced, in ledger order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiFinding"
+          }
+        },
+        "measured": {
+          "description": "Whether a ledger snapshot was found at all.\n\n`false` means the question could not be answered — no ledger, or the child predates finding adoption. It does NOT mean the child found nothing, and the inspector must not render it that way.",
+          "type": "boolean"
+        },
+        "profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        }
+      }
+    },
     "UiClarificationRequest": {
       "description": "A mid-task clarification the agent needs answered (spec §35).",
       "type": "object",
@@ -1689,6 +1861,57 @@
         "sequence": {
           "type": "integer",
           "format": "int64"
+        }
+      }
+    },
+    "UiFinding": {
+      "description": "One finding, as the inspector shows it.\n\nA projection of `leveler_lifecycle::FindingRecord`, not the record itself: this crate is the stable wire, and the ledger must stay free to change.",
+      "type": "object",
+      "required": [
+        "blocking",
+        "id",
+        "kind",
+        "state",
+        "summary"
+      ],
+      "properties": {
+        "blocking": {
+          "description": "Still gates a verified closure.",
+          "type": "boolean"
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Parent-ledger id (`f-1`). Stable enough for a user to refer to.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`relevant_file`, `risk`, `correctness`, …",
+          "type": "string"
+        },
+        "resolution_reason": {
+          "description": "Why the parent declined it. Present only on a rejection, where it is required — a rejection without a reason is not a judgement.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "description": "`created` | `acknowledged` | `accepted` | `rejected` | `addressed` | `verified`.",
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

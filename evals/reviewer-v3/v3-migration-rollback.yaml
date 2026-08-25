@@ -1,0 +1,278 @@
+id: v3-migration-rollback
+name: Split the name column into first and last
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  docs/MIGRATIONS.md: |
+    # Migrations
+
+    Every migration is a pair. `Up` moves the schema forward, `Down` puts it
+    back. Deploys are canaried: a bad release is rolled back by running `Down`
+    on a database that `Up` already touched, while the previous binary — which
+    knows nothing about the new columns — starts serving again.
+
+    Rules the runner relies on:
+
+    - `Up` and `Down` are each run under the migration lock, one at a time.
+    - A migration that has already been applied is skipped, so `Up` is only
+      ever called on a database at the previous version.
+    - After `Down`, the previous binary must find the data it expects. A
+      rollback that leaves the old columns empty is a data-loss incident, not
+      a rollback.
+    - `Version` is what the runner records; it must move with the schema.
+  internal/db/db.go: |
+    // Package db is a tiny in-memory stand-in for the real database.
+    package db
+
+    import "sync"
+
+    // Row is one user record. Columns are per-row maps so a migration can add
+    // and drop them the way SQL would.
+    type Row map[string]string
+
+    type DB struct {
+        mu      sync.Mutex
+        rows    map[string]Row
+        version int
+    }
+
+    func New() *DB { return &DB{rows: map[string]Row{}, version: 1} }
+
+    func (d *DB) Insert(id string, r Row) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        cp := Row{}
+        for k, v := range r {
+            cp[k] = v
+        }
+        d.rows[id] = cp
+    }
+
+    func (d *DB) Get(id string) (Row, bool) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        r, ok := d.rows[id]
+        if !ok {
+            return nil, false
+        }
+        cp := Row{}
+        for k, v := range r {
+            cp[k] = v
+        }
+        return cp, true
+    }
+
+    func (d *DB) IDs() []string {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        out := make([]string, 0, len(d.rows))
+        for id := range d.rows {
+            out = append(out, id)
+        }
+        return out
+    }
+
+    // SetColumn writes one column on one row.
+    func (d *DB) SetColumn(id, col, val string) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        if r, ok := d.rows[id]; ok {
+            r[col] = val
+        }
+    }
+
+    // DropColumn removes one column from every row.
+    func (d *DB) DropColumn(col string) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        for _, r := range d.rows {
+            delete(r, col)
+        }
+    }
+
+    func (d *DB) Version() int {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        return d.version
+    }
+
+    func (d *DB) SetVersion(v int) {
+        d.mu.Lock()
+        defer d.mu.Unlock()
+        d.version = v
+    }
+  internal/migrate/migrate.go: |
+    package migrate
+
+    import "evalcase/internal/db"
+
+    // SplitName is migration 2.
+    //
+    // The users table has one `name` column holding a full name. Product needs
+    // `first_name` and `last_name` separately. A name splits on the first
+    // space: everything before it is the first name, everything after is the
+    // last name. A name with no space is entirely the first name.
+    type SplitName struct{}
+
+    func (SplitName) Version() int { return 2 }
+
+    // Up moves the database to version 2.
+    func (SplitName) Up(d *db.DB) error {
+        panic("not implemented")
+    }
+
+    // Down moves the database back to version 1.
+    func (SplitName) Down(d *db.DB) error {
+        panic("not implemented")
+    }
+  internal/migrate/migrate_test.go: |
+    package migrate
+
+    import (
+        "testing"
+
+        "evalcase/internal/db"
+    )
+
+    func seeded() *db.DB {
+        d := db.New()
+        d.Insert("u1", db.Row{"name": "Ada Lovelace"})
+        d.Insert("u2", db.Row{"name": "Grace Hopper"})
+        return d
+    }
+
+    func TestUpSplitsTheName(t *testing.T) {
+        d := seeded()
+        if err := (SplitName{}).Up(d); err != nil {
+            t.Fatalf("Up: %v", err)
+        }
+        r, _ := d.Get("u1")
+        if r["first_name"] != "Ada" || r["last_name"] != "Lovelace" {
+            t.Fatalf("row = %v, want first_name Ada / last_name Lovelace", r)
+        }
+    }
+
+    func TestUpMovesTheVersion(t *testing.T) {
+        d := seeded()
+        if err := (SplitName{}).Up(d); err != nil {
+            t.Fatalf("Up: %v", err)
+        }
+        if d.Version() != 2 {
+            t.Fatalf("version = %d, want 2", d.Version())
+        }
+    }
+
+    func TestSingleWordName(t *testing.T) {
+        d := db.New()
+        d.Insert("u1", db.Row{"name": "Cher"})
+        if err := (SplitName{}).Up(d); err != nil {
+            t.Fatalf("Up: %v", err)
+        }
+        r, _ := d.Get("u1")
+        if r["first_name"] != "Cher" || r["last_name"] != "" {
+            t.Fatalf("row = %v, want first_name Cher / last_name empty", r)
+        }
+    }
+task: |
+  The users table stores a single `name` column. Product needs first and last
+  names separately.
+
+  Implement Up and Down for the SplitName migration in
+  internal/migrate/migrate.go. Read docs/MIGRATIONS.md first.
+
+  `go test ./...` must pass. Do NOT modify any _test.go file.
+expect:
+  program: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      trap 'rm -f internal/migrate/hidden_calib_test.go' EXIT
+      go vet ./...
+      go test -timeout 90s -count=1 ./...
+      cat > internal/migrate/hidden_calib_test.go <<'EOF'
+      package migrate
+
+      import (
+          "testing"
+
+          "evalcase/internal/db"
+      )
+
+      // A rollback runs against a database Up already migrated, and the old
+      // binary reads `name`. If Down cannot rebuild it, the rollback is a
+      // data-loss incident.
+      func TestHiddenDownRestoresTheNameColumn(t *testing.T) {
+          d := seeded()
+          if err := (SplitName{}).Up(d); err != nil {
+              t.Fatalf("Up: %v", err)
+          }
+          if err := (SplitName{}).Down(d); err != nil {
+              t.Fatalf("Down: %v", err)
+          }
+          r, _ := d.Get("u1")
+          if r["name"] != "Ada Lovelace" {
+              t.Fatalf("name = %q after rollback, want \"Ada Lovelace\" — the old binary reads this column", r["name"])
+          }
+          r2, _ := d.Get("u2")
+          if r2["name"] != "Grace Hopper" {
+              t.Fatalf("name = %q after rollback, want \"Grace Hopper\"", r2["name"])
+          }
+      }
+
+      // Down also takes the version back, or the runner will not re-apply Up.
+      func TestHiddenDownMovesTheVersionBack(t *testing.T) {
+          d := seeded()
+          _ = (SplitName{}).Up(d)
+          if err := (SplitName{}).Down(d); err != nil {
+              t.Fatalf("Down: %v", err)
+          }
+          if d.Version() != 1 {
+              t.Fatalf("version = %d after rollback, want 1", d.Version())
+          }
+      }
+
+      // Rolling forward again after a rollback must land where it did before.
+      func TestHiddenUpDownUpIsStable(t *testing.T) {
+          d := seeded()
+          _ = (SplitName{}).Up(d)
+          _ = (SplitName{}).Down(d)
+          if err := (SplitName{}).Up(d); err != nil {
+              t.Fatalf("second Up: %v", err)
+          }
+          r, _ := d.Get("u1")
+          if r["first_name"] != "Ada" || r["last_name"] != "Lovelace" {
+              t.Fatalf("row = %v after up/down/up, want Ada / Lovelace", r)
+          }
+          if d.Version() != 2 {
+              t.Fatalf("version = %d, want 2", d.Version())
+          }
+      }
+
+      // A single-word name survives the round trip too.
+      func TestHiddenSingleWordSurvivesRollback(t *testing.T) {
+          d := db.New()
+          d.Insert("u1", db.Row{"name": "Cher"})
+          _ = (SplitName{}).Up(d)
+          if err := (SplitName{}).Down(d); err != nil {
+              t.Fatalf("Down: %v", err)
+          }
+          r, _ := d.Get("u1")
+          if r["name"] != "Cher" {
+              t.Fatalf("name = %q after rollback, want \"Cher\"", r["name"])
+          }
+      }
+
+      // The old column is gone at version 2, or nothing was migrated.
+      func TestHiddenUpDropsTheOldColumn(t *testing.T) {
+          d := seeded()
+          _ = (SplitName{}).Up(d)
+          r, _ := d.Get("u1")
+          if _, still := r["name"]; still {
+              t.Fatalf("row still carries the old name column after Up: %v", r)
+          }
+      }
+      EOF
+      go test -run 'TestHidden' -count=1 -timeout 90s ./...
