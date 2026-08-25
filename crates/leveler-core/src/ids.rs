@@ -120,6 +120,13 @@ string_id!(
     TaskId
 );
 string_id!(
+ /// Identifies one long-running goal — a durable intent, distinct from the
+ /// turn that executes it. A turn is one execution; a goal outlives it and
+ /// may span several work windows and several processes. One task hosts many
+ /// goals over its life, so a goal id is not a task id.
+    GoalId
+);
+string_id!(
  /// Identifies a single node within a task graph.
     TaskNodeId
 );

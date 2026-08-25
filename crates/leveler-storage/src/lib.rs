@@ -12,6 +12,7 @@ mod database;
 mod engine_stores;
 mod event_repo;
 mod event_store;
+mod goal_store;
 mod message_repo;
 mod message_store;
 mod model_request_repo;
@@ -29,6 +30,7 @@ pub use database::{Database, StorageError, peek_repository};
 pub use engine_stores::EngineStores;
 pub use event_repo::{EVENT_SCHEMA_VERSION, EventRecord, EventRepository};
 pub use event_store::{EventStore, MemoryEventStore};
+pub use goal_store::{GoalRecord, GoalState, GoalStore, MemoryGoalStore};
 pub use message_repo::MessageRepository;
 pub use message_store::{
     MemoryMessageStore, MemoryModelRequestStore, MessageStore, ModelRequestStore,

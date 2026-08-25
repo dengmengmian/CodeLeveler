@@ -144,6 +144,46 @@ fn title_from_first_message(content: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
+/// Record that a long-lived intent exists, before the work starts.
+///
+/// Best-effort: a goal whose bookkeeping cannot be written must still run.
+/// Returning `None` means "not recorded", and every caller treats that as
+/// nothing to settle rather than as a settled goal.
+async fn open_goal_record(
+    app: &Arc<Application>,
+    session_id: &SessionId,
+    objective: &str,
+) -> Option<leveler_core::GoalId> {
+    let db = app.open_database().await.ok()?;
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    let now = leveler_core::now();
+    let task = stores
+        .tasks
+        .ensure_for_session(session_id, now)
+        .await
+        .ok()?;
+    match stores.goals.open(&task, objective, now).await {
+        Ok(id) => Some(id),
+        Err(error) => {
+            tracing::warn!(%error, "could not record goal identity; the goal still runs");
+            None
+        }
+    }
+}
+
+/// Mark a goal as owing no further work.
+async fn settle_goal_record(app: &Arc<Application>, goal: Option<leveler_core::GoalId>) {
+    let Some(goal) = goal else { return };
+    let Ok(db) = app.open_database().await else {
+        tracing::warn!("could not settle goal: database unavailable");
+        return;
+    };
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    if let Err(error) = stores.goals.settle(&goal, leveler_core::now()).await {
+        tracing::warn!(%error, "could not settle goal record");
+    }
+}
+
 fn emit_project_rules(events: &broadcast::Sender<RuntimeEvent>, repo: &Path) {
     let sources = leveler_context::load_rules(repo)
         .into_iter()
@@ -1017,9 +1057,17 @@ impl InProcessRuntimeClient {
         let steering = self.steering_for(&session_id);
 
         let handle = tokio::runtime::Handle::current();
+        let objective = content.clone();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 emit_project_rules(&events, &repo);
+                // Goal identity (long-goal P1): record that this intent exists
+                // before it runs, so a process that dies mid-goal leaves
+                // something saying work is owed. Best-effort on purpose — a
+                // goal that cannot be recorded must still be allowed to run;
+                // losing the bookkeeping is worse than refusing the work only
+                // if you believe the bookkeeping is the point.
+                let goal = open_goal_record(&app, &session_id, &objective).await;
                 let mut bridge = EventBridge::new(events.clone());
                 let mut observer = |event: leveler_engine::EngineEvent| bridge.forward(event);
                 let result = app
@@ -1037,6 +1085,10 @@ impl InProcessRuntimeClient {
                     )
                     .await;
                 let outcome = turn_runtime_event(result);
+                // The goal stops owing work when its driving turn reaches a
+                // terminal state. How it went is `sessions.outcome`; this only
+                // records that nothing further is owed.
+                settle_goal_record(&app, goal).await;
                 let _ = events.send(outcome);
                 active.finish(&session_id);
                 // Session-owned background reap moved to the engine's terminal

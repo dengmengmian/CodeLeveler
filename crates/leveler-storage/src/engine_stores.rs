@@ -34,6 +34,8 @@ pub struct EngineStores {
     pub terminal: Arc<dyn TerminalStore>,
     /// Durable task ownership (CAS acquire + current-owner reads).
     pub ownership: Arc<dyn crate::OwnershipStore>,
+    /// Durable goal identity: what long-lived intent still owes work.
+    pub goals: Arc<dyn crate::GoalStore>,
 }
 
 impl EngineStores {
@@ -49,6 +51,7 @@ impl EngineStores {
             model_requests: Arc::new(db.clone()),
             terminal: Arc::new(db.clone()),
             ownership: Arc::new(db.clone()),
+            goals: Arc::new(db.clone()),
         }
     }
 }
