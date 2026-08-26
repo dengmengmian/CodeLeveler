@@ -414,6 +414,14 @@ fn renders_failed_tool_inline_and_tools_screen() {
             duration_ms: 13000,
         }),
     );
+    // History begins when the group CLOSES (next conversation item), not
+    // when its members settle — an open group is live work.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("close-group"),
+        }),
+    );
     // A failed shell collapses to its disclosure: ✗ label + first error line.
     let conv = render_at(100, 24, &mut state);
     assert!(
@@ -478,6 +486,14 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
         }),
     );
 
+    // History begins when the group CLOSES (next conversation item), not
+    // when its members settle — an open group is live work.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("close-group"),
+        }),
+    );
     // Folded by default: one ▸ disclosure row; raw output stays hidden.
     let folded = render_at(100, 24, &mut state);
     assert!(
@@ -554,6 +570,14 @@ fn command_result_renders_as_important_activity_not_file_list() {
         }),
     );
 
+    // History begins when the group CLOSES (next conversation item), not
+    // when its members settle — an open group is live work.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new("close-group"),
+        }),
+    );
     let collapsed = render_at(120, 30, &mut state);
     assert!(
         !collapsed.lines().any(|line| line.trim() == "Agent Message"),

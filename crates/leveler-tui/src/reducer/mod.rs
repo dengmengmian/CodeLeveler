@@ -1182,6 +1182,8 @@ mod disclosure_tests {
             .complete_tool(&ToolCallId::new("s1"), true, "".into(), 3);
         s.transcript.push_user("between".into());
         finished_tool(&mut s, "w1", "grep", r#"{"pattern":"x"}"#);
+        // Close the trailing group: an open group is live work, not history.
+        s.transcript.push_user("tail".into());
         let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
         assert_eq!(hits.len(), 1, "only the visible work group: {hits:?}");
         let (line, item) = hits[0];
@@ -1207,6 +1209,7 @@ mod disclosure_tests {
                 &format!(r#"{{"path":"f{i}.rs"}}"#),
             );
         }
+        s.transcript.push_user("tail".into());
         let (lines, hits) = s.conversation_lines_and_hits(100);
         assert_eq!(hits.len(), 100);
         let (_, ry, _, rh) = s.conv.rect.unwrap();
@@ -1386,10 +1389,19 @@ mod disclosure_tests {
         );
         s.transcript
             .complete_tool(&ToolCallId::new("r1"), true, "ok".into(), 10);
+        // Member completion alone is NOT history: the group is still open
+        // (the model may stream another call). No disclosure yet.
+        let hits = s.conversation_lines_and_hits(80).1;
+        assert!(
+            hits.iter().all(|(_, i)| *i != running_idx),
+            "an open group stays live even with all members settled: {hits:?}"
+        );
+        // The group closing (next conversation item) is what commits it.
+        s.transcript.push_user("next".into());
         let hits = s.conversation_lines_and_hits(80).1;
         assert!(
             hits.iter().any(|(_, i)| *i == running_idx),
-            "completion turns the group into a disclosure: {hits:?}"
+            "a closed settled group becomes the clickable disclosure: {hits:?}"
         );
     }
 

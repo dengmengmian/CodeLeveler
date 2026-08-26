@@ -65,8 +65,8 @@ pub(crate) fn render_group(
     // earns screen space, settled work compacts to one truthful line and
     // folds fully (clickable) when the group finishes. Failures keep their
     // rows (an error is why you are reading this), and edits keep their diff.
-    let open_group = !group_is_finished(group);
-    if open_group {
+    let live_group = group.open || !group_is_finished(group);
+    if live_group {
         let settled: Vec<&ToolCallBlock> = visible
             .iter()
             .copied()
@@ -85,7 +85,17 @@ pub(crate) fn render_group(
     }
     // A concurrent batch gets one quiet dim header so the user sees these
     // calls ran together rather than one after another.
-    let parallel_n = group.calls.iter().filter(|c| c.parallel).count();
+    let parallel_n = if live_group {
+        // Live, the header answers "how many are running NOW" — settled
+        // members are already counted by the compact ✓ line above.
+        group
+            .calls
+            .iter()
+            .filter(|c| c.parallel && c.status == ToolStatus::Running)
+            .count()
+    } else {
+        group.calls.iter().filter(|c| c.parallel).count()
+    };
     if parallel_n >= 2 {
         let label = t.parallel_header.replace("{}", &parallel_n.to_string());
         out.push(Line::from(Span::styled(
@@ -93,12 +103,26 @@ pub(crate) fn render_group(
             Style::default().fg(theme.text.muted),
         )));
     }
+    const LIVE_RUNNING_ROWS: usize = 3;
+    let mut running_shown = 0usize;
+    let mut running_hidden = 0usize;
     for unit in plan_units(&group.calls) {
         match unit {
             StreamUnit::Single(call) => {
-                if open_group && call.status == ToolStatus::Ok && !is_edit_call(call) {
+                if live_group && call.status == ToolStatus::Ok && !is_edit_call(call) {
                     // Already represented by the compact settled line above.
                     continue;
+                }
+                if live_group && call.status == ToolStatus::Running {
+                    // Bounded live area: a 17-wide parallel burst must not
+                    // claim 17 rows. First LIVE_RUNNING_ROWS running members
+                    // (deterministic call order) get rows; the rest are one
+                    // truthful count line.
+                    running_shown += 1;
+                    if running_shown > LIVE_RUNNING_ROWS {
+                        running_hidden += 1;
+                        continue;
+                    }
                 }
                 out.extend(unit_lines(
                     call,
@@ -150,6 +174,16 @@ pub(crate) fn render_group(
                 }
             }
         }
+    }
+    if running_hidden > 0 {
+        out.push(Line::from(Span::styled(
+            truncate_display(
+                &t.parallel_more_running
+                    .replace("{}", &running_hidden.to_string()),
+                width,
+            ),
+            Style::default().fg(theme.text.muted),
+        )));
     }
     out
 }
@@ -204,7 +238,13 @@ fn disclosure_class(name: &str) -> DisclosureClass {
 /// Bookkeeping/interaction calls (a denied plan update, a permission request)
 /// keep their own presentation instead of being folded into "ran N tools".
 pub(crate) fn group_has_disclosure(group: &ToolGroupBlock) -> bool {
-    if !group_is_finished(group) || group_has_edits(group) {
+    // `open` is the group's own truth about whether the burst is still in
+    // flight. Members can ALL be momentarily settled while the model is
+    // still streaming the next call's arguments — projecting such a group
+    // as completed history paints active work as done (the real
+    // `▸ 并行执行了 7 个工具`-while-running regression). History begins when
+    // the group closes, not when its current members happen to be settled.
+    if group.open || !group_is_finished(group) || group_has_edits(group) {
         return false;
     }
     let visible: Vec<&ToolCallBlock> = group
@@ -953,6 +993,183 @@ mod tests {
             open: false,
             expanded: false,
         }
+    }
+
+    fn open_group(calls: Vec<ToolCallBlock>) -> ToolGroupBlock {
+        ToolGroupBlock {
+            calls,
+            open: true,
+            expanded: false,
+        }
+    }
+
+    /// THE regression: an OPEN group whose members are all momentarily
+    /// settled (the model is still streaming the next parallel call) must
+    /// NOT render as completed history. History begins when the group
+    /// closes, not when its current members happen to be settled.
+    #[test]
+    fn an_open_group_with_all_members_settled_is_not_history() {
+        let mut calls: Vec<ToolCallBlock> = (0..7)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    ToolStatus::Ok,
+                )
+            })
+            .collect();
+        for c in &mut calls {
+            c.parallel = true;
+        }
+        let g = open_group(calls);
+        assert!(
+            !group_has_disclosure(&g),
+            "open group is never a disclosure"
+        );
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            !lines.iter().any(|l| l.starts_with('▸')),
+            "no history-style row while the burst is in flight: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains('✓') && l.contains('7')),
+            "settled-so-far stays truthfully visible: {lines:?}"
+        );
+        // …and the same group, closed, becomes exactly one history row —
+        // one presentation role at a time, never both.
+        let mut closed = g.clone();
+        closed.open = false;
+        assert!(group_has_disclosure(&closed));
+        let lines = render_group_text(&closed, 100, Locale::Zh);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with('▸'), "{lines:?}");
+    }
+
+    /// The invariant is class-agnostic: Read, Search, Command, and
+    /// generic/unknown (MCP-style) groups all obey the same rule — an OPEN
+    /// group is never history, whatever its members' momentary statuses.
+    #[test]
+    fn every_group_class_obeys_the_open_is_not_history_invariant() {
+        let cases: [(&str, &str); 4] = [
+            ("read_file", r#"{"path":"a.rs"}"#),
+            ("grep", r#"{"pattern":"BrowserSession"}"#),
+            ("run_command", r#"{"program":"cargo","args":["test"]}"#),
+            ("mcp__demo__inspect", r#"{"target":"repo"}"#),
+        ];
+        for (name, args) in cases {
+            let g = open_group(vec![
+                call(name, args, ToolStatus::Ok),
+                call(name, args, ToolStatus::Ok),
+            ]);
+            assert!(
+                !group_has_disclosure(&g),
+                "{name}: open group must not be history"
+            );
+            let lines = render_group_text(&g, 100, Locale::Zh);
+            assert!(
+                !lines.iter().any(|l| l.starts_with('▸')),
+                "{name}: no history row while open: {lines:?}"
+            );
+            let mut closed = g.clone();
+            closed.open = false;
+            assert!(
+                group_has_disclosure(&closed),
+                "{name}: closed settled group IS history"
+            );
+        }
+    }
+
+    /// A mixed parallel burst (read + search + command) is one bounded live
+    /// area, not one block per tool kind.
+    #[test]
+    fn a_mixed_parallel_burst_is_one_bounded_live_area() {
+        let mut calls = vec![
+            call("read_file", r#"{"path":"runtime.rs"}"#, ToolStatus::Running),
+            call("grep", r#"{"pattern":"owner"}"#, ToolStatus::Running),
+            call(
+                "run_command",
+                r#"{"program":"cargo","args":["check"]}"#,
+                ToolStatus::Running,
+            ),
+            call("read_file", r#"{"path":"driver.rs"}"#, ToolStatus::Ok),
+        ];
+        for c in &mut calls {
+            c.parallel = true;
+        }
+        let g = open_group(calls);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            !lines.iter().any(|l| l.starts_with('▸')),
+            "not history: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains('◌')).count(),
+            3,
+            "each running member (≤ bound) keeps one row: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains('✓')),
+            "the settled member is counted, not shown running: {lines:?}"
+        );
+    }
+
+    /// Partial completion keeps the group live at every step until the LAST
+    /// member settles — completing the first member must not collapse it.
+    #[test]
+    fn a_parallel_group_stays_live_until_the_last_member_settles() {
+        let mk = |statuses: [ToolStatus; 3]| {
+            let mut calls: Vec<ToolCallBlock> = statuses
+                .iter()
+                .enumerate()
+                .map(|(i, st)| call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#), *st))
+                .collect();
+            for c in &mut calls {
+                c.parallel = true;
+            }
+            open_group(calls)
+        };
+        use ToolStatus::{Ok as O, Running as R};
+        for (label, g) in [
+            ("all running", mk([R, R, R])),
+            ("one done", mk([O, R, R])),
+            ("two done", mk([O, O, R])),
+        ] {
+            let lines = render_group_text(&g, 100, Locale::Zh);
+            assert!(
+                lines.iter().any(|l| l.contains('◌')),
+                "{label}: live members keep live rows: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.starts_with('▸')),
+                "{label}: not history yet: {lines:?}"
+            );
+        }
+    }
+
+    /// §6 bounded live area: a wide burst gets a fixed number of running
+    /// rows plus one truthful hidden count — never one row per member.
+    #[test]
+    fn a_wide_parallel_burst_is_bounded_with_an_honest_hidden_count() {
+        let mut calls: Vec<ToolCallBlock> = (0..7)
+            .map(|i| {
+                call(
+                    "read_file",
+                    &format!(r#"{{"path":"file{i}.rs"}}"#),
+                    ToolStatus::Running,
+                )
+            })
+            .collect();
+        for c in &mut calls {
+            c.parallel = true;
+        }
+        let g = open_group(calls);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        let live = lines.iter().filter(|l| l.contains('◌')).count();
+        assert_eq!(live, 3, "bounded running rows: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("还有 4 个")),
+            "hidden members are counted, not dropped: {lines:?}"
+        );
     }
 
     /// §11 serial replace-in-place: while a group is open, settled ordinary

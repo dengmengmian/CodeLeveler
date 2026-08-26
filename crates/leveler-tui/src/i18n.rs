@@ -428,6 +428,8 @@ pub struct UiText {
 
     // Parallel batch header
     pub parallel_header: &'static str, // "并行执行 {} 个工具"
+    /// Live parallel area overflow: "… 还有 {} 个" running members without rows.
+    pub parallel_more_running: &'static str,
     /// Collapsed row for a finished batch: "{} 个工具 · Ctrl+O".
     pub batch_done: &'static str,
     /// Appended when some of them failed: "{} 个失败".
@@ -891,6 +893,7 @@ static ZH: UiText = UiText {
     tools_col_duration: "耗时",
     tools_output: "输出",
     parallel_header: "并行执行 {} 个工具",
+    parallel_more_running: "  … 还有 {} 个",
     disclosure_shell_one: "执行了 1 个命令",
     disclosure_shell_many: "执行了 {} 个命令",
     disclosure_read_one: "读取了 1 个文件",
@@ -1276,6 +1279,7 @@ static EN: UiText = UiText {
     tools_col_duration: "Duration",
     tools_output: "Output",
     parallel_header: "{} tools in parallel",
+    parallel_more_running: "  … {} more",
     disclosure_shell_one: "Ran 1 shell command",
     disclosure_shell_many: "Ran {} shell commands",
     disclosure_read_one: "Read 1 file",

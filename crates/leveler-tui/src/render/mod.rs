@@ -1408,6 +1408,8 @@ mod tests {
         );
         s.transcript
             .complete_tool(&second, false, "grep failed loudly".into(), 20);
+        // Close the group: only a CLOSED settled batch is history.
+        s.transcript.begin_assistant(MessageId::new("m-done"));
 
         // A finished batch states that it happened and names its failures; the
         // error text itself is one Ctrl+O away, so a run full of broken calls
@@ -1429,9 +1431,12 @@ mod tests {
             "collapsed group must not leak tool output: {auto}"
         );
 
-        // Opened, both calls and the error come back.
-        if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items_mut().last_mut() {
-            group.expanded = true;
+        // Opened, both calls and the error come back. (The assistant item that
+        // closed the group sits after it, so find the group by type.)
+        for item in s.transcript.items_mut() {
+            if let TranscriptItem::ToolGroup(group) = item {
+                group.expanded = true;
+            }
         }
         let open: String = crate::conversation::build::build_conversation_lines(&s, 100)
             .iter()
@@ -1443,9 +1448,11 @@ mod tests {
             "expanding must expose the error: {open}"
         );
 
-        // Expand the current (only) group via its own flag — not a global blast.
-        if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items_mut().last_mut() {
-            group.expanded = true;
+        // Expand the (only) group via its own flag — not a global blast.
+        for item in s.transcript.items_mut() {
+            if let TranscriptItem::ToolGroup(group) = item {
+                group.expanded = true;
+            }
         }
         let expanded: String = crate::conversation::build::build_conversation_lines(&s, 100)
             .iter()
