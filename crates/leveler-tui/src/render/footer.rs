@@ -581,9 +581,11 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
     let hints = if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
     } else if state.composer.is_empty() && state.turn_nav.is_none() {
+        // `!` sits right after `/`: both are composer entry points, and the
+        // width-truncation rule keeps the two openers alive longest.
         format!(
-            "/ {} · @ {} · Shift+Tab {} · Ctrl+? {}",
-            t.hint_commands, t.hint_files, t.hint_permission, t.hint_shortcuts
+            "/ {} · ! {} · @ {} · Shift+Tab {} · Ctrl+? {}",
+            t.hint_commands, t.hint_user_shell, t.hint_files, t.hint_permission, t.hint_shortcuts
         )
     } else {
         return Vec::new();
@@ -683,6 +685,57 @@ mod p1_tests {
                 reasoning_effort: None,
             },
         )
+    }
+
+    fn hint_text(s: &AppState, width: usize) -> String {
+        key_hint_line(s, width)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .collect()
+    }
+
+    /// The idle footer surfaces BOTH composer entry points: `/` for commands
+    /// and `!` for the user's own shell. `!` is a user-shell path, so it is
+    /// worded "Shell" — never like agent tool activity.
+    #[test]
+    fn idle_hint_surfaces_slash_commands_and_bang_shell() {
+        let s = state();
+        let text = hint_text(&s, 120);
+        assert!(text.contains("/ 命令"), "{text}");
+        assert!(text.contains("! Shell"), "{text}");
+        let mut en = state();
+        en.locale = crate::i18n::Locale::En;
+        let text = hint_text(&en, 120);
+        assert!(text.contains("/ commands"), "{text}");
+        assert!(text.contains("! Shell"), "{text}");
+    }
+
+    /// Narrow widths stay bounded via the existing truncation rule, and the
+    /// two openers sit early enough to survive it. A busy turn keeps the
+    /// interrupt hints — `!` does not displace them.
+    #[test]
+    fn hint_row_stays_bounded_and_busy_hints_unchanged() {
+        let s = state();
+        for width in [10, 24, 40, 80] {
+            let text = hint_text(&s, width);
+            assert!(
+                unicode_width::UnicodeWidthStr::width(text.as_str()) <= width,
+                "width {width}: `{text}`"
+            );
+        }
+        assert!(
+            hint_text(&s, 40).contains("! Shell"),
+            "{}",
+            hint_text(&s, 40)
+        );
+        let mut busy = state();
+        busy.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let text = hint_text(&busy, 120);
+        assert!(text.contains("Esc"), "{text}");
+        assert!(
+            !text.contains("! Shell"),
+            "busy row is for interrupts: {text}"
+        );
     }
 
     #[test]
