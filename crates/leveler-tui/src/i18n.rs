@@ -430,6 +430,13 @@ pub struct UiText {
     pub parallel_header: &'static str, // "并行执行 {} 个工具"
     /// Live parallel area overflow: "… 还有 {} 个" running members without rows.
     pub parallel_more_running: &'static str,
+    /// Background task lifecycle toasts. The task's opaque runtime id is
+    /// never the user-facing name: these carry what it is actually running.
+    pub background_task_started: &'static str,
+    pub background_task_done: &'static str,
+    pub background_task_failed: &'static str,
+    /// Fallback when no label was recorded (e.g. exit after a reconnect).
+    pub background_task_generic: &'static str,
     /// Collapsed row for a finished batch: "{} 个工具 · Ctrl+O".
     pub batch_done: &'static str,
     /// Appended when some of them failed: "{} 个失败".
@@ -894,6 +901,10 @@ static ZH: UiText = UiText {
     tools_output: "输出",
     parallel_header: "并行执行 {} 个工具",
     parallel_more_running: "  … 还有 {} 个",
+    background_task_started: "后台任务已启动:{}",
+    background_task_done: "后台任务已完成:{}",
+    background_task_failed: "后台任务失败:{}",
+    background_task_generic: "后台任务",
     disclosure_shell_one: "执行了 1 个命令",
     disclosure_shell_many: "执行了 {} 个命令",
     disclosure_read_one: "读取了 1 个文件",
@@ -1280,6 +1291,10 @@ static EN: UiText = UiText {
     tools_output: "Output",
     parallel_header: "{} tools in parallel",
     parallel_more_running: "  … {} more",
+    background_task_started: "Background task started: {}",
+    background_task_done: "Background task finished: {}",
+    background_task_failed: "Background task failed: {}",
+    background_task_generic: "background task",
     disclosure_shell_one: "Ran 1 shell command",
     disclosure_shell_many: "Ran {} shell commands",
     disclosure_read_one: "Read 1 file",

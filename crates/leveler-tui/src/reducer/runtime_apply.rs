@@ -534,11 +534,28 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             });
         }
         RuntimeEvent::BackgroundTaskStarted {
-            task_id, program, ..
+            task_id,
+            program,
+            args,
         } => {
+            // One lifecycle, one human label. The id stays as the projection
+            // key (stable identity, never text matching); what the user reads
+            // is the command it is running.
+            let label = crate::render::tool_summary(
+                "run_command",
+                &serde_json::json!({ "program": program, "args": args }).to_string(),
+            );
+            let label = if label.is_empty() {
+                program.clone()
+            } else {
+                label
+            };
+            state
+                .background_task_labels
+                .insert(task_id.clone(), label.clone());
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
-                message: format!("bg {task_id}: {program} started"),
+                message: state.t().background_task_started.replace("{}", &label),
             });
         }
         RuntimeEvent::ObservabilityLoaded {
@@ -560,13 +577,30 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             ok,
             ..
         } => {
+            let t = state.t();
+            // The same lifecycle settling: name what finished, not its id.
+            // A missing label (exit seen without its start, e.g. after a
+            // reconnect) falls back to a truthful generic — never invented.
+            let label = state
+                .background_task_labels
+                .remove(&task_id)
+                .unwrap_or_else(|| t.background_task_generic.to_string());
+            let message = if ok {
+                t.background_task_done.replace("{}", &label)
+            } else {
+                let failed = t.background_task_failed.replace("{}", &label);
+                match exit_code {
+                    Some(code) => format!("{failed} · exit {code}"),
+                    None => failed,
+                }
+            };
             state.notification = Some(Notification {
                 level: if ok {
                     NotificationLevel::Info
                 } else {
                     NotificationLevel::Warning
                 },
-                message: format!("bg {task_id}: exited code={exit_code:?}"),
+                message,
             });
         }
     }
@@ -861,6 +895,7 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
         state.token_output = 0;
         state.token_cached = 0;
         state.project_rule_sources.clear();
+        state.background_task_labels.clear();
         seal_analysis_segment(state);
         state.activity = None;
         state.turn_tool_calls = 0;

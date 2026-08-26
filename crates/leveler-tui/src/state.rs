@@ -102,6 +102,12 @@ pub struct AppState {
     /// start, turn end). Raw reasoning is not conversation content, and there
     /// is deliberately no historical representation of it at all.
     pub live_reasoning: String,
+    /// Background task id → human label, remembered from the task's start
+    /// event so its exit can name what finished. The exit event carries only
+    /// the id, and an opaque id is not a user-facing name. Entries are
+    /// removed on exit and cleared on session switch, so the map holds only
+    /// tasks currently in flight.
+    pub background_task_labels: std::collections::HashMap<String, String>,
     /// Multi-agent view model: what each child is for and what the parent did
     /// with what it produced. Built from events, never from prose.
     pub team: crate::multi_agent::TaskTeamView,
@@ -281,6 +287,7 @@ impl AppState {
             session_id: boot.session_id.clone(),
             transcript: TranscriptState::new(),
             live_reasoning: String::new(),
+            background_task_labels: std::collections::HashMap::new(),
             team: crate::multi_agent::TaskTeamView::default(),
             unfinished_goals: Vec::new(),
             composer: Composer::new(),

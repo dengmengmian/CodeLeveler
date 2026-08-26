@@ -3339,6 +3339,96 @@ fn activity_clears_when_the_tool_completes() {
     );
 }
 
+/// One background lifecycle reads as one named activity: the start names
+/// what is running, the exit names what finished, and the opaque runtime id
+/// is never the user-facing label. Two concurrent tasks stay distinct, keyed
+/// by that id — never by matching text.
+#[test]
+fn background_task_lifecycle_is_named_not_id_addressed() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-7f3a".into(),
+            program: "cargo".into(),
+            args: vec!["test".into(), "-p".into(), "leveler-tui".into()],
+        }),
+    );
+    let msg = s.notification.as_ref().unwrap().message.clone();
+    assert!(msg.contains("cargo test"), "names the command: {msg}");
+    assert!(
+        !msg.contains("bg-7f3a"),
+        "opaque id is not the label: {msg}"
+    );
+
+    // A second task in flight: the map keeps them apart by identity.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-91c2".into(),
+            program: "npm".into(),
+            args: vec!["run".into(), "dev".into()],
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-7f3a".into(),
+            exit_code: Some(0),
+            duration_ms: 12_000,
+            ok: true,
+        }),
+    );
+    let msg = s.notification.as_ref().unwrap().message.clone();
+    assert!(msg.contains("cargo test"), "the RIGHT task settled: {msg}");
+    assert!(!msg.contains("npm"), "the other task is untouched: {msg}");
+    assert!(!msg.contains("bg-7f3a"), "{msg}");
+    assert!(
+        s.background_task_labels.contains_key("bg-91c2"),
+        "the still-running task keeps its label"
+    );
+    assert!(
+        !s.background_task_labels.contains_key("bg-7f3a"),
+        "a settled task leaves no entry behind"
+    );
+
+    // Failure stays truthful and prominent, with the exit code.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-91c2".into(),
+            exit_code: Some(1),
+            duration_ms: 900,
+            ok: false,
+        }),
+    );
+    let note = s.notification.as_ref().unwrap();
+    assert!(note.message.contains("npm run dev"), "{}", note.message);
+    assert!(note.message.contains("exit 1"), "{}", note.message);
+    assert!(matches!(
+        note.level,
+        leveler_client_protocol::NotificationLevel::Warning
+    ));
+}
+
+/// An exit whose start was never seen (reconnect) must not invent a name.
+#[test]
+fn an_unlabeled_background_exit_falls_back_to_a_truthful_generic() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-unknown".into(),
+            exit_code: Some(0),
+            duration_ms: 5,
+            ok: true,
+        }),
+    );
+    let msg = s.notification.as_ref().unwrap().message.clone();
+    assert!(!msg.contains("bg-unknown"), "{msg}");
+    assert!(msg.contains("后台任务"), "generic but truthful: {msg}");
+}
+
 #[test]
 fn empty_end_requests_jump_to_bottom() {
     let mut s = opened();
