@@ -1764,9 +1764,14 @@ mod tests {
         let folded = tool_render(&item, false);
         let text = folded.iter().map(line_str).collect::<Vec<_>>().join("\n");
         assert!(!text.contains("line 30"), "folded diff is capped: {text}");
+        // Click-first: the fold names the interaction, not a shortcut.
         assert!(
-            text.contains("Ctrl+O") && text.contains("…"),
+            text.contains("点击展开完整 Diff") && text.contains("…"),
             "must hint how to see the full diff: {text}"
+        );
+        assert!(
+            !text.contains("Ctrl+O"),
+            "shortcuts are not advertised: {text}"
         );
 
         let expanded = tool_render(&item, true);

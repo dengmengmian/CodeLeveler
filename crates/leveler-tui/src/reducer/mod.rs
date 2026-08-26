@@ -740,17 +740,11 @@ fn navigate_user_turn(state: &mut AppState, delta: i32) {
     }
 }
 
-/// Ctrl+O: expand/collapse only the *current* focus item — never every group.
+/// Ctrl+O (undocumented fallback): toggle only the latest tool group.
 ///
-/// Priority:
-/// 1. Live reasoning (when non-empty) — toggle `reasoning_expanded` only.
-/// 2. Else the latest tool group — toggle its per-group `expanded` only.
+/// Analysis is visible conversation content and has no disclosure to toggle;
+/// the primary product interaction for tool detail is clicking the ▸ row.
 fn toggle_current_expand(state: &mut AppState) {
-    if !state.reasoning.trim().is_empty() {
-        state.reasoning_expanded = !state.reasoning_expanded;
-        // Reasoning lives only in the live footer; no scrollback rebuild.
-        return;
-    }
     if let Some(expanded) = state.transcript.toggle_last_tool_group() {
         // Mirror into the workbench flag used to render the focused group.
         state.tools_expanded = expanded;

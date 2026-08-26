@@ -169,6 +169,11 @@ pub struct UiText {
     pub team_panel_working: &'static str,
     pub team_panel_done: &'static str,
     pub team_panel_blocking: &'static str,
+    /// Header for a visible model-reasoning block. Product wording, not
+    /// "思考": analysis is content the user reads, not a hidden internal.
+    pub analysis_label: &'static str,
+    /// Truthful truncation marker for a long Analysis body (tail shown).
+    pub analysis_earlier_lines: &'static str,
     pub team_panel_incomplete: &'static str,
     pub goals_title: &'static str,
     pub goals_none_need_attention: &'static str,
@@ -311,7 +316,6 @@ pub struct UiText {
     // Reasoning / queue footer
     pub thinking: &'static str,
     pub thinking_lines: &'static str, // " · {} 行"
-    pub expand_thinking_tools: &'static str,
 
     // Slash command descriptions (same order as screen::SLASH_COMMANDS)
     pub slash: SlashText,
@@ -616,6 +620,8 @@ static ZH: UiText = UiText {
     team_panel_working: "协作中",
     team_panel_done: "协作完成",
     team_panel_blocking: "{n} 项阻塞待处理",
+    analysis_label: "分析",
+    analysis_earlier_lines: "… 前面还有 {} 行分析",
     team_panel_incomplete: "协作未完成",
     goals_title: "{n} 项目标待处理",
     goals_none_need_attention: "没有待处理的目标",
@@ -669,7 +675,7 @@ static ZH: UiText = UiText {
     key_newline: "换行",
     key_cancel_quit: "取消 / 退出",
     key_screens: "Diff/工具/会话",
-    key_expand: "Ctrl+O：展开/收起当前思考，否则仅最新工具组",
+    key_expand: "Ctrl+O：展开/收起最新工具组",
     key_turn_nav: "跳转用户轮次",
     key_model: "切换模型",
     key_jump: "回到底部输入（滚上看历史后）",
@@ -723,7 +729,6 @@ static ZH: UiText = UiText {
     candidate_files: "候选文件（{}）",
     thinking: "思考",
     thinking_lines: " · {} 行",
-    expand_thinking_tools: "  … Ctrl+O 展开当前思考（无思考时切换最新工具组）",
     slash: SlashText {
         model: "切换使用的 AI 模型",
         permission: "权限：逐步批准 / 辅助放行 / 全权（别名 /mode）",
@@ -868,9 +873,9 @@ static ZH: UiText = UiText {
     completion_files_changed: "修改 {} 个文件",
     completion_verified: "验证 {}/{} 通过",
     completion_diff_hint: "/diff 查看改动",
-    fold_more_lines: "… 还有 {} 行 · Ctrl+O 展开",
-    fold_more_lines_short: "(+{} 行 · Ctrl+O)",
-    fold_full_diff: "… Ctrl+O 查看完整 Diff",
+    fold_more_lines: "… 还有 {} 行",
+    fold_more_lines_short: "(+{} 行)",
+    fold_full_diff: "… 点击展开完整 Diff",
     tool_label_args: "参数",
     tool_label_patch: "补丁",
     tool_label_replace: "文本替换",
@@ -1000,6 +1005,8 @@ static EN: UiText = UiText {
     team_panel_working: "AI team",
     team_panel_done: "AI team · done",
     team_panel_blocking: "{n} blocking",
+    analysis_label: "Analysis",
+    analysis_earlier_lines: "… {} earlier analysis lines",
     team_panel_incomplete: "AI team · incomplete",
     goals_title: "{n} goals need attention",
     goals_none_need_attention: "nothing owed",
@@ -1053,7 +1060,7 @@ static EN: UiText = UiText {
     key_newline: "newline",
     key_cancel_quit: "cancel / quit",
     key_screens: "diff/tools/sessions",
-    key_expand: "Ctrl+O: expand/collapse live thinking, else only the latest tool group",
+    key_expand: "Ctrl+O: expand/collapse the latest tool group",
     key_turn_nav: "jump user turns",
     key_model: "switch model",
     key_jump: "jump to bottom after scrolling history",
@@ -1107,7 +1114,6 @@ static EN: UiText = UiText {
     candidate_files: "Candidate files ({})",
     thinking: "thinking",
     thinking_lines: " · {} lines",
-    expand_thinking_tools: "  … Ctrl+O expand live thinking (else latest tool group)",
     slash: SlashText {
         model: "switch AI model",
         permission: "permission: request-approval / assisted / full (alias /mode)",
@@ -1252,9 +1258,9 @@ static EN: UiText = UiText {
     completion_files_changed: "{} files changed",
     completion_verified: "verification {}/{} passed",
     completion_diff_hint: "/diff to view changes",
-    fold_more_lines: "… {} more lines · Ctrl+O to expand",
-    fold_more_lines_short: "(+{} lines · Ctrl+O)",
-    fold_full_diff: "… Ctrl+O for full diff",
+    fold_more_lines: "… {} more lines",
+    fold_more_lines_short: "(+{} lines)",
+    fold_full_diff: "… click for full diff",
     tool_label_args: "Arguments",
     tool_label_patch: "Patch",
     tool_label_replace: "Text replacement",

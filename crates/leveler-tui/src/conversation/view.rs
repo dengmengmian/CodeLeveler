@@ -19,8 +19,6 @@ pub struct ConvKey {
     pub(crate) monochrome: bool,
     pub(crate) locale: crate::i18n::Locale,
     pub(crate) tools_expanded: bool,
-    pub(crate) reasoning_expanded: bool,
-    pub(crate) reasoning: String,
 }
 
 /// One memoized conversation build: cache key, wrapped lines, and the

@@ -589,7 +589,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
 }
 
 #[test]
-fn ctrl_o_prefers_live_reasoning_over_tool_groups() {
+fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -609,16 +609,18 @@ fn ctrl_o_prefers_live_reasoning_over_tool_groups() {
             duration_ms: 1,
         }),
     );
-    s.reasoning = "thinking hard about the fix".into();
-    s.reasoning_expanded = false;
-
+    // Analysis is visible conversation content with no disclosure to toggle:
+    // even with a live analysis block, Ctrl+O goes straight to the latest
+    // tool group.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReasoningDelta {
+            delta: "thinking hard about the fix".into(),
+        }),
+    );
     reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-    );
-    assert!(
-        s.reasoning_expanded,
-        "Ctrl+O must expand live reasoning first"
     );
     let groups: Vec<_> = s
         .transcript
@@ -629,17 +631,11 @@ fn ctrl_o_prefers_live_reasoning_over_tool_groups() {
             _ => None,
         })
         .collect();
-    assert!(
-        groups.iter().all(|e| !*e),
-        "tool groups stay collapsed while reasoning is the target: {groups:?}"
+    assert_eq!(
+        groups.iter().filter(|e| **e).count(),
+        1,
+        "Ctrl+O toggles the latest tool group; analysis is not a disclosure: {groups:?}"
     );
-
-    // Second toggle collapses reasoning only.
-    reduce(
-        &mut s,
-        Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-    );
-    assert!(!s.reasoning_expanded);
 }
 
 #[test]
@@ -1726,7 +1722,7 @@ fn switching_session_resets_per_session_state_but_resync_keeps_it() {
     s.context_tokens = 4242;
     s.token_input = 100;
     s.diff_selected = 3;
-    s.reasoning = "old thinking".into();
+    s.transcript.push_reasoning_delta("old thinking");
 
     // Open a DIFFERENT session → per-session view state must reset.
     let mut other = snapshot();
@@ -1738,7 +1734,10 @@ fn switching_session_resets_per_session_state_but_resync_keeps_it() {
     assert_eq!(s.context_tokens, 0, "context gauge must reset on switch");
     assert_eq!(s.token_input, 0);
     assert_eq!(s.diff_selected, 0);
-    assert!(s.reasoning.is_empty());
+    assert!(
+        s.transcript.live_analysis().is_none(),
+        "switching sessions must not carry another session's live analysis"
+    );
 
     // A same-session resync (lag recovery) must NOT wipe live state.
     s.context_tokens = 777;
@@ -3299,7 +3298,12 @@ fn alt_backspace_deletes_word_not_attachment() {
 #[test]
 fn activity_clears_when_the_tool_completes() {
     let mut s = opened();
-    s.reasoning = "stale previous-step reasoning".into();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReasoningDelta {
+            delta: "previous-step analysis".into(),
+        }),
+    );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ToolCallStarted {
@@ -3323,9 +3327,18 @@ fn activity_clears_when_the_tool_completes() {
         s.activity.is_none(),
         "a finished tool must not linger in the status line while the model thinks"
     );
+    // The analysis emitted before the tool is sealed, not erased: it stays
+    // readable in the conversation, and the next delta starts a new block.
+    assert!(s.transcript.live_analysis().is_none(), "sealed, not live");
+    let kept = s.transcript.items().iter().any(|i| {
+        matches!(
+            i,
+            TranscriptItem::Analysis(b) if b.text.contains("previous-step analysis") && b.done
+        )
+    });
     assert!(
-        s.reasoning.is_empty(),
-        "completed tools must clear stale reasoning before waiting for the next model step"
+        kept,
+        "emitted analysis must survive as conversation history"
     );
 }
 
@@ -3427,10 +3440,18 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
         }),
     );
 
+    // Each step's reasoning is its own Analysis block now — the earlier
+    // step's text is sealed history, not a prefix of the new block.
+    assert_eq!(s.transcript.live_analysis(), Some("再补测试"));
+    let sealed_blocks = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|i| matches!(i, TranscriptItem::Analysis(b) if b.done))
+        .count();
     assert_eq!(
-        s.reasoning, "再补测试",
-        "each model step's reasoning replaces the previous step's, \
-         otherwise the thinking footer reads as one run-on paragraph"
+        sealed_blocks, 1,
+        "the first step's analysis is kept, sealed"
     );
 }
 
@@ -3467,7 +3488,9 @@ fn retry_attempt_reset_removes_divergent_transient_output() {
     assert!(s.transcript.items().iter().all(|item| {
         !matches!(item, TranscriptItem::Assistant(block) if block.text == "wrong prefix")
     }));
-    assert!(s.reasoning.is_empty());
+    // The retried attempt's reasoning is sealed history, not live state:
+    // nothing streams until the retry produces a new delta.
+    assert!(s.transcript.live_analysis().is_none());
 }
 
 #[test]

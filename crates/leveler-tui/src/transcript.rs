@@ -59,6 +59,20 @@ pub struct ToolGroupBlock {
     pub expanded: bool,
 }
 
+/// One contiguous run of model reasoning, visible in the conversation as an
+/// Analysis block (CC-style: Analysis → Tool → Analysis → …).
+///
+/// `done` is presentation segmentation ONLY — it means "another item began
+/// after this text", never "the reasoning completed / succeeded". Nothing in
+/// the runtime measures reasoning completion, so no state here may claim it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisBlock {
+    pub text: String,
+    /// Sealed: a non-reasoning item (tool call, assistant answer, turn end)
+    /// followed this text, so the next ReasoningDelta starts a new block.
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnEndStatus {
     Completed,
@@ -185,6 +199,8 @@ pub enum TranscriptItem {
     User(String),
     Assistant(AssistantBlock),
     ToolGroup(ToolGroupBlock),
+    /// Visible model reasoning. Not a disclosure: rendered directly.
+    Analysis(AnalysisBlock),
     SubAgent(SubAgentBlock),
     UserShell(UserShellBlock),
     Completion(UiCompletionReport),
@@ -470,6 +486,60 @@ impl TranscriptState {
     }
 
     /// Record a started tool call as a running block.
+    /// Append streamed reasoning to the live Analysis block, or start one.
+    ///
+    /// Segmentation falls out of ordering: if anything was pushed after the
+    /// last Analysis block, that block is no longer last, so this creates a
+    /// new one — Analysis / Tool / Analysis without a bespoke state machine.
+    pub fn push_reasoning_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.bump();
+        if let Some(TranscriptItem::Analysis(block)) = self.items.last_mut()
+            && !block.done
+        {
+            block.text.push_str(delta);
+            return;
+        }
+        // Defensive sweep: any earlier Analysis block is historical by
+        // definition (something interrupted it, or we would have appended).
+        // Marking it done here keeps scrollback finality honest even if a
+        // seal point was missed.
+        self.seal_analysis();
+        self.items.push(TranscriptItem::Analysis(AnalysisBlock {
+            text: delta.to_string(),
+            done: false,
+        }));
+    }
+
+    /// Seal every open Analysis block: the next ReasoningDelta starts fresh.
+    ///
+    /// Presentation only. This must never be rendered as "分析完成" — absence
+    /// of further reasoning is not proof of completion.
+    pub fn seal_analysis(&mut self) {
+        let mut changed = false;
+        for item in self.items.iter_mut() {
+            if let TranscriptItem::Analysis(block) = item
+                && !block.done
+            {
+                block.done = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump();
+        }
+    }
+
+    /// The live (still-streaming) Analysis text, if any.
+    pub fn live_analysis(&self) -> Option<&str> {
+        match self.items.last() {
+            Some(TranscriptItem::Analysis(block)) if !block.done => Some(block.text.as_str()),
+            _ => None,
+        }
+    }
+
     pub fn push_tool_started(
         &mut self,
         id: ToolCallId,
@@ -899,6 +969,97 @@ mod tests {
             open: false,
             expanded,
         }
+    }
+
+    /// One contiguous reasoning stream is ONE block, not one per delta.
+    #[test]
+    fn consecutive_reasoning_deltas_grow_one_analysis_block() {
+        let mut ts = TranscriptState::default();
+        ts.push_reasoning_delta("先确认契约。");
+        ts.push_reasoning_delta("schema 和 runtime 不一致。");
+        let analysis: Vec<_> = ts
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Analysis(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(analysis.len(), 1, "one stream, one block");
+        assert_eq!(analysis[0].text, "先确认契约。schema 和 runtime 不一致。");
+        assert!(!analysis[0].done, "still live");
+    }
+
+    /// A tool call ends the segment; later reasoning starts a NEW block after
+    /// the tool — Analysis / Tool / Analysis, the whole point of the feature.
+    #[test]
+    fn a_tool_boundary_starts_a_new_analysis_block() {
+        let mut ts = TranscriptState::default();
+        ts.push_reasoning_delta("第一段分析。");
+        ts.seal_analysis();
+        ts.push_tool_started(ToolCallId::new("t1"), "grep".into(), "{}".into(), false, 0);
+        ts.push_reasoning_delta("第二段分析。");
+        let kinds: Vec<&str> = ts
+            .items()
+            .iter()
+            .map(|i| match i {
+                TranscriptItem::Analysis(_) => "analysis",
+                TranscriptItem::ToolGroup(_) => "tools",
+                _ => "other",
+            })
+            .filter(|k| *k != "other")
+            .collect();
+        assert_eq!(kinds, vec!["analysis", "tools", "analysis"]);
+        // And the first block's text survived the boundary.
+        let TranscriptItem::Analysis(first) = &ts.items()[ts.items().len() - 3] else {
+            panic!("expected analysis");
+        };
+        assert_eq!(first.text, "第一段分析。");
+        assert!(first.done, "sealed by the boundary");
+    }
+
+    /// Sealing keeps the emitted text. A cancelled/failed turn must not erase
+    /// or complete the analysis that actually happened.
+    #[test]
+    fn sealing_preserves_emitted_analysis_verbatim() {
+        let mut ts = TranscriptState::default();
+        ts.push_reasoning_delta("正在检查回滚路径……");
+        ts.seal_analysis();
+        let TranscriptItem::Analysis(b) = ts.items().last().unwrap() else {
+            panic!("expected analysis");
+        };
+        assert_eq!(b.text, "正在检查回滚路径……");
+        assert!(b.done);
+    }
+
+    /// Interleaved analysis must not re-open or split tool grouping wrongly:
+    /// a tool after Analysis B opens a NEW group below it, in order.
+    #[test]
+    fn tools_after_a_new_analysis_open_a_new_group_below_it() {
+        let mut ts = TranscriptState::default();
+        ts.push_tool_started(ToolCallId::new("t1"), "grep".into(), "{}".into(), false, 0);
+        ts.push_reasoning_delta("分析。");
+        ts.push_tool_started(ToolCallId::new("t2"), "grep".into(), "{}".into(), false, 0);
+        let kinds: Vec<&str> = ts
+            .items()
+            .iter()
+            .map(|i| match i {
+                TranscriptItem::Analysis(_) => "analysis",
+                TranscriptItem::ToolGroup(_) => "tools",
+                _ => "other",
+            })
+            .filter(|k| *k != "other")
+            .collect();
+        assert_eq!(kinds, vec!["tools", "analysis", "tools"]);
+    }
+
+    /// Streaming must invalidate the conversation cache.
+    #[test]
+    fn reasoning_deltas_bump_the_transcript_version() {
+        let mut ts = TranscriptState::default();
+        let before = ts.version();
+        ts.push_reasoning_delta("x");
+        assert!(ts.version() > before);
     }
 
     #[test]

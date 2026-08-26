@@ -82,6 +82,9 @@ pub fn item_render(
         TranscriptItem::Assistant(block) => {
             out.extend(assistant_split(block, theme, wrap_width).0);
         }
+        TranscriptItem::Analysis(block) => {
+            out.extend(analysis_lines(block, theme, wrap_width, t));
+        }
         TranscriptItem::ToolGroup(group) => {
             // Same product surface as workbench Conversation: Silent tools
             // (update_goal success, ls probes, …) stay out; exploration
@@ -444,6 +447,9 @@ pub fn item_is_final(item: &TranscriptItem) -> bool {
                     .all(|call| call.status != ToolStatus::Running)
         }
         TranscriptItem::SubAgent(b) => b.status != ToolStatus::Running,
+        // Sealed = another item followed. Never a completion claim; it only
+        // says this text will not grow, which is all scrollback needs.
+        TranscriptItem::Analysis(b) => b.done,
         TranscriptItem::Btw(b) => b.done,
         _ => true,
     }
@@ -456,6 +462,57 @@ fn locale_from_ui_text(t: &UiText) -> Locale {
     } else {
         Locale::Zh
     }
+}
+
+/// Visible model reasoning: header + muted body. Not a disclosure — analysis
+/// is content the user reads, so there is no ▸/▾, no click, no shortcut.
+///
+/// Long bodies show their TAIL under a truthful marker. The tail is the
+/// decision-relevant end of a reasoning segment, and it is also what a live
+/// block needs (latest lines at the live edge). Bound chosen from measured
+/// data: typical segments run 10–25 lines, but this project has recorded
+/// single rounds of 6.7k reasoning tokens — unbounded rendering would bury
+/// the conversation under one thought.
+fn analysis_lines(
+    block: &crate::transcript::AnalysisBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    const ANALYSIS_TAIL_LINES: usize = 16;
+    let mut out = Vec::new();
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        format!("● {}", t.analysis_label),
+        Style::default()
+            .fg(theme.text.secondary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    out.push(Line::from(""));
+    let inner = wrap_width.saturating_sub(2).max(1);
+    let rows: Vec<String> = block
+        .text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .flat_map(|l| wrap(l, inner))
+        .collect();
+    let hidden = rows.len().saturating_sub(ANALYSIS_TAIL_LINES);
+    if hidden > 0 {
+        out.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                t.analysis_earlier_lines.replace("{}", &hidden.to_string())
+            ),
+            Style::default().fg(theme.border.normal),
+        )));
+    }
+    for row in rows.iter().skip(hidden) {
+        out.push(Line::from(Span::styled(
+            format!("  {row}"),
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    out
 }
 
 pub(crate) fn sub_agent_display_name(
@@ -1025,6 +1082,78 @@ pub(crate) fn user_shell_lines(
 
 #[cfg(test)]
 mod tests {
+
+    fn plain(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn analysis_item(text: &str, done: bool) -> crate::transcript::TranscriptItem {
+        crate::transcript::TranscriptItem::Analysis(crate::transcript::AnalysisBlock {
+            text: text.into(),
+            done,
+        })
+    }
+
+    fn render_item(item: &crate::transcript::TranscriptItem) -> String {
+        let theme = crate::theme::Theme::default();
+        let t = crate::i18n::Locale::En.text();
+        plain(&item_render(item, &theme, 80, false, t))
+    }
+
+    /// Analysis is conversation content: visible without any expansion, no
+    /// disclosure glyph, no shortcut hint, labeled as analysis — not 思考.
+    #[test]
+    fn analysis_is_visible_by_default_with_no_disclosure_chrome() {
+        let text = render_item(&analysis_item("check the rollback path first", true));
+        assert!(text.contains("Analysis"), "{text}");
+        assert!(text.contains("check the rollback path first"), "{text}");
+        assert!(!text.contains("Ctrl+O"), "{text}");
+        assert!(!text.contains('▸'), "analysis is not a disclosure: {text}");
+        assert!(!text.contains("思考"), "{text}");
+    }
+
+    /// No completion state exists to render — sealed and live blocks carry the
+    /// same header. "分析完成" would claim something nothing measured.
+    #[test]
+    fn no_analysis_completion_state_is_rendered() {
+        for done in [false, true] {
+            let text = render_item(&analysis_item("still looking", done));
+            assert!(!text.contains("完成"), "{text}");
+            assert!(!text.contains("Completed"), "{text}");
+            assert!(!text.contains('✓'), "{text}");
+        }
+    }
+
+    /// A long body shows its tail under a truthful marker rather than either
+    /// flooding the viewport or silently dropping content.
+    #[test]
+    fn a_long_analysis_shows_its_tail_with_an_honest_marker() {
+        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let text = render_item(&analysis_item(&body, true));
+        assert!(text.contains("earlier analysis lines"), "{text}");
+        assert!(
+            text.contains("line 40"),
+            "the tail is the live edge: {text}"
+        );
+        assert!(!text.contains("line 1\n"), "head is folded: {text}");
+    }
+
+    /// Finality: a live block must not be committed to scrollback; a sealed
+    /// one may be.
+    #[test]
+    fn analysis_finality_follows_the_seal() {
+        assert!(!item_is_final(&analysis_item("t", false)));
+        assert!(item_is_final(&analysis_item("t", true)));
+    }
     use super::*;
     use crate::i18n::Locale;
     use crate::theme::Theme;
@@ -1235,9 +1364,15 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
+        // The honest count is the cut marker; expansion is click / the
+        // undocumented Ctrl+O fallback, neither advertised inline.
         assert!(
-            text.contains("Ctrl+O"),
-            "the cut must offer a way back: {text}"
+            text.contains("还有 16 行"),
+            "the cut must be named truthfully: {text}"
+        );
+        assert!(
+            !text.contains("Ctrl+O"),
+            "shortcuts are not advertised: {text}"
         );
     }
 

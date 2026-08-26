@@ -1,4 +1,4 @@
-//! Conversation build: transcript (+ live reasoning) → wrapped display lines
+//! Conversation build: transcript → wrapped display lines
 //! plus the disclosure hit rows, memoized under one cache key.
 //!
 //! The hit rows are built in the same pass and cached in the same entry as
@@ -52,8 +52,6 @@ impl AppState {
             monochrome: self.theme.monochrome,
             locale: self.locale,
             tools_expanded: self.tools_expanded,
-            reasoning_expanded: self.reasoning_expanded,
-            reasoning: self.reasoning.clone(),
         };
         if let Some((k, lines, hits)) = self.conv.cache.borrow().as_ref()
             && *k == key
@@ -206,52 +204,6 @@ pub fn build_conversation_lines_with_hits(
             out.remove(at);
         }
         idx += 1;
-    }
-
-    // Live reasoning as activity while in flight.
-    if !state.reasoning.is_empty() {
-        out.push(Line::from(""));
-        let disclosure = if state.reasoning_expanded {
-            "▾"
-        } else {
-            "▸"
-        };
-        let reasoning_lines: Vec<&str> = state
-            .reasoning
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-        let n = reasoning_lines.len();
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("{disclosure} {} · {n} lines", t.thinking),
-                Style::default().fg(theme.text.secondary),
-            ),
-            Span::styled(
-                if state.reasoning_expanded {
-                    String::new()
-                } else {
-                    "  Ctrl+O".to_string()
-                },
-                Style::default().fg(theme.border.normal),
-            ),
-        ]));
-        if state.reasoning_expanded {
-            // Cap body so CoT cannot flood the viewport; show honest remainder.
-            const MAX_EXPANDED_REASONING: usize = 24;
-            for line in reasoning_lines.iter().take(MAX_EXPANDED_REASONING) {
-                out.push(Line::from(Span::styled(
-                    format!("  {line}"),
-                    Style::default().fg(theme.text.secondary),
-                )));
-            }
-            if n > MAX_EXPANDED_REASONING {
-                out.push(Line::from(Span::styled(
-                    format!("  … (+{} lines)", n - MAX_EXPANDED_REASONING),
-                    Style::default().fg(theme.border.normal),
-                )));
-            }
-        }
     }
 
     (out, hits)

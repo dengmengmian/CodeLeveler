@@ -75,14 +75,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::AssistantMessageStarted { message_id } => {
             mark_turn_busy(state);
-            reset_reasoning(state);
+            seal_analysis_segment(state);
             state.transcript.begin_assistant(message_id);
         }
         RuntimeEvent::AssistantAttemptReset { message_id } => {
             if let Some(message_id) = message_id {
                 state.transcript.reset_assistant_attempt(&message_id);
             }
-            reset_reasoning(state);
+            seal_analysis_segment(state);
         }
         RuntimeEvent::AssistantTextDelta { message_id, delta } => {
             mark_turn_busy(state);
@@ -90,13 +90,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::ReasoningDelta { delta } => {
             mark_turn_busy(state);
-            // The previous step's thought ended when it called a tool. This
-            // delta belongs to a fresh step, so it replaces that thought
-            // instead of running on from it.
-            if state.reasoning_superseded {
-                reset_reasoning(state);
-            }
-            state.reasoning.push_str(&delta);
+            // Transcript-owned: the conversation keeps every Analysis block.
+            // Segmentation (a tool call / answer ends the block) is handled by
+            // seal points; a delta after a seal starts a new visible block.
+            state.transcript.push_reasoning_delta(&delta);
         }
         RuntimeEvent::AssistantMessageCompleted { message_id } => {
             state.transcript.finish_assistant(&message_id);
@@ -128,9 +125,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         } => {
             mark_turn_busy(state);
             state.turn_tool_calls = state.turn_tool_calls.saturating_add(1);
-            // Acting on the thought ends it. It stays on screen while the tool
-            // runs; the next step's first reasoning delta replaces it.
-            state.reasoning_superseded = true;
+            // Acting on the thought ends this Analysis segment. The text
+            // stays visible in the conversation; the next step's reasoning
+            // starts a NEW block after the tool disclosure.
+            state.transcript.seal_analysis();
             // Status line shows what the tool is DOING ("运行 cargo check -p x"),
             // not the internal tool name ("运行 run_command").
             let verb = crate::tool_taxonomy::presentation_label(&name, state.locale);
@@ -161,7 +159,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // reads as a hung tool ("读取 x… (4m)"). Fall back to the
             // thinking indicator until the next activity arrives.
             state.activity = None;
-            reset_reasoning(state);
+            seal_analysis_segment(state);
         }
         RuntimeEvent::PlanUpdated { plan } => {
             // Fully succeeded plans (incl. 1/1) clear immediately so the chrome
@@ -268,7 +266,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.finalize_in_flight();
             state.cancel_armed = false;
             state.force_cancel_armed = false;
-            reset_reasoning(state);
+            seal_analysis_segment(state);
             // Surface the error ONCE, followed by the persistent turn-end
             // marker. A duplicate transient notification would only add noise.
             let detail = error.clone();
@@ -296,7 +294,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 summary,
                 None,
             );
-            reset_reasoning(state);
+            seal_analysis_segment(state);
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
                 message: state.t().cancelled_continue.to_string(),
@@ -635,7 +633,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     {
         state.composer.replace_suggestion(suggestion);
     }
-    reset_reasoning(state);
+    seal_analysis_segment(state);
 }
 
 /// Rough token estimate from transcript text (CJK-aware), used only when the
@@ -747,15 +745,14 @@ pub(super) fn start_turn(state: &mut AppState) {
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
     state.project_rule_sources.clear();
-    reset_reasoning(state);
+    seal_analysis_segment(state);
 }
 
-/// Take the thinking footer back to empty: no step is in flight, so there is no
-/// thought to show.
-fn reset_reasoning(state: &mut AppState) {
-    state.reasoning.clear();
-    state.reasoning_expanded = false;
-    state.reasoning_superseded = false;
+/// Seal the live Analysis segment: whatever reasoning was emitted stays
+/// visible in the conversation, and the next delta starts a new block.
+/// This is presentation segmentation, never a completion claim.
+fn seal_analysis_segment(state: &mut AppState) {
+    state.transcript.seal_analysis();
 }
 
 fn mark_turn_busy(state: &mut AppState) {
@@ -866,7 +863,7 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
         state.token_output = 0;
         state.token_cached = 0;
         state.project_rule_sources.clear();
-        reset_reasoning(state);
+        seal_analysis_segment(state);
         state.activity = None;
         state.turn_tool_calls = 0;
         state.screen_scroll = 0;

@@ -68,10 +68,6 @@ pub(crate) fn result_lines(
             ),
             Style::default().fg(theme.border.normal),
         ),
-        Span::styled(
-            if expanded { "" } else { " · Ctrl+O" }.to_string(),
-            Style::default().fg(theme.border.normal),
-        ),
     ]));
 
     if expanded {

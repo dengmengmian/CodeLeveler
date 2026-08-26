@@ -121,15 +121,6 @@ pub struct AppState {
     pub verification: Option<UiVerification>,
     pub diff: Option<UiDiff>,
     pub diff_selected: usize,
-    /// Reasoning streamed by the model step currently in flight. A turn runs
-    /// many steps; each step's thought stands on its own, so the next step's
-    /// first delta replaces this rather than appending to it (see
-    /// `reasoning_superseded`).
-    pub reasoning: String,
-    /// Set once the in-flight step commits to an action (a tool call), which
-    /// ends its thought. The thought stays on screen while the tools run; the
-    /// next step's first reasoning delta clears it.
-    pub reasoning_superseded: bool,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
     /// Product work profile: economy | balanced | delivery.
@@ -204,9 +195,6 @@ pub struct AppState {
     /// Legacy global expand flag — no longer forces every tool group open.
     /// Kept so the workbench can render the currently focused tool group.
     pub tools_expanded: bool,
-    /// Whether the live reasoning block is fully expanded (Ctrl+O when
-    /// reasoning is the current focus).
-    pub reasoning_expanded: bool,
     /// Shift+↑/↓ review index into user turns (`None` = live edge).
     /// Composer draft is never cleared while navigating.
     pub turn_nav: Option<usize>,
@@ -299,8 +287,6 @@ impl AppState {
             verification: None,
             diff: None,
             diff_selected: 0,
-            reasoning: String::new(),
-            reasoning_superseded: false,
             goal_mode_active: false,
             work_profile: "balanced".into(),
             collaboration: "chat".into(),
@@ -333,7 +319,6 @@ impl AppState {
             shell_screen_item: None,
             plan_collapsed: false,
             tools_expanded: false,
-            reasoning_expanded: false,
             turn_nav: None,
             slash_selected: 0,
             slash_popup_dismissed: false,

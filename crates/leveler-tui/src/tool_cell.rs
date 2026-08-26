@@ -743,7 +743,7 @@ pub(crate) fn tool_lines(
                     t.fold_more_lines_short.replace("{}", &more.to_string())
                 )
             } else {
-                "  (Ctrl+O)".to_string()
+                String::new()
             }
         } else {
             String::new()
@@ -1399,9 +1399,12 @@ mod tests {
         let body = text.iter().filter(|l| l.contains("usage line")).count();
         assert_eq!(body, 1, "collapsed shows only the first line: {text:?}");
         assert!(
-            text.iter()
-                .any(|l| l.contains("+39 行") && l.contains("Ctrl+O")),
-            "must hint how to expand: {text:?}"
+            text.iter().any(|l| l.contains("(+39 行)")),
+            "the fold names its size truthfully: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("Ctrl+O")),
+            "shortcuts are not advertised: {text:?}"
         );
     }
 
