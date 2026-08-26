@@ -112,6 +112,49 @@ most likely means `go test`, but running argv[0] would launch `/usr/bin/test`
 instead — a different program, silently. Naming the missing field is honest;
 inferring it is a coin flip with side effects.
 
+## The second real failure — and what it proved
+
+After the schema fix landed, a real session produced another program-less
+call. Forensics (EventLog, verbatim):
+
+```json
+{"args":["test","./...","-count=1"],"timeout_seconds":120}
+```
+
+What the trace established, link by link:
+
+| Link | Verdict |
+| --- | --- |
+| Stream parsing | strict JSON, never repairs — the arguments are the model's own, verbatim |
+| Outbound conversion | `parameters: t.input_schema.clone()` — `required` reaches the wire untouched |
+| Strict function calling | not supported by the provider, not requested by CodeLeveler — `required` is advisory to this model |
+| Prompts/examples | no repo text teaches `cmd` or args-only shapes |
+| **The binary** | **pre-fix.** The error text in the log is the old universal message, which the fixed code cannot produce for a non-empty `args` — the session ran against a long-lived daemon started before the fixed binary was installed |
+
+So the schema fix was never actually exercised: whether it changes the
+model's behavior is unproven until a real session runs on the fixed binary.
+The failure did prove the model omits `program` habitually — which is why the
+runtime fallback layer exists at all.
+
+### The cmd shape is refused by name
+
+`{"cmd": "go test ./..."}` on run_command deserializes with `cmd` dropped
+(no `deny_unknown_fields`), so it used to fall into the generic empty-args
+message. Now the raw payload is checked first and the refusal names the field:
+the caller is told `cmd` was seen, nothing was executed, and which tool owns
+that shape. **Never silently convert one tool into the other** — run_command
+executes argv, shell_command executes a shell line; they differ in execution
+and security semantics, and a silent conversion runs the caller's text under
+a model it did not choose.
+
+### The TUI must not prettify invalid calls
+
+`execute_command_summary` used to render `{"args":["test","./..."]}` as
+`$ test ./... -count=1` and `run_command {"cmd": …}` as `$ go test …` — a
+valid-looking command line for a call the runtime refused (and naming the
+wrong executable). Both now render `参数无效 · 缺少 program`, and the `$`
+prefix is reserved for genuine command lines.
+
 ## Audit — every tool argument struct
 
 Looking for the dangerous shape: `Option<T>` + unconditional runtime rejection

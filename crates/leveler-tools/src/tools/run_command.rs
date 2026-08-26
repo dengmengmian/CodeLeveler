@@ -85,6 +85,33 @@ impl Tool for RunCommandTool {
         super::schema_of::<Input>()
     }
 
+    /// The registry's schema gate rejects a program-less call before
+    /// `execute` runs; this phrases that refusal. Two shapes, two messages —
+    /// and the input is never repaired into the other tool.
+    fn invalid_input_guidance(&self, input: &serde_json::Value) -> Option<String> {
+        let program_ok = input
+            .get("program")
+            .and_then(|v| v.as_str())
+            .is_some_and(|p| !p.trim().is_empty());
+        if program_ok {
+            return None; // some other schema violation: the raw error is right
+        }
+        if let Some(cmd) = input.get("cmd").and_then(|v| v.as_str()) {
+            return Some(cmd_shape_guidance(cmd));
+        }
+        let args: Vec<String> = input
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(missing_program_guidance(&args))
+    }
+
     fn risk(&self) -> RiskLevel {
         RiskLevel::WorkspaceWrite
     }
@@ -99,6 +126,13 @@ impl Tool for RunCommandTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        // shell_command's `cmd` field on run_command is a distinct mistake from
+        // a missing program: the caller wants shell semantics from the argv
+        // tool. Detect it on the raw payload (the typed Input has no such
+        // field) so the refusal can name what was actually sent. Never
+        // silently convert one tool into the other — their execution and
+        // security semantics differ.
+        let cmd_shape = input.get("cmd").and_then(|v| v.as_str()).map(str::to_owned);
         let input: Input = super::parse_input(self.name(), input)?;
         // The frequent mixup: the model hands run_command a whole shell string
         // (or shell_command's `cmd` field) instead of program+args. Steer it to
@@ -111,6 +145,9 @@ impl Tool for RunCommandTool {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         else {
+            if let Some(cmd) = cmd_shape {
+                return Ok(ToolOutput::error(cmd_shape_guidance(&cmd)));
+            }
             // Two different mistakes reach here and they need different advice.
             // A real argument array with no executable is not a shell string;
             // sending it to shell_command would be wrong advice, and the caller
@@ -838,6 +875,25 @@ fn resolve_timeout(timeout_seconds: Option<u64>) -> Duration {
 /// most likely means `go test`, but running argv[0] would launch
 /// `/usr/bin/test` instead — a different program, silently. Naming the missing
 /// field is honest; inferring it is a coin flip with side effects.
+/// The caller sent shell_command's `cmd` field to run_command. Nothing is
+/// executed: run_command runs one executable under argv semantics, and a
+/// shell line silently re-routed (either direction) would run under the
+/// wrong execution and security model.
+fn cmd_shape_guidance(cmd: &str) -> String {
+    format!(
+        "run_command does not take a `cmd` field — nothing was executed. \
+         run_command runs one executable: {{\"program\": \"go\", \"args\": \
+         [\"test\", \"./...\"]}}. For a whole shell command line like `{}` \
+         (pipes, $(), redirection, &&), call shell_command with its `cmd` field.",
+        if cmd.chars().count() > 120 {
+            let head: String = cmd.chars().take(120).collect();
+            format!("{head}\u{2026}")
+        } else {
+            cmd.to_string()
+        },
+    )
+}
+
 fn missing_program_guidance(args: &[String]) -> String {
     if args.is_empty() {
         return "run_command needs a `program` (the executable) and an optional \
@@ -1864,6 +1920,27 @@ mod contract_tests {
         assert!(
             out.contains("\\\"program\\\": \\\"go\\\""),
             "a concrete corrected call is worth more than a rule: {out}"
+        );
+    }
+
+    /// shell_command's `cmd` field on run_command is refused BY NAME, and the
+    /// command inside it is never executed. run_command and shell_command have
+    /// different security/execution semantics — a silent conversion would run
+    /// a shell line under argv semantics (or the reverse); an explicit error
+    /// is the only honest response.
+    #[tokio::test]
+    async fn a_cmd_shape_call_is_refused_naming_the_cmd_field() {
+        let marker = "leveler-cmd-shape-must-not-run";
+        let out = run(serde_json::json!({"cmd": format!("touch {marker}")})).await;
+        assert!(out.contains("error") || out.contains("Error"), "{out}");
+        assert!(out.contains("cmd"), "names the field it saw: {out}");
+        assert!(
+            out.contains("shell_command"),
+            "steers to the right tool: {out}"
+        );
+        assert!(
+            !std::path::Path::new(marker).exists(),
+            "the shell line must never execute"
         );
     }
 

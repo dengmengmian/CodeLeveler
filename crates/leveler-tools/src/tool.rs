@@ -436,6 +436,18 @@ pub trait Tool: Send + Sync {
         input
     }
 
+    /// Phrase the refusal for a structurally invalid call, in this tool's
+    /// own vocabulary. Consulted by the registry ONLY after schema validation
+    /// has already rejected the input — returning `Some` replaces the bare
+    /// schema error with actionable guidance; `None` (the default) lets the
+    /// schema error surface as-is.
+    ///
+    /// Implementations must never execute anything and never repair the
+    /// input: the call is refused either way, this only decides the wording.
+    fn invalid_input_guidance(&self, _input: &serde_json::Value) -> Option<String> {
+        None
+    }
+
     /// The risk class of this tool.
     fn risk(&self) -> RiskLevel;
 

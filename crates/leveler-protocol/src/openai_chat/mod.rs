@@ -539,6 +539,39 @@ mod tests {
             .body
     }
 
+    /// The wire contract: a tool's published `required` list reaches the
+    /// provider verbatim. If a conversion step ever drops or rewrites
+    /// `required`, a schema fix in the tool crate silently stops reaching the
+    /// model — exactly the run_command failure mode.
+    #[test]
+    fn tool_schema_required_reaches_the_outbound_request_verbatim() {
+        let mut req = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-chat"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        req.tools = vec![ToolDefinition {
+            name: "run_command".into(),
+            description: "run".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "program": {"type": ["string", "null"]},
+                    "args": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["program"]
+            }),
+        }];
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&req, &ctx(), true)
+            .unwrap()
+            .body;
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["required"],
+            serde_json::json!(["program"]),
+            "outbound parameters must carry required verbatim"
+        );
+    }
+
     #[test]
     fn thinking_model_with_auto_choice_keeps_thinking_and_omits_tool_choice() {
         let context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::Max));

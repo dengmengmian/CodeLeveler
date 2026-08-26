@@ -195,7 +195,16 @@ impl ToolRegistry {
         }
 
         let input = tool.normalize_input(input);
-        validate_schema(name, &tool.input_schema(), &input)?;
+        // A structural rejection is final either way; the tool may only
+        // choose the wording. run_command turns "\"program\" is a required
+        // property" into guidance naming the exact mistake — the only
+        // feedback loop a provider that ignores `required` ever sees.
+        if let Err(schema_error) = validate_schema(name, &tool.input_schema(), &input) {
+            if let Some(guidance) = tool.invalid_input_guidance(&input) {
+                return Ok(ToolOutput::error(guidance));
+            }
+            return Err(schema_error);
+        }
 
         let budget = context.policy.tool_output_budget;
         let mut output = tool.execute(input, context, cancellation).await?;
@@ -672,6 +681,40 @@ mod tests {
     /// upstream by schema validation with a bare "program is a required field".
     /// This exercises the full registry path (schema validation → dispatch),
     /// unlike the unit test that calls `RunCommandTool::execute` directly.
+    /// The production gate for the shape a real session produced: a correct
+    /// args array with no executable. The refusal must lead with the repair
+    /// (supply `program`), not steer to a different tool.
+    #[tokio::test]
+    async fn run_command_args_only_gets_targeted_guidance_through_the_registry() {
+        let reg = default_registry();
+        let dir =
+            std::env::temp_dir().join(format!("leveler-argsonly-{}", crate::tools::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = reg
+            .execute(
+                "run_command",
+                serde_json::json!({"args": ["test", "./...", "-count=1"], "timeout_seconds": 120}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a friendly tool error, not a schema rejection");
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("missing `program`"),
+            "the repair leads: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("\"program\": \"go\""),
+            "a concrete corrected call is shown: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn run_command_missing_program_steers_to_shell_command() {
         let reg = default_registry();
