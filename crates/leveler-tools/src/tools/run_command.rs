@@ -15,11 +15,31 @@ const MAX_OUTPUT: usize = 32 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
-    /// The program to run, e.g. "cargo". Required in practice, but kept
-    /// schema-optional so a missing/blank value reaches the tool and returns
-    /// actionable guidance (steer to `shell_command`) instead of a bare
-    /// "program is a required field" schema rejection from the registry.
-    #[serde(default)]
+    /// Required. The executable only, e.g. "cargo" or "go" — never a whole
+    /// command line. Everything after it goes in `args`.
+    //
+    // Deliberately `Option` in the type despite being required in the
+    // contract, so a missing value reaches `execute` and gets guidance
+    // naming what is wrong instead of a bare schema rejection. That rationale
+    // stays OUT of the doc comment: schemars publishes doc comments as the
+    // model-facing description, and a field documented as "kept
+    // schema-optional" reads as permission to omit it — which a real session
+    // did, twice, sending `{"args":["test","./..."]}` with no program at all.
+    //
+    // `schemars(required)` keeps the MACHINE contract honest: the published
+    // schema lists `program` in `required`, which is the only signal a
+    // strict-function-calling provider actually enforces. Prose in a
+    // description is not a contract. The `Option` remains so a provider that
+    // does not enforce `required` — or a model that sends an empty string —
+    // still reaches `execute` and gets a message naming what is missing.
+    //
+    // No `#[serde(default)]`: schemars 0.8 treats a serde default as a veto
+    // over `required` (`_private::insert_object_property` checks
+    // `!has_default && …`), so the two cannot be combined — the attribute
+    // would be silently ignored and the published contract would keep lying.
+    // `Option<T>` alone already deserializes a missing key to `None`, which
+    // is the fallback this needs.
+    #[schemars(required)]
     program: Option<String>,
     /// Arguments passed as an array (never a shell string).
     #[serde(default)]
@@ -91,12 +111,11 @@ impl Tool for RunCommandTool {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         else {
-            return Ok(ToolOutput::error(
-                "run_command needs a `program` (the executable) and an optional \
-                 `args` array — it does not take a shell string. To run a whole \
-                 command line (e.g. `./admin-server`, or one with pipes / $() / \
-                 redirection / &&), use shell_command with its `cmd` field instead.",
-            ));
+            // Two different mistakes reach here and they need different advice.
+            // A real argument array with no executable is not a shell string;
+            // sending it to shell_command would be wrong advice, and the caller
+            // would keep making the same mistake.
+            return Ok(ToolOutput::error(missing_program_guidance(&input.args)));
         };
         let args = normalize_args(program, input.args);
         // Same product semantics as the workspace layer: read_file(".env") is
@@ -811,6 +830,31 @@ fn resolve_timeout(timeout_seconds: Option<u64>) -> Duration {
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .min(MAX_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// What to tell a caller that supplied no `program`.
+///
+/// The executable is never guessed from `args`: `{"args":["test","./..."]}`
+/// most likely means `go test`, but running argv[0] would launch
+/// `/usr/bin/test` instead — a different program, silently. Naming the missing
+/// field is honest; inferring it is a coin flip with side effects.
+fn missing_program_guidance(args: &[String]) -> String {
+    if args.is_empty() {
+        return "run_command needs a `program` (the executable) and an optional \
+                `args` array — it does not take a shell string. To run a whole \
+                command line (e.g. `./admin-server`, or one with pipes / $() / \
+                redirection / &&), use shell_command with its `cmd` field instead."
+            .to_string();
+    }
+    format!(
+        "run_command is missing `program`: the executable that runs `{}`. \
+         `args` is correct as an array — it just has nothing to run. Repeat the \
+         call with `program` set, e.g. {{\"program\": \"go\", \"args\": {}}}. \
+         Use shell_command only for a whole command line with pipes, $(), \
+         redirection or &&.",
+        args.join(" "),
+        serde_json::to_string(args).unwrap_or_else(|_| "[…]".into()),
+    )
 }
 
 fn normalize_args(program: &str, mut args: Vec<String>) -> Vec<String> {
@@ -1713,5 +1757,140 @@ mod command_gate_tests {
             "uncontended gate must be ~free"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::tool::Tool;
+
+    /// The doc comment on `program` becomes the JSON Schema description the
+    /// model reads. It must state the contract, not explain the runtime's
+    /// internals — a field documented as "kept schema-optional" reads as
+    /// permission to omit it, and a real session did exactly that twice.
+    #[test]
+    fn the_program_field_does_not_tell_the_model_it_is_optional() {
+        let schema = RunCommandTool.input_schema();
+        let description = schema
+            .pointer("/properties/program/description")
+            .and_then(|d| d.as_str())
+            .expect("program has a description")
+            .to_lowercase();
+        for leak in [
+            "schema-optional",
+            "optional so",
+            "reaches the tool",
+            "registry",
+        ] {
+            assert!(
+                !description.contains(leak),
+                "implementation rationale leaked into the model-facing schema: {description}"
+            );
+        }
+        assert!(
+            description.contains("required"),
+            "the model must be told this is required: {description}"
+        );
+    }
+
+    /// Prose is not a contract. A strict-function-calling provider enforces
+    /// the `required` array and nothing else, so a field the tool cannot work
+    /// without must appear there — regardless of how the Rust type spells it.
+    ///
+    /// Asserted against `ToolRegistry::definitions()` — the exact value handed
+    /// to a provider — not against the local type's schema. If a registry
+    /// transform, adapter or normalisation step ever drops `required`, the
+    /// contract breaks there and a type-local test would still pass.
+    #[test]
+    fn the_published_schema_requires_program() {
+        let registry = crate::registry::default_registry();
+        let def = registry
+            .definitions()
+            .into_iter()
+            .find(|d| d.name == "run_command")
+            .expect("run_command is registered");
+        let required: Vec<&str> = def
+            .input_schema
+            .pointer("/required")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            required.contains(&"program"),
+            "the schema published to providers must require `program`; it lists {required:?}"
+        );
+    }
+
+    /// The fallback must survive the schema fix. A provider that does not
+    /// enforce `required` still reaches the runtime, and the runtime must
+    /// still refuse — a strong contract at the first gate does not remove the
+    /// need for the last one.
+    #[tokio::test]
+    async fn an_empty_program_is_refused_by_the_runtime() {
+        for blank in ["", "   ", "\t"] {
+            let out = run(serde_json::json!({"program": blank, "args": ["x"]})).await;
+            assert!(
+                out.contains("is_error: true"),
+                "a blank program must be refused, not run: {out}"
+            );
+        }
+    }
+
+    /// A well-formed call is untouched by any of this.
+    #[tokio::test]
+    async fn a_valid_call_still_runs() {
+        let out = run(serde_json::json!({"program": "echo", "args": ["contract-ok"]})).await;
+        assert!(out.contains("contract-ok"), "{out}");
+        assert!(!out.contains("is_error: true"), "{out}");
+    }
+
+    /// The observed failure: a valid argument array with the executable simply
+    /// missing. Telling it to use `shell_command` is wrong advice — the fix is
+    /// to supply `program`.
+    #[tokio::test]
+    async fn a_missing_program_with_real_args_names_the_missing_field() {
+        let out = run(serde_json::json!({"args": ["test", "./..."], "cwd": "."})).await;
+        // The fix must be the FIRST thing said: supply `program`. Mentioning
+        // shell_command afterwards is fine — it is the boundary between the
+        // two tools — but it must not be the headline, because the args array
+        // was already correct and switching tools is not the repair.
+        let program_at = out.find("program").expect("names the missing field");
+        let shell_at = out.find("shell_command").unwrap_or(usize::MAX);
+        assert!(
+            program_at < shell_at,
+            "the repair is to supply `program`, not to switch tools: {out}"
+        );
+        assert!(
+            out.contains("\\\"program\\\": \\\"go\\\""),
+            "a concrete corrected call is worth more than a rule: {out}"
+        );
+    }
+
+    /// The other shape, unchanged: a whole command line crammed into `program`
+    /// really does belong in `shell_command`.
+    #[tokio::test]
+    async fn a_shell_string_is_still_steered_to_shell_command() {
+        let out = run(serde_json::json!({"program": "  "})).await;
+        assert!(out.contains("shell_command"), "{out}");
+    }
+
+    async fn run(input: serde_json::Value) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-run-command-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(workspace, leveler_execution::PermissionProfile::Assisted);
+        let out = RunCommandTool
+            .execute(input, ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        format!("{out:?}")
     }
 }
