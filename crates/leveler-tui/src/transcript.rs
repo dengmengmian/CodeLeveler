@@ -71,6 +71,8 @@ pub struct AnalysisBlock {
     /// Sealed: a non-reasoning item (tool call, assistant answer, turn end)
     /// followed this text, so the next ReasoningDelta starts a new block.
     pub done: bool,
+    /// Sealed blocks collapse to a disclosure row; a click reopens the text.
+    pub expanded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +512,7 @@ impl TranscriptState {
         self.items.push(TranscriptItem::Analysis(AnalysisBlock {
             text: delta.to_string(),
             done: false,
+            expanded: false,
         }));
     }
 
@@ -675,6 +678,12 @@ impl TranscriptState {
             TranscriptItem::UserShell(shell) => {
                 shell.expanded = !shell.expanded;
                 Some(shell.expanded)
+            }
+            // Sealed analysis is collapsible; a live block is being watched
+            // via the status line, not folded.
+            TranscriptItem::Analysis(a) if a.done => {
+                a.expanded = !a.expanded;
+                Some(a.expanded)
             }
             _ => None,
         };
@@ -916,6 +925,18 @@ fn compact_summary(text: String, max_chars: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Sealed analysis is a collapsible disclosure; a live block is not —
+    /// it is being watched, not folded.
+    #[test]
+    fn toggle_reaches_sealed_analysis_but_not_live() {
+        let mut tr = TranscriptState::new();
+        tr.push_reasoning_delta("thinking");
+        assert_eq!(tr.toggle_tool_group_at(0), None, "live block refuses");
+        tr.seal_analysis();
+        assert_eq!(tr.toggle_tool_group_at(0), Some(true));
+        assert_eq!(tr.toggle_tool_group_at(0), Some(false));
+    }
+
     use super::*;
     use leveler_client_protocol::ToolCallId;
 

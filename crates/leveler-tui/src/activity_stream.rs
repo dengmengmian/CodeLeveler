@@ -60,6 +60,29 @@ pub(crate) fn render_group(
             width,
         ));
     }
+    // Replace-in-place: while the group is still working, ordinary calls
+    // that already finished give up their rows to the live one — current work
+    // earns screen space, settled work compacts to one truthful line and
+    // folds fully (clickable) when the group finishes. Failures keep their
+    // rows (an error is why you are reading this), and edits keep their diff.
+    let open_group = !group_is_finished(group);
+    if open_group {
+        let settled: Vec<&ToolCallBlock> = visible
+            .iter()
+            .copied()
+            .filter(|c| c.status == ToolStatus::Ok && !is_edit_call(c))
+            .collect();
+        if !settled.is_empty() {
+            let label = disclosure_presentation(&settled, false, t).label;
+            out.push(Line::from(vec![
+                Span::styled("\u{2713} ", Style::default().fg(theme.status.success)),
+                Span::styled(
+                    truncate_display(&label, width.saturating_sub(2).max(1)),
+                    Style::default().fg(theme.text.muted),
+                ),
+            ]));
+        }
+    }
     // A concurrent batch gets one quiet dim header so the user sees these
     // calls ran together rather than one after another.
     let parallel_n = group.calls.iter().filter(|c| c.parallel).count();
@@ -73,6 +96,10 @@ pub(crate) fn render_group(
     for unit in plan_units(&group.calls) {
         match unit {
             StreamUnit::Single(call) => {
+                if open_group && call.status == ToolStatus::Ok && !is_edit_call(call) {
+                    // Already represented by the compact settled line above.
+                    continue;
+                }
                 out.extend(unit_lines(
                     call,
                     theme,
@@ -199,14 +226,19 @@ fn group_is_finished(group: &ToolGroupBlock) -> bool {
 /// (`write_file` is kept by name so an out-of-taxonomy writer can never be
 /// folded away as generic work.)
 fn group_has_edits(group: &ToolGroupBlock) -> bool {
+    group.calls.iter().any(is_edit_call)
+}
+
+/// Edits are the exception everywhere: a diff is not a step toward the
+/// result, it IS the result. (`write_file` kept by name so an out-of-taxonomy
+/// writer can never be folded away as generic work.)
+fn is_edit_call(c: &ToolCallBlock) -> bool {
     use crate::tool_taxonomy::ToolKind;
-    group.calls.iter().any(|c| {
-        c.name == "write_file"
-            || matches!(
-                crate::tool_taxonomy::lookup(&c.name).map(|e| e.kind),
-                Some(ToolKind::Edit | ToolKind::Write)
-            )
-    })
+    c.name == "write_file"
+        || matches!(
+            crate::tool_taxonomy::lookup(&c.name).map(|e| e.kind),
+            Some(ToolKind::Edit | ToolKind::Write)
+        )
 }
 /// Adapter: an Agent ToolGroup's visible calls → the shared disclosure
 /// presentation. All tool-specific judgement happens here (semantic label,
@@ -477,7 +509,8 @@ fn unit_lines(
         summary = file;
     }
     if !summary.is_empty() && summary != "{}" {
-        let shell = is_shell_call(call);
+        let shell = is_shell_call(call)
+            && crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
         let used = 2 + UnicodeWidthStr::width(action.as_str()) + 2 + usize::from(shell) * 2;
         let avail = width
             .saturating_sub(used + UnicodeWidthStr::width(tail.as_str()) + 8)
@@ -922,6 +955,138 @@ mod tests {
         }
     }
 
+    /// §11 serial replace-in-place: while a group is open, settled ordinary
+    /// calls compact to ONE line and only the live call keeps a full row.
+    #[test]
+    fn an_open_group_compacts_settled_calls_and_keeps_one_live_row() {
+        let g = group(vec![
+            call(
+                "read_file",
+                r#"{"path":"internal/bot/service.go"}"#,
+                ToolStatus::Ok,
+            ),
+            call(
+                "read_file",
+                r#"{"path":"internal/model/bot.go"}"#,
+                ToolStatus::Ok,
+            ),
+            call("grep", r#"{"pattern":"TokenPlain"}"#, ToolStatus::Running),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(lines.len(), 2, "settled summary + live row: {lines:?}");
+        assert!(
+            lines[0].contains("2"),
+            "counts the settled calls: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("service.go")),
+            "settled calls gave up their rows: {lines:?}"
+        );
+        assert!(
+            lines[1].contains('◌'),
+            "the live call keeps its row: {lines:?}"
+        );
+        assert!(lines[1].contains("TokenPlain"), "{lines:?}");
+    }
+
+    /// §21: a failure keeps its row while the group is still working — an
+    /// error must never be compacted away as ordinary settled work.
+    #[test]
+    fn a_failed_call_keeps_its_row_while_the_group_is_open() {
+        let mut failed = call(
+            "run_command",
+            r#"{"args":["test","./..."]}"#,
+            ToolStatus::Failed,
+        );
+        failed.preview = Some("run_command is missing `program`".into());
+        let g = group(vec![
+            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            failed,
+            call("grep", r#"{"pattern":"x"}"#, ToolStatus::Running),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            lines.iter().any(|l| l.contains('✗')),
+            "failure stays prominent: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains('◌')), "{lines:?}");
+    }
+
+    /// §33 parallel: a bounded current group, updated in place — finishing
+    /// one member moves it into the settled line, live rows shrink.
+    #[test]
+    fn a_parallel_group_updates_in_place_as_members_finish() {
+        let mut a = call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok);
+        let mut b = call("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Running);
+        let mut c = call("grep", r#"{"pattern":"x"}"#, ToolStatus::Running);
+        for x in [&mut a, &mut b, &mut c] {
+            x.parallel = true;
+        }
+        let g = group(vec![a, b, c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        let live = lines.iter().filter(|l| l.contains('◌')).count();
+        assert_eq!(live, 2, "two still running: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("a.rs")),
+            "finished member settled compactly: {lines:?}"
+        );
+    }
+
+    /// §12/§14: once every call finishes, the whole group folds to its
+    /// clickable disclosure row — the settled line and live rows all vanish.
+    #[test]
+    fn a_finished_group_folds_and_drops_the_live_rendering() {
+        let g = group(vec![
+            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            call("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Ok),
+            call("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(lines.len(), 1, "one disclosure row: {lines:?}");
+        assert!(lines[0].starts_with('▸'), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains('◌')), "{lines:?}");
+    }
+
+    /// An invalid run_command (no program) must not be prettified as `$ …` —
+    /// the runtime refused it, and the row has to say so, not fabricate a
+    /// command line out of the arguments.
+    #[test]
+    fn a_failed_program_less_run_command_shows_no_shell_prompt() {
+        let mut c = call(
+            "run_command",
+            r#"{"args":["test","./...","-count=1"]}"#,
+            ToolStatus::Failed,
+        );
+        c.preview = Some("run_command is missing `program`".into());
+        let g = group(vec![c]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(
+            !lines.iter().any(|l| l.contains('$')),
+            "no shell prompt for an invalid call: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("test ./...")),
+            "must not fabricate a command: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("program")),
+            "names the missing field: {lines:?}"
+        );
+        assert!(lines[0].contains('✗'), "failure stays visible: {lines:?}");
+    }
+
+    /// A long multi-line shell script stays a single compact running row —
+    /// current work earns focus, not screen area.
+    #[test]
+    fn a_long_multi_line_script_renders_one_compact_running_row() {
+        let script = "echo start\ncurl -X POST http://127.0.0.1:8090/api/v1/bots/1/permissions \\\n  -H 'Content-Type: application/json' \\\n  -d '{\\\"scope\\\":\\\"repo\\\"}'\ntail -5 out.log";
+        let args = serde_json::json!({ "cmd": script }).to_string();
+        let g = group(vec![call("shell_command", &args, ToolStatus::Running)]);
+        let lines = render_group_text(&g, 80, Locale::Zh);
+        assert_eq!(lines.len(), 1, "one row while running: {lines:?}");
+        assert!(lines[0].contains('◌'), "{lines:?}");
+    }
+
     #[test]
     fn unknown_tool_folds_to_a_generic_disclosure() {
         // MCP-style / future tool the taxonomy has never heard of.
@@ -1120,7 +1285,9 @@ mod tests {
 
     #[test]
     fn a_running_parallel_batch_stays_open() {
-        // While it runs, which call is still going is exactly what you want.
+        // While it runs, which call is STILL GOING is exactly what you want —
+        // and only that: settled members compact to one line (frozen model:
+        // current work earns screen space, completed work gets out of the way).
         let mut calls: Vec<ToolCallBlock> = (0..4)
             .map(|i| parallel_call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#)))
             .collect();
@@ -1128,8 +1295,18 @@ mod tests {
         let g = group(calls);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines.len() >= 5,
-            "a running batch must stay expanded, got:\n{}",
+            lines.iter().any(|l| l.contains('◌') && l.contains("f2.rs")),
+            "the live call keeps its row:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().any(|l| l.contains('✓') && l.contains('3')),
+            "settled members compact to one counted line:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("f0.rs")),
+            "settled members gave up their rows:\n{}",
             lines.join("\n")
         );
     }

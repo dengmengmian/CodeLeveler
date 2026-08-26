@@ -479,16 +479,14 @@ fn analysis_lines(
     wrap_width: usize,
     t: &crate::i18n::UiText,
 ) -> Vec<Line<'static>> {
-    const ANALYSIS_TAIL_LINES: usize = 16;
-    let mut out = Vec::new();
-    out.push(Line::from(""));
-    out.push(Line::from(Span::styled(
-        format!("● {}", t.analysis_label),
-        Style::default()
-            .fg(theme.text.secondary)
-            .add_modifier(Modifier::BOLD),
-    )));
-    out.push(Line::from(""));
+    // Raw provider reasoning is not conversation prose: the assistant's own
+    // commentary narrates the work, and rendering the reasoning too doubles
+    // the narration. While streaming, the status line carries the thinking
+    // indicator and the conversation shows nothing; once sealed, the text
+    // folds to one disclosure row — click to read it back.
+    if !block.done {
+        return Vec::new();
+    }
     let inner = wrap_width.saturating_sub(2).max(1);
     let rows: Vec<String> = block
         .text
@@ -496,17 +494,27 @@ fn analysis_lines(
         .filter(|l| !l.trim().is_empty())
         .flat_map(|l| wrap(l, inner))
         .collect();
-    let hidden = rows.len().saturating_sub(ANALYSIS_TAIL_LINES);
-    if hidden > 0 {
-        out.push(Line::from(Span::styled(
-            format!(
-                "  {}",
-                t.analysis_earlier_lines.replace("{}", &hidden.to_string())
-            ),
-            Style::default().fg(theme.border.normal),
-        )));
+    if rows.is_empty() {
+        return Vec::new();
     }
-    for row in rows.iter().skip(hidden) {
+    let label = t.analysis_collapsed.replace("{}", &rows.len().to_string());
+    let header = crate::presentation::disclosure::header_line(
+        &crate::presentation::disclosure::DisclosurePresentation {
+            label,
+            failed: 0,
+            failed_suffix: None,
+            expanded: block.expanded,
+            duration_ms: None,
+            first_error: None,
+        },
+        theme,
+        wrap_width,
+    );
+    if !block.expanded {
+        return vec![header];
+    }
+    let mut out = vec![header, Line::from("")];
+    for row in &rows {
         out.push(Line::from(Span::styled(
             format!("  {row}"),
             Style::default().fg(theme.text.secondary),
@@ -1100,6 +1108,7 @@ mod tests {
         crate::transcript::TranscriptItem::Analysis(crate::transcript::AnalysisBlock {
             text: text.into(),
             done,
+            expanded: false,
         })
     }
 
@@ -1109,16 +1118,50 @@ mod tests {
         plain(&item_render(item, &theme, 80, false, t))
     }
 
-    /// Analysis is conversation content: visible without any expansion, no
-    /// disclosure glyph, no shortcut hint, labeled as analysis — not 思考.
+    /// Raw provider reasoning is NOT conversation prose. While streaming, the
+    /// status line carries the thinking indicator; the conversation shows
+    /// nothing — the assistant's own commentary is the visible narrative.
     #[test]
-    fn analysis_is_visible_by_default_with_no_disclosure_chrome() {
-        let text = render_item(&analysis_item("check the rollback path first", true));
+    fn live_analysis_renders_nothing_in_conversation() {
+        let text = render_item(&analysis_item("The user wants me to look at...", false));
+        assert!(
+            text.trim().is_empty(),
+            "raw reasoning must not render: {text:?}"
+        );
+    }
+
+    /// A SEALED block collapses to one disclosure row: raw reasoning must not
+    /// remain default-permanent conversation body (it duplicates the
+    /// assistant's own user-facing commentary). The row is truthful about how
+    /// much it folds.
+    #[test]
+    fn sealed_analysis_collapses_to_a_disclosure_row() {
+        let text = render_item(&analysis_item("first line\nsecond line\nthird line", true));
+        assert!(text.contains('▸'), "{text}");
         assert!(text.contains("Analysis"), "{text}");
-        assert!(text.contains("check the rollback path first"), "{text}");
-        assert!(!text.contains("Ctrl+O"), "{text}");
-        assert!(!text.contains('▸'), "analysis is not a disclosure: {text}");
-        assert!(!text.contains("思考"), "{text}");
+        assert!(text.contains("3"), "folded line count is shown: {text}");
+        assert!(
+            !text.contains("second line"),
+            "collapsed body must not render: {text}"
+        );
+    }
+
+    /// Clicking expands to the FULL text — including the head that the live
+    /// tail view folds. Expansion is deliberate; nothing is hidden inside it.
+    #[test]
+    fn expanded_analysis_shows_the_full_text() {
+        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let mut item = analysis_item(&body, true);
+        if let crate::transcript::TranscriptItem::Analysis(a) = &mut item {
+            a.expanded = true;
+        }
+        let text = render_item(&item);
+        assert!(text.contains('▾'), "{text}");
+        assert!(
+            text.contains("line 1\n") || text.contains(" line 1"),
+            "{text}"
+        );
+        assert!(text.contains("line 40"), "{text}");
     }
 
     /// No completion state exists to render — sealed and live blocks carry the
@@ -1131,20 +1174,6 @@ mod tests {
             assert!(!text.contains("Completed"), "{text}");
             assert!(!text.contains('✓'), "{text}");
         }
-    }
-
-    /// A long body shows its tail under a truthful marker rather than either
-    /// flooding the viewport or silently dropping content.
-    #[test]
-    fn a_long_analysis_shows_its_tail_with_an_honest_marker() {
-        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
-        let text = render_item(&analysis_item(&body, true));
-        assert!(text.contains("earlier analysis lines"), "{text}");
-        assert!(
-            text.contains("line 40"),
-            "the tail is the live edge: {text}"
-        );
-        assert!(!text.contains("line 1\n"), "head is folded: {text}");
     }
 
     /// Finality: a live block must not be committed to scrollback; a sealed

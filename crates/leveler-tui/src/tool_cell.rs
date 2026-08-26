@@ -242,7 +242,7 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
             .to_string()
     };
     let summary = match name {
-        "run_command" | "shell_command" => execute_command_summary(name, &v),
+        "run_command" | "shell_command" => execute_command_summary(name, &v, t),
         "read_file" => {
             let path = compact_path_for_summary(&s("path"));
             match (
@@ -353,9 +353,28 @@ fn update_goal_summary_from_arguments(arguments: &str, t: &crate::i18n::UiText) 
 }
 
 /// Human-readable command line for shell / run tools (no JSON, no `cd` noise).
-fn execute_command_summary(name: &str, v: &serde_json::Value) -> String {
-    // shell_command uses a single `cmd` string.
-    if name == "shell_command" || v.get("cmd").is_some() {
+/// Whether this call's summary is an actual command line deserving the `$ `
+/// prefix. An invalid run_command renders a truthful marker instead — the
+/// prefix would claim a command ran when the runtime refused the call.
+pub(crate) fn summary_is_command_line(name: &str, arguments: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return true; // unparsable falls back to the raw-string summary path
+    };
+    match name {
+        "run_command" => v
+            .get("program")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .is_some_and(|p| !p.is_empty()),
+        _ => true,
+    }
+}
+
+fn execute_command_summary(name: &str, v: &serde_json::Value, t: &crate::i18n::UiText) -> String {
+    // Only shell_command owns `cmd`. A run_command carrying `cmd` is an
+    // INVALID call the runtime refuses — rendering it as `$ …` would paint a
+    // command line that never ran.
+    if name == "shell_command" {
         let cmd = v
             .get("cmd")
             .or_else(|| v.get("command"))
@@ -383,6 +402,12 @@ fn execute_command_summary(name: &str, v: &serde_json::Value) -> String {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // run_command without a program is refused by the runtime, whatever the
+    // rest of the payload says (args-only, cmd-shape, empty). Say what is
+    // wrong instead of fabricating a command from the arguments.
+    if name == "run_command" && program.is_empty() {
+        return t.run_command_missing_program.to_string();
+    }
     drop_duplicate_program_arg(&program, &mut args);
 
     // `bash -c '…'` / `sh -c '…'` → summarize the script body, not the shell wrapper.
@@ -1681,6 +1706,30 @@ mod tests {
             r#"{"path":"/Users/example/projects/sample-project/package.json"}"#,
         );
         assert_eq!(root_file, "package.json");
+    }
+
+    /// A run_command call with no `program` is INVALID and the runtime
+    /// refuses it. Rendering its args as `$ test ./...` paints a command line
+    /// that never ran (and names the wrong executable). The summary must say
+    /// what is wrong, not fabricate a command.
+    #[test]
+    fn a_program_less_run_command_never_renders_as_a_command_line() {
+        let s = tool_summary(
+            "run_command",
+            r#"{"args":["test","./...","-count=1"],"timeout_seconds":120}"#,
+        );
+        assert_ne!(s, "test ./... -count=1", "must not fabricate a command");
+        assert!(s.contains("program"), "names the missing field: {s}");
+    }
+
+    /// run_command with shell_command's `cmd` field is the OTHER invalid
+    /// shape: the runtime never executes it, so the summary must not render
+    /// it as if a shell line ran. Only shell_command owns `cmd`.
+    #[test]
+    fn run_command_with_cmd_shape_is_not_rendered_as_a_shell_line() {
+        let s = tool_summary("run_command", r#"{"cmd":"go test ./... -count=1"}"#);
+        assert_ne!(s, "go test ./... -count=1", "cmd on run_command is invalid");
+        assert!(s.contains("program"), "names the missing field: {s}");
     }
 
     #[test]

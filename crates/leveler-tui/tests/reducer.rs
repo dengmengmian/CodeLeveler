@@ -609,8 +609,8 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
             duration_ms: 1,
         }),
     );
-    // Analysis is visible conversation content with no disclosure to toggle:
-    // even with a live analysis block, Ctrl+O goes straight to the latest
+    // A live analysis block renders nothing and is not a disclosure:
+    // even while reasoning streams, Ctrl+O goes straight to the latest
     // tool group.
     reduce(
         &mut s,
