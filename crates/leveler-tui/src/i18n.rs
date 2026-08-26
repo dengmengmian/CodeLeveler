@@ -169,16 +169,9 @@ pub struct UiText {
     pub team_panel_working: &'static str,
     pub team_panel_done: &'static str,
     pub team_panel_blocking: &'static str,
-    /// Header for a visible model-reasoning block. Product wording, not
-    /// "思考": analysis is content the user reads, not a hidden internal.
-    pub analysis_label: &'static str,
-    /// Collapsed sealed-analysis disclosure row: "分析 · {} 行".
-    pub analysis_collapsed: &'static str,
     /// Truthful summary for a run_command call missing `program` — never
     /// rendered as a `$ …` command line.
     pub run_command_missing_program: &'static str,
-    /// Truthful truncation marker for a long Analysis body (tail shown).
-    pub analysis_earlier_lines: &'static str,
     pub team_panel_incomplete: &'static str,
     pub goals_title: &'static str,
     pub goals_none_need_attention: &'static str,
@@ -625,10 +618,7 @@ static ZH: UiText = UiText {
     team_panel_working: "协作中",
     team_panel_done: "协作完成",
     team_panel_blocking: "{n} 项阻塞待处理",
-    analysis_label: "分析",
-    analysis_collapsed: "分析 · {} 行",
     run_command_missing_program: "参数无效 · 缺少 program",
-    analysis_earlier_lines: "… 前面还有 {} 行分析",
     team_panel_incomplete: "协作未完成",
     goals_title: "{n} 项目标待处理",
     goals_none_need_attention: "没有待处理的目标",
@@ -1012,10 +1002,7 @@ static EN: UiText = UiText {
     team_panel_working: "AI team",
     team_panel_done: "AI team · done",
     team_panel_blocking: "{n} blocking",
-    analysis_label: "Analysis",
-    analysis_collapsed: "Analysis · {} lines",
     run_command_missing_program: "invalid arguments · missing program",
-    analysis_earlier_lines: "… {} earlier analysis lines",
     team_panel_incomplete: "AI team · incomplete",
     goals_title: "{n} goals need attention",
     goals_none_need_attention: "nothing owed",

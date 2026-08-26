@@ -7,7 +7,7 @@ The conversation's information hierarchy, as shipped:
 
 | Surface | Default presentation |
 | --- | --- |
-| Raw provider reasoning | **hidden** — not conversation prose |
+| Raw provider reasoning | **absent** — no prose, no history disclosure, no click path |
 | User-facing commentary (assistant) | visible, primary narrative |
 | Current tool | auto-visible: `◌ 动作 摘要 · 12s`, one compact row |
 | Completed tool | auto-collapsed to its `▸` disclosure row |
@@ -18,7 +18,7 @@ The conversation's information hierarchy, as shipped:
 The guiding rule: **current work earns screen space; completed work gets out
 of the way.**
 
-## Why raw reasoning is hidden
+## Why raw reasoning is hidden — completely
 
 A real dogfood session showed the failure of rendering it:
 
@@ -33,33 +33,34 @@ A real dogfood session showed the failure of rendering it:
 
 The model's own commentary (`●` prose) already narrates the work for the
 user. `reasoning_content` is the same plan in provider-internal voice —
-rendering both doubles the narration. So:
+rendering both doubles the narration. An intermediate design folded sealed
+reasoning to a `▸ 分析 · N 行` disclosure row; the final model removes even
+that: raw reasoning is **not conversation content, not historical
+disclosure, and not click-expandable** — there is no doorway back into it.
 
-- a **live** reasoning block renders **nothing** in the conversation; the
-  status line carries the thinking indicator (`transcript.live_analysis()`)
-- a **sealed** block folds to one disclosure row — `▸ 分析 · N 行` — click to
-  read it back; the count is honest, nothing is silently dropped
-- nothing summarizes, parses, or persists reasoning: `ReasoningDelta` remains
-  transient, `TranscriptItem::Analysis` is presentation state only, and
-  history does not survive a restart
+```
+RAW_REASONING_DEFAULT_VISIBLE=NO
+RAW_REASONING_HISTORY_DISCLOSURE=NO
+```
+
+What remains of `ReasoningDelta`:
+
+- `AppState.live_reasoning` — a status-line scratch feeding the thinking
+  indicator/token estimate while the model works. Cleared at every segment
+  boundary (tool start, assistant start, turn end, session switch). It is
+  the only reader; nothing renders it, nothing persists it.
+- `TranscriptItem::Analysis` / `AnalysisBlock` are **removed** — no
+  invisible transcript items, no ghost hit geometry, and reasoning deltas
+  no longer invalidate the conversation cache at all.
+- Nothing summarizes, parses, or transforms reasoning into commentary:
+  `ReasoningDelta != Commentary`, strictly.
+
+A consequence worth naming: reasoning between two tool calls no longer
+splits their ToolGroup (only real items — commentary, tools — break
+adjacency). Fewer, larger groups; the same truth.
 
 Commentary is model-directed. The UI never manufactures narration and never
 forces commentary before a tool.
-
-## Representation
-
-Unchanged from the segmentation design — one typed transcript item:
-
-```rust
-TranscriptItem::Analysis(AnalysisBlock { text, done, expanded })
-```
-
-Segmentation-by-ordering still holds (a block is live iff it is the last
-item and unsealed; tool start / assistant start / turn end seal it). `done`
-means "another item began after this text" and is never rendered as a
-completion verdict. The sealed row joins the same click plumbing as tool
-groups: the hit map registers its header, `toggle_tool_group_at` flips
-`expanded`, `transcript.version` invalidates the conversation cache.
 
 ## Current tool activity
 
@@ -93,7 +94,7 @@ The summary must respect the tool's actual contract:
 ## Click-first disclosure
 
 `▸` collapsed / `▾` expanded, click to toggle — for tool groups, sub-agents,
-user shells, and sealed analysis alike. Visible `Ctrl+O` hints stay removed;
+user shells alike. Visible `Ctrl+O` hints stay removed;
 Ctrl+O remains an undocumented fallback toggling the latest tool group only.
 
 ## The machine-contract invariant (recorded per the gate)

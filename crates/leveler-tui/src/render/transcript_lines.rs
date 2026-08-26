@@ -82,9 +82,6 @@ pub fn item_render(
         TranscriptItem::Assistant(block) => {
             out.extend(assistant_split(block, theme, wrap_width).0);
         }
-        TranscriptItem::Analysis(block) => {
-            out.extend(analysis_lines(block, theme, wrap_width, t));
-        }
         TranscriptItem::ToolGroup(group) => {
             // Same product surface as workbench Conversation: Silent tools
             // (update_goal success, ls probes, …) stay out; exploration
@@ -449,7 +446,6 @@ pub fn item_is_final(item: &TranscriptItem) -> bool {
         TranscriptItem::SubAgent(b) => b.status != ToolStatus::Running,
         // Sealed = another item followed. Never a completion claim; it only
         // says this text will not grow, which is all scrollback needs.
-        TranscriptItem::Analysis(b) => b.done,
         TranscriptItem::Btw(b) => b.done,
         _ => true,
     }
@@ -463,66 +459,6 @@ fn locale_from_ui_text(t: &UiText) -> Locale {
         Locale::Zh
     }
 }
-
-/// Visible model reasoning: header + muted body. Not a disclosure — analysis
-/// is content the user reads, so there is no ▸/▾, no click, no shortcut.
-///
-/// Long bodies show their TAIL under a truthful marker. The tail is the
-/// decision-relevant end of a reasoning segment, and it is also what a live
-/// block needs (latest lines at the live edge). Bound chosen from measured
-/// data: typical segments run 10–25 lines, but this project has recorded
-/// single rounds of 6.7k reasoning tokens — unbounded rendering would bury
-/// the conversation under one thought.
-fn analysis_lines(
-    block: &crate::transcript::AnalysisBlock,
-    theme: &Theme,
-    wrap_width: usize,
-    t: &crate::i18n::UiText,
-) -> Vec<Line<'static>> {
-    // Raw provider reasoning is not conversation prose: the assistant's own
-    // commentary narrates the work, and rendering the reasoning too doubles
-    // the narration. While streaming, the status line carries the thinking
-    // indicator and the conversation shows nothing; once sealed, the text
-    // folds to one disclosure row — click to read it back.
-    if !block.done {
-        return Vec::new();
-    }
-    let inner = wrap_width.saturating_sub(2).max(1);
-    let rows: Vec<String> = block
-        .text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .flat_map(|l| wrap(l, inner))
-        .collect();
-    if rows.is_empty() {
-        return Vec::new();
-    }
-    let label = t.analysis_collapsed.replace("{}", &rows.len().to_string());
-    let header = crate::presentation::disclosure::header_line(
-        &crate::presentation::disclosure::DisclosurePresentation {
-            label,
-            failed: 0,
-            failed_suffix: None,
-            expanded: block.expanded,
-            duration_ms: None,
-            first_error: None,
-        },
-        theme,
-        wrap_width,
-    );
-    if !block.expanded {
-        return vec![header];
-    }
-    let mut out = vec![header, Line::from("")];
-    for row in &rows {
-        out.push(Line::from(Span::styled(
-            format!("  {row}"),
-            Style::default().fg(theme.text.secondary),
-        )));
-    }
-    out
-}
-
 pub(crate) fn sub_agent_display_name(
     block: &crate::transcript::SubAgentBlock,
     t: &crate::i18n::UiText,
@@ -1091,98 +1027,6 @@ pub(crate) fn user_shell_lines(
 #[cfg(test)]
 mod tests {
 
-    fn plain(lines: &[Line<'_>]) -> String {
-        lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn analysis_item(text: &str, done: bool) -> crate::transcript::TranscriptItem {
-        crate::transcript::TranscriptItem::Analysis(crate::transcript::AnalysisBlock {
-            text: text.into(),
-            done,
-            expanded: false,
-        })
-    }
-
-    fn render_item(item: &crate::transcript::TranscriptItem) -> String {
-        let theme = crate::theme::Theme::default();
-        let t = crate::i18n::Locale::En.text();
-        plain(&item_render(item, &theme, 80, false, t))
-    }
-
-    /// Raw provider reasoning is NOT conversation prose. While streaming, the
-    /// status line carries the thinking indicator; the conversation shows
-    /// nothing — the assistant's own commentary is the visible narrative.
-    #[test]
-    fn live_analysis_renders_nothing_in_conversation() {
-        let text = render_item(&analysis_item("The user wants me to look at...", false));
-        assert!(
-            text.trim().is_empty(),
-            "raw reasoning must not render: {text:?}"
-        );
-    }
-
-    /// A SEALED block collapses to one disclosure row: raw reasoning must not
-    /// remain default-permanent conversation body (it duplicates the
-    /// assistant's own user-facing commentary). The row is truthful about how
-    /// much it folds.
-    #[test]
-    fn sealed_analysis_collapses_to_a_disclosure_row() {
-        let text = render_item(&analysis_item("first line\nsecond line\nthird line", true));
-        assert!(text.contains('▸'), "{text}");
-        assert!(text.contains("Analysis"), "{text}");
-        assert!(text.contains("3"), "folded line count is shown: {text}");
-        assert!(
-            !text.contains("second line"),
-            "collapsed body must not render: {text}"
-        );
-    }
-
-    /// Clicking expands to the FULL text — including the head that the live
-    /// tail view folds. Expansion is deliberate; nothing is hidden inside it.
-    #[test]
-    fn expanded_analysis_shows_the_full_text() {
-        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
-        let mut item = analysis_item(&body, true);
-        if let crate::transcript::TranscriptItem::Analysis(a) = &mut item {
-            a.expanded = true;
-        }
-        let text = render_item(&item);
-        assert!(text.contains('▾'), "{text}");
-        assert!(
-            text.contains("line 1\n") || text.contains(" line 1"),
-            "{text}"
-        );
-        assert!(text.contains("line 40"), "{text}");
-    }
-
-    /// No completion state exists to render — sealed and live blocks carry the
-    /// same header. "分析完成" would claim something nothing measured.
-    #[test]
-    fn no_analysis_completion_state_is_rendered() {
-        for done in [false, true] {
-            let text = render_item(&analysis_item("still looking", done));
-            assert!(!text.contains("完成"), "{text}");
-            assert!(!text.contains("Completed"), "{text}");
-            assert!(!text.contains('✓'), "{text}");
-        }
-    }
-
-    /// Finality: a live block must not be committed to scrollback; a sealed
-    /// one may be.
-    #[test]
-    fn analysis_finality_follows_the_seal() {
-        assert!(!item_is_final(&analysis_item("t", false)));
-        assert!(item_is_final(&analysis_item("t", true)));
-    }
     use super::*;
     use crate::i18n::Locale;
     use crate::theme::Theme;

@@ -179,16 +179,6 @@ pub fn build_conversation_lines_with_hits(
                     state.elapsed_secs,
                 ));
             }
-            TranscriptItem::Analysis(block) => {
-                // A sealed block's first emitted line is its ▸/▾ disclosure
-                // row — a click target. A live block renders nothing (the
-                // status line carries the thinking indicator), so it must
-                // not claim a hit row.
-                if block.done {
-                    hits.push((out.len(), idx));
-                }
-                out.extend(item_render(item, theme, width, state.tools_expanded, t));
-            }
             TranscriptItem::UserShell(shell) => {
                 // Every user shell row is a click target: click opens its
                 // Shell Details (running or finished) — the reducer

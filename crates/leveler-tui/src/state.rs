@@ -96,6 +96,12 @@ pub struct AppState {
     pub runtime_connected: bool,
     pub session_id: SessionId,
     pub transcript: TranscriptState,
+    /// Live raw-reasoning scratch. Feeds ONLY the status line's thinking
+    /// indicator/token estimate — never rendered into the conversation, never
+    /// persisted, cleared at every segment boundary (tool start, assistant
+    /// start, turn end). Raw reasoning is not conversation content, and there
+    /// is deliberately no historical representation of it at all.
+    pub live_reasoning: String,
     /// Multi-agent view model: what each child is for and what the parent did
     /// with what it produced. Built from events, never from prose.
     pub team: crate::multi_agent::TaskTeamView,
@@ -274,6 +280,7 @@ impl AppState {
             runtime_connected: true,
             session_id: boot.session_id.clone(),
             transcript: TranscriptState::new(),
+            live_reasoning: String::new(),
             team: crate::multi_agent::TaskTeamView::default(),
             unfinished_goals: Vec::new(),
             composer: Composer::new(),

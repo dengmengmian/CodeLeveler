@@ -1019,61 +1019,59 @@ mod disclosure_tests {
             .collect()
     }
 
-    /// A sealed Analysis block is a disclosure row: raw reasoning collapses
-    /// out of the conversation body and a click brings it back on demand.
+    /// Raw reasoning never enters the transcript: no item, no rendered
+    /// prose, no disclosure row, no click target — live or sealed. Only the
+    /// status line's thinking scratch sees it, and a segment boundary
+    /// (tool start) spends it.
     #[test]
-    fn a_sealed_analysis_row_is_a_click_target_that_expands_it() {
+    fn raw_reasoning_never_reaches_the_conversation() {
         let mut s = test_state();
-        s.transcript.push_user("q".into());
-        s.transcript
-            .push_reasoning_delta("why: the schema lies about program");
-        s.transcript.seal_analysis();
-        s.transcript.push_user("tail".into());
-        let a_idx = s
-            .transcript
-            .items()
+        s.transcript.push_user("详细看下这是一个什么项目？".into());
+        let items_before = s.transcript.items().len();
+        let version_before = s.transcript.version();
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReasoningDelta {
+                delta: "The user wants me to look at the project...".into(),
+            }),
+        );
+        assert_eq!(
+            s.transcript.items().len(),
+            items_before,
+            "no transcript item for reasoning"
+        );
+        assert_eq!(
+            s.transcript.version(),
+            version_before,
+            "the conversation cache is not invalidated by invisible content"
+        );
+        assert!(!s.live_reasoning.is_empty(), "the status scratch sees it");
+        let plain: String = s
+            .conversation_lines_and_hits(80)
+            .0
             .iter()
-            .position(|i| matches!(i, TranscriptItem::Analysis(_)))
-            .unwrap();
-        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
-        let (line, _) = *hits
-            .iter()
-            .find(|(_, i)| *i == a_idx)
-            .expect("sealed analysis registers a disclosure hit");
-        let row = screen_row_of(&s, line);
-        click(&mut s, 3, row);
-        match &s.transcript.items()[a_idx] {
-            TranscriptItem::Analysis(a) => assert!(a.expanded, "click expands the block"),
-            other => panic!("expected analysis, got {other:?}"),
-        }
-        // Expansion grew the transcript, which moves every screen row under
-        // bottom-alignment — re-resolve the header before the second click.
-        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
-        let (line, _) = *hits.iter().find(|(_, i)| *i == a_idx).unwrap();
-        let row = screen_row_of(&s, line);
-        click(&mut s, 3, row);
-        match &s.transcript.items()[a_idx] {
-            TranscriptItem::Analysis(a) => assert!(!a.expanded, "second click folds it again"),
-            other => panic!("expected analysis, got {other:?}"),
-        }
-    }
-
-    /// A LIVE block is watchable content, not a disclosure — no hit row.
-    #[test]
-    fn a_live_analysis_is_not_a_click_target() {
-        let mut s = test_state();
-        s.transcript.push_user("q".into());
-        s.transcript.push_reasoning_delta("still thinking");
-        let a_idx = s
-            .transcript
-            .items()
-            .iter()
-            .position(|i| matches!(i, TranscriptItem::Analysis(_)))
-            .unwrap();
-        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+            .map(crate::selection::line_to_plain)
+            .collect();
+        assert!(!plain.contains("分析"), "no analysis label: {plain}");
         assert!(
-            !hits.iter().any(|(_, i)| *i == a_idx),
-            "live analysis must not be a disclosure target: {hits:?}"
+            !plain.contains("wants me"),
+            "no raw reasoning prose: {plain}"
+        );
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        assert!(hits.is_empty(), "no disclosure row for reasoning: {hits:?}");
+        // A tool boundary spends the scratch.
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new("t1"),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+                parallel: false,
+            }),
+        );
+        assert!(
+            s.live_reasoning.is_empty(),
+            "a segment boundary clears the scratch"
         );
     }
 

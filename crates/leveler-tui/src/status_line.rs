@@ -73,11 +73,11 @@ fn streaming_output_estimate(state: &AppState) -> Option<u32> {
         })
         .map(estimate_tokens)
         .unwrap_or(0);
-    let thinking = state
-        .transcript
-        .live_analysis()
-        .map(estimate_tokens)
-        .unwrap_or(0);
+    let thinking = if state.live_reasoning.is_empty() {
+        0
+    } else {
+        estimate_tokens(&state.live_reasoning)
+    };
     let total = visible.saturating_add(thinking);
     (total > 0).then_some(total)
 }
@@ -721,7 +721,7 @@ mod tests {
         state.token_input = 51_360;
         state.token_output = 633;
         // Current round is streaming reasoning and nothing else yet.
-        state.transcript.push_reasoning_delta(&"思考".repeat(400));
+        state.live_reasoning = "思考".repeat(400);
         let status = status_line_content(&state, 160).to_string();
         assert!(
             status.contains('~'),

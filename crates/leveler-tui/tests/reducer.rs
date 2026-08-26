@@ -1722,7 +1722,7 @@ fn switching_session_resets_per_session_state_but_resync_keeps_it() {
     s.context_tokens = 4242;
     s.token_input = 100;
     s.diff_selected = 3;
-    s.transcript.push_reasoning_delta("old thinking");
+    s.live_reasoning = "old thinking".into();
 
     // Open a DIFFERENT session → per-session view state must reset.
     let mut other = snapshot();
@@ -1735,8 +1735,8 @@ fn switching_session_resets_per_session_state_but_resync_keeps_it() {
     assert_eq!(s.token_input, 0);
     assert_eq!(s.diff_selected, 0);
     assert!(
-        s.transcript.live_analysis().is_none(),
-        "switching sessions must not carry another session's live analysis"
+        s.live_reasoning.is_empty(),
+        "switching sessions must not carry another session's live reasoning"
     );
 
     // A same-session resync (lag recovery) must NOT wipe live state.
@@ -3327,18 +3327,15 @@ fn activity_clears_when_the_tool_completes() {
         s.activity.is_none(),
         "a finished tool must not linger in the status line while the model thinks"
     );
-    // The analysis emitted before the tool is sealed, not erased: it stays
-    // readable in the conversation, and the next delta starts a new block.
-    assert!(s.transcript.live_analysis().is_none(), "sealed, not live");
-    let kept = s.transcript.items().iter().any(|i| {
-        matches!(
-            i,
-            TranscriptItem::Analysis(b) if b.text.contains("previous-step analysis") && b.done
-        )
-    });
+    // Raw reasoning has no conversation representation at all: the tool
+    // boundary spent the status scratch, and no transcript item ever existed.
+    assert!(s.live_reasoning.is_empty(), "scratch spent at the boundary");
     assert!(
-        kept,
-        "emitted analysis must survive as conversation history"
+        !s.transcript
+            .items()
+            .iter()
+            .any(|i| { format!("{i:?}").contains("previous-step analysis") }),
+        "raw reasoning must not survive anywhere in the transcript"
     );
 }
 
@@ -3440,18 +3437,16 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
         }),
     );
 
-    // Each step's reasoning is its own Analysis block now — the earlier
-    // step's text is sealed history, not a prefix of the new block.
-    assert_eq!(s.transcript.live_analysis(), Some("再补测试"));
-    let sealed_blocks = s
-        .transcript
-        .items()
-        .iter()
-        .filter(|i| matches!(i, TranscriptItem::Analysis(b) if b.done))
-        .count();
-    assert_eq!(
-        sealed_blocks, 1,
-        "the first step's analysis is kept, sealed"
+    // The new step's reasoning replaces the old in the status scratch —
+    // the earlier step's text was spent at the tool boundary and has no
+    // representation anywhere.
+    assert_eq!(s.live_reasoning, "再补测试");
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|i| { format!("{i:?}").contains("先读一遍源码") }),
+        "the previous step's reasoning is gone, not archived"
     );
 }
 
@@ -3490,7 +3485,7 @@ fn retry_attempt_reset_removes_divergent_transient_output() {
     }));
     // The retried attempt's reasoning is sealed history, not live state:
     // nothing streams until the retry produces a new delta.
-    assert!(s.transcript.live_analysis().is_none());
+    assert!(s.live_reasoning.is_empty());
 }
 
 #[test]

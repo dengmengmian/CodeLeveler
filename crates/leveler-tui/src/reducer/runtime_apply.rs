@@ -90,10 +90,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::ReasoningDelta { delta } => {
             mark_turn_busy(state);
-            // Transcript-owned: the conversation keeps every Analysis block.
-            // Segmentation (a tool call / answer ends the block) is handled by
-            // seal points; a delta after a seal starts a new visible block.
-            state.transcript.push_reasoning_delta(&delta);
+            // Raw reasoning never enters the transcript: it only keeps the
+            // status line's thinking indicator honest while the model works.
+            state.live_reasoning.push_str(&delta);
         }
         RuntimeEvent::AssistantMessageCompleted { message_id } => {
             state.transcript.finish_assistant(&message_id);
@@ -125,10 +124,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         } => {
             mark_turn_busy(state);
             state.turn_tool_calls = state.turn_tool_calls.saturating_add(1);
-            // Acting on the thought ends this Analysis segment. The text
-            // stays visible in the conversation; the next step's reasoning
-            // starts a NEW block after the tool disclosure.
-            state.transcript.seal_analysis();
+            // Acting on the thought ends the reasoning segment: the status
+            // scratch is spent, and nothing else ever held that text.
+            state.live_reasoning.clear();
             // Status line shows what the tool is DOING ("运行 cargo check -p x"),
             // not the internal tool name ("运行 run_command").
             let verb = crate::tool_taxonomy::presentation_label(&name, state.locale);
@@ -748,11 +746,11 @@ pub(super) fn start_turn(state: &mut AppState) {
     seal_analysis_segment(state);
 }
 
-/// Seal the live Analysis segment: whatever reasoning was emitted stays
-/// visible in the conversation, and the next delta starts a new block.
-/// This is presentation segmentation, never a completion claim.
+/// A segment boundary (tool start, assistant start, turn end): the live
+/// reasoning scratch is spent — drop it. Nothing renders it, nothing keeps
+/// it; only the status line's thinking indicator ever read it.
 fn seal_analysis_segment(state: &mut AppState) {
-    state.transcript.seal_analysis();
+    state.live_reasoning.clear();
 }
 
 fn mark_turn_busy(state: &mut AppState) {
