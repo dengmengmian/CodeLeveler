@@ -82,7 +82,9 @@ pub(crate) fn plan_chrome_title(plan: &UiPlan, collapsed: bool, t: &UiText) -> S
     if let Some(step) = plan_current_step(plan) {
         let desc = step.description.trim();
         if !desc.is_empty() {
-            title.push_str(&format!(" · {}. {desc}", step.index + 1));
+            // No "N. " here: the expanded list numbers every step, so the
+            // title would repeat the row directly under it verbatim.
+            title.push_str(&format!(" · {desc}"));
         }
     }
     title
@@ -428,6 +430,14 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     let theme = &state.theme;
     let t = state.t();
+    // The plan is task-level state, a sibling of the conversation — so it
+    // starts at the same content baseline instead of hanging off the left
+    // edge, and its steps sit one level inside their own header.
+    let area = crate::layout::horizontal_inset(area, crate::layout::WORKSPACE_GUTTER_X);
+    if area.width == 0 {
+        return;
+    }
+    const STEP_INDENT: &str = "  ";
     let title = truncate(
         plan_chrome_title(plan, state.plan_collapsed, t),
         area.width as usize,
@@ -450,11 +460,11 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                 PlanStepStatus::Pending => ("○", theme.text.secondary),
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{g} "), Style::default().fg(c)),
+                Span::styled(format!("{STEP_INDENT}{g} "), Style::default().fg(c)),
                 Span::styled(
                     truncate(
                         format!("{}. {}", step.index + 1, step.description),
-                        area.width.saturating_sub(3) as usize,
+                        area.width.saturating_sub(3 + STEP_INDENT.len() as u16) as usize,
                     ),
                     Style::default().fg(if step.status == PlanStepStatus::Running {
                         theme.text.primary
@@ -1171,8 +1181,60 @@ mod tests {
         assert!(title.starts_with('▼'), "{title}");
         assert!(title.contains("1/3"), "done/total: {title}");
         assert!(
-            title.contains("2.") && title.contains("edit module"),
+            title.contains("edit module"),
             "current running step: {title}"
+        );
+        assert!(
+            !title.contains("2."),
+            "the numbered list under the header already carries the index: {title}"
+        );
+    }
+
+    /// The plan is a sibling of the conversation, not a footnote to the
+    /// status line: its header starts at the content baseline and its steps
+    /// sit one level inside it. Real frames showed both at column 0, which
+    /// gave the dock no hierarchy at all.
+    #[test]
+    fn plan_dock_header_and_steps_form_one_indent_level() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut state = test_state();
+        state.plan = Some(sample_plan());
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 60,
+                    height: 6,
+                };
+                render_plan_panel(f, area, &state);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..6)
+            .map(|y| {
+                (0..60)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect();
+        let header = &rows[0];
+        let step = rows
+            .iter()
+            .find(|r| r.trim_start().starts_with('→') || r.trim_start().starts_with('○'))
+            .unwrap_or_else(|| panic!("no plan step rendered:\n{}", rows.join("\n")));
+        let header_col = header.len() - header.trim_start().len();
+        let step_col = step.len() - step.trim_start().len();
+        assert_eq!(
+            header_col,
+            crate::layout::WORKSPACE_GUTTER_X as usize,
+            "header sits on the content baseline: {header:?}"
+        );
+        assert!(
+            step_col > header_col,
+            "steps indent one level inside the header: {header:?} / {step:?}"
         );
     }
 
