@@ -1826,6 +1826,73 @@ async fn non_retryable_model_error_is_not_retried() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The loop guard refuses BEFORE a call runs, using the previous count — and a
+/// refused call never executes, so it can never record new content and never
+/// clears its own entry. Without a novelty epoch that makes the refusal
+/// PERMANENT for the rest of the turn, which kills any zero-argument tool
+/// whose result legitimately changes later. `browser_snapshot` is the case
+/// that found this: re-snapshotting is the only documented stale-ref
+/// recovery, and after two identical snapshots it was locked out — the agent
+/// could no longer verify its own fix in the browser.
+///
+/// Real dogfood trace (TailAdmin, R010):
+///   navigate → snapshot REFUSED → type → "ref is stale (generation 5)"
+///   → snapshot REFUSED → navigate REFUSED
+#[tokio::test]
+async fn a_novel_result_lets_a_previously_refused_call_try_again() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-loopepoch-{}",
+        std::process::id() as u64 * 31 + 11
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(dir.join("other.txt"), "one\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Two identical list_files (the key reaches the threshold), then a
+    // genuinely novel read, then the SAME list_files again. The third
+    // list_files must be allowed to run: something moved, so "made no
+    // progress" is no longer a true statement about the world.
+    let responses: Vec<ModelResponse> = vec![
+        assistant_tool_call("c0", "list_files", serde_json::json!({"path": "."})),
+        assistant_tool_call("c1", "list_files", serde_json::json!({"path": "."})),
+        assistant_tool_call("c2", "read_file", serde_json::json!({"path": "other.txt"})),
+        assistant_tool_call("c3", "list_files", serde_json::json!({"path": "."})),
+        assistant_text("done"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(responses));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "observe, learn something, observe again",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let refused_after_novelty = events.iter().any(|e| {
+        matches!(e,
+        leveler_agent::AgentEvent::ToolResult { id, is_error: true, preview, .. }
+            if id == "c3" && preview.contains("no progress"))
+    });
+    assert!(
+        !refused_after_novelty,
+        "a novel result must un-freeze the key, not leave it locked: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn repeated_identical_call_is_blocked_by_loop_guard() {
     let dir = std::env::temp_dir().join(format!(

@@ -287,9 +287,22 @@ impl Executor {
         // Re-arm guard for the evidence nudge: it fires again only after real
         // progress (any successful tool call), never on idle repeats.
         // No-progress loop guard: "name\0args" -> (last result content, identical
-        // repeat count). Blocks a call that keeps producing the same output.
-        let mut call_history: std::collections::HashMap<String, (String, u32)> =
+        // repeat count, novelty epoch at that count). Blocks a call that keeps
+        // producing the same output WHILE nothing else moved.
+        //
+        // The epoch is what keeps the refusal from being permanent. The guard
+        // refuses BEFORE running, on the previous count — and a refused call
+        // never executes, so it can never record new content and can never
+        // clear its own entry. Without the epoch a zero-argument tool whose
+        // result legitimately changes later (browser_snapshot is the canonical
+        // case: re-snapshotting is the ONLY documented stale-ref recovery) is
+        // locked out for the rest of the turn once it twice returned the same
+        // text. The epoch advances whenever ANY call produces content it has
+        // not produced before, so genuine alternating thrash (every result
+        // identical) still freezes it and still trips the guard.
+        let mut call_history: std::collections::HashMap<String, (String, u32, u64)> =
             std::collections::HashMap::new();
+        let mut novelty_epoch: u64 = 0;
         // Bounded recovery from a malformed tool call: a weak model sometimes
         // emits `run_command`/tool arguments that aren't valid JSON (an
         // unescaped backslash from a regex, or a raw newline from a multi-line
@@ -1953,7 +1966,14 @@ impl Executor {
                 let loop_key = observe_class(&call.name, &call.arguments)
                     .unwrap_or_else(|| format!("{}\0{}", call.name, compact_json(&call.arguments)));
                 let repeats = if self.policy.progress_guards {
-                    call_history.get(&loop_key).map(|(_, n)| *n).unwrap_or(0)
+                    match call_history.get(&loop_key) {
+                        // Something novel happened since this key last repeated:
+                        // let it run and let the RESULT decide, instead of
+                        // predicting that the world stood still.
+                        Some((_, _, epoch)) if *epoch != novelty_epoch => 0,
+                        Some((_, n, _)) => *n,
+                        None => 0,
+                    }
                 } else {
                     0
                 };
@@ -2274,6 +2294,7 @@ impl Executor {
                 match call_history.get_mut(&loop_key) {
                     Some(entry) if entry.0 == content => {
                         entry.1 += 1;
+                        entry.2 = novelty_epoch;
                         repeated_observe_this_round = true;
                     }
                     _ => {
@@ -2284,7 +2305,8 @@ impl Executor {
                         if !is_error && is_observe_result_tool(&call.name, &call.arguments) {
                             novel_observe_this_round = true;
                         }
-                        call_history.insert(loop_key, (content.clone(), 1));
+                        novelty_epoch = novelty_epoch.saturating_add(1);
+                        call_history.insert(loop_key, (content.clone(), 1, novelty_epoch));
                     }
                 }
 
@@ -2468,6 +2490,7 @@ impl Executor {
                     match call_history.get_mut(&job.loop_key) {
                         Some(entry) if entry.0 == content => {
                             entry.1 += 1;
+                            entry.2 = novelty_epoch;
                             repeated_observe_this_round = true;
                         }
                         _ => {
@@ -2483,7 +2506,9 @@ impl Executor {
                             {
                                 novel_observe_this_round = true;
                             }
-                            call_history.insert(job.loop_key.clone(), (content.clone(), 1));
+                            novelty_epoch = novelty_epoch.saturating_add(1);
+                            call_history
+                                .insert(job.loop_key.clone(), (content.clone(), 1, novelty_epoch));
                         }
                     }
                     observer(AgentEvent::ToolResult {
