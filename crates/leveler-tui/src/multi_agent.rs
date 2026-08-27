@@ -1253,6 +1253,123 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
     Some(rows)
 }
 
+/// Visual tone of one agent-roster row; the renderer maps it to theme
+/// colors. Presentation-only — never persisted, never a lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterTone {
+    /// The coordinator/root row.
+    Main,
+    /// A child actively working (or queued to work).
+    Active,
+    /// A child that settled successfully.
+    Done,
+    /// A child that ended without completing. Never rendered as success.
+    Failed,
+}
+
+/// One row of the active agent runtime roster: who, doing what, for how
+/// long, at what accumulated usage. A pure render projection over existing
+/// TUI state — structurally ready for future activation states (a child
+/// that EXISTS is not assumed ACTIVE; tone follows current status), but no
+/// new state is added before the runtime supports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRosterRow {
+    pub glyph: &'static str,
+    /// Localized identity: 主 Agent / 探索 Agent / …
+    pub label: String,
+    /// Current human-readable activity — structured runtime facts only
+    /// (tool/background labels, task text), never reasoning.
+    pub activity: String,
+    /// Right-aligned metadata: "4m09s · 168k", "4m09s", or absent.
+    pub meta: Option<String>,
+    pub tone: RosterTone,
+}
+
+/// Compact token figure for the roster meta column: `168k`, `9.4k`, `312`.
+/// No fake precision — one decimal only below 10k.
+pub fn fmt_tokens_compact(n: u32) -> String {
+    if n >= 10_000 {
+        format!("{}k", n / 1000)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn child_meta(view: &ChildAgentView, now_elapsed: u64) -> Option<String> {
+    let elapsed =
+        crate::status_line::fmt_elapsed(now_elapsed.saturating_sub(view.started_elapsed_secs));
+    let usage = view.input_tokens.saturating_add(view.output_tokens);
+    Some(if usage > 0 {
+        format!("{elapsed} · {}", fmt_tokens_compact(usage))
+    } else {
+        elapsed
+    })
+}
+
+/// The child's current activity, by structured-source priority: the latest
+/// runtime tool/step label, then the task text, then a role-state fallback.
+/// Raw reasoning is not a source and never becomes one.
+fn child_activity(view: &ChildAgentView, t: &crate::i18n::UiText) -> String {
+    if matches!(view.status, ChildStatus::Running | ChildStatus::Waiting)
+        && let Some(step) = view.recent_step.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        return step.trim().to_string();
+    }
+    running_line(view, t)
+}
+
+/// Build the active agent runtime roster: Main first (the coordinator row —
+/// not a spawned child), then every child in spawn order; the renderer owns
+/// the cap. `main_activity` is the existing structured activity label;
+/// absence means the truthful fallback "正在工作", never invented detail.
+pub fn roster_rows(
+    team: &TaskTeamView,
+    main_activity: Option<&str>,
+    now_elapsed: u64,
+    t: &crate::i18n::UiText,
+) -> Vec<AgentRosterRow> {
+    let mut rows = Vec::with_capacity(team.children.len() + 1);
+    rows.push(AgentRosterRow {
+        glyph: "●",
+        label: t.main_agent.to_string(),
+        activity: main_activity
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or(t.main_agent_working)
+            .to_string(),
+        meta: None,
+        tone: RosterTone::Main,
+    });
+    for child in &team.children {
+        let (glyph, tone, activity) = match child.status {
+            ChildStatus::Waiting | ChildStatus::Running => {
+                ("○", RosterTone::Active, child_activity(child, t))
+            }
+            ChildStatus::Completed => (
+                "✓",
+                RosterTone::Done,
+                contribution_line(child, t).unwrap_or_else(|| t.sub_agent_completed.to_string()),
+            ),
+            // Truth over comfort: an incomplete child never renders as ✓.
+            ChildStatus::Failed => (
+                "!",
+                RosterTone::Failed,
+                t.sub_agent_ended_incomplete.to_string(),
+            ),
+        };
+        rows.push(AgentRosterRow {
+            glyph,
+            label: display_role(&child.role, t),
+            activity,
+            meta: child_meta(child, now_elapsed),
+            tone,
+        });
+    }
+    rows
+}
+
 /// One line of the Task Team header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamLine {

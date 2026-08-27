@@ -380,7 +380,14 @@ fn team_panel_height(state: &AppState) -> u16 {
     if state.collaboration_collapsed || state.team.surface_is_terminal(state.elapsed_secs) {
         return 1;
     }
-    (state.team.children.len() + 1).min(5) as u16
+    // Roster shape: optional blocking banner + Main row + up to 4 child rows
+    // + an overflow row. Capped so the runtime surface stays a caption on
+    // the task, never most of the viewport.
+    let children = state.team.children.len();
+    let shown = children.min(4);
+    let overflow = usize::from(children > shown);
+    let banner = usize::from(state.team.open_blocking() > 0);
+    (banner + 1 + shown + overflow).min(7) as u16
 }
 
 fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -427,50 +434,87 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         );
         return;
     }
-    let title = truncate(
-        crate::multi_agent::team_panel_title(&state.team, t),
-        area.width as usize,
+    // Active agent runtime roster: WHO is working, WHAT each is doing, for
+    // HOW LONG, at what accumulated usage. A process-list shape — no boxes,
+    // no cards. Main leads as the coordinator/root row (it is not a spawned
+    // child); the existing structured activity label is its source, with a
+    // truthful "正在工作" fallback rather than invented detail.
+    let mut lines: Vec<Line> = Vec::new();
+    if blocking {
+        lines.push(Line::from(Span::styled(
+            truncate(
+                crate::multi_agent::team_panel_title(&state.team, t),
+                area.width as usize,
+            ),
+            Style::default()
+                .fg(theme.status.error)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    let rows = crate::multi_agent::roster_rows(
+        &state.team,
+        state.activity.as_deref(),
+        state.elapsed_secs,
+        t,
     );
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(if blocking {
-                theme.status.error
-            } else {
-                theme.accent.primary
-            })
-            .add_modifier(Modifier::BOLD),
-    ))];
-
-    for line in crate::multi_agent::team_lines(&state.team, t)
-        .into_iter()
-        .take(area.height.saturating_sub(1) as usize)
-    {
-        let color = match line.status {
-            crate::multi_agent::ChildStatus::Completed => theme.status.success,
-            crate::multi_agent::ChildStatus::Failed => theme.status.error,
-            crate::multi_agent::ChildStatus::Running => theme.accent.primary,
-            crate::multi_agent::ChildStatus::Waiting => theme.text.secondary,
+    let budget = (area.height as usize).saturating_sub(lines.len());
+    // Main always leads; children take what remains. If they do not all
+    // fit, one line is reserved for the "还有 N 个 Agent…" overflow note.
+    let child_rows = rows.len() - 1;
+    let avail = budget.saturating_sub(1);
+    let shown_children = if child_rows <= avail {
+        child_rows
+    } else {
+        avail.saturating_sub(1)
+    };
+    let width = area.width as usize;
+    // Narrow terminals drop the right-aligned meta column rather than
+    // squeezing the activity into unreadability.
+    let narrow = width < 48;
+    for row in rows.iter().take(1 + shown_children) {
+        let color = match row.tone {
+            crate::multi_agent::RosterTone::Main => theme.accent.primary,
+            crate::multi_agent::RosterTone::Active => theme.accent.primary,
+            crate::multi_agent::RosterTone::Done => theme.status.success,
+            crate::multi_agent::RosterTone::Failed => theme.status.error,
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{MEMBER_INDENT}{} ", line.glyph),
-                Style::default().fg(color),
-            ),
-            Span::styled(
-                format!("{} ", line.role),
-                Style::default().fg(theme.text.primary),
-            ),
-            Span::styled(
-                truncate(
-                    line.detail,
-                    area.width.saturating_sub(
-                        line.role.chars().count() as u16 + 3 + MEMBER_INDENT.len() as u16,
-                    ) as usize,
-                ),
+        let head = format!("{} {}  ", row.glyph, row.label);
+        let head_w = UnicodeWidthStr::width(head.as_str());
+        let meta = match (&row.meta, narrow) {
+            (Some(meta), false) => meta.as_str(),
+            _ => "",
+        };
+        let meta_w = if meta.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(meta) + 2
+        };
+        let activity_budget = width.saturating_sub(head_w + meta_w).max(4);
+        let activity = truncate(row.activity.clone(), activity_budget);
+        let pad = width.saturating_sub(head_w + UnicodeWidthStr::width(activity.as_str()) + meta_w)
+            + usize::from(!meta.is_empty()) * 2;
+        let mut spans = vec![
+            Span::styled(head, Style::default().fg(color)),
+            Span::styled(activity, Style::default().fg(theme.text.secondary)),
+        ];
+        if !meta.is_empty() {
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(
+                meta.to_string(),
                 Style::default().fg(theme.text.secondary),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    let hidden = child_rows - shown_children;
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{MEMBER_INDENT}{}",
+                t.agent_roster_more.replace("{n}", &hidden.to_string())
             ),
-        ]));
+            Style::default().fg(theme.text.secondary),
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -793,8 +837,10 @@ mod tests {
             ("a1", "explorer", "look"),
             ("w1", "worker", "implement"),
         ]));
-        assert!(!empty.contains("AI team"), "{empty}");
-        assert!(staffed.contains("AI team"), "{staffed}");
+        // Roster shape: no standing title — presence is the Main row itself.
+        assert!(!empty.contains("● Main"), "{empty}");
+        assert!(staffed.contains("● Main"), "{staffed}");
+        assert!(staffed.contains("Explorer"), "{staffed}");
     }
 
     /// The layout indices shift when a panel is inserted; a footer that moved
@@ -1322,22 +1368,225 @@ mod tests {
         let mut state = test_state();
         state.team = active_team();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
-        let rows = panel_rows(&state, 3);
-        let header = &rows[0];
-        let header_col = header.len() - header.trim_start().len();
+        let rows = panel_rows(&state, 4);
+        // Roster shape: every row (Main + children) sits on the shared task
+        // baseline — a process list, not a header with indented members.
+        let main = rows
+            .iter()
+            .find(|r| r.contains('●'))
+            .unwrap_or_else(|| panic!("main row rendered:\n{}", rows.join("\n")));
+        let main_col = main.len() - main.trim_start().len();
         assert_eq!(
-            header_col,
+            main_col,
             crate::layout::WORKSPACE_GUTTER_X as usize,
-            "header on the content baseline: {header:?}"
+            "main row on the content baseline: {main:?}"
         );
         let member = rows
             .iter()
-            .find(|r| r.contains('⟳') || r.contains('○'))
+            .find(|r| r.contains('○'))
             .unwrap_or_else(|| panic!("member row rendered:\n{}", rows.join("\n")));
         let member_col = member.len() - member.trim_start().len();
+        assert_eq!(
+            member_col, main_col,
+            "children share the same baseline: {main:?} / {member:?}"
+        );
+    }
+
+    /// Matrix D/M: Main leads with its structured activity label; an active
+    /// child shows activity plus right-aligned elapsed · usage.
+    #[test]
+    fn roster_shows_main_activity_and_child_meta() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.activity = Some("正在汇总审计结果".into());
+        state.elapsed_secs = 249;
+        let mut team = crate::multi_agent::TaskTeamView::default();
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done: false,
+            ok: false,
+            detail: "审计生命周期与身份".into(),
+            profile_id: None,
+            capabilities: Vec::new(),
+            contribution: None,
+            started_elapsed_secs: 0,
+        });
+        team.apply_progress("c1", true, 120_000, 48_000);
+        state.team = team;
+        let rows = panel_rows(&state, 3).join("\n");
+        // Cell-by-cell extraction pads wide glyphs with spaces; compare
+        // space-stripped for CJK anchors.
+        let squashed = rows.replace(' ', "");
+        assert!(rows.contains('●'), "{rows}");
+        assert!(squashed.contains("正在汇总审计结果"), "{rows}");
+        assert!(squashed.contains("审计生命周期与身份"), "{rows}");
+        assert!(squashed.contains("4m09s"), "elapsed: {rows}");
+        assert!(rows.contains("168k"), "usage: {rows}");
+    }
+
+    /// Matrix L: no usage reported yet → elapsed only, never a fake 0.
+    #[test]
+    fn roster_omits_usage_until_it_exists() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.elapsed_secs = 61;
+        state.team = team_with(&[("c1", "explorer", "look around")]);
+        let rows = panel_rows(&state, 3).join("\n");
+        assert!(rows.contains("1m 01s"), "{rows}");
+        assert!(!rows.contains("· 0"), "no fake usage figure: {rows}");
+    }
+
+    /// Matrix F/E (§15/§16): an incomplete child renders truthfully with !,
+    /// never as ✓; completed siblings keep ✓ while Main keeps working.
+    #[test]
+    fn roster_failure_truth_and_integrating_main() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.activity = Some("正在整合结果".into());
+        let mut team = team_with(&[("ok1", "explorer", "audit a"), ("bad1", "worker", "fix b")]);
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "ok1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done: true,
+            ok: true,
+            detail: "done".into(),
+            profile_id: None,
+            capabilities: Vec::new(),
+            contribution: None,
+            started_elapsed_secs: 4,
+        });
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "bad1".into(),
+            nickname: "Newton".into(),
+            role: "worker".into(),
+            done: true,
+            ok: false,
+            detail: "died".into(),
+            profile_id: None,
+            capabilities: Vec::new(),
+            contribution: None,
+            started_elapsed_secs: 5,
+        });
+        // A third child still active keeps the surface in full roster shape
+        // (frozen transience: all-settled collapses to the terminal line).
+        team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "live1".into(),
+            nickname: "Kepler".into(),
+            role: "explorer".into(),
+            done: false,
+            ok: false,
+            detail: "audit c".into(),
+            profile_id: None,
+            capabilities: Vec::new(),
+            contribution: None,
+            started_elapsed_secs: 6,
+        });
+        state.team = team;
+        let rows = panel_rows(&state, 5).join("\n");
+        let squashed = rows.replace(' ', "");
+        assert!(rows.contains('✓'), "{rows}");
+        assert!(rows.contains('!'), "{rows}");
+        assert!(rows.contains('○'), "{rows}");
         assert!(
-            member_col > header_col,
-            "members indent one level inside the header: {header:?} / {member:?}"
+            !squashed.contains("✓执行"),
+            "an incomplete worker must never wear the success glyph: {rows}"
+        );
+        assert!(squashed.contains("工作未完成"), "{rows}");
+        assert!(squashed.contains("正在整合结果"), "{rows}");
+    }
+
+    /// §14: when EVERY child settles, the surface collapses to one truthful
+    /// terminal line — an incomplete child keeps the count honest and the
+    /// line never reads as pure success.
+    #[test]
+    fn roster_all_settled_collapses_to_truthful_terminal_line() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let mut team = crate::multi_agent::TaskTeamView::default();
+        for (id, ok) in [("ok1", true), ("bad1", false)] {
+            team.apply_update(crate::multi_agent::ChildUpdate {
+                id: id.into(),
+                nickname: "Euclid".into(),
+                role: "explorer".into(),
+                done: true,
+                ok,
+                detail: "done".into(),
+                profile_id: None,
+                capabilities: Vec::new(),
+                contribution: None,
+                started_elapsed_secs: 3,
+            });
+        }
+        state.team = team;
+        let rows = panel_rows(&state, 4).join("\n");
+        let squashed = rows.replace(' ', "");
+        assert!(squashed.contains("未完成"), "truthful terminal: {rows}");
+        assert!(
+            !rows.contains('●'),
+            "the full roster yields to the terminal line: {rows}"
+        );
+    }
+
+    /// Matrix J: narrow terminals drop the meta column, keep identity+activity.
+    #[test]
+    fn roster_narrow_width_drops_meta_keeps_activity() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.elapsed_secs = 100;
+        state.team = team_with(&[("c1", "explorer", "audit the lifecycle paths")]);
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                render_team_panel(
+                    f,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 3,
+                    },
+                    &state,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: String = (0..3)
+            .map(|y| {
+                (0..40)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rows.contains('○'), "{rows}");
+        assert!(!rows.contains("1m 40s"), "meta dropped when narrow: {rows}");
+    }
+
+    /// Matrix §18: more children than rows → an overflow note, never a
+    /// viewport-eating roster.
+    #[test]
+    fn roster_overflow_names_the_hidden_agents() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.team = team_with(&[
+            ("c1", "explorer", "a"),
+            ("c2", "explorer", "b"),
+            ("c3", "worker", "c"),
+            ("c4", "reviewer", "d"),
+            ("c5", "explorer", "e"),
+            ("c6", "explorer", "f"),
+        ]);
+        let height = team_panel_height(&state);
+        assert!(height <= 7, "capped: {height}");
+        let rows = panel_rows(&state, height).join("\n");
+        assert!(
+            rows.replace(' ', "").contains("还有"),
+            "overflow note: {rows}"
         );
     }
 

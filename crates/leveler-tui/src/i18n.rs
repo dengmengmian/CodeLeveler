@@ -158,6 +158,14 @@ pub struct UiText {
     pub sub_agent_waiting: &'static str,
     pub sub_agent_running: &'static str,
     pub sub_agent_completed: &'static str,
+    /// The coordinator/root execution row of the agent runtime roster.
+    pub main_agent: &'static str,
+    /// Main-row fallback when no structured activity label exists.
+    pub main_agent_working: &'static str,
+    /// Truthful terminal line for a child that ended without completing.
+    pub sub_agent_ended_incomplete: &'static str,
+    /// Overflow row when the roster is taller than its cap: "还有 {n} 个 Agent…"
+    pub agent_roster_more: &'static str,
     pub sub_agent_incomplete: &'static str,
     pub sub_agent_round_limit: &'static str,
     pub sub_agent_latest_note: &'static str,
@@ -647,6 +655,10 @@ static ZH: UiText = UiText {
     sub_agent_waiting: "等待执行",
     sub_agent_running: "执行中",
     sub_agent_completed: "已完成",
+    main_agent: "主 Agent",
+    main_agent_working: "正在工作",
+    sub_agent_ended_incomplete: "已结束 · 工作未完成",
+    agent_roster_more: "还有 {n} 个 Agent…",
     sub_agent_incomplete: "未完成",
     sub_agent_round_limit: "未在 {} 轮内完成。",
     sub_agent_latest_note: "最后进展：",
@@ -1056,6 +1068,10 @@ static EN: UiText = UiText {
     sub_agent_waiting: "waiting",
     sub_agent_running: "running",
     sub_agent_completed: "completed",
+    main_agent: "Main",
+    main_agent_working: "Working",
+    sub_agent_ended_incomplete: "ended · work incomplete",
+    agent_roster_more: "{n} more…",
     sub_agent_incomplete: "incomplete",
     sub_agent_round_limit: "Did not finish within {} rounds.",
     sub_agent_latest_note: "Latest progress: ",
