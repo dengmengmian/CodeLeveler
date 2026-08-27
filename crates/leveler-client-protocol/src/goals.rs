@@ -37,3 +37,59 @@ impl UiUnfinishedGoal {
         self.ours && !self.driving
     }
 }
+
+/// One durable goal checkpoint, projected for history presentation (long-goal
+/// P3). Every Recap a client renders maps to exactly one persisted checkpoint
+/// (`checkpoint_id`) — the client presents these fields, it never rebuilds its
+/// own summary, and it never parses `display_summary` to reconstruct facts.
+///
+/// Truth rules ride the shape: `findings_total == None` means the ledger was
+/// not readable when the checkpoint was cut — UNKNOWN, which a client must
+/// never render as zero. `verification` is `"unmeasured"` when nothing was
+/// proven — never a pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiGoalRecap {
+    /// The persisted `GoalCheckpointId` this Recap presents.
+    pub checkpoint_id: String,
+    pub goal_id: String,
+    /// `manual` | `milestone` | `context_compaction` | `interrupted`.
+    pub reason: String,
+    /// RFC3339. When the checkpoint was cut.
+    pub created_at: String,
+    /// Transcript position the checkpoint represents (messages `[0..n)`), so
+    /// a reopened session can interleave the Recap where it happened.
+    /// `None` = unknown; append after existing history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_ordinal: Option<u64>,
+    /// The 1–2 line presentation. Runtime-rendered: the semantic summary when
+    /// one exists, otherwise the deterministic structured fallback.
+    pub display_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    /// Plan progress; both `None` when no plan was recorded (absent, not 0/0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_completed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_milestones: Vec<String>,
+    /// `passed` | `failed` | `unmeasured`.
+    pub verification: String,
+    /// Evidence for a pass, or the failure detail. Absent when unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_detail: Option<String>,
+    /// `None` = UNKNOWN (ledger unreadable) — never render as 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_open: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_blocking: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_limitations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_work: Vec<String>,
+}

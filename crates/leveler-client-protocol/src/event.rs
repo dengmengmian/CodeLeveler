@@ -282,6 +282,11 @@ pub enum RuntimeEvent {
         query_id: Option<leveler_core::CommandId>,
         detail: crate::UiChildContribution,
     },
+    /// A durable goal checkpoint was cut; render it as a Recap history item
+    /// (long-goal P3). Emitted for `/recap`, milestones, context compaction,
+    /// and on surfacing an interruption checkpoint — the recap carries its
+    /// `checkpoint_id`, so an expanded view presents the same persisted facts.
+    GoalRecapCreated { recap: crate::UiGoalRecap },
     /// Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only.
     UnfinishedGoalsLoaded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,6 +407,7 @@ mod tests {
                 id: MessageId::new("m1"),
                 role: UiRole::User,
                 text: "hi".to_string(),
+                ordinal: None,
             }],
             pending_interactions: vec![],
             available_models: vec![ModelRef::new("openai", "gpt-4o-mini")],
@@ -412,6 +418,7 @@ mod tests {
             verification: None,
             diff: None,
             checkpoints: Vec::new(),
+            recaps: Vec::new(),
             user_shells: Vec::new(),
             completion_report: None,
             reasoning: None,
@@ -624,6 +631,7 @@ mod tests {
                     id: MessageId::new("m1"),
                     role: UiRole::User,
                     text: "hello".to_string(),
+                    ordinal: None,
                 },
             },
             "user_message_added",

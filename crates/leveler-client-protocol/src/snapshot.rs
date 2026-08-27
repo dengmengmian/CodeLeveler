@@ -106,6 +106,7 @@ mod tests {
             verification: None,
             diff: None,
             checkpoints: Vec::new(),
+            recaps: Vec::new(),
             user_shells: Vec::new(),
             completion_report: None,
             reasoning: None,
@@ -146,6 +147,7 @@ mod tests {
             verification: None,
             diff: None,
             checkpoints: Vec::new(),
+            recaps: Vec::new(),
             user_shells: Vec::new(),
             completion_report: None,
             reasoning: None,
@@ -175,6 +177,12 @@ pub struct UiMessage {
     pub id: MessageId,
     pub role: UiRole,
     pub text: String,
+    /// Persisted transcript ordinal (append order in the message log), when
+    /// known. Lets a client interleave durable goal recaps at the position
+    /// their checkpoint represents. Additive: absent on live-stream messages
+    /// and old runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u64>,
 }
 
 /// The runtime's self-description, served to clients for identity
@@ -339,6 +347,11 @@ pub struct UiSessionSnapshot {
     pub diff: Option<UiDiff>,
     #[serde(default)]
     pub checkpoints: Vec<UiCheckpoint>,
+    /// Durable goal recaps for this session's goals (long-goal P3), oldest
+    /// first. Each maps to one persisted GoalCheckpoint; a reopened client
+    /// interleaves them into history by `transcript_ordinal`. Additive.
+    #[serde(default)]
+    pub recaps: Vec<crate::UiGoalRecap>,
     /// User shell executions: the active one (if any) plus a bounded recent
     /// history, newest last. Additive/defaulted like the rest of this block.
     #[serde(default)]

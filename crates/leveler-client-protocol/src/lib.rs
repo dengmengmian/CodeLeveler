@@ -62,7 +62,7 @@ pub use event::{
     ChildContribution, NotificationLevel, REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES,
     RuntimeEvent, UiMemoryEntry, parse_runtime_event,
 };
-pub use goals::UiUnfinishedGoal;
+pub use goals::{UiGoalRecap, UiUnfinishedGoal};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
 pub use observability::{
     OBSERVABILITY_REQUESTS_MAX, OBSERVABILITY_WINDOW_MAX, ObservationClass, UiAgentObservation,

@@ -47,11 +47,13 @@ fn snapshot() -> UiSessionSnapshot {
                 id: MessageId::new("m_user_1"),
                 role: UiRole::User,
                 text: "第一句".to_string(),
+                ordinal: None,
             },
             UiMessage {
                 id: MessageId::new("m_assistant_1"),
                 role: UiRole::Assistant,
                 text: "第一句的回答".to_string(),
+                ordinal: None,
             },
         ],
         pending_interactions: vec![UiPendingInteraction::Approval(UiApprovalRequest {
@@ -69,6 +71,7 @@ fn snapshot() -> UiSessionSnapshot {
         verification: None,
         diff: None,
         checkpoints: Vec::new(),
+        recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
         reasoning: None,
@@ -88,6 +91,7 @@ fn turn() -> Vec<RuntimeEvent> {
                 id: MessageId::new("m_user_2"),
                 role: UiRole::User,
                 text: "1+1 等于几".to_string(),
+                ordinal: None,
             },
         },
         RuntimeEvent::AgentActivity {

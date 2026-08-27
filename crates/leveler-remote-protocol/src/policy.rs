@@ -255,6 +255,13 @@ impl RemotePolicy {
                 reason: "goal listing is local-only",
             },
 
+            // A recap projects plan wording, findings, and workspace paths —
+            // repository content in prose form, same class as the goal list.
+            ClientCommand::Recap { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "goal recap is local-only",
+            },
+
             // Shuts down the runtime for every client, local ones included.
             // The local socket transport refuses it too.
             ClientCommand::Quit => RemoteVerdict::Deny {

@@ -210,6 +210,15 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// Cut a durable goal checkpoint for the session's current goal and
+    /// surface it as a Recap (long-goal P3, `/recap`).
+    ///
+    /// This is NOT "summarize the visible transcript": the runtime projects
+    /// authoritative facts (event log, evidence ledger, goal row) into a
+    /// persisted GoalCheckpoint and answers with
+    /// [`crate::RuntimeEvent::GoalRecapCreated`]. Idempotent at the same
+    /// event boundary — a transport retry returns the same checkpoint.
+    Recap { session_id: SessionId },
     /// List goals that still owe work (long-goal P2).
     ///
     /// Read-only, and there is deliberately no companion command that
@@ -260,6 +269,7 @@ impl ClientCommand {
             | ClientCommand::RunUserShell { session_id, .. }
             | ClientCommand::CancelUserShell { session_id, .. }
             | ClientCommand::Btw { session_id, .. }
+            | ClientCommand::Recap { session_id }
             | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::ListUnfinishedGoals { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. } => Some(session_id),

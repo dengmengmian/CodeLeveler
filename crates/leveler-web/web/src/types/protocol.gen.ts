@@ -196,6 +196,37 @@ export interface UiFinding {
   symbol?: string | null;
 }
 
+/** One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts. Truth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero. `verification` is `"unmeasured"` when nothing was proven — never a pass. */
+export interface UiGoalRecap {
+  /** The persisted `GoalCheckpointId` this Recap presents. */
+  checkpoint_id: string;
+  completed_milestones?: string[];
+  /** RFC3339. When the checkpoint was cut. */
+  created_at: string;
+  /** The 1–2 line presentation. Runtime-rendered: the semantic summary when one exists, otherwise the deterministic structured fallback. */
+  display_summary: string;
+  findings_blocking?: number | null;
+  findings_open?: number | null;
+  /** `None` = UNKNOWN (ledger unreadable) — never render as 0. */
+  findings_total?: number | null;
+  goal_id: string;
+  known_limitations?: string[];
+  next_action?: string | null;
+  phase?: string | null;
+  /** Plan progress; both `None` when no plan was recorded (absent, not 0/0). */
+  plan_completed?: number | null;
+  plan_total?: number | null;
+  /** `manual` | `milestone` | `context_compaction` | `interrupted`. */
+  reason: string;
+  /** Transcript position the checkpoint represents (messages `[0..n)`), so a reopened session can interleave the Recap where it happened. `None` = unknown; append after existing history. */
+  transcript_ordinal?: number | null;
+  unresolved_work?: string[];
+  /** `passed` | `failed` | `unmeasured`. */
+  verification: string;
+  /** Evidence for a pass, or the failure detail. Absent when unmeasured. */
+  verification_detail?: string | null;
+}
+
 /** Compact durable-memory row for TUI list surfaces. */
 export interface UiMemoryEntry {
   id: string;
@@ -205,6 +236,8 @@ export interface UiMemoryEntry {
 /** A rendered message in the transcript. */
 export interface UiMessage {
   id: MessageId;
+  /** Persisted transcript ordinal (append order in the message log), when known. Lets a client interleave durable goal recaps at the position their checkpoint represents. Additive: absent on live-stream messages and old runtimes. */
+  ordinal?: number | null;
   role: UiRole;
   text: string;
 }
@@ -345,6 +378,8 @@ export interface UiSessionSnapshot {
   plan?: UiPlan | null;
   /** Runtime-projected reasoning state. Absent on old runtimes so a new client keeps its boot-time value. Present with `effective: None` means the model has no controllable effort knob (do not invent one). */
   reasoning?: UiReasoningState | null;
+  /** Durable goal recaps for this session's goals (long-goal P3), oldest first. Each maps to one persisted GoalCheckpoint; a reopened client interleaves them into history by `transcript_ordinal`. Additive. */
+  recaps?: UiGoalRecap[];
   repository: string;
   /** Persisted status string (e.g. "running", "completed"). */
   status: string;
@@ -497,6 +532,8 @@ export type ClientCommand =
   | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id?: CommandId | null; session_id: SessionId }
   /** Load one child's findings for the Contribution Inspector. A query, not a subscription: findings live in the ledger, and pushing them through the event stream would duplicate the record and re-grow the payloads the event pipeline was trimmed of. The client asks when the user opens a detail view. */
   | { type: 'query_child_contribution'; child_id: string; query_id?: CommandId | null; session_id: SessionId }
+  /** Cut a durable goal checkpoint for the session's current goal and surface it as a Recap (long-goal P3, `/recap`). This is NOT "summarize the visible transcript": the runtime projects authoritative facts (event log, evidence ledger, goal row) into a persisted GoalCheckpoint and answers with [`crate::RuntimeEvent::GoalRecapCreated`]. Idempotent at the same event boundary — a transport retry returns the same checkpoint. */
+  | { type: 'recap'; session_id: SessionId }
   /** List goals that still owe work (long-goal P2). Read-only, and there is deliberately no companion command that continues one: resume is a policy this runtime has not decided, and a protocol that can only report is a protocol that cannot accidentally restart somebody's half-finished mutation. */
   | { type: 'list_unfinished_goals'; query_id?: CommandId | null; session_id: SessionId }
   /** The runtime owner is shutting down; all work should stop. Disconnecting an individual UI client must not issue this command. */
@@ -592,6 +629,8 @@ export type RuntimeEvent =
   | { type: 'sub_agent_activity'; id: string; is_error: boolean; phase: string; preview: string; tool: string }
   /** Result of [`crate::ClientCommand::QueryChildContribution`]. Read-only: a snapshot of the ledger, never a mutation. */
   | { type: 'child_contribution_loaded'; detail: UiChildContribution; query_id?: CommandId | null }
+  /** A durable goal checkpoint was cut; render it as a Recap history item (long-goal P3). Emitted for `/recap`, milestones, context compaction, and on surfacing an interruption checkpoint — the recap carries its `checkpoint_id`, so an expanded view presents the same persisted facts. */
+  | { type: 'goal_recap_created'; recap: UiGoalRecap }
   /** Result of [`crate::ClientCommand::ListUnfinishedGoals`]. Read-only. */
   | { type: 'unfinished_goals_loaded'; goals?: UiUnfinishedGoal[]; query_id?: CommandId | null }
   /** A transient notification for the status line. */

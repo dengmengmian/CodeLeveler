@@ -135,6 +135,14 @@
         }
       ]
     },
+    "recaps": {
+      "description": "Durable goal recaps for this session's goals (long-goal P3), oldest first. Each maps to one persisted GoalCheckpoint; a reopened client interleaves them into history by `transcript_ordinal`. Additive.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiGoalRecap"
+      }
+    },
     "repository": {
       "type": "string"
     },
@@ -460,6 +468,131 @@
         }
       }
     },
+    "UiGoalRecap": {
+      "description": "One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts.\n\nTruth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero. `verification` is `\"unmeasured\"` when nothing was proven — never a pass.",
+      "type": "object",
+      "required": [
+        "checkpoint_id",
+        "created_at",
+        "display_summary",
+        "goal_id",
+        "reason",
+        "verification"
+      ],
+      "properties": {
+        "checkpoint_id": {
+          "description": "The persisted `GoalCheckpointId` this Recap presents.",
+          "type": "string"
+        },
+        "completed_milestones": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "created_at": {
+          "description": "RFC3339. When the checkpoint was cut.",
+          "type": "string"
+        },
+        "display_summary": {
+          "description": "The 1–2 line presentation. Runtime-rendered: the semantic summary when one exists, otherwise the deterministic structured fallback.",
+          "type": "string"
+        },
+        "findings_blocking": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "findings_open": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "findings_total": {
+          "description": "`None` = UNKNOWN (ledger unreadable) — never render as 0.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "known_limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_completed": {
+          "description": "Plan progress; both `None` when no plan was recorded (absent, not 0/0).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "plan_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "reason": {
+          "description": "`manual` | `milestone` | `context_compaction` | `interrupted`.",
+          "type": "string"
+        },
+        "transcript_ordinal": {
+          "description": "Transcript position the checkpoint represents (messages `[0..n)`), so a reopened session can interleave the Recap where it happened. `None` = unknown; append after existing history.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unresolved_work": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification": {
+          "description": "`passed` | `failed` | `unmeasured`.",
+          "type": "string"
+        },
+        "verification_detail": {
+          "description": "Evidence for a pass, or the failure detail. Absent when unmeasured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "UiMessage": {
       "description": "A rendered message in the transcript.",
       "type": "object",
@@ -471,6 +604,15 @@
       "properties": {
         "id": {
           "$ref": "#/definitions/MessageId"
+        },
+        "ordinal": {
+          "description": "Persisted transcript ordinal (append order in the message log), when known. Lets a client interleave durable goal recaps at the position their checkpoint represents. Additive: absent on live-stream messages and old runtimes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
         },
         "role": {
           "$ref": "#/definitions/UiRole"
