@@ -1178,10 +1178,9 @@ impl InProcessRuntimeClient {
                 next_action: next_action.filter(|s| !s.is_empty()),
             })
         };
-        match tokio::time::timeout(RECAP_SEMANTIC_TIMEOUT, work).await {
-            Ok(semantic) => semantic,
-            Err(_) => None,
-        }
+        tokio::time::timeout(RECAP_SEMANTIC_TIMEOUT, work)
+            .await
+            .unwrap_or_default()
     }
 
     /// Side question: one generate call over a fork of the session transcript.

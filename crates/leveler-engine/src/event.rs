@@ -308,7 +308,9 @@ pub enum EngineEvent {
         reason: String,
         /// RFC3339 creation time of the persisted row.
         created_at: String,
-        payload: leveler_lifecycle::GoalCheckpoint,
+        /// Boxed: the full checkpoint snapshot dwarfs every other variant,
+        /// and events are moved through channels by value.
+        payload: Box<leveler_lifecycle::GoalCheckpoint>,
     },
     /// Delivery process-evidence ledger snapshot (SoT for resume seed).
     EvidenceLedgerUpdated {

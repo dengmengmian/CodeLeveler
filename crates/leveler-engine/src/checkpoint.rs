@@ -191,7 +191,7 @@ pub fn checkpoint_created_event(record: &GoalCheckpointRecord) -> EngineEvent {
         goal_id: record.goal_id.as_str().to_string(),
         reason: record.reason.as_str().to_string(),
         created_at: record.created_at.to_rfc3339(),
-        payload: record.payload.clone(),
+        payload: Box::new(record.payload.clone()),
     }
 }
 
@@ -502,12 +502,14 @@ mod tests {
         let events = MemoryEventStore::new();
         let messages = MemoryMessageStore::new();
         let session = SessionId::new("s1");
-        let mut ledger = EvidenceLedger::default();
-        ledger.findings = vec![
-            finding("f-1", FindingState::Acknowledged, true),
-            finding("f-2", FindingState::Rejected, true),
-            finding("f-3", FindingState::Verified, false),
-        ];
+        let ledger = EvidenceLedger {
+            findings: vec![
+                finding("f-1", FindingState::Acknowledged, true),
+                finding("f-2", FindingState::Rejected, true),
+                finding("f-3", FindingState::Verified, false),
+            ],
+            ..Default::default()
+        };
         append(
             &events,
             &session,
@@ -659,22 +661,24 @@ mod tests {
         let events = MemoryEventStore::new();
         let messages = MemoryMessageStore::new();
         let session = SessionId::new("s1");
-        let mut ledger = EvidenceLedger::default();
-        ledger.plan = leveler_lifecycle::PlanState {
-            steps: vec![
-                leveler_lifecycle::PlanStep {
-                    step: "audit".into(),
-                    status: "completed".into(),
-                    id: None,
-                    origin: Default::default(),
-                },
-                leveler_lifecycle::PlanStep {
-                    step: "implement".into(),
-                    status: "pending".into(),
-                    id: None,
-                    origin: Default::default(),
-                },
-            ],
+        let ledger = EvidenceLedger {
+            plan: leveler_lifecycle::PlanState {
+                steps: vec![
+                    leveler_lifecycle::PlanStep {
+                        step: "audit".into(),
+                        status: "completed".into(),
+                        id: None,
+                        origin: Default::default(),
+                    },
+                    leveler_lifecycle::PlanStep {
+                        step: "implement".into(),
+                        status: "pending".into(),
+                        id: None,
+                        origin: Default::default(),
+                    },
+                ],
+            },
+            ..Default::default()
         };
         append(
             &events,
