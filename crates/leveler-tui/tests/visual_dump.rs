@@ -66,6 +66,7 @@ fn opened() -> AppState {
         verification: None,
         diff: None,
         checkpoints: Vec::new(),
+        recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
         reasoning: None,
@@ -136,6 +137,7 @@ fn visual_inspect() {
                 id: MessageId::new("u1"),
                 role: leveler_client_protocol::UiRole::User,
                 text: "分析一下 usage resolver 的设计，给个对比表和代码示例".into(),
+                ordinal: None,
             },
         }),
     );

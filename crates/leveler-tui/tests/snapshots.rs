@@ -50,6 +50,7 @@ fn opened_state() -> AppState {
         verification: None,
         diff: None,
         checkpoints: Vec::new(),
+        recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
         reasoning: None,
@@ -994,6 +995,7 @@ fn a_short_conversation_sits_against_the_composer() {
                 id: MessageId::new("u1"),
                 role: UiRole::User,
                 text: "改个字".into(),
+                ordinal: None,
             },
         }),
     );
@@ -1043,6 +1045,7 @@ fn a_silent_tool_group_leaves_no_hole() {
                 id: MessageId::new("u1"),
                 role: UiRole::User,
                 text: "看看有多少文件".into(),
+                ordinal: None,
             },
         }),
     );
@@ -1113,6 +1116,7 @@ fn a_narrow_terminal_keeps_the_answer_and_the_composer() {
                     id: MessageId::new("u1"),
                     role: UiRole::User,
                     text: "问题".into(),
+                    ordinal: None,
                 },
             }),
         );
@@ -1151,6 +1155,7 @@ fn no_rendered_line_exceeds_the_terminal_width() {
                 role: UiRole::User,
                 // No spaces: a naive wrapper has nowhere to break.
                 text: "验证一个非常长的不带空格的中文串".repeat(6),
+                ordinal: None,
             },
         }),
     );
@@ -1179,6 +1184,7 @@ fn the_approval_overlay_sits_where_the_composer_was() {
                 id: MessageId::new("u1"),
                 role: UiRole::User,
                 text: "推一下代码".into(),
+                ordinal: None,
             },
         }),
     );
@@ -1252,5 +1258,116 @@ fn the_splash_sits_in_the_middle_of_an_empty_session() {
     assert!(
         above.abs_diff(below) <= 2,
         "splash is not centred: {above} rows above, {below} below\n{text}"
+    );
+}
+
+// ── Long-goal P3: goal recap rendering ───────────────────────────────────
+
+fn sample_recap(unknown_truth: bool) -> leveler_client_protocol::UiGoalRecap {
+    leveler_client_protocol::UiGoalRecap {
+        checkpoint_id: "cp-render".to_string(),
+        goal_id: "g1".to_string(),
+        reason: "manual".to_string(),
+        created_at: "2026-08-27T00:00:00Z".to_string(),
+        transcript_ordinal: Some(0),
+        display_summary: "架构与数据层审查已完成".to_string(),
+        phase: Some("Browser Capability Closure".to_string()),
+        next_action: Some("检查 API 与验证路径".to_string()),
+        plan_completed: Some(3),
+        plan_total: Some(5),
+        completed_milestones: vec!["ownership / cleanup".to_string()],
+        verification: if unknown_truth {
+            "unmeasured"
+        } else {
+            "passed"
+        }
+        .to_string(),
+        verification_detail: (!unknown_truth).then(|| "cargo test: 2707 passed".to_string()),
+        findings_total: if unknown_truth { None } else { Some(3) },
+        findings_open: if unknown_truth { None } else { Some(1) },
+        findings_blocking: if unknown_truth { None } else { Some(1) },
+        known_limitations: vec!["delayed popup 未覆盖".to_string()],
+        unresolved_work: Vec::new(),
+    }
+}
+
+/// §70/§41: the compact recap lives in conversation HISTORY as
+/// `✽ 阶段回顾 · …`, 1–2 lines, with the next step on the second line.
+#[test]
+fn compact_goal_recap_renders_in_history() {
+    let mut state = opened_state();
+    state.transcript.push_user("检查这个仓库".to_string());
+    state.transcript.push_goal_recap(sample_recap(false));
+    let text = render_at(100, 30, &mut state);
+    assert!(
+        text.contains("✽ 阶段回顾 · 架构与数据层审查已完成"),
+        "{text}"
+    );
+    assert!(text.contains("下一步：检查 API 与验证路径"), "{text}");
+    // Collapsed: the structured sections stay folded away.
+    assert!(!text.contains("已知限制"), "{text}");
+}
+
+/// §71/§72: expansion presents the persisted structured fields, and UNKNOWN
+/// truth stays explicit — unmeasured verification never renders as a pass,
+/// unknown findings never render as zero.
+#[test]
+fn expanded_goal_recap_presents_structured_truth() {
+    let mut state = opened_state();
+    state.transcript.push_user("检查这个仓库".to_string());
+    state.transcript.push_goal_recap(sample_recap(true));
+    let idx = state.transcript.items().len() - 1;
+    state.transcript.toggle_tool_group_at(idx);
+    let text = render_at(100, 40, &mut state);
+    assert!(text.contains("▾ 阶段回顾"), "{text}");
+    assert!(text.contains("当前阶段"), "{text}");
+    assert!(text.contains("Browser Capability Closure"), "{text}");
+    assert!(text.contains("3/5"), "{text}");
+    assert!(text.contains("未测量"), "{text}");
+    assert!(
+        !text.contains("✓ 已通过"),
+        "unmeasured verification must not show a pass: {text}"
+    );
+    assert!(text.contains("未知（账本不可读）"), "{text}");
+    assert!(
+        !text.contains("发现\n  0"),
+        "unknown findings must not read as zero: {text}"
+    );
+    assert!(text.contains("delayed popup 未覆盖"), "{text}");
+}
+
+/// §73 (layout half): a historical recap coexists with the lower runtime
+/// plan dock — the recap stays in history, the plan stays docked below.
+#[test]
+fn goal_recap_and_plan_dock_do_not_mix() {
+    let mut state = opened_state();
+    state.transcript.push_user("检查这个仓库".to_string());
+    state.transcript.push_goal_recap(sample_recap(false));
+    state.plan = Some(leveler_client_protocol::UiPlan {
+        steps: vec![
+            leveler_client_protocol::UiPlanStep {
+                index: 0,
+                description: "审查架构".to_string(),
+                status: leveler_client_protocol::PlanStepStatus::Done,
+            },
+            leveler_client_protocol::UiPlanStep {
+                index: 1,
+                description: "实现持久化".to_string(),
+                status: leveler_client_protocol::PlanStepStatus::Running,
+            },
+        ],
+    });
+    let text = render_at(100, 34, &mut state);
+    let recap_line = text
+        .lines()
+        .position(|l| l.contains("✽ 阶段回顾"))
+        .expect("recap in history");
+    let plan_line = text
+        .lines()
+        .position(|l| l.contains("审查架构"))
+        .expect("plan dock");
+    assert!(
+        recap_line < plan_line,
+        "recap belongs to the history above the docked plan: {text}"
     );
 }

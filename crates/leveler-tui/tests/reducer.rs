@@ -80,6 +80,7 @@ fn snapshot() -> UiSessionSnapshot {
         verification: None,
         diff: None,
         checkpoints: Vec::new(),
+        recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
         reasoning: None,
@@ -241,6 +242,7 @@ fn user_message_added_appends_user_block() {
                 id: MessageId::new("u1"),
                 role: UiRole::User,
                 text: "hi".into(),
+                ordinal: None,
             },
         }),
     );
@@ -782,6 +784,7 @@ fn runtime_user_echo_does_not_duplicate_local_echo() {
                 id: MessageId::new("u1"),
                 role: UiRole::User,
                 text: "fix bug".into(),
+                ordinal: None,
             },
         }),
     );
@@ -1548,6 +1551,7 @@ fn slash_clear_empties_transcript() {
                 id: MessageId::new("u1"),
                 role: UiRole::User,
                 text: "hi".into(),
+                ordinal: None,
             },
         }),
     );
@@ -1832,6 +1836,7 @@ fn compaction_summary_renders_as_summary_not_user_message() {
         id: MessageId::new("m1"),
         role: UiRole::User,
         text: format!("{COMPACTION_SUMMARY_PREFIX}：\n## Briefing\n做了一些事"),
+        ordinal: None,
     }];
     reduce(
         &mut s,
@@ -2195,6 +2200,7 @@ fn open_session_rebuilds_transcript() {
                 id: MessageId::new("u1"),
                 role: UiRole::User,
                 text: "old".into(),
+                ordinal: None,
             },
         }),
     );
@@ -2204,6 +2210,7 @@ fn open_session_rebuilds_transcript() {
         id: MessageId::new("m1"),
         role: UiRole::User,
         text: "loaded".into(),
+        ordinal: None,
     }];
     reduce(
         &mut s,
@@ -5162,5 +5169,126 @@ fn multiline_unknown_slash_prefix_stays_a_message() {
             [Effect::Send(ClientCommand::SubmitMessage { content, .. })] if content.contains("line3")
         ),
         "{effects:?}"
+    );
+}
+
+// ── Long-goal P3: durable goal recaps ────────────────────────────────────
+
+fn goal_recap(id: &str, ordinal: Option<u64>) -> leveler_client_protocol::UiGoalRecap {
+    leveler_client_protocol::UiGoalRecap {
+        checkpoint_id: id.to_string(),
+        goal_id: "g1".to_string(),
+        reason: "manual".to_string(),
+        created_at: "2026-08-27T00:00:00Z".to_string(),
+        transcript_ordinal: ordinal,
+        display_summary: "架构审查已完成".to_string(),
+        phase: Some("Beta Capability Closure".to_string()),
+        next_action: Some("检查 API 边界".to_string()),
+        plan_completed: Some(3),
+        plan_total: Some(5),
+        completed_milestones: vec!["ownership 清理".to_string()],
+        verification: "unmeasured".to_string(),
+        verification_detail: None,
+        findings_total: None,
+        findings_open: None,
+        findings_blocking: None,
+        known_limitations: Vec::new(),
+        unresolved_work: Vec::new(),
+    }
+}
+
+#[test]
+fn recap_slash_sends_the_recap_command() {
+    let mut s = opened();
+    s.composer.replace("/recap");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            &effects[..],
+            [Effect::Send(ClientCommand::Recap { session_id })]
+                if session_id.as_str() == "s1"
+        ),
+        "effects: {effects:?}"
+    );
+}
+
+/// A GoalRecapCreated event lands in HISTORY as a GoalRecap item, and
+/// at-least-once delivery of the same checkpoint never duplicates it.
+#[test]
+fn goal_recap_event_is_history_and_idempotent() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::GoalRecapCreated {
+            recap: goal_recap("cp-1", Some(2)),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::GoalRecapCreated {
+            recap: goal_recap("cp-1", Some(2)),
+        }),
+    );
+    let recaps: Vec<_> = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|i| matches!(i, TranscriptItem::GoalRecap(_)))
+        .collect();
+    assert_eq!(recaps.len(), 1, "one checkpoint = one history item");
+    assert!(matches!(
+        s.transcript.items().last(),
+        Some(TranscriptItem::GoalRecap(block))
+            if block.recap.checkpoint_id == "cp-1" && !block.expanded
+    ));
+}
+
+/// A reopened session interleaves persisted recaps at the transcript
+/// position their checkpoint represents (messages [0..ordinal) precede it).
+#[test]
+fn session_snapshot_interleaves_goal_recaps_by_ordinal() {
+    let mut s = opened();
+    let mut snap = snapshot();
+    snap.messages = vec![
+        UiMessage {
+            id: MessageId::new("m0"),
+            role: UiRole::User,
+            text: "第一问".to_string(),
+            ordinal: Some(0),
+        },
+        UiMessage {
+            id: MessageId::new("m1"),
+            role: UiRole::Assistant,
+            text: "第一答".to_string(),
+            ordinal: Some(1),
+        },
+        UiMessage {
+            id: MessageId::new("m2"),
+            role: UiRole::User,
+            text: "第二问".to_string(),
+            ordinal: Some(2),
+        },
+    ];
+    snap.recaps = vec![goal_recap("cp-mid", Some(2))];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+
+    let kinds: Vec<&'static str> = s
+        .transcript
+        .items()
+        .iter()
+        .map(|i| match i {
+            TranscriptItem::User(_) => "user",
+            TranscriptItem::Assistant(_) => "assistant",
+            TranscriptItem::GoalRecap(_) => "recap",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["user", "assistant", "recap", "user"],
+        "the recap sits after the messages it represents, before the delta"
     );
 }

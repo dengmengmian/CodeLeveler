@@ -92,6 +92,16 @@ pub struct RecapBlock {
     pub next_step: String,
 }
 
+/// A durable goal recap (long-goal P3): the HISTORY presentation of one
+/// persisted GoalCheckpoint. `recap.checkpoint_id` is its identity — the
+/// expanded view presents the same persisted fields, never a client-side
+/// re-summary — and it never moves into the lower runtime stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalRecapBlock {
+    pub recap: leveler_client_protocol::UiGoalRecap,
+    pub expanded: bool,
+}
+
 /// A spawned sub-agent (multi-agent delegation), one block per agent, updated
 /// from running → done in place.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -195,6 +205,8 @@ pub enum TranscriptItem {
     Note(String),
     TurnEnd(TurnEndBlock),
     Recap(RecapBlock),
+    /// Durable goal checkpoint presentation (`✽ 阶段回顾`), click-expandable.
+    GoalRecap(GoalRecapBlock),
     Btw(BtwBlock),
 }
 
@@ -345,6 +357,24 @@ impl TranscriptState {
         }
         self.close_tool_group();
         self.items.push(TranscriptItem::Recap(recap));
+    }
+
+    /// Append a durable goal recap. Idempotent on `checkpoint_id`:
+    /// at-least-once event delivery (or a snapshot replay racing a live
+    /// event) must not duplicate a checkpoint's history item.
+    pub fn push_goal_recap(&mut self, recap: leveler_client_protocol::UiGoalRecap) {
+        self.bump();
+        if self.items.iter().any(|item| {
+            matches!(item, TranscriptItem::GoalRecap(block)
+                if block.recap.checkpoint_id == recap.checkpoint_id)
+        }) {
+            return;
+        }
+        self.close_tool_group();
+        self.items.push(TranscriptItem::GoalRecap(GoalRecapBlock {
+            recap,
+            expanded: false,
+        }));
     }
 
     /// Return a handoff only when a successful `update_goal` explicitly
@@ -606,6 +636,10 @@ impl TranscriptState {
             TranscriptItem::UserShell(shell) => {
                 shell.expanded = !shell.expanded;
                 Some(shell.expanded)
+            }
+            TranscriptItem::GoalRecap(block) => {
+                block.expanded = !block.expanded;
+                Some(block.expanded)
             }
             _ => None,
         };

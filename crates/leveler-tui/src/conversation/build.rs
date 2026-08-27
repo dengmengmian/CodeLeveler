@@ -192,6 +192,12 @@ pub fn build_conversation_lines_with_hits(
                     state.elapsed_secs,
                 ));
             }
+            TranscriptItem::GoalRecap(_) => {
+                // A goal recap's first line is its disclosure row: click
+                // expands the persisted checkpoint's structured sections.
+                hits.push((out.len(), idx));
+                out.extend(item_render(item, theme, width, state.tools_expanded, t));
+            }
             _ => {
                 out.extend(item_render(item, theme, width, state.tools_expanded, t));
             }

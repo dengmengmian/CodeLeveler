@@ -299,6 +299,12 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "compact" => vec![Effect::Send(ClientCommand::CompactContext {
             session_id: state.session_id.clone(),
         })],
+        // Long-goal P3: the runtime cuts a durable goal checkpoint and
+        // answers with GoalRecapCreated — the Recap is persisted truth, not
+        // a client-side transcript summary.
+        "recap" => vec![Effect::Send(ClientCommand::Recap {
+            session_id: state.session_id.clone(),
+        })],
         "export" => export_conversation(state, command),
         "paste" => vec![Effect::Send(ClientCommand::AddClipboardImage {
             session_id: state.session_id.clone(),

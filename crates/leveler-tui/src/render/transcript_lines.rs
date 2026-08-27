@@ -134,9 +134,129 @@ pub fn item_render(
                 wrap_width,
             );
         }
+        TranscriptItem::GoalRecap(block) => goal_recap_lines(block, theme, wrap_width, &mut out, t),
         TranscriptItem::Btw(block) => out.extend(btw_card_lines(block, theme, wrap_width, t)),
     }
     out
+}
+
+/// Durable goal recap (`✽ 阶段回顾`): compact 1–2 lines by default; expanded,
+/// structured sections rendered from the persisted checkpoint fields — never
+/// parsed back out of the display summary. Unknown facts stay explicit:
+/// unmeasured verification never renders as a pass, unknown findings never
+/// render as zero.
+fn goal_recap_lines(
+    block: &crate::transcript::GoalRecapBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    out: &mut Vec<Line<'static>>,
+    t: &crate::i18n::UiText,
+) {
+    let recap = &block.recap;
+    let head = Style::default().fg(theme.text.primary);
+    let muted = Style::default().fg(theme.text.secondary);
+    let marker = if block.expanded { "▾ " } else { "✽ " };
+    push_prefixed(
+        out,
+        marker,
+        &format!("{} · {}", t.goal_recap_label, recap.display_summary),
+        head,
+        wrap_width,
+    );
+    if !block.expanded {
+        if let Some(next) = &recap.next_action {
+            push_prefixed(
+                out,
+                "  ",
+                &format!("{}{next}", t.recap_next_step),
+                muted,
+                wrap_width,
+            );
+        }
+        return;
+    }
+
+    let section = |title: &str, body: &str, out: &mut Vec<Line<'static>>| {
+        out.push(Line::from(Span::styled(
+            format!("  {title}"),
+            muted.add_modifier(Modifier::BOLD),
+        )));
+        push_prefixed(out, "  ", body, head, wrap_width);
+    };
+    if let Some(phase) = &recap.phase {
+        section(t.goal_recap_phase, phase, out);
+    }
+    if !recap.completed_milestones.is_empty() {
+        out.push(Line::from(Span::styled(
+            format!("  {}", t.goal_recap_completed),
+            muted.add_modifier(Modifier::BOLD),
+        )));
+        for item in &recap.completed_milestones {
+            push_prefixed(out, "  ✓ ", item, head, wrap_width);
+        }
+    }
+    if let (Some(done), Some(total)) = (recap.plan_completed, recap.plan_total) {
+        section(t.goal_recap_plan, &format!("{done}/{total}"), out);
+    }
+    let verification = match recap.verification.as_str() {
+        "passed" => match &recap.verification_detail {
+            Some(detail) => format!("✓ {} · {detail}", t.goal_recap_verified),
+            None => format!("✓ {}", t.goal_recap_verified),
+        },
+        "failed" => match &recap.verification_detail {
+            Some(detail) => format!("✗ {} · {detail}", t.goal_recap_verify_failed),
+            None => format!("✗ {}", t.goal_recap_verify_failed),
+        },
+        // Explicit absence — never a checkmark, never omitted-and-implied.
+        _ => t.goal_recap_unmeasured.to_string(),
+    };
+    section(t.goal_recap_verification, &verification, out);
+    let findings = match (
+        recap.findings_total,
+        recap.findings_open,
+        recap.findings_blocking,
+    ) {
+        (Some(total), open, blocking) => {
+            let mut text = format!("{total}");
+            if let Some(open) = open {
+                text.push_str(&format!(" · {open} {}", t.goal_recap_unresolved));
+            }
+            if let Some(blocking) = blocking
+                && blocking > 0
+            {
+                text.push_str(&format!(" · {blocking} {}", t.goal_recap_open_blocking));
+            }
+            text
+        }
+        // UNKNOWN is a statement, not a zero.
+        (None, _, _) => t.goal_recap_findings_unknown.to_string(),
+    };
+    section(t.goal_recap_findings, &findings, out);
+    if !recap.known_limitations.is_empty() {
+        out.push(Line::from(Span::styled(
+            format!("  {}", t.goal_recap_limitations),
+            muted.add_modifier(Modifier::BOLD),
+        )));
+        for item in &recap.known_limitations {
+            push_prefixed(out, "  • ", item, head, wrap_width);
+        }
+    }
+    if !recap.unresolved_work.is_empty() {
+        out.push(Line::from(Span::styled(
+            format!("  {}", t.goal_recap_unresolved),
+            muted.add_modifier(Modifier::BOLD),
+        )));
+        for item in &recap.unresolved_work {
+            push_prefixed(out, "  • ", item, head, wrap_width);
+        }
+    }
+    if let Some(next) = &recap.next_action {
+        section(
+            t.recap_next_step.trim_end_matches([':', '：', ' ']),
+            next,
+            out,
+        );
+    }
 }
 
 /// Floating `/btw` card (overlay on Conversation). Full border, question on top,

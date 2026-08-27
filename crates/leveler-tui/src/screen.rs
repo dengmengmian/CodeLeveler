@@ -126,6 +126,14 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
+    // Long-goal P3: cut a durable goal checkpoint and show it as a Recap.
+    slash(
+        "/recap",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
     slash(
         "/work-mode",
         &["/work_mode"],
@@ -317,6 +325,7 @@ pub const SLASH_NAMES: &[&str] = &[
     "/permission",
     "/goal",
     "/btw",
+    "/recap",
     "/work-mode",
     "/collab",
     "/plan",
@@ -399,6 +408,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/permission" | "/mode" => s.permission,
         "/goal" => s.goal,
         "/btw" => s.btw,
+        "/recap" => s.recap,
         "/work-mode" | "/work_mode" => s.work_mode,
         "/collab" => s.collab,
         "/plan" => s.plan_collab,

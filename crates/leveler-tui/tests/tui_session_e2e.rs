@@ -74,6 +74,7 @@ fn opened() -> AppState {
                 verification: None,
                 diff: None,
                 checkpoints: Vec::new(),
+                recaps: Vec::new(),
                 user_shells: Vec::new(),
                 completion_report: None,
                 reasoning: None,

@@ -345,6 +345,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::UnfinishedGoalsLoaded { goals, .. } => {
             state.unfinished_goals = goals;
         }
+        RuntimeEvent::GoalRecapCreated { recap } => {
+            // History, never the lower runtime stack. Idempotent on
+            // checkpoint_id inside push_goal_recap.
+            state.transcript.push_goal_recap(recap);
+        }
         RuntimeEvent::ChildContributionLoaded { detail, .. } => {
             state.team.apply_detail(detail);
         }
@@ -906,7 +911,23 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     // Rebuild the transcript from the session's persisted messages. Opening a
     // different session (or a lagged resync) replaces the current view.
     state.transcript.clear();
+    // Durable goal recaps (long-goal P3) interleave at the transcript
+    // position their checkpoint represents: messages `[0..ordinal)` precede
+    // the recap. A recap without a usable position lands after the messages
+    // — still history, never dropped.
+    let mut recaps = session.recaps.iter().cloned().peekable();
     for message in &session.messages {
+        while let Some(next) = recaps.peek() {
+            let due = matches!(
+                (next.transcript_ordinal, message.ordinal),
+                (Some(recap_at), Some(message_at)) if recap_at <= message_at
+            );
+            if !due {
+                break;
+            }
+            let recap = recaps.next().expect("peeked");
+            state.transcript.push_goal_recap(recap);
+        }
         match message.role {
             // A compacted-history summary is stored as a User message so the model
             // keeps it as context, but it isn't something the user typed — render
@@ -932,6 +953,9 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
             }
             UiRole::System | UiRole::Tool => {}
         }
+    }
+    for recap in recaps {
+        state.transcript.push_goal_recap(recap);
     }
     // User shell executions (history + a still-running one) survive
     // reconnect via the snapshot; blocks are rebuilt in order.
