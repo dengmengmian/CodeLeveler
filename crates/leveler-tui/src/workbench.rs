@@ -369,6 +369,14 @@ fn team_panel_height(state: &AppState) -> u16 {
     if !state.team.surface_visible(state.elapsed_secs) {
         return 0;
     }
+    // The turn clock stops when the turn ends, so the linger window alone
+    // cannot expire the terminal row afterwards — and it shouldn't: once the
+    // turn settles, 任务已完成 is the single completion owner (§16) and the
+    // collaboration surface yields immediately. Open blocking findings keep
+    // it on screen: the user still owes those a decision.
+    if !state.is_busy() && state.team.open_blocking() == 0 {
+        return 0;
+    }
     if state.collaboration_collapsed || state.team.surface_is_terminal(state.elapsed_secs) {
         return 1;
     }
@@ -727,6 +735,9 @@ mod tests {
                 reasoning_effort: None,
             },
         );
+        // An active team surface only shows during a busy turn — settled
+        // collaborations yield to the main completion state.
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.team = team;
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
@@ -1310,6 +1321,7 @@ mod tests {
     fn collaboration_panel_shares_the_task_baseline_with_indented_members() {
         let mut state = test_state();
         state.team = active_team();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
         let rows = panel_rows(&state, 3);
         let header = &rows[0];
         let header_col = header.len() - header.trim_start().len();
@@ -1335,6 +1347,7 @@ mod tests {
     fn settled_collaboration_shows_one_terminal_row_then_leaves() {
         let mut state = test_state();
         state.team = active_team();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.elapsed_secs = 100;
         assert!(team_panel_height(&state) > 1, "active team is expanded");
 
@@ -1353,6 +1366,18 @@ mod tests {
             0,
             "after the linger window the surface is gone — history lives in Task Detail"
         );
+
+        // Turn over → 任务已完成 is the single completion owner; the terminal
+        // row yields at once even inside the linger window (the turn clock
+        // has stopped, so the window could otherwise never expire).
+        state.elapsed_secs = 101;
+        state.status = leveler_client_protocol::RuntimeStatus::Idle;
+        assert_eq!(
+            team_panel_height(&state),
+            0,
+            "an idle turn never keeps a settled collaboration row"
+        );
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
 
         // Failure wording stays truthful in the terminal row.
         state.elapsed_secs = 101;
