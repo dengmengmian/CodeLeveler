@@ -7434,3 +7434,221 @@ async fn a_shell_byproduct_does_not_count_as_material_progress() {
          nothing and must still be told so"
     );
 }
+
+// ── Long-goal P3: durable checkpoint at the compaction boundary ──────────
+
+/// A checkpoint port that hands back a durable block, or fails, and records
+/// how it was consulted.
+struct RecordingCheckpoint {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    fail: bool,
+}
+
+#[async_trait]
+impl leveler_agent::CompactionCheckpoint for RecordingCheckpoint {
+    async fn checkpoint_before_compaction(
+        &self,
+        _summary: Option<&str>,
+    ) -> Result<Option<String>, AgentError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            return Err(AgentError::Persistence("checkpoint store down".into()));
+        }
+        Ok(Some(
+            "[GOAL CHECKPOINT]\nGoal:\nport the parser\nNext:\ninspect the API".to_string(),
+        ))
+    }
+}
+
+fn compaction_fixture(tag: &str, rounds: usize) -> (std::path::PathBuf, ToolContext) {
+    let dir = std::env::temp_dir().join(format!("leveler-agent-p3-{tag}-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    for i in 0..rounds {
+        std::fs::write(
+            dir.join(format!("src/f{i}.rs")),
+            format!("pub fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let workspace = Workspace::new(&dir).unwrap();
+    (
+        dir,
+        ToolContext::new(workspace, PermissionProfile::Assisted),
+    )
+}
+
+fn read_rounds(rounds: usize) -> VecDeque<ModelResponse> {
+    let mut responses: Vec<ModelResponse> = (0..rounds)
+        .map(|i| {
+            assistant_tool_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    responses.push(assistant_text("done reading"));
+    VecDeque::from(responses)
+}
+
+/// §30/§32: when the host provides a durable checkpoint, the fold's summary
+/// IS the checkpoint's context block — the model continues from persisted
+/// truth, not from an ephemeral paragraph.
+#[tokio::test]
+async fn compaction_folds_with_the_durable_checkpoint_block() {
+    let (dir, tool_context) = compaction_fixture("block", 16);
+    let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime = Arc::new(CheckpointProbeRuntime {
+        responses: Mutex::new(read_rounds(16)),
+        saw_block: saw.clone(),
+    });
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_context_budget(1000)
+    .with_compaction_checkpoint(Arc::new(RecordingCheckpoint {
+        calls: calls.clone(),
+        fail: false,
+    }));
+
+    let outcome = executor
+        .run(
+            "read the files",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the checkpoint port must be consulted at the fold"
+    );
+    assert!(
+        saw.load(std::sync::atomic::Ordering::SeqCst),
+        "a later request must carry the [GOAL CHECKPOINT] block"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §24/§30 fail-closed: when the checkpoint cannot be made durable, the fold
+/// is SKIPPED — old context is kept rather than dropped uncheckpointed, and
+/// the run itself continues.
+#[tokio::test]
+async fn a_failed_checkpoint_keeps_the_context_unfolded() {
+    let (dir, tool_context) = compaction_fixture("failclosed", 16);
+    let saw_breadcrumb = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime = Arc::new(CompactingRuntime {
+        responses: Mutex::new(read_rounds(16)),
+        saw_breadcrumb: saw_breadcrumb.clone(),
+    });
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_context_budget(1000)
+    .with_compaction_checkpoint(Arc::new(RecordingCheckpoint {
+        calls: calls.clone(),
+        fail: true,
+    }));
+
+    let outcome = executor
+        .run(
+            "read the files",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the port was consulted"
+    );
+    assert!(
+        !saw_breadcrumb.load(std::sync::atomic::Ordering::SeqCst),
+        "no request may carry a fold breadcrumb when no durable checkpoint exists"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Like `CompactingRuntime`, but watches for the durable checkpoint block.
+struct CheckpointProbeRuntime {
+    responses: Mutex<VecDeque<ModelResponse>>,
+    saw_block: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl ModelRuntime for CheckpointProbeRuntime {
+    async fn generate(
+        &self,
+        _r: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        Ok(assistant_text("earlier rounds read files"))
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        _c: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        use leveler_model::ModelEvent;
+        if request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains("[GOAL CHECKPOINT]"))
+        {
+            self.saw_block
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let response = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| ModelError::new(leveler_model::ModelErrorKind::Other, "drained"))?;
+        let mut events: Vec<Result<ModelEvent, ModelError>> =
+            vec![Ok(ModelEvent::MessageStarted {
+                request_id: response.request_id.clone(),
+            })];
+        for part in &response.message.content {
+            match part {
+                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                    delta: text.clone(),
+                })),
+                ContentPart::ToolCall { call } => {
+                    events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
+                }
+                _ => {}
+            }
+        }
+        events.push(Ok(ModelEvent::UsageUpdated {
+            usage: TokenUsage {
+                input_tokens: 500_000,
+                output_tokens: 100,
+                cached_input_tokens: 0,
+            },
+        }));
+        events.push(Ok(ModelEvent::MessageCompleted {
+            finish_reason: response.finish_reason,
+        }));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
+        unimplemented!()
+    }
+}

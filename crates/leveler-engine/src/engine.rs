@@ -485,6 +485,7 @@ impl TaskEngine {
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         result: &Result<TaskReport, EngineError>,
+        repo: Option<&std::path::Path>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
         // A stale runtime has no authority to write a terminal fact - not even
@@ -536,7 +537,7 @@ impl TaskEngine {
                 );
             }
         }
-        match result {
+        let settled = match result {
             Ok(report) => {
                 let (status, state) = terminal_status_for(report);
                 self.finish_task(
@@ -577,7 +578,44 @@ impl TaskEngine {
                 )
                 .await
             }
+        };
+        // Long-goal P3 milestone: a work-window boundary where the goal still
+        // continues is the deterministic phase signal — cut a durable
+        // checkpoint AFTER the terminal fact committed (the cursor then
+        // includes it). Best-effort: a failed checkpoint never un-settles a
+        // committed terminal.
+        if settled.is_ok() && goal_continues {
+            match crate::checkpoint::create_goal_checkpoint(
+                &self.stores,
+                session_id,
+                leveler_lifecycle::CheckpointReason::Milestone,
+                repo,
+                None,
+            )
+            .await
+            {
+                Ok(Some(record)) => {
+                    let log = EventLog::new_owned(
+                        self.stores.events.as_ref(),
+                        session_id.clone(),
+                        token.clone(),
+                    );
+                    let event = crate::checkpoint::checkpoint_created_event(&record);
+                    if let Err(error) = log.append(None, event, observer).await {
+                        tracing::warn!(
+                            %error,
+                            "milestone checkpoint persisted but its announcement failed"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    "milestone goal checkpoint failed; the terminal fact stands"
+                ),
+            }
         }
+        settled
     }
 
     /// Mark the session running before the first turn. The engine owns this
@@ -711,6 +749,7 @@ impl TaskEngine {
             expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 expanded_seed,
             )),
+            repo: Some(spec.coding.repository.clone()),
         };
         log.append(
             None,
@@ -762,8 +801,14 @@ impl TaskEngine {
 
         // Stamp the terminal outcome (interrupted on cancellation) and emit
         // TaskFinished before returning.
-        self.finish_from_result(&token, session_id, &result, observer)
-            .await?;
+        self.finish_from_result(
+            &token,
+            session_id,
+            &result,
+            Some(&spec.coding.repository),
+            observer,
+        )
+        .await?;
         result
     }
 
@@ -821,26 +866,44 @@ impl TaskEngine {
         // reads replay, everything else stops for explicit acknowledgement.
         self.recover_crash_window(&log, observer, &cancellation)
             .await?;
-        let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
-        let objective_hint = content
-            .iter()
-            .filter_map(|p| match p {
-                leveler_model::ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .next();
-        let context = raw
-            .assemble(
+        // Long-goal P3: over the fold threshold the continuation runs from a
+        // durable checkpoint (fresh existing one, or one cut right here)
+        // instead of replayed old history. Under the threshold — or with no
+        // goal — the pre-checkpoint path stands unchanged.
+        let checkpoint_prior = self
+            .checkpointed_prior(
                 &log,
-                summary.as_deref(),
-                objective_hint,
-                u64::from(crate::ContextPolicy::chat_default().initial_budget),
+                session_id,
+                &raw.messages,
+                Some(&spec.coding.repository),
+                &cancellation,
+                observer,
             )
             .await?;
-        if context.compacted {
-            log.append(None, context.snapshot_event(), observer).await?;
-        }
-        let prior = context.prior;
+        let prior = if let Some(prior) = checkpoint_prior {
+            prior
+        } else {
+            let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
+            let objective_hint = content
+                .iter()
+                .filter_map(|p| match p {
+                    leveler_model::ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .next();
+            let context = raw
+                .assemble(
+                    &log,
+                    summary.as_deref(),
+                    objective_hint,
+                    u64::from(crate::ContextPolicy::chat_default().initial_budget),
+                )
+                .await?;
+            if context.compacted {
+                log.append(None, context.snapshot_event(), observer).await?;
+            }
+            context.prior
+        };
         let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
@@ -853,6 +916,7 @@ impl TaskEngine {
             expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 expanded_seed,
             )),
+            repo: Some(spec.coding.repository.clone()),
         };
         let result = async {
             let recorded = runner
@@ -875,8 +939,14 @@ impl TaskEngine {
             .await
         }
         .await;
-        self.finish_from_result(&token, session_id, &result, observer)
-            .await?;
+        self.finish_from_result(
+            &token,
+            session_id,
+            &result,
+            Some(&spec.coding.repository),
+            observer,
+        )
+        .await?;
         result
     }
 
@@ -930,20 +1000,35 @@ impl TaskEngine {
             session_id.clone(),
             token.clone(),
         );
-        let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
-        // Same merge rules as chat: never drop post-snapshot transcript rows.
-        let context = raw
-            .assemble(
-                &log,
-                summary.as_deref(),
-                Some(spec.runtime.goal.as_str()),
-                u64::from(crate::ContextPolicy::chat_default().initial_budget),
-            )
-            .await?;
-        if context.compacted {
-            log.append(None, context.snapshot_event(), observer).await?;
-        }
-        let prior = context.prior;
+        // Long-goal P3: a valid durable checkpoint replaces the replayed old
+        // context — resume receives the checkpoint block plus exactly the
+        // transcript after its watermark. No usable checkpoint (none written,
+        // corrupt, future version, stale watermark) falls back to the
+        // pre-checkpoint full-history path below.
+        let checkpoint_prior = crate::checkpoint::resume_prior_from_checkpoint(
+            &self.stores,
+            session_id,
+            &raw.messages,
+        )
+        .await?;
+        let prior = if let Some(prior) = checkpoint_prior {
+            prior
+        } else {
+            let summary = self.summarize_if_over(&raw.messages, &cancellation).await;
+            // Same merge rules as chat: never drop post-snapshot transcript rows.
+            let context = raw
+                .assemble(
+                    &log,
+                    summary.as_deref(),
+                    Some(spec.runtime.goal.as_str()),
+                    u64::from(crate::ContextPolicy::chat_default().initial_budget),
+                )
+                .await?;
+            if context.compacted {
+                log.append(None, context.snapshot_event(), observer).await?;
+            }
+            context.prior
+        };
         let expanded_seed = log.max_expanded_context_budget().await?.unwrap_or(0);
         let runner = TurnRunner {
             stores: &self.stores,
@@ -956,6 +1041,7 @@ impl TaskEngine {
             expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 expanded_seed,
             )),
+            repo: Some(spec.coding.repository.clone()),
         };
 
         // Reconcile the crash window before continuing: a tool that started but
@@ -967,9 +1053,90 @@ impl TaskEngine {
         let result = self
             .resume_direct(&log, &runner, spec, prior, observer, cancellation)
             .await;
-        self.finish_from_result(&token, session_id, &result, observer)
-            .await?;
+        self.finish_from_result(
+            &token,
+            session_id,
+            &result,
+            Some(&spec.coding.repository),
+            observer,
+        )
+        .await?;
         result
+    }
+
+    /// Long-goal P3: the checkpoint-backed pre-request fold.
+    ///
+    /// Over the fold threshold, prefer a FRESH durable checkpoint (one whose
+    /// delta still fits the threshold); when the newest checkpoint is stale
+    /// or absent, cut a `ContextCompaction` checkpoint at the current
+    /// committed boundary and continue from its block plus a bounded recent
+    /// tail. `None` = keep the pre-checkpoint path: transcript under the
+    /// threshold, no goal in scope, or checkpoint creation failed — every
+    /// fold leaves the durable transcript untouched, so the fallback
+    /// degrades only to exactly the pre-P3 context, never to lost history.
+    async fn checkpointed_prior(
+        &self,
+        log: &EventLog<'_>,
+        session_id: &SessionId,
+        raw: &[leveler_model::Message],
+        repo: Option<&std::path::Path>,
+        cancellation: &CancellationToken,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
+        let threshold = u64::from(crate::ContextPolicy::chat_default().initial_budget);
+        if leveler_agent::estimate_tokens(raw) <= threshold {
+            return Ok(None);
+        }
+        // Cheap goal probe BEFORE any model call: a session with no goal
+        // keeps the pre-checkpoint path bit-for-bit (including exactly one
+        // summarization call, which mocks and cost accounting rely on).
+        let Some(task) = self.stores.tasks.task_for_session(session_id).await? else {
+            return Ok(None);
+        };
+        if self.stores.goals.for_task(&task).await?.is_empty() {
+            return Ok(None);
+        }
+        if let Some(prior) =
+            crate::checkpoint::resume_prior_from_checkpoint(&self.stores, session_id, raw).await?
+            && leveler_agent::estimate_tokens(&prior) <= threshold
+        {
+            return Ok(Some(prior));
+        }
+        let summary = self.summarize_if_over(raw, cancellation).await;
+        match crate::checkpoint::create_goal_checkpoint(
+            &self.stores,
+            session_id,
+            leveler_lifecycle::CheckpointReason::ContextCompaction,
+            repo,
+            crate::checkpoint::SemanticRecap::briefing(summary.as_deref()),
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                let event = crate::checkpoint::checkpoint_created_event(&record);
+                log.append(None, event, observer).await?;
+                // The checkpoint block, plus a bounded raw tail for local
+                // continuity — the same recency window the pre-P3 fold kept.
+                let tail_start = raw.len().saturating_sub(leveler_agent::COMPACT_KEEP_RECENT);
+                let mut prior = Vec::with_capacity(1 + raw.len() - tail_start);
+                prior.push(leveler_model::Message {
+                    role: leveler_model::Role::User,
+                    content: vec![leveler_model::ContentPart::Text {
+                        text: record.payload.context_block(),
+                    }],
+                });
+                prior.extend_from_slice(&raw[tail_start..]);
+                Ok(Some(prior))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "context-compaction checkpoint failed; using the pre-checkpoint fold"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Best-effort model handoff briefing for a pre-request fold: only called
@@ -1187,7 +1354,14 @@ impl TaskEngine {
         // Multi-turn Goal: inject bounded session history so follow-ups can
         // resolve deictic references ("刚才那个超时").
         let prior = self
-            .bounded_session_history(log, &runner.session_id, &spec.runtime.goal)
+            .bounded_session_history(
+                log,
+                &runner.session_id,
+                &spec.runtime.goal,
+                Some(&spec.coding.repository),
+                &cancellation,
+                observer,
+            )
             .await?;
         let recorded = runner
             .run_turn(
@@ -1218,17 +1392,31 @@ impl TaskEngine {
     }
 
     /// Load session messages (prefer snapshot), bound length for Goal injection.
+    #[allow(clippy::too_many_arguments)]
     async fn bounded_session_history(
         &self,
         log: &EventLog<'_>,
         session_id: &SessionId,
         goal: &str,
+        repo: Option<&std::path::Path>,
+        cancellation: &CancellationToken,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
         const GOAL_HISTORY_MAX: usize = 24;
         let raw =
             crate::RawTranscript::load_lossy(self.stores.messages.as_ref(), session_id).await?;
         if raw.is_empty() {
             return Ok(Vec::new());
+        }
+        // Long-goal P3: the interactive multi-turn path is where a long
+        // session's history actually grows — over the fold threshold it
+        // continues from a durable checkpoint (fresh or cut here) instead of
+        // a blunt last-N tail of replayed history.
+        if let Some(prior) = self
+            .checkpointed_prior(log, session_id, &raw.messages, repo, cancellation, observer)
+            .await?
+        {
+            return Ok(prior);
         }
         let context = raw
             .assemble(
@@ -1409,18 +1597,36 @@ impl TaskEngine {
             "goal transcript during continuation",
         )
         .await?;
-        let summary = self.summarize_if_over(&raw.messages, cancellation).await;
-        let context = raw
-            .assemble(
+        // Long-goal P3: a window boundary over the fold threshold continues
+        // from a durable checkpoint (fresh or cut here) instead of replaying
+        // the earlier windows' history.
+        let checkpoint_prior = self
+            .checkpointed_prior(
                 log,
-                summary.as_deref(),
-                Some(spec.runtime.goal.as_str()),
-                u64::from(crate::ContextPolicy::chat_default().initial_budget),
+                &runner.session_id,
+                &raw.messages,
+                Some(&spec.coding.repository),
+                cancellation,
+                observer,
             )
             .await?;
-        if context.compacted {
-            log.append(None, context.snapshot_event(), observer).await?;
-        }
+        let prior = if let Some(prior) = checkpoint_prior {
+            prior
+        } else {
+            let summary = self.summarize_if_over(&raw.messages, cancellation).await;
+            let context = raw
+                .assemble(
+                    log,
+                    summary.as_deref(),
+                    Some(spec.runtime.goal.as_str()),
+                    u64::from(crate::ContextPolicy::chat_default().initial_budget),
+                )
+                .await?;
+            if context.compacted {
+                log.append(None, context.snapshot_event(), observer).await?;
+            }
+            context.prior
+        };
         // Full objective restatement — not a vague "Continue…" only. When
         // the previous drive recorded WHY its closeout stalled, name that
         // gap so the continuation addresses it instead of repeating the
@@ -1454,7 +1660,7 @@ impl TaskEngine {
                     limits: spec.runtime.limits,
                 },
                 TurnInput::Content {
-                    prior: context.prior,
+                    prior,
                     content: vec![leveler_model::ContentPart::Text {
                         text: continue_text,
                     }],

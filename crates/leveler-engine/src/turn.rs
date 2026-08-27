@@ -99,6 +99,48 @@ impl TranscriptSink for TurnSink {
 
 /// The engine's [`leveler_agent::ExecutionFence`]: before a tool dispatch,
 /// re-read the task's current owner and compare it to this run's token.
+/// Long-goal P3: the compaction-boundary checkpoint port handed to the
+/// executor. Flush-then-cursor: every event emitted so far becomes durable
+/// BEFORE the cursor is captured, so the checkpoint can never represent an
+/// event that is not on disk. The `GoalCheckpointCreated` announcement is
+/// emitted after the row exists and lands after the cursor — part of the
+/// recent delta, exactly where a fact newer than the checkpoint belongs.
+struct CompactionCheckpointPort {
+    stores: leveler_storage::EngineStores,
+    session_id: SessionId,
+    repo: Option<std::path::PathBuf>,
+    events: crate::recorders::EventEmitter,
+}
+
+#[async_trait::async_trait]
+impl leveler_agent::CompactionCheckpoint for CompactionCheckpointPort {
+    async fn checkpoint_before_compaction(
+        &self,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, leveler_agent::AgentError> {
+        self.events
+            .flush()
+            .await
+            .map_err(leveler_agent::AgentError::Persistence)?;
+        let record = crate::checkpoint::create_goal_checkpoint(
+            &self.stores,
+            &self.session_id,
+            leveler_lifecycle::CheckpointReason::ContextCompaction,
+            self.repo.as_deref(),
+            crate::checkpoint::SemanticRecap::briefing(summary),
+        )
+        .await
+        .map_err(|e| leveler_agent::AgentError::Persistence(e.to_string()))?;
+        let Some(record) = record else {
+            // No goal in scope (plain chat): the fold proceeds as before P3.
+            return Ok(None);
+        };
+        self.events
+            .emit(crate::checkpoint::checkpoint_created_event(&record));
+        Ok(Some(record.payload.context_block()))
+    }
+}
+
 /// Inherently check-then-dispatch (§ the fence guarantees a runtime already
 /// known stale dispatches nothing new; it does not claim exactly-once).
 struct OwnershipFence {
@@ -144,6 +186,9 @@ pub struct TurnRunner<'a> {
     /// live as this runner forwards them). Later turns start from it instead
     /// of shrinking back to the initial tier.
     pub expanded_context_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Repository root for bounded workspace metadata on goal checkpoints
+    /// (long-goal P3). `None` = no workspace facts captured, never assumed.
+    pub repo: Option<std::path::PathBuf>,
 }
 
 impl TurnRunner<'_> {
@@ -262,6 +307,16 @@ impl TurnRunner<'_> {
                 // Side-effect barrier: tool dispatch waits until the announcing
                 // canonical events are durable in this turn's event log.
                 .with_event_barrier(Arc::new(crate::recorders::PumpBarrier {
+                    events: events.clone(),
+                }))
+                // Long-goal P3: a context fold first cuts a durable goal
+                // checkpoint (flush-then-cursor inside the port); the fold's
+                // summary becomes persisted truth, and a failed checkpoint
+                // keeps the context uncompacted (fail closed in the loop).
+                .with_compaction_checkpoint(Arc::new(CompactionCheckpointPort {
+                    stores: self.stores.clone(),
+                    session_id: self.session_id.clone(),
+                    repo: self.repo.clone(),
                     events: events.clone(),
                 }))
                 // Ownership fence: after the barriers, before dispatch, the

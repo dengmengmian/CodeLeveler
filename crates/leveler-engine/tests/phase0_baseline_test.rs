@@ -336,6 +336,7 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         expanded_context_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        repo: None,
     };
 
     let recorded = runner

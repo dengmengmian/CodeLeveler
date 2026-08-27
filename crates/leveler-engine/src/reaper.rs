@@ -109,6 +109,45 @@ pub async fn reap_after_restart(
         )
         .await?;
         outcome.events.extend(events);
+        // Long-goal P3: a goal left `running` by the dead process IS the
+        // interrupted one (P2). Cut a structured-only durable checkpoint at
+        // this boundary — no model call, startup must never wait on prose.
+        // Best-effort: a failed checkpoint must not fail the reap, and the
+        // schema-level dedupe makes a repeated restart a no-op (same cursor,
+        // same reason → the same logical checkpoint).
+        match crate::checkpoint::create_goal_checkpoint(
+            stores,
+            &session,
+            leveler_lifecycle::CheckpointReason::Interrupted,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                let log = crate::EventLog::new_owned(
+                    stores.events.as_ref(),
+                    session.clone(),
+                    token.clone(),
+                );
+                let event = crate::checkpoint::checkpoint_created_event(&record);
+                let mut forward = |_: EngineEvent| {};
+                if let Err(error) = log.append(None, event.clone(), &mut forward).await {
+                    tracing::warn!(
+                        %error,
+                        "interrupted checkpoint persisted but its announcement failed"
+                    );
+                } else {
+                    outcome.events.push(event);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                session = %session,
+                "interrupted goal checkpoint failed; the reap stands"
+            ),
+        }
     }
     Ok(outcome)
 }

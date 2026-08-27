@@ -632,6 +632,30 @@ pub trait EventBarrier: Send + Sync {
     fn record_child_tool_event(&self, event: ChildToolEvent);
 }
 
+/// Host port: cut a durable goal checkpoint at the context-compaction
+/// boundary (long-goal P3), so the fold's summary is backed by persisted
+/// truth instead of an ephemeral paragraph.
+///
+/// Contract: the implementation must make every event emitted so far durable
+/// BEFORE capturing its cursor (flush-then-read), persist the checkpoint,
+/// and return its rendered context block — which the loop folds with in
+/// place of the bare summary.
+///
+/// - `Ok(Some(block))`: a durable checkpoint exists; fold with `block`.
+/// - `Ok(None)`: no goal is in scope (plain chat); fold proceeds exactly as
+///   without the port.
+/// - `Err(_)`: the durable boundary could not be established. The loop must
+///   NOT fold this round — old context is kept and the fold retries at the
+///   next boundary (fail closed: continuity is never dropped uncheckpointed).
+#[async_trait]
+pub trait CompactionCheckpoint: Send + Sync {
+    /// `summary` is the semantic compaction summary when one was produced.
+    async fn checkpoint_before_compaction(
+        &self,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, AgentError>;
+}
+
 /// A delegated agent's tool call, attributed to the child that made it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChildToolEvent {
@@ -982,6 +1006,9 @@ pub struct Executor {
     /// tool with possible side effects is dispatched. `None` = no durable
     /// host (standalone library use); the loop proceeds without waiting.
     event_barrier: Option<Arc<dyn EventBarrier>>,
+    /// Durable-checkpoint port for context compaction (long-goal P3).
+    /// `None` = no durable host; folds keep their pre-checkpoint behavior.
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     /// Ownership fence consulted after the admission barriers and before
     /// tool dispatch; None = unfenced (non-engine/test executors).
     execution_fence: Option<Arc<dyn ExecutionFence>>,
@@ -1044,6 +1071,7 @@ impl Executor {
             ),
             grants_state_dir: None,
             event_barrier: None,
+            compaction_checkpoint: None,
             execution_fence: None,
             agent_id: None,
         }
@@ -1414,6 +1442,10 @@ impl Executor {
             // delegated side effect is as durable-before-execution as a
             // parent one. `agent_id` is stamped by the spawn handler.
             event_barrier: self.event_barrier.clone(),
+            // Children never cut goal checkpoints: the goal belongs to the
+            // parent loop, and a child fold summarizing its own scratch
+            // context must not write the goal's continuity record.
+            compaction_checkpoint: None,
             execution_fence: self.execution_fence.clone(),
             agent_id: None,
         }
@@ -1664,6 +1696,12 @@ impl Executor {
     /// Install the host's side-effect barrier (see [`EventBarrier`]).
     pub fn with_event_barrier(mut self, barrier: Arc<dyn EventBarrier>) -> Self {
         self.event_barrier = Some(barrier);
+        self
+    }
+
+    /// Install the durable-checkpoint port consulted at every context fold.
+    pub fn with_compaction_checkpoint(mut self, port: Arc<dyn CompactionCheckpoint>) -> Self {
+        self.compaction_checkpoint = Some(port);
         self
     }
 

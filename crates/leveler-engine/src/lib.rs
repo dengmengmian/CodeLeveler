@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod baseline;
+mod checkpoint;
 mod continuation;
 mod engine;
 mod event;
@@ -29,6 +30,10 @@ pub use event::{
 };
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
+pub use checkpoint::{
+    ProjectedCheckpoint, SemanticRecap, checkpoint_created_event, create_goal_checkpoint,
+    project_goal_checkpoint, resume_prior_from_checkpoint,
+};
 pub use continuation::{
     Continuation, DefaultSupervisorPolicy, MAX_EXTENSIONS, NoContinuation, SupervisorPolicy,
     TurnEnded,

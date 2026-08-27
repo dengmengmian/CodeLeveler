@@ -3478,7 +3478,7 @@ impl Executor {
                         )
                         .await;
                 }
-                let summary = self
+                let mut summary = self
                     .summarize_for_compaction(
                         &messages,
                         COMPACT_KEEP_RECENT,
@@ -3486,13 +3486,35 @@ impl Executor {
                         &cancellation,
                     )
                     .await;
-                messages = compact_messages(
-                    &messages,
-                    COMPACT_KEEP_RECENT,
-                    keep_recent_tokens,
-                    summary.as_deref(),
-                    Some(objective.text()),
-                );
+                // Long-goal P3: before old context is folded away, the host
+                // cuts a durable checkpoint and hands back its context block
+                // — the fold's summary becomes persisted truth. If the
+                // checkpoint cannot be made durable, we keep the context this
+                // round instead of dropping continuity (fail closed); the
+                // fold retries at the next boundary.
+                let mut fold_permitted = true;
+                if let Some(port) = &self.compaction_checkpoint {
+                    match port.checkpoint_before_compaction(summary.as_deref()).await {
+                        Ok(Some(block)) => summary = Some(block),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "goal checkpoint failed; keeping context uncompacted this round"
+                            );
+                            fold_permitted = false;
+                        }
+                    }
+                }
+                if fold_permitted {
+                    messages = compact_messages(
+                        &messages,
+                        COMPACT_KEEP_RECENT,
+                        keep_recent_tokens,
+                        summary.as_deref(),
+                        Some(objective.text()),
+                    );
+                }
                 if self.hook_runner.has_lifecycle() {
                     self.hook_runner
                         .run_lifecycle(
@@ -3511,7 +3533,9 @@ impl Executor {
                         to: messages.len(),
                     });
                 }
-                crate::context_budget::apply_compaction(&mut context_state, guard_trips);
+                if fold_permitted {
+                    crate::context_budget::apply_compaction(&mut context_state, guard_trips);
+                }
             }
 
             // Persist the exact next-request context through the engine event

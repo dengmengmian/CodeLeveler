@@ -296,6 +296,20 @@ pub enum EngineEvent {
         action: String,
         detail: String,
     },
+    /// A durable goal checkpoint was cut (long-goal P3). Carries the bounded
+    /// payload so clients can render the Recap without a second read — the
+    /// `goal_checkpoints` row stays the durable authority (same precedent as
+    /// `EvidenceLedgerUpdated` carrying the ledger). Emitted AFTER the row is
+    /// persisted, so this event always names a checkpoint that exists.
+    GoalCheckpointCreated {
+        checkpoint_id: String,
+        goal_id: String,
+        /// `manual` | `milestone` | `context_compaction` | `interrupted`.
+        reason: String,
+        /// RFC3339 creation time of the persisted row.
+        created_at: String,
+        payload: leveler_lifecycle::GoalCheckpoint,
+    },
     /// Delivery process-evidence ledger snapshot (SoT for resume seed).
     EvidenceLedgerUpdated {
         ledger: leveler_lifecycle::EvidenceLedger,
@@ -603,6 +617,8 @@ impl EngineEvent {
             | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
+            // Carries the checkpoint payload (paths, plan wording) — local.
+            | EngineEvent::GoalCheckpointCreated { .. }
             | EngineEvent::VerificationCheck { .. }
             | EngineEvent::RequirementReady { .. }
             | EngineEvent::PlanReady { .. }
@@ -742,6 +758,7 @@ impl EngineEvent {
             | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
+            | EngineEvent::GoalCheckpointCreated { .. }
             | EngineEvent::VerificationCheck { .. }
             | EngineEvent::RequirementReady { .. }
             | EngineEvent::PlanReady { .. }
