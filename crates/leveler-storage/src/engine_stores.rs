@@ -36,6 +36,8 @@ pub struct EngineStores {
     pub ownership: Arc<dyn crate::OwnershipStore>,
     /// Durable goal identity: what long-lived intent still owes work.
     pub goals: Arc<dyn crate::GoalStore>,
+    /// Durable goal checkpoints: derived semantic continuity boundaries.
+    pub goal_checkpoints: Arc<dyn crate::GoalCheckpointStore>,
 }
 
 impl EngineStores {
@@ -52,6 +54,7 @@ impl EngineStores {
             terminal: Arc::new(db.clone()),
             ownership: Arc::new(db.clone()),
             goals: Arc::new(db.clone()),
+            goal_checkpoints: Arc::new(db.clone()),
         }
     }
 }

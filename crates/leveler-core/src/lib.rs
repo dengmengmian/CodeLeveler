@@ -23,9 +23,9 @@ pub use environment::{
 };
 pub use home::LevelerHome;
 pub use ids::{
-    AgentId, ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId, GoalId,
-    RequestId, RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId, TurnId, UserShellId,
-    new_uuid_string,
+    AgentId, ApprovalId, ArtifactId, CheckpointId, ClarificationId, CommandId, EventId,
+    GoalCheckpointId, GoalId, RequestId, RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId,
+    TurnId, UserShellId, new_uuid_string,
 };
 pub use ownership::{OwnerEpoch, OwnershipToken};
 pub use secret::{

@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 
 mod axes;
+mod checkpoint;
 mod contract;
 mod findings;
 mod impact;
@@ -49,6 +50,10 @@ pub mod runtime;
 pub mod workflow;
 
 pub use axes::{CollaborationMode, DepthUseMetrics, WorkProfile};
+pub use checkpoint::{
+    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
+    CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
+};
 pub use contract::TaskContract;
 pub use findings::{
     ChildResultProjection, ContributionSource, FindingError, FindingKind, FindingRecord,

@@ -127,6 +127,12 @@ string_id!(
     GoalId
 );
 string_id!(
+ /// Identifies one durable goal checkpoint — a derived semantic projection
+ /// of a goal's progress at an exact event-log boundary. Distinct from
+ /// [`CheckpointId`], which names an in-memory conversation restore point.
+    GoalCheckpointId
+);
+string_id!(
  /// Identifies a single node within a task graph.
     TaskNodeId
 );
