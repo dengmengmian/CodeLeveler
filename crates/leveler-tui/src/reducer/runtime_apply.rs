@@ -359,13 +359,20 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             input_tokens,
             output_tokens,
             cached_input_tokens,
-        } => state.transcript.update_sub_agent_progress(
-            &id,
-            active,
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-        ),
+        } => {
+            // Feed BOTH projections: the transcript block and the runtime
+            // roster (elapsed · usage column).
+            state
+                .team
+                .apply_progress(&id, active, input_tokens, output_tokens);
+            state.transcript.update_sub_agent_progress(
+                &id,
+                active,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            )
+        }
         RuntimeEvent::SubAgentActivity {
             id,
             phase,
@@ -382,6 +389,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             } else {
                 tool
             };
+            state.team.apply_activity(&id, &step);
             state.transcript.update_sub_agent_activity(&id, step);
         }
         RuntimeEvent::MemoryList {
