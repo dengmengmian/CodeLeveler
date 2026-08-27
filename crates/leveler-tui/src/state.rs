@@ -203,6 +203,9 @@ pub struct AppState {
     pub shell_screen_item: Option<usize>,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
+    /// Collapse the collaboration surface to its one-line compact row.
+    /// View preference only — visibility itself is derived from team activity.
+    pub collaboration_collapsed: bool,
 
     /// Legacy global expand flag — no longer forces every tool group open.
     /// Kept so the workbench can render the currently focused tool group.
@@ -332,6 +335,7 @@ impl AppState {
             input_rect: None,
             shell_screen_item: None,
             plan_collapsed: false,
+            collaboration_collapsed: false,
             tools_expanded: false,
             turn_nav: None,
             slash_selected: 0,

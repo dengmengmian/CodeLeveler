@@ -167,6 +167,15 @@ pub struct UiText {
     pub inspector_summary: &'static str,
     pub inspector_unjudged: &'static str,
     pub team_panel_working: &'static str,
+    /// Compact runtime row: "2 个 Agent · Explore 运行中 · Review 等待中".
+    pub collaboration_compact: &'static str,
+    /// Terminal summary when every child succeeded.
+    pub collaboration_done: &'static str,
+    /// Terminal summary when any child failed/was incomplete — never worded
+    /// as success.
+    pub collaboration_ended_incomplete: &'static str,
+    /// Expanded member-list heading.
+    pub collaboration_members: &'static str,
     pub team_panel_done: &'static str,
     pub team_panel_blocking: &'static str,
     /// Truthful summary for a run_command call missing `program` — never
@@ -628,6 +637,10 @@ static ZH: UiText = UiText {
     inspector_summary: "采纳 {accepted} · 已验证 {verified} · 已驳回 {rejected}",
     inspector_unjudged: "{n} 项尚未判定",
     team_panel_working: "协作中",
+    collaboration_compact: "{n} 个 Agent",
+    collaboration_done: "{n} 个 Agent 已完成",
+    collaboration_ended_incomplete: "{n} 个 Agent 已结束 · {bad} 项未完成",
+    collaboration_members: "Agents",
     team_panel_done: "协作完成",
     team_panel_blocking: "{n} 项阻塞待处理",
     run_command_missing_program: "参数无效 · 缺少 program",
@@ -1018,6 +1031,10 @@ static EN: UiText = UiText {
     inspector_summary: "{accepted} accepted · {verified} verified · {rejected} rejected",
     inspector_unjudged: "{n} not judged",
     team_panel_working: "AI team",
+    collaboration_compact: "{n} Agents",
+    collaboration_done: "{n} Agents completed",
+    collaboration_ended_incomplete: "{n} Agents ended · {bad} incomplete",
+    collaboration_members: "Agents",
     team_panel_done: "AI team · done",
     team_panel_blocking: "{n} blocking",
     run_command_missing_program: "invalid arguments · missing program",

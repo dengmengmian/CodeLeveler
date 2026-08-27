@@ -662,6 +662,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             // Toggle plan panel when not typing.
             state.plan_collapsed = !state.plan_collapsed;
         }
+        KeyCode::Char('a') if !ctrl && state.composer.is_empty() => {
+            // Toggle collaboration surface density when not typing — the
+            // same convention as `p` for the plan dock.
+            state.collaboration_collapsed = !state.collaboration_collapsed;
+        }
         // Esc priority: slash popup → turn-nav → interrupt → finished 旁问 card
         // → notice. Dismissing a popup or leaving turn review is a *narrower*
         // undo than killing the turn, so those win while they are on screen.

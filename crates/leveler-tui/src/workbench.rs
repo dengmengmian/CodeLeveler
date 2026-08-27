@@ -362,8 +362,15 @@ fn plan_panel_height(state: &AppState) -> u16 {
 /// panel that grows with the child count would turn the workbench into an
 /// agent dashboard, which is the shape this product deliberately avoids.
 fn team_panel_height(state: &AppState) -> u16 {
-    if !crate::multi_agent::team_panel_should_show(&state.team) {
+    // Visibility is an ACTIVITY question, not a composition one: the surface
+    // is live while children work or block, lingers briefly as a terminal
+    // summary after the last one settles, then leaves. History stays in the
+    // Agents screen / transcript — a settled team is not runtime state.
+    if !state.team.surface_visible(state.elapsed_secs) {
         return 0;
+    }
+    if state.collaboration_collapsed || state.team.surface_is_terminal(state.elapsed_secs) {
+        return 1;
     }
     (state.team.children.len() + 1).min(5) as u16
 }
@@ -374,11 +381,48 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     }
     let theme = &state.theme;
     let t = state.t();
+    // Same primary task baseline as the plan dock and the conversation
+    // content: the collaboration row is task-runtime state, a sibling of the
+    // plan — not chrome hanging off the terminal's left edge.
+    let area = crate::layout::horizontal_inset(area, crate::layout::WORKSPACE_GUTTER_X);
+    if area.width == 0 {
+        return;
+    }
+    const MEMBER_INDENT: &str = "  ";
+    let blocking = state.team.open_blocking() > 0;
+    let terminal = state.team.surface_is_terminal(state.elapsed_secs);
+    if area.height == 1 || terminal {
+        // Compact / terminal: one truthful row, nothing else.
+        let glyph = if terminal { "✓" } else { "◉" };
+        let row = format!(
+            "{glyph} {}",
+            crate::multi_agent::collaboration_compact_line(&state.team, t)
+        );
+        let bad = state
+            .team
+            .children
+            .iter()
+            .any(|c| c.status == crate::multi_agent::ChildStatus::Failed);
+        let color = if blocking || bad {
+            theme.status.error
+        } else if terminal {
+            theme.status.success
+        } else {
+            theme.accent.primary
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate(row, area.width as usize),
+                Style::default().fg(color),
+            ))),
+            area,
+        );
+        return;
+    }
     let title = truncate(
         crate::multi_agent::team_panel_title(&state.team, t),
         area.width as usize,
     );
-    let blocking = state.team.open_blocking() > 0;
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         title,
         Style::default()
@@ -401,7 +445,10 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             crate::multi_agent::ChildStatus::Waiting => theme.text.secondary,
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{} ", line.glyph), Style::default().fg(color)),
+            Span::styled(
+                format!("{MEMBER_INDENT}{} ", line.glyph),
+                Style::default().fg(color),
+            ),
             Span::styled(
                 format!("{} ", line.role),
                 Style::default().fg(theme.text.primary),
@@ -409,9 +456,9 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 truncate(
                     line.detail,
-                    area.width
-                        .saturating_sub(line.role.chars().count() as u16 + 3)
-                        as usize,
+                    area.width.saturating_sub(
+                        line.role.chars().count() as u16 + 3 + MEMBER_INDENT.len() as u16,
+                    ) as usize,
                 ),
                 Style::default().fg(theme.text.secondary),
             ),
@@ -1188,6 +1235,131 @@ mod tests {
             !title.contains("2."),
             "the numbered list under the header already carries the index: {title}"
         );
+    }
+
+    fn active_team() -> crate::multi_agent::TaskTeamView {
+        let mut team = crate::multi_agent::TaskTeamView::default();
+        for (i, st) in [
+            crate::multi_agent::ChildStatus::Running,
+            crate::multi_agent::ChildStatus::Waiting,
+        ]
+        .iter()
+        .enumerate()
+        {
+            team.children.push(crate::multi_agent::ChildAgentView {
+                id: format!("c{i}"),
+                nickname: String::new(),
+                role: if i == 0 {
+                    "探索 Agent".into()
+                } else {
+                    "审查 Agent".into()
+                },
+                profile_id: None,
+                capabilities: Vec::new(),
+                purpose: "check deps".into(),
+                status: *st,
+                contribution: crate::multi_agent::Contribution::Pending,
+                recent_step: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                started_elapsed_secs: 0,
+                detail: None,
+            });
+        }
+        team
+    }
+
+    fn panel_rows(state: &AppState, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
+        terminal
+            .draw(|f| {
+                render_team_panel(
+                    f,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 70,
+                        height,
+                    },
+                    state,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..70)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Wide glyphs leave pad cells in the TestBackend buffer ("已 完 成"), so
+    /// substring assertions compare with spaces stripped.
+    fn squash(row: &str) -> String {
+        row.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The collaboration surface shares the primary task baseline with the
+    /// plan dock, and its member rows sit one level inside the header —
+    /// the real screenshot had every row at column 0.
+    #[test]
+    fn collaboration_panel_shares_the_task_baseline_with_indented_members() {
+        let mut state = test_state();
+        state.team = active_team();
+        let rows = panel_rows(&state, 3);
+        let header = &rows[0];
+        let header_col = header.len() - header.trim_start().len();
+        assert_eq!(
+            header_col,
+            crate::layout::WORKSPACE_GUTTER_X as usize,
+            "header on the content baseline: {header:?}"
+        );
+        let member = rows
+            .iter()
+            .find(|r| r.contains('⟳') || r.contains('○'))
+            .unwrap_or_else(|| panic!("member row rendered:\n{}", rows.join("\n")));
+        let member_col = member.len() - member.trim_start().len();
+        assert!(
+            member_col > header_col,
+            "members indent one level inside the header: {header:?} / {member:?}"
+        );
+    }
+
+    /// Once every child settles the surface shows one brief terminal row and
+    /// then leaves entirely; a failed child is never worded as completed.
+    #[test]
+    fn settled_collaboration_shows_one_terminal_row_then_leaves() {
+        let mut state = test_state();
+        state.team = active_team();
+        state.elapsed_secs = 100;
+        assert!(team_panel_height(&state) > 1, "active team is expanded");
+
+        for c in &mut state.team.children {
+            c.status = crate::multi_agent::ChildStatus::Completed;
+        }
+        state.team.settled_at_elapsed = Some(100);
+        assert_eq!(team_panel_height(&state), 1, "terminal = one row");
+        let rows = panel_rows(&state, 1);
+        assert!(squash(&rows[0]).contains("已完成"), "{rows:?}");
+        assert!(rows[0].contains('✓'), "{rows:?}");
+
+        state.elapsed_secs = 100 + crate::multi_agent::COLLABORATION_TERMINAL_SECS;
+        assert_eq!(
+            team_panel_height(&state),
+            0,
+            "after the linger window the surface is gone — history lives in Task Detail"
+        );
+
+        // Failure wording stays truthful in the terminal row.
+        state.elapsed_secs = 101;
+        state.team.children[1].status = crate::multi_agent::ChildStatus::Failed;
+        let rows = panel_rows(&state, 1);
+        assert!(!squash(&rows[0]).contains("已完成"), "{rows:?}");
+        assert!(squash(&rows[0]).contains("未完成"), "{rows:?}");
     }
 
     /// The plan is a sibling of the conversation, not a footnote to the

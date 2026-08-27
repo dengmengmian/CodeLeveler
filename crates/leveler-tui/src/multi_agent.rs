@@ -140,7 +140,16 @@ pub struct ChildUpdate {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskTeamView {
     pub children: Vec<ChildAgentView>,
+    /// Turn-elapsed seconds at the moment the LAST active child settled.
+    /// Presentation-only, and deliberately not persisted anywhere: it exists
+    /// so the runtime surface can show a brief terminal summary and then get
+    /// out of the way. Cleared whenever a child becomes active again.
+    pub settled_at_elapsed: Option<u64>,
 }
+
+/// How long the terminal collaboration summary stays on screen after the last
+/// child settles, before the surface disappears entirely.
+pub const COLLABORATION_TERMINAL_SECS: u64 = 6;
 
 impl TaskTeamView {
     /// Children still working.
@@ -162,6 +171,47 @@ impl TaskTeamView {
 
     /// Apply one `SubAgentUpdated`. Upserts by id so a child transitions in
     /// place rather than appearing twice.
+    /// Re-derive the terminal stamp after any child-state change.
+    ///
+    /// Active again → the surface is live, so clear the stamp. Just went
+    /// fully settled → stamp it so the terminal summary can age out. Already
+    /// stamped → leave it, or the summary would restart on every event.
+    fn restamp_settlement(&mut self, now_elapsed: u64) {
+        if self.children.is_empty() {
+            self.settled_at_elapsed = None;
+            return;
+        }
+        if self.active().next().is_some() {
+            self.settled_at_elapsed = None;
+        } else if self.settled_at_elapsed.is_none() {
+            self.settled_at_elapsed = Some(now_elapsed);
+        }
+    }
+
+    /// Whether the runtime surface should be on screen at all.
+    ///
+    /// This is an ACTIVITY question, not a composition one: a team that
+    /// merely exists is history, and history belongs to Task Detail. The
+    /// surface is live while anyone is working or blocking, stays briefly
+    /// after the last child settles, and then goes away.
+    pub fn surface_visible(&self, now_elapsed: u64) -> bool {
+        if self.children.is_empty() {
+            return false;
+        }
+        if self.active().next().is_some() || self.open_blocking() > 0 {
+            return true;
+        }
+        match self.settled_at_elapsed {
+            None => true,
+            Some(at) => now_elapsed.saturating_sub(at) < COLLABORATION_TERMINAL_SECS,
+        }
+    }
+
+    /// Whether the surface is showing its brief post-settlement summary.
+    pub fn surface_is_terminal(&self, now_elapsed: u64) -> bool {
+        self.surface_visible(now_elapsed) && self.active().next().is_none()
+    }
+
     pub fn apply_update(&mut self, update: ChildUpdate) {
         let ChildUpdate {
             id,
@@ -201,6 +251,7 @@ impl TaskTeamView {
             if !capabilities.is_empty() {
                 existing.capabilities = capabilities;
             }
+            self.restamp_settlement(started_elapsed_secs);
             return;
         }
         self.children.push(ChildAgentView {
@@ -218,6 +269,7 @@ impl TaskTeamView {
             started_elapsed_secs,
             detail: None,
         });
+        self.restamp_settlement(started_elapsed_secs);
     }
 
     /// Live execution state. `active` separates "spending model calls" from
@@ -279,6 +331,90 @@ fn project(c: Option<&ChildContribution>, ok: bool) -> Contribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn team_with(statuses: &[ChildStatus]) -> TaskTeamView {
+        let mut team = TaskTeamView::default();
+        for (i, st) in statuses.iter().enumerate() {
+            team.children.push(ChildAgentView {
+                id: format!("c{i}"),
+                nickname: String::new(),
+                role: if i == 0 {
+                    "探索 Agent".into()
+                } else {
+                    "审查 Agent".into()
+                },
+                profile_id: None,
+                capabilities: Vec::new(),
+                purpose: "look around".into(),
+                status: *st,
+                contribution: Contribution::Pending,
+                recent_step: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                started_elapsed_secs: 0,
+                detail: None,
+            });
+        }
+        team
+    }
+
+    /// The runtime surface answers "who is working NOW". A team that merely
+    /// exists is history: visible while active, visible briefly as a terminal
+    /// summary after the last child settles, gone afterwards — and back the
+    /// moment a child becomes active again.
+    #[test]
+    fn collaboration_surface_follows_activity_not_existence() {
+        let mut team = team_with(&[ChildStatus::Running, ChildStatus::Waiting]);
+        assert!(team.surface_visible(100), "active children → visible");
+        assert!(!team.surface_is_terminal(100));
+
+        team.children[0].status = ChildStatus::Completed;
+        team.children[1].status = ChildStatus::Completed;
+        team.restamp_settlement(120);
+        assert!(
+            team.surface_visible(121),
+            "terminal summary lingers briefly"
+        );
+        assert!(team.surface_is_terminal(121));
+        assert!(
+            !team.surface_visible(120 + COLLABORATION_TERMINAL_SECS),
+            "then the surface leaves — history belongs to Task Detail"
+        );
+
+        // A new child re-activates the surface and clears the stamp.
+        team.children[0].status = ChildStatus::Running;
+        team.restamp_settlement(130);
+        assert_eq!(team.settled_at_elapsed, None);
+        assert!(team.surface_visible(500));
+
+        assert!(
+            !TaskTeamView::default().surface_visible(0),
+            "no children, no surface"
+        );
+    }
+
+    /// The compact row never words a lost child as success.
+    #[test]
+    fn compact_line_is_truthful_about_failure() {
+        let t = crate::i18n::Locale::Zh.text();
+        let mut team = team_with(&[ChildStatus::Running, ChildStatus::Waiting]);
+        let row = collaboration_compact_line(&team, t);
+        assert!(row.contains("2 个 Agent"), "{row}");
+        assert!(row.contains("探索 Agent"), "{row}");
+
+        team.children[0].status = ChildStatus::Completed;
+        team.children[1].status = ChildStatus::Completed;
+        let row = collaboration_compact_line(&team, t);
+        assert!(row.contains("已完成"), "{row}");
+
+        team.children[1].status = ChildStatus::Failed;
+        let row = collaboration_compact_line(&team, t);
+        assert!(
+            !row.contains("已完成"),
+            "a failed child is not 已完成: {row}"
+        );
+        assert!(row.contains("未完成"), "{row}");
+    }
 
     fn contribution(total: u32, accepted: u32, verified: u32, rejected: u32) -> ChildContribution {
         ChildContribution {
@@ -1134,6 +1270,37 @@ pub struct TeamLine {
 /// terminal to tell the user something the transcript already shows.
 pub fn team_panel_should_show(team: &TaskTeamView) -> bool {
     team.children.len() >= 2 || team.children.iter().any(|c| c.role == "reviewer")
+}
+
+/// The one-line runtime row: who is working right now.
+///
+/// Truth over brevity: a settled team says what it ended as, and a team that
+/// lost a child never says "completed".
+pub fn collaboration_compact_line(team: &TaskTeamView, t: &crate::i18n::UiText) -> String {
+    let n = team.children.len();
+    let bad = team
+        .children
+        .iter()
+        .filter(|c| c.status == ChildStatus::Failed)
+        .count();
+    if team.active().next().is_none() {
+        return if bad > 0 {
+            t.collaboration_ended_incomplete
+                .replace("{n}", &n.to_string())
+                .replace("{bad}", &bad.to_string())
+        } else {
+            t.collaboration_done.replace("{n}", &n.to_string())
+        };
+    }
+    let mut row = t.collaboration_compact.replace("{n}", &n.to_string());
+    for c in team.active() {
+        let state = match c.status {
+            ChildStatus::Running => t.agent_status_running,
+            _ => t.sub_agent_waiting,
+        };
+        row.push_str(&format!(" · {} {}", c.role, state));
+    }
+    row
 }
 
 /// Compact team summary for the header.
