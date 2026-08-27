@@ -589,3 +589,312 @@ async fn a_settled_child_reports_a_contribution_projection() {
         "this child reported nothing, and the projection must say so rather than flatter it"
     );
 }
+
+// ── MA-RT-4: spawn persistence (durable-before-execute) ──────────────────────
+
+/// Order log entries shared by the observer, the event barrier and the model,
+/// so a single sequence answers "was the start durable before the child ran".
+type OrderLog = Arc<Mutex<Vec<String>>>;
+
+struct RecordingBarrier {
+    order: OrderLog,
+}
+
+#[async_trait]
+impl leveler_agent::EventBarrier for RecordingBarrier {
+    async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
+        self.order.lock().unwrap().push("flush".to_string());
+        Ok(())
+    }
+
+    fn record_child_tool_event(&self, _event: leveler_agent::ChildToolEvent) {}
+}
+
+/// A barrier that reports durability failure once armed. Arming from the
+/// observer at `SubAgentStarted` makes the SPAWN-path flush the first failing
+/// one, so the test proves that seam specifically rather than an earlier
+/// tool-dispatch flush.
+struct ArmedFailingBarrier {
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl leveler_agent::EventBarrier for ArmedFailingBarrier {
+    async fn flush(&self) -> Result<(), leveler_agent::AgentError> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(leveler_agent::AgentError::Persistence(
+                "event log unavailable (injected)".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_child_tool_event(&self, _event: leveler_agent::ChildToolEvent) {}
+}
+
+/// MA_RT_STARTED_DURABLE_BEFORE_EXECUTE — the runtime must flush the batch's
+/// `SubAgentStarted` events (make them durable) after emitting them and before
+/// any accepted child begins executing. The sequence proves it: both starts,
+/// then a flush, then the first child model stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_child_executes_before_its_start_event_is_flushed() {
+    let dir = tmp("durable-before-execute", 71);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let script = vec![
+        assistant_with(
+            vec![
+                spawn_call("s0", "explore slice 0"),
+                spawn_call("s1", "explore slice 1"),
+            ],
+            FinishReason::ToolCalls,
+        ),
+        assistant_text("child 0 report"),
+        assistant_text("child 1 report"),
+        assistant_text("parent synthesis"),
+    ];
+
+    let order: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    let model_order = order.clone();
+    let observer_order = order.clone();
+    let mut observer = move |event: AgentEvent| {
+        if let AgentEvent::SubAgentStarted { .. } = event {
+            observer_order.lock().unwrap().push("started".to_string());
+        }
+    };
+
+    let result = Executor::new(
+        Arc::new(ScriptedRuntime::new(script).with_stream_hook(move |i| {
+            model_order.lock().unwrap().push(format!("model{i}"));
+        })),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_event_barrier(Arc::new(RecordingBarrier {
+        order: order.clone(),
+    }))
+    .run(
+        "spawn and synthesise",
+        &mut observer,
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+    result.expect("the fan-out run itself must succeed");
+
+    let log = order.lock().unwrap().clone();
+    let second_started = log
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| *e == "started")
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("both children must be announced");
+    let first_child_stream = log
+        .iter()
+        .position(|e| e == "model1")
+        .expect("the children must actually run");
+    let flush_between = log[second_started..first_child_stream]
+        .iter()
+        .any(|e| e == "flush");
+    assert!(
+        flush_between,
+        "no barrier flush between the SubAgentStarted announcements and the first \
+         child execution — a crash there leaves running children no durable record \
+         can reconcile; sequence: {log:?}"
+    );
+}
+
+/// MA_RT_STARTED_FLUSH_FAILURE_FAIL_CLOSED — if `SubAgentStarted` cannot become
+/// durable, the accepted children must never begin executing and the run must
+/// abort with the persistence error, not limp on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_cannot_become_durable_stops_the_children() {
+    let dir = tmp("flush-fail-closed", 72);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+
+    let script = vec![
+        assistant_with(
+            vec![
+                spawn_call("s0", "explore slice 0"),
+                spawn_call("s1", "explore slice 1"),
+            ],
+            FinishReason::ToolCalls,
+        ),
+        assistant_text("child 0 report"),
+        assistant_text("child 1 report"),
+        assistant_text("parent synthesis"),
+    ];
+
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let arm = armed.clone();
+    let streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream_counter = streams.clone();
+    let lifecycle = Arc::new(Mutex::new(Lifecycle::default()));
+    let sink = lifecycle.clone();
+    let mut observer = move |event: AgentEvent| match event {
+        AgentEvent::SubAgentStarted { id, .. } => {
+            arm.store(true, std::sync::atomic::Ordering::SeqCst);
+            sink.lock().unwrap().started.push(id);
+        }
+        AgentEvent::SubAgentFinished { id, .. } => sink.lock().unwrap().finished.push(id),
+        _ => {}
+    };
+
+    let result = Executor::new(
+        Arc::new(ScriptedRuntime::new(script).with_stream_hook(move |_| {
+            stream_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_event_barrier(Arc::new(ArmedFailingBarrier { armed }))
+    .run(
+        "spawn and synthesise",
+        &mut observer,
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        matches!(result, Err(leveler_agent::AgentError::Persistence(_))),
+        "an unflushable start must abort the run with the persistence error, got {result:?}"
+    );
+    let life = lifecycle.lock().unwrap().clone();
+    assert_eq!(
+        life.started.len(),
+        2,
+        "the starts were announced before the flush refused them"
+    );
+    assert!(
+        life.finished.is_empty(),
+        "no child may settle: none was allowed to begin"
+    );
+    assert_eq!(
+        streams.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the parent's own model stream may have run — a child stream here \
+         means a child executed without a durable start"
+    );
+}
+
+// ── MA-RT-1: durable total child cap ─────────────────────────────────────────
+
+/// MA_RT_TOTAL_CAP_ACROSS_TURNS + MA_RT_SETTLED_CHILD_COUNTS_TOTAL — the
+/// total-delegation cap is a property of the task epoch, carried in the
+/// durable `ProgressLedger`, so a second window seeded from the first one's
+/// ledger starts with the quota already partly consumed — settled children
+/// included. 4 spawned-and-settled in window one leaves room for exactly 2 of
+/// the 3 asked for in window two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_total_child_cap_survives_a_window_boundary() {
+    let dir = tmp("total-cap-windows", 73);
+
+    // Window one: spawn 4, all settle.
+    let mut script = vec![assistant_with(
+        (0..4)
+            .map(|i| spawn_call(&format!("w1-{i}"), &format!("explore slice {i}")))
+            .collect(),
+        FinishReason::ToolCalls,
+    )];
+    for i in 0..4 {
+        script.push(assistant_text(&format!("child {i} report")));
+    }
+    script.push(assistant_text("window one synthesis"));
+
+    let carried: Arc<Mutex<Option<leveler_agent::ProgressLedger>>> = Arc::new(Mutex::new(None));
+    let capture = carried.clone();
+    let mut observer = move |event: AgentEvent| {
+        if let AgentEvent::ProgressUpdated { ledger } = event {
+            *capture.lock().unwrap() = Some(ledger);
+        }
+    };
+    Executor::new(
+        Arc::new(ScriptedRuntime::new(script)),
+        Arc::new(default_registry()),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "window one",
+        &mut observer,
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("window one must run");
+    let progress = carried
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("window one must persist a progress ledger");
+    assert_eq!(
+        progress.children_spawned_total, 4,
+        "four accepted spawns must be durably counted, settled or not"
+    );
+
+    // Window two: seeded with window one's durable ledger, asks for 3 more.
+    let mut script = vec![assistant_with(
+        (0..3)
+            .map(|i| spawn_call(&format!("w2-{i}"), &format!("explore more {i}")))
+            .collect(),
+        FinishReason::ToolCalls,
+    )];
+    for i in 0..2 {
+        script.push(assistant_text(&format!("late child {i} report")));
+    }
+    script.push(assistant_text("window two synthesis"));
+
+    let lifecycle = Arc::new(Mutex::new(Lifecycle::default()));
+    let sink = lifecycle.clone();
+    let mut observer = move |event: AgentEvent| match event {
+        AgentEvent::SubAgentStarted { id, .. } => sink.lock().unwrap().started.push(id),
+        AgentEvent::ToolResult {
+            name,
+            is_error: true,
+            preview,
+            ..
+        } if name == "spawn_agent" => sink.lock().unwrap().refusals.push(preview),
+        _ => {}
+    };
+    Executor::new(
+        Arc::new(ScriptedRuntime::new(script)),
+        Arc::new(default_registry()),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_seeded_progress(progress)
+    .run(
+        "window two",
+        &mut observer,
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("window two must run");
+    std::fs::remove_dir_all(&dir).ok();
+
+    let life = lifecycle.lock().unwrap().clone();
+    assert_eq!(
+        life.started.len(),
+        2,
+        "4 of 6 consumed in window one leaves exactly 2: {life:?}"
+    );
+    assert_eq!(life.refusals.len(), 1, "the 7th total must be refused");
+    assert!(
+        life.refusals[0].contains("limit reached"),
+        "the refusal must name the limit, got: {}",
+        life.refusals[0]
+    );
+}

@@ -230,26 +230,54 @@ impl<'a> EventLog<'a> {
     /// to this day. A ghost like that is not cosmetic; it is the log asserting
     /// something false about work that has stopped.
     pub async fn unfinished_children(&self) -> Result<Vec<UnfinishedChild>, EngineError> {
+        Ok(self.child_reconciliation_view().await?.0)
+    }
+
+    /// One scan, both sides of the child ledger: children still open (started,
+    /// never finished) and the durable terminal facts of those that did finish.
+    /// First terminal fact wins — a child with a persisted `SubAgentFinished`
+    /// is settled, and no later reconciliation may re-classify it as lost.
+    pub async fn child_reconciliation_view(
+        &self,
+    ) -> Result<(Vec<UnfinishedChild>, Vec<FinishedChildFact>), EngineError> {
         // Raw rows, not `replay`: the reconciling event has to be attributed to
         // the turn the child was started in.
         let rows = self.store.load(&self.session_id).await?;
         let mut open: Vec<UnfinishedChild> = Vec::new();
+        let mut finished: Vec<FinishedChildFact> = Vec::new();
         for row in &rows {
             match decode_row(row)? {
-                EngineEvent::SubAgentStarted { id, nickname, .. } => {
+                EngineEvent::SubAgentStarted {
+                    id, nickname, role, ..
+                } => {
                     open.push(UnfinishedChild {
                         turn_id: row.turn_id.clone(),
                         id,
                         nickname,
+                        role,
                     });
                 }
-                EngineEvent::SubAgentFinished { id, .. } => {
+                EngineEvent::SubAgentFinished {
+                    id,
+                    nickname,
+                    ok,
+                    summary,
+                    ..
+                } => {
                     open.retain(|child| child.id != id);
+                    if !finished.iter().any(|f: &FinishedChildFact| f.id == id) {
+                        finished.push(FinishedChildFact {
+                            id,
+                            nickname,
+                            ok,
+                            summary,
+                        });
+                    }
                 }
                 _ => {}
             }
         }
-        Ok(open)
+        Ok((open, finished))
     }
 
     /// Tool calls with a persisted `ToolCallStarted` but no matching
@@ -351,6 +379,20 @@ pub struct UnfinishedChild {
     pub turn_id: Option<String>,
     pub id: String,
     pub nickname: String,
+    /// Role label from `SubAgentStarted`. A lost Worker is original-goal debt
+    /// (its scoped work is unfinished); other roles are knowledge loss only.
+    pub role: String,
+}
+
+/// The durable terminal fact of a child that DID finish — what restart
+/// reconciliation consults so a settled child is never called lost, and what
+/// an unconsumed settlement is re-delivered from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedChildFact {
+    pub id: String,
+    pub nickname: String,
+    pub ok: bool,
+    pub summary: String,
 }
 
 /// A tool call started but never finished — the crash window M5 reconciles.

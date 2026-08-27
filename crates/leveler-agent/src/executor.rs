@@ -979,6 +979,11 @@ pub struct Executor {
     seeded_ledger: EvidenceLedger,
     /// Seeded progress (engine continue / resume).
     seeded_progress: ProgressLedger,
+    /// Settlements from a previous window the host proved durable but the
+    /// parent may not have acted on (MA-RT-3 C10). Re-delivered once at the
+    /// top of a depth-0 run; the pruned outstanding record is the
+    /// once-per-restart mark.
+    restart_settled_children: Vec<crate::sub_agent::SettledChildNotice>,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
@@ -1059,6 +1064,7 @@ impl Executor {
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
+            restart_settled_children: Vec::new(),
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits::default(),
@@ -1123,6 +1129,16 @@ impl Executor {
     /// Seed progress ledger (engine continue_active_goal carries streak/closeout).
     pub fn with_seeded_progress(mut self, progress: ProgressLedger) -> Self {
         self.seeded_progress = progress;
+        self
+    }
+
+    /// Hand the run the durable settlements a dead window left unconsumed
+    /// (derived by the host from `SubAgentFinished` facts, MA-RT-3 C10).
+    pub fn with_restart_settled_children(
+        mut self,
+        children: Vec<crate::sub_agent::SettledChildNotice>,
+    ) -> Self {
+        self.restart_settled_children = children;
         self
     }
 
@@ -1422,6 +1438,7 @@ impl Executor {
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
+            restart_settled_children: Vec::new(),
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits {

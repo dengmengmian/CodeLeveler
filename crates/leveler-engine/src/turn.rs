@@ -252,6 +252,26 @@ impl TurnRunner<'_> {
             )
             .await?;
 
+        // MA-RT-2: durable ghosts — children a dead window STARTED and never
+        // finished — are reconciled into truthful terminal debt BEFORE this
+        // turn seeds its state, so both completion gates (the drive's
+        // update_goal refusal and the closure-boundary ledger check) see the
+        // debt instead of an empty outstanding list. Hard error on purpose:
+        // running a turn past an unreconciled ghost Worker is exactly the
+        // false-Verified path this exists to close. The finished facts feed
+        // the C10 settlement re-delivery during seeding below.
+        let (open_ghosts, finished_children) = self.log.child_reconciliation_view().await?;
+        if !open_ghosts.is_empty() {
+            self.settle_ghost_children(
+                open_ghosts,
+                "was lost when its previous runtime window ended before it reported",
+                "its runtime window ended before it reported",
+                &turn_id,
+                observer,
+            )
+            .await?;
+        }
+
         // Margin, not the fix. The fix is the batching pump below: raising this
         // alone only moves the cliff, and a wider fan-out would walk straight
         // back off it. Sized so a burst from several agents has somewhere to sit
@@ -333,8 +353,34 @@ impl TurnRunner<'_> {
             // the seed decision and the seeding itself. Each `last_persisted_*`
             // call scans the full event log, so loading plan/progress twice
             // (as this did) doubled that cost every Content/Goal turn.
-            let progress =
+            let mut progress =
                 last_persisted_progress(self.stores.events.as_ref(), &self.session_id).await?;
+            // MA-RT-3 C10/C11: an outstanding entry whose child durably
+            // FINISHED is not lost — the settlement raced the window's end.
+            // Prune it (the lost note must never contradict a terminal fact)
+            // and re-deliver the recorded outcome instead. Genuine ghosts were
+            // already settled above and stay listed for the lost note.
+            let mut settled_notices: Vec<leveler_agent::SettledChildNotice> = Vec::new();
+            if let Some(p) = progress.as_mut() {
+                p.outstanding_children.retain(|entry| {
+                    let mut parts = entry.splitn(4, '|');
+                    let id = parts.next().unwrap_or("");
+                    let role = parts.nth(1).unwrap_or("?");
+                    match finished_children.iter().find(|f| f.id == id) {
+                        Some(fact) => {
+                            settled_notices.push(leveler_agent::SettledChildNotice {
+                                id: fact.id.clone(),
+                                nickname: fact.nickname.clone(),
+                                role: role.to_string(),
+                                ok: fact.ok,
+                                summary: fact.summary.clone(),
+                            });
+                            false
+                        }
+                        None => true,
+                    }
+                });
+            }
             let plan = last_persisted_plan(self.stores.events.as_ref(), &self.session_id).await?;
             let seed_state = match &input {
                 TurnInput::Resume(_) => true,
@@ -354,6 +400,9 @@ impl TurnRunner<'_> {
                 if let Some(progress) = progress {
                     executor = executor.with_seeded_progress(progress);
                 }
+                if !settled_notices.is_empty() {
+                    executor = executor.with_restart_settled_children(settled_notices);
+                }
             } else if is_repair_turn
                 && progress.as_ref().is_some_and(|p| {
                     p.delegation_decision_offered
@@ -372,6 +421,10 @@ impl TurnRunner<'_> {
                     delegation_decision_offered: prior.delegation_decision_offered,
                     delegation_kept_recorded: prior.delegation_kept_recorded,
                     delegation_delegated_recorded: prior.delegation_delegated_recorded,
+                    // MA-RT-1: a repair turn continues the same goal, so the
+                    // total-delegation quota it consumed carries — a repair is
+                    // not a fresh allowance.
+                    children_spawned_total: prior.children_spawned_total,
                     ..Default::default()
                 });
                 if let Some(ledger) =
@@ -577,34 +630,26 @@ impl TurnRunner<'_> {
         // the terminal event below.
         match self.log.unfinished_children().await {
             Ok(open) => {
-                for child in open {
-                    let event = EngineEvent::SubAgentFinished {
-                        id: child.id.clone(),
-                        nickname: child.nickname.clone(),
-                        ok: false,
-                        // A child that never reported contributed nothing, and
-                        // an empty projection says that rather than leaving the
-                        // question open.
-                        contribution: None,
-                        summary: format!(
-                            "[sub-agent {}] did not report before the turn ended ({})",
-                            child.nickname,
-                            match terminal {
-                                TurnOutcome::Interrupted => "cancelled",
-                                TurnOutcome::Failed => "failed",
-                                _ => "ended",
-                            }
-                        ),
-                    };
-                    if let Err(error) = self.log.append(Some(&turn_id), event, observer).await {
-                        tracing::warn!(
-                            session_id = %self.session_id.as_str(),
-                            child = %child.id,
-                            %error,
-                            "could not settle an unfinished child; it stays running in the log"
-                        );
-                        break;
-                    }
+                let how = match terminal {
+                    TurnOutcome::Interrupted => "cancelled",
+                    TurnOutcome::Failed => "failed",
+                    _ => "ended",
+                };
+                if let Err(error) = self
+                    .settle_ghost_children(
+                        open,
+                        &format!("did not report before the turn ended ({how})"),
+                        &format!("the turn ended ({how}) before it reported"),
+                        &turn_id,
+                        observer,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %self.session_id.as_str(),
+                        %error,
+                        "could not settle an unfinished child; it stays running in the log"
+                    );
                 }
             }
             Err(error) => tracing::warn!(
@@ -710,6 +755,107 @@ pub(crate) async fn last_persisted_plan(
 }
 
 impl TurnRunner<'_> {
+    /// Settle durable ghosts — children with a persisted `SubAgentStarted` and
+    /// no terminal — into truthful terminal facts under CURRENT lost-child
+    /// semantics: the activation is gone, the work is not done, the child is
+    /// NOT resumed. Mirrors `fold_child_settlement`'s truth rules for a child
+    /// that never reported:
+    ///
+    /// - a lost Worker is original-goal debt: an open blocking finding is
+    ///   recorded (once — an existing open one is not duplicated), so neither
+    ///   completion gate can pass it off as done;
+    /// - findings the child ALREADY durably reported stay adopted, and its
+    ///   terminal carries a projection over them (C9: the synthetic finish
+    ///   must not contradict durable evidence);
+    /// - debt is persisted BEFORE the terminal: if only one of the two
+    ///   commits, an open child with recorded debt re-reconciles on the next
+    ///   turn, while a terminal without debt would reopen the false-Verified
+    ///   window;
+    /// - the terminal is attributed to the turn the child STARTED in.
+    ///
+    /// `desc` finishes the sentence "[sub-agent {nickname}] …" on the terminal
+    /// event; `debt_cause` finishes "did not complete scoped work (…)" on the
+    /// Worker debt finding.
+    async fn settle_ghost_children(
+        &self,
+        open: Vec<crate::log::UnfinishedChild>,
+        desc: &str,
+        debt_cause: &str,
+        current_turn: &TurnId,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<(), EngineError> {
+        if open.is_empty() {
+            return Ok(());
+        }
+        let mut ledger = last_persisted_ledger(self.stores.events.as_ref(), &self.session_id)
+            .await?
+            .unwrap_or_default();
+        let mut ledger_dirty = false;
+        for child in &open {
+            let has_open_debt = ledger
+                .findings
+                .iter()
+                .any(|f| f.source_child == child.id && f.open_blocking());
+            if child.role == "worker" && !has_open_debt {
+                ledger.record_parent_finding(
+                    &child.id,
+                    &child.role,
+                    leveler_lifecycle::FindingKind::Observation,
+                    format!(
+                        "Worker {} did not complete scoped work ({debt_cause}). Finish it \
+                         yourself, then reject this finding with a reason, or spawn the \
+                         worker again.",
+                        child.nickname
+                    ),
+                    true,
+                );
+                ledger_dirty = true;
+            }
+        }
+        if ledger_dirty {
+            self.log
+                .append(
+                    Some(current_turn),
+                    EngineEvent::EvidenceLedgerUpdated {
+                        ledger: ledger.clone(),
+                    },
+                    observer,
+                )
+                .await?;
+        }
+        for child in open {
+            let projection = leveler_lifecycle::ChildResultProjection::from_findings(
+                &child.id,
+                &child.role,
+                &ledger.findings,
+            )
+            .with_source(leveler_lifecycle::ContributionSource::ExecutorChild {
+                child_id: child.id.clone(),
+            });
+            let preserved = projection.findings_total;
+            let summary = if preserved > 0 {
+                format!(
+                    "[sub-agent {}] {desc}; {preserved} finding(s) on its ledger record \
+                     remain adopted",
+                    child.nickname
+                )
+            } else {
+                format!("[sub-agent {}] {desc}", child.nickname)
+            };
+            let event = EngineEvent::SubAgentFinished {
+                id: child.id.clone(),
+                nickname: child.nickname.clone(),
+                ok: false,
+                contribution: (preserved > 0).then_some(projection),
+                summary,
+            };
+            let origin = child.turn_id.clone().map(TurnId::new);
+            let attribute_to = origin.as_ref().unwrap_or(current_turn);
+            self.log.append(Some(attribute_to), event, observer).await?;
+        }
+        Ok(())
+    }
+
     /// Run one independent reviewer child over work this session already did,
     /// and report whether the review actually completed.
     ///

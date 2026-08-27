@@ -154,6 +154,47 @@ pub(crate) fn settlement_notice(
     )
 }
 
+/// A child that durably settled while the previous window ended, before the
+/// parent demonstrably acted on its result. The host derives these from the
+/// event log at seed time (the `SubAgentFinished` fact) so the resumed parent
+/// gets the recorded outcome re-delivered instead of a false "lost" verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledChildNotice {
+    pub id: String,
+    pub nickname: String,
+    pub role: String,
+    pub ok: bool,
+    /// The recorded settlement summary (bounded preview persisted on the
+    /// terminal event). The full prose result of the dead activation is not
+    /// reconstructable — this is the durable truth that remains.
+    pub summary: String,
+}
+
+/// Re-delivery note for settlements the previous window may not have acted
+/// on. Distinct from `lost_children_note`: these children FINISHED — telling
+/// the model they were lost would be false, and would invite re-doing work
+/// that is already done.
+pub(crate) fn settled_children_redelivery_note(children: &[SettledChildNotice]) -> String {
+    let mut out = String::from(
+        "## Sub-agent results re-delivered after restart
+         The previous session window ended after these sub-agents settled,          possibly before their results were acted on. Their recorded outcomes          follow (re-delivered; one may repeat a notice you already saw).          Integrate them — do NOT re-delegate or redo work that is already          done:
+",
+    );
+    for child in children {
+        let status = if child.ok {
+            "completed"
+        } else {
+            "stopped incomplete"
+        };
+        out.push_str(&format!(
+            "- {} ({}, role={}) — {status}: {}
+",
+            child.nickname, child.id, child.role, child.summary
+        ));
+    }
+    out
+}
+
 /// Truthful note for a resumed run whose previous window still had background
 /// children running: in-process children do not survive a restart.
 pub(crate) fn lost_children_note(outstanding: &[String]) -> String {

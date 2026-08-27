@@ -125,6 +125,13 @@ pub struct ProgressLedger {
     /// and clears it. Normally drained to empty before a run returns.
     #[serde(default)]
     pub outstanding_children: Vec<String>,
+    /// Total children ever accepted by `spawn_agent` in this task epoch —
+    /// settled children included, refused spawns excluded. Durable so the
+    /// total-delegation cap is a property of the task, not of one drive: a
+    /// turn, window, or process boundary must not hand the model a fresh
+    /// quota. Reviewer children are harness-owned and never consume it.
+    #[serde(default)]
+    pub children_spawned_total: u32,
     /// The user explicitly denied network elevation this task epoch.
     /// Host-side re-request guard; not a durable project rule.
     #[serde(default)]

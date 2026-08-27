@@ -209,8 +209,6 @@ impl Executor {
                 session_approved.insert(sig);
             }
         }
-        // Sub-agents spawned so far this run (bounds total delegation).
-        let mut agents_spawned = 0usize;
         // V2 background delegation state: children the model started with
         // run_in_background (the default). One run-level concurrency semaphore
         // covers foreground batches AND background children; the progress
@@ -225,6 +223,23 @@ impl Executor {
         ));
         let (bg_progress_tx, mut bg_progress_rx) =
             tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        // MA-RT-3 C10: children that durably SETTLED while the previous
+        // window ended are not lost — their recorded outcomes are re-delivered
+        // so the parent integrates instead of re-delegating. The host already
+        // pruned them out of `outstanding_children`; persisting that pruned
+        // ledger here is the once-per-restart mark (a crash before it lands
+        // re-delivers again, which repeats a note but never repeats state).
+        if self.depth == 0 && !self.restart_settled_children.is_empty() {
+            let note = Message::text(
+                Role::User,
+                crate::sub_agent::settled_children_redelivery_note(&self.restart_settled_children),
+            );
+            observer(AgentEvent::ProgressUpdated {
+                ledger: progress.clone(),
+            });
+            sink.append(std::slice::from_ref(&note)).await?;
+            messages.push(note);
+        }
         // In-process children did not survive a restart: tell the model
         // truthfully which delegations were lost, release their scopes, and
         // clear the durable record.
@@ -2719,10 +2734,15 @@ impl Executor {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ))
-                    } else if agents_spawned >= self.policy.max_total_agents {
+                    } else if (progress.children_spawned_total as usize)
+                        >= self.policy.max_total_agents
+                    {
+                        // MA-RT-1: the durable task-epoch total, not a
+                        // drive-local counter — a turn, window, or restart
+                        // boundary must not hand the model a fresh quota.
                         Some(format!(
-                            "Sub-agent limit reached ({} max this run). Do the remaining work \
-                             directly.",
+                            "Sub-agent limit reached ({} total for this task). Do the \
+                             remaining work directly.",
                             self.policy.max_total_agents
                         ))
                     } else {
@@ -2753,9 +2773,9 @@ impl Executor {
                         admitted_worker_scopes.push(files.clone());
                         delegation_decision.note_worker_admitted(&files);
                     }
-                    agents_spawned += 1;
+                    progress.children_spawned_total += 1;
                     let id = new_delegated_agent_id();
-                    let nickname = agent_nickname(agents_spawned);
+                    let nickname = agent_nickname(progress.children_spawned_total as usize);
                     self.ownership
                         .register_owner(&id, &format!("{nickname} ({id})"));
                     if role == AgentRole::Worker && !files.is_empty() {
@@ -2778,7 +2798,8 @@ impl Executor {
                                     is_error: true,
                                 },
                             });
-                            agents_spawned -= 1;
+                            progress.children_spawned_total =
+                                progress.children_spawned_total.saturating_sub(1);
                             continue;
                         }
                     }
@@ -2787,6 +2808,9 @@ impl Executor {
                     } else {
                         task.clone()
                     };
+                    observer(AgentEvent::ProgressUpdated {
+                        ledger: progress.clone(),
+                    });
                     let (profile_id, profile_role, capabilities) = profile.trace_fields();
                     observer(AgentEvent::SubAgentStarted {
                         id: id.clone(),
@@ -2810,6 +2834,18 @@ impl Executor {
                         agent_max_rounds,
                         background,
                     ));
+                }
+                // A child may only begin once its `SubAgentStarted` is durable
+                // — the same truth-before-effect rule tool dispatch already
+                // follows. Without the flush, a crash between spawn and the
+                // next pump commit leaves children running that no durable
+                // record can reconcile. A flush failure aborts the run before
+                // any accepted child executes (fail closed); hosts without
+                // persistence leave the barrier unset and proceed as before.
+                if !accepted.is_empty()
+                    && let Some(barrier) = &self.event_barrier
+                {
+                    barrier.flush().await?;
                 }
                 let share_n = accepted.len() as u32;
                 for (
