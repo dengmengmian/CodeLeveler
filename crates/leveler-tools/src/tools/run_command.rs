@@ -560,15 +560,20 @@ pub(crate) async fn execute_program(
             .unwrap_or_else(|| "signal".to_string())
     ));
     let store = context.services.artifact_store.as_deref();
+    let mut locators: Vec<String> = Vec::new();
     if !output.stdout.trim().is_empty() {
         body.push_str("--- stdout ---\n");
         let stdout = leveler_core::sanitize_terminal_output(&output.stdout);
-        body.push_str(&truncate_or_spill(&stdout, store));
+        let (shown, locator) = truncate_or_spill("stdout", &stdout, store);
+        body.push_str(&shown);
+        locators.extend(locator);
     }
     if !output.stderr.trim().is_empty() {
         body.push_str("--- stderr ---\n");
         let stderr = leveler_core::sanitize_terminal_output(&output.stderr);
-        body.push_str(&truncate_or_spill(&stderr, store));
+        let (shown, locator) = truncate_or_spill("stderr", &stderr, store);
+        body.push_str(&shown);
+        locators.extend(locator);
     }
     if let Some(hint) = sandbox_denial_hint(sandboxed, output.success(), &body) {
         body.push_str(hint);
@@ -580,6 +585,26 @@ pub(crate) async fn execute_program(
         body.push_str("\n[mutation rejected] ");
         body.push_str(error);
         body.push('\n');
+    }
+    // HCH-FIX-3: recovery locators go LAST, after every note, so the
+    // registry cap's retained tail always carries them. And when the body
+    // plus locators would exceed this model's result budget, shrink the
+    // PREVIEWS first — the registry's later head/tail cap must never be the
+    // thing that decides whether a locator survives, because at small
+    // budgets its retained tail is smaller than two locator lines.
+    if !locators.is_empty() {
+        let budget = context.policy.tool_output_budget;
+        let locators_len: usize = locators.iter().map(|l| l.len() + 1).sum();
+        if body.len() + locators_len > budget {
+            let preview_budget = budget
+                .saturating_sub(locators_len)
+                .max(crate::registry::MIN_TOOL_OUTPUT / 2);
+            body = crate::registry::cap_output_with(&body, preview_budget);
+        }
+    }
+    for locator in &locators {
+        body.push('\n');
+        body.push_str(locator);
     }
 
     let out = ToolOutput {
@@ -827,11 +852,22 @@ mod grant_tests {
 /// land at the end) with an elision marker between, mirroring
 /// [`crate::registry::cap_output`]. When the output is larger and an artifact
 /// store is available, spill the FULL output to a content-addressed file and
-/// reference it in the marker, so nothing is silently lost — the model (or
-/// user) can read the full output back.
-fn truncate_or_spill(s: &str, store: Option<&leveler_execution::ArtifactStore>) -> String {
+/// return its recovery locator SEPARATELY, so nothing is silently lost — the
+/// model (or user) can read the full output back.
+///
+/// The locator is returned rather than embedded (HCH-FIX-3): the registry
+/// applies a second, model-specific head/tail cap after this tool returns,
+/// and a locator inside a stream's own block can land in that cap's elided
+/// middle when BOTH streams spill under a small model budget. The caller
+/// appends every locator at the absolute end of the result, inside the
+/// cap's retained tail — previews are disposable, locators are not.
+fn truncate_or_spill(
+    label: &str,
+    s: &str,
+    store: Option<&leveler_execution::ArtifactStore>,
+) -> (String, Option<String>) {
     if s.len() <= MAX_OUTPUT {
-        return s.to_string();
+        return (s.to_string(), None);
     }
     let head = leveler_core::floor_char_boundary(s, MAX_OUTPUT / 2);
     let tail = leveler_core::ceil_char_boundary(s, s.len() - MAX_OUTPUT / 4);
@@ -842,15 +878,10 @@ fn truncate_or_spill(s: &str, store: Option<&leveler_execution::ArtifactStore>) 
         tail - head,
         s.len()
     );
-    let mut shown = format!("{}\n{}\n{}", &s[..head], marker, &s[tail..]);
-    if let Some(artifact) = artifact {
-        // Keep the recovery reference at the very end. The registry applies a
-        // second, model-specific head/tail cap after this tool returns; a link
-        // embedded in the middle marker would be elided and make the stored
-        // full output unreachable.
-        shown.push_str(&format!("\n[full output: {}]\n", artifact.path.display()));
-    }
-    shown
+    let shown = format!("{}\n{}\n{}", &s[..head], marker, &s[tail..]);
+    let locator =
+        artifact.map(|artifact| format!("[{label} full output: {}]\n", artifact.path.display()));
+    (shown, locator)
 }
 
 /// Default command timeout, and the ceiling we clamp any request to.
@@ -1200,7 +1231,8 @@ mod tests {
         // Errors land at the end of build/test output; truncation must keep the
         // tail, not just the head.
         let big = format!("HEAD{}TAIL", "z".repeat(MAX_OUTPUT));
-        let shown = truncate_or_spill(&big, None);
+        let (shown, locator) = truncate_or_spill("stdout", &big, None);
+        assert!(locator.is_none(), "no store, no locator");
         assert!(shown.len() < big.len(), "must shrink");
         assert!(shown.starts_with("HEAD"), "keeps the head");
         assert!(shown.trim_end().ends_with("TAIL"), "keeps the tail");
@@ -1216,12 +1248,14 @@ mod tests {
             super::super::test_ordinal()
         ));
         let store = leveler_execution::ArtifactStore::new(&root);
-        let shown = truncate_or_spill(&big, Some(&store));
+        let (shown, locator) = truncate_or_spill("stdout", &big, Some(&store));
         assert!(shown.starts_with("HEAD"), "keeps the head");
-        assert!(shown.contains("TAIL"), "keeps the tail");
+        assert!(shown.trim_end().ends_with("TAIL"), "keeps the tail");
         assert!(
-            shown.contains(&format!("full output: {}", root.display())),
-            "must reference the artifact path: {shown}"
+            locator
+                .as_deref()
+                .is_some_and(|l| l.contains(&format!("full output: {}", root.display()))),
+            "must reference the artifact path: {locator:?}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1235,16 +1269,20 @@ mod tests {
             super::super::test_ordinal()
         ));
         let store = leveler_execution::ArtifactStore::new(&root);
-        let shown = truncate_or_spill(&big, Some(&store));
+        let (shown, locator) = truncate_or_spill("stdout", &big, Some(&store));
 
         assert!(shown.len() < big.len(), "the shown output must be capped");
+        let locator = locator.expect("spill must yield a locator");
         assert!(
-            shown.contains(&format!("full output: {}", root.display())),
-            "must reference the artifact path: {shown}"
+            locator.contains(&format!("full output: {}", root.display())),
+            "must reference the artifact path: {locator}"
         );
         assert!(shown.contains(&format!("of {} bytes", big.len())));
         // The referenced file holds the FULL, untruncated output.
-        let path_line = shown.lines().find(|l| l.contains("full output:")).unwrap();
+        let path_line = locator
+            .lines()
+            .find(|l| l.contains("full output:"))
+            .unwrap();
         let path = path_line
             .split("full output: ")
             .nth(1)
@@ -1265,8 +1303,10 @@ mod tests {
             super::super::test_ordinal()
         ));
         let store = leveler_execution::ArtifactStore::new(&root);
-        let shown = truncate_or_spill(&big, Some(&store));
-        let capped = crate::registry::cap_output_with(&shown, 4 * 1024);
+        let (shown, locator) = truncate_or_spill("stdout", &big, Some(&store));
+        // The execute path appends locators at the absolute end of the body.
+        let body = format!("{shown}\n{}", locator.expect("spilled"));
+        let capped = crate::registry::cap_output_with(&body, 4 * 1024);
 
         assert!(
             capped.contains(&format!("full output: {}", root.display())),
@@ -1275,11 +1315,132 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// HCH-FIX-3 matrix: a successfully spilled stream's recovery locator
+    /// must survive every later model-facing cap — previews are disposable,
+    /// locators are not. Exercises the REAL tool execute path (both streams
+    /// produced by a real process), then the registry-shaped final cap.
+    async fn run_dual_stream(
+        out_lines: usize,
+        err_lines: usize,
+        root: &std::path::Path,
+        budget: usize,
+    ) -> String {
+        let dir = root.join("ws");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let store = leveler_execution::ArtifactStore::new(root.join("artifacts"));
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .with_artifact_store(std::sync::Arc::new(store));
+        // Mirror the real chain: the registry cap and the tool's own policy
+        // budget are the SAME resolved value.
+        ctx.policy.tool_output_budget = budget;
+        let script = format!(
+            "awk 'BEGIN {{ for (i = 0; i < {out_lines}; i++) print \"OUT padding padding padding padding padding\" i; \
+             for (j = 0; j < {err_lines}; j++) print \"ERR padding padding padding padding padding\" j > \"/dev/stderr\" }}'"
+        );
+        let out = RunCommandTool
+            .execute(
+                serde_json::json!({"program": "/bin/sh", "args": ["-c", script]}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        out.content
+    }
+
+    fn locator_count(text: &str) -> usize {
+        text.matches("full output:").count()
+    }
+
+    #[tokio::test]
+    async fn spilled_stdout_locator_survives_the_final_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-a-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let content = run_dual_stream(2000, 3, &root, crate::registry::MAX_TOOL_OUTPUT).await;
+        assert_eq!(locator_count(&content), 1, "stdout spilled: {content}");
+        let capped = crate::registry::cap_output_with(&content, crate::registry::MAX_TOOL_OUTPUT);
+        assert_eq!(
+            locator_count(&capped),
+            1,
+            "locator lost under cap: {capped}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn spilled_stderr_locator_survives_the_final_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-b-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let content = run_dual_stream(3, 2000, &root, crate::registry::MAX_TOOL_OUTPUT).await;
+        assert_eq!(locator_count(&content), 1, "stderr spilled: {content}");
+        let capped = crate::registry::cap_output_with(&content, crate::registry::MAX_TOOL_OUTPUT);
+        assert_eq!(
+            locator_count(&capped),
+            1,
+            "locator lost under cap: {capped}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn dual_spilled_locators_survive_the_default_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-c-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        let content = run_dual_stream(2000, 2000, &root, crate::registry::MAX_TOOL_OUTPUT).await;
+        assert_eq!(
+            locator_count(&content),
+            2,
+            "both streams spilled: {content}"
+        );
+        let capped = crate::registry::cap_output_with(&content, crate::registry::MAX_TOOL_OUTPUT);
+        assert_eq!(
+            locator_count(&capped),
+            2,
+            "a spilled stream lost its only recovery handle: {capped}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The clamp permits per-model budgets down to 1 KiB; locators must
+    /// survive the SMALLEST legal budget, not just the 48 KiB default.
+    #[tokio::test]
+    async fn dual_spilled_locators_survive_a_small_model_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-hch3-d-{}-{}",
+            std::process::id(),
+            super::super::test_ordinal()
+        ));
+        for budget in [16 * 1024, 4 * 1024, crate::registry::MIN_TOOL_OUTPUT] {
+            let sub = root.join(format!("b{budget}"));
+            let content = run_dual_stream(2000, 2000, &sub, budget).await;
+            assert_eq!(locator_count(&content), 2, "budget {budget}: {content}");
+            let capped = crate::registry::cap_output_with(&content, budget);
+            assert!(capped.len() <= budget, "cap must stay bounded at {budget}");
+            assert_eq!(
+                locator_count(&capped),
+                2,
+                "budget {budget}: a spilled stream lost its locator: {capped}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn truncate_or_spill_without_a_store_falls_back_to_marker() {
         let big = "y".repeat(MAX_OUTPUT + 100);
-        let shown = truncate_or_spill(&big, None);
+        let (shown, locator) = truncate_or_spill("stdout", &big, None);
         assert!(shown.contains("elided"));
+        assert!(locator.is_none());
         assert!(!shown.contains("full output:"));
     }
 
