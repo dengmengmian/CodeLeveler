@@ -724,6 +724,7 @@ impl InProcessRuntimeClient {
                     id: MessageId::new(leveler_core::new_uuid_string()),
                     role: UiRole::User,
                     text: text.to_string(),
+                    ordinal: None,
                 },
             });
         Ok(cancel)
@@ -1045,6 +1046,142 @@ impl InProcessRuntimeClient {
                 // (R006 R6-P4).
             });
         });
+    }
+
+    /// `/recap` (long-goal P3): cut a durable goal checkpoint and surface it
+    /// as a Recap history item.
+    ///
+    /// This is NOT a transcript summary: the checkpoint projects
+    /// authoritative facts through the engine's one canonical builder and is
+    /// persisted before anything is shown. The semantic wording is attempted
+    /// first with a hard timeout; any failure degrades to a structured-only
+    /// checkpoint with a deterministic display — never a lost checkpoint,
+    /// never "recap unavailable".
+    fn spawn_recap(&self, session_id: SessionId, config: SessionRuntimeConfig) {
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let model = config.model;
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                let result: Result<Option<leveler_client_protocol::UiGoalRecap>, String> = async {
+                    let db = app.open_database().await.map_err(|e| e.to_string())?;
+                    let stores = leveler_storage::EngineStores::from_database(&db);
+                    // A session without any goal has nothing to recap —
+                    // answer truthfully before spending a model call.
+                    let has_goal = match stores.tasks.task_for_session(&session_id).await {
+                        Ok(Some(task)) => !stores
+                            .goals
+                            .for_task(&task)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .is_empty(),
+                        _ => false,
+                    };
+                    if !has_goal {
+                        return Ok(None);
+                    }
+                    let semantic = Self::recap_semantic(&app, &session_id, model.clone()).await;
+                    let record = leveler_engine::create_goal_checkpoint(
+                        &stores,
+                        &session_id,
+                        leveler_lifecycle::CheckpointReason::Manual,
+                        Some(app.layout.repo_root.as_path()),
+                        semantic,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    Ok(record.as_ref().map(crate::goal_recap::project_goal_recap))
+                }
+                .await;
+                match result {
+                    Ok(Some(recap)) => {
+                        let _ = events.send(RuntimeEvent::GoalRecapCreated { recap });
+                    }
+                    Ok(None) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Info,
+                            message: "当前会话没有可回顾的 Goal".to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("阶段回顾失败：{error}"),
+                        });
+                    }
+                }
+            });
+        });
+    }
+
+    /// Bounded, optional semantic wording for a manual recap. Grounded in the
+    /// projected structured facts plus a short recent-transcript tail;
+    /// reasoning never reaches this input (it is dropped at the stream
+    /// boundary and never persisted). Every failure returns `None`.
+    async fn recap_semantic(
+        app: &Application,
+        session_id: &SessionId,
+        model: ModelRef,
+    ) -> Option<leveler_engine::SemanticRecap> {
+        const RECAP_SEMANTIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let work = async {
+            let db = app.open_database().await.ok()?;
+            let raw = leveler_engine::RawTranscript::load_lossy(&db, session_id)
+                .await
+                .ok()?;
+            if raw.is_empty() {
+                return None;
+            }
+            let tail: String = raw
+                .messages
+                .iter()
+                .rev()
+                .filter_map(|m| {
+                    let text = m.text_content();
+                    (!text.is_empty()).then_some(text)
+                })
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            let tail: String = tail.chars().take(6_000).collect();
+            let prompt = format!(
+                "请基于下面的对话片段，用两行中文总结当前任务进展。\
+                 第一行：当前阶段与已完成的内容（一句话）。\
+                 第二行：以「下一步：」开头，说明接下来要做什么。\
+                 只依据给出的内容，不要编造未发生的事实。\n\n{tail}"
+            );
+            let mut request = ModelRequest::new(model, vec![Message::text(Role::User, prompt)]);
+            request.tool_choice = ToolChoice::None;
+            request.max_output_tokens = Some(256);
+            let resp = app
+                .registry
+                .generate(request, CancellationToken::new())
+                .await
+                .ok()?;
+            let text = resp.message.text_content();
+            let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+            let display = lines.next()?.trim().to_string();
+            let next_action = lines.next().map(|l| {
+                l.trim()
+                    .trim_start_matches("下一步：")
+                    .trim_start_matches("下一步:")
+                    .trim()
+                    .to_string()
+            });
+            Some(leveler_engine::SemanticRecap {
+                goal_summary: Some(text.trim().to_string()),
+                display_summary: Some(display),
+                next_action: next_action.filter(|s| !s.is_empty()),
+            })
+        };
+        match tokio::time::timeout(RECAP_SEMANTIC_TIMEOUT, work).await {
+            Ok(semantic) => semantic,
+            Err(_) => None,
+        }
     }
 
     /// Side question: one generate call over a fork of the session transcript.
@@ -2041,6 +2178,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .send(RuntimeEvent::ChildContributionLoaded { query_id, detail });
                 Ok(())
             }
+            ClientCommand::Recap { session_id } => {
+                let config = self.runtime_config(&session_id).await?;
+                self.spawn_recap(session_id, config);
+                Ok(())
+            }
             ClientCommand::ListUnfinishedGoals {
                 session_id,
                 query_id,
@@ -2279,7 +2421,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .load(session_id)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        let messages = payloads.iter().filter_map(|p| ui_message(p)).collect();
+        let messages = payloads
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| ui_message_at(p, Some(i as u64)))
+            .collect();
 
         let mut available_models = self.app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
@@ -2334,6 +2480,26 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let live = self.live_views.view(session_id);
         let checkpoints = self.checkpoints.list(session_id);
 
+        // Long-goal P3: durable goal recaps survive the process, so a
+        // reopened client re-renders them from the persisted rows — same
+        // projection as the live event, oldest boundary first.
+        let mut recaps = Vec::new();
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        if let Ok(Some(task)) = stores.tasks.task_for_session(session_id).await
+            && let Ok(goals) = stores.goals.for_task(&task).await
+        {
+            for goal in &goals {
+                if let Ok(rows) = stores.goal_checkpoints.for_goal(&goal.id).await {
+                    recaps.extend(rows.iter().map(crate::goal_recap::project_goal_recap));
+                }
+            }
+            recaps.sort_by(|a, b| {
+                a.transcript_ordinal
+                    .cmp(&b.transcript_ordinal)
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+            });
+        }
+
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
             repository: record.repository,
@@ -2352,6 +2518,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             verification: live.verification,
             diff: live.diff,
             checkpoints,
+            recaps,
             user_shells: self.user_shells.snapshot(session_id),
             completion_report: live.completion_report,
             reasoning,
@@ -2649,6 +2816,7 @@ async fn compact_conversation(
                 verification: live.verification,
                 diff: live.diff,
                 checkpoints: Vec::new(),
+                recaps: Vec::new(),
                 user_shells: Vec::new(),
                 completion_report: live.completion_report,
                 reasoning,
@@ -2716,6 +2884,13 @@ async fn reset_session_task_epoch_db(
 /// Deserialize a persisted `Message` payload into a `UiMessage`, or `None` for
 /// tool/empty messages that have nothing to render.
 fn ui_message(payload: &str) -> Option<UiMessage> {
+    ui_message_at(payload, None)
+}
+
+/// `ordinal` is the persisted append position of this payload in the message
+/// log — carried on snapshots so a client can interleave durable goal recaps
+/// at the transcript position their checkpoint represents (long-goal P3).
+fn ui_message_at(payload: &str, ordinal: Option<u64>) -> Option<UiMessage> {
     let message: leveler_model::Message = serde_json::from_str(payload).ok()?;
     let role = match message.role {
         Role::User => UiRole::User,
@@ -2731,6 +2906,7 @@ fn ui_message(payload: &str) -> Option<UiMessage> {
         id: MessageId::new(leveler_core::new_uuid_string()),
         role,
         text,
+        ordinal,
     })
 }
 

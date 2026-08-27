@@ -394,6 +394,23 @@ impl EventBridge {
             EngineEvent::EvidenceLedgerUpdated { .. } => {
                 // Persisted by engine; no dedicated UI cell in v1.
             }
+            EngineEvent::GoalCheckpointCreated {
+                checkpoint_id,
+                goal_id,
+                reason,
+                created_at,
+                payload,
+            } => {
+                let _ = self.events.send(RuntimeEvent::GoalRecapCreated {
+                    recap: crate::goal_recap::project_goal_recap_parts(
+                        &checkpoint_id,
+                        &goal_id,
+                        &reason,
+                        &created_at,
+                        &payload,
+                    ),
+                });
+            }
             EngineEvent::UserShellStarted {
                 execution_id,
                 command,
