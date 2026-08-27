@@ -274,10 +274,15 @@ pub fn budget_prior_messages(
         // Snapshot+tail already fits: persist so next request starts shorter.
         return (base, true);
     }
+    // HCH-FIX-2: bound the retained tail by TOKENS as well as by count —
+    // half the fold threshold, mirroring the agent loop's `budget / 2`
+    // (drive loop passes `current_budget / 2`). With `0` here, a single
+    // huge tool result inside the last 12 messages rode through a
+    // 24k-threshold fold intact, retaining 5-19x the threshold.
     let folded = leveler_agent::compact_messages(
         &base,
         leveler_agent::COMPACT_KEEP_RECENT,
-        0,
+        threshold / 2,
         summary,
         active_objective,
     );
@@ -2985,6 +2990,104 @@ mod multi_turn_session_tests {
         );
     }
 
+    /// HCH-OPT-5 characterization (reproduction only, no fix in this train):
+    /// a legacy snapshot with `through_ordinal: None` whose LAST message is
+    /// an in-memory-only injection (scoped rules / nudge — never persisted
+    /// to the transcript) defeats the suffix-overlap heuristic, and the
+    /// fallback appends the last 12 raw messages on top of a snapshot that
+    /// already contains that same recent window.
+    #[test]
+    fn characterize_overlap_fallback_duplicates_the_recent_window() {
+        let raw = long_prior(30);
+        // The executor's in-loop snapshot: summary + the recent window it
+        // already carries + a memory-only tail (never in the transcript).
+        let mut snap = vec![msg(Role::User, "[compact summary of earlier work]")];
+        snap.extend_from_slice(&raw[raw.len() - 12..]);
+        snap.push(msg(
+            Role::System,
+            "Project rules:\n- memory-only injection, never persisted",
+        ));
+        // The duplication is visible on the "merged base already fits"
+        // branch (over-threshold raw, under-threshold merge — the common
+        // real shape: raw is long, the snapshot is a folded view). When the
+        // merge itself is over threshold the subsequent fold swallows the
+        // duplicated window into the summarized middle — efficiency waste,
+        // not resent duplication.
+        let mut expected_base = snap.clone();
+        expected_base.extend_from_slice(&raw[raw.len() - 12..]);
+        let threshold = leveler_agent::estimate_tokens(&expected_base) + 10;
+        assert!(leveler_agent::estimate_tokens(&raw) > threshold);
+
+        let (out, _) = budget_prior_messages(
+            raw.clone(),
+            Some(SnapshotView {
+                messages: snap,
+                through_ordinal: None,
+            }),
+            None,
+            None,
+            threshold,
+        );
+
+        // Quantify the duplication: every text in the last-12 raw window that
+        // appears more than once in the merged output is a duplicate.
+        let texts: Vec<String> = out.iter().map(|m| m.text_content()).collect();
+        let duplicated = raw[raw.len() - 12..]
+            .iter()
+            .filter(|m| {
+                let t = m.text_content();
+                texts.iter().filter(|x| **x == t).count() > 1
+            })
+            .count();
+        let inflation = leveler_agent::estimate_tokens(&raw[raw.len() - 12..]);
+        let total = leveler_agent::estimate_tokens(&out);
+        println!(
+            "OPT5: duplicated_messages={duplicated} duplicate_window_tokens={inflation} \
+             merged_total_tokens={total}"
+        );
+        assert!(
+            duplicated > 0,
+            "characterization: the fallback is expected to duplicate the window \
+             (if this starts passing with 0, the heuristic changed — re-audit OPT-5)"
+        );
+    }
+
+    /// HCH-FIX-2: the engine fold must bound the retained recent tail by
+    /// TOKENS, not only by message count. A single huge tool result inside
+    /// the last 12 messages used to ride through a 24k-threshold fold intact
+    /// (keep_recent_tokens = 0), leaving ~5-19x the threshold behind.
+    #[test]
+    fn engine_fold_bounds_the_retained_tail_by_tokens() {
+        let threshold: u64 = 24_000;
+        let mut raw = long_prior(20);
+        // A huge tool-ish payload well inside the last 12 messages:
+        // ~300 KiB ASCII ≈ 75k estimated tokens on its own.
+        raw.push(msg(Role::Assistant, &"x".repeat(300 * 1024)));
+        for i in 0..3 {
+            raw.push(msg(Role::Assistant, &format!("tail {i}")));
+        }
+        let before = leveler_agent::estimate_tokens(&raw);
+        assert!(
+            before > threshold,
+            "precondition: over threshold ({before})"
+        );
+
+        let (folded, changed) = budget_prior_messages(
+            raw,
+            None,
+            Some("summary of earlier work"),
+            Some("obj"),
+            threshold,
+        );
+
+        assert!(changed, "an over-threshold prior must fold");
+        let after = leveler_agent::estimate_tokens(&folded);
+        assert!(
+            after <= threshold,
+            "a {threshold}-token fold must not retain {after} tokens"
+        );
+    }
+
     #[test]
     fn budget_prior_merges_snapshot_tail_when_over_threshold() {
         // Oversized raw with a compact snap that ends with a shared suffix;
@@ -3036,34 +3139,46 @@ mod multi_turn_session_tests {
             msg(Role::User, &format!("run the tests {pad}")),
             msg(Role::Assistant, &format!("all green {pad}")),
         ];
-        let mut raw = round.to_vec();
+        // A realistically LONG raw transcript whose snapshot is a small
+        // folded view: the first identical round sits before the watermark,
+        // the second after it. Suffix-overlap inference would match the
+        // snapshot tail against the MOST RECENT occurrence and drop a round;
+        // the explicit watermark appends exactly raw[wm..].
+        let mut raw = long_prior(30);
+        raw.extend(round.to_vec());
+        let watermark = raw.len() as u64;
         raw.extend(round.to_vec());
         raw.push(msg(
             Role::User,
             &format!("what changed between runs? {pad}"),
         ));
         let snap = vec![
-            msg(Role::User, "[compact summary]"),
+            msg(Role::User, "[compact summary of earlier work]"),
             round[0].clone(),
             round[1].clone(),
         ];
-        let tokens = leveler_agent::estimate_tokens(&raw);
-        assert!(tokens > 50, "raw must exceed the threshold: {tokens}");
+        let threshold = leveler_agent::estimate_tokens(&snap)
+            + leveler_agent::estimate_tokens(&raw[watermark as usize..])
+            + 10;
+        assert!(
+            leveler_agent::estimate_tokens(&raw) > threshold,
+            "raw must exceed the threshold"
+        );
 
         let (out, _) = budget_prior_messages(
             raw,
             Some(SnapshotView {
                 messages: snap,
-                through_ordinal: Some(2),
+                through_ordinal: Some(watermark),
             }),
             None,
             None,
-            50,
+            threshold,
         );
         assert_eq!(
             out.len(),
             6,
-            "snapshot(3) + raw[2..](3): the duplicate round after the \
+            "snapshot(3) + raw[wm..](3): the duplicate round after the \
              watermark must survive the merge: {out:?}"
         );
     }

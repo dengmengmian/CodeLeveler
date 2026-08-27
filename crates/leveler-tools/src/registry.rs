@@ -272,9 +272,13 @@ pub fn cap_output_with(s: &str, budget: usize) -> String {
     }
 }
 
-/// ~4 bytes/token heuristic — enough for "is it worth re-reading" decisions.
+/// ~2.5 bytes/token heuristic for TOOL OUTPUT, matching the fold
+/// accountant's weighting (`estimate_tokens` charges tool bytes at 2/5 —
+/// calibrated against measured provider usage). The old bytes/4 figure
+/// under-reported elided cost by ~60%, making a re-read look cheaper than
+/// the context accountant would charge for it.
 pub(crate) fn approx_tokens(bytes: usize) -> usize {
-    bytes.div_ceil(4)
+    (bytes * 2).div_ceil(5)
 }
 
 /// Validate `instance` against `schema`, returning a readable error listing the
@@ -561,6 +565,29 @@ mod tests {
     #[test]
     fn cap_output_leaves_small_content_untouched() {
         assert_eq!(cap_output("hello"), "hello");
+    }
+
+    /// HCH: the model-facing elision marker must charge tool bytes at the
+    /// SAME rate as the fold accountant (2/5 tokens per byte), so a re-read
+    /// never looks ~60% cheaper than the context accountant will charge.
+    #[test]
+    fn elision_marker_token_figure_matches_the_fold_accountant() {
+        assert_eq!(approx_tokens(1000), 400, "2/5 per byte, not 1/4");
+        let big = "y".repeat(100 * 1024);
+        let capped = cap_output_with(&big, 10 * 1024);
+        let marker_tokens: usize = capped
+            .split("(~")
+            .nth(1)
+            .and_then(|rest| rest.split(" tokens").next())
+            .and_then(|n| n.parse().ok())
+            .expect("marker carries a token figure");
+        let elided_bytes: usize = capped
+            .split("… [")
+            .nth(1)
+            .and_then(|rest| rest.split(" bytes").next())
+            .and_then(|n| n.parse().ok())
+            .expect("marker carries a byte figure");
+        assert_eq!(marker_tokens, (elided_bytes * 2).div_ceil(5));
     }
 
     #[test]
