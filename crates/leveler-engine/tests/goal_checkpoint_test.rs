@@ -305,3 +305,76 @@ async fn restart_reap_cuts_one_interrupted_checkpoint() {
         after.len()
     );
 }
+
+/// HCH-FIX-1 (§9C): a checkpoint created against a pre-/compact transcript
+/// must never be eligible for post-/compact resume reconstruction — even
+/// after the NEW conversation grows past the old transcript watermark,
+/// where the ordinal guard alone would stop rejecting it.
+#[tokio::test]
+async fn a_pre_compact_checkpoint_is_never_consumed_after_the_cut() {
+    let fx = fixture().await;
+    // Pre-compact epoch: 4 transcript messages, a checkpoint at ordinal 4.
+    append_messages(&fx, &["m1", "m2", "m3", "m4"]).await;
+    append_event(&fx, marker_event("work")).await;
+    let old = create_goal_checkpoint(
+        &fx.stores,
+        &fx.session,
+        CheckpointReason::Manual,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("pre-compact checkpoint");
+    assert_eq!(old.payload.transcript_ordinal, Some(4));
+
+    // The user compacts: one atomic cut replaces the transcript, appends the
+    // epoch events, and invalidates the destroyed epoch's checkpoints.
+    let summary = serde_json::to_string(&Message::text(Role::User, "compaction summary")).unwrap();
+    let epoch_events: Vec<(String, String)> = [
+        leveler_engine::EngineEvent::ContextSnapshot {
+            messages: vec![Message::text(Role::User, "compaction summary")],
+            through_ordinal: Some(1),
+        },
+        leveler_engine::EngineEvent::PlanUpdated { steps: vec![] },
+    ]
+    .into_iter()
+    .map(|e| e.to_row().unwrap())
+    .collect();
+    fx.db
+        .cut_context_epoch(&fx.session, &[summary], &epoch_events, leveler_core::now())
+        .await
+        .unwrap();
+
+    // The new conversation grows PAST the old watermark (5 > 4): the ordinal
+    // guard alone would no longer reject the stale checkpoint.
+    append_messages(&fx, &["n1", "n2", "n3", "n4"]).await;
+    let transcript = leveler_engine::RawTranscript::load_strict(
+        fx.stores.messages.as_ref(),
+        &fx.session,
+        "post-compact transcript",
+    )
+    .await
+    .unwrap();
+    assert!(
+        transcript.messages.len() > 4,
+        "grown past the old watermark"
+    );
+
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript.messages)
+        .await
+        .unwrap();
+    assert!(
+        prior.is_none(),
+        "an old-epoch checkpoint must never splice into a new-epoch delta"
+    );
+    assert!(
+        fx.stores
+            .goal_checkpoints
+            .for_goal(&fx.goal)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the cut invalidated the destroyed epoch's checkpoints"
+    );
+}

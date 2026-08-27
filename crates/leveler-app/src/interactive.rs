@@ -2744,8 +2744,13 @@ async fn compact_conversation(
             leveler_client_protocol::COMPACTION_SUMMARY_PREFIX
         ),
     );
-    // All-or-nothing: serialize first, then atomic replace. Never truncate
-    // before a successful write (append failure must not wipe history).
+    // All-or-nothing (HCH-FIX-1): the transcript replacement, the epoch
+    // events (snapshot/progress/plan/evidence), and the invalidation of the
+    // destroyed epoch's derived goal checkpoints commit as ONE transaction.
+    // The old shape — replace_all, then four independent event appends with
+    // a Warning on failure — could leave a rewritten transcript under
+    // old-epoch task state and still-eligible old checkpoints, with nothing
+    // on restart able to notice.
     let payload = match serde_json::to_string(&summary_msg) {
         Ok(p) => p,
         Err(e) => {
@@ -2753,20 +2758,22 @@ async fn compact_conversation(
             return false;
         }
     };
-    if let Err(e) = repo
-        .replace_all(session_id, &[payload], leveler_core::now())
+    let epoch_events =
+        match epoch_event_rows(vec![summary_msg.clone()], 1 /* the summary row */) {
+            Ok(rows) => rows,
+            Err(e) => {
+                fail(format!("压缩失败：序列化任务状态出错（原历史未改动）: {e}"));
+                return false;
+            }
+        };
+    if let Err(e) = db
+        .cut_context_epoch(session_id, &[payload], &epoch_events, leveler_core::now())
         .await
     {
-        fail(format!("压缩失败：写入摘要出错（原历史未改动）: {e}"));
+        // Fail closed: the transaction rolled back, so the pre-compact
+        // state is intact and coherent — never a half-compacted session.
+        fail(format!("压缩失败：{e}（原历史与任务状态未改动）"));
         return false;
-    }
-    // Cut Plan/Evidence/Progress and replace ContextSnapshot with the summary
-    // so later turns never re-merge a pre-compact snapshot.
-    if let Err(e) = reset_session_task_epoch_db(&db, session_id, vec![summary_msg.clone()]).await {
-        notify(
-            NotificationLevel::Warning,
-            format!("已压缩历史,但任务状态/快照重置失败: {e}"),
-        );
     }
 
     if let Ok(Some(record)) = SessionRepository::new(&db).get(session_id).await {
@@ -2848,19 +2855,13 @@ async fn reset_session_task_epoch(
 ///
 /// `model_visible` becomes the sole model-visible snapshot after the cut
 /// (summary-only after compact; empty after clear/restore).
-async fn reset_session_task_epoch_db(
-    db: &leveler_storage::Database,
-    session_id: &SessionId,
+/// The four epoch-cut events as `(type, payload)` rows, in the canonical
+/// order (snapshot first, so a partial legacy write cannot leave a fresh
+/// Progress with a stale ContextSnapshot still "latest").
+fn epoch_event_rows(
     model_visible: Vec<Message>,
-) -> Result<(), anyhow::Error> {
-    let repo = leveler_storage::EventRepository::new(db);
-    let now = leveler_core::now();
-    // The epoch-cut snapshot supersedes the WHOLE post-cut transcript, so its
-    // watermark is the live message count (all callers mutate messages before
-    // resetting: compact replaced them, clear/restore truncated them).
-    let through_ordinal = MessageRepository::new(db).count(session_id).await?;
-    // Order: invalidate snapshot first so a partial failure cannot leave a
-    // fresh Progress with a stale ContextSnapshot still "latest".
+    through_ordinal: u64,
+) -> Result<Vec<leveler_storage::EpochEventRow>, anyhow::Error> {
     let events = [
         leveler_engine::EngineEvent::ContextSnapshot {
             messages: model_visible,
@@ -2874,8 +2875,22 @@ async fn reset_session_task_epoch_db(
             ledger: leveler_lifecycle::EvidenceLedger::default(),
         },
     ];
-    for event in events {
-        let (tag, payload) = event.to_row()?;
+    events.into_iter().map(|e| Ok(e.to_row()?)).collect()
+}
+
+async fn reset_session_task_epoch_db(
+    db: &leveler_storage::Database,
+    session_id: &SessionId,
+    model_visible: Vec<Message>,
+) -> Result<(), anyhow::Error> {
+    let repo = leveler_storage::EventRepository::new(db);
+    let now = leveler_core::now();
+    // The epoch-cut snapshot supersedes the WHOLE post-cut transcript, so its
+    // watermark is the live message count (all callers mutate messages before
+    // resetting: clear/restore truncated them; /compact no longer comes
+    // through here — it uses the atomic `cut_context_epoch`).
+    let through_ordinal = MessageRepository::new(db).count(session_id).await?;
+    for (tag, payload) in epoch_event_rows(model_visible, through_ordinal)? {
         repo.append(session_id, None, &tag, &payload, now).await?;
     }
     Ok(())
