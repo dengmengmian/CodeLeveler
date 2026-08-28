@@ -62,9 +62,36 @@ BLOCKED / UNCERTAIN / 矛盾 / 畸形输出 / provider 失败 / 超时 → 拒�
 - `direct_spends_no_extra_model_call_on_acceptance` 语义更新：acceptance 审计仍零额外调用；
   reconciliation gate 是本轮有意新增的一次调用，在 mock 中带外应答。
 
-## 验收（§29-§33）
+## HC002-F1 — 结构化结果交付可靠性（假阴性收口）
 
-（实跑后回填：icg-6r ×10 / 受影响 lane 重跑 / CORRECT_WORK_UNDERCLAIMED 计数 / 时延与 token 实测）
+首版 gate 上线后，GORK 的 HC-002（icg-5-long-task ×2）与本地受影响 lane 重跑（17/18）暴露
+**系统性假阴性**：活全做对（隐藏验收绿）但每次 reconciliation 都 `Unavailable —
+reply carried no JSON object` → fail-closed 拒绝 → 终局 Blocked / rc 1。
+（×10 icg-6r 没暴露它，因为该探针的期望结局恰好就是 blocked。）
+
+**根因（对真网关逐项复现锁定）**：openai_chat 编码器对 thinking-flag 模型**总是**发
+`thinking:{"type":"enabled"}`；gate 又继承了主策略的 reasoning effort（profile 默认 **max**）；
+在 `max_tokens: 1024` 下 reasoning 吃光全部预算——实测 `finish=length`、
+`reasoning_tokens=1024/1024`、content 空。裸 API 同 prompt 不带 thinking/effort 时一切正常。
+
+**修复（transport 层，语义零改动）**：
+1. gate 请求自带 `reasoning_effort: low` + `max_tokens: 4096`（判格式不判难题；实测 4.6s /
+   ~350 reasoning tokens vs max 档 18s / ~1750）——不再继承主策略 effort；
+2. 解析加固：字符串感知的平衡花括号扫描，接受裸对象 / ```json 围栏 / 散文包裹的**唯一**对象；
+   相同对象重复可、**不同对象=ambiguous 拒绝**；
+3. 失败分类：provider_error / timeout / empty_reply / no_object / bad_json / bad_verdict /
+   ambiguous_objects（观测字段 + 拒绝文案区分"任务未满足"与"验证器不可用"）；
+4. **一次**格式修复重试（FORMAT_REPAIR_MAX_ATTEMPTS=1）：同对话回放 + 只要 schema、
+   明示不得改判；provider 错误不触发修复；两次失败即 fail-closed，无第三次；
+5. Unavailable 反馈加反重复重试指引（HC-002 观测到同一声明连提 5 次）。
+
+SATISFIED/BLOCKED/UNCERTAIN/UNAVAILABLE 接受规则逐字未动；解析成功≠语义成功
+（单测锁定不可能任务不因解析变宽而通过）。
+
+## 验收（§28-§33 / §59-§60）
+
+（双向控制 + lane 重跑后回填：icg-6r ×3 / HC-002 ×3（Completed+rc0+Unavailable=0）/
+受影响 lane 假完成 0 与 CORRECT_WORK_UNDERCLAIMED / 时延与修复率实测）
 
 ## 残余限制
 

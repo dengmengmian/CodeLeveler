@@ -862,6 +862,74 @@ async fn goal_mode_update_goal_emits_completed_tool_event() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Cross-model judge: the reconciliation request carries the CONFIGURED judge
+/// model with the gate's bounded request profile, while every main-loop
+/// request keeps the executor's own model.
+#[tokio::test]
+async fn reconciliation_uses_the_configured_judge_model_with_bounded_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-crossmodel-{}",
+        std::process::id() as u64 * 67 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+        reconcile_ok(),
+    ]));
+    let outcome = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("deepseek", "deepseek-v4-flash"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
+    .run(
+        "do the task",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    let requests = runtime.recorded_requests();
+    let judge: Vec<_> = requests
+        .iter()
+        .filter(|r| r.model.model == "deepseek-v4-pro")
+        .collect();
+    assert_eq!(
+        judge.len(),
+        1,
+        "exactly one judge request on the judge model"
+    );
+    let judge = judge[0];
+    assert_eq!(
+        judge.reasoning_effort,
+        Some(leveler_model::ReasoningEffort::Low),
+        "the gate keeps its bounded effort profile on the stronger model"
+    );
+    assert_eq!(judge.max_output_tokens, Some(4096));
+    assert!(
+        requests
+            .iter()
+            .filter(|r| !r
+                .messages
+                .iter()
+                .any(|m| m.text_content().contains("reconciliation judge")))
+            .all(|r| r.model.model == "deepseek-v4-flash"),
+        "every main-loop request stays on the executor model"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Completion Reconciliation Gate, end to end: a `blocked` verdict refuses the
 /// completion (durable GoalIntercepted + error ToolResult), the run continues,
 /// and the model may then resolve truthfully.

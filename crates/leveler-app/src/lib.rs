@@ -101,6 +101,8 @@ pub struct LoadedConfig {
     pub agents_offer_timing: leveler_project::OfferTiming,
     /// When the harness launches an independent reviewer (default Auto).
     pub agents_independent_review: leveler_project::IndependentReview,
+    /// Cross-model completion judge (`provider/model`); None = executor model.
+    pub agents_completion_judge_model: Option<String>,
 }
 
 impl Default for LoadedConfig {
@@ -115,6 +117,7 @@ impl Default for LoadedConfig {
             agents_delegation: true,
             agents_offer_timing: leveler_project::OfferTiming::default(),
             agents_independent_review: leveler_project::IndependentReview::default(),
+            agents_completion_judge_model: None,
         }
     }
 }
@@ -221,6 +224,7 @@ impl Application {
             agents_delegation: global.agents_delegation,
             agents_offer_timing: global.agents_offer_timing,
             agents_independent_review: global.agents_independent_review,
+            agents_completion_judge_model: global.agents_completion_judge_model,
         })
     }
 
@@ -570,6 +574,17 @@ impl Application {
                 // Project config wins over global when set; both default true.
                 allow_delegation: self.project_config().agents.delegation
                     && self.config.agents_delegation,
+                // A configured-but-unparseable judge is a config ERROR, not a
+                // silent same-model fallback (that would contaminate the
+                // cross-model experiment and hide typos).
+                completion_judge_model: match self.config.agents_completion_judge_model.as_deref() {
+                    None => None,
+                    Some(raw) => Some(leveler_model::ModelRef::parse(raw).ok_or_else(|| {
+                        AppError::GlobalConfig(format!(
+                            "agents.completion_judge_model `{raw}` is not `provider/model`"
+                        ))
+                    })?),
+                },
                 independent_review: combine_independent_review(
                     self.config.agents_independent_review,
                     self.project_config().agents.independent_review,

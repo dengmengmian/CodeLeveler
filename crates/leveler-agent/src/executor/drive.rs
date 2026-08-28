@@ -1710,9 +1710,11 @@ impl Executor {
                                 .trim();
                             let recent_claims = recent_assistant_claims(&messages);
                             let recent_evidence = recent_tool_evidence(&messages);
+                            let judge_model =
+                                self.reconciliation_model.as_ref().unwrap_or(&self.model);
                             let outcome = crate::reconciliation::reconcile_completion(
                                 self.runtime.as_ref(),
-                                &self.model,
+                                judge_model,
                                 self.policy.reasoning_effort,
                                 crate::reconciliation::ReconcileInput {
                                     original_goal: &original_task,
@@ -1726,6 +1728,9 @@ impl Executor {
                             )
                             .await;
                             tracing::info!(
+                                executor_model = %self.model,
+                                reconciliation_model = %judge_model,
+                                same_model = judge_model == &self.model,
                                 verdict = ?outcome.verdict,
                                 latency_ms = outcome.latency_ms,
                                 unsatisfied = outcome.unsatisfied.len(),

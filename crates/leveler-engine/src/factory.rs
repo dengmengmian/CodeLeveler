@@ -83,6 +83,9 @@ pub struct ExecutorFactory {
     pub steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
     /// When false, top-level executors do not advertise `spawn_agent`.
     pub allow_delegation: bool,
+    /// Cross-model completion judge for the reconciliation gate. `None` =
+    /// executor's own model. Parsed from config; the main model is untouched.
+    pub completion_judge_model: Option<ModelRef>,
     /// When the harness launches an independent reviewer. Default `Auto`.
     pub independent_review: crate::policy_resolver::IndependentReviewPolicy,
 }
@@ -152,6 +155,7 @@ impl ExecutorFactory {
             model_profile.limits.reliable_context,
         )
         .with_reasoning_effort(resolved.reasoning_effort)
+        .with_reconciliation_model_opt(self.completion_judge_model.clone())
         // A model profile may ship its own system prompt; None keeps the default.
         .with_base_instructions(model_profile.instructions.clone())
         .with_permission_rules(self.permission_rules.clone())

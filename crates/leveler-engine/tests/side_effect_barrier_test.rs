@@ -168,6 +168,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         steering: None,
         allow_delegation: true,
         independent_review: leveler_engine::IndependentReviewPolicy::Auto,
+        completion_judge_model: None,
     };
     Harness {
         db,

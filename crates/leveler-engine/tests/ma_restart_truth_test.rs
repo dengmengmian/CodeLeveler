@@ -180,6 +180,7 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> TaskEn
             steering: None,
             allow_delegation: true,
             independent_review: leveler_engine::IndependentReviewPolicy::Auto,
+            completion_judge_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

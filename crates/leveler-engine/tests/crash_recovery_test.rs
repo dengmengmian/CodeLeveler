@@ -171,6 +171,7 @@ async fn harness(
             steering: None,
             allow_delegation: true,
             independent_review: leveler_engine::IndependentReviewPolicy::Auto,
+            completion_judge_model: None,
         },
         approver,
         clarifier: Arc::new(AutoClarify),

@@ -984,6 +984,13 @@ pub struct Executor {
     /// top of a depth-0 run; the pruned outstanding record is the
     /// once-per-restart mark.
     restart_settled_children: Vec<crate::sub_agent::SettledChildNotice>,
+    /// Cross-model completion judge: the model the Completion Reconciliation
+    /// Gate calls. `None` = the executor's own model (documented fallback).
+    /// Separating judge from executor breaks the correlated-interpretation
+    /// failure where the same model approves its own semantic rescoping.
+    /// If a configured judge model is unreachable the gate fails closed —
+    /// never a silent same-model fallback.
+    reconciliation_model: Option<ModelRef>,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
@@ -1065,6 +1072,7 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
+            reconciliation_model: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits::default(),
@@ -1129,6 +1137,18 @@ impl Executor {
     /// Seed progress ledger (engine continue_active_goal carries streak/closeout).
     pub fn with_seeded_progress(mut self, progress: ProgressLedger) -> Self {
         self.seeded_progress = progress;
+        self
+    }
+
+    /// Select an independent model for the Completion Reconciliation Gate
+    /// (cross-model judge). The main execution model is untouched.
+    pub fn with_reconciliation_model(mut self, model: ModelRef) -> Self {
+        self.reconciliation_model = Some(model);
+        self
+    }
+
+    pub fn with_reconciliation_model_opt(mut self, model: Option<ModelRef>) -> Self {
+        self.reconciliation_model = model;
         self
     }
 
@@ -1439,6 +1459,7 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
+            reconciliation_model: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits {

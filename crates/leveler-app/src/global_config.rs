@@ -95,6 +95,10 @@ struct GlobalAgents {
     /// When the harness launches an independent reviewer. Default `auto`.
     #[serde(default)]
     independent_review: leveler_project::IndependentReview,
+    /// Cross-model completion judge: `provider/model` used by the Completion
+    /// Reconciliation Gate. Unset = the executor's own model.
+    #[serde(default)]
+    completion_judge_model: Option<String>,
 }
 
 impl Default for GlobalAgents {
@@ -103,6 +107,7 @@ impl Default for GlobalAgents {
             delegation: true,
             offer_timing: leveler_project::OfferTiming::default(),
             independent_review: leveler_project::IndependentReview::default(),
+            completion_judge_model: None,
         }
     }
 }
@@ -288,6 +293,8 @@ pub struct GlobalBundle {
     pub agents_offer_timing: leveler_project::OfferTiming,
     /// When the harness launches an independent reviewer (default Auto).
     pub agents_independent_review: leveler_project::IndependentReview,
+    /// Cross-model completion judge (`provider/model`); None = executor model.
+    pub agents_completion_judge_model: Option<String>,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -535,6 +542,7 @@ impl GlobalConfig {
             agents_delegation: self.agents.delegation,
             agents_offer_timing: self.agents.offer_timing,
             agents_independent_review: self.agents.independent_review,
+            agents_completion_judge_model: self.agents.completion_judge_model,
         }
     }
 }
