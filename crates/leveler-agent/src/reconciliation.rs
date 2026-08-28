@@ -27,7 +27,18 @@ use tokio_util::sync::CancellationToken;
 /// Never let the final gate stall a run: an unanswered reconciliation is a
 /// refusal (fail closed), not a hang and not an implicit pass.
 const RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-const MAX_OUTPUT_TOKENS: u32 = 1024;
+/// HC002-F1: thinking-flag models spend completion budget on reasoning before
+/// any content. At the profile-default max effort, 1024 tokens were consumed
+/// ENTIRELY by reasoning (finish=length, empty content → "no JSON object"),
+/// so every valid completion was refused. The gate now requests LOW effort —
+/// a format-following judgment, not a research task (measured 4.6s / ~350
+/// reasoning tokens vs 18s / ~1750 at max) — with enough budget that even a
+/// verbose thinking pass still delivers the object.
+const MAX_OUTPUT_TOKENS: u32 = 4096;
+const RECONCILE_EFFORT: leveler_model::ReasoningEffort = leveler_model::ReasoningEffort::Low;
+/// One bounded format-repair attempt: transport repair, never a second
+/// semantic review (the goal, evidence and judgment are unchanged).
+const FORMAT_REPAIR_MAX_ATTEMPTS: u32 = 1;
 
 /// What the gate decided. Only `Satisfied` lets completion proceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,16 +64,24 @@ pub(crate) struct ReconcileOutcome {
     /// Claim-vs-evidence contradictions the verifier identified.
     pub contradictions: Vec<String>,
     pub latency_ms: u64,
+    /// Whether the verdict needed the one bounded format-repair retry.
+    pub repaired: bool,
+    /// Structured failure class for observability when the verdict is
+    /// `Unavailable` (`provider_error` / `timeout` / `empty_reply` /
+    /// `no_object` / `bad_json` / `bad_verdict` / `ambiguous_objects`).
+    pub failure_kind: Option<&'static str>,
 }
 
 impl ReconcileOutcome {
-    fn refused(verdict: ReconcileVerdict, reason: impl Into<String>) -> Self {
+    fn refused(verdict: ReconcileVerdict, kind: &'static str, reason: impl Into<String>) -> Self {
         Self {
             verdict,
             reason: reason.into(),
             unsatisfied: Vec::new(),
             contradictions: Vec::new(),
             latency_ms: 0,
+            repaired: false,
+            failure_kind: Some(kind),
         }
     }
 
@@ -172,28 +191,101 @@ struct RawRequirement {
     satisfied: bool,
 }
 
+/// Every balanced top-level `{…}` span in `text`, string-aware (braces inside
+/// JSON strings do not count). Handles fenced blocks and prose wrappers by
+/// construction — the fence is just prose around a balanced object.
+fn candidate_objects(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' if depth > 0 => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        spans.push(&text[start..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
 /// Parse the verifier's reply. Anything that does not decode into the exact
 /// structure is `Unavailable` — a malformed judgment must not become a pass.
+/// Accepted shapes: a bare object, a fenced ```json object, or prose around
+/// exactly one decodable object. Several DIFFERENT decodable objects are
+/// ambiguous and refuse.
 fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
-    let Some(start) = text.find('{') else {
+    if text.trim().is_empty() {
         return ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
-            "reconciliation reply carried no JSON object",
+            "empty_reply",
+            "reconciliation reply was empty (no content delivered)",
         );
-    };
-    let Some(end) = text.rfind('}') else {
+    }
+    let candidates = candidate_objects(text);
+    if candidates.is_empty() {
         return ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
+            "no_object",
             "reconciliation reply carried no JSON object",
         );
-    };
-    let raw: RawVerdict = match serde_json::from_str(&text[start..=end]) {
-        Ok(raw) => raw,
-        Err(error) => {
+    }
+    let mut decoded: Vec<(&str, RawVerdict)> = Vec::new();
+    let mut last_error = String::new();
+    for span in &candidates {
+        match serde_json::from_str::<RawVerdict>(span) {
+            Ok(raw) if !raw.verdict.trim().is_empty() => decoded.push((span, raw)),
+            Ok(_) => {}
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    let raw = match decoded.len() {
+        0 => {
             return ReconcileOutcome::refused(
                 ReconcileVerdict::Unavailable,
-                format!("reconciliation reply did not parse: {error}"),
+                "bad_json",
+                format!("reconciliation reply did not parse: {last_error}"),
             );
+        }
+        1 => decoded.remove(0).1,
+        _ => {
+            // Identical repeats are fine (a model that restates its object);
+            // different objects are an ambiguous judgment.
+            let first_text = decoded[0].0;
+            if decoded.iter().all(|(span, _)| *span == first_text) {
+                decoded.remove(0).1
+            } else {
+                return ReconcileOutcome::refused(
+                    ReconcileVerdict::Unavailable,
+                    "ambiguous_objects",
+                    "reconciliation reply carried multiple conflicting objects",
+                );
+            }
         }
     };
     let unsatisfied: Vec<String> = raw
@@ -212,6 +304,7 @@ fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
         other => {
             return ReconcileOutcome::refused(
                 ReconcileVerdict::Unavailable,
+                "bad_verdict",
                 format!("reconciliation verdict `{other}` is not in the contract"),
             );
         }
@@ -222,48 +315,100 @@ fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
         unsatisfied,
         contradictions: raw.contradictions,
         latency_ms,
+        repaired: false,
+        failure_kind: None,
     }
 }
 
-/// One fresh, independent model request judging the completion claim against
-/// the original contract. Cancellation-aware; every failure path refuses.
-pub(crate) async fn reconcile_completion(
+async fn one_call(
     runtime: &dyn ModelRuntime,
     model: &ModelRef,
-    reasoning_effort: Option<leveler_model::ReasoningEffort>,
-    input: ReconcileInput<'_>,
+    messages: Vec<Message>,
     cancellation: &CancellationToken,
-) -> ReconcileOutcome {
-    let mut request = ModelRequest::new(
-        model.clone(),
-        vec![Message::text(Role::User, instruction(&input))],
-    );
+) -> Result<String, ReconcileOutcome> {
+    let mut request = ModelRequest::new(model.clone(), messages);
     request.tool_choice = ToolChoice::None;
     request.max_output_tokens = Some(MAX_OUTPUT_TOKENS);
-    request.reasoning_effort = reasoning_effort;
-    let started = std::time::Instant::now();
-    let response = match tokio::time::timeout(
+    // The gate's own effort, NOT the main policy's: this is a
+    // format-following judgment, and a thinking-flag model at high effort
+    // spends the completion budget on reasoning before any content (HC002-F1).
+    request.reasoning_effort = Some(RECONCILE_EFFORT);
+    match tokio::time::timeout(
         RECONCILE_TIMEOUT,
         runtime.generate(request, cancellation.child_token()),
     )
     .await
     {
-        Err(_) => {
-            return ReconcileOutcome::refused(
-                ReconcileVerdict::Unavailable,
-                "reconciliation timed out",
-            );
-        }
-        Ok(Err(error)) => {
-            return ReconcileOutcome::refused(
-                ReconcileVerdict::Unavailable,
-                format!("reconciliation request failed: {error}"),
-            );
-        }
-        Ok(Ok(response)) => response,
+        Err(_) => Err(ReconcileOutcome::refused(
+            ReconcileVerdict::Unavailable,
+            "timeout",
+            "reconciliation timed out",
+        )),
+        Ok(Err(error)) => Err(ReconcileOutcome::refused(
+            ReconcileVerdict::Unavailable,
+            "provider_error",
+            format!("reconciliation request failed: {error}"),
+        )),
+        Ok(Ok(response)) => Ok(response.message.text_content()),
+    }
+}
+
+/// One fresh, independent model request judging the completion claim against
+/// the original contract, plus at most ONE bounded format-repair retry when a
+/// reply arrived but no valid schema object could be recovered. The repair
+/// replays the same conversation and asks only for the already-required
+/// format — it never invites re-judging. Cancellation-aware; every failure
+/// path refuses.
+pub(crate) async fn reconcile_completion(
+    runtime: &dyn ModelRuntime,
+    model: &ModelRef,
+    _main_policy_effort: Option<leveler_model::ReasoningEffort>,
+    input: ReconcileInput<'_>,
+    cancellation: &CancellationToken,
+) -> ReconcileOutcome {
+    let started = std::time::Instant::now();
+    let prompt = instruction(&input);
+    let first_text = match one_call(
+        runtime,
+        model,
+        vec![Message::text(Role::User, prompt.clone())],
+        cancellation,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(refused) => return refused,
     };
-    let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    parse_outcome(&response.message.text_content(), latency_ms)
+    let latency = |s: &std::time::Instant| s.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let first = parse_outcome(&first_text, latency(&started));
+    let format_failure = matches!(
+        first.failure_kind,
+        Some("empty_reply" | "no_object" | "bad_json" | "bad_verdict" | "ambiguous_objects")
+    );
+    if !format_failure || FORMAT_REPAIR_MAX_ATTEMPTS == 0 {
+        return first;
+    }
+    // Format repair: same goal, same evidence, same judgment — schema only.
+    let repair_messages = vec![
+        Message::text(Role::User, prompt),
+        Message::text(Role::Assistant, first_text),
+        Message::text(
+            Role::User,
+            "Your previous reconciliation response was not parseable as the              required schema. Return ONLY a valid JSON object matching the              schema from the instructions, with no prose around it. Do not              change your judgment or re-reason about the task.",
+        ),
+    ];
+    let second_text = match one_call(runtime, model, repair_messages, cancellation).await {
+        Ok(text) => text,
+        Err(refused) => return refused,
+    };
+    let mut second = parse_outcome(&second_text, latency(&started));
+    if second.failure_kind.is_none() {
+        second.repaired = true;
+        return second;
+    }
+    // Still undeliverable after the one repair: fail closed with the repair's
+    // classification (the more recent fact).
+    second
 }
 
 /// Tail of `text` bounded to `max` bytes on a char boundary — evidence stays
@@ -337,6 +482,161 @@ mod tests {
     fn prose_around_the_json_still_parses() {
         let text = format!("Here is my judgment:\n{}\nDone.", ok_json());
         assert!(parse_outcome(&text, 1).allows_completion());
+    }
+
+    #[test]
+    fn fenced_json_parses() {
+        let text = format!("```json\n{}\n```", ok_json());
+        assert!(parse_outcome(&text, 1).allows_completion());
+    }
+
+    #[test]
+    fn repeated_identical_objects_parse_but_conflicting_objects_refuse() {
+        let twice = format!("{}\nAgain:\n{}", ok_json(), ok_json());
+        assert!(parse_outcome(&twice, 1).allows_completion());
+        let conflicting = format!(
+            "{}\n{}",
+            ok_json(),
+            r#"{"verdict":"blocked","requirements":[{"requirement":"a","satisfied":false}],"contradictions":[],"reason":"x"}"#
+        );
+        let out = parse_outcome(&conflicting, 1);
+        assert_eq!(out.failure_kind, Some("ambiguous_objects"));
+        assert!(!out.allows_completion());
+    }
+
+    #[test]
+    fn braces_inside_json_strings_do_not_split_the_object() {
+        let text = r#"{"verdict":"satisfied","requirements":[{"requirement":"print {x} literally","satisfied":true,"evidence":"output shows {x}"}],"contradictions":[],"reason":"ok"}"#;
+        assert!(parse_outcome(text, 1).allows_completion());
+    }
+
+    #[test]
+    fn empty_reply_is_classified_distinctly() {
+        let out = parse_outcome("   \n", 1);
+        assert_eq!(out.failure_kind, Some("empty_reply"));
+        assert_eq!(out.verdict, ReconcileVerdict::Unavailable);
+    }
+
+    struct ScriptedGen(std::sync::Mutex<std::collections::VecDeque<Result<String, ()>>>);
+
+    #[async_trait::async_trait]
+    impl ModelRuntime for ScriptedGen {
+        async fn generate(
+            &self,
+            _request: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<leveler_model::ModelResponse, leveler_model::ModelError> {
+            match self.0.lock().unwrap().pop_front() {
+                Some(Ok(text)) => Ok(leveler_model::ModelResponse {
+                    request_id: leveler_core::RequestId::new("r"),
+                    message: Message::text(Role::Assistant, text),
+                    finish_reason: leveler_model::FinishReason::Stop,
+                    usage: leveler_model::TokenUsage::default(),
+                }),
+                _ => Err(leveler_model::ModelError::new(
+                    leveler_model::ModelErrorKind::Other,
+                    "scripted provider failure",
+                )),
+            }
+        }
+        async fn stream(
+            &self,
+            _r: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<leveler_model::ModelEventStream, leveler_model::ModelError> {
+            unimplemented!()
+        }
+        async fn profile(
+            &self,
+            _m: &ModelRef,
+        ) -> Result<leveler_model::ModelProfile, leveler_model::ModelError> {
+            unimplemented!()
+        }
+    }
+
+    fn input() -> ReconcileInput<'static> {
+        ReconcileInput {
+            original_goal: "add mul",
+            claimed_summary: "done",
+            recent_claims: "",
+            recent_evidence: "",
+            modified_files: &[],
+            fresh_verification: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_format_repair_recovers_a_prose_first_reply() {
+        let runtime = ScriptedGen(std::sync::Mutex::new(
+            vec![
+                Ok("looks good to me!".to_string()),
+                Ok(ok_json().to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let out = reconcile_completion(
+            &runtime,
+            &ModelRef::new("mock", "m"),
+            None,
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(out.allows_completion());
+        assert!(out.repaired, "the verdict must be marked as repaired");
+        assert!(runtime.0.lock().unwrap().is_empty(), "exactly two calls");
+    }
+
+    #[tokio::test]
+    async fn two_unparseable_replies_fail_closed_with_no_third_attempt() {
+        let runtime = ScriptedGen(std::sync::Mutex::new(
+            vec![
+                Ok("prose only".to_string()),
+                Ok("still prose".to_string()),
+                Ok(ok_json().to_string()), // must never be reached
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let out = reconcile_completion(
+            &runtime,
+            &ModelRef::new("mock", "m"),
+            None,
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(out.verdict, ReconcileVerdict::Unavailable);
+        assert!(!out.allows_completion());
+        assert_eq!(
+            runtime.0.lock().unwrap().len(),
+            1,
+            "FORMAT_REPAIR_MAX_ATTEMPTS=1: no third call"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_failure_refuses_without_repair() {
+        let runtime = ScriptedGen(std::sync::Mutex::new(
+            vec![Err(()), Ok(ok_json().to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let out = reconcile_completion(
+            &runtime,
+            &ModelRef::new("mock", "m"),
+            None,
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(out.failure_kind, Some("provider_error"));
+        assert_eq!(
+            runtime.0.lock().unwrap().len(),
+            1,
+            "a provider error is not a format problem; no repair call"
+        );
     }
 
     #[test]

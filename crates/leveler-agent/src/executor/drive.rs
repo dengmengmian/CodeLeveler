@@ -1730,6 +1730,8 @@ impl Executor {
                                 latency_ms = outcome.latency_ms,
                                 unsatisfied = outcome.unsatisfied.len(),
                                 contradictions = outcome.contradictions.len(),
+                                repaired = outcome.repaired,
+                                failure_kind = outcome.failure_kind.unwrap_or("none"),
                                 "completion reconciliation"
                             );
                             if !outcome.allows_completion() {
@@ -1761,7 +1763,7 @@ impl Executor {
                                 let feedback = match outcome.verdict {
                                     crate::reconciliation::ReconcileVerdict::Unavailable => {
                                         format!(
-                                            "update_goal(complete) refused: the independent completion check could not run ({detail}). Nothing about your work was judged. Retry update_goal(complete); if this persists, report blocked with this reason."
+                                            "update_goal(complete) refused: the independent completion check could not run ({detail}). Nothing about your work was judged. Do NOT resubmit the same completion claim unchanged — verification is unavailable, not your work wrong. If a later state change gives new evidence, complete then; otherwise report blocked citing verification unavailability."
                                         )
                                     }
                                     _ => format!(

@@ -947,6 +947,7 @@ async fn reconciliation_malformed_output_fails_closed() {
             serde_json::json!({"status": "complete", "summary": "claimed done"}),
         ),
         assistant_text("I think it looks fine overall!"), // no JSON verdict
+        assistant_text("still prose, no object"),         // repair also fails
         assistant_tool_call(
             "g2",
             "update_goal",
