@@ -83,7 +83,15 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             repeatedly stuck and cannot make progress. Going silent does NOT end \
             the task — you must call this. Do not mark complete on unproven or \
             indirect evidence, and do not redefine success down to what already \
-            exists."
+            exists. `complete` means the objective AS THE USER STATED IT. If the \
+            stated objective cannot be satisfied — it conflicts with something \
+            you must not change (an existing test that pins the opposite \
+            behavior, a frozen interface, an explicit prohibition) — do NOT \
+            reinterpret or narrow its terms into a weaker task and complete \
+            that instead: that is a false completion. Report `blocked`, name \
+            the exact conflict (which requirement collides with which \
+            constraint), and first revert edits that served only the abandoned \
+            attempt so the workspace is left clean."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -91,7 +99,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 "status": {
                     "type": "string",
                     "enum": ["complete", "blocked"],
-                    "description": "complete = proven done; blocked = truly stuck."
+                    "description": "complete = proven done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what)."
                 },
                 "summary": {
                     "type": "string",
@@ -551,6 +559,29 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
             },
             "required": ["action"]
         }),
+    }
+}
+
+#[cfg(test)]
+mod scope_fidelity_tests {
+    /// ICG-6R: the completion contract must keep saying, in so many words,
+    /// that an unsatisfiable objective is `blocked` — never reinterpreted into
+    /// a weaker task and completed. A wording regression here re-opens the
+    /// scope-substitution false-completion path.
+    #[test]
+    fn update_goal_contract_forbids_scope_substitution() {
+        let def = super::update_goal_tool_definition();
+        for needle in [
+            "AS THE USER STATED IT",
+            "do NOT",
+            "false completion",
+            "revert edits",
+        ] {
+            assert!(
+                def.description.contains(needle),
+                "completion contract lost `{needle}`"
+            );
+        }
     }
 }
 

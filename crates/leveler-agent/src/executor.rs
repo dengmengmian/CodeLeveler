@@ -1676,7 +1676,11 @@ impl Executor {
                  - **Code / config delivery:** keep working until every requirement is PROVEN \
                  against the current workspace (build/tests since last edit when you edited). \
                  Then update_goal(complete). If genuinely stuck, update_goal(blocked). Never \
-                 shrink the objective to what already exists. Use next_step for the single best \
+                 shrink the objective to what already exists, and never reinterpret its terms \
+                 into a weaker task the constraints happen to allow: an objective that \
+                 conflicts with tests or constraints you must not change is `blocked` (name \
+                 the conflict, revert edits that only served the abandoned attempt), not \
+                 `complete`. Use next_step for the single best \
                  follow-up action when one exists.\n\
                  - **Large multi-part goals:** break into concrete steps; use `spawn_agent` in \
                  the same turn for independent investigation or disjoint edits (explorer vs \

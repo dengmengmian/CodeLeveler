@@ -43,7 +43,10 @@ pub(crate) fn goal_resolve_nudge(objective: &str) -> String {
          → Audit against the CURRENT workspace with tools (file contents, command \
          output, tests). If build/tests have not run since your last edit, run them. \
          Only when every requirement is PROVEN done, call update_goal(complete). \
-         Otherwise keep working; do not shrink the objective. If genuinely stuck, \
+         Otherwise keep working; do not shrink the objective or reinterpret its \
+         terms into a weaker one — a stated requirement that conflicts with tests \
+         or constraints you must not change makes the goal blocked (name the \
+         conflict, revert abandoned edits), never complete. If genuinely stuck, \
          call update_goal(blocked).\n\
          C) **Follow-up in the same session** — use the conversation history; do \
          not claim you have \"no prior context\" and re-discover the project from \
