@@ -145,7 +145,6 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // (status / plan / attachments) sits on top of it; blank below always so
     // Context footer is not flush on the composer border.
     let chrome_above = status_rows
-        .saturating_add(team_rows)
         .saturating_add(plan_rows)
         .saturating_add(attach_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
@@ -154,26 +153,34 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let hints = crate::render::key_hint_line(state, workspace_inner.width as usize);
     let post_composer_gap: u16 = 1;
 
+    // One breathing row between the Context footer and the roster, so the
+    // process list reads as its own surface rather than a second footer.
+    let team_gap: u16 = if team_rows > 0 { 1 } else { 0 };
     let chunks = Layout::vertical([
         Constraint::Length(header_rows),
         Constraint::Min(3), // conversation viewport
         Constraint::Length(gap_rows),
         Constraint::Length(status_rows),
-        Constraint::Length(team_rows),
         Constraint::Length(plan_rows),
         Constraint::Length(attach_rows),
         Constraint::Length(pre_composer_gap),
         Constraint::Length(composer_rows),
         Constraint::Length(post_composer_gap),
         Constraint::Length(footer_rows),
+        // The agent runtime roster lives BELOW the composer/status chrome:
+        // above the composer is the work (plan, conversation), the composer is
+        // what the user can do now, and below it is who is executing in the
+        // background. Last in the stack also means a too-short terminal
+        // squeezes the roster before it can crush approval/input/plan.
+        Constraint::Length(team_gap),
+        Constraint::Length(team_rows),
         Constraint::Length(footer_bottom),
     ])
     .split(area);
 
-    let input_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
-    let hint_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
-    let footer_slot =
-        crate::layout::horizontal_inset(chunks[10], crate::layout::WORKSPACE_GUTTER_X);
+    let input_slot = crate::layout::horizontal_inset(chunks[7], crate::layout::WORKSPACE_GUTTER_X);
+    let hint_slot = crate::layout::horizontal_inset(chunks[8], crate::layout::WORKSPACE_GUTTER_X);
+    let footer_slot = crate::layout::horizontal_inset(chunks[9], crate::layout::WORKSPACE_GUTTER_X);
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
@@ -185,21 +192,22 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     if status_rows > 0 {
         frame.render_widget(Paragraph::new(status_line), chunks[3]);
     }
-    render_team_panel(frame, chunks[4], state);
-    render_plan_panel(frame, chunks[5], state);
-    render_attachments(frame, chunks[6], state);
-    // chunks[7] = pre_composer_gap (leave blank)
+    render_plan_panel(frame, chunks[4], state);
+    render_attachments(frame, chunks[5], state);
+    // chunks[6] = pre_composer_gap (leave blank)
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
         }
         None => render_input(frame, input_slot, state),
     }
-    // chunks[9]: the key hints when there are any, otherwise the blank gap.
+    // chunks[8]: the key hints when there are any, otherwise the blank gap.
     if let Some(line) = hints.into_iter().next() {
         frame.render_widget(Paragraph::new(line), hint_slot);
     }
     render_footer(frame, footer_slot, state);
+    // chunks[10] = breathing row; the roster docks under the footer.
+    render_team_panel(frame, chunks[11], state);
 
     // /btw floats over the conversation viewport (not in the scroll stream).
     render_btw_overlay(frame, chunks[1], state);
@@ -468,36 +476,63 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         avail.saturating_sub(1)
     };
     let width = area.width as usize;
-    // Narrow terminals drop the right-aligned meta column rather than
-    // squeezing the activity into unreadability.
+    // Narrow terminals drop the meta column rather than squeezing the
+    // activity into unreadability.
     let narrow = width < 48;
-    for row in rows.iter().take(1 + shown_children) {
+    // The roster is a compact process list, not a full-width table: on wide
+    // terminals the `elapsed · tokens` column aligns to the roster's own
+    // content inside a bounded readable width — never to the terminal's
+    // right edge, which turns each row into two disconnected islands.
+    const ROSTER_MAX_WIDTH: usize = 96;
+    const META_GAP: usize = 4;
+    let bound = width.min(ROSTER_MAX_WIDTH);
+    let visible: Vec<&crate::multi_agent::AgentRosterRow> =
+        rows.iter().take(1 + shown_children).collect();
+    // Shared column width: the widest meta among the rows that carry one.
+    let meta_col = if narrow {
+        0
+    } else {
+        visible
+            .iter()
+            .filter_map(|row| row.meta.as_deref())
+            .map(UnicodeWidthStr::width)
+            .max()
+            .unwrap_or(0)
+    };
+    // Every row's activity respects the shared meta reservation so the
+    // column stays vertically aligned; the column position itself is
+    // content-driven (widest head+activity plus breathing room).
+    let mut prepared: Vec<(String, usize, String, usize)> = Vec::new();
+    let mut content_w = 0usize;
+    for row in &visible {
+        let head = format!("{} {}  ", row.glyph, row.label);
+        let head_w = UnicodeWidthStr::width(head.as_str());
+        let cap = if meta_col > 0 {
+            bound.saturating_sub(meta_col + META_GAP + head_w).max(4)
+        } else {
+            width.saturating_sub(head_w).max(4)
+        };
+        let activity = truncate(row.activity.clone(), cap);
+        let activity_w = UnicodeWidthStr::width(activity.as_str());
+        content_w = content_w.max(head_w + activity_w);
+        prepared.push((head, head_w, activity, activity_w));
+    }
+    let meta_x = content_w + META_GAP;
+    for (row, (head, head_w, activity, activity_w)) in visible.iter().zip(prepared) {
         let color = match row.tone {
             crate::multi_agent::RosterTone::Main => theme.accent.primary,
             crate::multi_agent::RosterTone::Active => theme.accent.primary,
             crate::multi_agent::RosterTone::Done => theme.status.success,
             crate::multi_agent::RosterTone::Failed => theme.status.error,
         };
-        let head = format!("{} {}  ", row.glyph, row.label);
-        let head_w = UnicodeWidthStr::width(head.as_str());
-        let meta = match (&row.meta, narrow) {
-            (Some(meta), false) => meta.as_str(),
-            _ => "",
-        };
-        let meta_w = if meta.is_empty() {
-            0
-        } else {
-            UnicodeWidthStr::width(meta) + 2
-        };
-        let activity_budget = width.saturating_sub(head_w + meta_w).max(4);
-        let activity = truncate(row.activity.clone(), activity_budget);
-        let pad = width.saturating_sub(head_w + UnicodeWidthStr::width(activity.as_str()) + meta_w)
-            + usize::from(!meta.is_empty()) * 2;
         let mut spans = vec![
             Span::styled(head, Style::default().fg(color)),
             Span::styled(activity, Style::default().fg(theme.text.secondary)),
         ];
-        if !meta.is_empty() {
+        if let Some(meta) = row.meta.as_deref()
+            && !narrow
+        {
+            let pad = meta_x.saturating_sub(head_w + activity_w);
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(
                 meta.to_string(),
@@ -796,6 +831,330 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// Full-workbench render with a team, a plan, custom size/locale, and a
+    /// turn clock (so `elapsed · tokens` metas materialize).
+    fn render_workbench(
+        width: u16,
+        height: u16,
+        locale: crate::i18n::Locale,
+        elapsed: u64,
+        team: crate::multi_agent::TaskTeamView,
+        plan: bool,
+    ) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(
+            crate::theme::Theme::default(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.elapsed_secs = elapsed;
+        // A used context so the `Context …` footer chip actually renders.
+        state.context_tokens = 59_000;
+        state.team = team;
+        if plan {
+            state.plan = Some(sample_plan());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn team_with_usage(specs: &[(&str, &str, &str, u32)]) -> crate::multi_agent::TaskTeamView {
+        let mut team = team_with(
+            &specs
+                .iter()
+                .map(|(id, role, act, _)| (*id, *role, *act))
+                .collect::<Vec<_>>(),
+        );
+        for (id, _, _, tokens) in specs {
+            if *tokens > 0 {
+                team.apply_progress(id, true, *tokens / 2, *tokens - *tokens / 2);
+            }
+        }
+        team
+    }
+
+    /// Terminal COLUMN of `needle` (each extracted cell is one char, so the
+    /// char count — not the byte offset — is the column).
+    fn col_of(line: &str, needle: &str) -> Option<usize> {
+        line.find(needle).map(|b| line[..b].chars().count())
+    }
+
+    fn row_of(lines: &[String], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not on screen:\n{}", lines.join("\n")))
+    }
+
+    /// Final IA (placement closure): Plan, then the composer, then the
+    /// Context footer — and the roster BELOW all of them, one breathing row
+    /// under the footer. The roster is a bottom runtime surface, not
+    /// pre-composer chrome.
+    #[test]
+    fn the_roster_docks_below_the_context_footer_and_never_above_plan() {
+        let lines = render_workbench(
+            100,
+            34,
+            crate::i18n::Locale::En,
+            55,
+            team_with_usage(&[("a1", "explorer", "read_file", 158_000)]),
+            true,
+        );
+        let plan_row = row_of(&lines, "edit module");
+        let input_row = row_of(&lines, "Type a message");
+        let footer_row = row_of(&lines, "Context");
+        let roster_row = row_of(&lines, "● Main");
+        assert!(plan_row < input_row, "plan must stay above the composer");
+        assert!(input_row < footer_row, "composer above the Context footer");
+        assert!(
+            footer_row < roster_row,
+            "the roster docks BELOW the Context footer"
+        );
+        assert!(
+            roster_row > footer_row + 1,
+            "one breathing row between footer and roster"
+        );
+    }
+
+    /// Approval state: the approval body, its keyboard hints and the Context
+    /// footer stay one contiguous unit; the roster comes only after all of
+    /// them — never between the approval choices and their hints.
+    #[test]
+    fn approval_body_hints_and_footer_stay_contiguous_above_the_roster() {
+        use leveler_client_protocol::{ApprovalId, UiApprovalRequest};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(
+            crate::theme::Theme::default(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::En,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.elapsed_secs = 55;
+        state.context_tokens = 59_000;
+        state.team = team_with_usage(&[("a1", "explorer", "read_file", 158_000)]);
+        state.overlay = Some(crate::overlay::Overlay::Approval(Box::new(
+            crate::overlay::ApprovalOverlay::new(UiApprovalRequest {
+                id: ApprovalId::new("a1"),
+                tool: "run_command".into(),
+                summary: "git push".into(),
+                command: Some("git push".into()),
+                risks: vec!["network".into()],
+            }),
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        let body_row = row_of(&lines, "git push");
+        let footer_row = row_of(&lines, "Context");
+        let roster_row = row_of(&lines, "● Main");
+        assert!(
+            body_row < footer_row,
+            "approval body renders above the footer"
+        );
+        assert!(
+            footer_row < roster_row,
+            "the roster must not wedge into the approval/composer unit"
+        );
+        assert!(
+            lines[body_row..footer_row]
+                .iter()
+                .all(|l| !l.contains("● Main")),
+            "no roster row between the approval body and the footer"
+        );
+    }
+
+    /// With no collaboration there is no roster row and the footer stays the
+    /// last content strip — the move must not reserve dead space.
+    #[test]
+    fn no_team_leaves_the_footer_as_the_bottom_strip() {
+        let lines = render_workbench(
+            100,
+            30,
+            crate::i18n::Locale::En,
+            0,
+            crate::multi_agent::TaskTeamView::default(),
+            true,
+        );
+        let footer_row = row_of(&lines, "Context");
+        assert!(
+            lines
+                .iter()
+                .skip(footer_row + 1)
+                .all(|l| l.trim().is_empty()),
+            "nothing renders below the footer without an active team"
+        );
+    }
+
+    /// Density closure: on a wide terminal the `elapsed · tokens` column
+    /// aligns to the roster's own bounded content width, NOT the terminal's
+    /// right edge — and stays one aligned column across rows of very
+    /// different activity lengths.
+    #[test]
+    fn wide_terminal_meta_is_bounded_and_aligned_not_edge_pinned() {
+        let lines = render_workbench(
+            180,
+            30,
+            crate::i18n::Locale::En,
+            55,
+            team_with_usage(&[
+                (
+                    "a1",
+                    "explorer",
+                    "analyzing the repository layout in depth",
+                    362_000,
+                ),
+                ("a2", "explorer", "grep", 248_000),
+                ("a3", "explorer", "shell_command", 91_000),
+            ]),
+            false,
+        );
+        let meta_cols: Vec<usize> = lines
+            .iter()
+            .filter(|l| l.contains("55s ·"))
+            .map(|l| col_of(l, "55s ·").unwrap())
+            .collect();
+        assert_eq!(meta_cols.len(), 3, "all three children carry usage metas");
+        assert!(
+            meta_cols.iter().all(|c| *c == meta_cols[0]),
+            "meta is one shared column: {meta_cols:?}"
+        );
+        assert!(
+            meta_cols[0] < 110,
+            "meta aligns to the roster content, not the 180-column right edge: {}",
+            meta_cols[0]
+        );
+        for l in lines.iter().filter(|l| l.contains("55s ·")) {
+            let col = l.find("55s ·").unwrap();
+            assert!(
+                l[..col].ends_with("    "),
+                "at least four columns of breathing room before the meta: {l:?}"
+            );
+            let end = l.trim_end().len();
+            assert!(end < 130, "the roster keeps a bounded visual width: {end}");
+        }
+    }
+
+    /// A row whose usage is genuinely zero shows elapsed only — the column
+    /// never invents a token figure to fill itself.
+    #[test]
+    fn zero_usage_shows_elapsed_without_a_fake_token_value() {
+        let lines = render_workbench(
+            120,
+            30,
+            crate::i18n::Locale::En,
+            55,
+            team_with_usage(&[("a1", "explorer", "read_file", 0)]),
+            false,
+        );
+        let row = lines
+            .iter()
+            .find(|l| l.contains("read_file"))
+            .expect("child row renders");
+        assert!(row.contains("55s"), "elapsed still shown: {row:?}");
+        assert!(
+            !row.contains('·'),
+            "no `· tokens` half for a zero-usage child: {row:?}"
+        );
+    }
+
+    /// CJK activity labels are double-width; the shared meta column must stay
+    /// aligned across a Chinese row and an ASCII row.
+    #[test]
+    fn cjk_activity_keeps_the_meta_column_aligned() {
+        let lines = render_workbench(
+            140,
+            30,
+            crate::i18n::Locale::Zh,
+            55,
+            team_with_usage(&[
+                ("a1", "explorer", "已审查，无阻塞问题", 362_000),
+                ("a2", "explorer", "shell_command", 248_000),
+            ]),
+            false,
+        );
+        let meta_cols: Vec<usize> = lines
+            .iter()
+            .filter(|l| l.contains("55s ·"))
+            .map(|l| col_of(l, "55s ·").unwrap())
+            .collect();
+        assert_eq!(meta_cols.len(), 2);
+        assert_eq!(
+            meta_cols[0], meta_cols[1],
+            "double-width text must not skew the column"
+        );
+    }
+
+    /// Narrow terminals keep identity/activity and drop the meta entirely —
+    /// unchanged by the placement move.
+    #[test]
+    fn narrow_terminal_still_drops_the_meta_column() {
+        let lines = render_workbench(
+            46,
+            30,
+            crate::i18n::Locale::En,
+            55,
+            team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
+            false,
+        );
+        let row = lines
+            .iter()
+            .find(|l| l.contains("read_file"))
+            .expect("child row renders");
+        assert!(!row.contains("55s"), "narrow width drops the meta: {row:?}");
     }
 
     fn team_with(children: &[(&str, &str, &str)]) -> crate::multi_agent::TaskTeamView {
