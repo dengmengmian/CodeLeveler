@@ -1,0 +1,55 @@
+# Comparative case manifest — annotations over existing EvaluationCase YAMLs.
+# The cases themselves stay in evals/ (single manifest format, §54); this file
+# adds only the comparative-lane metadata the runner needs.
+suite: pre-beta-comparative
+cases:
+  - id: rust-first-even
+    path: evals/smoke/rust-first-even.yaml
+    category: A-small-fix
+    timeout_seconds: 900
+    delegation_opportunity: NONE
+  - id: go-normalize-email
+    path: evals/core/go-normalize-email.yaml
+    category: B-medium-bug
+    timeout_seconds: 900
+    delegation_opportunity: NONE
+  - id: ts-concurrency-limit
+    path: evals/core/ts-concurrency-limit.yaml
+    category: B-medium-bug
+    timeout_seconds: 900
+    delegation_opportunity: NONE
+  - id: n3-caller-propagation
+    path: evals/navigation/n3-caller-propagation.yaml
+    category: C-cross-file
+    timeout_seconds: 1200
+    delegation_opportunity: LOW
+  - id: rust-area-trait
+    path: evals/hard/rust-area-trait.yaml
+    category: F-behavior-preserving
+    timeout_seconds: 900
+    delegation_opportunity: NONE
+  - id: c4-r2-test-recovery
+    path: evals/recovery/c4-r2-test-recovery.yaml
+    category: E-test-diagnosis
+    timeout_seconds: 1200
+    delegation_opportunity: LOW
+  - id: c3-e5-move-dependency
+    path: evals/edit/c3-e5-move-dependency.yaml
+    category: F-refactor-move
+    timeout_seconds: 1200
+    delegation_opportunity: LOW
+  - id: yq-doc-count
+    path: evals/realrepo/yq-doc-count.yaml
+    category: D-search-real-repo
+    timeout_seconds: 1800
+    delegation_opportunity: MEDIUM
+  - id: icg-5-long-task
+    path: evals/icg/icg-5-long-task.yaml
+    category: G-long-multistage
+    timeout_seconds: 1800
+    delegation_opportunity: MEDIUM
+  - id: scale-s800
+    path: evals/scale/scale-s800.yaml
+    category: H-multiagent-opportunity
+    timeout_seconds: 1800
+    delegation_opportunity: HIGH

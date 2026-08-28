@@ -1,0 +1,16 @@
+# HC-002 run list. Frozen before paid execution.
+# Paid launches require CODELEVELER_EVAL_BASELINE != 3b400357.
+suite: hc-002
+case: icg-5-long-task
+path: evals/icg/icg-5-long-task.yaml
+timeout_seconds: 1800
+paid_runs: HOLD
+hold_reason: Completion Reconciliation (icg-6r) not accepted
+token_ranking: DISABLED
+order:
+  - {arm: leveler, rep: 1}
+  - {arm: atomcode, rep: 1}
+  - {arm: dsh, rep: 1}
+  - {arm: dsh, rep: 2}
+  - {arm: atomcode, rep: 2}
+  - {arm: leveler, rep: 2}
