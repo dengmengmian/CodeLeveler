@@ -99,6 +99,12 @@ struct GlobalAgents {
     /// Reconciliation Gate. Unset = the executor's own model.
     #[serde(default)]
     completion_judge_model: Option<String>,
+    /// Ceiling for ONE completion-reconciliation request, in seconds. Unset =
+    /// the gate's own default. A slower independent judge needs a longer
+    /// ceiling than the flash-calibrated default; the value is operational
+    /// policy and never depends on which model is configured.
+    #[serde(default)]
+    completion_judge_timeout_seconds: Option<u64>,
 }
 
 impl Default for GlobalAgents {
@@ -108,6 +114,7 @@ impl Default for GlobalAgents {
             offer_timing: leveler_project::OfferTiming::default(),
             independent_review: leveler_project::IndependentReview::default(),
             completion_judge_model: None,
+            completion_judge_timeout_seconds: None,
         }
     }
 }
@@ -295,6 +302,9 @@ pub struct GlobalBundle {
     pub agents_independent_review: leveler_project::IndependentReview,
     /// Cross-model completion judge (`provider/model`); None = executor model.
     pub agents_completion_judge_model: Option<String>,
+    /// Ceiling for one completion-reconciliation request, in seconds; None =
+    /// the gate's default.
+    pub agents_completion_judge_timeout_seconds: Option<u64>,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -543,6 +553,7 @@ impl GlobalConfig {
             agents_offer_timing: self.agents.offer_timing,
             agents_independent_review: self.agents.independent_review,
             agents_completion_judge_model: self.agents.completion_judge_model,
+            agents_completion_judge_timeout_seconds: self.agents.completion_judge_timeout_seconds,
         }
     }
 }
@@ -689,6 +700,16 @@ mod tests {
                 .agents_completion_judge_model
                 .as_deref(),
             Some("deepseek/deepseek-v4-pro")
+        );
+
+        let with_timeout =
+            GlobalConfig::from_toml_str("[agents]\ncompletion_judge_timeout_seconds = 180\n")
+                .expect("the judge timeout must parse under deny_unknown_fields");
+        assert_eq!(
+            with_timeout
+                .into_bundle()
+                .agents_completion_judge_timeout_seconds,
+            Some(180)
         );
 
         let without = GlobalConfig::from_toml_str("[agents]\ndelegation = true\n")

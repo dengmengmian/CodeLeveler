@@ -103,6 +103,8 @@ pub struct LoadedConfig {
     pub agents_independent_review: leveler_project::IndependentReview,
     /// Cross-model completion judge (`provider/model`); None = executor model.
     pub agents_completion_judge_model: Option<String>,
+    /// Ceiling for one completion-reconciliation request, in seconds.
+    pub agents_completion_judge_timeout_seconds: Option<u64>,
 }
 
 impl Default for LoadedConfig {
@@ -118,6 +120,7 @@ impl Default for LoadedConfig {
             agents_offer_timing: leveler_project::OfferTiming::default(),
             agents_independent_review: leveler_project::IndependentReview::default(),
             agents_completion_judge_model: None,
+            agents_completion_judge_timeout_seconds: None,
         }
     }
 }
@@ -225,6 +228,7 @@ impl Application {
             agents_offer_timing: global.agents_offer_timing,
             agents_independent_review: global.agents_independent_review,
             agents_completion_judge_model: global.agents_completion_judge_model,
+            agents_completion_judge_timeout_seconds: global.agents_completion_judge_timeout_seconds,
         })
     }
 
@@ -577,6 +581,9 @@ impl Application {
                 completion_judge_model: resolve_completion_judge_model(
                     self.config.agents_completion_judge_model.as_deref(),
                 )?,
+                completion_judge_timeout: resolve_completion_judge_timeout(
+                    self.config.agents_completion_judge_timeout_seconds,
+                )?,
                 independent_review: combine_independent_review(
                     self.config.agents_independent_review,
                     self.project_config().agents.independent_review,
@@ -676,6 +683,24 @@ fn resolve_completion_judge_model(
                 "agents.completion_judge_model `{raw}` is not `provider/model`"
             ))
         })
+}
+
+/// Resolve the configured ceiling for one completion-reconciliation request.
+///
+/// Unset keeps the gate's own default. Zero is rejected rather than coerced:
+/// a zero ceiling would time every judgment out instantly and turn the gate
+/// into a blanket refusal, which reads as "the work is incomplete" and would
+/// be indistinguishable from a real verdict.
+fn resolve_completion_judge_timeout(
+    seconds: Option<u64>,
+) -> Result<Option<std::time::Duration>, AppError> {
+    match seconds {
+        None => Ok(None),
+        Some(0) => Err(AppError::GlobalConfig(
+            "agents.completion_judge_timeout_seconds must be greater than zero".to_string(),
+        )),
+        Some(s) => Ok(Some(std::time::Duration::from_secs(s))),
+    }
 }
 
 #[cfg(test)]
@@ -938,6 +963,40 @@ mod completion_judge_tests {
             .expect_err("a reference without a provider must not be accepted");
         assert!(
             matches!(&err, AppError::GlobalConfig(m) if m.contains("completion_judge_model")),
+            "the error names the setting: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod completion_judge_timeout_tests {
+    use super::{AppError, resolve_completion_judge_timeout};
+
+    /// §20: unset resolves to no override — the gate keeps its own default.
+    #[test]
+    fn an_unset_timeout_leaves_the_gate_default_in_place() {
+        assert_eq!(resolve_completion_judge_timeout(None).unwrap(), None);
+    }
+
+    /// §21: the experiment's explicit ceiling reaches the gate as configured.
+    #[test]
+    fn an_explicit_timeout_resolves_to_that_duration() {
+        assert_eq!(
+            resolve_completion_judge_timeout(Some(180)).unwrap(),
+            Some(std::time::Duration::from_secs(180))
+        );
+    }
+
+    /// §8/§22: zero is a config error, never coerced. A zero ceiling would
+    /// time out every judgment instantly — a blanket refusal wearing the
+    /// costume of a verdict.
+    #[test]
+    fn a_zero_timeout_is_a_config_error_not_a_silent_default() {
+        let err = resolve_completion_judge_timeout(Some(0))
+            .expect_err("zero must not be accepted as a ceiling");
+        assert!(
+            matches!(&err, AppError::GlobalConfig(m)
+                if m.contains("completion_judge_timeout_seconds")),
             "the error names the setting: {err}"
         );
     }

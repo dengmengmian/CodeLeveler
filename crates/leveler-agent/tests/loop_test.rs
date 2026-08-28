@@ -1087,6 +1087,212 @@ async fn an_unreachable_judge_model_fails_closed_without_same_model_fallback() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// §20: the shipped default ceiling stays 60s — the experiment configures its
+/// own, it does not move everyone's.
+#[test]
+fn the_default_gate_ceiling_is_sixty_seconds() {
+    assert_eq!(
+        leveler_agent::DEFAULT_RECONCILE_TIMEOUT,
+        std::time::Duration::from_secs(60)
+    );
+}
+
+/// A judge that answers only after `delay`, so a test can place the configured
+/// ceiling on either side of it. Honours cancellation, like a real provider.
+struct SlowJudgeRuntime {
+    inner: MockRuntime,
+    delay: std::time::Duration,
+    generated: Mutex<Vec<ModelRef>>,
+}
+
+#[async_trait]
+impl ModelRuntime for SlowJudgeRuntime {
+    async fn generate(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        self.generated.lock().unwrap().push(request.model.clone());
+        tokio::select! {
+            _ = tokio::time::sleep(self.delay) => {}
+            _ = cancellation.cancelled() => {
+                return Err(ModelError::new(
+                    leveler_model::ModelErrorKind::Other,
+                    "request cancelled",
+                ));
+            }
+        }
+        self.inner.generate(request, cancellation).await
+    }
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.inner.stream(request, cancellation).await
+    }
+    async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
+        self.inner.profile(m).await
+    }
+}
+
+fn slow_judge(delay_ms: u64) -> Arc<SlowJudgeRuntime> {
+    Arc::new(SlowJudgeRuntime {
+        inner: MockRuntime::new(vec![
+            assistant_tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "done"}),
+            ),
+            reconcile_ok(),
+            assistant_tool_call(
+                "g2",
+                "update_goal",
+                serde_json::json!({"status": "blocked", "summary": "verifier unavailable"}),
+            ),
+        ]),
+        delay: std::time::Duration::from_millis(delay_ms),
+        generated: Mutex::new(Vec::new()),
+    })
+}
+
+/// §21: a ceiling wide enough for the judge lets its verdict land. Same judge,
+/// same delay as the test below — only the configured ceiling differs.
+#[tokio::test]
+async fn a_ceiling_above_the_judge_latency_lets_the_verdict_land() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-ceiling-wide-{}",
+        std::process::id() as u64 * 71 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = slow_judge(300);
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("deepseek", "deepseek-v4-flash"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
+    .with_reconciliation_timeout(std::time::Duration::from_secs(5))
+    .run(
+        "do the task",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "a judge inside the configured ceiling must be allowed to answer"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §25: a judge that overruns the configured ceiling is UNAVAILABLE, and
+/// unavailable is a refusal — never a pass. Right-censoring the judge can only
+/// ever cost a completion, it can never manufacture one.
+#[tokio::test]
+async fn a_judge_that_overruns_the_ceiling_fails_closed() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-ceiling-tight-{}",
+        std::process::id() as u64 * 71 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = slow_judge(2_000);
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("deepseek", "deepseek-v4-flash"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
+    .with_reconciliation_timeout(std::time::Duration::from_millis(120))
+    .run(
+        "do the task",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "a timed-out judgment must never become a completion"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, name, is_error: true, preview }
+                if id == "g1" && name == "update_goal" && preview.contains("could not run")
+        )),
+        "the refusal names the unavailable verifier: {events:?}"
+    );
+    // §27: and it stays on the judge — a timeout is not a licence to ask the
+    // executor's own model instead.
+    let generated = runtime.generated.lock().unwrap().clone();
+    assert!(
+        !generated.is_empty() && generated.iter().all(|m| m.model == "deepseek-v4-pro"),
+        "no same-model fallback after a timeout: {generated:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §26: a wide ceiling must not make the gate uncancellable. Cancelling wins
+/// immediately instead of waiting out the configured seconds.
+#[tokio::test]
+async fn cancellation_preempts_a_wide_ceiling() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-ceiling-cancel-{}",
+        std::process::id() as u64 * 71 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    // The judge would take an hour; the ceiling allows it.
+    let runtime = slow_judge(3_600_000);
+    let cancellation = CancellationToken::new();
+    let canceller = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        canceller.cancel();
+    });
+    let started = std::time::Instant::now();
+    let result = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("deepseek", "deepseek-v4-flash"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
+    .with_reconciliation_timeout(std::time::Duration::from_secs(3_600))
+    .run("do the task", &mut |_| {}, &mut NoopSink, cancellation)
+    .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "cancellation must preempt the ceiling, not wait it out ({:?})",
+        started.elapsed()
+    );
+    match result {
+        Err(leveler_agent::AgentError::Cancelled) => {}
+        other => panic!("a cancelled run is Cancelled, never a completion: {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Completion Reconciliation Gate, end to end: a `blocked` verdict refuses the
 /// completion (durable GoalIntercepted + error ToolResult), the run continues,
 /// and the model may then resolve truthfully.

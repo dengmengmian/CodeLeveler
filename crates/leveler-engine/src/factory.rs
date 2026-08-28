@@ -86,6 +86,9 @@ pub struct ExecutorFactory {
     /// Cross-model completion judge for the reconciliation gate. `None` =
     /// executor's own model. Parsed from config; the main model is untouched.
     pub completion_judge_model: Option<ModelRef>,
+    /// Ceiling for one completion-reconciliation request. `None` = the gate's
+    /// default (60s). Operational policy resolved from config.
+    pub completion_judge_timeout: Option<std::time::Duration>,
     /// When the harness launches an independent reviewer. Default `Auto`.
     pub independent_review: crate::policy_resolver::IndependentReviewPolicy,
 }
@@ -156,6 +159,7 @@ impl ExecutorFactory {
         )
         .with_reasoning_effort(resolved.reasoning_effort)
         .with_reconciliation_model_opt(self.completion_judge_model.clone())
+        .with_reconciliation_timeout_opt(self.completion_judge_timeout)
         // A model profile may ship its own system prompt; None keeps the default.
         .with_base_instructions(model_profile.instructions.clone())
         .with_permission_rules(self.permission_rules.clone())

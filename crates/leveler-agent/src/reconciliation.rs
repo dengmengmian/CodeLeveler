@@ -26,7 +26,14 @@ use tokio_util::sync::CancellationToken;
 
 /// Never let the final gate stall a run: an unanswered reconciliation is a
 /// refusal (fail closed), not a hang and not an implicit pass.
-const RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+///
+/// This is the DEFAULT ceiling, not a semantic invariant. 60s was calibrated
+/// when the judge was the executor's own flash model (13.2s median, 4.5x
+/// headroom); a slower independent judge needs its own ceiling, so the host
+/// may configure one (`agents.completion_judge_timeout_seconds`). The ceiling
+/// bounds ONE request: the first judgment and the single format repair each
+/// get it, exactly as they each got 60s before.
+pub const DEFAULT_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// HC002-F1: thinking-flag models spend completion budget on reasoning before
 /// any content. At the profile-default max effort, 1024 tokens were consumed
 /// ENTIRELY by reasoning (finish=length, empty content → "no JSON object"),
@@ -324,6 +331,7 @@ async fn one_call(
     runtime: &dyn ModelRuntime,
     model: &ModelRef,
     messages: Vec<Message>,
+    timeout: std::time::Duration,
     cancellation: &CancellationToken,
 ) -> Result<String, ReconcileOutcome> {
     let mut request = ModelRequest::new(model.clone(), messages);
@@ -334,7 +342,7 @@ async fn one_call(
     // spends the completion budget on reasoning before any content (HC002-F1).
     request.reasoning_effort = Some(RECONCILE_EFFORT);
     match tokio::time::timeout(
-        RECONCILE_TIMEOUT,
+        timeout,
         runtime.generate(request, cancellation.child_token()),
     )
     .await
@@ -342,7 +350,7 @@ async fn one_call(
         Err(_) => Err(ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
             "timeout",
-            "reconciliation timed out",
+            format!("reconciliation timed out after {}s", timeout.as_secs()),
         )),
         Ok(Err(error)) => Err(ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
@@ -363,23 +371,28 @@ pub(crate) async fn reconcile_completion(
     runtime: &dyn ModelRuntime,
     model: &ModelRef,
     _main_policy_effort: Option<leveler_model::ReasoningEffort>,
+    timeout: std::time::Duration,
     input: ReconcileInput<'_>,
     cancellation: &CancellationToken,
 ) -> ReconcileOutcome {
     let started = std::time::Instant::now();
     let prompt = instruction(&input);
+    let latency = |s: &std::time::Instant| s.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let first_text = match one_call(
         runtime,
         model,
         vec![Message::text(Role::User, prompt.clone())],
+        timeout,
         cancellation,
     )
     .await
     {
         Ok(text) => text,
-        Err(refused) => return refused,
+        Err(mut refused) => {
+            refused.latency_ms = latency(&started);
+            return refused;
+        }
     };
-    let latency = |s: &std::time::Instant| s.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let first = parse_outcome(&first_text, latency(&started));
     let format_failure = matches!(
         first.failure_kind,
@@ -403,9 +416,12 @@ pub(crate) async fn reconcile_completion(
             Message::text(Role::User, REPAIR_ASK.to_string()),
         ]
     };
-    let second_text = match one_call(runtime, model, repair_messages, cancellation).await {
+    let second_text = match one_call(runtime, model, repair_messages, timeout, cancellation).await {
         Ok(text) => text,
-        Err(refused) => return refused,
+        Err(mut refused) => {
+            refused.latency_ms = latency(&started);
+            return refused;
+        }
     };
     let mut second = parse_outcome(&second_text, latency(&started));
     if second.failure_kind.is_none() {
@@ -585,6 +601,7 @@ mod tests {
             &runtime,
             &ModelRef::new("mock", "m"),
             None,
+            DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
         )
@@ -652,6 +669,7 @@ mod tests {
             &runtime,
             &ModelRef::new("mock", "m"),
             None,
+            DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
         )
@@ -680,6 +698,7 @@ mod tests {
             &runtime,
             &ModelRef::new("mock", "m"),
             None,
+            DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
         )
@@ -704,6 +723,7 @@ mod tests {
             &runtime,
             &ModelRef::new("mock", "m"),
             None,
+            DEFAULT_RECONCILE_TIMEOUT,
             input(),
             &CancellationToken::new(),
         )

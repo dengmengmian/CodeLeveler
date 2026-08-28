@@ -991,6 +991,11 @@ pub struct Executor {
     /// If a configured judge model is unreachable the gate fails closed —
     /// never a silent same-model fallback.
     reconciliation_model: Option<ModelRef>,
+    /// Ceiling for ONE Completion Reconciliation request (`None` = the gate's
+    /// default). Operational policy, not a semantic rule: a slower independent
+    /// judge needs a longer ceiling than the flash-calibrated default, and
+    /// right-censoring the judge shows up as a false NEGATIVE, never a pass.
+    reconciliation_timeout: Option<std::time::Duration>,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
@@ -1073,6 +1078,7 @@ impl Executor {
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             reconciliation_model: None,
+            reconciliation_timeout: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits::default(),
@@ -1149,6 +1155,18 @@ impl Executor {
 
     pub fn with_reconciliation_model_opt(mut self, model: Option<ModelRef>) -> Self {
         self.reconciliation_model = model;
+        self
+    }
+
+    /// Ceiling for one Completion Reconciliation request. `None` keeps the
+    /// gate's default; the host resolves the configured value.
+    pub fn with_reconciliation_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.reconciliation_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_reconciliation_timeout_opt(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.reconciliation_timeout = timeout;
         self
     }
 
@@ -1460,6 +1478,7 @@ impl Executor {
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             reconciliation_model: None,
+            reconciliation_timeout: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits {

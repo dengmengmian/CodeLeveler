@@ -21,6 +21,7 @@ mod nudges;
 pub mod ownership;
 mod prompt;
 mod reconciliation;
+pub use reconciliation::DEFAULT_RECONCILE_TIMEOUT;
 mod sub_agent;
 
 pub use budget::{
