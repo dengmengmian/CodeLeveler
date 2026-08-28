@@ -180,6 +180,36 @@ UNMEASURED**：全部 3 次校准后判定里只有 2 次拿到判决，样本�
 **保留证据**（`PRE_CALIBRATION_RESULTS_SCORING=NO`，不计入任何新分母）：
 校准前 icg-6r 8 次 / scale-s800 2 次 / HC-002 2 次；校准后 HC-002 1 次 Completed（隐藏验收绿、rc0）。
 
+## 裁决：同步跨模型 Judge 关闭（CLOSED_OPERATIONALLY）
+
+```
+SYNC_V4_PRO_COMPLETION_JUDGE=REJECTED_FOR_BETA
+V4_PRO_SEMANTIC_VALUE=UNMEASURED
+V4_PRO_SYNC_OPERATIONAL_VIABILITY=FAIL
+CROSS_MODEL_EXPERIMENT=CLOSED_OPERATIONALLY
+COMPLETION_JUDGE_TIMEOUT_CONFIGURABLE=KEEP
+DEFAULT_JUDGE_TIMEOUT_SECONDS=60
+```
+
+结论不是"异构 Judge 没有语义价值"——那个假设**从未被测量**（两轮 cohort 一共只拿到 4 次
+真实判决）。被证伪的是**产品形态**：把一次分钟级、时延尾部无界的强模型判定放进同步完成路径。
+`leveler -p …` 必须能回答"什么时候退出、退出码是什么"，而这个形态回答不了。
+
+保留：`completion_judge_model` / `completion_judge_timeout_seconds` 两个配置能力
+（默认 60s，未配置时行为与过去完全一致）。已证明不同 Judge 模型不能共享同一个隐藏 timeout 假设——
+把它显式化本身是净收益。**但 Beta baseline 不把同步 v4-pro 作为强制完成门。**
+
+不采纳的替代方案及原因：
+
+| 方案 | 不做的原因 |
+| --- | --- |
+| timeout 抬到 300/600s | 只是把同一条尾巴往后推，最坏等待推到分钟级 |
+| 异步 v4-pro 判定 | 立刻引入 pending-completion 状态、进程退出语义、重启持久化、后台验证器生命周期、验证期间用户继续发消息、旧结果回来时目标已变——这是一整套新生命周期系统 |
+| 多数投票 / 第三个 Judge | 用更多概率层去修概率语义 |
+| 继续调 prompt | 已经渐近，每封死一种重解释就换一种新的 |
+
+后继：Explicit Completion Contract V1。
+
 ## 残余限制
 
 - 二审仍是模型判断：同一模型对自身同型偷换存在共谋风险；×10 探针是回归门不是数学保证。
