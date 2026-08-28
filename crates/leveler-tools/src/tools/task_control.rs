@@ -17,12 +17,28 @@ struct TaskIdInput {
     task_id: String,
 }
 
+/// Default wait interval. Long enough that a model is not forced into
+/// sub-second polling; short enough that the AgentLoop recovers control.
+const WAIT_DEFAULT_SECS: u64 = 30;
+/// Hard cap. A caller may ask for more; we still return running status
+/// rather than owning the AgentLoop for minutes.
+const WAIT_MAX_SECS: u64 = 120;
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitInput {
     task_id: String,
-    /// Max seconds to wait (default 600).
+    /// Seconds to wait before returning current status (default 30, max 120).
+    /// Expiry does not cancel the background task.
     #[serde(default)]
     timeout_seconds: Option<u64>,
+}
+
+fn wait_interval(timeout_seconds: Option<u64>) -> Duration {
+    Duration::from_secs(
+        timeout_seconds
+            .unwrap_or(WAIT_DEFAULT_SECS)
+            .clamp(1, WAIT_MAX_SECS),
+    )
 }
 
 fn format_snap(snap: &leveler_execution::BackgroundTaskSnapshot) -> String {
@@ -89,7 +105,9 @@ impl Tool for WaitTaskTool {
     }
 
     fn description(&self) -> &'static str {
-        "Block until a background task exits (or timeout). Returns final status and log."
+        "Wait for a background task for a bounded interval (default 30s, max 120s). \
+         If it is still running, returns current status, elapsed time, and recent log \
+         without cancelling it. If it has exited, returns final status and log."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -115,8 +133,23 @@ impl Tool for WaitTaskTool {
             return Ok(ToolOutput::error("no background task registry"));
         };
         let task_id = input.task_id.trim().to_string();
-        let timeout = Duration::from_secs(input.timeout_seconds.unwrap_or(600).max(1));
+        let timeout = wait_interval(input.timeout_seconds);
         match reg.wait(&task_id, Some(timeout), &cancellation).await {
+            Ok(snap)
+                if matches!(
+                    snap.status,
+                    BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
+                ) =>
+            {
+                // Interval elapsed (or a kill is in flight). Do not consume the
+                // mutation baseline — that runs once, at true terminal.
+                Ok(
+                    ToolOutput::ok(format_snap(&snap)).with_metadata(serde_json::json!({
+                        "exit_code": snap.exit_code,
+                        "duration_ms": snap.duration_ms,
+                    })),
+                )
+            }
             Ok(snap) => {
                 // PR-3b: account file diffs at wait end; auto-restore only when
                 // command_write_allowlist is set (worker/node constrained).
@@ -279,6 +312,60 @@ mod tests {
         assert_eq!(WaitTaskTool.risk(), RiskLevel::WorkspaceWrite);
         // get_task stays a pure status read.
         assert_eq!(GetTaskTool.risk(), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn wait_interval_is_capped() {
+        assert_eq!(wait_interval(None).as_secs(), WAIT_DEFAULT_SECS);
+        assert_eq!(wait_interval(Some(1)).as_secs(), 1);
+        assert_eq!(wait_interval(Some(900)).as_secs(), WAIT_MAX_SECS);
+    }
+
+    #[tokio::test]
+    async fn wait_interval_returns_running_as_ok_without_killing() {
+        let dir = scratch_repo();
+        let (ctx, reg) = ctx_with_reg(dir.path());
+        let start = RunCommandTool
+            .execute(
+                serde_json::json!({
+                    "program": "sleep",
+                    "args": ["30"],
+                    "background": true,
+                }),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!start.is_error, "spawn: {}", start.content);
+        let task_id = start
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("task_id: "))
+            .expect("task_id")
+            .to_string();
+
+        let wait = WaitTaskTool
+            .execute(
+                serde_json::json!({"task_id": task_id, "timeout_seconds": 1}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !wait.is_error,
+            "still-running wait must not be a tool error: {}",
+            wait.content
+        );
+        assert!(
+            wait.content.contains("status: running"),
+            "expected running snapshot: {}",
+            wait.content
+        );
+        let snap = reg.get(&task_id).await.expect("retained");
+        assert_eq!(snap.status, BackgroundTaskStatus::Running);
+        let _ = reg.kill(&task_id).await;
     }
 
     fn ctx_with_reg(dir: &std::path::Path) -> (ToolContext, Arc<BackgroundTaskRegistry>) {

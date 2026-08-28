@@ -421,7 +421,15 @@ impl BackgroundTaskRegistry {
                 biased;
                 _ = cancellation.cancelled() => return Err("wait cancelled".into()),
                 _ = &mut wait_fut => {}
-                _ = tokio::time::sleep(t) => return Err("wait timed out".into()),
+                _ = tokio::time::sleep(t) => {
+                    // Interval elapsed: return current snapshot. Do not kill
+                    // the process. A still-running status is truthful, not an
+                    // error — the waiter gets control back.
+                    return self
+                        .get(id)
+                        .await
+                        .ok_or_else(|| format!("task `{id}` disappeared"));
+                }
             }
         } else {
             tokio::select! {
@@ -687,6 +695,115 @@ mod tests {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )))
+    }
+
+    #[tokio::test]
+    async fn wait_interval_returns_running_snapshot_without_killing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let pid_file = dir.path().join("pid");
+        #[cfg(unix)]
+        let (program, args) = (
+            "sh",
+            vec![
+                "-c".into(),
+                format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+            ],
+        );
+        #[cfg(windows)]
+        let (program, args) = ("ping", vec!["-n".into(), "30".into(), "127.0.0.1".into()]);
+        let reg = BackgroundTaskRegistry::new();
+        let req = ProcessRequest::new(program, args, dir.path().to_path_buf());
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let snap = reg
+            .wait(
+                &id,
+                Some(Duration::from_millis(200)),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("wait interval should return a snapshot, not an error");
+        assert_eq!(
+            snap.status,
+            BackgroundTaskStatus::Running,
+            "interval expiry is not terminal: {:?}",
+            snap.status
+        );
+        assert!(snap.exit_code.is_none());
+        let still = reg.get(&id).await.expect("task retained");
+        assert_eq!(still.status, BackgroundTaskStatus::Running);
+        #[cfg(unix)]
+        {
+            let pid = wait_for_pid_file(&pid_file, Duration::from_secs(5))
+                .await
+                .expect("pid file");
+            assert!(
+                process_alive(pid),
+                "wait interval must not kill background pid {pid}"
+            );
+        }
+        let _ = reg.kill(&id).await;
+    }
+
+    #[tokio::test]
+    async fn wait_cancel_returns_without_killing() {
+        let reg = BackgroundTaskRegistry::new();
+        let req = ProcessRequest::new("sleep", vec!["30".into()], std::env::temp_dir());
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let wait = tokio::spawn({
+            let reg = reg.clone();
+            let id = id.clone();
+            async move {
+                reg.wait(&id, Some(Duration::from_secs(10)), &cancel_clone)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let err = wait
+            .await
+            .expect("join")
+            .expect_err("cancelled wait is an error");
+        assert!(
+            err.contains("cancelled"),
+            "expected wait cancelled, got {err}"
+        );
+        let snap = reg.get(&id).await.expect("still listed");
+        assert!(
+            snap.status.is_active(),
+            "cancel waits; it does not kill: {:?}",
+            snap.status
+        );
+        let _ = reg.kill(&id).await;
+    }
+
+    #[tokio::test]
+    async fn kill_wakes_a_pending_wait() {
+        let reg = BackgroundTaskRegistry::new();
+        let req = ProcessRequest::new("sleep", vec!["30".into()], std::env::temp_dir());
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let wait = tokio::spawn({
+            let reg = reg.clone();
+            let id = id.clone();
+            async move {
+                reg.wait(
+                    &id,
+                    Some(Duration::from_secs(10)),
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = reg.kill(&id).await;
+        let snap = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("wait must wake after kill")
+            .expect("join")
+            .expect("wait after kill");
+        assert_eq!(snap.status, BackgroundTaskStatus::Killed);
     }
 
     #[tokio::test]
