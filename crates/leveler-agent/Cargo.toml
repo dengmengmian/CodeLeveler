@@ -28,6 +28,7 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+leveler-test-support = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tempfile = "3"

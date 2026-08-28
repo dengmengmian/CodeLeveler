@@ -180,6 +180,46 @@ impl Executor {
         // Complex tasks still require ModelExplicit update_plan before mutation;
         // navigation tools stay available without a plan. HostImplicit remains for
         // resume of older sessions that already persisted that origin.
+        // The Completion Contract is derived ONCE, here, before the first
+        // model turn — while the task is still only the user's words. Deriving
+        // it later, after the executor has met the obstacle, would let the
+        // obstacle shape the obligations, which is the icg-6r failure exactly.
+        // Top level only: children settle through their parent, and a chat
+        // turn has no goal to account for. A failed derivation leaves `None`,
+        // and `None` means "unavailable", never "nothing was required".
+        let completion_contract: Option<leveler_lifecycle::CompletionContract> = match self
+            .completion_contract
+            .clone()
+            // A resumed run keeps the obligations it already had: the
+            // ledger carried them across the restart.
+            .or_else(|| self.seeded_ledger.completion_contract.clone())
+        {
+            seeded @ Some(_) => seeded,
+            None if self.policy.goal_mode && self.depth == 0 => {
+                let judge_timeout = self
+                    .reconciliation_timeout
+                    .unwrap_or(crate::reconciliation::DEFAULT_RECONCILE_TIMEOUT);
+                let derived = crate::completion_contract::derive_contract(
+                    self.runtime.as_ref(),
+                    &self.model,
+                    judge_timeout,
+                    &original_task,
+                    &cancellation,
+                )
+                .await;
+                tracing::info!(
+                    derived = derived.as_ref().map(|c| c.requirements.len()).unwrap_or(0),
+                    available = derived.is_some(),
+                    "completion contract derived"
+                );
+                // Durable immediately, and before any mutation can run: a
+                // crash between the first edit and the contract landing
+                // would leave a changed workspace with no record of what
+                // completing it was supposed to mean.
+                derived
+            }
+            None => None,
+        };
         // Task contract → user turn (never system prefix) so prefix cache stays stable.
         let task_contract = TaskContract::parse(&original_task);
         let contract_injection = task_contract.user_injection();
@@ -189,6 +229,27 @@ impl Executor {
                 .any(|m| m.role == Role::User && m.text_content().contains("## Task contract"))
         {
             messages.push(Message::text(Role::User, contract_injection));
+        }
+        // The obligations stay visible for the whole run. This is what stops a
+        // requirement from being quietly rescoped: the executor cannot retire
+        // R2 by restating the task in easier words, because R2 is still on
+        // screen, in the user's wording, every turn.
+        if let Some(contract) = completion_contract.as_ref() {
+            const OBLIGATIONS_HEADER: &str = "## Completion obligations";
+            if !messages
+                .iter()
+                .any(|m| m.role == Role::User && m.text_content().contains(OBLIGATIONS_HEADER))
+            {
+                let mut text = format!(
+                    "{OBLIGATIONS_HEADER}\n\nThese come from the task as written. Completion is \
+                     refused while any is outstanding, and an obligation to demonstrate something \
+                     is discharged by running it, not by reporting it.\n\n"
+                );
+                for r in &contract.requirements {
+                    text.push_str(&format!("- {}: {}\n", r.id, r.text));
+                }
+                messages.push(Message::text(Role::User, text));
+            }
         }
         // Product steer: top-level runs see keep-vs-delegate once. Parallel
         // keywords are not required — ordinary implementation goals must still
@@ -295,6 +356,18 @@ impl Executor {
             }
             led
         };
+        // The contract goes durable HERE, before the loop can run a single
+        // mutating tool: a crash between the first edit and the obligations
+        // landing would leave a changed workspace with no record of what
+        // completing it was supposed to mean.
+        if ledger.completion_contract.is_none()
+            && let Some(contract) = completion_contract.clone()
+        {
+            ledger.completion_contract = Some(contract);
+            observer(AgentEvent::EvidenceLedgerUpdated {
+                ledger: ledger.clone(),
+            });
+        }
         // Unified closeout nudge budget shared by every quiet-round mechanism
         // (goal resolution, completion evidence, empty answer, audit repair) —
         // the old per-mechanism caps (3 + 2 + 2 + 1) are deliberately gone.
@@ -1727,6 +1800,7 @@ impl Executor {
                                     recent_evidence: &recent_evidence,
                                     modified_files: &modified_files,
                                     fresh_verification: ledger.has_fresh_successful_verify(),
+                                    contract: completion_contract.as_ref(),
                                 },
                                 &cancellation,
                             )
@@ -1745,8 +1819,80 @@ impl Executor {
                                 failure_kind = outcome.failure_kind.unwrap_or("none"),
                                 "completion reconciliation"
                             );
-                            if !outcome.allows_completion() {
+                            // The Completion Contract gate. The obligations
+                            // were written down before the work began, so an
+                            // obligation cannot be discharged by going
+                            // unmentioned, and one that can be DEMONSTRATED is
+                            // not discharged by the judge's reading alone —
+                            // the ledger has to show a check that ran green
+                            // over the tree as it stands. This runs BEFORE the
+                            // semantic verdict is honoured: mechanical account
+                            // first, judgment for the residue.
+                            // A missing contract is NOT consent. Derivation may
+                            // have failed at the start of the run (provider
+                            // hiccup, malformed reply); rather than deadlock the
+                            // goal, try once more here — and if it still cannot
+                            // be established, refuse. Absence must never read as
+                            // "nothing was required".
+                            let completion_contract = match completion_contract.as_ref() {
+                                Some(_) => completion_contract.clone(),
+                                None => {
+                                    crate::completion_contract::derive_contract(
+                                        self.runtime.as_ref(),
+                                        &self.model,
+                                        judge_timeout,
+                                        &original_task,
+                                        &cancellation,
+                                    )
+                                    .await
+                                }
+                            };
+                            let open_obligations: Vec<String> = match completion_contract.as_ref() {
+                                None => vec![
+                                    "the completion contract could not be established, so no \
+                                     obligation could be checked"
+                                        .to_string(),
+                                ],
+                                Some(contract) => {
+                                    let mut accounted = contract.clone();
+                                    for r in &mut accounted.requirements {
+                                        if let Some(a) =
+                                            outcome.accounting.iter().find(|a| a.id == r.id)
+                                        {
+                                            r.status = if a.satisfied {
+                                                leveler_lifecycle::RequirementStatus::Satisfied
+                                            } else {
+                                                leveler_lifecycle::RequirementStatus::Pending
+                                            };
+                                            r.evidence.push(
+                                                leveler_lifecycle::RequirementEvidence {
+                                                    strength: a.strength,
+                                                    detail: a.evidence.clone(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                    accounted
+                                        .unsatisfied_material(&ledger)
+                                        .into_iter()
+                                        .map(|r| format!("{} ({})", r.id, r.text))
+                                        .collect()
+                                }
+                            };
+                            if !open_obligations.is_empty() {
+                                tracing::info!(
+                                    open = open_obligations.len(),
+                                    "completion contract refused"
+                                );
+                            }
+                            if !outcome.allows_completion() || !open_obligations.is_empty() {
                                 let mut detail = format!("verdict={:?}", outcome.verdict);
+                                if !open_obligations.is_empty() {
+                                    detail.push_str(&format!(
+                                        "; obligations still open: {}",
+                                        open_obligations.join("; ")
+                                    ));
+                                }
                                 if !outcome.reason.is_empty() {
                                     detail.push_str(&format!("; {}", outcome.reason));
                                 }
@@ -1775,6 +1921,19 @@ impl Executor {
                                     crate::reconciliation::ReconcileVerdict::Unavailable => {
                                         format!(
                                             "update_goal(complete) refused: the independent completion check could not run ({detail}). Nothing about your work was judged. Do NOT resubmit the same completion claim unchanged — verification is unavailable, not your work wrong. If a later state change gives new evidence, complete then; otherwise report blocked citing verification unavailability."
+                                        )
+                                    }
+                                    // Only when the judge itself was content
+                                    // and the CONTRACT is what refuses: then
+                                    // the outstanding obligations are the whole
+                                    // story. A semantic refusal keeps its own
+                                    // wording, with the obligations already
+                                    // named in `detail`.
+                                    _ if outcome.allows_completion()
+                                        && !open_obligations.is_empty() =>
+                                    {
+                                        format!(
+                                            "update_goal(complete) refused: {detail}. These obligations come from the ORIGINAL task and are still outstanding. An obligation to demonstrate something (a test, a check, a command that must pass) is discharged by actually running it and showing it green over the current tree — not by stating that it was done. Finish them and complete again, or call update_goal(blocked) naming which one cannot be satisfied and why."
                                         )
                                     }
                                     _ => format!(

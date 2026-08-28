@@ -60,6 +60,15 @@ pub(crate) enum ReconcileVerdict {
     Unavailable,
 }
 
+/// One obligation, as the judge accounted for it.
+#[derive(Debug, Clone)]
+pub(crate) struct RequirementAccounting {
+    pub id: String,
+    pub satisfied: bool,
+    pub evidence: String,
+    pub strength: leveler_lifecycle::EvidenceStrength,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReconcileOutcome {
     pub verdict: ReconcileVerdict,
@@ -73,6 +82,10 @@ pub(crate) struct ReconcileOutcome {
     pub latency_ms: u64,
     /// Whether the verdict needed the one bounded format-repair retry.
     pub repaired: bool,
+    /// The judge's account of each contract obligation, by id. Empty when no
+    /// contract was in play. The caller applies the mechanical floor to this;
+    /// the judge's word alone never discharges a demonstrable obligation.
+    pub accounting: Vec<RequirementAccounting>,
     /// Structured failure class for observability when the verdict is
     /// `Unavailable` (`provider_error` / `timeout` / `empty_reply` /
     /// `no_object` / `bad_json` / `bad_verdict` / `ambiguous_objects`).
@@ -88,6 +101,7 @@ impl ReconcileOutcome {
             contradictions: Vec::new(),
             latency_ms: 0,
             repaired: false,
+            accounting: Vec::new(),
             failure_kind: Some(kind),
         }
     }
@@ -119,6 +133,10 @@ pub(crate) struct ReconcileInput<'a> {
     pub modified_files: &'a [String],
     /// Whether a verification command succeeded since the last edit.
     pub fresh_verification: bool,
+    /// The obligations derived at the START of this goal, if derivation
+    /// succeeded. When present the judge accounts for them BY ID, so an
+    /// obligation cannot be discharged by going unmentioned.
+    pub contract: Option<&'a leveler_lifecycle::CompletionContract>,
 }
 
 fn instruction(input: &ReconcileInput<'_>) -> String {
@@ -126,6 +144,31 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
         "(none)".to_string()
     } else {
         input.modified_files.join(", ")
+    };
+    // The obligations were written down before the work started. Accounting
+    // for them BY ID is what stops one from quietly disappearing: an
+    // unmentioned obligation stays unsatisfied instead of being waved through.
+    let (obligations, accounting_schema, accounting_rule) = match input.contract {
+        None => (String::new(), String::new(), String::new()),
+        Some(contract) => {
+            let mut listed = String::from("\n<obligations_from_the_original_goal>\n");
+            for r in &contract.requirements {
+                listed.push_str(&format!("{}: {}\n", r.id, r.text));
+            }
+            listed.push_str("</obligations_from_the_original_goal>\n");
+            (
+                listed,
+                "  \"requirement_accounting\": [\n    {\"id\": \"R1\", \"satisfied\": true|false, \"evidence\": \"...\", \"evidence_strength\": \"mechanical\" | \"observed\" | \"semantic\"}\n  ],\n"
+                    .to_string(),
+                "- Account for EVERY obligation id listed above in \
+                 \"requirement_accounting\". An obligation you do not mention \
+                 stays unsatisfied. For \"evidence_strength\" use \"mechanical\" \
+                 only when a recorded command or file change demonstrates it, \
+                 \"observed\" when output was actually seen, and \"semantic\" \
+                 when it is your reading of the work.\n"
+                    .to_string(),
+            )
+        }
     };
     format!(
         "You are the completion reconciliation judge for a coding agent. The \
@@ -146,8 +189,10 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
          is \"uncertain\" — never \"satisfied\".\n\
          - Do not judge whether the solution seems reasonable. Judge only \
          whether the original request was satisfied.\n\
+         {accounting_rule}\
          \n\
          <original_goal>\n{goal}\n</original_goal>\n\
+         {obligations}\
          \n\
          <completion_claim>\n{claim}\n</completion_claim>\n\
          \n\
@@ -166,6 +211,7 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
          \"evidence\": \"...\"}}\n\
            ],\n\
            \"contradictions\": [\"...\"],\n\
+         {accounting_schema}\
            \"reason\": \"...\"\n\
          }}\n\
          List every material requirement from the original goal in \
@@ -175,6 +221,9 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
         claims = input.recent_claims,
         evidence = input.recent_evidence,
         fresh = input.fresh_verification,
+        obligations = obligations,
+        accounting_rule = accounting_rule,
+        accounting_schema = accounting_schema,
     )
 }
 
@@ -187,6 +236,8 @@ struct RawVerdict {
     #[serde(default)]
     contradictions: Vec<String>,
     #[serde(default)]
+    requirement_accounting: Vec<RawAccounting>,
+    #[serde(default)]
     reason: String,
 }
 
@@ -198,10 +249,22 @@ struct RawRequirement {
     satisfied: bool,
 }
 
+#[derive(serde::Deserialize)]
+struct RawAccounting {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    satisfied: bool,
+    #[serde(default)]
+    evidence: String,
+    #[serde(default)]
+    evidence_strength: String,
+}
+
 /// Every balanced top-level `{…}` span in `text`, string-aware (braces inside
 /// JSON strings do not count). Handles fenced blocks and prose wrappers by
 /// construction — the fence is just prose around a balanced object.
-fn candidate_objects(text: &str) -> Vec<&str> {
+pub(crate) fn candidate_objects(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut depth = 0usize;
@@ -316,6 +379,24 @@ fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
             );
         }
     };
+    let accounting = raw
+        .requirement_accounting
+        .into_iter()
+        .filter(|a| !a.id.trim().is_empty())
+        .map(|a| RequirementAccounting {
+            id: a.id.trim().to_string(),
+            satisfied: a.satisfied,
+            evidence: a.evidence,
+            // An unrecognised strength is the WEAKEST one, never the
+            // strongest: a judge that writes nonsense in this field must not
+            // thereby clear a mechanically floored obligation.
+            strength: match a.evidence_strength.trim().to_ascii_lowercase().as_str() {
+                "mechanical" => leveler_lifecycle::EvidenceStrength::Mechanical,
+                "observed" => leveler_lifecycle::EvidenceStrength::Observed,
+                _ => leveler_lifecycle::EvidenceStrength::Semantic,
+            },
+        })
+        .collect();
     ReconcileOutcome {
         verdict,
         reason: raw.reason,
@@ -323,6 +404,7 @@ fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
         contradictions: raw.contradictions,
         latency_ms,
         repaired: false,
+        accounting,
         failure_kind: None,
     }
 }
@@ -584,6 +666,7 @@ mod tests {
             recent_evidence: "",
             modified_files: &[],
             fresh_verification: true,
+            contract: None,
         }
     }
 

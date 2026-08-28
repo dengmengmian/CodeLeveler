@@ -65,6 +65,13 @@ pub struct EvidenceLedger {
     /// Monotonic id source for findings owned by THIS ledger.
     #[serde(default)]
     pub next_finding_seq: u64,
+    /// The goal's Completion Contract, once derived. It rides the ledger
+    /// because the ledger is already the durable, replayed record of what this
+    /// run knows — a restart that lost the obligations would be free to
+    /// reinterpret the goal from scratch, which is the failure the contract
+    /// exists to prevent. Serde-default so pre-contract snapshots still replay.
+    #[serde(default)]
+    pub completion_contract: Option<crate::CompletionContract>,
 }
 
 impl EvidenceLedger {

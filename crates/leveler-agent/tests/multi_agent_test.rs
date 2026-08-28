@@ -73,9 +73,14 @@ impl SleepyRuntime {
 impl ModelRuntime for SleepyRuntime {
     async fn generate(
         &self,
-        _request: ModelRequest,
+        request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        // Contract derivation is answered out of band, so these scripts stay
+        // about multi-agent behaviour rather than about obligations.
+        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
+            return Ok(canned);
+        }
         // The reconciliation gate's non-streaming call draws from the same
         // scripted queue, without the stream delay.
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
@@ -200,7 +205,7 @@ fn assistant_text(text: &str) -> ModelResponse {
 /// top-level update_goal(complete) consumes exactly one of these.
 fn reconcile_ok() -> ModelResponse {
     assistant_text(
-        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"reason":"satisfied as stated"}"#,
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"recorded output","evidence_strength":"observed"}],"reason":"satisfied as stated"}"#,
     )
 }
 
@@ -4527,6 +4532,11 @@ impl ModelRuntime for RoutedRuntime {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        // Contract derivation is answered out of band, ahead of the queue
+        // split: it is neither a parent loop round nor a child turn.
+        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
+            return Ok(canned);
+        }
         // The reconciliation gate's call: parent-side (no child marker), from
         // the parent queue, and NOT recorded in parent_requests — those
         // assertions count loop rounds, not gate calls.

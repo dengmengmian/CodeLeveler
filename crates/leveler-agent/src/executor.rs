@@ -996,6 +996,10 @@ pub struct Executor {
     /// judge needs a longer ceiling than the flash-calibrated default, and
     /// right-censoring the judge shows up as a false NEGATIVE, never a pass.
     reconciliation_timeout: Option<std::time::Duration>,
+    /// Obligations derived from the ORIGINAL goal at the start of this run.
+    /// `None` means derivation was unavailable — the semantic gate still runs,
+    /// but nothing may read a missing contract as "nothing was required".
+    completion_contract: Option<leveler_lifecycle::CompletionContract>,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
@@ -1079,6 +1083,7 @@ impl Executor {
             restart_settled_children: Vec::new(),
             reconciliation_model: None,
             reconciliation_timeout: None,
+            completion_contract: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits::default(),
@@ -1162,6 +1167,16 @@ impl Executor {
     /// gate's default; the host resolves the configured value.
     pub fn with_reconciliation_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.reconciliation_timeout = Some(timeout);
+        self
+    }
+
+    /// Seed the contract (restart: the obligations are durable, and a resumed
+    /// run must not silently lose them).
+    pub fn with_completion_contract(
+        mut self,
+        contract: leveler_lifecycle::CompletionContract,
+    ) -> Self {
+        self.completion_contract = Some(contract);
         self
     }
 
@@ -1479,6 +1494,7 @@ impl Executor {
             restart_settled_children: Vec::new(),
             reconciliation_model: None,
             reconciliation_timeout: None,
+            completion_contract: None,
             seeded_objective: None,
             memory_index: String::new(),
             step_limits: StepLimits {

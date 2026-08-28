@@ -1776,6 +1776,7 @@ dependencies = [
  "leveler-memory",
  "leveler-model",
  "leveler-skills",
+ "leveler-test-support",
  "leveler-tools",
  "serde",
  "serde_json",

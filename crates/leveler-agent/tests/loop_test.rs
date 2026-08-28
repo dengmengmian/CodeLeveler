@@ -104,6 +104,15 @@ impl ModelRuntime for MockRuntime {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        // Contract derivation is answered out of band with an empty (i.e.
+        // unavailable) contract, so a test that did not opt into obligations
+        // keeps its scripted FIFO and its request counts. Tests that want
+        // obligations state them with `with_completion_contract`.
+        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
+            // Out of band: not recorded either, so request-count assertions
+            // stay about the loop's own turns.
+            return Ok(canned);
+        }
         self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
@@ -448,7 +457,7 @@ fn assistant_text(text: &str) -> ModelResponse {
 /// goal-mode update_goal(complete) consumes exactly one of these.
 fn reconcile_ok() -> ModelResponse {
     assistant_text(
-        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"reason":"satisfied as stated"}"#,
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"recorded output","evidence_strength":"observed"}],"reason":"satisfied as stated"}"#,
     )
 }
 
@@ -1003,6 +1012,9 @@ async fn an_unreachable_judge_model_fails_closed_without_same_model_fallback() {
             request: ModelRequest,
             cancellation: CancellationToken,
         ) -> Result<ModelResponse, ModelError> {
+            if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
+                return Ok(canned);
+            }
             self.generated.lock().unwrap().push(request.model.clone());
             if request.model.model == "deepseek-v4-pro" {
                 return Err(ModelError::new(
@@ -1112,6 +1124,9 @@ impl ModelRuntime for SlowJudgeRuntime {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        if let Some(canned) = leveler_test_support::derive_autopilot(&request) {
+            return Ok(canned);
+        }
         self.generated.lock().unwrap().push(request.model.clone());
         tokio::select! {
             _ = tokio::time::sleep(self.delay) => {}
@@ -1290,6 +1305,311 @@ async fn cancellation_preempts_a_wide_ceiling() {
         Err(leveler_agent::AgentError::Cancelled) => {}
         other => panic!("a cancelled run is Cancelled, never a completion: {other:?}"),
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// THE scale-s800 DEFECT, as a test. The goal says in so many words that the
+/// boundary rule must be covered by a test. The implementation lands, the
+/// judge is happy with the overall picture, and it accounts for the test
+/// obligation with nothing but its own reading of the work. The completion
+/// must still be refused, and the refusal must name the obligation.
+#[tokio::test]
+async fn an_explicit_test_obligation_backed_only_by_prose_refuses_completion() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-contract-prose-{}",
+        std::process::id() as u64 * 73 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R1".into(),
+            text: "the window boundary rule is [start, start+width)".into(),
+            kind: leveler_lifecycle::RequirementKind::Behavior,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence: Vec::new(),
+        },
+        leveler_lifecycle::CompletionRequirement {
+            id: "R2".into(),
+            text: "the boundary rule is covered by a test".into(),
+            kind: leveler_lifecycle::RequirementKind::Verification,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence: Vec::new(),
+        },
+    ]);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "fixed the boundary rule"}),
+        ),
+        assistant_text(
+            r#"{"verdict":"satisfied",
+                "requirements":[{"requirement":"boundary rule","satisfied":true,"evidence":"fixed"}],
+                "contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,"evidence":"window.go now uses [start, start+width)","evidence_strength":"mechanical"},
+                  {"id":"R2","satisfied":true,"evidence":"I added a test for the boundary","evidence_strength":"semantic"}
+                ],
+                "reason":"all good"}"#,
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "no test written"}),
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "fix the boundary rule; the boundary rule must be covered by a test",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "an obligation to DEMONSTRATE cannot be discharged by saying so"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, name, is_error: true, preview }
+                if id == "g1" && name == "update_goal" && preview.contains("R2")
+        )),
+        "the refusal names the obligation that is still open: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same contract clears once the obligation is backed by a check that
+/// actually ran green over the tree as it stands.
+#[tokio::test]
+async fn a_mechanically_backed_obligation_completes() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-contract-mech-{}",
+        std::process::id() as u64 * 73 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R1".into(),
+            text: "the CLI reports the rule".into(),
+            kind: leveler_lifecycle::RequirementKind::Behavior,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence: Vec::new(),
+        },
+    ]);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+        assistant_text(
+            r#"{"verdict":"satisfied",
+                "requirements":[{"requirement":"cli","satisfied":true,"evidence":"ok"}],
+                "contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,"evidence":"observed the report output","evidence_strength":"observed"}
+                ],
+                "reason":"ok"}"#,
+        ),
+    ]));
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "make the CLI report the rule",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §72: a goal whose contract could not be established cannot complete. The
+/// absence of obligations is not a finding that none existed — nothing was
+/// checked, and nothing checked is not the same as everything satisfied.
+#[tokio::test]
+async fn a_goal_with_no_derivable_contract_cannot_complete() {
+    /// Derivation always answers prose, so no contract can ever be built.
+    struct NoContractRuntime(MockRuntime);
+    #[async_trait]
+    impl ModelRuntime for NoContractRuntime {
+        async fn generate(
+            &self,
+            request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            if request.messages.iter().any(|m| {
+                m.text_content()
+                    .contains(leveler_test_support::DERIVE_MARKER)
+            }) {
+                return Ok(assistant_text("the task looks clear enough to me"));
+            }
+            self.0.generate(request, cancellation).await
+        }
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            self.0.stream(request, cancellation).await
+        }
+        async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
+            self.0.profile(m).await
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-nocontract-{}",
+        std::process::id() as u64 * 79 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(NoContractRuntime(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+        reconcile_ok(),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "cannot establish obligations"}),
+        ),
+    ])));
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .run(
+        "do the task",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "no contract means nothing was checked, which is not the same as satisfied"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §42: the obligations survive a restart. A resumed run must not get to
+/// reinterpret the goal from scratch just because the process died — that is
+/// the rescoping this whole mechanism exists to prevent, arriving by another
+/// door.
+#[tokio::test]
+async fn a_resumed_run_keeps_the_obligations_it_already_had() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-contract-resume-{}",
+        std::process::id() as u64 * 79 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    // What the dead window left behind: obligations, one of them a test the
+    // run never wrote.
+    let seeded = leveler_lifecycle::EvidenceLedger {
+        completion_contract: Some(leveler_lifecycle::CompletionContract::new(vec![
+            leveler_lifecycle::CompletionRequirement {
+                id: "R1".into(),
+                text: "the boundary rule is covered by a test".into(),
+                kind: leveler_lifecycle::RequirementKind::Verification,
+                source: leveler_lifecycle::RequirementSource::OriginalGoal,
+                status: leveler_lifecycle::RequirementStatus::Pending,
+                evidence: Vec::new(),
+            },
+        ])),
+        ..Default::default()
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "picked up where I left off"}),
+        ),
+        assistant_text(
+            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,"evidence":"I believe a test covers it","evidence_strength":"semantic"}
+                ],
+                "reason":"looks done"}"#,
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "no test"}),
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_seeded_ledger(seeded)
+    .run(
+        "fix the boundary rule; it must be covered by a test",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "the surviving obligation still has no mechanical backing"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, is_error: true, preview, .. }
+                if id == "g1" && preview.contains("R1")
+        )),
+        "the refusal names the obligation that outlived the restart: {events:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

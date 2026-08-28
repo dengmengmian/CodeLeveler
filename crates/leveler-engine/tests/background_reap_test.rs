@@ -48,6 +48,9 @@ impl ModelRuntime for MockRuntime {
     ) -> Result<ModelResponse, ModelError> {
         // Completion Reconciliation Gate calls are answered out of band so
         // scripted FIFOs and request-count assertions stay about the loop.
+        if let Some(reply) = leveler_test_support::derive_autopilot(&request) {
+            return Ok(reply);
+        }
         if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
             return Ok(reply);
         }

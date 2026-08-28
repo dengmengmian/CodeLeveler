@@ -13,6 +13,7 @@ mod authorization;
 mod budget;
 mod child_profile;
 mod compaction;
+mod completion_contract;
 pub mod context_budget;
 mod executor;
 mod injected_tools;
