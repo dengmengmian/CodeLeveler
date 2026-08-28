@@ -614,7 +614,10 @@ mod tests {
                         .all(|m| !m.text_content().trim().is_empty()),
                     "no request message may carry empty content (gateway 400)"
                 );
-                self.message_counts.lock().unwrap().push(request.messages.len());
+                self.message_counts
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.len());
                 let text = self.replies.lock().unwrap().pop_front().unwrap();
                 Ok(leveler_model::ModelResponse {
                     request_id: leveler_core::RequestId::new("r"),
@@ -639,7 +642,9 @@ mod tests {
         }
         let runtime = CountingGen {
             replies: std::sync::Mutex::new(
-                vec!["".to_string(), ok_json().to_string()].into_iter().collect(),
+                vec!["".to_string(), ok_json().to_string()]
+                    .into_iter()
+                    .collect(),
             ),
             message_counts: std::sync::Mutex::new(Vec::new()),
         };
