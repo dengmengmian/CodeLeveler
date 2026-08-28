@@ -389,14 +389,20 @@ pub(crate) async fn reconcile_completion(
         return first;
     }
     // Format repair: same goal, same evidence, same judgment — schema only.
-    let repair_messages = vec![
-        Message::text(Role::User, prompt),
-        Message::text(Role::Assistant, first_text),
-        Message::text(
-            Role::User,
-            "Your previous reconciliation response was not parseable as the              required schema. Return ONLY a valid JSON object matching the              schema from the instructions, with no prose around it. Do not              change your judgment or re-reason about the task.",
-        ),
-    ];
+    // An EMPTY first reply is retried fresh instead of replayed: echoing an
+    // empty assistant message is itself an invalid request ("content is a
+    // required field" — observed 400 on the gateway), and an empty reply
+    // holds no prior judgment to preserve.
+    const REPAIR_ASK: &str = "Your previous reconciliation response was not parseable as the required schema. Return ONLY a valid JSON object matching the schema from the instructions, with no prose around it. Do not change your judgment or re-reason about the task.";
+    let repair_messages = if first_text.trim().is_empty() {
+        vec![Message::text(Role::User, prompt)]
+    } else {
+        vec![
+            Message::text(Role::User, prompt),
+            Message::text(Role::Assistant, first_text),
+            Message::text(Role::User, REPAIR_ASK.to_string()),
+        ]
+    };
     let second_text = match one_call(runtime, model, repair_messages, cancellation).await {
         Ok(text) => text,
         Err(refused) => return refused,
@@ -586,6 +592,72 @@ mod tests {
         assert!(out.allows_completion());
         assert!(out.repaired, "the verdict must be marked as repaired");
         assert!(runtime.0.lock().unwrap().is_empty(), "exactly two calls");
+    }
+
+    #[tokio::test]
+    async fn empty_first_reply_retries_fresh_without_echoing_empty_content() {
+        struct CountingGen {
+            replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+            message_counts: std::sync::Mutex<Vec<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelRuntime for CountingGen {
+            async fn generate(
+                &self,
+                request: ModelRequest,
+                _c: CancellationToken,
+            ) -> Result<leveler_model::ModelResponse, leveler_model::ModelError> {
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .all(|m| !m.text_content().trim().is_empty()),
+                    "no request message may carry empty content (gateway 400)"
+                );
+                self.message_counts.lock().unwrap().push(request.messages.len());
+                let text = self.replies.lock().unwrap().pop_front().unwrap();
+                Ok(leveler_model::ModelResponse {
+                    request_id: leveler_core::RequestId::new("r"),
+                    message: Message::text(Role::Assistant, text),
+                    finish_reason: leveler_model::FinishReason::Stop,
+                    usage: leveler_model::TokenUsage::default(),
+                })
+            }
+            async fn stream(
+                &self,
+                _r: ModelRequest,
+                _c: CancellationToken,
+            ) -> Result<leveler_model::ModelEventStream, leveler_model::ModelError> {
+                unimplemented!()
+            }
+            async fn profile(
+                &self,
+                _m: &ModelRef,
+            ) -> Result<leveler_model::ModelProfile, leveler_model::ModelError> {
+                unimplemented!()
+            }
+        }
+        let runtime = CountingGen {
+            replies: std::sync::Mutex::new(
+                vec!["".to_string(), ok_json().to_string()].into_iter().collect(),
+            ),
+            message_counts: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = reconcile_completion(
+            &runtime,
+            &ModelRef::new("mock", "m"),
+            None,
+            input(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(out.allows_completion());
+        assert!(out.repaired);
+        assert_eq!(
+            *runtime.message_counts.lock().unwrap(),
+            vec![1, 1],
+            "the empty-reply retry is a FRESH single-message request"
+        );
     }
 
     #[tokio::test]
