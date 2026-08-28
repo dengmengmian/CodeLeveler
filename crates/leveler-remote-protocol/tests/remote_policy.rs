@@ -295,6 +295,30 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         (
+            "query_child_contribution",
+            ClientCommand::QueryChildContribution {
+                session_id: session(),
+                child_id: "agent-1".to_string(),
+                query_id: None,
+            },
+            false,
+        ),
+        (
+            "recap",
+            ClientCommand::Recap {
+                session_id: session(),
+            },
+            false,
+        ),
+        (
+            "list_unfinished_goals",
+            ClientCommand::ListUnfinishedGoals {
+                session_id: session(),
+                query_id: None,
+            },
+            false,
+        ),
+        (
             "query_observability",
             ClientCommand::QueryObservability {
                 session_id: session(),
