@@ -200,12 +200,13 @@ pub async fn run(
     selection_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut alt: Option<Terminal<CrosstermBackend<Stdout>>> = None;
+    let mut tab_title = crate::terminal_title::TerminalTitleProjection::default();
     let mut pending_runtime_paint = false;
     let mut pending_terminal_actions: VecDeque<Action> = VecDeque::new();
     // The notification currently on screen and when it appeared, for expiry.
     let mut note_shown: Option<(Notification, Instant)> = None;
 
-    paint(&mut alt, &mut stdout, &mut state)?;
+    paint(&mut alt, &mut stdout, &mut state, &mut tab_title)?;
 
     while state.running {
         let mut effects: Vec<Effect> = Vec::new();
@@ -343,7 +344,7 @@ pub async fn run(
         // (spinner/elapsed). Idle ticks only repaint when the wall clock minute
         // changes (handled above via paint_now).
         if paint_now || (ticked && state.is_busy()) || (!state.is_busy() && pending_runtime_paint) {
-            paint(&mut alt, &mut stdout, &mut state)?;
+            paint(&mut alt, &mut stdout, &mut state, &mut tab_title)?;
             pending_runtime_paint = false;
         }
     }
@@ -666,6 +667,7 @@ fn paint(
     alt: &mut Option<Terminal<CrosstermBackend<Stdout>>>,
     stdout: &mut Stdout,
     state: &mut AppState,
+    title: &mut crate::terminal_title::TerminalTitleProjection,
 ) -> Result<(), TuiError> {
     if alt.is_none() {
         execute!(stdout, EnterAlternateScreen)?;
@@ -676,6 +678,10 @@ fn paint(
     if let Some(t) = alt {
         t.draw(|f| render(f, state))?;
     }
+    // Terminal tab title: a best-effort projection of the same structured
+    // state this frame just rendered. Deduplicated inside; a terminal that
+    // ignores OSC titles degrades silently.
+    title.maybe_apply(state, stdout);
     Ok(())
 }
 

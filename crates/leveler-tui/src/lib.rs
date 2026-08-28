@@ -36,6 +36,7 @@ mod splash;
 pub mod state;
 mod status_line;
 pub mod terminal;
+mod terminal_title;
 pub mod theme;
 mod theme_config;
 mod tool_cell;
