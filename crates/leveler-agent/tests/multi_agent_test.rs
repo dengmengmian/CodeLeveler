@@ -76,7 +76,11 @@ impl ModelRuntime for SleepyRuntime {
         _request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        unimplemented!()
+        // The reconciliation gate's non-streaming call draws from the same
+        // scripted queue, without the stream delay.
+        self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
+        })
     }
 
     async fn stream(
@@ -190,6 +194,14 @@ fn assistant_text(text: &str) -> ModelResponse {
         finish_reason: FinishReason::Stop,
         usage: TokenUsage::default(),
     }
+}
+
+/// The Completion Reconciliation Gate's approval, scripted. Every ACCEPTED
+/// top-level update_goal(complete) consumes exactly one of these.
+fn reconcile_ok() -> ModelResponse {
+    assistant_text(
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"reason":"satisfied as stated"}"#,
+    )
 }
 
 fn assistant_text_with_usage(text: &str, usage: TokenUsage) -> ModelResponse {
@@ -3571,6 +3583,7 @@ async fn an_open_blocking_finding_refuses_goal_completion_until_resolved() {
                 ],
                 FinishReason::ToolCalls,
             ),
+            reconcile_ok(),
         ],
         Duration::from_millis(0),
     ));
@@ -4511,10 +4524,22 @@ impl RoutedRuntime {
 impl ModelRuntime for RoutedRuntime {
     async fn generate(
         &self,
-        _request: ModelRequest,
+        request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        unimplemented!()
+        // The reconciliation gate's call: parent-side (no child marker), from
+        // the parent queue, and NOT recorded in parent_requests — those
+        // assertions count loop rounds, not gate calls.
+        let is_child = request
+            .messages
+            .iter()
+            .any(|m| m.text_content().contains(self.child_marker));
+        let queue = if is_child { &self.child } else { &self.parent };
+        queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| ModelError::new(leveler_model::ModelErrorKind::Other, "queue exhausted"))
     }
 
     async fn stream(
@@ -4834,6 +4859,7 @@ async fn goal_completion_is_refused_while_children_are_outstanding() {
                 )],
                 FinishReason::ToolCalls,
             ),
+            reconcile_ok(),
         ],
         vec![
             assistant_with(
@@ -5179,6 +5205,7 @@ async fn the_completion_gate_drain_keeps_same_batch_parent_spend() {
                 )],
                 FinishReason::ToolCalls,
             ),
+            reconcile_ok(),
         ],
         vec![
             assistant_with(

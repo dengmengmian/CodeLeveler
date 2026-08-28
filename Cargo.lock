@@ -2228,6 +2228,8 @@ dependencies = [
 name = "leveler-test-support"
 version = "0.2.0-beta.1"
 dependencies = [
+ "leveler-core",
+ "leveler-model",
  "tokio",
 ]
 

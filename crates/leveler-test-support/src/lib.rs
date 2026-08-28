@@ -10,5 +10,7 @@
 
 pub mod git;
 mod mock_server;
+mod reconcile;
 
 pub use mock_server::{MockResponse, MockServer};
+pub use reconcile::reconcile_autopilot;

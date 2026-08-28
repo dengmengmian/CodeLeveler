@@ -45,6 +45,11 @@ impl ModelRuntime for MockRuntime {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        // Completion Reconciliation Gate calls are answered out of band so
+        // scripted FIFOs and request-count assertions stay about the loop.
+        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
+            return Ok(reply);
+        }
         self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
@@ -420,6 +425,11 @@ impl ModelRuntime for HijackingRuntime {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        // Completion Reconciliation Gate calls are answered out of band so
+        // scripted FIFOs and request-count assertions stay about the loop.
+        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
+            return Ok(reply);
+        }
         if !self
             .hijacked
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -2043,6 +2053,11 @@ impl ModelRuntime for FailingProfileRuntime {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        // Completion Reconciliation Gate calls are answered out of band so
+        // scripted FIFOs and request-count assertions stay about the loop.
+        if let Some(reply) = leveler_test_support::reconcile_autopilot(&request) {
+            return Ok(reply);
+        }
         self.inner.generate(request, cancellation).await
     }
     async fn stream(

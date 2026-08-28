@@ -134,6 +134,21 @@ impl MockServer {
                 let count = count.clone();
                 let bodies = bodies.clone();
                 tokio::spawn(async move {
+                    let mut stream = stream;
+                    let body = drain_request(&mut stream).await;
+                    // Completion Reconciliation Gate calls are answered out of
+                    // band: the scripted queue, the request count and the
+                    // recorded bodies stay about the loop under test.
+                    if body
+                        .as_deref()
+                        .is_some_and(|b| b.contains(crate::reconcile::RECONCILE_MARKER))
+                    {
+                        let _ = write_reconcile_autopilot(&mut stream).await;
+                        return;
+                    }
+                    if let Some(body) = body {
+                        bodies.lock().await.push(body);
+                    }
                     let response = {
                         let mut q = queue.lock().await;
                         if q.len() > 1 {
@@ -144,7 +159,7 @@ impl MockServer {
                     };
                     count.fetch_add(1, Ordering::SeqCst);
                     if let Some(resp) = response {
-                        let _ = serve(stream, resp, &bodies).await;
+                        let _ = serve(stream, resp).await;
                     }
                 });
             }
@@ -181,16 +196,23 @@ impl MockServer {
     }
 }
 
-/// Read (and discard) the request, then write the scripted response.
-async fn serve(
-    mut stream: TcpStream,
-    response: MockResponse,
-    bodies: &Mutex<Vec<String>>,
-) -> std::io::Result<()> {
-    if let Some(body) = drain_request(&mut stream).await {
-        bodies.lock().await.push(body);
-    }
+/// The canned non-streaming completion the reconciliation autopilot serves.
+async fn write_reconcile_autopilot(stream: &mut TcpStream) -> std::io::Result<()> {
+    let verdict = r#"{\"verdict\":\"satisfied\",\"requirements\":[{\"requirement\":\"the requested outcome\",\"satisfied\":true,\"evidence\":\"recorded output\"}],\"contradictions\":[],\"reason\":\"satisfied as stated\"}"#;
+    let body = format!(
+        r#"{{"id":"reconcile-autopilot","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{verdict}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
+    );
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(body.as_bytes()).await?;
+    stream.flush().await
+}
 
+/// Write the scripted response (the request was already drained/recorded).
+async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result<()> {
     match response {
         MockResponse::Sse { body } => {
             let header = "HTTP/1.1 200 OK\r\n\

@@ -444,6 +444,14 @@ fn assistant_text(text: &str) -> ModelResponse {
     }
 }
 
+/// The Completion Reconciliation Gate's approval, scripted. Every ACCEPTED
+/// goal-mode update_goal(complete) consumes exactly one of these.
+fn reconcile_ok() -> ModelResponse {
+    assistant_text(
+        r#"{"verdict":"satisfied","requirements":[{"requirement":"the requested outcome","satisfied":true,"evidence":"recorded output"}],"contradictions":[],"reason":"satisfied as stated"}"#,
+    )
+}
+
 fn assistant_text_finished(text: &str, finish_reason: FinishReason) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
@@ -660,6 +668,7 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "All requirements verified."}),
         ),
+        reconcile_ok(),
     ]));
 
     let executor = Executor::new(
@@ -688,9 +697,10 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
         outcome.final_text
     );
     // Two model requests: the quiet round was re-prompted, then it resolved.
+    // quiet round re-prompted, resolution, then the reconciliation gate.
     assert_eq!(
         runtime.recorded_requests().len(),
-        2,
+        3,
         "quiet round was re-prompted"
     );
 
@@ -730,6 +740,7 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "未提交改动已全部回退。"}),
         ),
+        reconcile_ok(),
     ]));
 
     let mut events: Vec<AgentEvent> = Vec::new();
@@ -759,9 +770,10 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
         .count();
     assert_eq!(summaries, 1, "exactly one summary block: {events:?}");
     // 无冗余验证轮: revert + summary + resolve — nothing extra.
+    // revert round, summary round, resolution — plus the reconciliation gate.
     assert_eq!(
         runtime.recorded_requests().len(),
-        3,
+        4,
         "no redundant verification rounds"
     );
     let commands = events
@@ -796,11 +808,14 @@ async fn goal_mode_update_goal_emits_completed_tool_event() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
-        "g1",
-        "update_goal",
-        serde_json::json!({"status": "complete", "summary": "Done."}),
-    )]));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "Done."}),
+        ),
+        reconcile_ok(),
+    ]));
 
     let executor = Executor::new(
         runtime,
@@ -844,6 +859,212 @@ async fn goal_mode_update_goal_emits_completed_tool_event() {
         "update_goal needs a matching successful result so UIs do not mark it failed"
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Completion Reconciliation Gate, end to end: a `blocked` verdict refuses the
+/// completion (durable GoalIntercepted + error ToolResult), the run continues,
+/// and the model may then resolve truthfully.
+#[tokio::test]
+async fn reconciliation_blocked_verdict_refuses_completion_and_run_continues() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-reconcile-blocked-{}",
+        std::process::id() as u64 * 61 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "claimed done"}),
+        ),
+        // The gate's verdict: the original contract is not satisfied.
+        assistant_text(
+            r#"{"verdict":"blocked","requirements":[{"requirement":"remove zero rows from both surfaces","satisfied":false,"evidence":"idle total=0 still rendered"}],"contradictions":["claim says both surfaces fixed; output shows idle count=1 total=0"],"reason":"requirement unsatisfied as written"}"#,
+        ),
+        // The model reacts honestly.
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "requirement conflicts with pinned test"}),
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .run(
+        "remove zero rows",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::GoalIntercepted { kind, detail }
+                if kind == "completion_reconciliation" && detail.contains("contradiction")
+        )),
+        "the refusal must be durably observable: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, name, is_error: true, preview }
+                if id == "g1" && name == "update_goal"
+                    && preview.contains("independent completion check")
+        )),
+        "the model must receive the refusal with the contract restated: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A verifier that cannot answer must never be read as "complete": malformed
+/// JSON from the reconciliation call refuses the completion, fail closed.
+#[tokio::test]
+async fn reconciliation_malformed_output_fails_closed() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-reconcile-malformed-{}",
+        std::process::id() as u64 * 61 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "claimed done"}),
+        ),
+        assistant_text("I think it looks fine overall!"), // no JSON verdict
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "cannot verify completion"}),
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .run(
+        "do the task",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "a malformed verdict must never become a completion"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, name, is_error: true, preview }
+                if id == "g1" && name == "update_goal" && preview.contains("could not run")
+        )),
+        "the unavailable-verifier refusal names itself: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Provider failure on the reconciliation call: completion refused (fail
+/// closed), never silently converted into success. The mock errors on every
+/// non-streaming call while serving the loop's streamed script normally.
+#[tokio::test]
+async fn reconciliation_provider_failure_fails_closed() {
+    struct GateErrorRuntime(MockRuntime);
+    #[async_trait]
+    impl ModelRuntime for GateErrorRuntime {
+        async fn generate(
+            &self,
+            _request: ModelRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            Err(ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "verifier provider down (injected)",
+            ))
+        }
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            self.0.stream(request, cancellation).await
+        }
+        async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
+            self.0.profile(m).await
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-reconcile-provider-{}",
+        std::process::id() as u64 * 61 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(GateErrorRuntime(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "claimed done"}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "verifier unavailable"}),
+        ),
+    ])));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .run(
+        "do the task",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "verifier unavailable must never be read as complete"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, name, is_error: true, preview }
+                if id == "g1" && name == "update_goal" && preview.contains("could not run")
+        )),
+        "the unavailable-verifier refusal names itself: {events:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3096,6 +3317,7 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "did things, explicitly"}),
         ),
+        reconcile_ok(),
     ]));
 
     let executor = Executor::new(
@@ -3119,9 +3341,10 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Completed);
+    // malformed attempt, retried resolution, then the reconciliation gate.
     assert_eq!(
         runtime.recorded_requests().len(),
-        2,
+        3,
         "the malformed resolution must be fed back for a retry"
     );
     assert!(
@@ -4252,11 +4475,14 @@ async fn simple_goal_does_not_seed_host_implicit_plan() {
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
-        "g1",
-        "update_goal",
-        serde_json::json!({"status": "complete", "summary": "done"}),
-    )]));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+        reconcile_ok(),
+    ]));
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
@@ -4276,7 +4502,8 @@ async fn simple_goal_does_not_seed_host_implicit_plan() {
         .await
         .unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    assert_eq!(runtime.requests.lock().unwrap().len(), 1);
+    // the resolution plus the completion reconciliation gate.
+    assert_eq!(runtime.requests.lock().unwrap().len(), 2);
     let plan_events: Vec<_> = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::PlanUpdated { .. }))
@@ -4339,6 +4566,7 @@ async fn update_goal_complete_rejects_incomplete_model_todos() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "yes"}),
         ),
+        reconcile_ok(),
     ]));
     let executor = Executor::new(
         runtime,
@@ -4416,6 +4644,7 @@ async fn update_goal_second_bare_complete_still_refuses_incomplete_todos() {
                 "override_incomplete_todos": true
             }),
         ),
+        reconcile_ok(),
     ]));
     let executor = Executor::new(
         runtime,
@@ -4979,6 +5208,7 @@ async fn resume_seeded_plan_is_used_by_todo_gate() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "ok"}),
         ),
+        reconcile_ok(),
     ]));
     let executor = Executor::new(
         runtime,
@@ -6113,6 +6343,7 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the function"}),
         ),
+        reconcile_ok(),
     ]));
 
     let transcript = Arc::new(Mutex::new(Vec::new()));

@@ -1689,6 +1689,101 @@ impl Executor {
                             });
                             continue;
                         }
+                        // Completion Reconciliation Gate (ICG-6R closure):
+                        // after every mechanical gate has passed, one fresh,
+                        // independent model request judges whether the
+                        // ORIGINAL user-stated objective — not the executor's
+                        // later interpretation of it — is actually satisfied.
+                        // Top level only: children settle through their
+                        // parent, and a chat turn has no goal to reconcile.
+                        // Fail closed: uncertain, contradictions, malformed
+                        // output, provider failure and timeout all refuse; the
+                        // model may finish the missing work or truthfully
+                        // report blocked, and a later update_goal(complete)
+                        // runs the gate again.
+                        if self.depth == 0 {
+                            let claimed = call
+                                .arguments
+                                .get("summary")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            let recent_claims = recent_assistant_claims(&messages);
+                            let recent_evidence = recent_tool_evidence(&messages);
+                            let outcome = crate::reconciliation::reconcile_completion(
+                                self.runtime.as_ref(),
+                                &self.model,
+                                self.policy.reasoning_effort,
+                                crate::reconciliation::ReconcileInput {
+                                    original_goal: &original_task,
+                                    claimed_summary: claimed,
+                                    recent_claims: &recent_claims,
+                                    recent_evidence: &recent_evidence,
+                                    modified_files: &modified_files,
+                                    fresh_verification: ledger.has_fresh_successful_verify(),
+                                },
+                                &cancellation,
+                            )
+                            .await;
+                            tracing::info!(
+                                verdict = ?outcome.verdict,
+                                latency_ms = outcome.latency_ms,
+                                unsatisfied = outcome.unsatisfied.len(),
+                                contradictions = outcome.contradictions.len(),
+                                "completion reconciliation"
+                            );
+                            if !outcome.allows_completion() {
+                                let mut detail = format!("verdict={:?}", outcome.verdict);
+                                if !outcome.reason.is_empty() {
+                                    detail.push_str(&format!("; {}", outcome.reason));
+                                }
+                                if !outcome.unsatisfied.is_empty() {
+                                    detail.push_str(&format!(
+                                        "; unsatisfied as written: {}",
+                                        outcome.unsatisfied.join("; ")
+                                    ));
+                                }
+                                if !outcome.contradictions.is_empty() {
+                                    detail.push_str(&format!(
+                                        "; contradictions: {}",
+                                        outcome.contradictions.join("; ")
+                                    ));
+                                }
+                                ledger
+                                    .record_intercept("completion_reconciliation", detail.clone());
+                                observer(AgentEvent::GoalIntercepted {
+                                    kind: "completion_reconciliation".into(),
+                                    detail: detail.clone(),
+                                });
+                                observer(AgentEvent::EvidenceLedgerUpdated {
+                                    ledger: ledger.clone(),
+                                });
+                                let feedback = match outcome.verdict {
+                                    crate::reconciliation::ReconcileVerdict::Unavailable => {
+                                        format!(
+                                            "update_goal(complete) refused: the independent completion check could not run ({detail}). Nothing about your work was judged. Retry update_goal(complete); if this persists, report blocked with this reason."
+                                        )
+                                    }
+                                    _ => format!(
+                                        "update_goal(complete) refused by the independent completion check: {detail}. The ORIGINAL objective as the user wrote it is the contract — a reinterpreted or narrowed version does not count. Either finish the objective as stated (then update_goal(complete) again), or, if it cannot be satisfied as written, revert edits that only served the abandoned attempt and call update_goal(blocked) naming the exact conflict."
+                                    ),
+                                };
+                                observer(AgentEvent::ToolResult {
+                                    id: call.id.as_str().to_string(),
+                                    name: UPDATE_GOAL_TOOL.to_string(),
+                                    is_error: true,
+                                    preview: preview(&feedback),
+                                });
+                                results[index] = Some(ContentPart::ToolResult {
+                                    result: ToolResultContent {
+                                        call_id: call.id,
+                                        content: feedback,
+                                        is_error: true,
+                                    },
+                                });
+                                continue;
+                            }
+                        }
                         // HostImplicit single-step completes atomically with the goal.
                         if plan_state.is_host_implicit() {
                             plan_state.mark_all_completed();
@@ -3732,6 +3827,52 @@ fn fold_child_settlement(
         contribution: Some(contribution),
     });
     (content, result.result.status.completed())
+}
+
+/// The executor's most recent user-visible prose (up to two assistant texts,
+/// bounded): where a completion claim — and its self-contradictions — live.
+/// Reconciliation evidence only; never reasoning content.
+fn recent_assistant_claims(messages: &[Message]) -> String {
+    let mut texts: Vec<&str> = Vec::new();
+    for message in messages.iter().rev() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        for part in &message.content {
+            if let ContentPart::Text { text } = part
+                && !text.trim().is_empty()
+            {
+                texts.push(text);
+            }
+        }
+        if texts.len() >= 2 {
+            break;
+        }
+    }
+    texts.reverse();
+    let joined = texts.join("\n---\n");
+    crate::reconciliation::bounded_tail(&joined, 4000).to_string()
+}
+
+/// Tails of the most recent tool results (up to three, bounded): the recorded
+/// ground a completion claim stands on — test output, command output.
+fn recent_tool_evidence(messages: &[Message]) -> String {
+    let mut outs: Vec<String> = Vec::new();
+    'outer: for message in messages.iter().rev() {
+        for part in message.content.iter().rev() {
+            if let ContentPart::ToolResult { result } = part {
+                let tail = crate::reconciliation::bounded_tail(&result.content, 1500);
+                if !tail.trim().is_empty() {
+                    outs.push(tail.to_string());
+                }
+                if outs.len() >= 3 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    outs.reverse();
+    outs.join("\n---\n")
 }
 
 /// Remove `id` from the durable outstanding-children record.

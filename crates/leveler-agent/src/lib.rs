@@ -20,6 +20,7 @@ pub mod named_agent;
 mod nudges;
 pub mod ownership;
 mod prompt;
+mod reconciliation;
 mod sub_agent;
 
 pub use budget::{
