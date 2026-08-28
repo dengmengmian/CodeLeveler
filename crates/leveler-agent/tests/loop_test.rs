@@ -930,6 +930,163 @@ async fn reconciliation_uses_the_configured_judge_model_with_bounded_profile() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// §42B documented fallback: with no judge configured the gate runs on the
+/// executor's own model — today's same-model behaviour, unchanged.
+#[tokio::test]
+async fn reconciliation_without_a_configured_judge_uses_the_executor_model() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-samemodel-{}",
+        std::process::id() as u64 * 67 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+        reconcile_ok(),
+    ]));
+    let outcome = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("deepseek", "deepseek-v4-flash"),
+        10,
+    )
+    .with_goal_mode(true)
+    .run(
+        "do the task",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    let requests = runtime.recorded_requests();
+    let judge: Vec<_> = requests
+        .iter()
+        .filter(|r| {
+            r.messages
+                .iter()
+                .any(|m| m.text_content().contains("reconciliation judge"))
+        })
+        .collect();
+    assert_eq!(judge.len(), 1, "exactly one gate request");
+    assert_eq!(
+        judge[0].model,
+        ModelRef::new("deepseek", "deepseek-v4-flash"),
+        "unset judge policy keeps the gate on the executor's own model"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §42C/§39: a configured judge that cannot answer fails closed. It must never
+/// retry the gate on the executor model — a silent same-model fallback would
+/// read as a pass and contaminate the cross-model experiment.
+#[tokio::test]
+async fn an_unreachable_judge_model_fails_closed_without_same_model_fallback() {
+    /// Errors every gate call addressed to the judge model, while a gate call
+    /// addressed to the executor model would succeed — so a fallback, if one
+    /// existed, would show up as a completion.
+    struct JudgeDownRuntime {
+        inner: MockRuntime,
+        generated: Mutex<Vec<ModelRef>>,
+    }
+    #[async_trait]
+    impl ModelRuntime for JudgeDownRuntime {
+        async fn generate(
+            &self,
+            request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            self.generated.lock().unwrap().push(request.model.clone());
+            if request.model.model == "deepseek-v4-pro" {
+                return Err(ModelError::new(
+                    leveler_model::ModelErrorKind::Other,
+                    "judge model unreachable (injected)",
+                ));
+            }
+            // Would approve the completion — reachable only via a fallback.
+            self.inner.generate(request, cancellation).await
+        }
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            self.inner.stream(request, cancellation).await
+        }
+        async fn profile(&self, m: &ModelRef) -> Result<ModelProfile, ModelError> {
+            self.inner.profile(m).await
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-judgedown-{}",
+        std::process::id() as u64 * 67 + 17
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(JudgeDownRuntime {
+        inner: MockRuntime::new(vec![
+            assistant_tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "claimed done"}),
+            ),
+            reconcile_ok(),
+            assistant_tool_call(
+                "g2",
+                "update_goal",
+                serde_json::json!({"status": "blocked", "summary": "verifier unavailable"}),
+            ),
+        ]),
+        generated: Mutex::new(Vec::new()),
+    });
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("deepseek", "deepseek-v4-flash"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_reconciliation_model(ModelRef::new("deepseek", "deepseek-v4-pro"))
+    .run(
+        "do the task",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "an unreachable judge must never become a completion"
+    );
+    let generated = runtime.generated.lock().unwrap().clone();
+    assert!(
+        !generated.is_empty() && generated.iter().all(|m| m.model == "deepseek-v4-pro"),
+        "the gate stays on the configured judge — no same-model fallback: {generated:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, name, is_error: true, preview }
+                if id == "g1" && name == "update_goal" && preview.contains("could not run")
+        )),
+        "the refusal names the unavailable verifier: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Completion Reconciliation Gate, end to end: a `blocked` verdict refuses the
 /// completion (durable GoalIntercepted + error ToolResult), the run continues,
 /// and the model may then resolve truthfully.

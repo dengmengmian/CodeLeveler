@@ -574,17 +574,9 @@ impl Application {
                 // Project config wins over global when set; both default true.
                 allow_delegation: self.project_config().agents.delegation
                     && self.config.agents_delegation,
-                // A configured-but-unparseable judge is a config ERROR, not a
-                // silent same-model fallback (that would contaminate the
-                // cross-model experiment and hide typos).
-                completion_judge_model: match self.config.agents_completion_judge_model.as_deref() {
-                    None => None,
-                    Some(raw) => Some(leveler_model::ModelRef::parse(raw).ok_or_else(|| {
-                        AppError::GlobalConfig(format!(
-                            "agents.completion_judge_model `{raw}` is not `provider/model`"
-                        ))
-                    })?),
-                },
+                completion_judge_model: resolve_completion_judge_model(
+                    self.config.agents_completion_judge_model.as_deref(),
+                )?,
                 independent_review: combine_independent_review(
                     self.config.agents_independent_review,
                     self.project_config().agents.independent_review,
@@ -663,6 +655,27 @@ impl Application {
             }
         }
     }
+}
+
+/// Resolve the cross-model Completion Reconciliation judge from config.
+///
+/// Unset keeps the documented fallback (the gate runs on the executor's own
+/// model). A configured-but-unparseable value is a loud config ERROR, never a
+/// silent same-model fallback — that would hide a typo and quietly run a
+/// same-model gate under a cross-model configuration.
+fn resolve_completion_judge_model(
+    raw: Option<&str>,
+) -> Result<Option<leveler_model::ModelRef>, AppError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    leveler_model::ModelRef::parse(raw)
+        .map(Some)
+        .ok_or_else(|| {
+            AppError::GlobalConfig(format!(
+                "agents.completion_judge_model `{raw}` is not `provider/model`"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -894,5 +907,38 @@ mod merge_tests {
         );
         assert_eq!(limits.max_commands, None);
         assert_eq!(limits.max_modified_files, None);
+    }
+}
+
+#[cfg(test)]
+mod completion_judge_tests {
+    use super::{AppError, resolve_completion_judge_model};
+
+    /// §8/§42B: unset keeps the documented fallback — the gate runs on the
+    /// executor's own model.
+    #[test]
+    fn an_unset_judge_stays_on_the_executor_model() {
+        assert!(resolve_completion_judge_model(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_configured_judge_parses_into_a_model_ref() {
+        let judge = resolve_completion_judge_model(Some("deepseek/deepseek-v4-pro"))
+            .unwrap()
+            .expect("a configured judge resolves");
+        assert_eq!(judge.provider, "deepseek");
+        assert_eq!(judge.model, "deepseek-v4-pro");
+    }
+
+    /// §39: a typo must be loud. Falling back to the executor's model here
+    /// would silently run a same-model gate under a cross-model config.
+    #[test]
+    fn a_malformed_judge_reference_is_a_loud_config_error() {
+        let err = resolve_completion_judge_model(Some("deepseek-v4-pro"))
+            .expect_err("a reference without a provider must not be accepted");
+        assert!(
+            matches!(&err, AppError::GlobalConfig(m) if m.contains("completion_judge_model")),
+            "the error names the setting: {err}"
+        );
     }
 }

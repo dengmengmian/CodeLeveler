@@ -672,6 +672,34 @@ mod tests {
         GlobalConfig::from_toml_str(&text).expect("escaped values must still parse");
     }
 
+    /// §40/§42: the cross-model judge is a plain global setting — it reaches
+    /// the bundle verbatim, and stays `None` when the section omits it.
+    #[test]
+    fn carries_the_completion_judge_model_into_the_bundle() {
+        let with_judge = GlobalConfig::from_toml_str(
+            r#"
+            [agents]
+            completion_judge_model = "deepseek/deepseek-v4-pro"
+            "#,
+        )
+        .expect("the judge setting must parse under deny_unknown_fields");
+        assert_eq!(
+            with_judge
+                .into_bundle()
+                .agents_completion_judge_model
+                .as_deref(),
+            Some("deepseek/deepseek-v4-pro")
+        );
+
+        let without = GlobalConfig::from_toml_str("[agents]\ndelegation = true\n")
+            .expect("an agents section without the judge must still parse");
+        assert_eq!(
+            without.into_bundle().agents_completion_judge_model,
+            None,
+            "unset stays unset — the documented same-model fallback"
+        );
+    }
+
     #[test]
     fn expands_a_compact_toml_into_a_full_bundle() {
         let toml = r#"
