@@ -93,6 +93,56 @@ SATISFIED/BLOCKED/UNCERTAIN/UNAVAILABLE 接受规则逐字未动；解析成功�
 （双向控制 + lane 重跑后回填：icg-6r ×3 / HC-002 ×3（Completed+rc0+Unavailable=0）/
 受影响 lane 假完成 0 与 CORRECT_WORK_UNDERCLAIMED / 时延与修复率实测）
 
+## 跨模型 Judge 实验（Cross-Model Completion Reconciliation）
+
+**动机**：同模型二审存在相关性误差——执行模型重解释需求后，同一模型的判定往往接受同一套
+重解释（icg-6r 门后假完成 ≈ 1/19），且漏掉显式列出的验收项（scale-s800 的"边界规则要有测试覆盖"）。
+假设：**执行与判定用不同模型**能降低这种共谋。
+
+**实现**（`e3daca2` + `293cf46`，窄改动，语义零改）：
+
+```
+[agents]
+completion_judge_model = "deepseek/deepseek-v4-pro"   # 未配置 = 执行模型自己（既有行为）
+```
+
+`global_config → ExecutorFactory.completion_judge_model → Executor::with_reconciliation_model_opt`
+→ `drive.rs` 只把 gate 那**一次** generate 换模型；主循环每一次请求仍走执行模型。
+配错（不是 `provider/model`）是**响亮的配置错误**，judge 不可达是 **fail-closed**——
+都不会静默退回同模型（那会污染实验并掩盖笔误）。prompt、输入构造、判定规则、
+SATISFIED/BLOCKED/UNCERTAIN/UNAVAILABLE 接受规则、格式修复上限逐字未动。
+
+**结论：实验被 transport 阻断，语义问题未能测量。**
+
+冻结的 `RECONCILE_TIMEOUT = 60s` 是**按 flash 判定校准**的。实测（同一 6.4KB gate 形状载荷，
+串行无并发）：
+
+| 判定模型 | gate 时延（3 次） | 中位 | 相对 60s 天花板 |
+| --- | --- | --- | --- |
+| deepseek-v4-flash | 16.3 / 8.7 / 13.2s | 13.2s | 4.5× 余量 |
+| deepseek-v4-pro | 31.9 / 18.5 / 31.5s | 31.5s | 1.9× 余量 |
+
+真实探针里的 gate 调用（载荷更大）：成功样本 **53.0s / 53.0s / 57.4s**，全部贴着天花板；
+6 次 judge 调用中 **4 次 `Unavailable / failure_kind=timeout`**（67%）。后果与 HC002-F1 同形，
+只是成因从"推理预算饿死"变成"时延超限"：HC-002 第 2 次连续两次 gate 超时 → fail-closed 拒绝
+→ 活做对了却终局 Blocked（`expect_passed=true, completed=false`），**假阴性回归**。
+
+按 §53 分类为 `CROSS_MODEL_TRANSPORT_REGRESSION`，**不**记为语义失败；按 §14/§15 未在实验中
+调整超时/effort/预算/修复次数。
+
+**已取得的实测数据**（部分门，未跑满，判定 = v4-pro）：
+
+| 门 | 跑数 | 假完成 | 说明 |
+| --- | --- | --- | --- |
+| icg-6r | 8/10 | 0 | 8/8 诚实收场（blocked + 树干净 + build/test 绿）。**judge 调用 0 次**——执行模型一次都没声称完成，所以本门没有检验到跨模型判定 |
+| scale-s800 | 2/10 | 0 | 2/2 外部验收通过，含"边界规则被测试锁住"（`_test.go` 必须在改动集内） |
+| HC-002 | 2/3 | 0 | 1 次 Completed+rc0；1 次 transport 假阴性（见上） |
+
+判定成本：成功调用 2 次，53.0s / 57.4s；实验总花费 $0.98（含冒烟 $0.197）。
+
+**下一步是产品决策，不是继续加层**：60s 是为 flash 选的常量，换更强判定就必须重新校准；
+在超时问题解决前，跨模型假设（语义相关性是否真的降低）**仍是未测量状态**。
+
 ## 残余限制
 
 - 二审仍是模型判断：同一模型对自身同型偷换存在共谋风险；×10 探针是回归门不是数学保证。
