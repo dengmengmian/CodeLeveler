@@ -1680,7 +1680,9 @@ impl Executor {
                  into a weaker task the constraints happen to allow: an objective that \
                  conflicts with tests or constraints you must not change is `blocked` (name \
                  the conflict, revert edits that only served the abandoned attempt), not \
-                 `complete`. Use next_step for the single best \
+                 `complete` — including PARTIAL conflicts: satisfying part of the objective \
+                 and quietly exempting the conflicting part is the same false completion. \
+                 Use next_step for the single best \
                  follow-up action when one exists.\n\
                  - **Large multi-part goals:** break into concrete steps; use `spawn_agent` in \
                  the same turn for independent investigation or disjoint edits (explorer vs \

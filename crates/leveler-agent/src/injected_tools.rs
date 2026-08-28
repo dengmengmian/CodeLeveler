@@ -91,7 +91,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             that instead: that is a false completion. Report `blocked`, name \
             the exact conflict (which requirement collides with which \
             constraint), and first revert edits that served only the abandoned \
-            attempt so the workspace is left clean."
+            attempt so the workspace is left clean. Partial conflicts are the \
+            same rule: when only PART of the stated objective is satisfiable, \
+            delivering that part while quietly exempting the rest — with or \
+            without a rationalization — is still a false completion. Blocked, \
+            naming which part cannot be satisfied and why."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -573,6 +577,7 @@ mod scope_fidelity_tests {
         let def = super::update_goal_tool_definition();
         for needle in [
             "AS THE USER STATED IT",
+            "Partial conflicts",
             "do NOT",
             "false completion",
             "revert edits",
