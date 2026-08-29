@@ -250,18 +250,6 @@ impl leveler_local_transport::RuntimeReviver for DaemonReviver {
     }
 }
 
-/// Discover the repository's local runtime, starting one if none is running.
-///
-/// The default TUI path: probe the per-repo socket; when nobody answers,
-/// spawn `leveler --repo <root> serve` as a *detached* process (its own
-/// process group, no kill-on-drop — the daemon must outlive this TUI), wait
-/// for its `--ready-json`, and connect. Two TUIs racing this function are
-/// safe: the socket bind's flock elects exactly one daemon, the loser child
-/// exits `AlreadyRunning`, and the losing TUI's retry loop connects to the
-/// winner. Returns the connected client; a startup failure is a hard error
-/// carrying the daemon's log tail — never a silent fall back to an
-/// in-process runtime.
-
 /// Whether the connected runtime is the build this client expects.
 #[cfg(unix)]
 enum RuntimeConsistency {
@@ -316,6 +304,17 @@ async fn wait_for_runtime_exit(socket_path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Discover the repository's local runtime, starting one if none is running.
+///
+/// The default TUI path: probe the per-repo socket; when nobody answers,
+/// spawn `leveler --repo <root> serve` as a *detached* process (its own
+/// process group, no kill-on-drop — the daemon must outlive this TUI), wait
+/// for its `--ready-json`, and connect. Two TUIs racing this function are
+/// safe: the socket bind's flock elects exactly one daemon, the loser child
+/// exits `AlreadyRunning`, and the losing TUI's retry loop connects to the
+/// winner. Returns the connected client; a startup failure is a hard error
+/// carrying the daemon's log tail — never a silent fall back to an
+/// in-process runtime.
 #[cfg(unix)]
 async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
     let socket_path = layout.socket_path();

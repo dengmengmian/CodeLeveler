@@ -20,7 +20,9 @@ use leveler_client_protocol::{
     RuntimeEvent,
 };
 use leveler_execution::PermissionProfile;
-use leveler_local_transport::{CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer};
+use leveler_local_transport::{
+    CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient, LocalSocketServer,
+};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use tokio_util::sync::CancellationToken;
@@ -327,4 +329,79 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
 
     shutdown.cancel();
     let _ = serve_task.await;
+}
+
+/// Retiring a runtime is not killing it.
+///
+/// The client asks; the runtime decides when. An idle one leaves at once, and
+/// the process token it was handed is how it actually ends — replacing a
+/// binary on disk cannot do that, which is the whole reason this exists.
+#[tokio::test]
+async fn an_idle_runtime_retires_itself_when_asked() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let token = tokio_util::sync::CancellationToken::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new(
+            app,
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+        .with_process_shutdown(token.clone()),
+    );
+
+    let before = runtime.runtime_info().await.unwrap();
+    assert!(
+        before.health.accepting_work,
+        "a healthy idle runtime takes work"
+    );
+
+    runtime
+        .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+            reason: leveler_client_protocol::RestartReason::BuildMismatch,
+        })
+        .await
+        .unwrap();
+
+    // Admissions close first: without that, arriving turns could keep the
+    // runtime alive indefinitely and the replacement would never happen.
+    let after = runtime.runtime_info().await.unwrap();
+    assert!(
+        !after.health.accepting_work,
+        "a retiring runtime stops taking new work"
+    );
+    assert!(after.health.shutting_down);
+
+    // Nothing is running, so the drain is immediate and the process is asked
+    // to end.
+    tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+        .await
+        .expect("an idle runtime retires promptly");
+}
+
+/// The identity a runtime reports is its own build, not merely its version —
+/// the distinction the stale-daemon incident turned on.
+#[tokio::test]
+async fn a_runtime_reports_the_build_it_is() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let h = harness(&base_url).await;
+    let info = h.runtime.runtime_info().await.unwrap();
+    assert!(
+        info.build.is_known(),
+        "a runtime that cannot say which build it is cannot be verified"
+    );
+    assert_eq!(info.build, leveler_core::BuildIdentity::current());
+    assert!(
+        info.build.matches(&leveler_core::BuildIdentity::current())
+            || leveler_core::BuildIdentity::current().dirty,
+        "a clean runtime matches the client that built it"
+    );
 }
