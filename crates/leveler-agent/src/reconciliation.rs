@@ -41,7 +41,14 @@ pub const DEFAULT_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// a format-following judgment, not a research task (measured 4.6s / ~350
 /// reasoning tokens vs 18s / ~1750 at max) — with enough budget that even a
 /// verbose thinking pass still delivers the object.
-const MAX_OUTPUT_TOKENS: u32 = 4096;
+/// 4096 was calibrated when the gate asked for one free-form verdict. With a
+/// Completion Contract the judge accounts for every obligation by id, and the
+/// thinking-flag reasoning that precedes the object grows with them: measured
+/// on HC-002 (6 and 9 obligations), BOTH the first call and its repair hit
+/// 4096 and delivered a truncated object, which reads as "no JSON object" and
+/// fails a correct run closed. The ceiling is on reasoning + content together,
+/// so the content being lean does not save it.
+const MAX_OUTPUT_TOKENS: u32 = 16384;
 const RECONCILE_EFFORT: leveler_model::ReasoningEffort = leveler_model::ReasoningEffort::Low;
 /// One bounded format-repair attempt: transport repair, never a second
 /// semantic review (the goal, evidence and judgment are unchanged).

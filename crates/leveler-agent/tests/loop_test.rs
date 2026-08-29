@@ -925,7 +925,11 @@ async fn reconciliation_uses_the_configured_judge_model_with_bounded_profile() {
         Some(leveler_model::ReasoningEffort::Low),
         "the gate keeps its bounded effort profile on the stronger model"
     );
-    assert_eq!(judge.max_output_tokens, Some(4096));
+    assert_eq!(
+        judge.max_output_tokens,
+        Some(16384),
+        "the gate's budget covers reasoning AND the per-obligation accounting"
+    );
     assert!(
         requests
             .iter()
