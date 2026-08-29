@@ -82,6 +82,11 @@ pub(crate) struct ReconcileOutcome {
     pub latency_ms: u64,
     /// Whether the verdict needed the one bounded format-repair retry.
     pub repaired: bool,
+    /// Material requirements the judge found in the original wording that the
+    /// obligation list does not represent. Non-empty means the contract is
+    /// incomplete, which refuses completion: the contract cannot detect its
+    /// own blind spots, which is precisely why the semantic guard stays.
+    pub omitted: Vec<String>,
     /// The judge's account of each contract obligation, by id. Empty when no
     /// contract was in play. The caller applies the mechanical floor to this;
     /// the judge's word alone never discharges a demonstrable obligation.
@@ -101,6 +106,7 @@ impl ReconcileOutcome {
             contradictions: Vec::new(),
             latency_ms: 0,
             repaired: false,
+            omitted: Vec::new(),
             accounting: Vec::new(),
             failure_kind: Some(kind),
         }
@@ -158,14 +164,24 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
             listed.push_str("</obligations_from_the_original_goal>\n");
             (
                 listed,
-                "  \"requirement_accounting\": [\n    {\"id\": \"R1\", \"satisfied\": true|false, \"evidence\": \"...\", \"evidence_strength\": \"mechanical\" | \"observed\" | \"semantic\"}\n  ],\n"
+                "  \"requirement_accounting\": [\n    {\"id\": \"R1\", \"satisfied\": true|false, \"evidence\": \"...\", \"evidence_strength\": \"mechanical\" | \"observed\" | \"semantic\"}\n  ],\n  \"omitted_requirements\": [\"...\"],\n"
                     .to_string(),
-                "- Account for EVERY obligation id listed above in \
-                 \"requirement_accounting\". An obligation you do not mention \
+                // The obligations already carry the task. What is left for the
+                // judge is the residue: did the list MISS something the user
+                // asked for, and does anything contradict the evidence. It is
+                // a second reader, not the sole authority.
+                "- The obligations above were derived from this same goal \
+                 before the work started. Account for EVERY obligation id in \
+                 \"requirement_accounting\": an obligation you do not mention \
                  stays unsatisfied. For \"evidence_strength\" use \"mechanical\" \
                  only when a recorded command or file change demonstrates it, \
                  \"observed\" when output was actually seen, and \"semantic\" \
-                 when it is your reading of the work.\n"
+                 when it is your reading of the work.\n\
+                 - Then answer the narrower question this gate exists for: is \
+                 there any material requirement in the original wording that \
+                 the obligation list does NOT represent? List those in \
+                 \"omitted_requirements\". Do not re-derive the whole task and \
+                 do not repeat obligations that are already listed.\n"
                     .to_string(),
             )
         }
@@ -237,6 +253,8 @@ struct RawVerdict {
     contradictions: Vec<String>,
     #[serde(default)]
     requirement_accounting: Vec<RawAccounting>,
+    #[serde(default)]
+    omitted_requirements: Vec<String>,
     #[serde(default)]
     reason: String,
 }
@@ -404,6 +422,7 @@ fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
         contradictions: raw.contradictions,
         latency_ms,
         repaired: false,
+        omitted: raw.omitted_requirements,
         accounting,
         failure_kind: None,
     }

@@ -1847,6 +1847,9 @@ impl Executor {
                                     .await
                                 }
                             };
+                            let mut rejected_not_accounted = 0usize;
+                            let mut rejected_missing_evidence = 0usize;
+                            let mut rejected_blocked = 0usize;
                             let open_obligations: Vec<String> = match completion_contract.as_ref() {
                                 None => vec![
                                     "the completion contract could not be established, so no \
@@ -1872,25 +1875,71 @@ impl Executor {
                                             );
                                         }
                                     }
-                                    accounted
-                                        .unsatisfied_material(&ledger)
-                                        .into_iter()
-                                        .map(|r| format!("{} ({})", r.id, r.text))
+                                    let open = accounted.open_obligations(&ledger);
+                                    for (_, why) in &open {
+                                        match why {
+                                            leveler_lifecycle::OpenReason::NotAccountedFor => {
+                                                rejected_not_accounted += 1
+                                            }
+                                            leveler_lifecycle::OpenReason::MissingMechanicalEvidence => {
+                                                rejected_missing_evidence += 1
+                                            }
+                                            leveler_lifecycle::OpenReason::Blocked => {
+                                                rejected_blocked += 1
+                                            }
+                                        }
+                                    }
+                                    open.into_iter()
+                                        .map(|(r, why)| {
+                                            let why = match why {
+                                                leveler_lifecycle::OpenReason::NotAccountedFor => {
+                                                    "not satisfied"
+                                                }
+                                                leveler_lifecycle::OpenReason::MissingMechanicalEvidence => {
+                                                    "no check demonstrates it over the current tree"
+                                                }
+                                                leveler_lifecycle::OpenReason::Blocked => "blocked",
+                                            };
+                                            format!("{} ({}) — {}", r.id, r.text, why)
+                                        })
                                         .collect()
                                 }
                             };
-                            if !open_obligations.is_empty() {
-                                tracing::info!(
-                                    open = open_obligations.len(),
-                                    "completion contract refused"
-                                );
-                            }
-                            if !outcome.allows_completion() || !open_obligations.is_empty() {
+                            // A requirement the contract never captured is the
+                            // one thing the contract cannot see about itself.
+                            let omitted = outcome.omitted.clone();
+                            tracing::info!(
+                                contract_available = completion_contract.is_some(),
+                                requirements_total = completion_contract
+                                    .as_ref()
+                                    .map(|c| c.requirements.len())
+                                    .unwrap_or(0),
+                                verification_requirements = completion_contract
+                                    .as_ref()
+                                    .map(|c| c.verification_count())
+                                    .unwrap_or(0),
+                                open = open_obligations.len(),
+                                rejected_not_accounted,
+                                rejected_missing_evidence,
+                                rejected_blocked,
+                                omitted = omitted.len(),
+                                "completion contract gate"
+                            );
+                            if !outcome.allows_completion()
+                                || !open_obligations.is_empty()
+                                || !omitted.is_empty()
+                            {
                                 let mut detail = format!("verdict={:?}", outcome.verdict);
                                 if !open_obligations.is_empty() {
                                     detail.push_str(&format!(
                                         "; obligations still open: {}",
                                         open_obligations.join("; ")
+                                    ));
+                                }
+                                if !omitted.is_empty() {
+                                    detail.push_str(&format!(
+                                        "; required by the original task but not in the obligations: {}",
+                                        omitted.join("; ")
                                     ));
                                 }
                                 if !outcome.reason.is_empty() {
@@ -1930,7 +1979,8 @@ impl Executor {
                                     // wording, with the obligations already
                                     // named in `detail`.
                                     _ if outcome.allows_completion()
-                                        && !open_obligations.is_empty() =>
+                                        && (!open_obligations.is_empty()
+                                            || !omitted.is_empty()) =>
                                     {
                                         format!(
                                             "update_goal(complete) refused: {detail}. These obligations come from the ORIGINAL task and are still outstanding. An obligation to demonstrate something (a test, a check, a command that must pass) is discharged by actually running it and showing it green over the current tree — not by stating that it was done. Finish them and complete again, or call update_goal(blocked) naming which one cannot be satisfied and why."

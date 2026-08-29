@@ -56,7 +56,7 @@ pub use checkpoint::{
     CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
 };
 pub use completion_contract::{
-    CompletionContract, CompletionRequirement, EvidenceStrength, RequirementEvidence,
+    CompletionContract, CompletionRequirement, EvidenceStrength, OpenReason, RequirementEvidence,
     RequirementKind, RequirementSource, RequirementStatus,
 };
 pub use contract::TaskContract;

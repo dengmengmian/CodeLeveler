@@ -117,6 +117,20 @@ impl CompletionRequirement {
     }
 }
 
+/// Why an obligation is still open. The executor needs to know which of these
+/// it is facing — finish the work, prove it, or stop and say it cannot be
+/// done — and the completion report counts them separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenReason {
+    /// Nobody accounted for it, or it was accounted for as unsatisfied.
+    NotAccountedFor,
+    /// Honestly unreachable. Truthful, and still not a completion.
+    Blocked,
+    /// Claimed satisfied, but a demonstrable obligation with nothing that
+    /// demonstrates it over the tree as it stands.
+    MissingMechanicalEvidence,
+}
+
 /// The material obligations of one goal, derived once and carried for its
 /// lifetime.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +163,48 @@ impl CompletionContract {
     /// The second rule is the mechanical floor. It is what "the boundary rule
     /// is covered by a test" needed: a judgment of satisfied, unaccompanied by
     /// a check that ran green over the tree as it stands, is not enough.
+    /// How many obligations are demands to DEMONSTRATE something.
+    pub fn verification_count(&self) -> usize {
+        self.requirements
+            .iter()
+            .filter(|r| r.kind == RequirementKind::Verification)
+            .count()
+    }
+
+    /// How many obligations the run reported as honestly unreachable.
+    pub fn blocked_count(&self) -> usize {
+        self.requirements
+            .iter()
+            .filter(|r| r.status == RequirementStatus::Blocked)
+            .count()
+    }
+
+    /// Every open obligation with the reason it is open.
+    pub fn open_obligations(
+        &self,
+        ledger: &EvidenceLedger,
+    ) -> Vec<(&CompletionRequirement, OpenReason)> {
+        self.requirements
+            .iter()
+            .filter_map(|r| self.open_reason(r, ledger).map(|why| (r, why)))
+            .collect()
+    }
+
+    fn open_reason(
+        &self,
+        r: &CompletionRequirement,
+        ledger: &EvidenceLedger,
+    ) -> Option<OpenReason> {
+        match r.status {
+            RequirementStatus::Blocked => Some(OpenReason::Blocked),
+            RequirementStatus::Pending => Some(OpenReason::NotAccountedFor),
+            RequirementStatus::Satisfied if !self.is_discharged(r, ledger) => {
+                Some(OpenReason::MissingMechanicalEvidence)
+            }
+            RequirementStatus::Satisfied => None,
+        }
+    }
+
     pub fn unsatisfied_material(&self, ledger: &EvidenceLedger) -> Vec<&CompletionRequirement> {
         self.requirements
             .iter()
@@ -316,6 +372,48 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// The gate has to say WHY, not just that something is open: "you never
+    /// accounted for it", "you claimed it without a check", and "you told me it
+    /// cannot be done" are three different situations for the executor, and
+    /// three different numbers in the report.
+    #[test]
+    fn each_open_obligation_reports_why_it_is_open() {
+        let mut pending = requirement("r1", RequirementKind::Behavior);
+        pending.status = RequirementStatus::Pending;
+
+        let mut blocked = requirement("r2", RequirementKind::Behavior);
+        blocked.status = RequirementStatus::Blocked;
+
+        let mut unproven = requirement("r3", RequirementKind::Verification);
+        unproven.status = RequirementStatus::Satisfied;
+        unproven.evidence.push(RequirementEvidence {
+            strength: EvidenceStrength::Semantic,
+            detail: "I added a test".into(),
+        });
+
+        let contract = CompletionContract::new(vec![pending, blocked, unproven]);
+        let open = contract.open_obligations(&EvidenceLedger::default());
+        assert_eq!(open.len(), 3);
+        assert_eq!(open[0].1, OpenReason::NotAccountedFor);
+        assert_eq!(open[1].1, OpenReason::Blocked);
+        assert_eq!(open[2].1, OpenReason::MissingMechanicalEvidence);
+    }
+
+    /// The counts the report needs, straight off the contract.
+    #[test]
+    fn the_contract_counts_its_own_shape() {
+        let mut blocked = requirement("r2", RequirementKind::Behavior);
+        blocked.status = RequirementStatus::Blocked;
+        let contract = CompletionContract::new(vec![
+            requirement("r1", RequirementKind::Verification),
+            blocked,
+            requirement("r3", RequirementKind::Behavior),
+        ]);
+        assert_eq!(contract.requirements.len(), 3);
+        assert_eq!(contract.verification_count(), 1);
+        assert_eq!(contract.blocked_count(), 1);
     }
 
     /// An empty contract is not a licence to complete — it means derivation

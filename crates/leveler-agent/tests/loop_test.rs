@@ -1613,6 +1613,85 @@ async fn a_resumed_run_keeps_the_obligations_it_already_had() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// §31/§32: the contract cannot see its own blind spots. If derivation missed
+/// a material requirement, the obligations can all be discharged and the task
+/// still not be done — so the semantic guard's remaining job is exactly this
+/// question, and an omission it names refuses the completion.
+#[tokio::test]
+async fn a_requirement_the_contract_missed_still_refuses_completion() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-contract-omission-{}",
+        std::process::id() as u64 * 83 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let contract = leveler_lifecycle::CompletionContract::new(vec![
+        leveler_lifecycle::CompletionRequirement {
+            id: "R1".into(),
+            text: "fix the boundary rule".into(),
+            kind: leveler_lifecycle::RequirementKind::Behavior,
+            source: leveler_lifecycle::RequirementSource::OriginalGoal,
+            status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence: Vec::new(),
+        },
+    ]);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "boundary fixed"}),
+        ),
+        // Every listed obligation is discharged, and the judge still reports
+        // that the list itself was short.
+        assistant_text(
+            r#"{"verdict":"satisfied","requirements":[],"contradictions":[],
+                "requirement_accounting":[
+                  {"id":"R1","satisfied":true,"evidence":"window.go updated","evidence_strength":"mechanical"}
+                ],
+                "omitted_requirements":["the CLI report must reflect the rule end to end"],
+                "reason":"listed obligations are met"}"#,
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "cli not updated"}),
+        ),
+    ]));
+    let mut events = Vec::new();
+    let outcome = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_completion_contract(contract)
+    .run(
+        "fix the boundary rule and make the CLI report reflect it",
+        &mut |e| events.push(e),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "an obligation list that missed a requirement is not a satisfied task"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, is_error: true, preview, .. }
+                if id == "g1" && preview.contains("CLI report")
+        )),
+        "the refusal names what the contract missed: {events:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Completion Reconciliation Gate, end to end: a `blocked` verdict refuses the
 /// completion (durable GoalIntercepted + error ToolResult), the run continues,
 /// and the model may then resolve truthfully.
