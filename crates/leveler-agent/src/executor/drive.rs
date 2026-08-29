@@ -360,13 +360,25 @@ impl Executor {
         // mutating tool: a crash between the first edit and the obligations
         // landing would leave a changed workspace with no record of what
         // completing it was supposed to mean.
-        if ledger.completion_contract.is_none()
-            && let Some(contract) = completion_contract.clone()
-        {
-            ledger.completion_contract = Some(contract);
-            observer(AgentEvent::EvidenceLedgerUpdated {
-                ledger: ledger.clone(),
-            });
+        if ledger.completion_contract.is_none() {
+            match completion_contract.clone() {
+                Some(contract) => {
+                    ledger.completion_contract = Some(contract);
+                    observer(AgentEvent::EvidenceLedgerUpdated {
+                        ledger: ledger.clone(),
+                    });
+                }
+                // A goal whose obligations could not be built is recorded as
+                // such, so the terminal boundary can tell it apart from a chat
+                // turn that never needed any.
+                None if self.policy.goal_mode && self.depth == 0 => {
+                    ledger.completion_contract_unavailable = true;
+                    observer(AgentEvent::EvidenceLedgerUpdated {
+                        ledger: ledger.clone(),
+                    });
+                }
+                None => {}
+            }
         }
         // Unified closeout nudge budget shared by every quiet-round mechanism
         // (goal resolution, completion evidence, empty answer, audit repair) —
@@ -1889,7 +1901,8 @@ impl Executor {
                                             }
                                         }
                                     }
-                                    open.into_iter()
+                                    let listed: Vec<String> = open
+                                        .into_iter()
                                         .map(|(r, why)| {
                                             let why = match why {
                                                 leveler_lifecycle::OpenReason::NotAccountedFor => {
@@ -1902,7 +1915,15 @@ impl Executor {
                                             };
                                             format!("{} ({}) — {}", r.id, r.text, why)
                                         })
-                                        .collect()
+                                        .collect();
+                                    // The accounting is durable from here on: the terminal
+                                    // boundary decides on what the ledger KNOWS, so a run
+                                    // that ends by some other door faces the same debt.
+                                    ledger.completion_contract = Some(accounted);
+                                    observer(AgentEvent::EvidenceLedgerUpdated {
+                                        ledger: ledger.clone(),
+                                    });
+                                    listed
                                 }
                             };
                             // A requirement the contract never captured is the

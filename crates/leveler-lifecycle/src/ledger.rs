@@ -72,6 +72,13 @@ pub struct EvidenceLedger {
     /// exists to prevent. Serde-default so pre-contract snapshots still replay.
     #[serde(default)]
     pub completion_contract: Option<crate::CompletionContract>,
+    /// A goal ran, and its obligations could not be established. Recorded so
+    /// the terminal boundary can tell "no contract was needed" (a chat turn)
+    /// apart from "the contract could not be built" (a goal whose obligations
+    /// are unknown). The second must never terminate as success: nothing was
+    /// checked, and nothing checked is not everything satisfied.
+    #[serde(default)]
+    pub completion_contract_unavailable: bool,
 }
 
 impl EvidenceLedger {
@@ -668,5 +675,219 @@ mod finding_tests {
         )
         .unwrap();
         assert!(legacy.findings.is_empty());
+    }
+}
+
+impl EvidenceLedger {
+    /// Why completion truth forbids calling this run a success — `None` when
+    /// nothing outstanding is known.
+    ///
+    /// THE canonical contract question, asked in exactly one place. Both the
+    /// executor's completion gate and the engine's terminal boundary call it,
+    /// so a run cannot reach success by arriving at the boundary through a
+    /// door the gate never watched. That is not hypothetical: a forced
+    /// closeout over a green workspace used to be mapped straight to verified
+    /// while the contract still recorded an unwritten test.
+    pub fn completion_debt(&self) -> Option<String> {
+        if self.completion_contract_unavailable && self.completion_contract.is_none() {
+            return Some("the completion contract could not be established".to_string());
+        }
+        let contract = self.completion_contract.as_ref()?;
+        let open = contract.open_obligations(self);
+        if open.is_empty() {
+            return None;
+        }
+        Some(
+            open.iter()
+                .map(|(r, why)| {
+                    let why = match why {
+                        crate::OpenReason::NotAccountedFor => "not satisfied",
+                        crate::OpenReason::MissingMechanicalEvidence => {
+                            "no check demonstrates it over the current tree"
+                        }
+                        crate::OpenReason::Blocked => "blocked",
+                    };
+                    format!("{} ({}) — {}", r.id, r.text, why)
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+}
+
+#[cfg(test)]
+mod completion_debt_tests {
+    use super::*;
+    use crate::{
+        CompletionContract, CompletionRequirement, RequirementKind, RequirementSource,
+        RequirementStatus,
+    };
+
+    fn contract(status: RequirementStatus) -> CompletionContract {
+        CompletionContract::new(vec![CompletionRequirement {
+            id: "R1".into(),
+            text: "the boundary rule is covered by a test".into(),
+            kind: RequirementKind::Behavior,
+            source: RequirementSource::OriginalGoal,
+            status,
+            evidence: Vec::new(),
+        }])
+    }
+
+    /// A task with nothing outstanding owes nothing — a run that genuinely
+    /// finished must still be able to succeed, however it reached its end.
+    #[test]
+    fn a_satisfied_contract_owes_nothing() {
+        let ledger = EvidenceLedger {
+            completion_contract: Some(contract(RequirementStatus::Satisfied)),
+            ..Default::default()
+        };
+        assert_eq!(ledger.completion_debt(), None);
+    }
+
+    /// This is the scale-s800 false completion, at the boundary: obligations
+    /// still open, and the route to the boundary is irrelevant.
+    #[test]
+    fn an_open_obligation_is_debt_whatever_the_route() {
+        let ledger = EvidenceLedger {
+            completion_contract: Some(contract(RequirementStatus::Pending)),
+            ..Default::default()
+        };
+        let debt = ledger.completion_debt().expect("open obligation is debt");
+        assert!(debt.contains("R1"), "the debt names what is owed: {debt}");
+    }
+
+    /// A chat turn has no obligations and owes nothing. Absence of a contract
+    /// is only debt when a goal actually failed to build one.
+    #[test]
+    fn no_contract_and_none_expected_owes_nothing() {
+        assert_eq!(EvidenceLedger::default().completion_debt(), None);
+    }
+
+    #[test]
+    fn a_contract_that_could_not_be_built_is_debt() {
+        let ledger = EvidenceLedger {
+            completion_contract_unavailable: true,
+            ..Default::default()
+        };
+        assert!(ledger.completion_debt().is_some());
+    }
+}
+
+#[cfg(test)]
+mod terminal_truth_matrix {
+    use super::*;
+    use crate::{
+        CompletionContract, CompletionRequirement, EvidenceStrength, RequirementEvidence,
+        RequirementKind, RequirementSource, RequirementStatus,
+    };
+
+    /// The debt a run carries is a property of the run, not of the door it
+    /// leaves by. These cases are named for the terminal route that used to
+    /// slip past — a forced closeout over a green workspace — but the
+    /// predicate never sees the route, which is the entire point of the fix.
+    fn ledger_with(reqs: Vec<CompletionRequirement>) -> EvidenceLedger {
+        EvidenceLedger {
+            completion_contract: Some(CompletionContract::new(reqs)),
+            ..Default::default()
+        }
+    }
+
+    fn req(kind: RequirementKind, status: RequirementStatus) -> CompletionRequirement {
+        CompletionRequirement {
+            id: "R1".into(),
+            text: "the boundary rule is covered by a test".into(),
+            kind,
+            source: RequirementSource::OriginalGoal,
+            status,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn closeout_with_a_pending_requirement_owes_debt() {
+        let l = ledger_with(vec![req(
+            RequirementKind::Behavior,
+            RequirementStatus::Pending,
+        )]);
+        assert!(l.completion_debt().is_some());
+    }
+
+    #[test]
+    fn closeout_with_a_blocked_requirement_owes_debt() {
+        let l = ledger_with(vec![req(
+            RequirementKind::Behavior,
+            RequirementStatus::Blocked,
+        )]);
+        assert!(l.completion_debt().is_some());
+    }
+
+    /// THE scale-s800 case. The workspace is green — the existing suite passes
+    /// — and the judge called the test obligation satisfied on its own say-so.
+    /// Green tests are evidence that the tree is healthy, not proof that the
+    /// test the user asked for exists.
+    #[test]
+    fn a_green_workspace_does_not_settle_an_unproven_test_obligation() {
+        let mut r = req(RequirementKind::Verification, RequirementStatus::Satisfied);
+        r.evidence.push(RequirementEvidence {
+            strength: EvidenceStrength::Semantic,
+            detail: "I added a test for the boundary".into(),
+        });
+        let mut l = ledger_with(vec![r]);
+        l.record_mutation(
+            "c1",
+            "apply_patch",
+            vec!["internal/window/window.go".into()],
+        );
+        l.record_verify("v1", "go\u{1f}test", 0);
+        let debt = l
+            .completion_debt()
+            .expect("a green suite is not the required test");
+        assert!(debt.contains("no check demonstrates it"), "{debt}");
+    }
+
+    #[test]
+    fn closeout_without_a_contract_that_should_exist_owes_debt() {
+        let l = EvidenceLedger {
+            completion_contract_unavailable: true,
+            ..Default::default()
+        };
+        assert!(l.completion_debt().is_some());
+    }
+
+    /// Stale evidence is not evidence: a check that went green and was then
+    /// invalidated by a later edit proves nothing about the tree that shipped.
+    #[test]
+    fn a_stale_check_owes_debt() {
+        let mut r = req(RequirementKind::Verification, RequirementStatus::Satisfied);
+        r.evidence.push(RequirementEvidence {
+            strength: EvidenceStrength::Mechanical,
+            detail: "go test ./...".into(),
+        });
+        let mut l = ledger_with(vec![r]);
+        l.record_mutation("c1", "apply_patch", vec!["a.go".into()]);
+        l.record_verify("v1", "go\u{1f}test", 0);
+        l.record_mutation("c2", "apply_patch", vec!["b.go".into()]);
+        assert!(l.completion_debt().is_some());
+    }
+
+    /// And the other direction, which matters just as much: a run that really
+    /// did finish owes nothing, however it reached its end. Truth closure must
+    /// not become blanket pessimism.
+    #[test]
+    fn a_genuinely_finished_run_owes_nothing_even_after_a_forced_closeout() {
+        let mut r = req(RequirementKind::Verification, RequirementStatus::Satisfied);
+        r.evidence.push(RequirementEvidence {
+            strength: EvidenceStrength::Mechanical,
+            detail: "go test ./... covering the boundary".into(),
+        });
+        let mut l = ledger_with(vec![r]);
+        l.record_mutation(
+            "c1",
+            "apply_patch",
+            vec!["internal/window/window_test.go".into()],
+        );
+        l.record_verify("v1", "go\u{1f}test", 0);
+        assert_eq!(l.completion_debt(), None);
     }
 }

@@ -1969,6 +1969,54 @@ impl TaskEngine {
         {
             task_outcome = TaskOutcome::CompletedUnverified;
         }
+        // TERMINAL TRUTH: the Completion Contract, asked at the boundary rather
+        // than only at the door the executor happens to use. `update_goal`
+        // consults it, but a run can reach this point without ever calling
+        // update_goal — a forced closeout, for instance — and a green
+        // workspace over an unwritten test used to be mapped straight to
+        // verified. Closeout is a lifecycle condition, not proof of
+        // completion; tests going green is evidence, not proof that every
+        // requirement was met. Same debt, whichever door the run came through.
+        if task_outcome == TaskOutcome::Verified {
+            match crate::turn::last_persisted_ledger(
+                runner.stores.events.as_ref(),
+                &runner.session_id,
+            )
+            .await
+            {
+                // Fail closed: an unreadable ledger cannot prove there is no
+                // outstanding obligation.
+                Err(e) => {
+                    task_outcome = TaskOutcome::CompletedUnverified;
+                    log.append(
+                        None,
+                        EngineEvent::ReviewStage {
+                            required: true,
+                            action: "completion_contract_open".to_string(),
+                            detail: format!("completion contract unreadable: {e}"),
+                        },
+                        observer,
+                    )
+                    .await?;
+                }
+                Ok(Some(ledger)) => {
+                    if let Some(debt) = ledger.completion_debt() {
+                        task_outcome = TaskOutcome::CompletedUnverified;
+                        log.append(
+                            None,
+                            EngineEvent::ReviewStage {
+                                required: true,
+                                action: "completion_contract_open".to_string(),
+                                detail: debt,
+                            },
+                            observer,
+                        )
+                        .await?;
+                    }
+                }
+                Ok(None) => {}
+            }
+        }
         // R007b N7 / R013-F1: the closure-boundary review, staged with durable
         // eligibility/launch/terminal events so an absent reviewer is always
         // explainable. A required review that did not complete keeps refusing
