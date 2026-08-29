@@ -154,6 +154,19 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
     // The obligations were written down before the work started. Accounting
     // for them BY ID is what stops one from quietly disappearing: an
     // unmentioned obligation stays unsatisfied instead of being waved through.
+    // Without a contract the judge still enumerates the requirements itself.
+    // WITH one, that list is exactly the obligations it is already accounting
+    // for by id — asking for both duplicated the work and the output, and a
+    // judge that runs out of budget mid-object delivers no verdict at all.
+    let (requirements_schema, requirements_rule) = match input.contract {
+        None => (
+            "  \"requirements\": [\n    {\"requirement\": \"...\", \"satisfied\": true|false, \"evidence\": \"...\"}\n  ],\n"
+                .to_string(),
+            " List every material requirement from the original goal in \"requirements\"."
+                .to_string(),
+        ),
+        Some(_) => (String::new(), String::new()),
+    };
     let (obligations, accounting_schema, accounting_rule) = match input.contract {
         None => (String::new(), String::new(), String::new()),
         Some(contract) => {
@@ -222,16 +235,12 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
          Answer with ONLY a JSON object, no prose around it:\n\
          {{\n\
            \"verdict\": \"satisfied\" | \"blocked\" | \"uncertain\",\n\
-           \"requirements\": [\n\
-             {{\"requirement\": \"...\", \"satisfied\": true|false, \
-         \"evidence\": \"...\"}}\n\
-           ],\n\
+         {requirements_schema}\
            \"contradictions\": [\"...\"],\n\
          {accounting_schema}\
            \"reason\": \"...\"\n\
          }}\n\
-         List every material requirement from the original goal in \
-         \"requirements\".",
+         Keep every \"evidence\" field to one short sentence.{requirements_rule}",
         goal = input.original_goal,
         claim = input.claimed_summary,
         claims = input.recent_claims,
@@ -240,6 +249,8 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
         obligations = obligations,
         accounting_rule = accounting_rule,
         accounting_schema = accounting_schema,
+        requirements_schema = requirements_schema,
+        requirements_rule = requirements_rule,
     )
 }
 
@@ -327,7 +338,7 @@ pub(crate) fn candidate_objects(text: &str) -> Vec<&str> {
 /// Accepted shapes: a bare object, a fenced ```json object, or prose around
 /// exactly one decodable object. Several DIFFERENT decodable objects are
 /// ambiguous and refuse.
-fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
+fn parse_outcome(text: &str, latency_ms: u64, expects_accounting: bool) -> ReconcileOutcome {
     if text.trim().is_empty() {
         return ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
@@ -383,9 +394,16 @@ fn parse_outcome(text: &str, latency_ms: u64) -> ReconcileOutcome {
         .map(|r| r.requirement.clone())
         .collect();
     let verdict = match raw.verdict.trim().to_ascii_lowercase().as_str() {
-        // A "satisfied" verdict with no enumerated requirements means the
-        // verifier did not actually check the contract: uncertain.
-        "satisfied" if raw.requirements.is_empty() => ReconcileVerdict::Uncertain,
+        // A "satisfied" verdict with nothing itemised means the verifier did
+        // not actually check anything: uncertain. Which list carries the
+        // itemisation depends on whether obligations were supplied — with a
+        // contract the judge accounts by id and does not re-enumerate.
+        "satisfied"
+            if (expects_accounting && raw.requirement_accounting.is_empty())
+                || (!expects_accounting && raw.requirements.is_empty()) =>
+        {
+            ReconcileVerdict::Uncertain
+        }
         "satisfied" => ReconcileVerdict::Satisfied,
         "blocked" => ReconcileVerdict::Blocked,
         "uncertain" => ReconcileVerdict::Uncertain,
@@ -458,7 +476,18 @@ async fn one_call(
             "provider_error",
             format!("reconciliation request failed: {error}"),
         )),
-        Ok(Ok(response)) => Ok(response.message.text_content()),
+        Ok(Ok(response)) => {
+            // A judgment cut off mid-object arrives as "no JSON object", which
+            // reads like a model that cannot follow a schema. It is usually a
+            // budget that ran out, so say which one it was.
+            if response.finish_reason == leveler_model::FinishReason::Length {
+                tracing::warn!(
+                    max_output_tokens = MAX_OUTPUT_TOKENS,
+                    "reconciliation reply hit the output budget"
+                );
+            }
+            Ok(response.message.text_content())
+        }
     }
 }
 
@@ -494,7 +523,8 @@ pub(crate) async fn reconcile_completion(
             return refused;
         }
     };
-    let first = parse_outcome(&first_text, latency(&started));
+    let expects_accounting = input.contract.is_some();
+    let first = parse_outcome(&first_text, latency(&started), expects_accounting);
     let format_failure = matches!(
         first.failure_kind,
         Some("empty_reply" | "no_object" | "bad_json" | "bad_verdict" | "ambiguous_objects")
@@ -524,7 +554,7 @@ pub(crate) async fn reconcile_completion(
             return refused;
         }
     };
-    let mut second = parse_outcome(&second_text, latency(&started));
+    let mut second = parse_outcome(&second_text, latency(&started), expects_accounting);
     if second.failure_kind.is_none() {
         second.repaired = true;
         return second;
@@ -557,7 +587,7 @@ mod tests {
 
     #[test]
     fn satisfied_with_all_requirements_met_allows_completion() {
-        let out = parse_outcome(ok_json(), 1);
+        let out = parse_outcome(ok_json(), 1, false);
         assert_eq!(out.verdict, ReconcileVerdict::Satisfied);
         assert!(out.allows_completion());
     }
@@ -565,7 +595,7 @@ mod tests {
     #[test]
     fn one_unsatisfied_requirement_refuses_even_with_satisfied_verdict() {
         let text = r#"{"verdict":"satisfied","requirements":[{"requirement":"a","satisfied":true},{"requirement":"b","satisfied":false}],"contradictions":[],"reason":"x"}"#;
-        let out = parse_outcome(text, 1);
+        let out = parse_outcome(text, 1, false);
         assert!(!out.allows_completion());
         assert_eq!(out.unsatisfied, vec!["b".to_string()]);
     }
@@ -573,13 +603,13 @@ mod tests {
     #[test]
     fn contradictions_refuse_even_with_optimistic_verdict() {
         let text = r#"{"verdict":"satisfied","requirements":[{"requirement":"a","satisfied":true}],"contradictions":["claim says gone, output still shows idle total=0"],"reason":"x"}"#;
-        assert!(!parse_outcome(text, 1).allows_completion());
+        assert!(!parse_outcome(text, 1, false).allows_completion());
     }
 
     #[test]
     fn uncertain_never_completes() {
         let text = r#"{"verdict":"uncertain","requirements":[{"requirement":"a","satisfied":true}],"contradictions":[],"reason":"cannot establish"}"#;
-        let out = parse_outcome(text, 1);
+        let out = parse_outcome(text, 1, false);
         assert_eq!(out.verdict, ReconcileVerdict::Uncertain);
         assert!(!out.allows_completion());
     }
@@ -587,7 +617,7 @@ mod tests {
     #[test]
     fn satisfied_without_enumerated_requirements_is_uncertain() {
         let text = r#"{"verdict":"satisfied","requirements":[],"contradictions":[],"reason":"looks fine"}"#;
-        let out = parse_outcome(text, 1);
+        let out = parse_outcome(text, 1, false);
         assert_eq!(out.verdict, ReconcileVerdict::Uncertain);
         assert!(!out.allows_completion());
     }
@@ -595,7 +625,7 @@ mod tests {
     #[test]
     fn malformed_output_fails_closed() {
         for bad in ["no json here", "{not json", r#"{"verdict":"maybe"}"#] {
-            let out = parse_outcome(bad, 1);
+            let out = parse_outcome(bad, 1, false);
             assert_eq!(out.verdict, ReconcileVerdict::Unavailable, "{bad}");
             assert!(!out.allows_completion());
         }
@@ -604,25 +634,25 @@ mod tests {
     #[test]
     fn prose_around_the_json_still_parses() {
         let text = format!("Here is my judgment:\n{}\nDone.", ok_json());
-        assert!(parse_outcome(&text, 1).allows_completion());
+        assert!(parse_outcome(&text, 1, false).allows_completion());
     }
 
     #[test]
     fn fenced_json_parses() {
         let text = format!("```json\n{}\n```", ok_json());
-        assert!(parse_outcome(&text, 1).allows_completion());
+        assert!(parse_outcome(&text, 1, false).allows_completion());
     }
 
     #[test]
     fn repeated_identical_objects_parse_but_conflicting_objects_refuse() {
         let twice = format!("{}\nAgain:\n{}", ok_json(), ok_json());
-        assert!(parse_outcome(&twice, 1).allows_completion());
+        assert!(parse_outcome(&twice, 1, false).allows_completion());
         let conflicting = format!(
             "{}\n{}",
             ok_json(),
             r#"{"verdict":"blocked","requirements":[{"requirement":"a","satisfied":false}],"contradictions":[],"reason":"x"}"#
         );
-        let out = parse_outcome(&conflicting, 1);
+        let out = parse_outcome(&conflicting, 1, false);
         assert_eq!(out.failure_kind, Some("ambiguous_objects"));
         assert!(!out.allows_completion());
     }
@@ -630,12 +660,12 @@ mod tests {
     #[test]
     fn braces_inside_json_strings_do_not_split_the_object() {
         let text = r#"{"verdict":"satisfied","requirements":[{"requirement":"print {x} literally","satisfied":true,"evidence":"output shows {x}"}],"contradictions":[],"reason":"ok"}"#;
-        assert!(parse_outcome(text, 1).allows_completion());
+        assert!(parse_outcome(text, 1, false).allows_completion());
     }
 
     #[test]
     fn empty_reply_is_classified_distinctly() {
-        let out = parse_outcome("   \n", 1);
+        let out = parse_outcome("   \n", 1, false);
         assert_eq!(out.failure_kind, Some("empty_reply"));
         assert_eq!(out.verdict, ReconcileVerdict::Unavailable);
     }
@@ -844,5 +874,65 @@ mod tests {
         let tail = bounded_tail(s, 4);
         assert!(tail.len() <= 4);
         assert!(s.ends_with(tail));
+    }
+}
+
+#[cfg(test)]
+mod prompt_render_tests {
+    use super::*;
+
+    /// Renders the contract-aware instruction so a human can read exactly what
+    /// the judge is asked. Guards the shape too: the schema block must appear
+    /// once, inside the answer object, with the obligations listed by id.
+    #[test]
+    fn contract_instruction_renders_readably() {
+        let contract = leveler_lifecycle::CompletionContract::new(vec![
+            leveler_lifecycle::CompletionRequirement {
+                id: "R1".into(),
+                text: "invalid records must not appear as summary rows".into(),
+                kind: leveler_lifecycle::RequirementKind::Behavior,
+                source: leveler_lifecycle::RequirementSource::OriginalGoal,
+                status: leveler_lifecycle::RequirementStatus::Pending,
+                evidence: Vec::new(),
+            },
+        ]);
+        let text = instruction(&ReconcileInput {
+            original_goal: "drop invalid rows",
+            claimed_summary: "done",
+            recent_claims: "I removed them",
+            recent_evidence: "go test ./... ok",
+            modified_files: &["internal/report/summary.go".to_string()],
+            fresh_verification: true,
+            contract: Some(&contract),
+        });
+        println!("\n=== RENDERED JUDGE INSTRUCTION ===\n{text}\n=== END ===\n");
+        assert_eq!(text.matches("requirement_accounting").count(), 2);
+        assert!(text.contains("R1: invalid records must not appear as summary rows"));
+    }
+}
+
+#[cfg(test)]
+mod accounting_verdict_tests {
+    use super::*;
+
+    /// With obligations in play the itemisation lives in the accounting, so a
+    /// satisfied verdict that accounts for them is a real verdict — the old
+    /// "requirements list is empty" rule would have made completion
+    /// unreachable, since the judge no longer re-enumerates the task.
+    #[test]
+    fn accounting_carries_the_itemisation_when_obligations_exist() {
+        let text = r#"{"verdict":"satisfied","contradictions":[],
+            "requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"ran green","evidence_strength":"mechanical"}],
+            "omitted_requirements":[],"reason":"ok"}"#;
+        assert!(parse_outcome(text, 1, true).allows_completion());
+    }
+
+    /// And a satisfied verdict that itemised NOTHING is still no verdict.
+    #[test]
+    fn a_satisfied_verdict_with_no_accounting_is_uncertain() {
+        let text = r#"{"verdict":"satisfied","contradictions":[],"requirement_accounting":[],"reason":"looks fine"}"#;
+        let out = parse_outcome(text, 1, true);
+        assert_eq!(out.verdict, ReconcileVerdict::Uncertain);
+        assert!(!out.allows_completion());
     }
 }
