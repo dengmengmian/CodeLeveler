@@ -88,6 +88,58 @@ strength: Mechanical > Observed > Semantic
 | agent 派生 ×4 | 派生出 kind 正确的义务、全部 Pending/OriginalGoal/有 id；畸形回复 → UNAVAILABLE；空 requirements → UNAVAILABLE；请求用 bounded profile 且只有一次调用 |
 | agent e2e ×4 | 仅 prose 支撑的测试义务拒绝完成且点名 R2；机械支撑的义务可完成；无契约不得完成；重启后义务存活并继续拦截 |
 
+## 首轮付费门结果：INSUFFICIENT（成因是终局映射，不是契约）
+
+冻结二进制 `7fbefd6b979f`，Dogfood Lab，串行。
+
+### Gate 1 — HC-002 ×3：通过
+
+| 指标 | 值 |
+| --- | --- |
+| Completed / 隐藏验收 / rc0 | 3 / 3 / 3 |
+| 假阴性、correct-work-underclaimed | 0、0 |
+| 契约抽取失败 | 0（3 次派生全成功，义务数 16 / 9 / 9） |
+| 完成尝试 / 被契约退回 | 4 / 2，退回后模型把活干完再提交 |
+| 花费 | $0.352 |
+
+### Gate 2 — scale-s800：跑到第 3 次停止，出现 1 次假完成
+
+| 跑 | 终局路径 | 外部验收 |
+| --- | --- | --- |
+| #1 | **CloseoutForced** | ✓ |
+| #2 | Completed（经过契约门） | ✓ |
+| #3 | **CloseoutForced** | ✗ **假完成** |
+
+### 契约本身是有效的
+
+三次跑里 `verification_requirements=2` 全部捕获到"边界规则要被测试覆盖"那条义务；
+机械下限按设计否决了只有 prose 支撑的声称（#1 退回 1 条、#3 退回 2 条，理由逐条写明
+"no check demonstrates it over the current tree"）。#3 的两次拒绝都正确。
+
+### 真正的洞：一条不经过契约的终局路径
+
+`#3` 最终不是"通过完成门"，而是**跑满 closeout 预算被强制收尾**（`stop_reason=CloseoutForced`），
+而 harness 把"强制收尾 + 工作区验证通过"映射为 `outcome=verified`，eval 据此记为完成。
+这条路径**从不查契约**：事件流里 `goal_intercepted` 两条都在，义务 R3/R4 明确还欠着，
+工作区最终只改了 `internal/window/window.go`，测试没留下。
+
+这违反 §35「不存在任何 requirement 未满足却能 Completed 的路由」。
+
+**它不是本次引入的**——强制收尾映射为 verified 是既有行为。是契约第一次让"收尾那一刻还欠什么"
+成为可查事实，才把它暴露出来。同一模式在 6 次跑里出现 3 次（s800 #1/#3、HC-002 #2），
+所以"Gate 1 通过"这个结论也要打折：那 3/3 里有 1 次并非经由契约门放行，只是外部验收恰好通过。
+
+### 建议的修法（未实施，等裁决）
+
+强制收尾时若尚有 material 义务未清，终局不得记为 verified/completed——应为 Incomplete 或
+Blocked。这是终局映射的一处收口，不是新架构。
+
+```
+EXPLICIT_COMPLETION_CONTRACT_V1=INSUFFICIENT
+CONTRACT_MECHANISM=WORKING
+FALSE_COMPLETION_ROUTE=CLOSEOUT_FORCED_TERMINAL_MAPPING
+```
+
 ## 尚未实现（不假装做了）
 
 - §27–§29 契约 revision 与"用户显式改需求"路径
