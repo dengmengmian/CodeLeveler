@@ -198,6 +198,15 @@ pub struct RuntimeInfo {
     /// The serving binary's version (diagnostics).
     #[serde(default)]
     pub version: String,
+    /// WHICH build is serving — version plus the revision it came from.
+    ///
+    /// `version` alone cannot answer that: a replaced binary on disk leaves
+    /// the running daemon on its original image, and both report the same
+    /// version while behaving differently. A runtime built before this field
+    /// existed reports the default, which `BuildIdentity::is_known` rejects
+    /// rather than reading as agreement.
+    #[serde(default)]
+    pub build: leveler_core::BuildIdentity,
     /// The serving process id (diagnostics; changes on restart).
     #[serde(default)]
     pub pid: u32,

@@ -636,6 +636,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::QueryObservability { .. } => "query_observability",
         ClientCommand::QueryChildContribution { .. } => "query_child_contribution",
         ClientCommand::ListUnfinishedGoals { .. } => "list_unfinished_goals",
+        ClientCommand::ShutdownWhenIdle { .. } => "shutdown_when_idle",
         ClientCommand::Quit => "quit",
     }
 }

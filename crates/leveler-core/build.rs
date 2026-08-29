@@ -1,4 +1,10 @@
-//! Stamp build provenance into the binary.
+//! Stamp build provenance into every binary that links the core crate.
+//!
+//! This lives in `leveler-core` rather than the CLI because the daemon
+//! reports its own identity: a runtime that can only say `0.2.0-beta.1` is
+//! indistinguishable from a differently-built runtime of the same version,
+//! which is precisely how a stale daemon once served a session while the
+//! binary on disk had already been replaced.
 //!
 //! Batch #1 shipped a release binary built from a checkout whose working tree
 //! carried another session's uncommitted work: git HEAD said one thing, the

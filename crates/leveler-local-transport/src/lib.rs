@@ -1721,6 +1721,7 @@ mod tests {
             Ok(leveler_client_protocol::RuntimeInfo {
                 runtime_id: leveler_client_protocol::RuntimeId::new("rt-test"),
                 version: "test".to_string(),
+                build: leveler_client_protocol::BuildIdentity::default(),
                 pid: std::process::id(),
                 health: leveler_client_protocol::RuntimeHealth {
                     accepting_work: true,

@@ -12,6 +12,22 @@ use leveler_model::ModelRef;
 use super::media::AttachmentRef;
 use super::{ApprovalDecision, PermissionProfile};
 
+/// Why a runtime is being asked to retire.
+///
+/// Typed rather than a string because the updater will reuse this exact
+/// lifecycle: install an artifact, ask the running runtime to retire, verify
+/// the replacement's identity. Only the reason differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RestartReason {
+    /// The connecting client is a different build than this runtime.
+    BuildMismatch,
+    /// A newer artifact is installed and waiting to take over. Reserved for
+    /// the updater; nothing sends it yet.
+    UpdateReady,
+}
+
 /// A command from a UI client to the runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -53,6 +69,14 @@ pub enum ClientCommand {
     },
     /// Import an image from the system clipboard (spec §38.1).
     AddClipboardImage { session_id: SessionId },
+    /// Retire this runtime once its current work has settled.
+    ///
+    /// One mechanism covers both cases the caller cares about: an idle
+    /// runtime drains instantly and exits, a busy one stops taking new work
+    /// and exits when the work it already owns is done. The caller never
+    /// polls for idleness and never kills anything — the runtime owns the
+    /// drain, because only it knows what "still working" means.
+    ShutdownWhenIdle { reason: RestartReason },
     /// Cooperatively cancel the running turn (graceful; resumable).
     CancelCurrentTurn { session_id: SessionId },
     /// Escalate a cancel the user has already requested once.
@@ -290,6 +314,9 @@ impl ClientCommand {
             ClientCommand::ApprovalDecision { .. }
             | ClientCommand::AnswerClarification { .. }
             | ClientCommand::RequestSessionList
+            // Retiring the runtime is a process-lifecycle request: it belongs
+            // to no session, and it must not be attributed to one.
+            | ClientCommand::ShutdownWhenIdle { .. }
             | ClientCommand::Quit => None,
         }
     }

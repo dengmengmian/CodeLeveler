@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod budget;
+pub mod build_identity;
 pub mod environment;
 pub mod home;
 pub mod ids;
@@ -17,6 +18,7 @@ pub mod text;
 pub mod time;
 
 pub use budget::ResourceBudget;
+pub use build_identity::BuildIdentity;
 pub use environment::{
     EnvSnapshot, environment, git_diff_stdout, git_stdout, install_environment,
     is_credential_env_name, leveler_home_dir, leveler_home_dir_from, scrubbed_environment,

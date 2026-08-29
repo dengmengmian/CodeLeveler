@@ -262,6 +262,16 @@ impl RemotePolicy {
                 reason: "goal recap is local-only",
             },
 
+            // Retiring the runtime is local lifecycle authority. A phone on
+            // another network running a different build has no business
+            // ending the process that owns this machine's work — build drift
+            // between a remote client and the runtime is a compatibility
+            // question, not a licence to restart someone else's daemon.
+            ClientCommand::ShutdownWhenIdle { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "a remote client cannot retire the local runtime",
+            },
+
             // Shuts down the runtime for every client, local ones included.
             // The local socket transport refuses it too.
             ClientCommand::Quit => RemoteVerdict::Deny {

@@ -53,7 +53,7 @@ mod wire_types;
 
 pub use approval::{UiApprovalRequest, UiClarificationRequest, UiPendingInteraction};
 pub use client::{ClientError, InteractiveRuntimeClient};
-pub use command::ClientCommand;
+pub use command::{ClientCommand, RestartReason};
 pub use command_envelope::{
     CommandEnvelope, CommandReceipts, Receipt, Recovery, recovery_for_tool,
 };
@@ -88,8 +88,8 @@ pub mod mock;
 // Re-export the shared domain types the protocol references, so clients get one
 // import surface and never generate provider-specific formats themselves.
 pub use leveler_core::{
-    ApprovalId, CheckpointId, ClarificationId, CommandId, RuntimeId, SessionId, ToolCallId,
-    UserShellId,
+    ApprovalId, BuildIdentity, CheckpointId, ClarificationId, CommandId, RuntimeId, SessionId,
+    ToolCallId, UserShellId,
 };
 pub use leveler_model::ModelRef;
 

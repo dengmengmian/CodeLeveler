@@ -345,9 +345,10 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
 /// commit it names, and Batch #1 lost an investigation cycle to exactly that
 /// confusion.
 fn build_provenance() -> String {
-    let commit = env!("LEVELER_BUILD_COMMIT");
-    let dirty = env!("LEVELER_BUILD_DIRTY") == "true";
-    format_provenance(env!("CARGO_PKG_VERSION"), commit, dirty)
+    // One identity, stamped in leveler-core so the daemon can report the same
+    // thing it compares against.
+    let id = leveler_core::BuildIdentity::current();
+    format_provenance(&id.version, &id.revision, id.dirty)
 }
 
 /// The same line, borrowed for the process lifetime. `clap`'s `version` takes
@@ -394,8 +395,12 @@ mod provenance_tests {
                 "{argv:?} must be a version query"
             );
             assert!(
-                err.to_string()
-                    .contains(env!("LEVELER_BUILD_COMMIT").get(..12).unwrap_or("")),
+                err.to_string().contains(
+                    leveler_core::BuildIdentity::current()
+                        .revision
+                        .get(..12)
+                        .unwrap_or("")
+                ),
                 "the version output must name the commit: {err}"
             );
         }

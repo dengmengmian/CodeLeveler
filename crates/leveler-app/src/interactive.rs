@@ -198,6 +198,9 @@ pub struct InProcessRuntimeClient {
     /// Set when the runtime owner begins an explicit shutdown (Quit);
     /// reported in health and never bypasses ownership fencing.
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Cancelled to retire the process once work has drained. `None` for an
+    /// in-process runtime, which has no process of its own to retire.
+    process_shutdown: Option<CancellationToken>,
     /// Text the user sent while a turn was already running, per session.
     /// Drained by the agent loop at the top of each round.
     steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
@@ -246,6 +249,14 @@ impl InProcessRuntimeClient {
         Self::new_with_options(app, model, mode, sandbox, false)
     }
 
+    /// Hand the runtime the token that retires its process, so
+    /// `ShutdownWhenIdle` can actually end the daemon once work drains. An
+    /// in-process runtime leaves this unset: it does not own a process.
+    pub fn with_process_shutdown(mut self, token: CancellationToken) -> Self {
+        self.process_shutdown = Some(token);
+        self
+    }
+
     /// Like [`Self::new`], with an explicit auto-approve switch for unattended
     /// interactive TUI sessions.
     pub fn new_with_options(
@@ -283,6 +294,7 @@ impl InProcessRuntimeClient {
             live_views: Arc::new(crate::live_view::LiveViews::default()),
             active: Arc::new(ActiveTurns::default()),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            process_shutdown: None,
         }
     }
 
@@ -2218,6 +2230,34 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .send(RuntimeEvent::UnfinishedGoalsLoaded { query_id, goals });
                 Ok(())
             }
+            ClientCommand::ShutdownWhenIdle { reason } => {
+                // Stop admitting new work FIRST: without this the runtime can
+                // be kept alive indefinitely by a stream of arriving turns and
+                // the replacement never happens.
+                self.shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(?reason, "runtime retiring once work drains");
+                if let Some(token) = self.process_shutdown.clone() {
+                    let active = self.active.clone();
+                    let background = self.app.background_tasks().clone();
+                    tokio::spawn(async move {
+                        // Idle means nothing is still owed: no turn running and
+                        // no background task alive. A turn ending is not
+                        // enough — a background build outliving its turn is
+                        // exactly the work a replacement would destroy.
+                        loop {
+                            let (turns, _) = active.load();
+                            if turns == 0 && background.alive_count().await == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        tracing::info!("runtime idle; retiring");
+                        token.cancel();
+                    });
+                }
+                Ok(())
+            }
             ClientCommand::Quit => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2616,6 +2656,9 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         Ok(leveler_client_protocol::RuntimeInfo {
             runtime_id,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            // The daemon says which build it IS, not just which version it
+            // calls itself: that difference is the whole point of the field.
+            build: leveler_core::BuildIdentity::current(),
             pid: std::process::id(),
             health: leveler_client_protocol::RuntimeHealth {
                 // Health is admission state, never authority: task writes

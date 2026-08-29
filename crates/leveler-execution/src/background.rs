@@ -445,6 +445,21 @@ impl BackgroundTaskRegistry {
 
     /// Kill every non-terminal task regardless of owner. Used on runtime
     /// shutdown paths where Drop-based reaping may never run (R004 F7).
+    /// How many background tasks are still alive.
+    ///
+    /// A runtime is not idle just because no turn is running: the wait_task
+    /// incident was a `cargo check` that outlived its turn by half an hour,
+    /// and replacing the process under it would have thrown that work away.
+    pub async fn alive_count(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .tasks
+            .values()
+            .filter(|t| t.status.is_active())
+            .count()
+    }
+
     pub async fn kill_all(&self) -> usize {
         let ids: Vec<String> = {
             let st = self.inner.lock().await;

@@ -13,8 +13,8 @@ use leveler_agent::StopReason;
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::InteractiveRuntimeClient;
 use leveler_local_transport::{
-    CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer,
-    TransportError,
+    CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient, LocalSocketServer,
+    TcpRuntimeServer, TransportError,
 };
 use leveler_project::Layout;
 
@@ -261,11 +261,100 @@ impl leveler_local_transport::RuntimeReviver for DaemonReviver {
 /// winner. Returns the connected client; a startup failure is a hard error
 /// carrying the daemon's log tail — never a silent fall back to an
 /// in-process runtime.
+
+/// Whether the connected runtime is the build this client expects.
+#[cfg(unix)]
+enum RuntimeConsistency {
+    Current,
+    Outdated {
+        runtime: leveler_core::BuildIdentity,
+        expected: leveler_core::BuildIdentity,
+    },
+    /// The runtime did not report a usable identity — a build older than the
+    /// handshake, or an unreadable snapshot.
+    Unknown,
+}
+
+/// Ask the runtime who it is. Silence is `Unknown`, never agreement.
+#[cfg(unix)]
+async fn runtime_is_current(client: &LocalSocketRuntimeClient) -> RuntimeConsistency {
+    let expected = leveler_core::BuildIdentity::current();
+    let Ok(info) = client.runtime_info().await else {
+        return RuntimeConsistency::Unknown;
+    };
+    if !info.build.is_known() || !expected.is_known() {
+        return RuntimeConsistency::Unknown;
+    }
+    if expected.matches(&info.build) {
+        RuntimeConsistency::Current
+    } else {
+        RuntimeConsistency::Outdated {
+            runtime: info.build,
+            expected,
+        }
+    }
+}
+
+/// Wait for the retiring runtime to release its socket. Bounded: a runtime
+/// that will not go must be reported, never waited on forever — and never
+/// escalated to a kill, which is the active work this whole path protects.
+#[cfg(unix)]
+async fn wait_for_runtime_exit(socket_path: &Path) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + DAEMON_ENSURE_TIMEOUT;
+    loop {
+        if tokio::net::UnixStream::connect(socket_path).await.is_err() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the previous local runtime did not finish its work within {}s; \
+                 it is still running and was not interrupted — try again once it is idle",
+                DAEMON_ENSURE_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 #[cfg(unix)]
 async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
     let socket_path = layout.socket_path();
     if let Some(client) = connect_default_runtime(&socket_path).await? {
-        return Ok(client);
+        match runtime_is_current(&client).await {
+            // Same build: reuse it, silently. This is the overwhelmingly
+            // common case and must stay free.
+            RuntimeConsistency::Current => return Ok(client),
+            // A runtime that cannot say what it is might be anything, and it
+            // might be busy. Leave it alone and say so — replacing a runtime
+            // we cannot reason about is how active work gets destroyed.
+            RuntimeConsistency::Unknown => {
+                anyhow::bail!(
+                    "the local runtime is from an unknown build and cannot be verified; \
+                     stop it and start CodeLeveler again"
+                );
+            }
+            RuntimeConsistency::Outdated { runtime, expected } => {
+                tracing::info!(
+                    runtime = %runtime.short(),
+                    expected = %expected.short(),
+                    "local runtime is a different build; asking it to retire"
+                );
+                // The runtime owns the drain. We do not kill it, and we do not
+                // poll it for idleness: it stops taking new work, finishes what
+                // it already owns, and exits. Replacing a binary on disk is not
+                // an update — this is.
+                client
+                    .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+                        reason: leveler_client_protocol::RestartReason::BuildMismatch,
+                    })
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("could not ask the local runtime to retire: {e}")
+                    })?;
+                drop(client);
+                wait_for_runtime_exit(&socket_path).await?;
+            }
+        }
     }
 
     std::fs::create_dir_all(&layout.state_dir)?;
@@ -344,7 +433,22 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
         ),
         Err(error) => tracing::debug!(%error, "local runtime did not report an identity"),
     }
-    Ok(client)
+    // §20: a spawn that returned Ok proves nothing. The replacement has to
+    // say it is the build we expected, or the bootstrap failed — and it fails
+    // once, without a second attempt, because a restart loop over a build that
+    // keeps coming back wrong helps nobody.
+    match runtime_is_current(&client).await {
+        RuntimeConsistency::Current => Ok(client),
+        RuntimeConsistency::Outdated { runtime, expected } => anyhow::bail!(
+            "the local runtime started as {} but this CodeLeveler is {}; \
+             the runtime was not replaced correctly",
+            runtime.short(),
+            expected.short()
+        ),
+        RuntimeConsistency::Unknown => {
+            anyhow::bail!("the local runtime started but did not report a usable build identity")
+        }
+    }
 }
 
 /// Bind the TUI-embedded Web UI against an existing local runtime service.
@@ -775,13 +879,20 @@ pub(crate) async fn cmd_serve(
     let app = Arc::new(Application::assemble(layout)?);
     let model_ref = resolve_model(app.as_ref(), model)?;
 
-    let runtime = Arc::new(InProcessRuntimeClient::new_with_options(
-        app.clone(),
-        model_ref.clone(),
-        map_mode(mode),
-        sandbox,
-        auto_approve,
-    ));
+    // Minted here so the runtime can retire this process itself once work
+    // drains (ShutdownWhenIdle); the signal handlers below cancel the same
+    // token, so there is one shutdown path rather than two.
+    let shutdown = CancellationToken::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new_with_options(
+            app.clone(),
+            model_ref.clone(),
+            map_mode(mode),
+            sandbox,
+            auto_approve,
+        )
+        .with_process_shutdown(shutdown.clone()),
+    );
     let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
 
     // Token comes from the environment when a supervising process (the WebUI
@@ -847,7 +958,6 @@ pub(crate) async fn cmd_serve(
     println!("  runtime: {runtime_id}");
     println!("  press Ctrl+C to stop the daemon");
 
-    let shutdown = CancellationToken::new();
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
         // Ctrl-C and SIGTERM both reach the graceful path: a plain `kill`
