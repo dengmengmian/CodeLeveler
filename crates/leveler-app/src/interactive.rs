@@ -268,6 +268,8 @@ impl InProcessRuntimeClient {
     ) -> Self {
         let (events, _) = broadcast::channel(2048);
         let media_root = app.layout.state_dir.join("media");
+        // One flag, shared: the runtime reports it and admission enforces it.
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             app,
             default_runtime: SessionRuntimeConfig {
@@ -292,8 +294,8 @@ impl InProcessRuntimeClient {
             user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
             checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
             live_views: Arc::new(crate::live_view::LiveViews::default()),
-            active: Arc::new(ActiveTurns::default()),
-            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active: Arc::new(ActiveTurns::with_retiring(shutting_down.clone())),
+            shutting_down: shutting_down.clone(),
             process_shutdown: None,
         }
     }

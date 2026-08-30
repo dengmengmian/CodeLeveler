@@ -252,6 +252,7 @@ impl leveler_local_transport::RuntimeReviver for DaemonReviver {
 
 /// Whether the connected runtime is the build this client expects.
 #[cfg(unix)]
+#[derive(Debug)]
 enum RuntimeConsistency {
     Current,
     Outdated {
@@ -263,24 +264,36 @@ enum RuntimeConsistency {
     Unknown,
 }
 
-/// Ask the runtime who it is. Silence is `Unknown`, never agreement.
+/// Classify a runtime from what it reported. `None` — a daemon that predates
+/// the handshake, or a transport failure — is `Unknown`, never agreement:
+/// silence is not a claim to be the same build.
 #[cfg(unix)]
-async fn runtime_is_current(client: &LocalSocketRuntimeClient) -> RuntimeConsistency {
-    let expected = leveler_core::BuildIdentity::current();
-    let Ok(info) = client.runtime_info().await else {
+fn classify_runtime(
+    reported: Option<&leveler_core::BuildIdentity>,
+    expected: &leveler_core::BuildIdentity,
+) -> RuntimeConsistency {
+    let Some(runtime) = reported else {
         return RuntimeConsistency::Unknown;
     };
-    if !info.build.is_known() || !expected.is_known() {
+    if !runtime.is_known() || !expected.is_known() {
         return RuntimeConsistency::Unknown;
     }
-    if expected.matches(&info.build) {
+    if expected.matches(runtime) {
         RuntimeConsistency::Current
     } else {
         RuntimeConsistency::Outdated {
-            runtime: info.build,
-            expected,
+            runtime: runtime.clone(),
+            expected: expected.clone(),
         }
     }
+}
+
+/// Ask the runtime who it is, then classify the answer.
+#[cfg(unix)]
+async fn runtime_is_current(client: &LocalSocketRuntimeClient) -> RuntimeConsistency {
+    let expected = leveler_core::BuildIdentity::current();
+    let reported = client.runtime_info().await.ok().map(|info| info.build);
+    classify_runtime(reported.as_ref(), &expected)
 }
 
 /// Wait for the retiring runtime to release its socket. Bounded: a runtime
@@ -2037,5 +2050,90 @@ mod resume_hint_tests {
         assert!(hint.contains('…'), "{hint}");
         assert!(!hint.contains("second line"), "{hint}");
         assert!(hint.lines().count() <= 2, "{hint}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_consistency_tests {
+    use super::{RuntimeConsistency, classify_runtime};
+    use leveler_core::BuildIdentity;
+
+    fn build(version: &str, revision: &str, dirty: bool) -> BuildIdentity {
+        BuildIdentity {
+            version: version.into(),
+            revision: revision.into(),
+            dirty,
+        }
+    }
+
+    fn clean(revision: &str) -> BuildIdentity {
+        build("0.2.0-beta.1", revision, false)
+    }
+
+    #[test]
+    fn the_same_build_is_reused() {
+        let me = clean("abc123");
+        assert!(matches!(
+            classify_runtime(Some(&me.clone()), &me),
+            RuntimeConsistency::Current
+        ));
+    }
+
+    /// THE incident, as a decision: two builds calling themselves
+    /// `0.2.0-beta.1` are not thereby the same build, and the one that has
+    /// been running since yesterday is the one that must go.
+    #[test]
+    fn same_version_different_revision_is_outdated() {
+        let expected = clean("new111");
+        match classify_runtime(Some(&clean("old999")), &expected) {
+            RuntimeConsistency::Outdated { runtime, .. } => {
+                assert_eq!(runtime.revision, "old999");
+            }
+            other => panic!("a different build must be Outdated, got {other:?}"),
+        }
+    }
+
+    /// A daemon old enough to predate the handshake reports nothing. Nothing
+    /// is Unknown — and Unknown is never replaced on a guess, because a
+    /// runtime we cannot reason about may be holding live work.
+    #[test]
+    fn a_runtime_that_reports_nothing_is_unknown() {
+        assert!(matches!(
+            classify_runtime(None, &clean("abc123")),
+            RuntimeConsistency::Unknown
+        ));
+        assert!(matches!(
+            classify_runtime(Some(&BuildIdentity::default()), &clean("abc123")),
+            RuntimeConsistency::Unknown
+        ));
+        assert!(matches!(
+            classify_runtime(
+                Some(&build("0.2.0-beta.1", "unknown", false)),
+                &clean("abc")
+            ),
+            RuntimeConsistency::Unknown
+        ));
+    }
+
+    /// The dirty matrix. A modified tree is not identified by the commit it
+    /// was modified from, so it matches nothing — not a clean build of that
+    /// commit, and not another dirty build of it either.
+    #[test]
+    fn dirty_builds_are_outdated_in_every_direction() {
+        let dirty = build("0.2.0-beta.1", "abc123", true);
+        let clean_same = clean("abc123");
+        for (reported, expected) in [
+            (&dirty, &clean_same),
+            (&clean_same, &dirty),
+            (&dirty, &dirty),
+        ] {
+            assert!(
+                matches!(
+                    classify_runtime(Some(reported), expected),
+                    RuntimeConsistency::Outdated { .. }
+                ),
+                "a dirty build must never be reused: {reported:?} vs {expected:?}"
+            );
+        }
     }
 }

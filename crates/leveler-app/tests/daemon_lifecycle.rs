@@ -405,3 +405,69 @@ async fn a_runtime_reports_the_build_it_is() {
         "a clean runtime matches the client that built it"
     );
 }
+
+/// A turn ending is not the runtime going idle.
+///
+/// The incident that started all of this was a `cargo check` that outlived
+/// its turn by half an hour. Retiring on "no turn running" would have ended
+/// the process on top of it and thrown that work away, so a live background
+/// task holds the handover open until it settles.
+#[tokio::test]
+async fn a_live_background_task_holds_the_handover_open() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let token = tokio_util::sync::CancellationToken::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new(
+            app.clone(),
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+        .with_process_shutdown(token.clone()),
+    );
+
+    // Long enough to outlive the retirement request, like a real build.
+    let task_id = app
+        .background_tasks()
+        .spawn(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".to_string()],
+                tmp.path().to_path_buf(),
+            ),
+            None,
+        )
+        .await
+        .expect("background task starts");
+    assert_eq!(app.background_tasks().alive_count().await, 1);
+
+    runtime
+        .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+            reason: leveler_client_protocol::RestartReason::BuildMismatch,
+        })
+        .await
+        .unwrap();
+
+    // No turn is running, so a turn-only idea of idleness would retire here.
+    assert_eq!(runtime.runtime_info().await.unwrap().health.active_turns, 0);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), token.cancelled())
+            .await
+            .is_err(),
+        "a runtime with live background work has not finished; it must not retire"
+    );
+
+    // The work settles, and only then does the handover proceed.
+    app.background_tasks().kill(&task_id).await.ok();
+    tokio::time::timeout(std::time::Duration::from_secs(10), token.cancelled())
+        .await
+        .expect("once nothing is left running, the runtime retires");
+}

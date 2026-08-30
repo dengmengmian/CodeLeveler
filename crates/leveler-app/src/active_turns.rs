@@ -1,7 +1,8 @@
 //! Per-session ownership of active interactive turns.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use leveler_core::SessionId;
 use tokio_util::sync::CancellationToken;
@@ -12,11 +13,21 @@ pub(crate) enum TurnAdmissionError {
     Busy(SessionId),
     #[error("interactive runtime is at its {0}-turn capacity")]
     Capacity(usize),
+    /// The runtime is retiring — it agreed to hand over to a newer build and
+    /// is waiting for its current work to finish. Taking new work here would
+    /// postpone the handover indefinitely, which is exactly how a stale
+    /// runtime survives forever.
+    #[error("interactive runtime is retiring and is not taking new work")]
+    Retiring,
 }
 
 pub(crate) struct ActiveTurns {
     active: Mutex<HashMap<SessionId, CancellationToken>>,
     capacity: usize,
+    /// Shared with the runtime's shutdown flag: admission is where retiring
+    /// has to bite, because reporting `accepting_work: false` while still
+    /// accepting work is just a label.
+    retiring: Arc<AtomicBool>,
 }
 
 impl Default for ActiveTurns {
@@ -24,11 +35,21 @@ impl Default for ActiveTurns {
         Self {
             active: Mutex::new(HashMap::new()),
             capacity: 4,
+            retiring: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl ActiveTurns {
+    /// Share the runtime's retirement flag, so a retiring runtime actually
+    /// refuses work rather than merely saying it would.
+    pub(crate) fn with_retiring(retiring: Arc<AtomicBool>) -> Self {
+        Self {
+            retiring,
+            ..Self::default()
+        }
+    }
+
     /// `(active main turns, admission capacity)` — the real limit `admit`
     /// enforces, surfaced for runtime health.
     pub(crate) fn load(&self) -> (usize, usize) {
@@ -44,6 +65,9 @@ impl ActiveTurns {
         &self,
         session_id: &SessionId,
     ) -> Result<CancellationToken, TurnAdmissionError> {
+        if self.retiring.load(Ordering::SeqCst) {
+            return Err(TurnAdmissionError::Retiring);
+        }
         let mut active = self.active.lock().unwrap();
         if active.contains_key(session_id) {
             return Err(TurnAdmissionError::Busy(session_id.clone()));
@@ -91,6 +115,27 @@ impl ActiveTurns {
 mod tests {
     use super::*;
 
+    /// The defect this test exists for: `accepting_work: false` was reported
+    /// while admission still said yes. A runtime that keeps taking work never
+    /// reaches the idle it promised to retire at, so the handover never
+    /// happens — the stale runtime simply outlives everyone.
+    #[test]
+    fn a_retiring_runtime_refuses_new_turns() {
+        let retiring = Arc::new(AtomicBool::new(false));
+        let turns = ActiveTurns::with_retiring(retiring.clone());
+        let session = SessionId::new("s1");
+
+        let admitted = turns.admit(&session).expect("a live runtime takes work");
+        turns.finish(&session);
+        drop(admitted);
+
+        retiring.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(turns.admit(&session), Err(TurnAdmissionError::Retiring)),
+            "a retiring runtime must refuse work, not merely report that it would"
+        );
+    }
+
     #[test]
     fn same_session_has_exactly_one_active_turn() {
         let turns = ActiveTurns::default();
@@ -123,8 +168,8 @@ mod tests {
     #[test]
     fn capacity_is_explicit_and_finishing_releases_it() {
         let turns = ActiveTurns {
-            active: Mutex::new(HashMap::new()),
             capacity: 2,
+            ..Default::default()
         };
         let a = SessionId::new("a");
         let b = SessionId::new("b");
