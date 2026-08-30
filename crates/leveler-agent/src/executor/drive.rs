@@ -1883,6 +1883,7 @@ impl Executor {
                                                 leveler_lifecycle::RequirementEvidence {
                                                     strength: a.strength,
                                                     detail: a.evidence.clone(),
+                                                    refs: a.refs.clone(),
                                                 },
                                             );
                                         }

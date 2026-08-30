@@ -1333,6 +1333,7 @@ async fn an_explicit_test_obligation_backed_only_by_prose_refuses_completion() {
             kind: leveler_lifecycle::RequirementKind::Behavior,
             source: leveler_lifecycle::RequirementSource::OriginalGoal,
             status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
             evidence: Vec::new(),
         },
         leveler_lifecycle::CompletionRequirement {
@@ -1341,6 +1342,7 @@ async fn an_explicit_test_obligation_backed_only_by_prose_refuses_completion() {
             kind: leveler_lifecycle::RequirementKind::Verification,
             source: leveler_lifecycle::RequirementSource::OriginalGoal,
             status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
             evidence: Vec::new(),
         },
     ]);
@@ -1418,6 +1420,7 @@ async fn a_mechanically_backed_obligation_completes() {
             kind: leveler_lifecycle::RequirementKind::Behavior,
             source: leveler_lifecycle::RequirementSource::OriginalGoal,
             status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
             evidence: Vec::new(),
         },
     ]);
@@ -1559,6 +1562,7 @@ async fn a_resumed_run_keeps_the_obligations_it_already_had() {
                 kind: leveler_lifecycle::RequirementKind::Verification,
                 source: leveler_lifecycle::RequirementSource::OriginalGoal,
                 status: leveler_lifecycle::RequirementStatus::Pending,
+                evidence_policy: None,
                 evidence: Vec::new(),
             },
         ])),
@@ -1637,6 +1641,7 @@ async fn a_requirement_the_contract_missed_still_refuses_completion() {
             kind: leveler_lifecycle::RequirementKind::Behavior,
             source: leveler_lifecycle::RequirementSource::OriginalGoal,
             status: leveler_lifecycle::RequirementStatus::Pending,
+            evidence_policy: None,
             evidence: Vec::new(),
         },
     ]);

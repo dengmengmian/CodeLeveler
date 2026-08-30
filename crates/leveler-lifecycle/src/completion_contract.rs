@@ -47,16 +47,6 @@ pub enum RequirementKind {
     Other,
 }
 
-impl RequirementKind {
-    /// Whether a claim of satisfaction must be backed by a recorded fact.
-    fn demands_mechanical_evidence(self) -> bool {
-        matches!(
-            self,
-            RequirementKind::Verification | RequirementKind::Deliverable
-        )
-    }
-}
-
 /// Where the obligation came from. Only the user can create one: the executor
 /// cannot mint requirements for itself, and — more importantly — cannot retire
 /// one by restating the task in easier words.
@@ -95,6 +85,12 @@ pub enum EvidenceStrength {
 pub struct RequirementEvidence {
     pub strength: EvidenceStrength,
     pub detail: String,
+    /// Durable ids this evidence points at — the tool calls that made the
+    /// change or ran the check. A claim that cites nothing resolvable is
+    /// prose, and prose is not a binding: the runtime resolves these against
+    /// the ledger rather than taking the description's word for it.
+    #[serde(default)]
+    pub refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +102,11 @@ pub struct CompletionRequirement {
     pub kind: RequirementKind,
     pub source: RequirementSource,
     pub status: RequirementStatus,
+    /// What proof this obligation demands. Fixed when the obligation is
+    /// derived — before the work starts and before anyone knows what evidence
+    /// will happen to exist — so it cannot be relaxed to fit what turned up.
+    #[serde(default)]
+    pub evidence_policy: Option<EvidencePolicy>,
     pub evidence: Vec<RequirementEvidence>,
 }
 
@@ -115,6 +116,45 @@ impl CompletionRequirement {
             .iter()
             .any(|e| e.strength == EvidenceStrength::Mechanical)
     }
+}
+
+/// What proof an obligation demands.
+///
+/// The kind says what is owed; this says how it may be proven. Two obligations
+/// that are both `Verification` can need completely different evidence, and
+/// conflating them cost one failure in each direction: "`go test ./...` must
+/// pass" was refused while four green runs sat in the ledger, and "the boundary
+/// rule is covered by a test" would be discharged by a pre-existing suite going
+/// green over code that added no test at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidencePolicy {
+    /// Named commands must have run and succeeded. The runtime answers this
+    /// from its own record; no reading of the work is involved.
+    CommandSuccess {
+        /// Normalized command fingerprints, matched against the ledger.
+        commands: Vec<String>,
+        mode: CommandMode,
+    },
+    /// A concrete test must address the obligation AND have been exercised.
+    /// Neither half is enough: a suite going green says nothing about whether
+    /// the required case exists, and a cited test that never ran proves
+    /// nothing about whether it passes.
+    TestCoverage,
+    /// The proof standard could not be determined. Fails closed — guessing
+    /// "any green check" here is exactly how a missing test gets waved
+    /// through.
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandMode {
+    /// Every named command must have succeeded — the default for "X and Y
+    /// must pass", where satisfying one is not satisfying the obligation.
+    All,
+    /// Any one of them suffices, and only when the wording actually says so.
+    Any,
 }
 
 /// Why an obligation is still open. The executor needs to know which of these
@@ -216,19 +256,42 @@ impl CompletionContract {
         if r.status != RequirementStatus::Satisfied {
             return false;
         }
-        if !r.kind.demands_mechanical_evidence() {
-            return true;
-        }
-        if !r.has_mechanical_evidence() {
-            return false;
-        }
         match r.kind {
-            // A demonstration is only a demonstration over the tree that
-            // exists now: a green check followed by more edits proves nothing
-            // about what those edits did.
-            RequirementKind::Verification => ledger.has_fresh_successful_verify(),
-            // Nothing changed means nothing was delivered.
-            RequirementKind::Deliverable => !ledger.mutations.is_empty(),
+            // The proof standard was fixed when the obligation was derived.
+            // Asking the judge's label first was an inversion that cost a
+            // correct run — four green checks sat in the ledger while the
+            // obligation was refused because the judge had described them in
+            // prose. The model may say what evidence means; it does not decide
+            // whether the runtime looks.
+            RequirementKind::Verification => match r.evidence_policy.as_ref() {
+                Some(EvidencePolicy::CommandSuccess { commands, mode }) => {
+                    let satisfied = |c: &String| ledger.fresh_successful_command(c);
+                    match mode {
+                        CommandMode::All => !commands.is_empty() && commands.iter().all(satisfied),
+                        CommandMode::Any => commands.iter().any(satisfied),
+                    }
+                }
+                // Both halves, or neither counts. A binding that resolves to
+                // nothing is a sentence, and a green suite over code that
+                // added no test says nothing about the case that was asked for.
+                Some(EvidencePolicy::TestCoverage) => {
+                    r.evidence
+                        .iter()
+                        .flat_map(|e| e.refs.iter())
+                        .any(|id| ledger.resolves_evidence_ref(id))
+                        && ledger.has_fresh_successful_verify()
+                }
+                // No policy is not a licence. Guessing "any green check" here
+                // is precisely how a missing test gets waved through.
+                Some(EvidencePolicy::Unresolved) | None => false,
+            },
+            // Unchanged: nothing changed means nothing was delivered, and the
+            // judge must still have claimed mechanical backing. What proves a
+            // specific deliverable exists is its own question.
+            RequirementKind::Deliverable => {
+                r.has_mechanical_evidence() && !ledger.mutations.is_empty()
+            }
+            // Not everything a user asks for is machine-checkable.
             _ => true,
         }
     }
@@ -246,6 +309,7 @@ mod tests {
             kind,
             source: RequirementSource::OriginalGoal,
             status: RequirementStatus::Pending,
+            evidence_policy: None,
             evidence: Vec::new(),
         }
     }
@@ -272,6 +336,7 @@ mod tests {
         r.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Semantic,
             detail: "the summary no longer prints invalid rows".into(),
+            refs: Vec::new(),
         });
         let contract = CompletionContract::new(vec![r]);
         assert!(
@@ -292,6 +357,7 @@ mod tests {
         r.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Semantic,
             detail: "I added a test for the boundary rule".into(),
+            refs: Vec::new(),
         });
         let contract = CompletionContract::new(vec![r]);
         let open = contract.unsatisfied_material(&EvidenceLedger::default());
@@ -311,6 +377,13 @@ mod tests {
         r.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Mechanical,
             detail: "go test ./...".into(),
+            refs: Vec::new(),
+        });
+        // Under V1 the proof standard is explicit: this obligation names a
+        // command, so that command having run green is what settles it.
+        r.evidence_policy = Some(EvidencePolicy::CommandSuccess {
+            commands: vec!["go\u{1f}test".into()],
+            mode: CommandMode::All,
         });
         let contract = CompletionContract::new(vec![r]);
         let mut ledger = EvidenceLedger::default();
@@ -332,6 +405,7 @@ mod tests {
         r.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Mechanical,
             detail: "go test ./...".into(),
+            refs: Vec::new(),
         });
         let contract = CompletionContract::new(vec![r]);
         let mut ledger = EvidenceLedger::default();
@@ -391,6 +465,7 @@ mod tests {
         unproven.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Semantic,
             detail: "I added a test".into(),
+            refs: Vec::new(),
         });
 
         let contract = CompletionContract::new(vec![pending, blocked, unproven]);
@@ -426,5 +501,338 @@ mod tests {
             CompletionContract::new(vec![requirement("r1", RequirementKind::Behavior)])
                 .accounts_for_anything()
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_policy_tests {
+    use super::*;
+    use crate::EvidenceLedger;
+
+    const BUILD: &str = "go\u{1f}build\u{1f}./...";
+    const TEST: &str = "go\u{1f}test\u{1f}./...";
+
+    fn requirement(
+        text: &str,
+        policy: EvidencePolicy,
+        evidence: Vec<RequirementEvidence>,
+    ) -> CompletionRequirement {
+        CompletionRequirement {
+            id: "R6".into(),
+            text: text.into(),
+            kind: RequirementKind::Verification,
+            source: RequirementSource::OriginalGoal,
+            status: RequirementStatus::Satisfied,
+            evidence_policy: Some(policy),
+            evidence,
+        }
+    }
+
+    fn prose(strength: EvidenceStrength) -> Vec<RequirementEvidence> {
+        vec![RequirementEvidence {
+            strength,
+            detail: "verification is recorded as green".into(),
+            refs: Vec::new(),
+        }]
+    }
+
+    fn cited(strength: EvidenceStrength, refs: &[&str]) -> Vec<RequirementEvidence> {
+        vec![RequirementEvidence {
+            strength,
+            detail: "the regression test for this behaviour".into(),
+            refs: refs.iter().map(|r| r.to_string()).collect(),
+        }]
+    }
+
+    fn debt(r: CompletionRequirement, mut ledger: EvidenceLedger) -> Option<String> {
+        ledger.completion_contract = Some(CompletionContract::new(vec![r]));
+        ledger.completion_debt()
+    }
+
+    fn edited() -> EvidenceLedger {
+        let mut l = EvidenceLedger::default();
+        l.record_mutation(
+            "c1",
+            "apply_patch",
+            vec!["internal/report/summary.go".into()],
+        );
+        l
+    }
+
+    // ── CommandSuccess: the HC-002 direction ────────────────────────────
+
+    /// The obligation named two commands and both ran green over the current
+    /// tree. That the judge described them in prose is beside the point —
+    /// this is a question about the record, and the record answers it.
+    #[test]
+    fn named_commands_that_ran_green_discharge_the_obligation() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", BUILD, 0);
+        ledger.record_verify("v2", TEST, 0);
+        let r = requirement(
+            "`go build ./...` and `go test ./...` must pass.",
+            EvidencePolicy::CommandSuccess {
+                commands: vec![BUILD.into(), TEST.into()],
+                mode: CommandMode::All,
+            },
+            prose(EvidenceStrength::Semantic),
+        );
+        assert_eq!(debt(r, ledger), None);
+    }
+
+    /// "X and Y must pass" is not satisfied by Y alone.
+    #[test]
+    fn one_of_two_required_commands_is_not_enough() {
+        let mut ledger = edited();
+        ledger.record_verify("v2", TEST, 0);
+        let r = requirement(
+            "both must pass",
+            EvidencePolicy::CommandSuccess {
+                commands: vec![BUILD.into(), TEST.into()],
+                mode: CommandMode::All,
+            },
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(debt(r, ledger).is_some());
+    }
+
+    /// A different command going green is not the named one going green.
+    #[test]
+    fn a_different_command_does_not_discharge_the_named_one() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", "go\u{1f}test\u{1f}./pkg/other", 0);
+        let r = requirement(
+            "`go test ./...` must pass",
+            EvidencePolicy::CommandSuccess {
+                commands: vec![TEST.into()],
+                mode: CommandMode::All,
+            },
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(debt(r, ledger).is_some());
+    }
+
+    /// A run invalidated by a later edit proves nothing about what shipped.
+    #[test]
+    fn a_stale_command_result_does_not_discharge() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 0);
+        ledger.record_mutation("c2", "apply_patch", vec!["b.go".into()]);
+        let r = requirement(
+            "`go test ./...` must pass",
+            EvidencePolicy::CommandSuccess {
+                commands: vec![TEST.into()],
+                mode: CommandMode::All,
+            },
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(debt(r, ledger).is_some());
+    }
+
+    #[test]
+    fn a_failing_command_does_not_discharge() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 1);
+        let r = requirement(
+            "`go test ./...` must pass",
+            EvidencePolicy::CommandSuccess {
+                commands: vec![TEST.into()],
+                mode: CommandMode::All,
+            },
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(debt(r, ledger).is_some());
+    }
+
+    /// Calling prose "mechanical" does not make a command have run.
+    #[test]
+    fn a_mechanical_label_cannot_fabricate_a_command_result() {
+        let r = requirement(
+            "`go test ./...` must pass",
+            EvidencePolicy::CommandSuccess {
+                commands: vec![TEST.into()],
+                mode: CommandMode::All,
+            },
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(debt(r, edited()).is_some());
+    }
+
+    // ── TestCoverage: the scale-s800 direction ──────────────────────────
+
+    /// THE scale-s800 false completion. Production code changed, no test was
+    /// written, and the pre-existing suite went green. A suite passing says
+    /// nothing about whether the case the user asked for is covered.
+    #[test]
+    fn a_green_suite_alone_does_not_discharge_a_coverage_obligation() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 0);
+        let r = requirement(
+            "the boundary rule is covered by a test",
+            EvidencePolicy::TestCoverage,
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(
+            debt(r, ledger).is_some(),
+            "a green suite is not the required test"
+        );
+    }
+
+    /// A cited test that actually exists, plus a green run over the current
+    /// tree, discharges it. Both halves are needed and both are present.
+    #[test]
+    fn a_cited_test_that_ran_green_discharges_the_coverage_obligation() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation(
+            "c9",
+            "apply_patch",
+            vec!["internal/window/window_test.go".into()],
+        );
+        ledger.record_verify("v1", TEST, 0);
+        let r = requirement(
+            "the boundary rule is covered by a test",
+            EvidencePolicy::TestCoverage,
+            cited(EvidenceStrength::Semantic, &["c9"]),
+        );
+        assert_eq!(debt(r, ledger), None);
+    }
+
+    /// An existing test the agent did not have to write is citable too: the
+    /// binding is to the run that exercised it, not to a file having changed.
+    #[test]
+    fn an_existing_test_can_be_cited_through_the_run_that_exercised_it() {
+        let mut ledger = edited();
+        ledger.record_verify(
+            "v7",
+            "go\u{1f}test\u{1f}./internal/report\u{1f}-run\u{1f}TestBoundary",
+            0,
+        );
+        ledger.record_verify("v8", TEST, 0);
+        let r = requirement(
+            "the boundary rule is covered by a test",
+            EvidencePolicy::TestCoverage,
+            cited(EvidenceStrength::Observed, &["v7"]),
+        );
+        assert_eq!(debt(r, ledger), None);
+    }
+
+    /// A citation to something that never happened is prose with a reference
+    /// number on it.
+    #[test]
+    fn an_unresolvable_citation_does_not_discharge() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 0);
+        let r = requirement(
+            "the boundary rule is covered by a test",
+            EvidencePolicy::TestCoverage,
+            cited(EvidenceStrength::Mechanical, &["c-never-happened"]),
+        );
+        assert!(debt(r, ledger).is_some());
+    }
+
+    /// Cited test, but nothing ran it since the last edit.
+    #[test]
+    fn a_cited_test_that_never_ran_does_not_discharge() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("c9", "apply_patch", vec!["window_test.go".into()]);
+        let r = requirement(
+            "the boundary rule is covered by a test",
+            EvidencePolicy::TestCoverage,
+            cited(EvidenceStrength::Mechanical, &["c9"]),
+        );
+        assert!(debt(r, ledger).is_some());
+    }
+
+    /// Cited test, ran green, then the code changed again.
+    #[test]
+    fn a_cited_test_with_a_stale_run_does_not_discharge() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("c9", "apply_patch", vec!["window_test.go".into()]);
+        ledger.record_verify("v1", TEST, 0);
+        ledger.record_mutation("c10", "apply_patch", vec!["window.go".into()]);
+        let r = requirement(
+            "the boundary rule is covered by a test",
+            EvidencePolicy::TestCoverage,
+            cited(EvidenceStrength::Mechanical, &["c9"]),
+        );
+        assert!(debt(r, ledger).is_some());
+    }
+
+    // ── policy integrity ────────────────────────────────────────────────
+
+    /// An obligation whose proof standard could not be determined fails
+    /// closed. Falling back to "any green check" is how the coverage case got
+    /// waved through in the first place.
+    #[test]
+    fn an_unresolved_policy_never_discharges() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 0);
+        let unresolved = requirement(
+            "something verifiable",
+            EvidencePolicy::Unresolved,
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(debt(unresolved, ledger.clone()).is_some());
+        let mut missing = requirement(
+            "something verifiable",
+            EvidencePolicy::TestCoverage,
+            prose(EvidenceStrength::Mechanical),
+        );
+        missing.evidence_policy = None;
+        assert!(
+            debt(missing, ledger).is_some(),
+            "no policy is not a licence"
+        );
+    }
+
+    /// A coverage obligation does not become a command obligation because the
+    /// only evidence that turned up was a green suite.
+    #[test]
+    fn a_coverage_obligation_is_not_downgraded_by_the_evidence_that_exists() {
+        let mut ledger = edited();
+        ledger.record_verify("v1", BUILD, 0);
+        ledger.record_verify("v2", TEST, 0);
+        let r = requirement(
+            "the boundary rule is covered by a test",
+            EvidencePolicy::TestCoverage,
+            prose(EvidenceStrength::Mechanical),
+        );
+        assert!(
+            debt(r, ledger).is_some(),
+            "every command in the world going green is still not the test"
+        );
+    }
+
+    /// Requirements without a mechanical predicate keep their semantics.
+    #[test]
+    fn semantic_requirements_are_unchanged() {
+        let r = CompletionRequirement {
+            id: "R1".into(),
+            text: "the summary reads clearly".into(),
+            kind: RequirementKind::Behavior,
+            source: RequirementSource::OriginalGoal,
+            status: RequirementStatus::Satisfied,
+            evidence_policy: None,
+            evidence: prose(EvidenceStrength::Semantic),
+        };
+        assert_eq!(debt(r, EvidenceLedger::default()), None);
+    }
+
+    /// The policy rides the durable contract, so a resumed run cannot end up
+    /// with a weaker proof standard than the one it started under.
+    #[test]
+    fn the_policy_survives_serialization() {
+        let r = requirement(
+            "`go test ./...` must pass",
+            EvidencePolicy::CommandSuccess {
+                commands: vec![TEST.into()],
+                mode: CommandMode::All,
+            },
+            cited(EvidenceStrength::Mechanical, &["v1"]),
+        );
+        let contract = CompletionContract::new(vec![r]);
+        let round: CompletionContract =
+            serde_json::from_str(&serde_json::to_string(&contract).unwrap()).unwrap();
+        assert_eq!(round, contract);
     }
 }

@@ -74,6 +74,10 @@ pub(crate) struct RequirementAccounting {
     pub satisfied: bool,
     pub evidence: String,
     pub strength: leveler_lifecycle::EvidenceStrength,
+    /// Tool-call ids the judge cites. The runtime resolves these against the
+    /// ledger, so an obligation that needs a concrete binding cannot be
+    /// discharged by a sentence that merely sounds like one.
+    pub refs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +188,7 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
             listed.push_str("</obligations_from_the_original_goal>\n");
             (
                 listed,
-                "  \"requirement_accounting\": [\n    {\"id\": \"R1\", \"satisfied\": true|false, \"evidence\": \"...\", \"evidence_strength\": \"mechanical\" | \"observed\" | \"semantic\"}\n  ],\n  \"omitted_requirements\": [\"...\"],\n"
+                "  \"requirement_accounting\": [\n    {\"id\": \"R1\", \"satisfied\": true|false, \"evidence\": \"...\", \"evidence_strength\": \"mechanical\" | \"observed\" | \"semantic\", \"evidence_refs\": [\"tool-call-id\"]}\n  ],\n  \"omitted_requirements\": [\"...\"],\n"
                     .to_string(),
                 // The obligations already carry the task. What is left for the
                 // judge is the residue: did the list MISS something the user
@@ -196,7 +200,10 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
                  stays unsatisfied. For \"evidence_strength\" use \"mechanical\" \
                  only when a recorded command or file change demonstrates it, \
                  \"observed\" when output was actually seen, and \"semantic\" \
-                 when it is your reading of the work.\n\
+                 when it is your reading of the work. When an obligation asks for \
+                 something to be COVERED BY a test, put the id of the tool \
+                 call that wrote or ran that test in \"evidence_refs\" — a \
+                 description of coverage is not coverage.\n\
                  - Then answer the narrower question this gate exists for: is \
                  there any material requirement in the original wording that \
                  the obligation list does NOT represent? List those in \
@@ -295,6 +302,8 @@ struct RawAccounting {
     evidence: String,
     #[serde(default)]
     evidence_strength: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
 }
 
 /// Every balanced top-level `{…}` span in `text`, string-aware (braces inside
@@ -438,6 +447,7 @@ fn parse_outcome(text: &str, latency_ms: u64, expects_accounting: bool) -> Recon
                 "observed" => leveler_lifecycle::EvidenceStrength::Observed,
                 _ => leveler_lifecycle::EvidenceStrength::Semantic,
             },
+            refs: a.evidence_refs,
         })
         .collect();
     ReconcileOutcome {
@@ -900,6 +910,7 @@ mod prompt_render_tests {
                 kind: leveler_lifecycle::RequirementKind::Behavior,
                 source: leveler_lifecycle::RequirementSource::OriginalGoal,
                 status: leveler_lifecycle::RequirementStatus::Pending,
+                evidence_policy: None,
                 evidence: Vec::new(),
             },
         ]);

@@ -123,6 +123,32 @@ impl EvidenceLedger {
     }
 
     /// Successful verify that is still valid after the latest mutation.
+    /// Did this exact command run green over the tree as it stands?
+    ///
+    /// Matched on the normalized fingerprint the ledger already records, so
+    /// "`go test ./...` must pass" is not satisfied by some other command
+    /// that happened to succeed. The runtime answers this from its own
+    /// record; no reading of anyone's description is involved.
+    pub fn fresh_successful_command(&self, fingerprint: &str) -> bool {
+        let last_mut = self.last_mutation_seq();
+        self.verifications.iter().any(|v| {
+            v.exit_code == 0
+                && v.after_mutation_seq >= last_mut
+                && last_mut > 0
+                && v.command_fingerprint == fingerprint
+        })
+    }
+
+    /// Does this durable id name something that actually happened?
+    ///
+    /// Evidence that cites nothing resolvable is prose wearing a citation's
+    /// clothes, so a binding is checked against the record rather than
+    /// believed.
+    pub fn resolves_evidence_ref(&self, id: &str) -> bool {
+        self.mutations.iter().any(|m| m.tool_call_id == id)
+            || self.verifications.iter().any(|v| v.tool_call_id == id)
+    }
+
     pub fn has_fresh_successful_verify(&self) -> bool {
         let last_mut = self.last_mutation_seq();
         self.verifications
@@ -730,6 +756,7 @@ mod completion_debt_tests {
             kind: RequirementKind::Behavior,
             source: RequirementSource::OriginalGoal,
             status,
+            evidence_policy: None,
             evidence: Vec::new(),
         }])
     }
@@ -800,6 +827,7 @@ mod terminal_truth_matrix {
             kind,
             source: RequirementSource::OriginalGoal,
             status,
+            evidence_policy: None,
             evidence: Vec::new(),
         }
     }
@@ -832,6 +860,7 @@ mod terminal_truth_matrix {
         r.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Semantic,
             detail: "I added a test for the boundary".into(),
+            refs: Vec::new(),
         });
         let mut l = ledger_with(vec![r]);
         l.record_mutation(
@@ -863,6 +892,7 @@ mod terminal_truth_matrix {
         r.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Mechanical,
             detail: "go test ./...".into(),
+            refs: Vec::new(),
         });
         let mut l = ledger_with(vec![r]);
         l.record_mutation("c1", "apply_patch", vec!["a.go".into()]);
@@ -880,6 +910,11 @@ mod terminal_truth_matrix {
         r.evidence.push(RequirementEvidence {
             strength: EvidenceStrength::Mechanical,
             detail: "go test ./... covering the boundary".into(),
+            refs: Vec::new(),
+        });
+        r.evidence_policy = Some(crate::EvidencePolicy::CommandSuccess {
+            commands: vec!["go\u{1f}test".into()],
+            mode: crate::CommandMode::All,
         });
         let mut l = ledger_with(vec![r]);
         l.record_mutation(

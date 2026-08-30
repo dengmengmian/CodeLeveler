@@ -48,10 +48,21 @@ fn instruction(goal: &str) -> String {
          \n\
          <task>\n{goal}\n</task>\n\
          \n\
+         For a \"verification\" obligation, say how it can be proven:\n\
+         - if the task names commands that must run or pass, list them in \
+         \"commands\" exactly as written (program and arguments), and set \
+         \"proof\": \"command_success\";\n\
+         - if the task asks for something to be COVERED BY a test rather than \
+         for a command to pass, set \"proof\": \"test_coverage\" and leave \
+         \"commands\" empty. \"go test must pass\" is a command; \"the \
+         boundary rule is covered by a test\" is coverage, and a suite passing \
+         is not by itself that coverage.\n\
+         - if neither fits, omit \"proof\".\n\
+         \n\
          Answer with ONLY a JSON object, no prose around it:\n\
          {{\n\
            \"requirements\": [\n\
-             {{\"text\": \"...\", \"kind\": \"behavior\"}}\n\
+             {{\"text\": \"...\", \"kind\": \"behavior\", \"proof\": \"command_success\", \"commands\": [\"go test ./...\"]}}\n\
            ]\n\
          }}"
     )
@@ -69,6 +80,10 @@ struct RawRequirement {
     text: String,
     #[serde(default)]
     kind: String,
+    #[serde(default)]
+    proof: String,
+    #[serde(default)]
+    commands: Vec<String>,
 }
 
 fn kind_from(raw: &str) -> RequirementKind {
@@ -78,6 +93,41 @@ fn kind_from(raw: &str) -> RequirementKind {
         "constraint" => RequirementKind::Constraint,
         "behavior" | "behaviour" => RequirementKind::Behavior,
         _ => RequirementKind::Other,
+    }
+}
+
+/// The proof standard for an obligation, fixed here — before the work starts,
+/// and so before anyone knows what evidence will happen to exist.
+///
+/// Only `verification` obligations carry one. An unrecognised or absent proof
+/// standard is `Unresolved` rather than a guess: assuming "any green check"
+/// is how an unwritten test gets waved through.
+fn policy_from(raw: &RawRequirement, kind: RequirementKind) -> Option<EvidencePolicy> {
+    if kind != RequirementKind::Verification {
+        return None;
+    }
+    match raw.proof.trim().to_ascii_lowercase().as_str() {
+        "command_success" if !raw.commands.is_empty() => Some(EvidencePolicy::CommandSuccess {
+            commands: raw
+                .commands
+                .iter()
+                .map(|c| {
+                    // Reuse the ledger's own normalization so a stated
+                    // command and a recorded one are the same string.
+                    let mut parts = c.split_whitespace().map(str::to_string);
+                    let program = parts.next().unwrap_or_default();
+                    let args: Vec<String> = parts.collect();
+                    leveler_lifecycle::EvidenceLedger::normalize_command_fingerprint(
+                        &program, &args,
+                    )
+                })
+                .collect(),
+            // "X and Y must pass" is not satisfied by Y. Only wording that
+            // actually offers a choice would justify Any, and nothing does yet.
+            mode: CommandMode::All,
+        }),
+        "test_coverage" => Some(EvidencePolicy::TestCoverage),
+        _ => Some(EvidencePolicy::Unresolved),
     }
 }
 
@@ -126,13 +176,17 @@ pub(crate) async fn derive_contract(
         .into_iter()
         .filter(|r| !r.text.trim().is_empty())
         .enumerate()
-        .map(|(i, r)| CompletionRequirement {
-            id: format!("R{}", i + 1),
-            text: r.text.trim().to_string(),
-            kind: kind_from(&r.kind),
-            source: RequirementSource::OriginalGoal,
-            status: RequirementStatus::Pending,
-            evidence: Vec::new(),
+        .map(|(i, r)| {
+            let kind = kind_from(&r.kind);
+            CompletionRequirement {
+                id: format!("R{}", i + 1),
+                text: r.text.trim().to_string(),
+                kind,
+                source: RequirementSource::OriginalGoal,
+                status: RequirementStatus::Pending,
+                evidence_policy: policy_from(&r, kind),
+                evidence: Vec::new(),
+            }
         })
         .collect();
     if requirements.is_empty() {
@@ -142,8 +196,8 @@ pub(crate) async fn derive_contract(
 }
 
 use leveler_lifecycle::{
-    CompletionContract, CompletionRequirement, RequirementKind, RequirementSource,
-    RequirementStatus,
+    CommandMode, CompletionContract, CompletionRequirement, EvidencePolicy, RequirementKind,
+    RequirementSource, RequirementStatus,
 };
 use leveler_model::{Message, ModelRef, ModelRequest, ModelRuntime, Role, ToolChoice};
 use tokio_util::sync::CancellationToken;
