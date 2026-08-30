@@ -288,6 +288,32 @@ fn classify_runtime(
     }
 }
 
+/// Did the replacement actually become the build we expected?
+///
+/// Spawning successfully proves nothing: the process that came up has to say
+/// it is the build this client is, or the runtime was not replaced — it was
+/// merely restarted. Exactly one verdict, and no retry: a replacement that
+/// keeps coming back as the wrong build is something to report, not something
+/// to keep relaunching.
+#[cfg(unix)]
+fn verify_replacement(
+    reported: Option<&leveler_core::BuildIdentity>,
+    expected: &leveler_core::BuildIdentity,
+) -> anyhow::Result<()> {
+    match classify_runtime(reported, expected) {
+        RuntimeConsistency::Current => Ok(()),
+        RuntimeConsistency::Outdated { runtime, expected } => anyhow::bail!(
+            "the local runtime started as {} but this CodeLeveler is {}; \
+             the runtime was not replaced correctly",
+            runtime.short(),
+            expected.short()
+        ),
+        RuntimeConsistency::Unknown => {
+            anyhow::bail!("the local runtime started but did not report a usable build identity")
+        }
+    }
+}
+
 /// Ask the runtime who it is, then classify the answer.
 #[cfg(unix)]
 async fn runtime_is_current(client: &LocalSocketRuntimeClient) -> RuntimeConsistency {
@@ -449,18 +475,9 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
     // say it is the build we expected, or the bootstrap failed — and it fails
     // once, without a second attempt, because a restart loop over a build that
     // keeps coming back wrong helps nobody.
-    match runtime_is_current(&client).await {
-        RuntimeConsistency::Current => Ok(client),
-        RuntimeConsistency::Outdated { runtime, expected } => anyhow::bail!(
-            "the local runtime started as {} but this CodeLeveler is {}; \
-             the runtime was not replaced correctly",
-            runtime.short(),
-            expected.short()
-        ),
-        RuntimeConsistency::Unknown => {
-            anyhow::bail!("the local runtime started but did not report a usable build identity")
-        }
-    }
+    let reported = client.runtime_info().await.ok().map(|info| info.build);
+    verify_replacement(reported.as_ref(), &leveler_core::BuildIdentity::current())?;
+    Ok(client)
 }
 
 /// Bind the TUI-embedded Web UI against an existing local runtime service.
@@ -2135,5 +2152,59 @@ mod runtime_consistency_tests {
                 "a dirty build must never be reused: {reported:?} vs {expected:?}"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod replacement_verification_tests {
+    use super::verify_replacement;
+    use leveler_core::BuildIdentity;
+
+    fn build(revision: &str, dirty: bool) -> BuildIdentity {
+        BuildIdentity {
+            version: "0.2.0-beta.1".into(),
+            revision: revision.into(),
+            dirty,
+        }
+    }
+
+    #[test]
+    fn a_replacement_that_is_the_expected_build_is_accepted() {
+        let expected = build("newbuild", false);
+        assert!(verify_replacement(Some(&expected.clone()), &expected).is_ok());
+    }
+
+    /// Starting a process is not replacing a runtime. If what came up is some
+    /// third build, the bootstrap fails — and it fails once, since relaunching
+    /// a wrong build repeatedly only burns the machine.
+    #[test]
+    fn a_replacement_of_the_wrong_build_is_rejected_once() {
+        let err = verify_replacement(
+            Some(&build("someothersha", false)),
+            &build("expected", false),
+        )
+        .expect_err("a different build is not a replacement");
+        let message = err.to_string();
+        assert!(message.contains("not replaced correctly"), "{message}");
+        assert!(
+            message.contains("someothersha") && message.contains("expected"),
+            "the failure names both builds so it can be acted on: {message}"
+        );
+    }
+
+    /// A replacement that came up but says nothing about itself cannot be
+    /// verified, so it is not accepted either — silence is not proof.
+    #[test]
+    fn a_replacement_that_reports_no_identity_is_rejected() {
+        assert!(verify_replacement(None, &build("expected", false)).is_err());
+        assert!(
+            verify_replacement(Some(&BuildIdentity::default()), &build("expected", false)).is_err()
+        );
+    }
+
+    /// A dirty replacement is not the clean build that was expected.
+    #[test]
+    fn a_dirty_replacement_is_rejected() {
+        assert!(verify_replacement(Some(&build("same", true)), &build("same", false)).is_err());
     }
 }

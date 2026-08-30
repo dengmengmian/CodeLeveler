@@ -471,3 +471,77 @@ async fn a_live_background_task_holds_the_handover_open() {
         .await
         .expect("once nothing is left running, the runtime retires");
 }
+
+/// A running turn holds the handover open — and with it every child agent,
+/// because a child cannot outlive the turn that spawned it: `drive` drains
+/// its background children on every exit path before returning, so a live
+/// child is always a live turn. That is why retirement asks about turns and
+/// background tasks and does not need a third counter for children.
+#[tokio::test]
+async fn a_running_turn_holds_the_handover_open() {
+    let (base_url, model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let token = tokio_util::sync::CancellationToken::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new(
+            app,
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+        .with_process_shutdown(token.clone()),
+    );
+
+    let bootstrap = runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "hold the turn open".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let session = bootstrap.session.id.clone();
+    runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "work forever".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert_turn_running(&runtime, &session).await;
+
+    runtime
+        .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+            reason: leveler_client_protocol::RestartReason::BuildMismatch,
+        })
+        .await
+        .unwrap();
+
+    // The turn was already admitted, so it keeps running: retiring stops new
+    // work, it does not cancel work in flight.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), token.cancelled())
+            .await
+            .is_err(),
+        "a runtime with a live turn has not finished; it must not retire"
+    );
+    assert!(runtime.runtime_info().await.unwrap().health.active_turns > 0);
+
+    // And no new work gets in behind it, which is what stops the handover
+    // from being postponed forever.
+    assert!(
+        !runtime.runtime_info().await.unwrap().health.accepting_work,
+        "a retiring runtime does not take new work"
+    );
+
+    model_stop.cancel();
+}
