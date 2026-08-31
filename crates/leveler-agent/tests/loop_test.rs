@@ -1103,13 +1103,17 @@ async fn an_unreachable_judge_model_fails_closed_without_same_model_fallback() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// §20: the shipped default ceiling stays 60s — the experiment configures its
-/// own, it does not move everyone's.
+/// The shipped default ceiling is one number everyone gets, so it is pinned
+/// here — an experiment configures its own rather than moving everyone's.
+///
+/// 180s, not the original 60s: measured on a saved HC-002 judgment, a
+/// contract-accounting verdict took 21.1s min / 53.6s median / 113.9s max, so
+/// the old ceiling refused correct completions on ordinary latency (F2).
 #[test]
-fn the_default_gate_ceiling_is_sixty_seconds() {
+fn the_default_gate_ceiling_clears_the_measured_judgment_tail() {
     assert_eq!(
         leveler_agent::DEFAULT_RECONCILE_TIMEOUT,
-        std::time::Duration::from_secs(60)
+        std::time::Duration::from_secs(180)
     );
 }
 

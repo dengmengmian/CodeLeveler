@@ -27,13 +27,23 @@ use tokio_util::sync::CancellationToken;
 /// Never let the final gate stall a run: an unanswered reconciliation is a
 /// refusal (fail closed), not a hang and not an implicit pass.
 ///
-/// This is the DEFAULT ceiling, not a semantic invariant. 60s was calibrated
-/// when the judge was the executor's own flash model (13.2s median, 4.5x
-/// headroom); a slower independent judge needs its own ceiling, so the host
-/// may configure one (`agents.completion_judge_timeout_seconds`). The ceiling
-/// bounds ONE request: the first judgment and the single format repair each
-/// get it, exactly as they each got 60s before.
-pub const DEFAULT_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// This is the DEFAULT ceiling, not a semantic invariant — an operational
+/// budget. The host may still configure its own
+/// (`agents.completion_judge_timeout_seconds`). The ceiling bounds ONE
+/// request: the first judgment and the single format repair each get it.
+///
+/// 60s was calibrated when the gate asked one free-form question of the
+/// executor's own flash model (13.2s median, 4.5x headroom). Accounting for a
+/// Completion Contract obligation by obligation is a much larger answer, and
+/// the budget stopped covering it: replaying ONE saved HC-002 judgment
+/// (7 obligations, `deepseek-v4-flash`) 10 times measured 21.1s min, 53.6s
+/// median, 109.8s p90, 113.9s max — every call answered, 2 of 10 only after
+/// more than 60s. The ceiling was cutting the distribution near its middle,
+/// so correct completions were refused as `Unavailable` (HC-002 Run 1). 180s
+/// clears the measured tail with headroom and still ends the stall; it does
+/// not change what any verdict MEANS, and an unanswered judgment still fails
+/// closed.
+pub const DEFAULT_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// HC002-F1: thinking-flag models spend completion budget on reasoning before
 /// any content. At the profile-default max effort, 1024 tokens were consumed
 /// ENTIRELY by reasoning (finish=length, empty content → "no JSON object"),
@@ -963,5 +973,146 @@ mod accounting_verdict_tests {
         let out = parse_outcome(text, 1, true);
         assert_eq!(out.verdict, ReconcileVerdict::Uncertain);
         assert!(!out.allows_completion());
+    }
+}
+
+/// F2 availability probe: replay ONE saved reconciliation input against a real
+/// provider N times and report the latency distribution and outcome types.
+///
+/// Measurement only — it changes no product behaviour and is `#[ignore]`d, so
+/// it runs when someone asks for it and never in an ordinary test run:
+///
+/// ```text
+/// LEVELER_F2_INPUT=<saved-input.json> \
+/// LEVELER_F2_BASE_URL=… DEEPSEEK_API_KEY=… LEVELER_F2_MODEL=deepseek-v4-flash \
+/// LEVELER_F2_SAMPLES=10 LEVELER_F2_TIMEOUT_SECS=60 \
+/// cargo test -p leveler-agent --lib reconciliation::probe -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct SavedInput {
+        original_goal: String,
+        claimed_summary: String,
+        recent_claims: String,
+        recent_evidence: String,
+        modified_files: Vec<String>,
+        fresh_verification: bool,
+        contract: Option<leveler_lifecycle::CompletionContract>,
+    }
+
+    fn env(key: &str) -> Option<String> {
+        std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    #[tokio::test]
+    #[ignore = "hits a real provider; run explicitly for an availability measurement"]
+    async fn reconciliation_availability_probe() {
+        let Some(path) = env("LEVELER_F2_INPUT") else {
+            eprintln!("LEVELER_F2_INPUT unset — nothing to measure");
+            return;
+        };
+        let saved: SavedInput =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read saved input"))
+                .expect("parse saved input");
+        let base_url = env("LEVELER_F2_BASE_URL").expect("LEVELER_F2_BASE_URL");
+        let api_key = env("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY");
+        let model_id = env("LEVELER_F2_MODEL").unwrap_or_else(|| "deepseek-v4-flash".to_string());
+        let samples: u32 = env("LEVELER_F2_SAMPLES")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let timeout = std::time::Duration::from_secs(
+            env("LEVELER_F2_TIMEOUT_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        );
+
+        let provider = leveler_provider::ProviderConfig {
+            id: "probe".to_string(),
+            protocol: leveler_model::ProtocolKind::OpenAiChat,
+            base_url,
+            api_key_env: String::new(),
+            api_key: None,
+            headers: Default::default(),
+            timeouts: Default::default(),
+            retry: Default::default(),
+        };
+        // The judged model as the lab configures it: a thinking-flag model with
+        // a 1M window. Only the reasoning style and ids change what is sent.
+        let profile: leveler_provider::ModelConfigFile = serde_json::from_value(serde_json::json!({
+            "id": model_id,
+            "provider": "probe",
+            "model_id": model_id,
+            "protocol": "openai_chat",
+            "capabilities": {
+                "streaming": true, "tool_calling": true, "parallel_tool_calls": false,
+                "structured_output": true, "reasoning": true, "vision": false
+            },
+            "limits": {
+                "context_window": 1_048_576u32, "reliable_context": 786_432u32,
+                "max_output_tokens": 393_216u32, "max_tool_schema_bytes": 65_536u32,
+                "max_parallel_tool_calls": 4u32
+            },
+            "reasoning": {"style": "thinking_flag", "supported_efforts": ["max"], "default_effort": "max"}
+        }))
+        .expect("profile");
+        let registry =
+            leveler_provider::ProviderRegistry::build(leveler_provider::RegistryInputs {
+                // The composition root resolves keys; the registry reads THIS one.
+                providers: vec![(provider, Some(api_key))],
+                models: vec![profile],
+            })
+            .expect("registry");
+        let model = ModelRef::new("probe", model_id);
+
+        println!("attempt,outcome,verdict,failure_kind,latency_ms,repaired");
+        let mut latencies = Vec::new();
+        for attempt in 1..=samples {
+            let outcome = reconcile_completion(
+                &registry,
+                &model,
+                None,
+                timeout,
+                ReconcileInput {
+                    original_goal: &saved.original_goal,
+                    claimed_summary: &saved.claimed_summary,
+                    recent_claims: &saved.recent_claims,
+                    recent_evidence: &saved.recent_evidence,
+                    modified_files: &saved.modified_files,
+                    fresh_verification: saved.fresh_verification,
+                    contract: saved.contract.as_ref(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+            let kind = outcome.failure_kind.unwrap_or("none");
+            let ok = outcome.failure_kind.is_none();
+            println!(
+                "{attempt},{},{:?},{kind},{},{}",
+                if ok { "answered" } else { "refused" },
+                outcome.verdict,
+                outcome.latency_ms,
+                outcome.repaired
+            );
+            if !ok {
+                println!("  reason: {}", outcome.reason);
+            }
+            latencies.push((outcome.latency_ms, ok));
+        }
+        let mut sorted: Vec<u64> = latencies.iter().map(|(ms, _)| *ms).collect();
+        sorted.sort_unstable();
+        let answered = latencies.iter().filter(|(_, ok)| *ok).count();
+        let pick = |q: f64| sorted[((sorted.len() as f64 - 1.0) * q).round() as usize];
+        println!(
+            "summary answered={answered}/{} min={} median={} p90={} max={} timeout_budget_ms={}",
+            latencies.len(),
+            sorted.first().copied().unwrap_or(0),
+            pick(0.5),
+            pick(0.9),
+            sorted.last().copied().unwrap_or(0),
+            timeout.as_millis()
+        );
     }
 }

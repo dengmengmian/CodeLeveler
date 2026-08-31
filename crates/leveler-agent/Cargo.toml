@@ -29,6 +29,9 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 leveler-test-support = { workspace = true }
+# Test-only: the reconciliation availability probe (F2) measures the gate
+# against a real provider, so it needs the same runtime the product uses.
+leveler-provider = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tempfile = "3"
