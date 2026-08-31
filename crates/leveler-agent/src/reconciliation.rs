@@ -144,6 +144,99 @@ impl ReconcileOutcome {
     }
 }
 
+/// One piece of authoritative evidence the judge may cite, named by the
+/// RUNTIME.
+///
+/// The judge is asked which evidence supports an obligation; it is never asked
+/// to produce the runtime's identifier for it. Before this existed the gate
+/// asked for "the id of the tool call", showed the judge no ids, and then
+/// refused every answer it got back — `[]` or a file path — so a
+/// `TestCoverage` obligation could not be discharged by any amount of real,
+/// green, freshly-run testing (scale-s800 F3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvidenceCandidate {
+    /// Opaque handle shown to the judge (`E1`, `E2`, …). Scope is ONE
+    /// reconciliation call, including its format repair.
+    pub id: String,
+    /// The authoritative identity this handle stands for. Never model-written.
+    pub tool_call_id: String,
+    /// `verification` (a command that ran) or `change` (files it wrote).
+    pub kind: &'static str,
+    /// Safe one-line display: the command, or the paths changed.
+    pub detail: String,
+    /// Whether this evidence still stands over the current tree.
+    pub fresh: bool,
+}
+
+/// At most this many candidates of each kind reach the judge, newest first —
+/// the evidence a completion claim can plausibly rest on, not the whole log.
+const MAX_CANDIDATES_PER_KIND: usize = 8;
+
+/// The authoritative evidence of THIS run, named for the judge to cite.
+///
+/// Built from the ledger the runtime already keeps: successful verifications
+/// and recorded mutations. Nothing here comes from prose, filenames guessed
+/// from text, or the judge itself.
+pub(crate) fn evidence_candidates(
+    ledger: &leveler_lifecycle::EvidenceLedger,
+) -> Vec<EvidenceCandidate> {
+    let last_mutation = ledger
+        .mutations
+        .iter()
+        .map(|m| m.seq)
+        .max()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let verifications = ledger
+        .verifications
+        .iter()
+        .rev()
+        .filter(|v| v.exit_code == 0)
+        .take(MAX_CANDIDATES_PER_KIND);
+    for v in verifications {
+        out.push(EvidenceCandidate {
+            id: String::new(),
+            tool_call_id: v.tool_call_id.clone(),
+            kind: "verification",
+            detail: v.command_fingerprint.replace('\u{1f}', " "),
+            fresh: v.after_mutation_seq >= last_mutation && last_mutation > 0,
+        });
+    }
+    for m in ledger.mutations.iter().rev().take(MAX_CANDIDATES_PER_KIND) {
+        out.push(EvidenceCandidate {
+            id: String::new(),
+            tool_call_id: m.tool_call_id.clone(),
+            kind: "change",
+            detail: m.paths.join(", "),
+            fresh: m.seq >= last_mutation,
+        });
+    }
+    // Oldest first, so the ids read in the order the work happened.
+    out.reverse();
+    for (index, candidate) in out.iter_mut().enumerate() {
+        candidate.id = format!("E{}", index + 1);
+    }
+    out
+}
+
+/// Rewrite the judge's citations into runtime identity.
+///
+/// A ref that names a candidate becomes that candidate's `tool_call_id`;
+/// anything else — a file path, a plausible-looking id the runtime never
+/// issued, an empty list — is dropped, and the obligation stays unsupported.
+/// The runtime never searches for what the judge might have meant.
+fn resolve_refs(refs: Vec<String>, candidates: &[EvidenceCandidate]) -> Vec<String> {
+    refs.into_iter()
+        .filter_map(|r| {
+            let named = r.trim();
+            candidates
+                .iter()
+                .find(|c| c.id.eq_ignore_ascii_case(named))
+                .map(|c| c.tool_call_id.clone())
+        })
+        .collect()
+}
+
 /// Bounded evidence the verifier reads. All fields come from existing truthful
 /// state; nothing here is hidden reasoning or evaluator-only ground truth.
 pub(crate) struct ReconcileInput<'a> {
@@ -160,6 +253,9 @@ pub(crate) struct ReconcileInput<'a> {
     pub modified_files: &'a [String],
     /// Whether a verification command succeeded since the last edit.
     pub fresh_verification: bool,
+    /// The authoritative evidence of this run, named by the runtime. The judge
+    /// cites these ids; it never writes a runtime identifier of its own.
+    pub evidence_candidates: &'a [EvidenceCandidate],
     /// The obligations derived at the START of this goal, if derivation
     /// succeeded. When present the judge accounts for them BY ID, so an
     /// obligation cannot be discharged by going unmentioned.
@@ -206,7 +302,7 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
             listed.push_str("</obligations_from_the_original_goal>\n");
             (
                 listed,
-                "  \"requirement_accounting\": [\n    {\"id\": \"R1\", \"satisfied\": true|false, \"evidence\": \"...\", \"evidence_strength\": \"mechanical\" | \"observed\" | \"semantic\", \"evidence_refs\": [\"tool-call-id\"]}\n  ],\n  \"omitted_requirements\": [\"...\"],\n"
+                "  \"requirement_accounting\": [\n    {\"id\": \"R1\", \"satisfied\": true|false, \"evidence\": \"...\", \"evidence_strength\": \"mechanical\" | \"observed\" | \"semantic\", \"evidence_refs\": [\"E1\"]}\n  ],\n  \"omitted_requirements\": [\"...\"],\n"
                     .to_string(),
                 // The obligations already carry the task. What is left for the
                 // judge is the residue: did the list MISS something the user
@@ -221,9 +317,15 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
                  only when a recorded command or file change demonstrates it, \
                  \"observed\" when output was actually seen, and \"semantic\" \
                  when it is your reading of the work. When an obligation asks for \
-                 something to be COVERED BY a test, put the id of the tool \
-                 call that wrote or ran that test in \"evidence_refs\" — a \
+                 something to be COVERED BY a test, put the id of the evidence \
+                 that wrote or ran that test in \"evidence_refs\" — a \
                  description of coverage is not coverage.\n\
+                 - \"evidence_refs\" holds ids from \
+                 <evidence_the_runtime_recorded> and nothing else. A file path, \
+                 a command line, or an id that is not in that list names \
+                 nothing the runtime can check, and the obligation stays \
+                 unsupported. Cite only evidence that genuinely bears on that \
+                 obligation; leave the list empty when none does.\n\
                  - Then answer the narrower question this gate exists for: is \
                  there any material requirement in the original wording that \
                  the obligation list does NOT represent? List those in \
@@ -232,6 +334,31 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
                     .to_string(),
             )
         }
+    };
+    // The evidence the judge may cite, with the runtime's own name for each.
+    // Empty is stated rather than omitted: "there is nothing to cite" is a
+    // fact about the run, and a judge that invents a citation anyway must find
+    // no list it could have taken it from.
+    let candidates = {
+        let mut block = String::from("\n<evidence_the_runtime_recorded>\n");
+        if input.evidence_candidates.is_empty() {
+            block.push_str("(none)\n");
+        }
+        for c in input.evidence_candidates {
+            block.push_str(&format!(
+                "{}: {} {} ({})\n",
+                c.id,
+                c.kind,
+                c.detail,
+                if c.fresh {
+                    "still current"
+                } else {
+                    "superseded by a later change"
+                }
+            ));
+        }
+        block.push_str("</evidence_the_runtime_recorded>\n");
+        block
     };
     format!(
         "You are the completion reconciliation judge for a coding agent. The \
@@ -265,6 +392,7 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
          \n\
          <workspace_facts>\nmodified files: {files}\nverification run and green \
          since last edit: {fresh}\n</workspace_facts>\n\
+         {candidates}\
          \n\
          Answer with ONLY a JSON object, no prose around it:\n\
          {{\n\
@@ -280,6 +408,7 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
         claims = input.recent_claims,
         evidence = input.recent_evidence,
         fresh = input.fresh_verification,
+        candidates = candidates,
         obligations = obligations,
         accounting_rule = accounting_rule,
         accounting_schema = accounting_schema,
@@ -374,7 +503,12 @@ pub(crate) fn candidate_objects(text: &str) -> Vec<&str> {
 /// Accepted shapes: a bare object, a fenced ```json object, or prose around
 /// exactly one decodable object. Several DIFFERENT decodable objects are
 /// ambiguous and refuse.
-fn parse_outcome(text: &str, latency_ms: u64, expects_accounting: bool) -> ReconcileOutcome {
+fn parse_outcome(
+    text: &str,
+    latency_ms: u64,
+    expects_accounting: bool,
+    evidence: &[EvidenceCandidate],
+) -> ReconcileOutcome {
     if text.trim().is_empty() {
         return ReconcileOutcome::refused(
             ReconcileVerdict::Unavailable,
@@ -467,7 +601,10 @@ fn parse_outcome(text: &str, latency_ms: u64, expects_accounting: bool) -> Recon
                 "observed" => leveler_lifecycle::EvidenceStrength::Observed,
                 _ => leveler_lifecycle::EvidenceStrength::Semantic,
             },
-            refs: a.evidence_refs,
+            // Citations become runtime identity here, or they cease to
+            // exist: the judge names evidence, the runtime says what that
+            // evidence IS.
+            refs: resolve_refs(a.evidence_refs, evidence),
         })
         .collect();
     ReconcileOutcome {
@@ -561,7 +698,12 @@ pub(crate) async fn reconcile_completion(
         }
     };
     let expects_accounting = input.contract.is_some();
-    let first = parse_outcome(&first_text, latency(&started), expects_accounting);
+    let first = parse_outcome(
+        &first_text,
+        latency(&started),
+        expects_accounting,
+        input.evidence_candidates,
+    );
     let format_failure = matches!(
         first.failure_kind,
         Some("empty_reply" | "no_object" | "bad_json" | "bad_verdict" | "ambiguous_objects")
@@ -591,7 +733,12 @@ pub(crate) async fn reconcile_completion(
             return refused;
         }
     };
-    let mut second = parse_outcome(&second_text, latency(&started), expects_accounting);
+    let mut second = parse_outcome(
+        &second_text,
+        latency(&started),
+        expects_accounting,
+        input.evidence_candidates,
+    );
     if second.failure_kind.is_none() {
         second.repaired = true;
         return second;
@@ -624,7 +771,7 @@ mod tests {
 
     #[test]
     fn satisfied_with_all_requirements_met_allows_completion() {
-        let out = parse_outcome(ok_json(), 1, false);
+        let out = parse_outcome(ok_json(), 1, false, &[]);
         assert_eq!(out.verdict, ReconcileVerdict::Satisfied);
         assert!(out.allows_completion());
     }
@@ -632,7 +779,7 @@ mod tests {
     #[test]
     fn one_unsatisfied_requirement_refuses_even_with_satisfied_verdict() {
         let text = r#"{"verdict":"satisfied","requirements":[{"requirement":"a","satisfied":true},{"requirement":"b","satisfied":false}],"contradictions":[],"reason":"x"}"#;
-        let out = parse_outcome(text, 1, false);
+        let out = parse_outcome(text, 1, false, &[]);
         assert!(!out.allows_completion());
         assert_eq!(out.unsatisfied, vec!["b".to_string()]);
     }
@@ -640,13 +787,13 @@ mod tests {
     #[test]
     fn contradictions_refuse_even_with_optimistic_verdict() {
         let text = r#"{"verdict":"satisfied","requirements":[{"requirement":"a","satisfied":true}],"contradictions":["claim says gone, output still shows idle total=0"],"reason":"x"}"#;
-        assert!(!parse_outcome(text, 1, false).allows_completion());
+        assert!(!parse_outcome(text, 1, false, &[]).allows_completion());
     }
 
     #[test]
     fn uncertain_never_completes() {
         let text = r#"{"verdict":"uncertain","requirements":[{"requirement":"a","satisfied":true}],"contradictions":[],"reason":"cannot establish"}"#;
-        let out = parse_outcome(text, 1, false);
+        let out = parse_outcome(text, 1, false, &[]);
         assert_eq!(out.verdict, ReconcileVerdict::Uncertain);
         assert!(!out.allows_completion());
     }
@@ -654,7 +801,7 @@ mod tests {
     #[test]
     fn satisfied_without_enumerated_requirements_is_uncertain() {
         let text = r#"{"verdict":"satisfied","requirements":[],"contradictions":[],"reason":"looks fine"}"#;
-        let out = parse_outcome(text, 1, false);
+        let out = parse_outcome(text, 1, false, &[]);
         assert_eq!(out.verdict, ReconcileVerdict::Uncertain);
         assert!(!out.allows_completion());
     }
@@ -662,7 +809,7 @@ mod tests {
     #[test]
     fn malformed_output_fails_closed() {
         for bad in ["no json here", "{not json", r#"{"verdict":"maybe"}"#] {
-            let out = parse_outcome(bad, 1, false);
+            let out = parse_outcome(bad, 1, false, &[]);
             assert_eq!(out.verdict, ReconcileVerdict::Unavailable, "{bad}");
             assert!(!out.allows_completion());
         }
@@ -671,25 +818,25 @@ mod tests {
     #[test]
     fn prose_around_the_json_still_parses() {
         let text = format!("Here is my judgment:\n{}\nDone.", ok_json());
-        assert!(parse_outcome(&text, 1, false).allows_completion());
+        assert!(parse_outcome(&text, 1, false, &[]).allows_completion());
     }
 
     #[test]
     fn fenced_json_parses() {
         let text = format!("```json\n{}\n```", ok_json());
-        assert!(parse_outcome(&text, 1, false).allows_completion());
+        assert!(parse_outcome(&text, 1, false, &[]).allows_completion());
     }
 
     #[test]
     fn repeated_identical_objects_parse_but_conflicting_objects_refuse() {
         let twice = format!("{}\nAgain:\n{}", ok_json(), ok_json());
-        assert!(parse_outcome(&twice, 1, false).allows_completion());
+        assert!(parse_outcome(&twice, 1, false, &[]).allows_completion());
         let conflicting = format!(
             "{}\n{}",
             ok_json(),
             r#"{"verdict":"blocked","requirements":[{"requirement":"a","satisfied":false}],"contradictions":[],"reason":"x"}"#
         );
-        let out = parse_outcome(&conflicting, 1, false);
+        let out = parse_outcome(&conflicting, 1, false, &[]);
         assert_eq!(out.failure_kind, Some("ambiguous_objects"));
         assert!(!out.allows_completion());
     }
@@ -697,12 +844,12 @@ mod tests {
     #[test]
     fn braces_inside_json_strings_do_not_split_the_object() {
         let text = r#"{"verdict":"satisfied","requirements":[{"requirement":"print {x} literally","satisfied":true,"evidence":"output shows {x}"}],"contradictions":[],"reason":"ok"}"#;
-        assert!(parse_outcome(text, 1, false).allows_completion());
+        assert!(parse_outcome(text, 1, false, &[]).allows_completion());
     }
 
     #[test]
     fn empty_reply_is_classified_distinctly() {
-        let out = parse_outcome("   \n", 1, false);
+        let out = parse_outcome("   \n", 1, false, &[]);
         assert_eq!(out.failure_kind, Some("empty_reply"));
         assert_eq!(out.verdict, ReconcileVerdict::Unavailable);
     }
@@ -752,6 +899,7 @@ mod tests {
             recent_evidence: "",
             modified_files: &[],
             fresh_verification: true,
+            evidence_candidates: &[],
             contract: None,
         }
     }
@@ -942,6 +1090,7 @@ mod prompt_render_tests {
             recent_evidence: "go test ./... ok",
             modified_files: &["internal/report/summary.go".to_string()],
             fresh_verification: true,
+            evidence_candidates: &[],
             contract: Some(&contract),
         });
         println!("\n=== RENDERED JUDGE INSTRUCTION ===\n{text}\n=== END ===\n");
@@ -963,16 +1112,237 @@ mod accounting_verdict_tests {
         let text = r#"{"verdict":"satisfied","contradictions":[],
             "requirement_accounting":[{"id":"R1","satisfied":true,"evidence":"ran green","evidence_strength":"mechanical"}],
             "omitted_requirements":[],"reason":"ok"}"#;
-        assert!(parse_outcome(text, 1, true).allows_completion());
+        assert!(parse_outcome(text, 1, true, &[]).allows_completion());
     }
 
     /// And a satisfied verdict that itemised NOTHING is still no verdict.
     #[test]
     fn a_satisfied_verdict_with_no_accounting_is_uncertain() {
         let text = r#"{"verdict":"satisfied","contradictions":[],"requirement_accounting":[],"reason":"looks fine"}"#;
-        let out = parse_outcome(text, 1, true);
+        let out = parse_outcome(text, 1, true, &[]);
         assert_eq!(out.verdict, ReconcileVerdict::Uncertain);
         assert!(!out.allows_completion());
+    }
+}
+
+/// F3 (scale-s800): a `TestCoverage` obligation could not be discharged by any
+/// amount of real testing, because the gate asked the judge for "the id of the
+/// tool call" and never showed it one. Every judgment came back with `[]` or a
+/// file path, neither of which the ledger can resolve, so nine correct runs
+/// ended unverified.
+///
+/// The fix is a division of labour: the runtime names its evidence, the judge
+/// says which named evidence supports which obligation.
+#[cfg(test)]
+mod evidence_identity {
+    use super::*;
+    use leveler_lifecycle::{
+        CompletionContract, CompletionRequirement, EvidenceLedger, EvidencePolicy, RequirementKind,
+        RequirementSource, RequirementStatus,
+    };
+
+    /// A run that edited a test and ran it green.
+    fn ledger() -> EvidenceLedger {
+        let mut led = EvidenceLedger::default();
+        led.record_mutation(
+            "call-edit",
+            "apply_patch",
+            vec!["internal/window/window_test.go".into()],
+        );
+        led.record_verify("call-test", "go\u{1f}test\u{1f}./...", 0);
+        led
+    }
+
+    fn coverage_contract() -> CompletionContract {
+        CompletionContract::new(vec![CompletionRequirement {
+            id: "R1".into(),
+            text: "the boundary rule is covered by a test".into(),
+            kind: RequirementKind::Verification,
+            source: RequirementSource::OriginalGoal,
+            status: RequirementStatus::Satisfied,
+            evidence_policy: Some(EvidencePolicy::TestCoverage),
+            evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
+        }])
+    }
+
+    /// Apply one judged accounting to the contract and ask the ledger whether
+    /// anything is still owed — the same question the closeout path asks.
+    fn debt_after(refs: &[&str], satisfied: bool, led: &EvidenceLedger) -> Option<String> {
+        let candidates = evidence_candidates(led);
+        let refs_json = refs
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let reply = format!(
+            r#"{{"verdict":"satisfied","contradictions":[],"requirement_accounting":[{{"id":"R1","satisfied":{satisfied},"evidence":"the boundary test runs green","evidence_strength":"mechanical","evidence_refs":[{refs_json}]}}],"omitted_requirements":[],"reason":"done"}}"#
+        );
+        let outcome = parse_outcome(&reply, 1, true, &candidates);
+        let mut contract = coverage_contract();
+        for account in &outcome.accounting {
+            if let Some(r) = contract
+                .requirements
+                .iter_mut()
+                .find(|r| r.id == account.id)
+            {
+                r.status = if account.satisfied {
+                    RequirementStatus::Satisfied
+                } else {
+                    RequirementStatus::Pending
+                };
+                r.evidence.push(leveler_lifecycle::RequirementEvidence {
+                    strength: account.strength,
+                    detail: account.evidence.clone(),
+                    refs: account.refs.clone(),
+                });
+            }
+        }
+        let mut led = led.clone();
+        led.completion_contract = Some(contract);
+        led.completion_debt()
+    }
+
+    #[test]
+    fn the_runtime_names_the_evidence_it_recorded() {
+        let candidates = evidence_candidates(&ledger());
+        assert_eq!(
+            candidates.len(),
+            2,
+            "one change and one verification: {candidates:?}"
+        );
+        let verify = candidates
+            .iter()
+            .find(|c| c.kind == "verification")
+            .unwrap();
+        assert_eq!(verify.tool_call_id, "call-test");
+        assert_eq!(verify.detail, "go test ./...");
+        assert!(verify.fresh, "the check ran after the last edit");
+        assert!(
+            candidates.iter().all(|c| c.id.starts_with('E')),
+            "ids are the runtime's, not the model's: {candidates:?}"
+        );
+    }
+
+    /// GREEN: the judge cites evidence the runtime named, and the obligation
+    /// closes. This is the case that could not happen before the fix.
+    #[test]
+    fn a_cited_runtime_candidate_discharges_test_coverage() {
+        let led = ledger();
+        let candidates = evidence_candidates(&led);
+        let verify = candidates
+            .iter()
+            .find(|c| c.kind == "verification")
+            .unwrap();
+        assert_eq!(
+            debt_after(&[&verify.id], true, &led),
+            None,
+            "a real, fresh, cited check must close the obligation"
+        );
+    }
+
+    /// RED before the fix, and still refused after it: the shapes the judge
+    /// actually produced on scale-s800 name nothing the runtime can check.
+    #[test]
+    fn citations_the_runtime_cannot_resolve_never_discharge_test_coverage() {
+        let led = ledger();
+        for refs in [
+            vec![],                                 // what runs 01/02 returned
+            vec!["internal/window/window_test.go"], // what run 03 returned
+            vec!["call-test"],                      // a real id, but not a candidate handle
+            vec!["E99"],                            // a handle the runtime never issued
+        ] {
+            assert!(
+                debt_after(&refs, true, &led).is_some(),
+                "refs {refs:?} must leave the obligation owed"
+            );
+        }
+    }
+
+    /// Freshness still decides: a citation that resolves to a check the tree
+    /// has since moved past proves nothing.
+    #[test]
+    fn a_superseded_check_does_not_discharge_test_coverage() {
+        let mut led = ledger();
+        let candidates = evidence_candidates(&led);
+        let verify = candidates
+            .iter()
+            .find(|c| c.kind == "verification")
+            .unwrap()
+            .id
+            .clone();
+        led.record_mutation(
+            "call-edit-2",
+            "apply_patch",
+            vec!["internal/window/window.go".into()],
+        );
+        assert!(
+            debt_after(&[&verify], true, &led).is_some(),
+            "the cited check ran over a tree that no longer exists"
+        );
+    }
+
+    /// A command that failed is not evidence, however it is cited.
+    #[test]
+    fn a_failed_check_is_not_offered_or_accepted() {
+        let mut led = EvidenceLedger::default();
+        led.record_mutation("call-edit", "apply_patch", vec!["window_test.go".into()]);
+        led.record_verify("call-test", "go\u{1f}test\u{1f}./...", 1);
+        let candidates = evidence_candidates(&led);
+        assert!(
+            candidates.iter().all(|c| c.kind != "verification"),
+            "a non-zero exit is never a candidate: {candidates:?}"
+        );
+        assert!(debt_after(&["E1"], true, &led).is_some());
+    }
+
+    /// The judge's word is still not the mechanical fact: an obligation it
+    /// declines stays owed even when the evidence exists and is cited.
+    #[test]
+    fn a_valid_citation_does_not_override_an_unsatisfied_judgment() {
+        let led = ledger();
+        let candidates = evidence_candidates(&led);
+        let verify = candidates
+            .iter()
+            .find(|c| c.kind == "verification")
+            .unwrap();
+        assert!(
+            debt_after(&[&verify.id], false, &led).is_some(),
+            "runtime evidence cannot overrule the judge's own refusal"
+        );
+    }
+
+    /// The candidate list is what the judge is allowed to cite, so it must be
+    /// in the prompt — and it must say when there is nothing to cite.
+    #[test]
+    fn the_prompt_shows_the_candidates_and_says_when_there_are_none() {
+        let led = ledger();
+        let candidates = evidence_candidates(&led);
+        let contract = coverage_contract();
+        let with = instruction(&ReconcileInput {
+            original_goal: "cover the boundary",
+            claimed_summary: "done",
+            recent_claims: "",
+            recent_evidence: "",
+            modified_files: &[],
+            fresh_verification: true,
+            evidence_candidates: &candidates,
+            contract: Some(&contract),
+        });
+        assert!(with.contains("<evidence_the_runtime_recorded>"), "{with}");
+        assert!(with.contains("go test ./..."), "{with}");
+        assert!(with.contains("E1"), "{with}");
+        let without = instruction(&ReconcileInput {
+            original_goal: "cover the boundary",
+            claimed_summary: "done",
+            recent_claims: "",
+            recent_evidence: "",
+            modified_files: &[],
+            fresh_verification: false,
+            evidence_candidates: &[],
+            contract: Some(&contract),
+        });
+        assert!(without.contains("(none)"), "{without}");
     }
 }
 
@@ -1001,6 +1371,10 @@ mod probe {
         modified_files: Vec<String>,
         fresh_verification: bool,
         contract: Option<leveler_lifecycle::CompletionContract>,
+        /// The run's ledger, so the replay carries the same runtime-named
+        /// evidence candidates the live gate would send.
+        #[serde(default)]
+        ledger: Option<leveler_lifecycle::EvidenceLedger>,
     }
 
     fn env(key: &str) -> Option<String> {
@@ -1067,6 +1441,12 @@ mod probe {
             .expect("registry");
         let model = ModelRef::new("probe", model_id);
 
+        let candidates = saved
+            .ledger
+            .as_ref()
+            .map(evidence_candidates)
+            .unwrap_or_default();
+        println!("evidence candidates: {}", candidates.len());
         println!("attempt,outcome,verdict,failure_kind,latency_ms,repaired");
         let mut latencies = Vec::new();
         for attempt in 1..=samples {
@@ -1082,6 +1462,7 @@ mod probe {
                     recent_evidence: &saved.recent_evidence,
                     modified_files: &saved.modified_files,
                     fresh_verification: saved.fresh_verification,
+                    evidence_candidates: &candidates,
                     contract: saved.contract.as_ref(),
                 },
                 &CancellationToken::new(),

@@ -1804,6 +1804,11 @@ impl Executor {
                             let judge_timeout = self
                                 .reconciliation_timeout
                                 .unwrap_or(crate::reconciliation::DEFAULT_RECONCILE_TIMEOUT);
+                            // Runtime names its own evidence before asking:
+                            // the judge cites these, it does not invent an id
+                            // the ledger would then fail to resolve.
+                            let evidence_candidates =
+                                crate::reconciliation::evidence_candidates(&ledger);
                             let outcome = crate::reconciliation::reconcile_completion(
                                 self.runtime.as_ref(),
                                 judge_model,
@@ -1816,6 +1821,7 @@ impl Executor {
                                     recent_evidence: &recent_evidence,
                                     modified_files: &modified_files,
                                     fresh_verification: ledger.has_fresh_successful_verify(),
+                                    evidence_candidates: &evidence_candidates,
                                     contract: completion_contract.as_ref(),
                                 },
                                 &cancellation,
