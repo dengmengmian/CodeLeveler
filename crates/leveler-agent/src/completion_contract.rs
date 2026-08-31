@@ -17,7 +17,14 @@
 /// has one: a thinking-flag model at the main policy's effort spends the whole
 /// completion budget reasoning before it emits any content (HC002-F1).
 const DERIVE_EFFORT: leveler_model::ReasoningEffort = leveler_model::ReasoningEffort::Low;
-const MAX_OUTPUT_TOKENS: u32 = 4096;
+/// 4096 was calibrated when derivation only listed obligations. Evidence
+/// Policy V1 made it also decide the proof standard and extract commands, and
+/// the heavier task hit the ceiling on the real HC-002 task: measured
+/// `finish=length`, `reasoning_tokens=4096/4096`, content empty — the
+/// reasoning consumed the whole completion budget before a single character of
+/// the object. The ceiling covers reasoning and content together, so a leaner
+/// schema would not have saved it.
+const MAX_OUTPUT_TOKENS: u32 = 16384;
 
 fn instruction(goal: &str) -> String {
     format!(
@@ -96,6 +103,47 @@ fn kind_from(raw: &str) -> RequirementKind {
     }
 }
 
+/// Why derivation produced no contract.
+///
+/// Every one of these used to be the same `None`, so a budget exhaustion and a
+/// provider outage and a malformed reply were indistinguishable in the logs —
+/// diagnosing the real one took a hand-replayed API call. Product behaviour is
+/// identical for all of them (no contract, and no contract cannot complete);
+/// this exists so the next failure names itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DerivationFailure {
+    /// The reply hit the completion budget before delivering the object.
+    OutputBudgetExhausted,
+    Timeout,
+    ProviderError,
+    /// Transport succeeded and the model said nothing.
+    EmptyResponse,
+    /// Content arrived carrying no decodable object.
+    NoStructuredObject,
+    /// An object arrived that is not the shape asked for.
+    InvalidStructuredObject,
+    /// Several different decodable objects — no way to tell which is meant.
+    AmbiguousObjects,
+    /// A well-formed answer that lists nothing. Not a contract: "no
+    /// obligations found" must never come out of a derivation.
+    EmptyRequirements,
+}
+
+impl DerivationFailure {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OutputBudgetExhausted => "output_budget_exhausted",
+            Self::Timeout => "timeout",
+            Self::ProviderError => "provider_error",
+            Self::EmptyResponse => "empty_response",
+            Self::NoStructuredObject => "no_structured_object",
+            Self::InvalidStructuredObject => "invalid_structured_object",
+            Self::AmbiguousObjects => "ambiguous_objects",
+            Self::EmptyRequirements => "empty_requirements",
+        }
+    }
+}
+
 /// The proof standard for an obligation, fixed here — before the work starts,
 /// and so before anyone knows what evidence will happen to exist.
 ///
@@ -112,11 +160,18 @@ fn policy_from(raw: &RawRequirement, kind: RequirementKind) -> Option<EvidencePo
                 .commands
                 .iter()
                 .map(|c| {
-                    // Reuse the ledger's own normalization so a stated
-                    // command and a recorded one are the same string.
-                    let mut parts = c.split_whitespace().map(str::to_string);
+                    // Tasks state commands in prose, and prose marks code with
+                    // backticks: "`go test ./...` must pass". A fingerprint
+                    // that keeps the markup matches nothing the runtime ever
+                    // records, so the obligation could never be discharged.
+                    // Only the markdown fence is stripped — shell quotes can
+                    // carry meaning and are left alone.
+                    let cleaned = c.trim().trim_matches('`').trim();
+                    let mut parts = cleaned.split_whitespace().map(str::to_string);
                     let program = parts.next().unwrap_or_default();
                     let args: Vec<String> = parts.collect();
+                    // Reuse the ledger's own normalization so a stated command
+                    // and a recorded one are the same string.
                     leveler_lifecycle::EvidenceLedger::normalize_command_fingerprint(
                         &program, &args,
                     )
@@ -140,9 +195,9 @@ pub(crate) async fn derive_contract(
     timeout: std::time::Duration,
     goal: &str,
     cancellation: &CancellationToken,
-) -> Option<CompletionContract> {
+) -> Result<CompletionContract, DerivationFailure> {
     if goal.trim().is_empty() {
-        return None;
+        return Err(DerivationFailure::EmptyRequirements);
     }
     let mut request = ModelRequest::new(
         model.clone(),
@@ -151,26 +206,39 @@ pub(crate) async fn derive_contract(
     request.tool_choice = ToolChoice::None;
     request.max_output_tokens = Some(MAX_OUTPUT_TOKENS);
     request.reasoning_effort = Some(DERIVE_EFFORT);
-    let response = tokio::time::timeout(
+    let response = match tokio::time::timeout(
         timeout,
         runtime.generate(request, cancellation.child_token()),
     )
     .await
-    .ok()?
-    .ok()?;
+    {
+        Err(_) => return Err(DerivationFailure::Timeout),
+        Ok(Err(_)) => return Err(DerivationFailure::ProviderError),
+        Ok(Ok(response)) => response,
+    };
     let text = response.message.text_content();
+    classify_reply(&text, response.finish_reason)?;
     // Same acceptance shape as the reconciliation gate: a bare object, a
     // fenced one, or prose around exactly one decodable object.
     let mut parsed: Option<RawContract> = None;
-    for candidate in crate::reconciliation::candidate_objects(&text) {
+    let mut decodable = 0usize;
+    let candidates = crate::reconciliation::candidate_objects(&text);
+    for candidate in &candidates {
         if let Ok(raw) = serde_json::from_str::<RawContract>(candidate) {
-            if parsed.is_some() {
-                return None;
+            decodable += 1;
+            if decodable > 1 {
+                return Err(DerivationFailure::AmbiguousObjects);
             }
             parsed = Some(raw);
         }
     }
-    let raw = parsed?;
+    let raw = match parsed {
+        Some(raw) => raw,
+        // Content arrived: either it held no object at all, or the object it
+        // held was not the shape asked for.
+        None if candidates.is_empty() => return Err(DerivationFailure::NoStructuredObject),
+        None => return Err(DerivationFailure::InvalidStructuredObject),
+    };
     let requirements: Vec<CompletionRequirement> = raw
         .requirements
         .into_iter()
@@ -190,9 +258,26 @@ pub(crate) async fn derive_contract(
         })
         .collect();
     if requirements.is_empty() {
-        return None;
+        return Err(DerivationFailure::EmptyRequirements);
     }
-    Some(CompletionContract::new(requirements))
+    Ok(CompletionContract::new(requirements))
+}
+
+/// Separate "said nothing" from "ran out of room saying it".
+///
+/// Both arrive as empty content, and treating them alike is what made a
+/// budget ceiling look like a model that would not answer.
+fn classify_reply(
+    text: &str,
+    finish_reason: leveler_model::FinishReason,
+) -> Result<(), DerivationFailure> {
+    if finish_reason == leveler_model::FinishReason::Length && text.trim().is_empty() {
+        return Err(DerivationFailure::OutputBudgetExhausted);
+    }
+    if text.trim().is_empty() {
+        return Err(DerivationFailure::EmptyResponse);
+    }
+    Ok(())
 }
 
 use leveler_lifecycle::{
@@ -314,7 +399,7 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await
-            .is_none()
+            .is_err()
         );
     }
 
@@ -330,7 +415,7 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await
-            .is_none()
+            .is_err()
         );
     }
 
@@ -357,6 +442,121 @@ mod tests {
             requests[0].reasoning_effort,
             Some(leveler_model::ReasoningEffort::Low)
         );
-        assert_eq!(requests[0].max_output_tokens, Some(4096));
+        assert_eq!(
+            requests[0].max_output_tokens,
+            Some(16384),
+            "derivation needs room for reasoning AND the object it must emit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod derivation_reliability_tests {
+    use super::*;
+    use leveler_lifecycle::EvidenceLedger;
+
+    /// What the ledger records when the agent actually runs the command.
+    fn ledger_fingerprint(program: &str, args: &[&str]) -> String {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        EvidenceLedger::normalize_command_fingerprint(program, &args)
+    }
+
+    fn raw(proof: &str, commands: &[&str]) -> RawRequirement {
+        RawRequirement {
+            text: "commands must pass".into(),
+            kind: "verification".into(),
+            proof: proof.into(),
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    fn commands_of(policy: Option<EvidencePolicy>) -> Vec<String> {
+        match policy {
+            Some(EvidencePolicy::CommandSuccess { commands, .. }) => commands,
+            other => panic!("expected CommandSuccess, got {other:?}"),
+        }
+    }
+
+    /// The task states its commands in Markdown — "`go test ./...` must pass"
+    /// — so the derivation is likely to hand them back with the backticks
+    /// still attached. A fingerprint that keeps them matches nothing the
+    /// runtime ever records, and the obligation could never be discharged.
+    #[test]
+    fn a_backticked_command_still_matches_what_the_runtime_records() {
+        let policy = policy_from(
+            &raw("command_success", &["`go test ./...`"]),
+            RequirementKind::Verification,
+        );
+        assert_eq!(
+            commands_of(policy),
+            vec![ledger_fingerprint("go", &["test", "./..."])]
+        );
+    }
+
+    #[test]
+    fn both_backticked_commands_are_materialized() {
+        let policy = policy_from(
+            &raw("command_success", &["`go build ./...`", "`go test ./...`"]),
+            RequirementKind::Verification,
+        );
+        assert_eq!(
+            commands_of(policy),
+            vec![
+                ledger_fingerprint("go", &["build", "./..."]),
+                ledger_fingerprint("go", &["test", "./..."]),
+            ]
+        );
+    }
+
+    /// Whatever the quoting cleanup does, it must not make different commands
+    /// look alike: a suite run is not a package run.
+    #[test]
+    fn normalization_does_not_broaden_the_match() {
+        let all = commands_of(policy_from(
+            &raw("command_success", &["`go test ./...`"]),
+            RequirementKind::Verification,
+        ));
+        let one = commands_of(policy_from(
+            &raw("command_success", &["go test ./pkg/foo"]),
+            RequirementKind::Verification,
+        ));
+        assert_ne!(all, one);
+    }
+
+    /// Plain commands are unaffected.
+    #[test]
+    fn an_unquoted_command_is_unchanged() {
+        let policy = policy_from(
+            &raw("command_success", &["go test ./..."]),
+            RequirementKind::Verification,
+        );
+        assert_eq!(
+            commands_of(policy),
+            vec![ledger_fingerprint("go", &["test", "./..."])]
+        );
+    }
+
+    /// The budget that the real task exhausted.
+    #[test]
+    fn derivation_asks_for_a_budget_that_fits_its_answer() {
+        assert_eq!(MAX_OUTPUT_TOKENS, 16384);
+    }
+
+    /// Running out of room mid-answer is not the same as having nothing to
+    /// say, and the difference is the whole reason this classification exists.
+    #[test]
+    fn an_exhausted_budget_is_named_as_such() {
+        assert_eq!(
+            classify_reply("", leveler_model::FinishReason::Length),
+            Err(DerivationFailure::OutputBudgetExhausted)
+        );
+        assert_eq!(
+            classify_reply("   \n", leveler_model::FinishReason::Stop),
+            Err(DerivationFailure::EmptyResponse)
+        );
+        assert_eq!(
+            classify_reply("{\"requirements\":[]}", leveler_model::FinishReason::Stop),
+            Ok(())
+        );
     }
 }

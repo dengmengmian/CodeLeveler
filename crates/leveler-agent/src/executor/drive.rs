@@ -207,16 +207,20 @@ impl Executor {
                     &cancellation,
                 )
                 .await;
+                // Failures used to be one indistinguishable `None`, so a
+                // budget ceiling read the same as a provider outage and the
+                // real cause had to be reconstructed by hand afterwards.
                 tracing::info!(
                     derived = derived.as_ref().map(|c| c.requirements.len()).unwrap_or(0),
-                    available = derived.is_some(),
+                    available = derived.is_ok(),
+                    failure = derived.as_ref().err().map(|f| f.label()).unwrap_or("none"),
                     "completion contract derived"
                 );
                 // Durable immediately, and before any mutation can run: a
                 // crash between the first edit and the contract landing
                 // would leave a changed workspace with no record of what
                 // completing it was supposed to mean.
-                derived
+                derived.ok()
             }
             None => None,
         };
@@ -1848,16 +1852,15 @@ impl Executor {
                             // "nothing was required".
                             let completion_contract = match completion_contract.as_ref() {
                                 Some(_) => completion_contract.clone(),
-                                None => {
-                                    crate::completion_contract::derive_contract(
-                                        self.runtime.as_ref(),
-                                        &self.model,
-                                        judge_timeout,
-                                        &original_task,
-                                        &cancellation,
-                                    )
-                                    .await
-                                }
+                                None => crate::completion_contract::derive_contract(
+                                    self.runtime.as_ref(),
+                                    &self.model,
+                                    judge_timeout,
+                                    &original_task,
+                                    &cancellation,
+                                )
+                                .await
+                                .ok(),
                             };
                             let mut rejected_not_accounted = 0usize;
                             let mut rejected_missing_evidence = 0usize;
