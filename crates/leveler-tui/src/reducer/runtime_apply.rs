@@ -12,7 +12,29 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
     match event {
         RuntimeEvent::RuntimeReady => {}
         RuntimeEvent::SessionOpened { session } => apply_session(state, session),
-        RuntimeEvent::SessionUpdated { session } => apply_meta(state, &session),
+        RuntimeEvent::SessionUpdated { session } => {
+            let previous = state.mode;
+            apply_meta(state, &session);
+            if state.pending_permission == Some(state.mode) {
+                state.pending_permission = None;
+            }
+            if previous != state.mode {
+                let t = state.t();
+                let human = match state.mode {
+                    PermissionProfile::RequestApproval => t.perm_readonly,
+                    PermissionProfile::Assisted => t.perm_workspace,
+                    PermissionProfile::FullAccess => t.perm_full,
+                };
+                state.notification = Some(crate::state::Notification {
+                    level: if state.mode == PermissionProfile::FullAccess {
+                        NotificationLevel::Warning
+                    } else {
+                        NotificationLevel::Info
+                    },
+                    message: format!("{}: {human}", t.overlay_mode),
+                });
+            }
+        }
         RuntimeEvent::ApprovalRequested { request } => {
             // If any overlay is already open (an earlier unanswered approval or a
             // picker the user opened), park this request instead of clobbering the
@@ -864,6 +886,9 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     // token state intact.
     let switching = state.session_id != session.id;
     apply_meta(state, &session);
+    // Snapshot is runtime truth. A pending Shift+Tab from the previous
+    // connection must not keep driving the cycle.
+    state.pending_permission = None;
     state.status = match session.status.as_str() {
         "running" => RuntimeStatus::Busy,
         "failed" => RuntimeStatus::Error,

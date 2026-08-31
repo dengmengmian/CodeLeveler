@@ -1199,7 +1199,11 @@ fn mode_picker_confirm_sends_set_permission_profile() {
             mode: PermissionProfile::RequestApproval,
         })]
     );
-    assert_eq!(s.mode, PermissionProfile::RequestApproval);
+    assert_eq!(
+        s.mode,
+        PermissionProfile::Assisted,
+        "the chip waits for SessionUpdated, not the keystroke"
+    );
     assert!(s.overlay.is_none());
 }
 
@@ -4259,7 +4263,16 @@ fn shift_tab_cycles_the_permission_profile() {
     assert_eq!(s.mode, PermissionProfile::Assisted);
 
     let effects = reduce(&mut s, key(KeyCode::BackTab));
-    assert_eq!(s.mode, PermissionProfile::FullAccess);
+    assert_eq!(
+        s.mode,
+        PermissionProfile::Assisted,
+        "the displayed profile must not lead the runtime"
+    );
+    assert!(
+        !s.mode_label.to_lowercase().contains("full"),
+        "chip stays on the last acked value: {}",
+        s.mode_label
+    );
     assert_eq!(
         effects,
         vec![Effect::Send(ClientCommand::SetPermissionProfile {
@@ -4267,9 +4280,17 @@ fn shift_tab_cycles_the_permission_profile() {
             mode: PermissionProfile::FullAccess,
         })]
     );
+
+    let mut snap = snapshot();
+    snap.mode = PermissionProfile::FullAccess;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
+    );
+    assert_eq!(s.mode, PermissionProfile::FullAccess);
     assert!(
         s.mode_label.to_lowercase().contains("full"),
-        "header label must follow the switch: {}",
+        "header label follows the runtime ack: {}",
         s.mode_label
     );
     assert!(
@@ -4278,9 +4299,46 @@ fn shift_tab_cycles_the_permission_profile() {
     );
 
     reduce(&mut s, key(KeyCode::BackTab));
+    assert_eq!(
+        s.mode,
+        PermissionProfile::FullAccess,
+        "chip still waits for the next ack"
+    );
+    let mut snap = snapshot();
+    snap.mode = PermissionProfile::RequestApproval;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
+    );
     assert_eq!(s.mode, PermissionProfile::RequestApproval);
     reduce(&mut s, key(KeyCode::BackTab));
+    let mut snap = snapshot();
+    snap.mode = PermissionProfile::Assisted;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
+    );
     assert_eq!(s.mode, PermissionProfile::Assisted);
+}
+
+#[test]
+fn session_opened_takes_the_runtime_profile_not_a_pending_keystroke() {
+    let mut s = state();
+    reduce(&mut s, key(KeyCode::BackTab));
+    assert_eq!(s.mode, PermissionProfile::Assisted);
+    assert_eq!(s.pending_permission, Some(PermissionProfile::FullAccess));
+
+    let mut snap = snapshot();
+    snap.mode = PermissionProfile::Assisted;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    assert_eq!(s.mode, PermissionProfile::Assisted);
+    assert_eq!(
+        s.pending_permission, None,
+        "a reconnect snapshot is runtime truth; a pending keystroke must not keep driving the cycle"
+    );
 }
 
 #[test]

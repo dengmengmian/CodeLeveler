@@ -18,7 +18,6 @@ mod submit;
 
 use overlay_keys::{handle_overlay_key, open_model_picker};
 use runtime_apply::apply_runtime;
-use runtime_apply::mode_label;
 use screen_nav::{handle_screen_key, open_diff_screen, open_sessions_screen, toggle_screen};
 use submit::{
     complete_file_mention, complete_slash, request_file_candidates, submit, touch_slash_filter,
@@ -856,29 +855,18 @@ pub(super) fn open_external_editor(state: &mut AppState) -> Vec<Effect> {
 }
 
 /// Cycle the permission profile (Shift+Tab), least → most privileged.
+///
+/// The chip stays on the last runtime-acked value until `SessionUpdated`.
+/// `pending_permission` only lets a second Shift+Tab before that ack
+/// compute the next step instead of re-sending the same one.
 fn cycle_permission_profile(state: &mut AppState) -> Vec<Effect> {
-    let next = match state.mode {
+    let from = state.pending_permission.unwrap_or(state.mode);
+    let next = match from {
         PermissionProfile::RequestApproval => PermissionProfile::Assisted,
         PermissionProfile::Assisted => PermissionProfile::FullAccess,
         PermissionProfile::FullAccess => PermissionProfile::RequestApproval,
     };
-    state.mode = next;
-    state.mode_label = mode_label(next).to_string();
-    let t = state.t();
-    let human = match next {
-        PermissionProfile::RequestApproval => t.perm_readonly,
-        PermissionProfile::Assisted => t.perm_workspace,
-        PermissionProfile::FullAccess => t.perm_full,
-    };
-    // A permission change must never be silent — full access especially.
-    state.notification = Some(Notification {
-        level: if next == PermissionProfile::FullAccess {
-            NotificationLevel::Warning
-        } else {
-            NotificationLevel::Info
-        },
-        message: format!("{}: {human}", t.overlay_mode),
-    });
+    state.pending_permission = Some(next);
     vec![Effect::Send(ClientCommand::SetPermissionProfile {
         session_id: state.session_id.clone(),
         mode: next,

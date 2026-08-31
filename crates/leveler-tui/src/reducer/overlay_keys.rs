@@ -12,7 +12,6 @@ use crate::overlay::selection::{SelectionModel, SelectionOption, SelectionOutcom
 use crate::state::{AppState, Notification, PendingInteraction};
 use crate::theme::{Theme, ThemeId};
 
-use super::runtime_apply::mode_label;
 use super::submit::send_message;
 
 /// Route a key to the active overlay, returning any resulting command. Ctrl+C
@@ -82,8 +81,7 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
             SelectionOutcome::Cancel => Vec::new(),
             SelectionOutcome::Confirm(key) => {
                 let mode = parse_mode(&key);
-                state.mode = mode;
-                state.mode_label = mode_label(mode).to_string();
+                state.pending_permission = Some(mode);
                 vec![Effect::Send(ClientCommand::SetPermissionProfile {
                     session_id: state.session_id.clone(),
                     mode,

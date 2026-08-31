@@ -282,6 +282,10 @@ pub struct AppState {
     /// `None` means the runtime did not report one.
     pub reasoning_effort: Option<String>,
     pub mode_label: String,
+    /// Last permission profile we asked the runtime to adopt. Used only so
+    /// rapid Shift+Tab can cycle while the displayed chip still waits for
+    /// `SessionUpdated` — the chip is `mode`/`mode_label`, never this.
+    pub pending_permission: Option<PermissionProfile>,
     /// Local wall clock `HH:MM`, refreshed by the event loop.
     pub clock_label: String,
     /// Mutable context window for the active model (updated on model switch).
@@ -397,6 +401,7 @@ impl AppState {
             model_label: "—".to_string(),
             reasoning_effort: boot.reasoning_effort.clone(),
             mode_label: "—".to_string(),
+            pending_permission: None,
             clock_label: String::new(),
             context_window_tokens: boot.context_window,
             editor_chord_armed: false,
