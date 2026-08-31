@@ -339,6 +339,7 @@ pub(crate) async fn execute_program(
 ) -> Result<ToolOutput, ToolError> {
     let rel = cwd_rel.unwrap_or(".").to_string();
     let cwd = context.execution.workspace.resolve(&rel)?;
+    let executed_commands = leveler_execution::proven_executed_commands(program, &args);
 
     // Read-preflight (R004 F3). On macOS/Linux the OS sandbox confines
     // *writes* and leaves reads broad so toolchains keep working — but that
@@ -615,6 +616,12 @@ pub(crate) async fn execute_program(
             "timed_out": output.timed_out,
             "modified_files": command_modified,
             "workspace_snapshot": snapshot.as_ref().map(|id| id.0.clone()),
+            // What this execution proves ran, stated by the layer that ran it.
+            // Every command tool funnels through here, so completion evidence
+            // reads one execution fact instead of guessing from tool names
+            // (HC-002 F1: the same `go build ./...` counted through
+            // `run_command` and vanished through `shell_command`).
+            "executed_commands": executed_commands,
         }),
     };
     Ok(out)

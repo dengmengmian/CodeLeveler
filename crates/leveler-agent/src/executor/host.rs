@@ -25,7 +25,7 @@ use leveler_lifecycle::PlanStep;
 use leveler_model::{ContentPart, ToolCall};
 use leveler_tools::{ToolContext, ToolError, ToolRegistry};
 
-use super::dispatch::{collect_modified, extract_image, extract_plan};
+use super::dispatch::{collect_modified, extract_executed_commands, extract_image, extract_plan};
 use super::{AgentError, Executor};
 use crate::authorization::{
     action_fingerprint, approval_signature, call_needs_host_escape, command_line_for_match,
@@ -484,10 +484,10 @@ impl Executor {
     }
 
     /// Execute one admitted call, returning `(content, is_error, image,
-    /// workspace_snapshot, plan)` to feed back to the model. Infrastructure
-    /// errors are converted to model-visible text so the model can react
-    /// rather than the loop aborting. Also records any files the tool
-    /// modified.
+    /// workspace_snapshot, plan, modified paths, executed commands)` to feed
+    /// back to the model. Infrastructure errors are converted to model-visible
+    /// text so the model can react rather than the loop aborting. Also records
+    /// any files the tool modified and the commands it actually ran.
     pub(crate) async fn dispatch(
         &self,
         admitted: &AdmittedCall,
@@ -500,6 +500,7 @@ impl Executor {
         Option<String>,
         Option<Vec<PlanStep>>,
         Vec<String>,
+        Vec<Vec<String>>,
     ) {
         let (content, is_error, metadata) = self.dispatch_raw(admitted, cancellation).await;
         // The call's own modified paths, BEFORE merging into the epoch set:
@@ -518,7 +519,10 @@ impl Executor {
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
         let plan = extract_plan(&metadata);
-        (content, is_error, image, snapshot, plan, call_files)
+        let executed = extract_executed_commands(&metadata);
+        (
+            content, is_error, image, snapshot, plan, call_files, executed,
+        )
     }
 
     /// Execute one admitted call, returning `(content, is_error, metadata)`

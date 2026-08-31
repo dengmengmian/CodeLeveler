@@ -23,7 +23,7 @@ pub mod permission_grants;
 pub mod permission_rules;
 pub mod risk;
 mod shell_ast;
-pub use shell_ast::literal_command_words;
+pub use shell_ast::{literal_command_words, proven_executed_commands};
 pub mod snapshot;
 pub mod trust;
 pub mod windows_acl;

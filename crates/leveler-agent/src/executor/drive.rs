@@ -33,8 +33,8 @@ use super::{
     ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
-    collect_scoped_paths_from_call, counts_as_verification_evidence, extract_command,
-    is_observe_result_tool, is_pure_observe_call, is_search_tool, observe_class, push_unique_path,
+    collect_scoped_paths_from_call, is_observe_result_tool, is_pure_observe_call, is_search_tool,
+    is_verification_program, observe_class, push_unique_path,
 };
 use crate::compaction::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 use crate::injected_tools::{
@@ -2554,6 +2554,7 @@ impl Executor {
                     plan,
                     newly_modified,
                     call_mutated,
+                    executed_commands,
                     call,
                 ) = match self
                     .admit(call, ctx, parallel, &mut session_approved, &cancellation)
@@ -2581,7 +2582,15 @@ impl Executor {
                         // "等待模型". select! keeps this in the same task, so
                         // calling `observer` from the ticker branch is sound.
                         let progress_label = command_progress_label(&self.registry, &admitted.call);
-                        let (content, is_error, image, workspace_snapshot, plan, call_files) = {
+                        let (
+                            content,
+                            is_error,
+                            image,
+                            workspace_snapshot,
+                            plan,
+                            call_files,
+                            executed_commands,
+                        ) = {
                             let started = std::time::Instant::now();
                             let dispatch_fut =
                                 self.dispatch(&admitted, &mut modified_files, &cancellation);
@@ -2621,6 +2630,7 @@ impl Executor {
                             plan,
                             newly,
                             !call_files.is_empty(),
+                            executed_commands,
                             admitted.into_call(),
                         )
                     }
@@ -2635,6 +2645,7 @@ impl Executor {
                             None,
                             Vec::new(),
                             false,
+                            Vec::new(),
                             call,
                         )
                     }
@@ -2738,22 +2749,35 @@ impl Executor {
                     consecutive_searches = 0;
                 }
                 // A passing verification-class command is completion evidence;
-                // an arbitrary command (echo, ls, …) is not. shell_command never
-                // counts (name gate inside counts_as_verification_evidence).
-                if !is_error && counts_as_verification_evidence(&call.name, &call.arguments) {
-                    verification_ran = true;
-                    // A verification-class command that PASSED is real progress.
-                    verify_passed_this_round = true;
-                    let (program, args) = extract_command(&call);
-                    let fp = EvidenceLedger::normalize_command_fingerprint(
-                        program.as_deref().unwrap_or("run_command"),
-                        &args,
-                    );
-                    ledger.record_verify(call.id.as_str(), fp, 0);
-                    ledger.plan = plan_state.clone();
-                    observer(AgentEvent::EvidenceLedgerUpdated {
-                        ledger: ledger.clone(),
-                    });
+                // an arbitrary command (echo, ls, …) is not. What ran comes
+                // from the execution layer's own report, so the SAME
+                // `go build ./...` counts whether the model routed it through
+                // `run_command` or `shell_command` (HC-002 F1). A shape whose
+                // zero exit proves nothing about its members reports nothing,
+                // and one execution is recorded once.
+                if !is_error {
+                    let mut recorded: Vec<String> = Vec::new();
+                    for command in &executed_commands {
+                        let (program, args) = command.split_first().expect("non-empty command");
+                        if !is_verification_program(program) {
+                            continue;
+                        }
+                        let fp = EvidenceLedger::normalize_command_fingerprint(program, args);
+                        if recorded.contains(&fp) {
+                            continue;
+                        }
+                        ledger.record_verify(call.id.as_str(), fp.clone(), 0);
+                        recorded.push(fp);
+                    }
+                    if !recorded.is_empty() {
+                        verification_ran = true;
+                        // A verification-class command that PASSED is real progress.
+                        verify_passed_this_round = true;
+                        ledger.plan = plan_state.clone();
+                        observer(AgentEvent::EvidenceLedgerUpdated {
+                            ledger: ledger.clone(),
+                        });
+                    }
                 }
                 // Any tool that newly modified files records a mutation (not
                 // only apply_patch/replace by name). Paths are this call only.

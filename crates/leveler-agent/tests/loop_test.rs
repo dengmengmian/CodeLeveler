@@ -6368,6 +6368,266 @@ async fn auto_approve_blocks_consolidate_memory_auto_write() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// F1 (HC-002 Run 2): a verification-class command the model ran through
+/// `shell_command` really executed and really passed, but no command evidence
+/// was recorded, so a `CommandSuccess` obligation could never be discharged and
+/// correct work was refused. Evidence must follow the execution fact, not the
+/// tool wrapper the model happened to pick.
+#[tokio::test]
+async fn shell_command_verification_is_recorded_as_command_evidence() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-shell-evidence-{}",
+        std::process::id() as u64 * 37 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "m1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: notes.txt\n+one\n*** End Patch"
+            }),
+        ),
+        assistant_tool_call(
+            "v1",
+            "shell_command",
+            serde_json::json!({"cmd": "cargo --version"}),
+        ),
+        assistant_text("checked"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "add notes and verify",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let ledger = last_ledger(&events).expect("a ledger update must be emitted");
+    let fingerprint = leveler_lifecycle::EvidenceLedger::normalize_command_fingerprint(
+        "cargo",
+        &["--version".to_string()],
+    );
+    assert!(
+        ledger.fresh_successful_command(&fingerprint),
+        "shell_command execution of `cargo --version` must be fresh command evidence: {:?}",
+        ledger.verifications
+    );
+    assert!(
+        ledger
+            .verifications
+            .iter()
+            .any(|v| v.tool_call_id == "v1" && v.exit_code == 0),
+        "evidence must cite the real tool_call_id: {:?}",
+        ledger.verifications
+    );
+    assert_eq!(
+        ledger
+            .verifications
+            .iter()
+            .filter(|v| v.command_fingerprint == fingerprint)
+            .count(),
+        1,
+        "one execution must not be recorded twice: {:?}",
+        ledger.verifications
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Control: the `run_command` wrapper keeps producing the same evidence, and a
+/// mixed-wrapper `All` policy is satisfied only while BOTH stay fresh — a later
+/// mutation invalidates them exactly as before.
+#[tokio::test]
+async fn mixed_command_wrappers_share_one_freshness_rule() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-mixed-wrappers-{}",
+        std::process::id() as u64 * 37 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "m1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: notes.txt\n+one\n*** End Patch"
+            }),
+        ),
+        assistant_tool_call(
+            "v1",
+            "shell_command",
+            serde_json::json!({"cmd": "cargo --version"}),
+        ),
+        assistant_tool_call(
+            "v2",
+            "run_command",
+            serde_json::json!({"program": "cargo", "args": ["--list"]}),
+        ),
+        assistant_text("checked"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "add notes and verify twice",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut ledger = last_ledger(&events).expect("a ledger update must be emitted");
+    let shell_fp = leveler_lifecycle::EvidenceLedger::normalize_command_fingerprint(
+        "cargo",
+        &["--version".to_string()],
+    );
+    let structured_fp = leveler_lifecycle::EvidenceLedger::normalize_command_fingerprint(
+        "cargo",
+        &["--list".to_string()],
+    );
+    assert!(
+        ledger.fresh_successful_command(&shell_fp)
+            && ledger.fresh_successful_command(&structured_fp),
+        "both wrappers must produce equivalent fresh evidence: {:?}",
+        ledger.verifications
+    );
+    // §28: one later edit makes BOTH stale — shell evidence obeys the same
+    // mutation-sequence rule as structured evidence.
+    ledger.record_mutation("m2", "apply_patch", vec!["notes.txt".to_string()]);
+    assert!(
+        !ledger.fresh_successful_command(&shell_fp)
+            && !ledger.fresh_successful_command(&structured_fp),
+        "a later mutation must invalidate evidence from either wrapper"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A shell command that FAILED is not evidence: exit code, not wrapper, decides.
+#[tokio::test]
+async fn failed_shell_command_is_not_command_evidence() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-shell-nonzero-{}",
+        std::process::id() as u64 * 37 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "m1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: notes.txt\n+one\n*** End Patch"
+            }),
+        ),
+        assistant_tool_call(
+            "v1",
+            "shell_command",
+            serde_json::json!({"cmd": "cargo --no-such-flag-here"}),
+        ),
+        assistant_text("failed"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "add notes and try a bad command",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let ledger = last_ledger(&events).unwrap_or_default();
+    assert!(
+        ledger.verifications.is_empty(),
+        "a non-zero command must not become command evidence: {:?}",
+        ledger.verifications
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A non-verification command (`git status`) through either wrapper stays out
+/// of the ledger: recording every shell call would hand `TestCoverage` a free
+/// "something green ran" and weaken the policy it exists to enforce.
+#[tokio::test]
+async fn ordinary_shell_command_is_not_verification_evidence() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-shell-ordinary-{}",
+        std::process::id() as u64 * 37 + 17
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "m1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: notes.txt\n+one\n*** End Patch"
+            }),
+        ),
+        assistant_tool_call("v1", "shell_command", serde_json::json!({"cmd": "echo hi"})),
+        assistant_text("looked"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        8,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "add notes and look around",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let ledger = last_ledger(&events).unwrap_or_default();
+    assert!(
+        !ledger.has_fresh_successful_verify(),
+        "an ordinary command must not count as a green check: {:?}",
+        ledger.verifications
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The last EvidenceLedger the executor emitted.
+fn last_ledger(events: &[AgentEvent]) -> Option<leveler_lifecycle::EvidenceLedger> {
+    events.iter().rev().find_map(|e| match e {
+        AgentEvent::EvidenceLedgerUpdated { ledger } => Some(ledger.clone()),
+        _ => None,
+    })
+}
+
 /// Gate intercepts emit GoalIntercepted + EvidenceLedgerUpdated for persistence.
 #[tokio::test]
 async fn goal_intercept_emits_ledger_events() {

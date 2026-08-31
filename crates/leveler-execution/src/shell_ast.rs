@@ -21,6 +21,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::approval::{
     CommandClass, basename, classify_program, is_shell_c_flag, is_shell_wrapper_program,
+    shell_c_script,
 };
 
 /// Classify a bash script by walking its tree-sitter parse tree.
@@ -220,6 +221,128 @@ fn heredoc_feeds_shell(stmt: &Node, src: &[u8]) -> bool {
     resolve_command_name(&name, src).is_some_and(|prog| is_shell_wrapper_program(&prog))
 }
 
+/// The commands one *successful* invocation proves actually ran and exited
+/// zero — the execution fact completion evidence is built on.
+///
+/// A program that is not a shell wrapper is itself the command. A shell
+/// wrapper (`sh -c "…"`) is decomposed only where the overall exit code is a
+/// statement about EVERY command in it: a single command, or a chain joined
+/// solely by `&&`. Anything else — `||`, `;`, pipelines, redirections,
+/// subshells, negation, background, an unparseable or non-literal script —
+/// yields nothing, because a zero exit there proves nothing about the members.
+///
+/// Wrapper-independent by construction: what is recorded follows from what
+/// ran, not from which tool the caller happened to route it through.
+pub fn proven_executed_commands(program: &str, args: &[String]) -> Vec<Vec<String>> {
+    if is_shell_wrapper_program(program) {
+        return match shell_c_script(args) {
+            Some(script) => proven_commands(script),
+            None => Vec::new(),
+        };
+    }
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(program.to_string());
+    command.extend(args.iter().cloned());
+    vec![command]
+}
+
+/// [`proven_executed_commands`] for a shell script body.
+fn proven_commands(script: &str) -> Vec<Vec<String>> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    // Unparseable, empty, or several statements (`a; b`, two lines): the exit
+    // code belongs to the last one alone, so nothing is proven about the rest.
+    if root.has_error() || root.named_child_count() != 1 {
+        return Vec::new();
+    }
+    // `cmd &` backgrounds the statement: the wrapper's exit code is the
+    // shell's, and the command may still be running. The `&` hangs off the
+    // root next to the statement, so it has to be looked for here.
+    let mut cursor = root.walk();
+    if root.children(&mut cursor).any(|c| c.kind() == "&") {
+        return Vec::new();
+    }
+    let Some(only) = root.named_child(0) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if collect_proven(&only, script.as_bytes(), &mut out) {
+        out
+    } else {
+        Vec::new()
+    }
+}
+
+/// Walk one statement, pushing every command whose success the statement's own
+/// zero exit implies. Returns false when the shape proves nothing.
+fn collect_proven(node: &Node, src: &[u8], out: &mut Vec<Vec<String>>) -> bool {
+    match node.kind() {
+        "command" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    // A redirect makes the visible outcome someone else's
+                    // story; an assignment prefix changes the environment the
+                    // command ran in. Neither is the plain execution the
+                    // fingerprint claims.
+                    "file_redirect" | "heredoc_redirect" | "variable_assignment" => return false,
+                    _ => {}
+                }
+            }
+            let Some(name) = node.child_by_field_name("name") else {
+                return false;
+            };
+            let Some(program) = resolve_command_name(&name, src) else {
+                return false;
+            };
+            let mut words = vec![program];
+            for arg in literal_arguments(node, src) {
+                // A word we cannot read statically (`$FLAGS`, `$(…)`) means we
+                // do not know which command ran.
+                let Some(word) = arg else {
+                    return false;
+                };
+                words.push(word);
+            }
+            out.push(words);
+            true
+        }
+        // `a && b`: exit 0 means a succeeded AND b ran and succeeded. `||`
+        // (and any other list operator) says nothing of the sort.
+        "list" => {
+            let mut cursor = node.walk();
+            let mut saw_and = false;
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "&&" => saw_and = true,
+                    "||" | "&" | ";" => return false,
+                    _ => {}
+                }
+            }
+            if !saw_and {
+                return false;
+            }
+            let (Some(left), Some(right)) = (node.named_child(0), node.named_child(1)) else {
+                return false;
+            };
+            collect_proven(&left, src, out) && collect_proven(&right, src, out)
+        }
+        // pipeline, subshell, negated_command, redirected_statement, loops,
+        // function definitions, …: not a shape whose exit code speaks for its
+        // members.
+        _ => false,
+    }
+}
+
 /// All plain-literal words appearing as command arguments anywhere in the
 /// script, nested `sh -c '…'` bodies included. This is the read-preflight's
 /// view of the paths a shell string touches (R004 F3): expansions and
@@ -276,6 +399,85 @@ mod tests {
     //! the AST decides (`Some`) and which it defers to the string fallback
     //! (`None`). End-to-end verdicts live in `tests/classify_adversarial.rs`.
     use super::*;
+
+    fn proven(script: &str) -> Vec<Vec<String>> {
+        proven_executed_commands("sh", &["-c".to_string(), script.to_string()])
+    }
+
+    #[test]
+    fn a_structured_invocation_is_its_own_command() {
+        assert_eq!(
+            proven_executed_commands("go", &["build".into(), "./...".into()]),
+            vec![vec![
+                "go".to_string(),
+                "build".to_string(),
+                "./...".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_shell_wrapper_yields_the_command_it_actually_ran() {
+        assert_eq!(
+            proven("go build ./..."),
+            vec![vec![
+                "go".to_string(),
+                "build".to_string(),
+                "./...".to_string()
+            ]]
+        );
+        // Quoting is the shell's, not part of the command that ran.
+        assert_eq!(
+            proven("go test './...'"),
+            vec![vec![
+                "go".to_string(),
+                "test".to_string(),
+                "./...".to_string()
+            ]]
+        );
+    }
+
+    /// `&&` is the one operator whose zero exit speaks for every member.
+    #[test]
+    fn an_and_chain_proves_every_member() {
+        assert_eq!(
+            proven("go build ./... && go test ./..."),
+            vec![
+                vec!["go".to_string(), "build".to_string(), "./...".to_string()],
+                vec!["go".to_string(), "test".to_string(), "./...".to_string()],
+            ]
+        );
+    }
+
+    /// Shapes where a zero exit proves nothing about the individual commands.
+    #[test]
+    fn shapes_that_prove_nothing_yield_nothing() {
+        for script in [
+            "go build ./... || true",         // the fallback may be what passed
+            "go build ./...; go test ./...",  // only the last exit survives
+            "go test ./... | tee out.txt",    // the pipeline's exit is tee's
+            "go test ./... > out.txt",        // redirect: outcome is elsewhere
+            "! go test ./...",                // negation inverts the meaning
+            "(go test ./...)",                // subshell
+            "GOFLAGS=-mod=mod go test ./...", // ran under a changed environment
+            "go test $PKGS",                  // we cannot read what ran
+            "go test ./... &",                // never waited for
+            "if true; then go test ./...; fi",
+            "for p in a b; do go test $p; done",
+            "go test ./... &&", // does not parse
+        ] {
+            assert!(
+                proven(script).is_empty(),
+                "must prove nothing for: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_wrapper_without_a_script_proves_nothing() {
+        assert!(proven_executed_commands("sh", &["-c".to_string()]).is_empty());
+        assert!(proven_executed_commands("bash", &[]).is_empty());
+    }
 
     #[test]
     fn decides_clean_scripts() {

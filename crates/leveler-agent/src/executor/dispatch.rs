@@ -21,6 +21,27 @@ pub(crate) fn extract_image(metadata: &serde_json::Value) -> Option<ContentPart>
     })
 }
 
+/// The commands a tool reported as actually executed (`metadata.executed_commands`).
+///
+/// The execution layer states this; the executor never re-derives it from tool
+/// names or arguments. A tool that runs nothing reports nothing.
+pub(crate) fn extract_executed_commands(metadata: &serde_json::Value) -> Vec<Vec<String>> {
+    let Some(commands) = metadata.get("executed_commands").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    commands
+        .iter()
+        .filter_map(|c| {
+            let words: Vec<String> = c
+                .as_array()?
+                .iter()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect();
+            (!words.is_empty()).then_some(words)
+        })
+        .collect()
+}
+
 pub(crate) fn collect_modified(metadata: &serde_json::Value, out: &mut Vec<String>) {
     if let Some(files) = metadata.get("modified_files").and_then(|v| v.as_array()) {
         for f in files {

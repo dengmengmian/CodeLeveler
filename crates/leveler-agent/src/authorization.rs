@@ -11,19 +11,17 @@ pub(crate) fn is_search_tool(name: &str) -> bool {
     leveler_model::is_search_tool(name)
 }
 
-/// Whether a `run_command` call runs a verification-class program (build /
-/// test / typecheck runner). Heuristic by program basename: the real gate is
-/// the verifier — this only decides whether the executor nudges the model to
-/// verify before accepting a completion.
-pub(crate) fn is_verification_command(arguments: &serde_json::Value) -> bool {
+/// Whether a program is a verification-class runner (build / test /
+/// typecheck). Heuristic by program basename over the command that ACTUALLY
+/// ran, whatever tool wrapper carried it: the real gate is the verifier — this
+/// decides what counts as a green check and whether the executor nudges the
+/// model to verify before accepting a completion.
+pub(crate) fn is_verification_program(program: &str) -> bool {
     const VERIFICATION_PROGRAMS: &[&str] = &[
         "cargo", "rustc", "go", "npm", "pnpm", "yarn", "npx", "bun", "deno", "node", "tsc", "jest",
         "vitest", "mocha", "pytest", "python", "python3", "tox", "mypy", "ruff", "make", "just",
         "gradle", "gradlew", "mvn", "mvnw", "dotnet", "ctest", "cmake", "swift", "zig",
     ];
-    let Some(program) = arguments.get("program").and_then(|v| v.as_str()) else {
-        return false;
-    };
     // Parse both separator styles so Windows tool calls are classified the
     // same way even when replayed or tested on a Unix host.
     let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
@@ -316,15 +314,6 @@ pub(crate) fn approval_signature(tool: &str, program: Option<&str>, args: &[Stri
         ),
         None => tool.to_string(),
     }
-}
-
-/// Whether this tool call would count as completion verification evidence.
-///
-/// Double-gated: only `run_command` with a verification-class `program`
-/// basename. Mirrors the executor gate so `shell_command` (even with a
-/// spoofed `program` field) never counts.
-pub(crate) fn counts_as_verification_evidence(tool: &str, arguments: &serde_json::Value) -> bool {
-    tool == "run_command" && is_verification_command(arguments)
 }
 
 /// Stable, non-reversible identity of one exact proposed action. Used to bind
@@ -688,37 +677,19 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_is_not_verification_evidence() {
-        // Evidence is double-gated: tool name == run_command AND program basename
-        // is a verification runner. Helper alone is program-only; the name gate
-        // is what seals shell_command (including spoofed program fields).
-        let cargo_args = serde_json::json!({"program": "cargo", "args": ["test"]});
-        let shell_cargo = serde_json::json!({"cmd": "cargo test"});
-        let shell_spoofed =
-            serde_json::json!({"cmd": "true", "program": "cargo", "args": ["test"]});
-
-        assert!(counts_as_verification_evidence("run_command", &cargo_args));
-        assert!(!counts_as_verification_evidence(
-            "shell_command",
-            &shell_cargo
-        ));
-        assert!(
-            !counts_as_verification_evidence("shell_command", &shell_spoofed),
-            "shell_command must not count even if arguments contain program=cargo"
-        );
-        assert!(!counts_as_verification_evidence(
-            "shell_command",
-            &serde_json::json!({"cmd": "true"})
-        ));
-        // Helper without name gate: no program → false; with program → true.
-        assert!(!is_verification_command(&shell_cargo));
-        assert!(is_verification_command(&cargo_args));
-        assert!(is_verification_command(
-            &serde_json::json!({"program": r"C:\\Rust\\bin\\cargo.exe", "args": ["test"]})
-        ));
-        assert!(is_verification_command(
-            &serde_json::json!({"program": r"C:\\Node\\npm.CMD", "args": ["test"]})
-        ));
+    fn verification_class_is_decided_by_the_program_that_ran() {
+        // HC-002 F1: this used to be double-gated on the TOOL NAME, so the
+        // same runner counted through `run_command` and vanished through
+        // `shell_command`. The class is a property of the program; which
+        // command actually ran is the execution layer's report, not a guess
+        // from arguments (a spoofed `program` field on a shell call never
+        // reaches this).
+        assert!(is_verification_program("cargo"));
+        assert!(is_verification_program("go"));
+        assert!(!is_verification_program("git"));
+        assert!(!is_verification_program("echo"));
+        assert!(is_verification_program(r"C:\Rust\bin\cargo.exe"));
+        assert!(is_verification_program(r"C:\Node\npm.CMD"));
     }
 
     #[test]
