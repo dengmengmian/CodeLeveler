@@ -464,6 +464,12 @@ impl InProcessRuntimeClient {
             )
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        // One permission change, both projections: the row above is the
+        // durable record, this is the same value as RUNNING state. Without
+        // it a turn already executing keeps authorizing under the profile it
+        // started with while the UI and the row show the new one.
+        self.app
+            .set_live_permission_profile(session_id.as_str(), config.mode);
         self.session_runtime
             .lock()
             .unwrap()

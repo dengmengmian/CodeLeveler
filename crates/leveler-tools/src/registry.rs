@@ -176,7 +176,7 @@ impl ToolRegistry {
         if context.policy.read_only && tool.risk() != RiskLevel::Safe {
             return Err(ToolError::NotPermitted {
                 tool: name.to_string(),
-                mode: context.policy.mode,
+                mode: context.policy.mode(),
                 risk: tool.risk(),
             });
         }
@@ -186,10 +186,10 @@ impl ToolRegistry {
                  code, then use claim_write_scope(paths) before modifying files.",
             ));
         }
-        if !context.policy.mode.permits(tool.risk()) {
+        if !context.policy.mode().permits(tool.risk()) {
             return Err(ToolError::NotPermitted {
                 tool: name.to_string(),
-                mode: context.policy.mode,
+                mode: context.policy.mode(),
                 risk: tool.risk(),
             });
         }

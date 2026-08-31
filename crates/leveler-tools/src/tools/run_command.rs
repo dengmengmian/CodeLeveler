@@ -191,7 +191,7 @@ async fn execute_background(
     #[cfg(not(windows))]
     {
         let confine_writes =
-            context.policy.mode.confines_workspace() && !context.policy.unrestricted_fs();
+            context.policy.mode().confines_workspace() && !context.policy.unrestricted_fs();
         if confine_writes {
             let mut allowed = vec![context.execution.workspace.root().to_path_buf()];
             allowed.extend(context.execution.workspace.readonly_roots().iter().cloned());
@@ -276,7 +276,7 @@ fn background_process_request(
     context: &ToolContext,
 ) -> ProcessRequest {
     let confine_writes =
-        context.policy.mode.confines_workspace() && !context.policy.unrestricted_fs();
+        context.policy.mode().confines_workspace() && !context.policy.unrestricted_fs();
     let mut req = ProcessRequest::new(program, args, cwd);
     req.deny_network = context.policy.network_denied();
     req.deny_env = context.policy.deny_env.as_ref().clone();
@@ -350,7 +350,7 @@ pub(crate) async fn execute_program(
     // is seen. On Windows AppContainer the stricter any-absolute-arg gate
     // remains the primary defense.
     let confine_writes =
-        context.policy.mode.confines_workspace() && !context.policy.unrestricted_fs();
+        context.policy.mode().confines_workspace() && !context.policy.unrestricted_fs();
     if confine_writes {
         let mut allowed = vec![context.execution.workspace.root().to_path_buf()];
         allowed.extend(context.execution.workspace.readonly_roots().iter().cloned());

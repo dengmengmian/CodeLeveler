@@ -288,7 +288,7 @@ impl Executor {
         }
 
         let requirement = self.approval_policy.evaluate(
-            self.tool_context.policy.mode,
+            self.tool_context.policy.mode(),
             &call.name,
             risk,
             command_view,
@@ -673,6 +673,290 @@ mod authorize_tests {
             10,
         )
         .with_approver(approver)
+    }
+
+    /// Same, at an explicit permission profile.
+    fn executor_at(
+        dir: &std::path::Path,
+        mode: PermissionProfile,
+        approver: Arc<FixedApprover>,
+    ) -> Executor {
+        let workspace = Workspace::new(dir).unwrap();
+        let tool_context = ToolContext::new(workspace, mode);
+        Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver)
+    }
+
+    /// An ordinary read-only repository search — the exact shape the user saw
+    /// a child stop on.
+    fn grep_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("g"),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"program": "grep", "args": ["-rn", "foo", "src"]}),
+        }
+    }
+
+    /// An executor bound to a permission profile the caller owns — the shape
+    /// the daemon builds, where the session holds the cell.
+    fn executor_sharing(
+        dir: &std::path::Path,
+        profile: &leveler_execution::SharedPermissionProfile,
+        approver: Arc<FixedApprover>,
+    ) -> Executor {
+        let workspace = Workspace::new(dir).unwrap();
+        let tool_context =
+            ToolContext::new(workspace, profile.get()).with_permission_profile(profile.clone());
+        Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver)
+    }
+
+    /// The defect this whole change exists for: the user switches to 完全访问
+    /// while a turn is running, and that turn keeps prompting because it
+    /// copied the profile at startup. The SAME executor — no restart — must
+    /// obey the change at its next decision.
+    #[tokio::test]
+    async fn a_running_agent_obeys_a_switch_to_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = leveler_execution::SharedPermissionProfile::new(PermissionProfile::Assisted);
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let main = executor_sharing(dir.path(), &session, approver.clone());
+        let mut seen = HashSet::new();
+
+        main.authorize(&rm_rf_call(), &mut seen).await.unwrap();
+        assert_eq!(
+            approver.asks(),
+            1,
+            "替我审批 asks for an irreversible delete"
+        );
+
+        session.set(PermissionProfile::FullAccess);
+
+        // Same executor, same turn, a call the session cache cannot answer.
+        let mut fresh = HashSet::new();
+        main.authorize(&rm_rf_call(), &mut fresh).await.unwrap();
+        assert_eq!(
+            approver.asks(),
+            1,
+            "the switch must land on the next decision, not the next turn"
+        );
+    }
+
+    /// The half that is a security property rather than a convenience one:
+    /// tightening must be just as live as widening, or a user who revokes
+    /// 完全访问 keeps an agent running with authority they just took away.
+    #[tokio::test]
+    async fn a_running_agent_obeys_a_switch_away_from_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            leveler_execution::SharedPermissionProfile::new(PermissionProfile::FullAccess);
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let main = executor_sharing(dir.path(), &session, approver.clone());
+        let mut seen = HashSet::new();
+
+        main.authorize(&rm_rf_call(), &mut seen).await.unwrap();
+        assert_eq!(approver.asks(), 0, "完全访问 does not prompt");
+
+        session.set(PermissionProfile::Assisted);
+
+        let mut fresh = HashSet::new();
+        main.authorize(&rm_rf_call(), &mut fresh).await.unwrap();
+        assert_eq!(
+            approver.asks(),
+            1,
+            "revoked authority must not survive in a turn that is already running"
+        );
+    }
+
+    /// A child delegated BEFORE the switch is the case a per-turn snapshot
+    /// gets most wrong: it holds a clone of the parent's context, so it must
+    /// hold a reference to the same cell rather than a copy of its value.
+    #[tokio::test]
+    async fn a_child_delegated_before_the_switch_sees_it_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = leveler_execution::SharedPermissionProfile::new(PermissionProfile::Assisted);
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let main = executor_sharing(dir.path(), &session, approver.clone());
+
+        // Delegated while the task is still 替我审批.
+        let child = main
+            .child_for_role_on(crate::sub_agent::AgentRole::Default, Vec::new(), None)
+            .with_agent_id("child-before");
+        let mut seen = HashSet::new();
+        child.authorize(&rm_rf_call(), &mut seen).await.unwrap();
+        assert_eq!(approver.asks(), 1);
+
+        session.set(PermissionProfile::FullAccess);
+        let mut fresh = HashSet::new();
+        child.authorize(&rm_rf_call(), &mut fresh).await.unwrap();
+        assert_eq!(
+            approver.asks(),
+            1,
+            "the existing child must see the upgrade"
+        );
+
+        session.set(PermissionProfile::Assisted);
+        let mut again = HashSet::new();
+        child.authorize(&rm_rf_call(), &mut again).await.unwrap();
+        assert_eq!(
+            approver.asks(),
+            2,
+            "and the downgrade, without being respawned"
+        );
+    }
+
+    /// A child delegated AFTER a change starts from the current profile, in
+    /// both directions.
+    #[tokio::test]
+    async fn a_child_delegated_after_the_switch_starts_from_the_current_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = leveler_execution::SharedPermissionProfile::new(PermissionProfile::Assisted);
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let main = executor_sharing(dir.path(), &session, approver.clone());
+
+        session.set(PermissionProfile::FullAccess);
+        let after_upgrade = main
+            .child_for_role_on(crate::sub_agent::AgentRole::Default, Vec::new(), None)
+            .with_agent_id("child-after-upgrade");
+        let mut seen = HashSet::new();
+        after_upgrade
+            .authorize(&rm_rf_call(), &mut seen)
+            .await
+            .unwrap();
+        assert_eq!(approver.asks(), 0);
+
+        session.set(PermissionProfile::Assisted);
+        let after_downgrade = main
+            .child_for_role_on(crate::sub_agent::AgentRole::Default, Vec::new(), None)
+            .with_agent_id("child-after-downgrade");
+        let mut fresh = HashSet::new();
+        after_downgrade
+            .authorize(&rm_rf_call(), &mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(approver.asks(), 1);
+    }
+
+    /// 完全访问 removes the PROMPT, never the structure. A read-only child
+    /// holds no write authority at any profile, and refusing it is a denial —
+    /// it must not become a question for the user.
+    #[tokio::test]
+    async fn full_access_never_buys_a_read_only_child_write_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            leveler_execution::SharedPermissionProfile::new(PermissionProfile::FullAccess);
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let main = executor_sharing(dir.path(), &session, approver.clone());
+        let explorer = main
+            .child_for_role_on(crate::sub_agent::AgentRole::Explorer, Vec::new(), None)
+            .with_agent_id("explorer-1");
+
+        // 完全访问 does not put a write tool back into a read-only role: the
+        // child's registry physically does not hold one.
+        assert!(
+            !explorer.registry.mutates_files("apply_patch"),
+            "an explorer must hold no write tool at any profile"
+        );
+
+        // And a writer that has claimed nothing is refused outright, rather
+        // than being turned into a question for the user.
+        let writer = main
+            .child_for_role_on(crate::sub_agent::AgentRole::Default, Vec::new(), None)
+            .with_agent_id("writer-unclaimed");
+        let write = ToolCall {
+            id: ToolCallId::new("w"),
+            name: "apply_patch".into(),
+            arguments: serde_json::json!({ "patch": ["not", "a", "string"] }),
+        };
+        let refusal = writer
+            .refuse_unscoped_mutation(&write)
+            .expect("an unclaimed child holds no write authority under any profile");
+        assert!(refusal.contains("no write scope"), "{refusal}");
+        assert_eq!(
+            approver.asks(),
+            0,
+            "a structural denial must never be turned into an approval prompt"
+        );
+    }
+
+    /// Several children already in flight all share the session cell, so one
+    /// write is visible to every next authorization — nothing to broadcast.
+    #[tokio::test]
+    async fn every_existing_child_sees_the_same_live_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = leveler_execution::SharedPermissionProfile::new(PermissionProfile::Assisted);
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let main = executor_sharing(dir.path(), &session, approver.clone());
+        let children: Vec<Executor> = (0..3)
+            .map(|i| {
+                main.child_for_role_on(crate::sub_agent::AgentRole::Default, Vec::new(), None)
+                    .with_agent_id(format!("child-{i}"))
+            })
+            .collect();
+
+        session.set(PermissionProfile::FullAccess);
+        for child in &children {
+            let mut seen = HashSet::new();
+            child.authorize(&rm_rf_call(), &mut seen).await.unwrap();
+        }
+        assert_eq!(approver.asks(), 0, "every existing child observes Full");
+
+        session.set(PermissionProfile::Assisted);
+        for child in &children {
+            let mut seen = HashSet::new();
+            child.authorize(&rm_rf_call(), &mut seen).await.unwrap();
+        }
+        assert_eq!(
+            approver.asks(),
+            3,
+            "and every existing child observes the downgrade"
+        );
+    }
+
+    /// 完全访问 is a promise about the whole task, not about the top agent:
+    /// the user opted out of prompting once, and a delegated agent doing
+    /// ordinary work must not re-open that decision.
+    #[tokio::test]
+    async fn full_access_asks_nobody_in_the_main_agent_or_in_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let main_approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let main = executor_at(
+            dir.path(),
+            PermissionProfile::FullAccess,
+            main_approver.clone(),
+        );
+        let mut session = HashSet::new();
+        main.authorize(&grep_call(), &mut session)
+            .await
+            .expect("full access executes a repo search directly");
+        assert_eq!(main_approver.asks(), 0, "main agent must not be asked");
+
+        let child = main
+            .child_for_role_on(crate::sub_agent::AgentRole::Explorer, Vec::new(), None)
+            .with_agent_id("child-1");
+        let mut child_session = HashSet::new();
+        child
+            .authorize(&grep_call(), &mut child_session)
+            .await
+            .expect("a child under full access executes the same search directly");
+        assert_eq!(
+            main_approver.asks(),
+            0,
+            "a delegated agent must not re-open a decision the user already made"
+        );
     }
 
     /// `rm -rf …` classifies dangerous (irreversible destruction), so Assisted

@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{FileStateTracker, RepeatedReadGuard};
 use leveler_execution::{
-    Checkpoint, CommandRunner, PermissionProfile, ProcessError, RiskLevel, Workspace,
-    WorkspaceError,
+    Checkpoint, CommandRunner, PermissionProfile, ProcessError, RiskLevel, SharedPermissionProfile,
+    Workspace, WorkspaceError,
 };
 
 /// Shared, cheaply-cloneable context handed to every tool invocation,
@@ -71,7 +71,14 @@ pub struct ExecutionResources {
 /// they share one change reason: what is this execution allowed to do.
 #[derive(Clone)]
 pub struct ToolPolicy {
-    pub mode: PermissionProfile,
+    /// The task's permission profile, held by REFERENCE, not by value.
+    ///
+    /// A turn used to freeze this at startup, so switching to 完全访问 while a
+    /// turn was running left that turn — and every agent it had already
+    /// delegated to — authorizing under the old profile while the UI and the
+    /// session row both said otherwise. Private so nothing can read a stale
+    /// copy: [`Self::mode`] is the only way in, and it always reads the cell.
+    permission_profile: SharedPermissionProfile,
     /// Collaboration-plan / `leveler plan` read-only overlay: only Safe tools.
     /// Orthogonal to the three-tier [`PermissionProfile`].
     pub read_only: bool,
@@ -114,6 +121,19 @@ pub struct ToolPolicy {
 }
 
 impl ToolPolicy {
+    /// The permission profile in force RIGHT NOW. Every authorization
+    /// decision goes through here, so a change the user makes mid-turn is
+    /// seen by the next decision — in the main agent and in children that
+    /// were delegated before the change.
+    pub fn mode(&self) -> PermissionProfile {
+        self.permission_profile.get()
+    }
+
+    /// The live cell itself, for a host that owns the session's profile.
+    pub fn permission_profile(&self) -> &SharedPermissionProfile {
+        &self.permission_profile
+    }
+
     /// Whether `run_command` children run with network access denied.
     pub fn network_denied(&self) -> bool {
         self.deny_network
@@ -227,7 +247,7 @@ impl ToolContext {
                 command_gate: Arc::new(tokio::sync::Mutex::new(())),
             },
             policy: ToolPolicy {
-                mode,
+                permission_profile: SharedPermissionProfile::new(mode),
                 read_only: false,
                 deny_network: false,
                 turn_unrestricted_fs: false,
@@ -252,6 +272,19 @@ impl ToolContext {
             },
             session_scope: None,
         }
+    }
+
+    /// Point this context at a permission profile the SESSION owns, instead
+    /// of the private cell the constructor made.
+    ///
+    /// This is what makes a permission change reach a turn that is already
+    /// running: the host holds the cell, the turn holds a reference, and
+    /// `ToolContext` is cloned into every child — so one write is seen by the
+    /// whole agent tree at its next authorization decision, with nothing to
+    /// broadcast and nothing to restart.
+    pub fn with_permission_profile(mut self, profile: SharedPermissionProfile) -> Self {
+        self.policy.permission_profile = profile;
+        self
     }
 
     /// Bind this context to a session identity (browser page/ref isolation).

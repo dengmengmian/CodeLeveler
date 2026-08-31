@@ -179,9 +179,74 @@ pub struct Application {
     /// Durable runtime identity, loaded (and minted on first use) lazily from
     /// the state directory. Cached: the id cannot change within one process.
     runtime_id: OnceLock<leveler_core::RuntimeId>,
+    /// The live permission profile of each session, keyed by session scope.
+    ///
+    /// The persisted `sessions.mode` column is the durable record; this is the
+    /// same value as running state, so a change reaches a turn that is already
+    /// executing. Per session — never one process-wide profile — because one
+    /// daemon hosts several sessions at different profiles at once.
+    permission_profiles: std::sync::Mutex<
+        std::collections::HashMap<String, leveler_execution::SharedPermissionProfile>,
+    >,
 }
 
 impl Application {
+    /// The live permission profile for a session, created on first use from
+    /// `mode` (the caller's authority — the session row or its cached runtime
+    /// config) and reused by every later turn of that session.
+    fn permission_profile_for(
+        &self,
+        scope: Option<&str>,
+        mode: PermissionProfile,
+    ) -> leveler_execution::SharedPermissionProfile {
+        let Some(scope) = scope else {
+            // No session identity (eval, one-shot CLI): nobody can change the
+            // profile mid-run, so a private cell is the whole truth.
+            return leveler_execution::SharedPermissionProfile::new(mode);
+        };
+        let mut map = self
+            .permission_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = map
+            .entry(scope.to_string())
+            .or_insert_with(|| leveler_execution::SharedPermissionProfile::new(mode))
+            .clone();
+        // A turn starts from the current authority, so the cell and the
+        // session row cannot drift apart across turns.
+        profile.set(mode);
+        profile
+    }
+
+    /// Apply a permission change to a session's RUNNING execution.
+    ///
+    /// Returns whether a live cell existed — false simply means no turn of
+    /// that session has built one yet, and the next turn will start from the
+    /// persisted value.
+    pub fn set_live_permission_profile(&self, scope: &str, mode: PermissionProfile) -> bool {
+        let map = self
+            .permission_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get(scope) {
+            Some(profile) => {
+                profile.set(mode);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The profile a session's execution is authorizing under right now.
+    /// `None` when that session has never run a turn in this process.
+    pub fn live_permission_profile(&self, scope: &str) -> Option<PermissionProfile> {
+        self.permission_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(scope)
+            .map(leveler_execution::SharedPermissionProfile::get)
+    }
+
     /// The shared background-task registry (R004 F7 shutdown reaping).
     pub fn background_tasks(&self) -> &Arc<leveler_execution::BackgroundTaskRegistry> {
         &self.background_tasks
@@ -294,6 +359,7 @@ impl Application {
             background_tasks,
             browser,
             runtime_id: OnceLock::new(),
+            permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -526,6 +592,12 @@ impl Application {
             .with_read_only(read_only)
             .with_background_tasks(bg)
             .with_browser(self.browser.clone());
+        // The permission profile this turn authorizes under is the SESSION's
+        // live cell, not the value captured here: a user who switches profile
+        // while this turn runs must be obeyed by it and by every agent it has
+        // already delegated to, at their next authorization decision.
+        let tool_context =
+            tool_context.with_permission_profile(self.permission_profile_for(session_scope, mode));
         let tool_context = match session_scope {
             Some(scope) => tool_context.with_session_scope(scope),
             None => tool_context,

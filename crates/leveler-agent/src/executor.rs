@@ -1660,7 +1660,7 @@ impl Executor {
             .commit_co_author(self.commit_co_author)
             .turn_context(TurnContext {
                 model: self.model.clone(),
-                mode: self.tool_context.policy.mode,
+                mode: self.tool_context.policy.mode(),
                 network_allowed: self.approval_policy.network_allowed,
                 deny_network: self.tool_context.policy.network_denied(),
                 cwd: self.tool_context.execution.workspace.root().to_path_buf(),

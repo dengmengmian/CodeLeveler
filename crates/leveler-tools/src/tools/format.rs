@@ -49,7 +49,7 @@ pub(crate) async fn format_after_edit(
     );
     req.deny_network = true;
     req.timeout = Duration::from_secs(30);
-    if context.policy.mode == PermissionProfile::Assisted {
+    if context.policy.mode() == PermissionProfile::Assisted {
         req.write_root = Some(context.execution.workspace.root().to_path_buf());
     }
     // Best-effort: never let a formatter error or absence fail the edit. Honor

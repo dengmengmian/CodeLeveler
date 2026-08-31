@@ -116,7 +116,7 @@ impl Executor {
         // Nothing to request under 完全访问 — the elevation it asks for is
         // already granted, so advertising it only invites a pointless round
         // trip and an interruption the user explicitly opted out of.
-        if self.tool_context.policy.mode != leveler_execution::PermissionProfile::FullAccess {
+        if self.tool_context.policy.mode() != leveler_execution::PermissionProfile::FullAccess {
             tools.push(request_permissions_tool_definition());
         }
         // A sub-agent shouldn't spawn its own sub-agents; product kill-switch

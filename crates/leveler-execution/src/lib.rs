@@ -58,7 +58,7 @@ pub use permission_rules::{
     RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
     clear_project_rules, clear_rules_file, load_merged_rules, load_rules_file, project_rules_path,
 };
-pub use risk::{PermissionProfile, RiskLevel};
+pub use risk::{PermissionProfile, RiskLevel, SharedPermissionProfile};
 pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};
 pub use trust::{
     TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,

@@ -124,7 +124,7 @@ impl Executor {
         // — which returns Auto for FullAccess before anything else — and
         // interrupts a user who opted out of prompting, to grant a permission
         // they already hold.
-        if self.tool_context.policy.mode == leveler_execution::PermissionProfile::FullAccess {
+        if self.tool_context.policy.mode() == leveler_execution::PermissionProfile::FullAccess {
             return Ok(PermissionRequestOutcome::Granted {
                 message: permission_grant_message(true, grants),
                 grants,
