@@ -93,6 +93,8 @@ pub struct ChildAgentView {
     /// inspector queries when the user opens a detail view, because findings
     /// are ledger facts and streaming them would duplicate the record.
     pub detail: Option<leveler_client_protocol::UiChildContribution>,
+    /// Bounded projection of [`SubAgentActivity`] steps, newest last.
+    pub steps: Vec<String>,
 }
 
 impl ChildAgentView {
@@ -268,6 +270,7 @@ impl TaskTeamView {
             output_tokens: 0,
             started_elapsed_secs,
             detail: None,
+            steps: Vec::new(),
         });
         self.restamp_settlement(started_elapsed_secs);
     }
@@ -299,6 +302,12 @@ impl TaskTeamView {
     pub fn apply_activity(&mut self, id: &str, tool: &str) {
         if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
             c.recent_step = Some(tool.to_string());
+            if c.steps.last().map(String::as_str) != Some(tool) {
+                c.steps.push(tool.to_string());
+                if c.steps.len() > 16 {
+                    c.steps.remove(0);
+                }
+            }
         }
     }
 }
@@ -353,6 +362,7 @@ mod tests {
                 output_tokens: 0,
                 started_elapsed_secs: 0,
                 detail: None,
+                steps: Vec::new(),
             });
         }
         team

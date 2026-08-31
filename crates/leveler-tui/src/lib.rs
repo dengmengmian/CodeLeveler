@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod action;
+pub mod activity;
 mod activity_stream;
 mod brand;
 mod code_block;

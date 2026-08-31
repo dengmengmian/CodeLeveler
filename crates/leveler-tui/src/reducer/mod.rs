@@ -243,6 +243,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 
     let over_input = point_in_rect(mouse.column, mouse.row, state.input_rect);
     let over_conv = point_in_rect(mouse.column, mouse.row, state.conv.rect);
+    let activity_hit = state
+        .activity_hits
+        .iter()
+        .find(|(y, _)| *y == mouse.row)
+        .map(|(_, id)| id.clone());
     let over_jump = point_in_rect(mouse.column, mouse.row, state.conv.scroll_bottom_rect);
 
     match mouse.kind {
@@ -268,6 +273,12 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
                 return Vec::new();
+            }
+            if let Some(id) = activity_hit {
+                state.workbench_focus = WorkbenchFocus::Activity;
+                interaction::clear_selection_drag(state);
+                state.conv.selection.clear();
+                return crate::activity::open(state, id);
             }
             if over_input {
                 state.workbench_focus = WorkbenchFocus::Input;
@@ -528,6 +539,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             }
             return submit(state);
         }
+        KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Activity => {
+            return crate::activity::open_selected(state);
+        }
         // Conversation focus while reading history: Enter = jump to live edge.
         KeyCode::Enter
             if state.workbench_focus == WorkbenchFocus::Conversation && !state.conv.auto_scroll =>
@@ -585,7 +599,15 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Tab => {
             state.workbench_focus = match state.workbench_focus {
                 WorkbenchFocus::Input => WorkbenchFocus::Conversation,
-                WorkbenchFocus::Conversation => WorkbenchFocus::Input,
+                WorkbenchFocus::Conversation => {
+                    crate::activity::ensure_selection(state);
+                    if crate::activity::summaries(state).is_empty() {
+                        WorkbenchFocus::Input
+                    } else {
+                        WorkbenchFocus::Activity
+                    }
+                }
+                WorkbenchFocus::Activity => WorkbenchFocus::Input,
             };
         }
         KeyCode::Char(c) if !ctrl && !c.is_control() => {
@@ -645,6 +667,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::PageDown => {
             state.workbench_focus = WorkbenchFocus::Conversation;
             interaction::scroll_by(state, (state.size.1 as i32 / 2).max(1));
+        }
+        KeyCode::Up if state.workbench_focus == WorkbenchFocus::Activity && popup_len == 0 => {
+            crate::activity::select_delta(state, -1);
+        }
+        KeyCode::Down if state.workbench_focus == WorkbenchFocus::Activity && popup_len == 0 => {
+            crate::activity::select_delta(state, 1);
         }
         // Conversation focus: ↑/↓ scroll the viewport only.
         KeyCode::Up if state.workbench_focus == WorkbenchFocus::Conversation && popup_len == 0 => {

@@ -129,7 +129,7 @@ fn derive_status(state: &AppState) -> TerminalTaskStatus {
         StatusPhase::AwaitingUser => TerminalTaskStatus::NeedsUser,
         StatusPhase::Busy => TerminalTaskStatus::Running,
         StatusPhase::Idle => {
-            if !state.background_task_labels.is_empty() {
+            if crate::activity::running_background_count(state) > 0 {
                 return TerminalTaskStatus::Waiting;
             }
             match last_turn_end(state) {
@@ -373,10 +373,7 @@ mod tests {
         state.status = RuntimeStatus::Idle;
         state.background_task_labels.insert(
             "bg-1".into(),
-            crate::state::BackgroundTaskChrome {
-                label: "cargo test".into(),
-                started_elapsed_secs: 0,
-            },
+            crate::state::BackgroundTaskChrome::running("cargo test", 0),
         );
         let mut p = TerminalTitleProjection::default();
         assert_eq!(p.project(&state), "◌ Task · 等待后台任务");

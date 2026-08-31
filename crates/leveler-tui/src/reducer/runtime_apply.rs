@@ -565,10 +565,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             };
             state.background_task_labels.insert(
                 task_id.clone(),
-                crate::state::BackgroundTaskChrome {
-                    label: label.clone(),
-                    started_elapsed_secs: state.elapsed_secs,
-                },
+                crate::state::BackgroundTaskChrome::running(label.clone(), state.elapsed_secs),
             );
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
@@ -591,18 +588,32 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BackgroundTaskExited {
             task_id,
             exit_code,
+            duration_ms,
             ok,
-            ..
         } => {
             let t = state.t();
             // The same lifecycle settling: name what finished, not its id.
             // A missing label (exit seen without its start, e.g. after a
             // reconnect) falls back to a truthful generic — never invented.
-            let label = state
-                .background_task_labels
-                .remove(&task_id)
-                .map(|chrome| chrome.label)
-                .unwrap_or_else(|| t.background_task_generic.to_string());
+            let label = if let Some(chrome) = state.background_task_labels.get_mut(&task_id) {
+                chrome.ok = Some(ok);
+                chrome.exit_code = exit_code;
+                chrome.duration_ms = Some(duration_ms);
+                chrome.label.clone()
+            } else {
+                let chrome = crate::state::BackgroundTaskChrome {
+                    label: t.background_task_generic.to_string(),
+                    started_elapsed_secs: state.elapsed_secs,
+                    ok: Some(ok),
+                    exit_code,
+                    duration_ms: Some(duration_ms),
+                    output: String::new(),
+                };
+                let label = chrome.label.clone();
+                state.background_task_labels.insert(task_id.clone(), chrome);
+                label
+            };
+            crate::activity::prune_completed_background(state);
             let message = if ok {
                 t.background_task_done.replace("{}", &label)
             } else {

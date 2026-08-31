@@ -193,7 +193,21 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     }
     // chunks[2] = gap (leave blank)
     if status_rows > 0 {
-        frame.render_widget(Paragraph::new(status_block), chunks[3]);
+        frame.render_widget(Paragraph::new(status_block.clone()), chunks[3]);
+        let (_, ids) =
+            crate::activity::status_activity_lines(state, area.width as usize, state.t());
+        let headline = status_block
+            .len()
+            .saturating_sub(ids.len())
+            .min(status_rows as usize);
+        state.activity_hits = ids
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| headline + i < status_rows as usize)
+            .map(|(i, id)| (chunks[3].y + (headline + i) as u16, id))
+            .collect();
+    } else {
+        state.activity_hits.clear();
     }
     render_plan_panel(frame, chunks[4], state);
     render_attachments(frame, chunks[5], state);
@@ -1686,6 +1700,7 @@ mod tests {
                 output_tokens: 0,
                 started_elapsed_secs: 0,
                 detail: None,
+                steps: Vec::new(),
             });
         }
         team

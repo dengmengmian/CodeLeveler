@@ -444,16 +444,7 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
         ),
         Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
     ])];
-    let leftover = crate::wait_status::non_blocking_background_count(state);
-    if leftover > 0 {
-        let note = t
-            .background_still_running
-            .replace("{}", &leftover.to_string());
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&format!("  └─ {note}"), width),
-            Style::default().fg(theme.text.muted),
-        )));
-    }
+    append_activity_rows(&mut lines, state, width, theme);
     lines
 }
 
@@ -479,13 +470,28 @@ fn blocked_wait_lines(
         ),
         Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
     ])];
-    for row in crate::wait_status::disclosure_plain(view, t, width) {
+    append_activity_rows(&mut lines, state, width, theme);
+    lines
+}
+
+fn append_activity_rows(
+    lines: &mut Vec<Line<'static>>,
+    state: &AppState,
+    width: usize,
+    theme: &crate::theme::Theme,
+) {
+    let (rows, _) = crate::activity::status_activity_lines(state, width, state.t());
+    for row in rows {
+        let selected = row.starts_with('→');
         lines.push(Line::from(Span::styled(
             truncate_to_width(&row, width),
-            Style::default().fg(theme.text.muted),
+            Style::default().fg(if selected {
+                theme.text.primary
+            } else {
+                theme.text.muted
+            }),
         )));
     }
-    lines
 }
 
 /// Sparse top chrome: `⑂ branch · ~/path` only. Trust signals sit by the
@@ -815,10 +821,7 @@ mod tests {
         state.elapsed_secs = 54;
         state.background_task_labels.insert(
             "bg-2".into(),
-            BackgroundTaskChrome {
-                label: "cargo test --workspace".into(),
-                started_elapsed_secs: 10,
-            },
+            BackgroundTaskChrome::running("cargo test --workspace", 10),
         );
         state.transcript.push_tool_started(
             leveler_client_protocol::ToolCallId::new("w1"),
@@ -831,7 +834,7 @@ mod tests {
         let text = status_text(&state);
         assert!(text.contains("等待后台任务"), "{text}");
         assert!(text.contains("cargo test --workspace"), "{text}");
-        assert!(text.contains("运行中"), "{text}");
+        assert!(text.contains('↗'), "{text}");
         assert!(text.contains(WAIT_MARKER), "{text}");
         for line in text.lines() {
             if line.contains("等待任务") {
@@ -850,14 +853,12 @@ mod tests {
         state.activity = Some("正在汇总审计结果".into());
         state.background_task_labels.insert(
             "bg-1".into(),
-            BackgroundTaskChrome {
-                label: "cargo test --workspace".into(),
-                started_elapsed_secs: 0,
-            },
+            BackgroundTaskChrome::running("cargo test --workspace", 0),
         );
         let text = status_text(&state);
         assert!(text.contains("正在汇总审计结果"), "{text}");
-        assert!(text.contains("后台仍有 1 个任务运行"), "{text}");
+        assert!(text.contains("cargo test --workspace"), "{text}");
+        assert!(text.contains('↗'), "{text}");
         assert!(!text.contains("等待后台任务"), "{text}");
     }
 }

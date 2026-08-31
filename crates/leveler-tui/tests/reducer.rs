@@ -3391,12 +3391,16 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
     assert!(!msg.contains("npm"), "the other task is untouched: {msg}");
     assert!(!msg.contains("bg-7f3a"), "{msg}");
     assert!(
-        s.background_task_labels.contains_key("bg-91c2"),
+        s.background_task_labels
+            .get("bg-91c2")
+            .is_some_and(|c| c.is_running()),
         "the still-running task keeps its label"
     );
     assert!(
-        !s.background_task_labels.contains_key("bg-7f3a"),
-        "a settled task leaves no entry behind"
+        s.background_task_labels
+            .get("bg-7f3a")
+            .is_some_and(|c| !c.is_running()),
+        "a settled task stays reopenable, not running"
     );
 
     // Failure stays truthful and prominent, with the exit code.
@@ -3434,6 +3438,41 @@ fn an_unlabeled_background_exit_falls_back_to_a_truthful_generic() {
     let msg = s.notification.as_ref().unwrap().message.clone();
     assert!(!msg.contains("bg-unknown"), "{msg}");
     assert!(msg.contains("后台任务"), "generic but truthful: {msg}");
+}
+
+#[test]
+fn activity_enter_opens_detail_and_esc_closes_without_cancel() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-2".into(),
+            program: "cargo".into(),
+            args: vec!["test".into(), "--workspace".into()],
+        }),
+    );
+    reduce(&mut s, key(KeyCode::Tab));
+    reduce(&mut s, key(KeyCode::Tab));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::Activity);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| format!("{e:?}").contains("Cancel") || format!("{e:?}").contains("Kill")),
+        "Enter must not cancel: {effects:?}"
+    );
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+    assert!(s.activity_open.is_none());
+    assert!(
+        s.background_task_labels
+            .get("bg-2")
+            .is_some_and(|c| c.is_running())
+    );
+    assert!(
+        effects.is_empty(),
+        "Esc close sends no command: {effects:?}"
+    );
 }
 
 #[test]

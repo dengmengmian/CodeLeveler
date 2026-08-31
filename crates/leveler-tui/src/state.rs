@@ -70,11 +70,13 @@ pub struct Notification {
 ///
 /// - [`Input`](WorkbenchFocus::Input): history browse, typing
 /// - [`Conversation`](WorkbenchFocus::Conversation): viewport scroll
+/// - [`Activity`](WorkbenchFocus::Activity): compact activity rows (Enter opens detail)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkbenchFocus {
     #[default]
     Input,
     Conversation,
+    Activity,
 }
 
 /// The `/remote` invite, as the screen shows it.
@@ -91,11 +93,35 @@ pub struct RemoteState {
 ///
 /// `started_elapsed_secs` is the turn clock when the TUI applied the start
 /// event — a projection timestamp, not a process clock, and never refreshed
-/// by redraws.
+/// by redraws. Completed entries stay until prune so Activity Detail can
+/// reopen them; this map is not a second task runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundTaskChrome {
     pub label: String,
     pub started_elapsed_secs: u64,
+    /// `None` while Running. `Some(true)` completed ok; `Some(false)` failed.
+    pub ok: Option<bool>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    /// Output retained from authoritative events. Empty means none arrived.
+    pub output: String,
+}
+
+impl BackgroundTaskChrome {
+    pub fn running(label: impl Into<String>, started_elapsed_secs: u64) -> Self {
+        Self {
+            label: label.into(),
+            started_elapsed_secs,
+            ok: None,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.ok.is_none()
+    }
 }
 
 /// The whole UI state.
@@ -213,6 +239,12 @@ pub struct AppState {
     pub input_rect: Option<(u16, u16, u16, u16)>,
     /// Transcript index of the user shell the Shell Details screen shows.
     pub shell_screen_item: Option<usize>,
+    /// Which first-class activity the Activity Detail screen is showing.
+    pub activity_open: Option<crate::activity::ActivityId>,
+    /// Keyboard selection into [`crate::activity::summaries`], stable by id.
+    pub activity_selected: Option<crate::activity::ActivityId>,
+    /// Last-painted status-strip hits: (row y, activity). Mouse open uses this.
+    pub activity_hits: Vec<(u16, crate::activity::ActivityId)>,
     /// Plan panel collapsed to a single title row.
     pub plan_collapsed: bool,
     /// Collapse the collaboration surface to its one-line compact row.
@@ -346,6 +378,9 @@ impl AppState {
             workbench_focus: WorkbenchFocus::Input,
             input_rect: None,
             shell_screen_item: None,
+            activity_open: None,
+            activity_selected: None,
+            activity_hits: Vec::new(),
             plan_collapsed: false,
             collaboration_collapsed: false,
             tools_expanded: false,

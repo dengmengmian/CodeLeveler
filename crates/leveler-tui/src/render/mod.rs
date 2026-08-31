@@ -135,6 +135,161 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
     frame.render_widget(Paragraph::new(visible), area);
 }
 
+/// Activity Detail: observational overlay-as-screen. Does not cancel work.
+fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
+    use crate::activity::{ActivityId, ActivityStatus, summaries};
+    let theme = &state.theme;
+    let t = state.t();
+    let dim = Style::default().fg(theme.text.muted);
+    let text_style = Style::default().fg(theme.text.primary);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let Some(id) = state.activity_open.clone() else {
+        lines.push(Line::from(Span::styled(t.activity_stale.to_string(), dim)));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    };
+    let summary = summaries(state).into_iter().find(|s| s.id == id);
+    let Some(summary) = summary else {
+        lines.push(Line::from(Span::styled(t.activity_stale.to_string(), dim)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(t.activity_esc.to_string(), dim)));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    };
+    let status_text = match summary.status {
+        ActivityStatus::Running => t.wait_target_running,
+        ActivityStatus::Waiting => t.sub_agent_waiting,
+        ActivityStatus::Completed => t.title_completed,
+        ActivityStatus::Failed => t.title_failed,
+    };
+    let status_style = match summary.status {
+        ActivityStatus::Running | ActivityStatus::Waiting => {
+            Style::default().fg(theme.accent.primary)
+        }
+        ActivityStatus::Completed => Style::default().fg(theme.status.success),
+        ActivityStatus::Failed => Style::default().fg(theme.status.error),
+    };
+    let heading = match &summary.secondary {
+        Some(sec) if summary.kind == crate::activity::ActivityKind::ChildAgent => {
+            format!("{} · {sec}", summary.title)
+        }
+        _ => summary.title.clone(),
+    };
+    lines.push(Line::from(Span::styled(
+        truncate_display(&heading, area.width.saturating_sub(1) as usize),
+        Style::default()
+            .fg(theme.text.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let mut meta = format!(
+        "{} · {}",
+        status_text,
+        crate::status_line::fmt_elapsed(summary.duration_secs)
+    );
+    match &id {
+        ActivityId::Background(task_id) => {
+            if let Some(chrome) = crate::activity::background_chrome(state, task_id)
+                && let Some(code) = chrome.exit_code
+            {
+                meta.push_str(&format!(" · exit {code}"));
+            }
+        }
+        ActivityId::Child(_) => {}
+    }
+    lines.push(Line::from(Span::styled(meta, status_style)));
+    lines.push(Line::from(""));
+
+    match &id {
+        ActivityId::Background(task_id) => {
+            lines.push(Line::from(Span::styled(
+                format!("$ {}", summary.title),
+                text_style,
+            )));
+            lines.push(Line::from(""));
+            let chrome = crate::activity::background_chrome(state, task_id);
+            let output = chrome.map(|c| c.output.as_str()).unwrap_or("");
+            if output.trim().is_empty() {
+                lines.push(Line::from(Span::styled(
+                    t.activity_no_output.to_string(),
+                    dim,
+                )));
+            } else {
+                let width = area.width.saturating_sub(2) as usize;
+                for raw in output.lines() {
+                    let line = sanitize_terminal_line(raw);
+                    lines.push(Line::from(Span::styled(
+                        truncate_display(&format!("  {line}"), width.max(4)),
+                        Style::default().fg(theme.text.secondary),
+                    )));
+                }
+            }
+        }
+        ActivityId::Child(child_id) => {
+            let child = state.team.children.iter().find(|c| &c.id == child_id);
+            if let Some(child) = child {
+                if !child.purpose.is_empty() {
+                    lines.push(Line::from(Span::styled(t.activity_goal.to_string(), dim)));
+                    lines.push(Line::from(Span::styled(child.purpose.clone(), text_style)));
+                    lines.push(Line::from(""));
+                }
+                if let Some(step) = child.recent_step.as_deref().filter(|s| !s.is_empty()) {
+                    lines.push(Line::from(Span::styled(
+                        t.activity_current.to_string(),
+                        dim,
+                    )));
+                    lines.push(Line::from(Span::styled(step.to_string(), text_style)));
+                    lines.push(Line::from(""));
+                }
+                if !child.steps.is_empty() {
+                    lines.push(Line::from(Span::styled(t.activity_steps.to_string(), dim)));
+                    for step in &child.steps {
+                        let live = child.recent_step.as_deref() == Some(step.as_str())
+                            && matches!(
+                                child.status,
+                                crate::multi_agent::ChildStatus::Running
+                                    | crate::multi_agent::ChildStatus::Waiting
+                            );
+                        let g = if live { "●" } else { "✓" };
+                        lines.push(Line::from(Span::styled(
+                            format!("  {g} {step}"),
+                            Style::default().fg(theme.text.secondary),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+                }
+                if let Some(block) = state.transcript.items().iter().find_map(|item| match item {
+                    crate::transcript::TranscriptItem::SubAgent(b) if &b.id == child_id => Some(b),
+                    _ => None,
+                }) && block.status != crate::transcript::ToolStatus::Running
+                    && !block.detail.trim().is_empty()
+                {
+                    lines.push(Line::from(Span::styled(t.activity_result.to_string(), dim)));
+                    lines.push(Line::from(Span::styled(
+                        sub_agent_detail(block.detail.trim(), t),
+                        text_style,
+                    )));
+                    lines.push(Line::from(""));
+                }
+                if let Some(rows) = crate::multi_agent::inspector_rows(child, t) {
+                    for row in rows {
+                        lines.push(Line::from(Span::styled(row.text, dim)));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(t.activity_esc.to_string(), dim)));
+
+    let height = area.height as usize;
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = state.screen_scroll.min(max_scroll);
+    let offset = max_scroll.saturating_sub(scroll);
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), area);
+}
+
 #[cfg(test)]
 pub(crate) use crate::tool_cell::tool_action_label;
 pub(crate) use crate::tool_cell::tool_summary;
@@ -217,6 +372,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Agents => render_agents_screen(frame, chunks[1], state),
         Screen::Remote => render_remote_screen(frame, chunks[1], state),
         Screen::Shell => render_shell_screen(frame, chunks[1], state),
+        Screen::Activity => render_activity_screen(frame, chunks[1], state),
         Screen::Help => render_help_screen(frame, chunks[1], state),
         Screen::Trace => crate::observability::render_trace_screen(frame, chunks[1], state),
     }

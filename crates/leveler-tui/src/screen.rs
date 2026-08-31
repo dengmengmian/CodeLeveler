@@ -22,6 +22,9 @@ pub enum Screen {
     /// One user shell execution (`!command`): status, runtime, command,
     /// live output; Esc backs out, `x` stops a running one.
     Shell,
+    /// First-class Activity Detail (background task or child agent).
+    /// Observational: Esc closes the viewer without cancelling the work.
+    Activity,
     Help,
     /// Durable runtime observatory (`/trace`).
     Trace,

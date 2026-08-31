@@ -159,6 +159,14 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 _ => {}
             }
         }
+        Screen::Activity => match key.code {
+            KeyCode::Esc => {
+                crate::activity::close(state);
+            }
+            _ => {
+                scroll_screen_key(state, &key, true);
+            }
+        },
         Screen::Plan | Screen::Verification | Screen::Context | Screen::Agents | Screen::Help => {
             if key.code == KeyCode::Esc {
                 close_screen(state);

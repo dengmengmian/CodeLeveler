@@ -10,6 +10,7 @@ use leveler_client_protocol::RuntimeStatus;
 use crate::i18n::UiText;
 use crate::multi_agent::ChildStatus;
 use crate::overlay::Overlay;
+#[cfg(test)]
 use crate::render::truncate_display;
 use crate::state::AppState;
 use crate::status_line::{StatusPhase, fmt_elapsed, status_phase};
@@ -109,6 +110,9 @@ fn project_background_wait(state: &AppState, running: &[&ToolCallBlock]) -> Opti
         let Some(chrome) = state.background_task_labels.get(&task_id) else {
             continue;
         };
+        if !chrome.is_running() {
+            continue;
+        }
         targets.push(WaitTarget {
             label: chrome.label.clone(),
             detail: None,
@@ -270,7 +274,8 @@ pub(crate) fn headline(view: &WaitView, t: &UiText) -> String {
 /// Compact indented disclosure of live wait targets. No last-activity text:
 /// the runtime does not currently expose an authoritative activity timestamp
 /// for background processes.
-pub(crate) fn disclosure_plain(view: &WaitView, t: &UiText, width: usize) -> Vec<String> {
+#[cfg(test)]
+fn disclosure_plain(view: &WaitView, t: &UiText, width: usize) -> Vec<String> {
     if matches!(view.kind, WaitKind::Model | WaitKind::Approval) {
         return Vec::new();
     }
@@ -281,6 +286,7 @@ pub(crate) fn disclosure_plain(view: &WaitView, t: &UiText, width: usize) -> Vec
         .collect()
 }
 
+#[cfg(test)]
 fn format_target(target: &WaitTarget, t: &UiText, width: usize, compact: bool) -> Vec<String> {
     let running = match target.lifecycle {
         TargetLifecycle::Running => t.wait_target_running,
@@ -335,14 +341,6 @@ fn render_plain(view: &WaitView, t: &UiText, width: usize) -> String {
     out
 }
 
-/// True when the live map still has background work that is *not* blocking Main.
-pub(crate) fn non_blocking_background_count(state: &AppState) -> usize {
-    if project(state).is_some_and(|v| v.kind == WaitKind::BackgroundTask) {
-        return 0;
-    }
-    state.background_task_labels.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,10 +384,7 @@ mod tests {
     fn live_background(state: &mut AppState, task_id: &str, label: &str, started: u64) {
         state.background_task_labels.insert(
             task_id.into(),
-            BackgroundTaskChrome {
-                label: label.into(),
-                started_elapsed_secs: started,
-            },
+            BackgroundTaskChrome::running(label, started),
         );
     }
 
@@ -470,6 +465,7 @@ mod tests {
                 output_tokens: 0,
                 started_elapsed_secs: 8,
                 detail: None,
+                steps: Vec::new(),
             });
 
         let view = project(&state).expect("child wait");
@@ -531,7 +527,7 @@ mod tests {
             project(&state).is_none(),
             "a live background process is not itself a Main wait"
         );
-        assert_eq!(non_blocking_background_count(&state), 1);
+        assert_eq!(crate::activity::running_background_count(&state), 1);
     }
 
     #[test]
