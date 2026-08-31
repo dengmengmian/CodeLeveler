@@ -66,10 +66,20 @@ fn instruction(goal: &str) -> String {
          is not by itself that coverage.\n\
          - if neither fits, omit \"proof\".\n\
          \n\
+         Group what you list. One entry per INDEPENDENT objective — something \
+         the user could accept, reject or change on its own. Conditions that \
+         belong to one objective (its details, constraints, and the proofs it \
+         demands) go in that objective's \"conditions\", not beside it. \
+         Splitting one objective into several entries does not make the task \
+         stricter; it only makes the same obligation harder to account for. \
+         Every condition still has to hold.\n\
+         \n\
          Answer with ONLY a JSON object, no prose around it:\n\
          {{\n\
            \"requirements\": [\n\
-             {{\"text\": \"...\", \"kind\": \"behavior\", \"proof\": \"command_success\", \"commands\": [\"go test ./...\"]}}\n\
+             {{\"text\": \"...\", \"kind\": \"behavior\", \"conditions\": [\n\
+               {{\"text\": \"...\", \"kind\": \"verification\", \"proof\": \"command_success\", \"commands\": [\"go test ./...\"]}}\n\
+             ]}}\n\
            ]\n\
          }}"
     )
@@ -91,6 +101,15 @@ struct RawRequirement {
     proof: String,
     #[serde(default)]
     commands: Vec<String>,
+    /// Conditions inside this objective, when the model nests them.
+    #[serde(default)]
+    conditions: Vec<RawRequirement>,
+    /// Which objective this item belongs to, when the model lists items flat
+    /// instead. Two shapes, one topology: the same goal is not allowed to
+    /// produce five sibling objectives one run and one objective the next
+    /// purely because the model chose to phrase it differently.
+    #[serde(default)]
+    objective: String,
 }
 
 fn kind_from(raw: &str) -> RequirementKind {
@@ -186,6 +205,67 @@ fn policy_from(raw: &RawRequirement, kind: RequirementKind) -> Option<EvidencePo
     }
 }
 
+/// Fold the derivation's answer into one canonical topology.
+///
+/// The model may nest conditions under an objective, or list everything flat
+/// with an `objective` key saying what belongs together. Both mean the same
+/// thing, and both must produce the same contract — the shape of the answer is
+/// the model's phrasing, not the user's intent. Items that claim no objective
+/// stand alone, because an unexplained grouping is not a grouping.
+///
+/// Nothing is dropped: every raw item becomes an objective or a condition of
+/// one. Merging obligations away would be worse than the fragmentation this
+/// exists to fix.
+fn canonicalize(raw: Vec<RawRequirement>) -> Vec<CompletionRequirement> {
+    let mut objectives: Vec<(String, RawRequirement, Vec<RawRequirement>)> = Vec::new();
+    for item in raw.into_iter().filter(|r| !r.text.trim().is_empty()) {
+        let key = item.objective.trim().to_string();
+        // A flat item naming an objective joins it; the first item to claim a
+        // key is that objective, the rest become its conditions.
+        if !key.is_empty()
+            && let Some(existing) = objectives.iter_mut().find(|(k, _, _)| k == &key)
+        {
+            existing.2.push(item);
+            continue;
+        }
+        let mut item = item;
+        let nested = std::mem::take(&mut item.conditions);
+        objectives.push((key, item, nested));
+    }
+    objectives
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, parent, conditions))| {
+            let id = format!("R{}", i + 1);
+            let kind = kind_from(&parent.kind);
+            CompletionRequirement {
+                text: parent.text.trim().to_string(),
+                kind,
+                source: RequirementSource::OriginalGoal,
+                status: RequirementStatus::Pending,
+                evidence_policy: policy_from(&parent, kind),
+                evidence: Vec::new(),
+                acceptance_facets: conditions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, c)| {
+                        let kind = kind_from(&c.kind);
+                        AcceptanceFacet {
+                            id: format!("{id}.F{}", j + 1),
+                            text: c.text.trim().to_string(),
+                            kind,
+                            status: RequirementStatus::Pending,
+                            evidence_policy: policy_from(&c, kind),
+                            evidence: Vec::new(),
+                        }
+                    })
+                    .collect(),
+                id,
+            }
+        })
+        .collect()
+}
+
 /// Derive the contract for one goal. `None` means the contract is UNAVAILABLE
 /// — the caller keeps today's semantic gate rather than treating an absent
 /// list of obligations as an empty one.
@@ -239,24 +319,7 @@ pub(crate) async fn derive_contract(
         None if candidates.is_empty() => return Err(DerivationFailure::NoStructuredObject),
         None => return Err(DerivationFailure::InvalidStructuredObject),
     };
-    let requirements: Vec<CompletionRequirement> = raw
-        .requirements
-        .into_iter()
-        .filter(|r| !r.text.trim().is_empty())
-        .enumerate()
-        .map(|(i, r)| {
-            let kind = kind_from(&r.kind);
-            CompletionRequirement {
-                id: format!("R{}", i + 1),
-                text: r.text.trim().to_string(),
-                kind,
-                source: RequirementSource::OriginalGoal,
-                status: RequirementStatus::Pending,
-                evidence_policy: policy_from(&r, kind),
-                evidence: Vec::new(),
-            }
-        })
-        .collect();
+    let requirements = canonicalize(raw.requirements);
     if requirements.is_empty() {
         return Err(DerivationFailure::EmptyRequirements);
     }
@@ -281,8 +344,8 @@ fn classify_reply(
 }
 
 use leveler_lifecycle::{
-    CommandMode, CompletionContract, CompletionRequirement, EvidencePolicy, RequirementKind,
-    RequirementSource, RequirementStatus,
+    AcceptanceFacet, CommandMode, CompletionContract, CompletionRequirement, EvidencePolicy,
+    RequirementKind, RequirementSource, RequirementStatus,
 };
 use leveler_model::{Message, ModelRef, ModelRequest, ModelRuntime, Role, ToolChoice};
 use tokio_util::sync::CancellationToken;
@@ -467,6 +530,8 @@ mod derivation_reliability_tests {
             kind: "verification".into(),
             proof: proof.into(),
             commands: commands.iter().map(|c| c.to_string()).collect(),
+            conditions: Vec::new(),
+            objective: String::new(),
         }
     }
 
@@ -558,5 +623,159 @@ mod derivation_reliability_tests {
             classify_reply("{\"requirements\":[]}", leveler_model::FinishReason::Stop),
             Ok(())
         );
+    }
+}
+
+#[cfg(test)]
+mod granularity_tests {
+    use super::*;
+
+    fn item(text: &str, kind: &str) -> RawRequirement {
+        RawRequirement {
+            text: text.into(),
+            kind: kind.into(),
+            proof: String::new(),
+            commands: Vec::new(),
+            conditions: Vec::new(),
+            objective: String::new(),
+        }
+    }
+
+    fn under(objective: &str, text: &str, kind: &str) -> RawRequirement {
+        RawRequirement {
+            objective: objective.into(),
+            ..item(text, kind)
+        }
+    }
+
+    /// The shape the derivation is asked for: one objective carrying its own
+    /// conditions.
+    #[test]
+    fn nested_conditions_stay_inside_their_objective() {
+        let mut parent = item("add the --stats flag", "behavior");
+        parent.conditions = vec![
+            item("prints the record count", "behavior"),
+            item("prints the invalid count", "behavior"),
+            item("leaves default output unchanged", "constraint"),
+        ];
+        let out = canonicalize(vec![parent]);
+        assert_eq!(out.len(), 1, "one objective, not four");
+        assert_eq!(out[0].acceptance_facets.len(), 3);
+        assert_eq!(out[0].id, "R1");
+        assert_eq!(out[0].acceptance_facets[0].id, "R1.F1");
+    }
+
+    /// The same intent listed flat, tied together by an objective key, has to
+    /// produce the same contract. The topology is the user's, not the model's
+    /// phrasing — a goal cannot owe five obligations one run and one the next.
+    #[test]
+    fn a_flat_answer_with_grouping_canonicalizes_to_the_same_topology() {
+        let flat = vec![
+            under("stats", "add the --stats flag", "behavior"),
+            under("stats", "prints the record count", "behavior"),
+            under("stats", "prints the invalid count", "behavior"),
+            under("stats", "leaves default output unchanged", "constraint"),
+        ];
+        let out = canonicalize(flat);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].acceptance_facets.len(), 3);
+        assert_eq!(out[0].text, "add the --stats flag");
+    }
+
+    /// Genuinely separate goals stay separate. Grouping is for conditions of
+    /// one objective, never a way to fold two asks into one.
+    #[test]
+    fn independent_objectives_are_not_merged() {
+        let out = canonicalize(vec![
+            item("add the --stats flag", "behavior"),
+            item("add a separate --json export", "behavior"),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Nearby items with no stated grouping are not assumed to belong
+    /// together: an unexplained grouping is not a grouping.
+    #[test]
+    fn ungrouped_items_are_not_merged_by_proximity() {
+        let out = canonicalize(vec![
+            under("", "first ask", "behavior"),
+            under("", "second ask", "behavior"),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Nothing may be lost on the way in. Folding obligations away would be a
+    /// worse failure than the fragmentation this exists to fix.
+    #[test]
+    fn every_raw_obligation_lands_somewhere() {
+        let mut parent = item("objective", "behavior");
+        parent.conditions = vec![item("c1", "behavior"), item("c2", "behavior")];
+        let flat = vec![
+            parent,
+            under("other", "second objective", "behavior"),
+            under("other", "its condition", "constraint"),
+            item("standalone", "behavior"),
+        ];
+        let raw_count = 1 + 2 + 2 + 1;
+        let out = canonicalize(flat);
+        let landed: usize =
+            out.len() + out.iter().map(|r| r.acceptance_facets.len()).sum::<usize>();
+        assert_eq!(landed, raw_count, "no obligation may vanish: {out:#?}");
+    }
+
+    /// A proof obligation keeps its standard wherever it sits.
+    #[test]
+    fn a_condition_carries_its_own_proof_standard() {
+        let mut parent = item("fix the boundary rule", "behavior");
+        parent.conditions = vec![
+            RawRequirement {
+                proof: "test_coverage".into(),
+                ..item("the rule is covered by a test", "verification")
+            },
+            RawRequirement {
+                proof: "command_success".into(),
+                commands: vec!["`go test ./...`".into()],
+                ..item("`go test ./...` must pass", "verification")
+            },
+        ];
+        let out = canonicalize(vec![parent]);
+        let facets = &out[0].acceptance_facets;
+        assert_eq!(
+            facets[0].evidence_policy,
+            Some(EvidencePolicy::TestCoverage)
+        );
+        match facets[1].evidence_policy.as_ref() {
+            Some(EvidencePolicy::CommandSuccess { commands, mode }) => {
+                assert_eq!(*mode, CommandMode::All);
+                assert_eq!(commands.len(), 1);
+                assert!(
+                    !commands[0].contains('`'),
+                    "markdown must not reach the fingerprint"
+                );
+            }
+            other => panic!("expected CommandSuccess, got {other:?}"),
+        }
+    }
+
+    /// An objective may itself be the command obligation when the user states
+    /// it standalone — grouping is not forced.
+    #[test]
+    fn a_standalone_command_objective_keeps_its_policy() {
+        let out = canonicalize(vec![RawRequirement {
+            proof: "command_success".into(),
+            commands: vec!["go build ./...".into(), "go test ./...".into()],
+            ..item(
+                "`go build ./...` and `go test ./...` must pass",
+                "verification",
+            )
+        }]);
+        assert_eq!(out.len(), 1);
+        match out[0].evidence_policy.as_ref() {
+            Some(EvidencePolicy::CommandSuccess { commands, mode }) => {
+                assert_eq!(*mode, CommandMode::All);
+                assert_eq!(commands.len(), 2);
+            }
+            other => panic!("expected CommandSuccess, got {other:?}"),
+        }
     }
 }

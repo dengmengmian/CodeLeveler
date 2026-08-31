@@ -1873,26 +1873,41 @@ impl Executor {
                                 ],
                                 Some(contract) => {
                                     let mut accounted = contract.clone();
+                                    let apply =
+                                        |id: &str,
+                                         status: &mut leveler_lifecycle::RequirementStatus,
+                                         evidence: &mut Vec<
+                                            leveler_lifecycle::RequirementEvidence,
+                                        >| {
+                                            if let Some(a) =
+                                                outcome.accounting.iter().find(|a| a.id == id)
+                                            {
+                                                *status = if a.satisfied {
+                                                    leveler_lifecycle::RequirementStatus::Satisfied
+                                                } else {
+                                                    leveler_lifecycle::RequirementStatus::Pending
+                                                };
+                                                evidence.push(
+                                                    leveler_lifecycle::RequirementEvidence {
+                                                        strength: a.strength,
+                                                        detail: a.evidence.clone(),
+                                                        refs: a.refs.clone(),
+                                                    },
+                                                );
+                                            }
+                                        };
                                     for r in &mut accounted.requirements {
-                                        if let Some(a) =
-                                            outcome.accounting.iter().find(|a| a.id == r.id)
-                                        {
-                                            r.status = if a.satisfied {
-                                                leveler_lifecycle::RequirementStatus::Satisfied
-                                            } else {
-                                                leveler_lifecycle::RequirementStatus::Pending
-                                            };
-                                            r.evidence.push(
-                                                leveler_lifecycle::RequirementEvidence {
-                                                    strength: a.strength,
-                                                    detail: a.evidence.clone(),
-                                                    refs: a.refs.clone(),
-                                                },
-                                            );
+                                        apply(&r.id.clone(), &mut r.status, &mut r.evidence);
+                                        // Conditions are accounted for by their
+                                        // own id: an objective cannot be
+                                        // reported satisfied over a condition
+                                        // nobody addressed.
+                                        for f in &mut r.acceptance_facets {
+                                            apply(&f.id.clone(), &mut f.status, &mut f.evidence);
                                         }
                                     }
-                                    let open = accounted.open_obligations(&ledger);
-                                    for (_, why) in &open {
+                                    let open = accounted.open_detail(&ledger);
+                                    for (_, _, why) in &open {
                                         match why {
                                             leveler_lifecycle::OpenReason::NotAccountedFor => {
                                                 rejected_not_accounted += 1
@@ -1907,7 +1922,7 @@ impl Executor {
                                     }
                                     let listed: Vec<String> = open
                                         .into_iter()
-                                        .map(|(r, why)| {
+                                        .map(|(id, text, why)| {
                                             let why = match why {
                                                 leveler_lifecycle::OpenReason::NotAccountedFor => {
                                                     "not satisfied"
@@ -1917,7 +1932,7 @@ impl Executor {
                                                 }
                                                 leveler_lifecycle::OpenReason::Blocked => "blocked",
                                             };
-                                            format!("{} ({}) — {}", r.id, r.text, why)
+                                            format!("{id} ({text}) — {why}")
                                         })
                                         .collect();
                                     // The accounting is durable from here on: the terminal

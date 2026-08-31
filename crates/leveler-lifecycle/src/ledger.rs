@@ -758,6 +758,7 @@ mod completion_debt_tests {
             status,
             evidence_policy: None,
             evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
         }])
     }
 
@@ -829,6 +830,7 @@ mod terminal_truth_matrix {
             status,
             evidence_policy: None,
             evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
         }
     }
 

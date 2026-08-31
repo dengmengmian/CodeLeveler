@@ -1335,6 +1335,7 @@ async fn an_explicit_test_obligation_backed_only_by_prose_refuses_completion() {
             status: leveler_lifecycle::RequirementStatus::Pending,
             evidence_policy: None,
             evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
         },
         leveler_lifecycle::CompletionRequirement {
             id: "R2".into(),
@@ -1344,6 +1345,7 @@ async fn an_explicit_test_obligation_backed_only_by_prose_refuses_completion() {
             status: leveler_lifecycle::RequirementStatus::Pending,
             evidence_policy: None,
             evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
         },
     ]);
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -1422,6 +1424,7 @@ async fn a_mechanically_backed_obligation_completes() {
             status: leveler_lifecycle::RequirementStatus::Pending,
             evidence_policy: None,
             evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
         },
     ]);
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -1564,6 +1567,7 @@ async fn a_resumed_run_keeps_the_obligations_it_already_had() {
                 status: leveler_lifecycle::RequirementStatus::Pending,
                 evidence_policy: None,
                 evidence: Vec::new(),
+                acceptance_facets: Vec::new(),
             },
         ])),
         ..Default::default()
@@ -1643,6 +1647,7 @@ async fn a_requirement_the_contract_missed_still_refuses_completion() {
             status: leveler_lifecycle::RequirementStatus::Pending,
             evidence_policy: None,
             evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
         },
     ]);
     let runtime = Arc::new(MockRuntime::new(vec![

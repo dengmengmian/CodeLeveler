@@ -181,9 +181,17 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
     let (obligations, accounting_schema, accounting_rule) = match input.contract {
         None => (String::new(), String::new(), String::new()),
         Some(contract) => {
+            // Objectives with their conditions nested underneath. Flattening
+            // them back into a list of siblings here would undo the point of
+            // grouping them: the judge would again be inventing a status for
+            // fifteen unrelated-looking ids instead of reading one objective
+            // and the conditions inside it.
             let mut listed = String::from("\n<obligations_from_the_original_goal>\n");
             for r in &contract.requirements {
                 listed.push_str(&format!("{}: {}\n", r.id, r.text));
+                for f in &r.acceptance_facets {
+                    listed.push_str(&format!("  {}: {}\n", f.id, f.text));
+                }
             }
             listed.push_str("</obligations_from_the_original_goal>\n");
             (
@@ -197,7 +205,9 @@ fn instruction(input: &ReconcileInput<'_>) -> String {
                 "- The obligations above were derived from this same goal \
                  before the work started. Account for EVERY obligation id in \
                  \"requirement_accounting\": an obligation you do not mention \
-                 stays unsatisfied. For \"evidence_strength\" use \"mechanical\" \
+                 stays unsatisfied — including the indented conditions, which \
+                 are part of the objective above them and not optional. For \
+                 \"evidence_strength\" use \"mechanical\" \
                  only when a recorded command or file change demonstrates it, \
                  \"observed\" when output was actually seen, and \"semantic\" \
                  when it is your reading of the work. When an obligation asks for \
@@ -912,6 +922,7 @@ mod prompt_render_tests {
                 status: leveler_lifecycle::RequirementStatus::Pending,
                 evidence_policy: None,
                 evidence: Vec::new(),
+                acceptance_facets: Vec::new(),
             },
         ]);
         let text = instruction(&ReconcileInput {

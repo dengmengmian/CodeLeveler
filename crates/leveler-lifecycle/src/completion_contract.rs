@@ -93,6 +93,31 @@ pub struct RequirementEvidence {
     pub refs: Vec<String>,
 }
 
+/// A mandatory condition inside one user objective.
+///
+/// The same goal derived six obligations one run, nine another, fifteen a
+/// third — one user bullet about a `--stats` flag became five sibling
+/// obligations, and every extra sibling is another chance for the accounting
+/// to mark something unsatisfied that was in fact done. The details are real
+/// and must not be dropped; they are simply not separate objectives. So they
+/// live inside the objective they belong to, where they still block it.
+///
+/// A facet carries its own proof standard, because that is where the proof
+/// obligation actually lives: "implement X, covered by a test" has one
+/// objective and a coverage obligation attached to it, not two goals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceFacet {
+    pub id: String,
+    /// The condition in the user's own wording.
+    pub text: String,
+    pub kind: RequirementKind,
+    pub status: RequirementStatus,
+    #[serde(default)]
+    pub evidence_policy: Option<EvidencePolicy>,
+    #[serde(default)]
+    pub evidence: Vec<RequirementEvidence>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionRequirement {
     pub id: String,
@@ -108,14 +133,10 @@ pub struct CompletionRequirement {
     #[serde(default)]
     pub evidence_policy: Option<EvidencePolicy>,
     pub evidence: Vec<RequirementEvidence>,
-}
-
-impl CompletionRequirement {
-    fn has_mechanical_evidence(&self) -> bool {
-        self.evidence
-            .iter()
-            .any(|e| e.strength == EvidenceStrength::Mechanical)
-    }
+    /// Conditions that must hold for this objective to be satisfied. Not
+    /// notes: an outstanding facet keeps its parent outstanding.
+    #[serde(default)]
+    pub acceptance_facets: Vec<AcceptanceFacet>,
 }
 
 /// What proof an obligation demands.
@@ -230,19 +251,61 @@ impl CompletionContract {
             .collect()
     }
 
+    /// Every outstanding obligation, named the way the executor can act on it:
+    /// an objective by its id, a condition by its own. Reporting only the
+    /// parent would tell someone that "R4" is unfinished without saying which
+    /// of its conditions is missing.
+    pub fn open_detail(&self, ledger: &EvidenceLedger) -> Vec<(String, String, OpenReason)> {
+        let mut open = Vec::new();
+        for r in &self.requirements {
+            if let Some(why) = open_reason_for(
+                r.kind,
+                r.status,
+                r.evidence_policy.as_ref(),
+                &r.evidence,
+                ledger,
+            ) {
+                open.push((r.id.clone(), r.text.clone(), why));
+            }
+            for f in &r.acceptance_facets {
+                if let Some(why) = open_reason_for(
+                    f.kind,
+                    f.status,
+                    f.evidence_policy.as_ref(),
+                    &f.evidence,
+                    ledger,
+                ) {
+                    open.push((f.id.clone(), f.text.clone(), why));
+                }
+            }
+        }
+        open
+    }
+
     fn open_reason(
         &self,
         r: &CompletionRequirement,
         ledger: &EvidenceLedger,
     ) -> Option<OpenReason> {
-        match r.status {
-            RequirementStatus::Blocked => Some(OpenReason::Blocked),
-            RequirementStatus::Pending => Some(OpenReason::NotAccountedFor),
-            RequirementStatus::Satisfied if !self.is_discharged(r, ledger) => {
-                Some(OpenReason::MissingMechanicalEvidence)
-            }
-            RequirementStatus::Satisfied => None,
+        if let Some(why) = open_reason_for(
+            r.kind,
+            r.status,
+            r.evidence_policy.as_ref(),
+            &r.evidence,
+            ledger,
+        ) {
+            return Some(why);
         }
+        // The objective itself holds; a condition inside it may not.
+        r.acceptance_facets.iter().find_map(|f| {
+            open_reason_for(
+                f.kind,
+                f.status,
+                f.evidence_policy.as_ref(),
+                &f.evidence,
+                ledger,
+            )
+        })
     }
 
     pub fn unsatisfied_material(&self, ledger: &EvidenceLedger) -> Vec<&CompletionRequirement> {
@@ -252,48 +315,98 @@ impl CompletionContract {
             .collect()
     }
 
+    /// One objective is discharged when its own obligation is met AND every
+    /// condition inside it is. A parent that "mostly" holds is not satisfied:
+    /// the details were part of what the user asked for.
     fn is_discharged(&self, r: &CompletionRequirement, ledger: &EvidenceLedger) -> bool {
-        if r.status != RequirementStatus::Satisfied {
-            return false;
+        discharged(
+            r.kind,
+            r.status,
+            r.evidence_policy.as_ref(),
+            &r.evidence,
+            ledger,
+        ) && r.acceptance_facets.iter().all(|f| {
+            discharged(
+                f.kind,
+                f.status,
+                f.evidence_policy.as_ref(),
+                &f.evidence,
+                ledger,
+            )
+        })
+    }
+}
+
+/// Why one obligation — objective or condition — is still open.
+fn open_reason_for(
+    kind: RequirementKind,
+    status: RequirementStatus,
+    policy: Option<&EvidencePolicy>,
+    evidence: &[RequirementEvidence],
+    ledger: &EvidenceLedger,
+) -> Option<OpenReason> {
+    match status {
+        RequirementStatus::Blocked => Some(OpenReason::Blocked),
+        RequirementStatus::Pending => Some(OpenReason::NotAccountedFor),
+        RequirementStatus::Satisfied if !discharged(kind, status, policy, evidence, ledger) => {
+            Some(OpenReason::MissingMechanicalEvidence)
         }
-        match r.kind {
-            // The proof standard was fixed when the obligation was derived.
-            // Asking the judge's label first was an inversion that cost a
-            // correct run — four green checks sat in the ledger while the
-            // obligation was refused because the judge had described them in
-            // prose. The model may say what evidence means; it does not decide
-            // whether the runtime looks.
-            RequirementKind::Verification => match r.evidence_policy.as_ref() {
-                Some(EvidencePolicy::CommandSuccess { commands, mode }) => {
-                    let satisfied = |c: &String| ledger.fresh_successful_command(c);
-                    match mode {
-                        CommandMode::All => !commands.is_empty() && commands.iter().all(satisfied),
-                        CommandMode::Any => commands.iter().any(satisfied),
-                    }
+        RequirementStatus::Satisfied => None,
+    }
+}
+
+/// The proof rules, applied identically to an objective and to a condition
+/// inside one — the standard depends on what is owed and what proves it, not
+/// on where it sits in the contract.
+fn discharged(
+    kind: RequirementKind,
+    status: RequirementStatus,
+    policy: Option<&EvidencePolicy>,
+    evidence: &[RequirementEvidence],
+    ledger: &EvidenceLedger,
+) -> bool {
+    if status != RequirementStatus::Satisfied {
+        return false;
+    }
+    match kind {
+        // The proof standard was fixed when the obligation was derived. Asking
+        // the judge's label first was an inversion that cost a correct run —
+        // four green checks sat in the ledger while the obligation was refused
+        // because the judge had described them in prose. The model may say what
+        // evidence means; it does not decide whether the runtime looks.
+        RequirementKind::Verification => match policy {
+            Some(EvidencePolicy::CommandSuccess { commands, mode }) => {
+                let ok = |c: &String| ledger.fresh_successful_command(c);
+                match mode {
+                    CommandMode::All => !commands.is_empty() && commands.iter().all(ok),
+                    CommandMode::Any => commands.iter().any(ok),
                 }
-                // Both halves, or neither counts. A binding that resolves to
-                // nothing is a sentence, and a green suite over code that
-                // added no test says nothing about the case that was asked for.
-                Some(EvidencePolicy::TestCoverage) => {
-                    r.evidence
-                        .iter()
-                        .flat_map(|e| e.refs.iter())
-                        .any(|id| ledger.resolves_evidence_ref(id))
-                        && ledger.has_fresh_successful_verify()
-                }
-                // No policy is not a licence. Guessing "any green check" here
-                // is precisely how a missing test gets waved through.
-                Some(EvidencePolicy::Unresolved) | None => false,
-            },
-            // Unchanged: nothing changed means nothing was delivered, and the
-            // judge must still have claimed mechanical backing. What proves a
-            // specific deliverable exists is its own question.
-            RequirementKind::Deliverable => {
-                r.has_mechanical_evidence() && !ledger.mutations.is_empty()
             }
-            // Not everything a user asks for is machine-checkable.
-            _ => true,
+            // Both halves, or neither counts. A binding that resolves to
+            // nothing is a sentence, and a green suite over code that added no
+            // test says nothing about the case that was asked for.
+            Some(EvidencePolicy::TestCoverage) => {
+                evidence
+                    .iter()
+                    .flat_map(|e| e.refs.iter())
+                    .any(|id| ledger.resolves_evidence_ref(id))
+                    && ledger.has_fresh_successful_verify()
+            }
+            // No policy is not a licence. Guessing "any green check" here is
+            // precisely how a missing test gets waved through.
+            Some(EvidencePolicy::Unresolved) | None => false,
+        },
+        // Nothing changed means nothing was delivered, and the judge must still
+        // have claimed mechanical backing. What proves a specific deliverable
+        // exists is its own question.
+        RequirementKind::Deliverable => {
+            evidence
+                .iter()
+                .any(|e| e.strength == EvidenceStrength::Mechanical)
+                && !ledger.mutations.is_empty()
         }
+        // Not everything a user asks for is machine-checkable.
+        _ => true,
     }
 }
 
@@ -311,6 +424,7 @@ mod tests {
             status: RequirementStatus::Pending,
             evidence_policy: None,
             evidence: Vec::new(),
+            acceptance_facets: Vec::new(),
         }
     }
 
@@ -525,6 +639,7 @@ mod evidence_policy_tests {
             status: RequirementStatus::Satisfied,
             evidence_policy: Some(policy),
             evidence,
+            acceptance_facets: Vec::new(),
         }
     }
 
@@ -814,6 +929,7 @@ mod evidence_policy_tests {
             status: RequirementStatus::Satisfied,
             evidence_policy: None,
             evidence: prose(EvidenceStrength::Semantic),
+            acceptance_facets: Vec::new(),
         };
         assert_eq!(debt(r, EvidenceLedger::default()), None);
     }
@@ -834,5 +950,237 @@ mod evidence_policy_tests {
         let round: CompletionContract =
             serde_json::from_str(&serde_json::to_string(&contract).unwrap()).unwrap();
         assert_eq!(round, contract);
+    }
+}
+
+#[cfg(test)]
+mod facet_tests {
+    use super::*;
+    use crate::EvidenceLedger;
+
+    const TEST: &str = "go\u{1f}test\u{1f}./...";
+    const BUILD: &str = "go\u{1f}build\u{1f}./...";
+
+    fn facet(id: &str, kind: RequirementKind, status: RequirementStatus) -> AcceptanceFacet {
+        AcceptanceFacet {
+            id: id.into(),
+            text: format!("condition {id}"),
+            kind,
+            status,
+            evidence_policy: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn objective(facets: Vec<AcceptanceFacet>) -> CompletionRequirement {
+        CompletionRequirement {
+            id: "R4".into(),
+            text: "add the --stats flag".into(),
+            kind: RequirementKind::Behavior,
+            source: RequirementSource::OriginalGoal,
+            status: RequirementStatus::Satisfied,
+            evidence_policy: None,
+            evidence: Vec::new(),
+            acceptance_facets: facets,
+        }
+    }
+
+    fn debt(r: CompletionRequirement, mut ledger: EvidenceLedger) -> Option<String> {
+        ledger.completion_contract = Some(CompletionContract::new(vec![r]));
+        ledger.completion_debt()
+    }
+
+    fn edited() -> EvidenceLedger {
+        let mut l = EvidenceLedger::default();
+        l.record_mutation("c1", "apply_patch", vec!["cmd/main.go".into()]);
+        l
+    }
+
+    /// One objective with its conditions attached — the shape that stops one
+    /// user bullet from becoming five sibling obligations.
+    #[test]
+    fn an_objective_carries_its_conditions_without_becoming_five_objectives() {
+        let r = objective(vec![
+            facet(
+                "R4.F1",
+                RequirementKind::Behavior,
+                RequirementStatus::Satisfied,
+            ),
+            facet(
+                "R4.F2",
+                RequirementKind::Behavior,
+                RequirementStatus::Satisfied,
+            ),
+            facet(
+                "R4.F3",
+                RequirementKind::Behavior,
+                RequirementStatus::Satisfied,
+            ),
+        ]);
+        let contract = CompletionContract::new(vec![r]);
+        assert_eq!(contract.requirements.len(), 1, "one objective");
+        assert_eq!(contract.requirements[0].acceptance_facets.len(), 3);
+        assert_eq!(debt(contract.requirements[0].clone(), edited()), None);
+    }
+
+    /// Conditions are not notes. One outstanding condition keeps the whole
+    /// objective outstanding — otherwise this becomes a way to lose детали.
+    #[test]
+    fn one_outstanding_condition_keeps_the_objective_outstanding() {
+        let r = objective(vec![
+            facet(
+                "R4.F1",
+                RequirementKind::Behavior,
+                RequirementStatus::Satisfied,
+            ),
+            facet(
+                "R4.F2",
+                RequirementKind::Behavior,
+                RequirementStatus::Pending,
+            ),
+        ]);
+        let debt = debt(r, edited()).expect("a pending condition blocks its objective");
+        assert!(debt.contains("R4"), "{debt}");
+    }
+
+    #[test]
+    fn a_blocked_condition_keeps_the_objective_outstanding() {
+        let r = objective(vec![facet(
+            "R4.F1",
+            RequirementKind::Behavior,
+            RequirementStatus::Blocked,
+        )]);
+        assert!(debt(r, edited()).is_some());
+    }
+
+    /// The proof standard belongs where the obligation lives: "implement X,
+    /// covered by a test" is one objective with a coverage condition, and the
+    /// coverage condition is held to the coverage standard.
+    #[test]
+    fn a_coverage_condition_is_not_settled_by_a_green_suite() {
+        let mut coverage = facet(
+            "R4.F5",
+            RequirementKind::Verification,
+            RequirementStatus::Satisfied,
+        );
+        coverage.evidence_policy = Some(EvidencePolicy::TestCoverage);
+        coverage.evidence.push(RequirementEvidence {
+            strength: EvidenceStrength::Mechanical,
+            detail: "the suite is green".into(),
+            refs: Vec::new(),
+        });
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 0);
+        assert!(
+            debt(objective(vec![coverage]), ledger).is_some(),
+            "a suite passing is not the coverage that was asked for"
+        );
+    }
+
+    /// And a command condition is settled by that command having run.
+    #[test]
+    fn a_command_condition_is_settled_by_the_command_running_green() {
+        let mut cmd = facet(
+            "R4.F6",
+            RequirementKind::Verification,
+            RequirementStatus::Satisfied,
+        );
+        cmd.evidence_policy = Some(EvidencePolicy::CommandSuccess {
+            commands: vec![TEST.into()],
+            mode: CommandMode::All,
+        });
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 0);
+        assert_eq!(debt(objective(vec![cmd]), ledger), None);
+    }
+
+    #[test]
+    fn a_command_condition_is_not_settled_by_a_stale_run() {
+        let mut cmd = facet(
+            "R4.F6",
+            RequirementKind::Verification,
+            RequirementStatus::Satisfied,
+        );
+        cmd.evidence_policy = Some(EvidencePolicy::CommandSuccess {
+            commands: vec![TEST.into()],
+            mode: CommandMode::All,
+        });
+        let mut ledger = edited();
+        ledger.record_verify("v1", TEST, 0);
+        ledger.record_mutation("c2", "apply_patch", vec!["b.go".into()]);
+        assert!(debt(objective(vec![cmd]), ledger).is_some());
+    }
+
+    /// The design decision, pinned so it cannot drift back: a later `go test`
+    /// does not stand in for the `go build` the user also named. Property
+    /// implication is not an explicit command obligation, and this run's false
+    /// negative is not a reason to invent an implication engine.
+    #[test]
+    fn a_fresh_test_run_does_not_stand_in_for_a_stale_build() {
+        let mut cmd = facet(
+            "R.F",
+            RequirementKind::Verification,
+            RequirementStatus::Satisfied,
+        );
+        cmd.evidence_policy = Some(EvidencePolicy::CommandSuccess {
+            commands: vec![BUILD.into(), TEST.into()],
+            mode: CommandMode::All,
+        });
+        let mut ledger = EvidenceLedger::default();
+        ledger.record_mutation("c1", "apply_patch", vec!["a.go".into()]);
+        ledger.record_verify("v1", BUILD, 0);
+        ledger.record_verify("v2", TEST, 0);
+        ledger.record_mutation("c2", "apply_patch", vec!["b.go".into()]);
+        ledger.record_verify("v3", TEST, 0);
+        assert!(
+            debt(objective(vec![cmd]), ledger).is_some(),
+            "go test passing is not go build having been re-run"
+        );
+    }
+
+    /// Every open obligation names itself, so the executor learns which
+    /// condition is missing rather than that its objective is "unfinished".
+    #[test]
+    fn open_conditions_are_named_individually() {
+        let r = objective(vec![
+            facet(
+                "R4.F1",
+                RequirementKind::Behavior,
+                RequirementStatus::Satisfied,
+            ),
+            facet(
+                "R4.F2",
+                RequirementKind::Behavior,
+                RequirementStatus::Pending,
+            ),
+        ]);
+        let contract = CompletionContract::new(vec![r]);
+        let open = contract.open_detail(&edited());
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].0, "R4.F2");
+    }
+
+    /// Conditions ride the durable contract; a resumed run cannot end up owing
+    /// less than it did.
+    #[test]
+    fn conditions_survive_serialization() {
+        let contract = CompletionContract::new(vec![objective(vec![facet(
+            "R4.F1",
+            RequirementKind::Verification,
+            RequirementStatus::Pending,
+        )])]);
+        let round: CompletionContract =
+            serde_json::from_str(&serde_json::to_string(&contract).unwrap()).unwrap();
+        assert_eq!(round, contract);
+        assert_eq!(round.requirements[0].acceptance_facets.len(), 1);
+    }
+
+    /// A contract written before conditions existed still reads, and reads as
+    /// an objective with none — not as one with weaker obligations.
+    #[test]
+    fn an_older_contract_without_conditions_still_reads() {
+        let json = r#"{"requirements":[{"id":"R1","text":"do it","kind":"behavior","source":"original_goal","status":"pending","evidence":[]}]}"#;
+        let contract: CompletionContract = serde_json::from_str(json).unwrap();
+        assert!(contract.requirements[0].acceptance_facets.is_empty());
     }
 }
